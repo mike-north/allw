@@ -1,0 +1,29 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Node / TypeScript
+node_modules/
+dist/
+*.tsbuildinfo
+
+# WASM build output
+pkg/
+*.wasm
+
+# Cloudflare / Wrangler
+.wrangler/
+
+# Env
+.env
+.env.*
+!.env.example
+
+# Local & OS
+*.local.*
+.DS_Store
+scratch/
+.worktrees/
+
+# Claude Code local configuration (auto-added)
+.claude/*.local.*
