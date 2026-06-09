@@ -3,6 +3,7 @@ name = "allw-core"
 version = "0.0.0"
 description = "Core types and crypto for the allw approval primitive: contract, verdict signing/verification, audit chaining."
 edition.workspace = true
+rust-version.workspace = true # MSRV 1.85 (serde_jcs 0.2)
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
@@ -17,10 +18,13 @@ workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
+# RFC 8785 JSON Canonicalization Scheme; used by hash::canonical_request_bytes.
+# serde_jcs 0.2.0 — actively maintained, explicit RFC 8785 conformance, requires Rust ≥ 1.85.
+serde_jcs = "0.2"
+sha2 = "0.10"
 # Planned as modules are implemented:
 #   josekit / rust JOSE     — JWE (context) + JWS (verdicts/rules)
 #   ed25519-dalek           — verdict/rule signatures
 #   x25519-dalek            — ECDH for E2EE context
-#   sha2                    — audit hash chain + request_hash
 #   uniffi                  — Swift/Kotlin bindings
 #   wasm-bindgen            — WASM for node/browser surfaces

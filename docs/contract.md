@@ -138,6 +138,38 @@ isn't E2EE / is size-limited). Context is fetched as JWE and decrypted on-device
 - **Timestamps** (`created_at`, `expires_at`, `decided_at`) are `i64` Unix milliseconds (UTC) — deterministic
   for the WYSIWYS canonical hash and trivially identical Rust↔TS.
 
+### request_hash (WYSIWYS canonicalization)
+
+`request_hash` binds a [`Verdict`] to the exact content the human was shown. Both the integrator
+(pre-send) and the device (post-decrypt) compute the value independently from the same plaintext;
+the WASM binding must reproduce the same bytes.
+
+**Hashed subset** — exactly four fields:
+
+| Field                          | Rationale                                                                                           |
+| ------------------------------ | --------------------------------------------------------------------------------------------------- |
+| `action` (full `ActionRecord`) | What the human approved                                                                             |
+| `summary`                      | Human-readable description shown in the inbox                                                       |
+| `actor.id`, `actor.kind`       | Actor identity as displayed — `attestation` is excluded (used for crypto verification, not display) |
+| `expires_at`                   | The deadline shown to the human                                                                     |
+
+Everything else is excluded: `request_hash` itself (circular), `context_ciphertext` (ciphertext; plaintext
+is captured above), `actor.attestation`, `constraints`, `chain`, `id`/`created_at`, `approver` routing id,
+top-level `risk`/`reversible` (echoed from `action`), `v`.
+
+**Recipe:**
+
+```
+request_hash = SHA-256( b"allw/request-hash/v1" || 0x00 || JCS(subset) )
+```
+
+where `JCS(subset)` is the [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785) JSON Canonicalization
+Scheme encoding of `{ action, actor: { id, kind }, expires_at, summary }` (keys in JCS-sorted order).
+The `0x00` byte separates the domain tag from the payload.
+
+**Versioning:** `b"allw/request-hash/v1"` is the domain separation tag and the version knob. Any change
+to the hashed subset, encoding, or recipe requires bumping `v1` → `v2`.
+
 ## Open decisions
 
 - **Account / device enrollment, key rotation & revocation** — needs its own mini-spec.
