@@ -21,7 +21,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -29,7 +29,9 @@ const vendorDir = join(here, "..", "vendor", "allw-wasm");
 
 /** Loads the `--target web` wasm module synchronously from on-disk bytes (node-friendly). */
 async function loadWasm() {
-  const glue = await import(join(vendorDir, "allw_wasm.js"));
+  // Convert the filesystem path to a file:// URL — a bare path string is not a valid ESM
+  // specifier on Windows (`C:\...`), so dynamic import must use a URL for cross-platform parity.
+  const glue = await import(pathToFileURL(join(vendorDir, "allw_wasm.js")).href);
   const bytes = readFileSync(join(vendorDir, "allw_wasm_bg.wasm"));
   const module = new WebAssembly.Module(bytes);
   glue.initSync({ module });

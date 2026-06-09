@@ -72,18 +72,25 @@ fn decode_b64_32(s: &str, what: &str) -> Result<[u8; 32], JsError> {
         .map_err(|_| JsError::new(&format!("{what} must decode to exactly 32 bytes")))
 }
 
+/// JS `Number.MAX_SAFE_INTEGER` = 2^53 − 1. Integer `f64`s within `±MAX_SAFE_INTEGER` are the
+/// exact integer the caller intended; beyond it, distinct integers collapse onto the same `f64`,
+/// so an `ms.fract() == 0.0` value there is NOT necessarily the millisecond count JS meant.
+const JS_MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
 /// Converts a JS-number millisecond timestamp (`f64`) to the core's `i64`, rejecting non-integer
-/// or out-of-range values rather than silently truncating.
+/// or unsafe-magnitude values rather than silently truncating or accepting a precision-lost value.
 fn ms_to_i64(ms: f64, what: &str) -> Result<i64, JsError> {
     if !ms.is_finite() || ms.fract() != 0.0 {
         return Err(JsError::new(&format!(
             "{what} must be a finite integer number of milliseconds, got {ms}"
         )));
     }
-    // i64 range as f64 bounds. Using the f64 literals avoids precision surprises at the edges.
-    if ms < i64::MIN as f64 || ms > i64::MAX as f64 {
+    // Bound to ±MAX_SAFE_INTEGER (not the wider i64 range): only there is the f64→i64 conversion
+    // guaranteed exact, so we never accept a value JS could not represent precisely. ~year 287396
+    // in ms — far beyond any real timestamp.
+    if ms.abs() > JS_MAX_SAFE_INTEGER {
         return Err(JsError::new(&format!(
-            "{what} is out of the i64 range: {ms}"
+            "{what} exceeds JS safe-integer range (±2^53-1); not exactly representable: {ms}"
         )));
     }
     Ok(ms as i64)
