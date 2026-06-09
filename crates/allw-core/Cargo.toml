@@ -28,11 +28,38 @@ sha2 = "0.10"
 # A hand-rolled EdDSA compact JWS (RFC 7515 + RFC 8037) is built on top — josekit/jsonwebtoken
 # are OpenSSL/ring-based and cannot target wasm32, so they are deliberately avoided.
 ed25519-dalek = "2"
+# ── JWE context encryption (issue #5) — multi-recipient JOSE JWE, all pure-Rust (wasm32-ok).
+# Every crate below is RustCrypto / dalek pure Rust; none pulls in OpenSSL or ring, so the
+# E2EE path compiles to wasm32 alongside the rest of the core (docs/architecture.md).
+# X25519 ECDH for ECDH-ES (RFC 8037 OKP). `static_secrets` exposes `StaticSecret` (the device's
+# long-term encryption key). The `getrandom`/`rand_core` features are intentionally NOT enabled —
+# all encryption randomness is injected by the caller (keeps the core deterministic + wasm-safe).
+x25519-dalek = { version = "2", default-features = false, features = [
+    "static_secrets",
+    "precomputed-tables",
+    "zeroize",
+] }
+# AES-256-GCM content encryption (enc = "A256GCM", RFC 7518 §5.3).
+# `default-features = false` drops the `getrandom` default — the IV/CEK randomness is injected by
+# the caller, so the core must NOT link an OS RNG (would break the wasm32 build / architecture
+# mandate). `aes` is the AES backend; `alloc` enables the `Vec`-returning AEAD API.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+# AES-256 Key Wrap (A256KW / RFC 3394) for per-recipient CEK wrapping (RFC 7518 §4.4).
+# `alloc` enables the `wrap_vec`/`unwrap_vec` convenience methods (core already links std).
+aes-kw = { version = "0.2", features = ["alloc"] }
+# Concat KDF (RFC 7518 §4.6.2) to derive the 256-bit KEK from the ECDH shared secret.
+concat-kdf = "0.1"
+# `CryptoRng + RngCore` trait bound for the injected RNG. `default-features = false` (no
+# `getrandom`/`std`) so this dependency never links an OS RNG — randomness is caller-injected.
+rand_core = { version = "0.6", default-features = false }
 # POSIX word-splitting tokenizer (small, well-tested; mirrors Python's shlex).
 # Used by `command::action_from_command` to tokenize shell command strings deterministically.
 shlex = "1"
 # Planned as modules are implemented:
-#   josekit / rust JOSE     — JWE (context); JWS verdicts/rules are hand-rolled on ed25519-dalek
-#   x25519-dalek            — ECDH for E2EE context
 #   uniffi                  — Swift/Kotlin bindings
 #   wasm-bindgen            — WASM for node/browser surfaces
+
+[dev-dependencies]
+# Deterministic, seedable RNG for JWE encryption tests (fixed seed → reproducible ciphertext),
+# proving the core never reaches for an OS RNG. Pure Rust.
+rand_chacha = "0.3"
