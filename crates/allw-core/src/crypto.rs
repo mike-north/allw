@@ -434,13 +434,14 @@ pub struct UnsignedVerdict {
 /// checked against a [`NonceStore`] on verify. `device_cert` is the device→root certificate
 /// JWS (from [`issue_device_cert`]); pass `Some` so verifiers can chain to the account root.
 ///
-/// `device_id` becomes the JWS header `kid`; [`verify_verdict`] requires it to equal
-/// `approver.device_id`.
+/// The JWS header `kid` is taken from `unsigned.approver.device_id` (not a separate parameter),
+/// so the signed `kid` and the outer verdict's device id cannot diverge — [`verify_verdict`]
+/// requires `kid == approver.device_id`, and deriving both from one source removes the chance to
+/// build a self-inconsistent verdict.
 #[must_use]
 pub fn sign_verdict(
     unsigned: &UnsignedVerdict,
     device_key: &SigningKeyPair,
-    device_id: &str,
     nonce: &[u8],
     device_cert: Option<String>,
 ) -> Verdict {
@@ -456,7 +457,7 @@ pub fn sign_verdict(
     let header = JwsHeader {
         alg: ALG_EDDSA.to_string(),
         typ: TYP_VERDICT.to_string(),
-        kid: device_id.to_string(),
+        kid: unsigned.approver.device_id.clone(),
     };
 
     let sig = encode_compact_jws(&header, &claims, device_key);
@@ -588,6 +589,9 @@ pub enum VerifyError {
         /// The field whose outer value diverged from the signed claim.
         field: &'static str,
     },
+    /// Step 4 — the signed `request_id` does not match `request.id`. The verdict was signed for a
+    /// different request (possibly one that renders identically — see the no-swap invariant).
+    RequestIdMismatch,
     /// Step 4 — the signed `request_hash` does not bind to `request.request_hash`.
     RequestHashMismatch,
     /// Step 5 — `now_ms` is past `request.expires_at`.
@@ -648,6 +652,12 @@ impl std::fmt::Display for VerifyError {
                     "outer verdict field '{field}' disagrees with the signed claim"
                 )
             }
+            Self::RequestIdMismatch => {
+                write!(
+                    f,
+                    "signed request_id does not match request.id (verdict bound to a different request)"
+                )
+            }
             Self::RequestHashMismatch => {
                 write!(
                     f,
@@ -686,18 +696,21 @@ impl std::error::Error for VerifyError {}
 ///
 /// 1. **Device cert → root** (checklist #1). Requires `verdict.device_cert`
 ///    ([`VerifyError::MissingDeviceCert`]); verifies its JWS against `approver_root`
-///    ([`VerifyError::CertSignatureInvalid`]); checks `typ`, `account_id`
-///    ([`VerifyError::CertAccountMismatch`]) and `device_id`
+///    ([`VerifyError::CertSignatureInvalid`]); checks `typ`, the signed header `kid` and
+///    `account_id` ([`VerifyError::CertAccountMismatch`]) and `device_id`
 ///    ([`VerifyError::CertDeviceMismatch`]); enforces `expires_at` if set
 ///    ([`VerifyError::CertExpired`]). Yields the certified device public key.
 /// 2. **Verdict signature** (checklist #1). Parses `verdict.sig` as a verdict JWS, checks
 ///    `typ`/`kid == approver.device_id`, and verifies it with the device key from step 1
 ///    ([`VerifyError::VerdictSignatureInvalid`] / [`VerifyError::MalformedJws`]).
 /// 3. **Claims ↔ outer consistency** (checklist #2). Each outer field
-///    (`request_id`, `decision`, `decided_at`, `request_hash`) must equal its signed claim
-///    ([`VerifyError::ClaimsMismatch`]).
-/// 4. **request_hash binds the exact request** (checklist #2). `claims.request_hash ==
-///    request.request_hash` ([`VerifyError::RequestHashMismatch`]) — the WYSIWYS↔verdict tie.
+///    (`request_id`, `decision`, `decided_at`, `request_hash`, `challenge_response`) must equal
+///    its signed claim ([`VerifyError::ClaimsMismatch`]).
+/// 4. **Binds the EXACT request — id AND hash** (checklist #2). `claims.request_id == request.id`
+///    ([`VerifyError::RequestIdMismatch`]) AND `claims.request_hash == request.request_hash`
+///    ([`VerifyError::RequestHashMismatch`]). The id check is essential because `request_hash`
+///    excludes `id`, so it alone cannot distinguish two requests that render identically — this
+///    is the "no swap" half of the binding invariant.
 /// 5. **Freshness / window** (checklist #4). `now_ms <= request.expires_at`
 ///    ([`VerifyError::Expired`]); `created_at <= decided_at <= expires_at`
 ///    ([`VerifyError::DecidedAtOutOfWindow`]).
@@ -741,6 +754,11 @@ pub fn verify_verdict(
         decode_and_verify_jws(cert_compact, TYP_DEVICE_CERT, approver_root)
             .map_err(|_| VerifyError::CertSignatureInvalid)?;
 
+    // The cert's signed `kid` must name the account it certifies (docs: device-cert uses
+    // `kid: <account_id>`). Checking it rejects key-id confusion before we trust the claims.
+    if cert.header.kid != cert.claims.account_id {
+        return Err(VerifyError::CertAccountMismatch);
+    }
     if cert.claims.account_id != verdict.approver.account_id {
         return Err(VerifyError::CertAccountMismatch);
     }
@@ -791,8 +809,22 @@ pub fn verify_verdict(
             field: "request_hash",
         });
     }
+    // The outer challenge_response must equal the signed one — the plaintext field is otherwise
+    // tamperable without breaking the signature (would corrupt downstream logging/UX).
+    if claims.challenge_response != verdict.challenge_response {
+        return Err(VerifyError::ClaimsMismatch {
+            field: "challenge_response",
+        });
+    }
 
-    // ── Step 4: request_hash binds to the exact request (WYSIWYS) ─────────────────
+    // ── Step 4: bind to the EXACT request — id AND hash (no swap) ─────────────────
+    // `request_hash` deliberately excludes `id` (it covers only the human-shown content), so two
+    // content-identical requests with different ids share a hash. Checking `request.id` closes the
+    // swap gap: a verdict signed for one request cannot be accepted for another that merely renders
+    // identically (contract.md §Invariants #2 — "bound to the exact request, no swap").
+    if claims.request_id != request.id {
+        return Err(VerifyError::RequestIdMismatch);
+    }
     if claims.request_hash != request.request_hash {
         return Err(VerifyError::RequestHashMismatch);
     }
@@ -1007,7 +1039,6 @@ mod tests {
         sign_verdict(
             &make_unsigned(Decision::Approved, REQUEST_HASH, None),
             &device_key(),
-            DEVICE_ID,
             NONCE,
             Some(cert),
         )
@@ -1078,7 +1109,6 @@ mod tests {
         let verdict = sign_verdict(
             &make_unsigned(Decision::Approved, REQUEST_HASH, None),
             &device_key(),
-            DEVICE_ID,
             NONCE,
             Some(cert),
         );
@@ -1110,7 +1140,6 @@ mod tests {
         let verdict = sign_verdict(
             &make_unsigned(Decision::Approved, REQUEST_HASH, None),
             &device_key(),
-            DEVICE_ID,
             NONCE,
             Some(cert),
         );
@@ -1134,7 +1163,6 @@ mod tests {
         let verdict = sign_verdict(
             &make_unsigned(Decision::Approved, REQUEST_HASH, None),
             &device_key(),
-            DEVICE_ID,
             NONCE,
             None, // no cert
         );
@@ -1244,7 +1272,6 @@ mod tests {
         let verdict = sign_verdict(
             &make_unsigned(Decision::Approved, OTHER_REQUEST_HASH, None),
             &device_key(),
-            DEVICE_ID,
             NONCE,
             Some(cert),
         );
@@ -1296,6 +1323,111 @@ mod tests {
         assert_eq!(err, VerifyError::CertSignatureInvalid);
     }
 
+    // ── No-swap: bind to the exact request id, not just identical content ─────────
+
+    /// "No swap" (contract.md §Invariants #2): a verdict legitimately signed for request A
+    /// (a different `id`, but identical hashed content) must NOT verify against a
+    /// content-identical request B. `request_hash` excludes `id`, so only the `request_id`
+    /// check distinguishes them.
+    #[test]
+    fn verdict_for_content_identical_request_rejected_by_id() {
+        let cert = make_cert(&root_key());
+        let unsigned = UnsignedVerdict {
+            v: 1,
+            request_id: "req_OTHER".to_string(), // signed for a DIFFERENT request id...
+            request_hash: REQUEST_HASH,          // ...but identical hashed content
+            decision: Decision::Approved,
+            decided_at: TS_DECIDED,
+            approver: make_approver(),
+            note: None,
+            challenge_response: None,
+        };
+        let verdict = sign_verdict(&unsigned, &device_key(), NONCE, Some(cert));
+
+        // Request B: different id, SAME request_hash (renders identically).
+        let request = make_request(REQUEST_HASH, false); // id == REQUEST_ID
+        let mut store = InMemoryNonceStore::new();
+
+        let err = verify_verdict(
+            &verdict,
+            &request,
+            &root_key().public_key(),
+            &mut store,
+            NOW_OK,
+        )
+        .expect_err("a verdict for a different (content-identical) request must be rejected");
+        assert_eq!(err, VerifyError::RequestIdMismatch);
+    }
+
+    /// The outer `challenge_response` must equal the signed claim: tampering the plaintext field
+    /// (without re-signing) is detected as `ClaimsMismatch` (checklist #2 — outer ↔ claims).
+    #[test]
+    fn tampered_outer_challenge_response_detected() {
+        let cert = make_cert(&root_key());
+        let mut verdict = sign_verdict(
+            &make_unsigned(Decision::Approved, REQUEST_HASH, Some("42".to_string())),
+            &device_key(),
+            NONCE,
+            Some(cert),
+        );
+        verdict.challenge_response = Some("99".to_string()); // tamper the OUTER field only
+
+        let request = make_request(REQUEST_HASH, true);
+        let mut store = InMemoryNonceStore::new();
+
+        let err = verify_verdict(
+            &verdict,
+            &request,
+            &root_key().public_key(),
+            &mut store,
+            NOW_OK,
+        )
+        .expect_err("tampered outer challenge_response must fail");
+        assert_eq!(
+            err,
+            VerifyError::ClaimsMismatch {
+                field: "challenge_response"
+            }
+        );
+    }
+
+    /// A device cert whose signed header `kid` disagrees with its `account_id` is rejected even
+    /// though the root signature is valid — guards against key-id confusion.
+    #[test]
+    fn cert_with_mismatched_kid_rejected() {
+        let header = JwsHeader {
+            alg: ALG_EDDSA.to_string(),
+            typ: TYP_DEVICE_CERT.to_string(),
+            kid: "wrong-account".to_string(), // != claims.account_id
+        };
+        let claims = DeviceCertClaims {
+            account_id: ACCOUNT_ID.to_string(),
+            device_id: DEVICE_ID.to_string(),
+            device_pubkey: device_key().public_key().to_bytes(),
+            issued_at: TS_CREATED,
+            expires_at: None,
+        };
+        let cert = encode_compact_jws(&header, &claims, &root_key());
+        let verdict = sign_verdict(
+            &make_unsigned(Decision::Approved, REQUEST_HASH, None),
+            &device_key(),
+            NONCE,
+            Some(cert),
+        );
+        let request = make_request(REQUEST_HASH, false);
+        let mut store = InMemoryNonceStore::new();
+
+        let err = verify_verdict(
+            &verdict,
+            &request,
+            &root_key().public_key(),
+            &mut store,
+            NOW_OK,
+        )
+        .expect_err("cert with mismatched kid must fail");
+        assert_eq!(err, VerifyError::CertAccountMismatch);
+    }
+
     // ── Decision gate: verified non-approvals are NotApproved, not crypto errors ──
 
     /// checklist #3: an authenticated DENIED verdict → NotApproved{Denied} (NOT a crypto error).
@@ -1306,7 +1438,6 @@ mod tests {
         let verdict = sign_verdict(
             &make_unsigned(Decision::Denied, REQUEST_HASH, None),
             &device_key(),
-            DEVICE_ID,
             NONCE,
             Some(cert),
         );
@@ -1337,7 +1468,6 @@ mod tests {
         let verdict = sign_verdict(
             &make_unsigned(Decision::Expired, REQUEST_HASH, None),
             &device_key(),
-            DEVICE_ID,
             NONCE,
             Some(cert),
         );
@@ -1367,7 +1497,6 @@ mod tests {
         let verdict = sign_verdict(
             &make_unsigned(Decision::Aborted, REQUEST_HASH, None),
             &device_key(),
-            DEVICE_ID,
             NONCE,
             Some(cert),
         );
@@ -1416,7 +1545,7 @@ mod tests {
         let cert = make_cert(&root_key());
         let mut unsigned = make_unsigned(Decision::Approved, REQUEST_HASH, None);
         unsigned.decided_at = TS_CREATED - 1; // before the window opens
-        let verdict = sign_verdict(&unsigned, &device_key(), DEVICE_ID, NONCE, Some(cert));
+        let verdict = sign_verdict(&unsigned, &device_key(), NONCE, Some(cert));
         let request = make_request(REQUEST_HASH, false);
         let mut store = InMemoryNonceStore::new();
 
@@ -1437,7 +1566,7 @@ mod tests {
         let cert = make_cert(&root_key());
         let mut unsigned = make_unsigned(Decision::Approved, REQUEST_HASH, None);
         unsigned.decided_at = TS_EXPIRES + 1; // after the window closes
-        let verdict = sign_verdict(&unsigned, &device_key(), DEVICE_ID, NONCE, Some(cert));
+        let verdict = sign_verdict(&unsigned, &device_key(), NONCE, Some(cert));
         let request = make_request(REQUEST_HASH, false);
         let mut store = InMemoryNonceStore::new();
 
@@ -1502,7 +1631,6 @@ mod tests {
         let verdict = sign_verdict(
             &make_unsigned(Decision::Approved, REQUEST_HASH, Some("42".to_string())),
             &device_key(),
-            DEVICE_ID,
             NONCE,
             Some(cert),
         );
@@ -1527,7 +1655,6 @@ mod tests {
         let verdict = sign_verdict(
             &make_unsigned(Decision::Approved, REQUEST_HASH, Some(String::new())),
             &device_key(),
-            DEVICE_ID,
             NONCE,
             Some(cert),
         );
@@ -1600,7 +1727,6 @@ mod tests {
         let verdict = sign_verdict(
             &make_unsigned(Decision::Approved, REQUEST_HASH, None),
             &imposter,
-            DEVICE_ID,
             NONCE,
             Some(cert),
         );
