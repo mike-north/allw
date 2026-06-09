@@ -57,18 +57,16 @@
 //! # Host extraction
 //!
 //! A conservative heuristic extracts the remote host for commands that trivially target one.
-//! Only the following commands are recognized:
+//! Only `ssh` and `scp` are recognized; every other command returns `None`.
 //!
-//! - `ssh`: first positional that contains `@` (e.g. `user@host` → `host`) or the first
-//!   positional that is not an option value and contains a `.` or looks like a hostname
-//!   (i.e. not a path, not a plain word without dot).  The simpler `user@host` pattern
-//!   takes precedence; bare hostnames are matched only when the first non-flag positional
-//!   does not contain `/`.
-//! - `scp`: source and destination arguments may contain `host:path`; the first `host:path`
-//!   token is split on `:` and the host part is returned.
+//! - `ssh`: the first positional containing `@` → the part after `@` (e.g. `user@host` →
+//!   `host`); otherwise the first positional that contains `.` and starts with neither `/`
+//!   nor `.` (a bare hostname, not a path).
+//! - `scp`: the first positional that does not start with `/` and contains `:` → the part
+//!   before `:` (the `host` of `host:path`).
 //!
-//! No other commands trigger host extraction.  This is intentionally conservative: over-
-//! inferring the host would produce noisy, incorrect data.
+//! This is intentionally conservative: over-inferring the host would produce noisy,
+//! incorrect data.
 //!
 //! # Environment variable references
 //!
@@ -86,7 +84,7 @@
 //! | Risk       | Matched commands / flags                                                      |
 //! |------------|-------------------------------------------------------------------------------|
 //! | `Critical` | `dd`, `mkfs`, `mkfs.*`, `fdisk`, `parted`, `shred`                           |
-//! | `High`     | `rm -rf` (recursive force), `git push --force`/`-f`, `chmod -R 777`, `sudo`  |
+//! | `High`     | `rm` recursive+force, `git push` with a force flag, `chmod -R` (recursive), `sudo` |
 //! | `Low`      | `ls`, `cat`, `echo`, `pwd`, `whoami`, `date`, `env`, `printenv`, `which`     |
 //! | `Medium`   | everything else                                                               |
 //!
@@ -170,9 +168,8 @@ pub fn action_from_command(
 /// This is the infallible variant for callers that have already split the command into
 /// tokens (e.g. received from a shell hook or process execution API).
 ///
-/// An empty `argv` slice produces an [`ActionRecord`] with all `SyntacticSubstrate` fields
-/// set to their empty/None state: `bin` and `argv` are `Some` with empty strings/vecs,
-/// `flags` and `positionals` are `Some([])`, `raw` is `None`.
+/// An empty `argv` slice produces an [`ActionRecord`] whose `bin`, `argv`, `flags`, and
+/// `positionals` are all `None` (there is nothing to populate), and `raw` is `None`.
 ///
 /// # Examples
 ///
@@ -198,7 +195,7 @@ fn build_record(argv: Vec<String>, ctx: &CommandContext, raw: Option<String>) ->
 
     let host = extract_host(&bin, &positionals);
 
-    let risk = classify_risk(&bin, &flags);
+    let risk = classify_risk(&bin, &flags, &positionals);
 
     let bin_opt = if argv.is_empty() {
         None
@@ -387,7 +384,7 @@ fn basename(s: &str) -> &str {
 ///
 /// v1 heuristic only; T3 will derive this from capabilities.
 /// Documented rules are in the module-level doc table.
-fn classify_risk(bin: &str, flags: &[String]) -> Risk {
+fn classify_risk(bin: &str, flags: &[String], positionals: &[String]) -> Risk {
     let base = basename(bin);
 
     // Critical: disk/partition destructive tools
@@ -424,18 +421,16 @@ fn classify_risk(bin: &str, flags: &[String]) -> Risk {
             }
         }
         "git" => {
-            // git push --force or git push -f
-            let has_push = flags.is_empty(); // flags doesn't include subcommands
-                                             // positionals aren't passed here, but "git push" is identified by the
-                                             // fact that we're in the git branch; the force flag is what elevates risk
-            let _ = has_push;
+            // Only `git push` with a force flag is High — NOT e.g. `git checkout -f`.
+            // The subcommand is the first positional (`git push ...` → positionals[0] == "push").
+            let is_push = positionals.first().is_some_and(|p| p == "push");
             let has_force = flags.iter().any(|f| {
                 f == "--force"
                     || f == "-f"
                     || f == "--force-with-lease"
                     || combined_short_flags(f).contains('f')
             });
-            if has_force {
+            if is_push && has_force {
                 return Risk::High;
             }
         }
@@ -820,6 +815,19 @@ mod tests {
     fn risk_high_for_git_push_force() {
         let r = action_from_command("git push --force origin main", &ctx_no_cwd()).unwrap();
         assert_eq!(r.risk, Risk::High);
+    }
+
+    /// Regression (#33 review): a force flag on a NON-`push` git subcommand must NOT be High.
+    /// The risk rule requires `positionals[0] == "push"`, so `git checkout -f` stays Medium —
+    /// before the fix, any `git` with a force flag was wrongly elevated.
+    #[test]
+    fn risk_not_high_for_git_force_without_push_subcommand() {
+        let r = action_from_command("git checkout -f main", &ctx_no_cwd()).unwrap();
+        assert_eq!(
+            r.risk,
+            Risk::Medium,
+            "git checkout -f is not a force-push; must not be High"
+        );
     }
 
     /// Medium: unrecognized commands default to medium.
