@@ -133,11 +133,8 @@ impl std::error::Error for AuditChainError {}
 /// All fields needed to append a new record to an [`AuditChain`], excluding the
 /// chain-managed fields (`seq`, `prev_hash`, `record_hash`) which the chain computes.
 ///
-/// # `context_digest`
-///
-/// This field is the SHA-256 of the plaintext the human was shown (WYSIWYS).  **Deriving
-/// it from the plaintext is the integrator's responsibility**, not this module's.  The chain
-/// stores it opaquely for non-repudiation purposes.
+/// Per `docs/contract.md` §Messages → AuditRecord, `request_hash` is the complete WYSIWYS
+/// proof; there is intentionally **no** separate `context_digest` (resolved in #28).
 pub struct AuditEntryInput {
     /// The [`ApprovalRequest`](crate::contract::ApprovalRequest) `id` this record covers.
     pub request_id: String,
@@ -154,9 +151,6 @@ pub struct AuditEntryInput {
     pub decided_at: i64,
     /// The full action record (for audit completeness).
     pub action: ActionRecord,
-    /// SHA-256 of the plaintext shown to the human.  Supplied by the integrator after
-    /// decrypting the context; NOT derived here.
-    pub context_digest: [u8; 32],
     /// Reserved policy block.  **v1 callers MUST set `decision: PolicyDecision::Escalate`** —
     /// the field is unconstrained at the type level so the T3 engine can later write
     /// `allow`/`deny`, but writing a non-`escalate` decision in v1 violates the pinned contract
@@ -250,7 +244,6 @@ impl AuditChain {
             decision: input.decision,
             decided_at: input.decided_at,
             action: input.action,
-            context_digest: input.context_digest,
             policy: input.policy,
             note: input.note,
             sig: input.sig,
@@ -455,7 +448,6 @@ mod tests {
             decision: Decision::Approved,
             decided_at: TS_DECIDED,
             action: make_action(),
-            context_digest: [0x22u8; 32],
             policy: make_policy(),
             note: None,
             // Representative EdDSA compact JWS (header.payload.signature). The audit chain
@@ -635,14 +627,18 @@ mod tests {
         );
     }
 
-    /// Mutating context_digest WITHOUT recomputing record_hash → RecordHashMismatch.
+    /// Mutating `request_hash` WITHOUT recomputing record_hash → RecordHashMismatch.
+    ///
+    /// Stands in for the removed `context_digest` tamper test (#28 dropped `context_digest`;
+    /// `request_hash` is now the complete WYSIWYS proof carried in the record). Verifies a
+    /// still-present binary field is covered by `record_hash`.
     #[test]
-    fn tamper_context_digest_detected_as_record_hash_mismatch() {
+    fn tamper_request_hash_detected_as_record_hash_mismatch() {
         let mut chain = AuditChain::new();
         chain.append(make_entry("req_001"));
         chain.append(make_entry("req_002"));
 
-        chain.records[0].context_digest = [0xabu8; 32];
+        chain.records[0].request_hash = [0xabu8; 32];
 
         let err = chain.verify().unwrap_err();
         assert_eq!(err, AuditChainError::RecordHashMismatch { seq: 0 });

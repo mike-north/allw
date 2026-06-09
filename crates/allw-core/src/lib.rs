@@ -29,8 +29,8 @@ pub use audit::{
 };
 pub use command::{action_from_argv, action_from_command, CommandContext, CommandError};
 pub use contract::{
-    ActionRecord, Actor, ApprovalRequest, Approver, AuditRecord, Constraints, Decision,
-    PolicyBlock, PolicyDecision, Risk, Surface, SyntacticSubstrate, Verdict,
+    ActionRecord, Actor, ApprovalContext, ApprovalRequest, Approver, AuditRecord, Constraints,
+    Decision, PolicyBlock, PolicyDecision, Risk, Surface, SyntacticSubstrate, Verdict,
 };
 pub use crypto::{
     effective_allow, issue_device_cert, sign_verdict, verify_verdict, DeviceCertClaims,

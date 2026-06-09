@@ -5,93 +5,87 @@
 //! independently:
 //!
 //! - The **integrator** computes it (via [`compute_request_hash`]) before sending the
-//!   [`ApprovalRequest`] to the relay.
-//! - The **device** recomputes it after decrypting the JWE context and before presenting the
-//!   request to the human; the device then covers the hash in its [`Verdict`] signature.
+//!   [`ApprovalRequest`] envelope to the relay.
+//! - The **device** recomputes it after decrypting the JWE [`ApprovalContext`] and before
+//!   presenting the request to the human; the device then covers the hash in its [`Verdict`]
+//!   signature.
 //! - The **WASM binding** (issue #9) must reproduce the same bytes; the frozen cross-platform
 //!   test vector anchors that requirement.
 //!
 //! # Recipe
 //!
 //! ```text
-//! request_hash = SHA-256( b"allw/request-hash/v1" || 0x00 || JCS(subset) )
+//! request_hash = SHA-256( b"allw/request-hash/v2" || 0x00 || JCS(request-hash input) )
 //! ```
 //!
-//! where `JCS(subset)` is the RFC 8785 JSON Canonicalization Scheme encoding of the
-//! **human-shown content subset** (see below), and `0x00` is a single null byte that
-//! separates the domain tag from the payload.
+//! where `JCS(request-hash input)` is the RFC 8785 JSON Canonicalization Scheme encoding of the
+//! **request-hash input** (see below), and `0x00` is a single null byte that separates the
+//! domain tag from the payload.
 //!
-//! # Hashed subset (human-shown content)
+//! # Hashed input — the request-hash input (the complete WYSIWYS binding)
 //!
-//! Exactly four fields from the [`ApprovalRequest`] are bound:
+//! The hashed object is **one flat JSON object** containing every [`ApprovalContext`] field
+//! **plus** the envelope's `expires_at` as a sibling top-level key (NOT nested). This is the
+//! complete human-shown payload, so `request_hash` alone is the full WYSIWYS binding — there is
+//! **no separate `context_digest`** (resolved in #28).
 //!
 //! | Field | Why included |
 //! |---|---|
 //! | `action` | The full [`ActionRecord`] — what the human approved |
 //! | `summary` | The human-readable description shown in the inbox |
 //! | `actor.id`, `actor.kind` | Actor identity as shown — NOT `attestation` (that is for cryptographic verification, not display) |
-//! | `expires_at` | The expiry time shown to the human |
-//!
-//! **`request_hash` is not the complete WYSIWYS binding on its own.** It binds the structured
-//! [`ApprovalRequest`] fields above; the decrypted human-facing context is bound separately by the
-//! audit record's `context_digest`. Whether `request_hash ∧ context_digest` is the full picture —
-//! and exactly what is plaintext vs inside the E2EE envelope — is tracked in #28.
+//! | `risk` | The risk tier shown to the human |
+//! | `reversible` | Whether the action is reversible, as shown |
+//! | `constraints` | Allowed decisions + challenge policy the human acts under |
+//! | `chain` | Upstream-gate ids (omitted entirely when absent) |
+//! | `expires_at` | The deadline shown to the human (read from the envelope, bound here so a tampered deadline fails verification) |
 //!
 //! # Excluded fields (and rationale)
 //!
-//! Everything else in [`ApprovalRequest`] is deliberately excluded:
-//!
-//! - **`request_hash` itself** — circular; cannot be included.
-//! - **`context_ciphertext`** — AEAD-protected ciphertext; the plaintext is captured via the
-//!   hashed subset above.  Including the ciphertext would break the invariant that device and
-//!   integrator compute the same hash from the same plaintext.
-//! - **`actor.attestation`** — used for cryptographic verification of actor identity, not shown
-//!   to the human in the display.
-//! - **`constraints`, `chain`** — policy/routing metadata, not content the human evaluates.
-//! - **`request_id` / `id`** — correlation identifiers, not human-facing content.
-//! - **`created_at`** — internal timestamp; the human sees `expires_at` (the deadline), not the
-//!   creation time.
-//! - **`approver`** — routing ID, not shown in the display.
-//! - **Top-level `risk`, `reversible`** — echoed from `action.risk`; binding `action` already
-//!   covers the risk and reversibility that affect the display.
-//! - **`v`** — protocol version; a version change implies a new canonicalization version too
-//!   (bump `DOMAIN_TAG`).
+//! - **`actor.attestation`** — a verification artifact the device checks separately, not shown
+//!   content.
+//! - **The envelope's other routing/lifecycle fields** (`id`, `created_at`, `approver`, `v`) and
+//!   **`context_ciphertext`** — correlation/routing metadata and the opaque ciphertext, not
+//!   human-shown content. (`id` is bound separately via the verdict's `request_id`, closing the
+//!   no-swap gap — see [`crate::crypto::verify_verdict`].)
 //!
 //! # Domain tag and versioning
 //!
-//! `DOMAIN_TAG = b"allw/request-hash/v1"` provides cryptographic domain separation so this
-//! hash cannot be confused with any other SHA-256 digest in the system.  Bumping `v1` → `v2`
-//! is the version knob for the canonicalization: any change to the hashed subset, the JCS
-//! encoding, or the recipe itself requires a domain-tag bump.
+//! `DOMAIN_TAG = b"allw/request-hash/v2"` provides cryptographic domain separation so this
+//! hash cannot be confused with any other SHA-256 digest in the system.  The `/v2` suffix is the
+//! version knob: the broadened input (every [`ApprovalContext`] field, not the four-field v1
+//! subset) is a breaking change from `request-hash/v1`, so the tag bumps with it.
 //!
 //! # JCS crate
 //!
 //! Uses `serde_jcs` 0.2.x — RFC 8785 conformant, actively maintained.  The on-the-wire key
 //! order is JCS-sorted (lexicographic by UTF-16 code unit), not the declaration order in the
-//! Rust structs.  The canonical object passed to JCS has fixed keys
-//! `{ "action", "actor", "expires_at", "summary" }` (ASCII, so UTF-16 sort = byte sort):
-//! `action` < `actor` < `expires_at` < `summary`.
+//! Rust structs.  The canonical object's top-level keys (ASCII, so UTF-16 sort = byte sort) are:
+//! `action` < `actor` < `chain` < `constraints` < `expires_at` < `reversible` < `risk` <
+//! `summary`.
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::contract::{ActionRecord, ApprovalRequest};
+use crate::contract::{ActionRecord, ApprovalContext, Constraints, Risk};
 
 /// Domain separation tag — prefixed to the JCS bytes before hashing.
 ///
-/// Bump to `allw/request-hash/v2` (etc.) whenever the hashed subset, encoding, or recipe
-/// changes.  This tag is a version knob, not just a label.
-const DOMAIN_TAG: &[u8] = b"allw/request-hash/v1";
+/// The `/v2` suffix is the version knob; it was bumped from `/v1` when the hashed input
+/// broadened from the four-field subset to the full [`ApprovalContext`] (plus `expires_at`).
+const DOMAIN_TAG: &[u8] = b"allw/request-hash/v2";
 
 /// Null-byte separator between domain tag and payload in the hash input.
 const SEPARATOR: u8 = 0x00;
 
 // ── Canonical helper struct ───────────────────────────────────────────────────
 
-/// The human-shown content subset serialized for JCS canonicalization.
+/// The flat *request-hash input* serialized for JCS canonicalization.
 ///
-/// Field names are chosen so that JCS (lexicographic UTF-16 key sort) produces the order:
-/// `action` < `actor` < `expires_at` < `summary`.
+/// Every [`ApprovalContext`] field plus the envelope's `expires_at`, as one flat object.
+/// JCS re-sorts keys, so declaration order is irrelevant; the canonical (sorted) top-level
+/// order is `action` < `actor` < `chain` < `constraints` < `expires_at` < `reversible` <
+/// `risk` < `summary`.
 ///
 /// This type is private; the public API is [`compute_request_hash`] and
 /// [`canonical_request_bytes`].
@@ -99,7 +93,12 @@ const SEPARATOR: u8 = 0x00;
 struct CanonicalSubset<'a> {
     action: &'a ActionRecord,
     actor: CanonicalActor<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chain: Option<&'a [String]>,
+    constraints: &'a Constraints,
     expires_at: i64,
+    reversible: bool,
+    risk: Risk,
     summary: &'a str,
 }
 
@@ -117,7 +116,8 @@ struct CanonicalActor<'a> {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Returns the RFC 8785 JCS canonical JSON bytes for the human-shown content subset of `req`.
+/// Returns the RFC 8785 JCS canonical JSON bytes for the *request-hash input* — the full
+/// [`ApprovalContext`] `ctx` plus the envelope's `expires_at`, as one flat object.
 ///
 /// This is the payload fed into the hash recipe *before* the domain tag and SHA-256 step.
 /// Exposed publicly so:
@@ -127,14 +127,16 @@ struct CanonicalActor<'a> {
 ///
 /// # Hashed fields
 ///
-/// `action` (full [`ActionRecord`]), `actor.id`, `actor.kind`, `expires_at`, `summary`.
-/// See the module doc for the full rationale and exclusion list.
+/// `action` (full [`ActionRecord`]), `actor.id`, `actor.kind`, `chain`, `constraints`,
+/// `expires_at`, `reversible`, `risk`, `summary`. See the module doc for the full rationale and
+/// exclusion list.
 ///
 /// # Key order (JCS / RFC 8785)
 ///
-/// Top-level: `action` < `actor` < `expires_at` < `summary`.
+/// Top-level: `action` < `actor` < `chain` < `constraints` < `expires_at` < `reversible` <
+/// `risk` < `summary` (`chain` omitted entirely when `None`).
 /// Within `actor`: `id` < `kind`.
-/// Within `action`: JCS-sorted (depends on [`ActionRecord`]'s field names).
+/// Within `action` / `constraints`: JCS-sorted (depends on their field names).
 ///
 /// # Panics
 ///
@@ -142,15 +144,19 @@ struct CanonicalActor<'a> {
 /// well-formed in-memory values (the contract types always serialize). The hash is modeled as
 /// infallible: [`compute_request_hash`] returns `[u8; 32]`, not a `Result`.
 #[must_use]
-pub fn canonical_request_bytes(req: &ApprovalRequest) -> Vec<u8> {
+pub fn canonical_request_bytes(ctx: &ApprovalContext, expires_at: i64) -> Vec<u8> {
     let subset = CanonicalSubset {
-        action: &req.action,
+        action: &ctx.action,
         actor: CanonicalActor {
-            id: &req.actor.id,
-            kind: &req.actor.kind,
+            id: &ctx.actor.id,
+            kind: &ctx.actor.kind,
         },
-        expires_at: req.expires_at,
-        summary: &req.summary,
+        chain: ctx.chain.as_deref(),
+        constraints: &ctx.constraints,
+        expires_at,
+        reversible: ctx.reversible,
+        risk: ctx.risk,
+        summary: &ctx.summary,
     };
     // serde_jcs::to_vec implements RFC 8785 canonicalization; it sorts object keys
     // lexicographically by UTF-16 code unit and encodes floats per the JCS spec.
@@ -159,24 +165,24 @@ pub fn canonical_request_bytes(req: &ApprovalRequest) -> Vec<u8> {
     )
 }
 
-/// Computes the WYSIWYS `request_hash` for `req`.
+/// Computes the WYSIWYS `request_hash` for the [`ApprovalContext`] `ctx` bound to `expires_at`.
 ///
 /// # Recipe
 ///
 /// ```text
-/// request_hash = SHA-256( b"allw/request-hash/v1" || 0x00 || JCS(subset) )
+/// request_hash = SHA-256( b"allw/request-hash/v2" || 0x00 || JCS(request-hash input) )
 /// ```
 ///
-/// where `JCS(subset)` is the output of [`canonical_request_bytes`].
+/// where `JCS(request-hash input)` is the output of [`canonical_request_bytes`].
 ///
 /// # Hashed fields
 ///
-/// `action`, `actor.id`, `actor.kind`, `expires_at`, `summary`.  See module doc for the full
-/// rationale and the excluded-fields list.
+/// `action`, `actor.id`, `actor.kind`, `chain`, `constraints`, `expires_at`, `reversible`,
+/// `risk`, `summary`.  See module doc for the full rationale and the excluded-fields list.
 ///
 /// # Domain separation
 ///
-/// `b"allw/request-hash/v1"` ensures this digest cannot collide with any other SHA-256 use in
+/// `b"allw/request-hash/v2"` ensures this digest cannot collide with any other SHA-256 use in
 /// the system.  Bumping the version suffix is the canonicalization version knob.
 ///
 /// # Determinism
@@ -184,8 +190,8 @@ pub fn canonical_request_bytes(req: &ApprovalRequest) -> Vec<u8> {
 /// JCS guarantees a stable key order for the same input, so this function is pure and
 /// deterministic: identical inputs always produce identical outputs.
 #[must_use]
-pub fn compute_request_hash(req: &ApprovalRequest) -> [u8; 32] {
-    let canonical = canonical_request_bytes(req);
+pub fn compute_request_hash(ctx: &ApprovalContext, expires_at: i64) -> [u8; 32] {
+    let canonical = canonical_request_bytes(ctx, expires_at);
     let mut hasher = Sha256::new();
     hasher.update(DOMAIN_TAG);
     hasher.update([SEPARATOR]);
@@ -199,7 +205,7 @@ pub fn compute_request_hash(req: &ApprovalRequest) -> [u8; 32] {
 mod tests {
     use super::*;
     use crate::contract::{
-        ActionRecord, Actor, ApprovalRequest, Constraints, Decision, Risk, Surface,
+        ActionRecord, Actor, ApprovalContext, Constraints, Decision, Risk, Surface,
         SyntacticSubstrate,
     };
     use sha2::{Digest, Sha256};
@@ -207,15 +213,8 @@ mod tests {
     // ── Fixture helpers ───────────────────────────────────────────────────────
 
     // Fixed Unix millisecond timestamps — never SystemTime::now().
-    // 2023-11-14T22:13:20Z
-    const TS_CREATED: i64 = 1_700_000_000_000;
-    // 2023-11-14T23:13:20Z (+1 hour)
+    // 2023-11-14T23:13:20Z
     const TS_EXPIRES: i64 = 1_700_003_600_000;
-
-    // Dummy [u8; 32] placeholder for request_hash in the ApprovalRequest fixture.
-    // The hash field in ApprovalRequest is what we're *computing*, but the struct still
-    // requires a value for the other fields; we use zeros as a placeholder.
-    const PLACEHOLDER_HASH: [u8; 32] = [0u8; 32];
 
     /// Minimal action used for the canonicalization anchor test.
     ///
@@ -259,21 +258,15 @@ mod tests {
         }
     }
 
-    /// The minimal fixture used for all canonicalization + hash vector tests.
-    fn make_minimal_request() -> ApprovalRequest {
-        ApprovalRequest {
-            v: 1,
-            id: "req_test_001".to_string(),
-            created_at: TS_CREATED,
-            expires_at: TS_EXPIRES,
-            approver: "acc_test_001".to_string(),
-            actor: make_minimal_actor(),
+    /// The minimal [`ApprovalContext`] fixture used for all canonicalization + hash vector
+    /// tests. Paired with [`TS_EXPIRES`] as the bound `expires_at`.
+    fn make_minimal_context() -> ApprovalContext {
+        ApprovalContext {
             action: make_minimal_action(),
             summary: "push to main".to_string(),
+            actor: make_minimal_actor(),
             risk: Risk::High,
             reversible: false,
-            context_ciphertext: None,
-            request_hash: PLACEHOLDER_HASH,
             constraints: make_minimal_constraints(),
             chain: None,
         }
@@ -281,29 +274,32 @@ mod tests {
 
     // ── Test 1: Canonicalization is spec-correct (the anchor test) ────────────
     //
-    // This expected string is derived BY HAND from RFC 8785 rules:
+    // This expected string is derived BY HAND from RFC 8785 rules for the v2 flat object:
     //   - No whitespace
     //   - Object keys sorted lexicographically by UTF-16 code unit (= byte order for ASCII)
     //   - Numbers in shortest form
     //
-    // Top-level keys (JCS order): "action" < "actor" < "expires_at" < "summary"
-    //   (a-c-t-i < a-c-t-o; "e" < "s")
+    // Top-level keys (JCS order) — `chain` omitted (None in the fixture):
+    //   "action" < "actor" < "constraints" < "expires_at" < "reversible" < "risk" < "summary"
+    //   (a-c-t-i < a-c-t-o; "c" < "e" < "r"; "reversible" < "risk" since "re" < "ri";
+    //    "ri" < "su")
     //
     // action keys (JCS order):
     //   "record_schema_version" < "risk" < "surface" < "syntactic"
     //   (r-e < r-i; su-r < su-y)
-    //
-    // action.syntactic keys (JCS order, only bin+raw present):
-    //   "bin" < "raw"
-    //
+    // action.syntactic keys (JCS order, only bin+raw present): "bin" < "raw"
     // actor keys (JCS order): "id" < "kind"
+    // constraints keys (JCS order): "allowed_decisions" < "challenge_required"
     //
-    // action.risk = "high" (Risk::High serializes as "high" per snake_case)
-    // action.surface = "command" (Surface::Command serializes as "command")
+    // Enum snake_case: Risk::High → "high"; Surface::Command → "command";
+    //   Decision::{Approved,Denied} → "approved","denied".
     const EXPECTED_CANONICAL: &str = concat!(
         r#"{"action":{"record_schema_version":1,"risk":"high","surface":"command","syntactic":{"bin":"git","raw":"git push"}},"#,
         r#""actor":{"id":"machine:x","kind":"claude-code"},"#,
+        r#""constraints":{"allowed_decisions":["approved","denied"],"challenge_required":false},"#,
         r#""expires_at":1700003600000,"#,
+        r#""reversible":false,"#,
+        r#""risk":"high","#,
         r#""summary":"push to main"}"#
     );
 
@@ -312,8 +308,8 @@ mod tests {
         // This test is the canonicalization anchor: it asserts the JCS output matches the
         // hand-derived expected string, proving the implementation is RFC 8785-correct
         // independent of the hash computation.
-        let req = make_minimal_request();
-        let canonical = canonical_request_bytes(&req);
+        let ctx = make_minimal_context();
+        let canonical = canonical_request_bytes(&ctx, TS_EXPIRES);
         let canonical_str =
             std::str::from_utf8(&canonical).expect("JCS output must be valid UTF-8");
 
@@ -334,18 +330,18 @@ mod tests {
 
     #[test]
     fn hash_matches_documented_recipe() {
-        let req = make_minimal_request();
+        let ctx = make_minimal_context();
 
         // Re-derive the recipe directly in the test (not via compute_request_hash):
-        let canonical = canonical_request_bytes(&req);
+        let canonical = canonical_request_bytes(&ctx, TS_EXPIRES);
         let mut hasher = Sha256::new();
-        hasher.update(b"allw/request-hash/v1"); // DOMAIN_TAG
+        hasher.update(b"allw/request-hash/v2"); // DOMAIN_TAG
         hasher.update([0x00u8]); // SEPARATOR
         hasher.update(&canonical);
         let expected: [u8; 32] = hasher.finalize().into();
 
         // Now assert compute_request_hash produces the same value:
-        let actual = compute_request_hash(&req);
+        let actual = compute_request_hash(&ctx, TS_EXPIRES);
         assert_eq!(
             actual, expected,
             "compute_request_hash must equal SHA-256(DOMAIN_TAG || 0x00 || canonical_bytes)"
@@ -356,35 +352,38 @@ mod tests {
 
     #[test]
     fn hash_is_deterministic_across_calls() {
-        let req = make_minimal_request();
-        let h1 = compute_request_hash(&req);
-        let h2 = compute_request_hash(&req);
+        let ctx = make_minimal_context();
+        let h1 = compute_request_hash(&ctx, TS_EXPIRES);
+        let h2 = compute_request_hash(&ctx, TS_EXPIRES);
         assert_eq!(h1, h2, "compute_request_hash must be deterministic");
     }
 
     #[test]
     fn hash_is_deterministic_for_clone() {
-        let req = make_minimal_request();
-        let req2 = req.clone();
+        let ctx = make_minimal_context();
+        let ctx2 = ctx.clone();
         assert_eq!(
-            compute_request_hash(&req),
-            compute_request_hash(&req2),
-            "cloned ApprovalRequest must hash identically"
+            compute_request_hash(&ctx, TS_EXPIRES),
+            compute_request_hash(&ctx2, TS_EXPIRES),
+            "cloned ApprovalContext must hash identically"
         );
     }
 
     // ── Test 4: Sensitivity — each hashed field changes the hash ─────────────
+    //
+    // The v2 request-hash input binds every ApprovalContext field plus expires_at, so each of
+    // these mutations must perturb the hash (docs/contract.md §request_hash).
 
     #[test]
     fn mutating_summary_changes_hash() {
-        let base = make_minimal_request();
-        let base_hash = compute_request_hash(&base);
+        let base = make_minimal_context();
+        let base_hash = compute_request_hash(&base, TS_EXPIRES);
 
         let mut mutated = base.clone();
         mutated.summary = "different summary".to_string();
 
         assert_ne!(
-            compute_request_hash(&mutated),
+            compute_request_hash(&mutated, TS_EXPIRES),
             base_hash,
             "mutating summary must change the request_hash"
         );
@@ -392,14 +391,14 @@ mod tests {
 
     #[test]
     fn mutating_actor_id_changes_hash() {
-        let base = make_minimal_request();
-        let base_hash = compute_request_hash(&base);
+        let base = make_minimal_context();
+        let base_hash = compute_request_hash(&base, TS_EXPIRES);
 
         let mut mutated = base.clone();
         mutated.actor.id = "machine:different".to_string();
 
         assert_ne!(
-            compute_request_hash(&mutated),
+            compute_request_hash(&mutated, TS_EXPIRES),
             base_hash,
             "mutating actor.id must change the request_hash"
         );
@@ -407,14 +406,14 @@ mod tests {
 
     #[test]
     fn mutating_actor_kind_changes_hash() {
-        let base = make_minimal_request();
-        let base_hash = compute_request_hash(&base);
+        let base = make_minimal_context();
+        let base_hash = compute_request_hash(&base, TS_EXPIRES);
 
         let mut mutated = base.clone();
         mutated.actor.kind = "different-kind".to_string();
 
         assert_ne!(
-            compute_request_hash(&mutated),
+            compute_request_hash(&mutated, TS_EXPIRES),
             base_hash,
             "mutating actor.kind must change the request_hash"
         );
@@ -422,14 +421,12 @@ mod tests {
 
     #[test]
     fn mutating_expires_at_changes_hash() {
-        let base = make_minimal_request();
-        let base_hash = compute_request_hash(&base);
-
-        let mut mutated = base.clone();
-        mutated.expires_at = TS_EXPIRES + 1;
+        let base = make_minimal_context();
+        let base_hash = compute_request_hash(&base, TS_EXPIRES);
 
         assert_ne!(
-            compute_request_hash(&mutated),
+            // Same context, different bound expires_at.
+            compute_request_hash(&base, TS_EXPIRES + 1),
             base_hash,
             "mutating expires_at must change the request_hash"
         );
@@ -437,14 +434,14 @@ mod tests {
 
     #[test]
     fn mutating_action_bin_changes_hash() {
-        let base = make_minimal_request();
-        let base_hash = compute_request_hash(&base);
+        let base = make_minimal_context();
+        let base_hash = compute_request_hash(&base, TS_EXPIRES);
 
         let mut mutated = base.clone();
         mutated.action.syntactic.bin = Some("rm".to_string());
 
         assert_ne!(
-            compute_request_hash(&mutated),
+            compute_request_hash(&mutated, TS_EXPIRES),
             base_hash,
             "mutating action.syntactic.bin must change the request_hash"
         );
@@ -452,143 +449,135 @@ mod tests {
 
     #[test]
     fn mutating_action_risk_changes_hash() {
-        let base = make_minimal_request();
-        let base_hash = compute_request_hash(&base);
+        let base = make_minimal_context();
+        let base_hash = compute_request_hash(&base, TS_EXPIRES);
 
         let mut mutated = base.clone();
         mutated.action.risk = Risk::Critical;
 
         assert_ne!(
-            compute_request_hash(&mutated),
+            compute_request_hash(&mutated, TS_EXPIRES),
             base_hash,
             "mutating action.risk must change the request_hash"
+        );
+    }
+
+    /// `risk` is now a top-level hashed field (v2), so mutating it must change the hash.
+    #[test]
+    fn mutating_top_level_risk_changes_hash() {
+        let base = make_minimal_context();
+        let base_hash = compute_request_hash(&base, TS_EXPIRES);
+
+        let mut mutated = base.clone();
+        mutated.risk = Risk::Low;
+
+        assert_ne!(
+            compute_request_hash(&mutated, TS_EXPIRES),
+            base_hash,
+            "mutating risk must change the request_hash (now a v2 hashed field)"
+        );
+    }
+
+    /// `reversible` is now a hashed field (v2), so mutating it must change the hash.
+    #[test]
+    fn mutating_reversible_changes_hash() {
+        let base = make_minimal_context();
+        let base_hash = compute_request_hash(&base, TS_EXPIRES);
+
+        let mut mutated = base.clone();
+        mutated.reversible = !base.reversible;
+
+        assert_ne!(
+            compute_request_hash(&mutated, TS_EXPIRES),
+            base_hash,
+            "mutating reversible must change the request_hash (now a v2 hashed field)"
+        );
+    }
+
+    /// `constraints` is now a hashed field (v2): flipping `challenge_required` must change it.
+    #[test]
+    fn mutating_constraints_challenge_required_changes_hash() {
+        let base = make_minimal_context();
+        let base_hash = compute_request_hash(&base, TS_EXPIRES);
+
+        let mut mutated = base.clone();
+        mutated.constraints.challenge_required = !base.constraints.challenge_required;
+
+        assert_ne!(
+            compute_request_hash(&mutated, TS_EXPIRES),
+            base_hash,
+            "mutating constraints.challenge_required must change the request_hash (v2 hashed field)"
+        );
+    }
+
+    /// `constraints.allowed_decisions` is hashed (v2): changing it must change the hash.
+    #[test]
+    fn mutating_constraints_allowed_decisions_changes_hash() {
+        let base = make_minimal_context();
+        let base_hash = compute_request_hash(&base, TS_EXPIRES);
+
+        let mut mutated = base.clone();
+        mutated.constraints.allowed_decisions = vec![Decision::Approved];
+
+        assert_ne!(
+            compute_request_hash(&mutated, TS_EXPIRES),
+            base_hash,
+            "mutating constraints.allowed_decisions must change the request_hash (v2 hashed field)"
+        );
+    }
+
+    /// `chain` is now a hashed field (v2): going from absent to present must change the hash.
+    #[test]
+    fn adding_chain_changes_hash() {
+        let base = make_minimal_context(); // chain: None
+        let base_hash = compute_request_hash(&base, TS_EXPIRES);
+
+        let mut mutated = base.clone();
+        mutated.chain = Some(vec!["upstream-gate-id-1".to_string()]);
+
+        assert_ne!(
+            compute_request_hash(&mutated, TS_EXPIRES),
+            base_hash,
+            "adding chain must change the request_hash (now a v2 hashed field)"
+        );
+    }
+
+    /// Mutating the contents of an existing `chain` must also change the hash.
+    #[test]
+    fn mutating_chain_contents_changes_hash() {
+        let mut base = make_minimal_context();
+        base.chain = Some(vec!["gate-a".to_string()]);
+        let base_hash = compute_request_hash(&base, TS_EXPIRES);
+
+        let mut mutated = base.clone();
+        mutated.chain = Some(vec!["gate-b".to_string()]);
+
+        assert_ne!(
+            compute_request_hash(&mutated, TS_EXPIRES),
+            base_hash,
+            "mutating chain contents must change the request_hash (v2 hashed field)"
         );
     }
 
     // ── Test 5: Exclusion — excluded fields do NOT change the hash ───────────
     //
     // This is the critical WYSIWYS-scope test: it proves the hash binds exactly the
-    // documented subset and nothing else.
-
-    #[test]
-    fn mutating_request_id_does_not_change_hash() {
-        let base = make_minimal_request();
-        let base_hash = compute_request_hash(&base);
-
-        let mut mutated = base.clone();
-        mutated.id = "req_different_id".to_string();
-
-        assert_eq!(
-            compute_request_hash(&mutated),
-            base_hash,
-            "mutating request id must NOT change the request_hash (excluded field)"
-        );
-    }
-
-    #[test]
-    fn mutating_created_at_does_not_change_hash() {
-        let base = make_minimal_request();
-        let base_hash = compute_request_hash(&base);
-
-        let mut mutated = base.clone();
-        mutated.created_at = TS_CREATED + 999;
-
-        assert_eq!(
-            compute_request_hash(&mutated),
-            base_hash,
-            "mutating created_at must NOT change the request_hash (excluded field)"
-        );
-    }
-
-    #[test]
-    fn mutating_approver_routing_id_does_not_change_hash() {
-        let base = make_minimal_request();
-        let base_hash = compute_request_hash(&base);
-
-        let mut mutated = base.clone();
-        mutated.approver = "acc_different".to_string();
-
-        assert_eq!(
-            compute_request_hash(&mutated),
-            base_hash,
-            "mutating approver routing ID must NOT change the request_hash (excluded field)"
-        );
-    }
-
-    #[test]
-    fn mutating_reversible_does_not_change_hash() {
-        let base = make_minimal_request();
-        let base_hash = compute_request_hash(&base);
-
-        let mut mutated = base.clone();
-        mutated.reversible = !base.reversible;
-
-        assert_eq!(
-            compute_request_hash(&mutated),
-            base_hash,
-            "mutating reversible must NOT change the request_hash (excluded field)"
-        );
-    }
-
-    #[test]
-    fn mutating_top_level_risk_does_not_change_hash() {
-        let base = make_minimal_request();
-        let base_hash = compute_request_hash(&base);
-
-        let mut mutated = base.clone();
-        // Top-level risk echoes action.risk; change only the top-level echo
-        mutated.risk = Risk::Low;
-        // Ensure action.risk is unchanged (so only the excluded field differs)
-        assert_eq!(mutated.action.risk, Risk::High);
-
-        assert_eq!(
-            compute_request_hash(&mutated),
-            base_hash,
-            "mutating top-level risk (echo field) must NOT change the request_hash (excluded field)"
-        );
-    }
-
-    #[test]
-    fn mutating_chain_does_not_change_hash() {
-        let base = make_minimal_request();
-        let base_hash = compute_request_hash(&base);
-
-        let mut mutated = base.clone();
-        mutated.chain = Some(vec!["upstream-gate-id-1".to_string()]);
-
-        assert_eq!(
-            compute_request_hash(&mutated),
-            base_hash,
-            "mutating chain must NOT change the request_hash (excluded field)"
-        );
-    }
-
-    #[test]
-    fn mutating_context_ciphertext_does_not_change_hash() {
-        let base = make_minimal_request();
-        let base_hash = compute_request_hash(&base);
-
-        let mut mutated = base.clone();
-        mutated.context_ciphertext = Some("eyJhbGciOiJFQ0RILUVTK0EyNTZLVyJ9.fake".to_string());
-
-        assert_eq!(
-            compute_request_hash(&mutated),
-            base_hash,
-            "mutating context_ciphertext must NOT change the request_hash (excluded field)"
-        );
-    }
+    // documented input and nothing else. In v2 the only excluded ApprovalContext-adjacent
+    // field is `actor.attestation` (a verification artifact, not shown content); the envelope's
+    // routing/lifecycle fields are not part of the ApprovalContext at all and so cannot be
+    // mutated here.
 
     #[test]
     fn mutating_actor_attestation_does_not_change_hash() {
-        let base = make_minimal_request();
-        let base_hash = compute_request_hash(&base);
+        let base = make_minimal_context();
+        let base_hash = compute_request_hash(&base, TS_EXPIRES);
 
         let mut mutated = base.clone();
         // Add an attestation payload — this must not affect the hash
         mutated.actor.attestation = Some(vec![0xca, 0xfe, 0xba, 0xbe]);
 
         assert_eq!(
-            compute_request_hash(&mutated),
+            compute_request_hash(&mutated, TS_EXPIRES),
             base_hash,
             "mutating actor.attestation must NOT change the request_hash (excluded per WYSIWYS design)"
         );
@@ -610,16 +599,16 @@ mod tests {
     /// Expected hex for the minimal fixture, computed once after tests 1+2 were green.
     ///
     /// Input:
-    /// - DOMAIN_TAG: b"allw/request-hash/v1"
+    /// - DOMAIN_TAG: b"allw/request-hash/v2"
     /// - SEPARATOR: 0x00
-    /// - canonical: (see EXPECTED_CANONICAL in this module)
+    /// - canonical: (see EXPECTED_CANONICAL in this module — the v2 flat object)
     const FROZEN_HASH_HEX: &str =
-        "bf3f3fcb56f5f4a4b26be9ee7f852b379d2b0a23ac8edf3cdaf5a8a1f6a9e2ff";
+        "809fe4763353e8b10417f118581b510ebfe52b0725d35842f391f3d0c3d47be7";
 
     #[test]
     fn frozen_cross_platform_vector() {
-        let req = make_minimal_request();
-        let hash = compute_request_hash(&req);
+        let ctx = make_minimal_context();
+        let hash = compute_request_hash(&ctx, TS_EXPIRES);
 
         // Encode as lowercase hex for a human-readable, portable comparison
         let hex = hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
