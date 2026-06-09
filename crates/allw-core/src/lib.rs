@@ -18,6 +18,7 @@
 //! and verification landed via an EdDSA compact JWS over Ed25519. JWE (context E2EE) is TODO.
 
 pub mod audit;
+pub mod command;
 pub mod contract;
 pub mod crypto;
 pub mod hash;
@@ -25,6 +26,7 @@ pub mod hash;
 pub use audit::{
     compute_record_hash, AuditChain, AuditChainError, AuditEntryInput, GENESIS_PREV_HASH,
 };
+pub use command::{action_from_argv, action_from_command, CommandContext, CommandError};
 pub use contract::{
     ActionRecord, Actor, ApprovalRequest, Approver, AuditRecord, Constraints, Decision,
     PolicyBlock, PolicyDecision, Risk, Surface, SyntacticSubstrate, Verdict,

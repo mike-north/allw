@@ -28,6 +28,9 @@ sha2 = "0.10"
 # A hand-rolled EdDSA compact JWS (RFC 7515 + RFC 8037) is built on top — josekit/jsonwebtoken
 # are OpenSSL/ring-based and cannot target wasm32, so they are deliberately avoided.
 ed25519-dalek = "2"
+# POSIX word-splitting tokenizer (small, well-tested; mirrors Python's shlex).
+# Used by `command::action_from_command` to tokenize shell command strings deterministically.
+shlex = "1"
 # Planned as modules are implemented:
 #   josekit / rust JOSE     — JWE (context); JWS verdicts/rules are hand-rolled on ed25519-dalek
 #   x25519-dalek            — ECDH for E2EE context
