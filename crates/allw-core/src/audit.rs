@@ -3,8 +3,19 @@
 //! # Design
 //!
 //! Every [`AuditRecord`] in the chain commits to its predecessor via `prev_hash`, creating
-//! a tamper-evident singly-linked list of decisions.  Any mutation of a past record — or
-//! insertion/deletion — breaks the hash chain and is detected by [`AuditChain::verify`].
+//! a tamper-evident singly-linked list of decisions.  [`AuditChain::verify`] detects any
+//! **mid-chain** mutation, reordering, or middle-deletion — each breaks `record_hash` or the
+//! `prev_hash` linkage.
+//!
+//! # What `verify()` does and does NOT catch
+//!
+//! `verify()` proves the chain it is given is **internally consistent**. It walks from `seq 0`,
+//! so it **cannot detect tail truncation**: dropping the last N records leaves a shorter,
+//! still-internally-consistent chain that verifies `Ok`. Detecting truncation (and rollback of
+//! the whole log) requires comparing [`AuditChain::head_hash`] against an **externally anchored**
+//! prior head — that is exactly what periodic head-hash anchoring is for. `verify()` is the
+//! integrity check; the external anchor is the freshness/completeness check. The two are
+//! complementary.
 //!
 //! # Record hash recipe
 //!
@@ -128,7 +139,7 @@ impl std::error::Error for AuditChainError {}
 /// it from the plaintext is the integrator's responsibility**, not this module's.  The chain
 /// stores it opaquely for non-repudiation purposes.
 pub struct AuditEntryInput {
-    /// The [`ApprovalRequest::id`] this record covers.
+    /// The [`ApprovalRequest`](crate::contract::ApprovalRequest) `id` this record covers.
     pub request_id: String,
     /// Echoes the WYSIWYS `request_hash` from the request.
     pub request_hash: [u8; 32],
@@ -146,8 +157,10 @@ pub struct AuditEntryInput {
     /// SHA-256 of the plaintext shown to the human.  Supplied by the integrator after
     /// decrypting the context; NOT derived here.
     pub context_digest: [u8; 32],
-    /// Reserved policy block.  v1 always writes `escalate`; see `docs/policy-seam.md`
-    /// §forward-compat req #4.
+    /// Reserved policy block.  **v1 callers MUST set `decision: PolicyDecision::Escalate`** —
+    /// the field is unconstrained at the type level so the T3 engine can later write
+    /// `allow`/`deny`, but writing a non-`escalate` decision in v1 violates the pinned contract
+    /// (`docs/policy-seam.md` §forward-compat req #4) and will mislead later policy analysis.
     pub policy: PolicyBlock,
     /// Optional free-form note from the approver.
     pub note: Option<String>,
@@ -256,6 +269,13 @@ impl AuditChain {
     /// Because each record commits to `prev_hash`, even "re-signing" a tampered middle record
     /// (updating its own `record_hash`) leaves the next record's `prev_hash` stale, which
     /// [`PrevHashMismatch`][`AuditChainError::PrevHashMismatch`] will detect.
+    ///
+    /// # Limitation: tail truncation is NOT detected here
+    ///
+    /// `verify()` proves the chain it is given is internally consistent. A chain with the last
+    /// N records **dropped** is still internally consistent, so it returns `Ok`. Detecting
+    /// truncation (or whole-log rollback) requires comparing [`head_hash`](Self::head_hash)
+    /// against an externally anchored prior head — see the module-level docs.
     pub fn verify(&self) -> Result<(), AuditChainError> {
         let mut expected_prev = GENESIS_PREV_HASH;
 
@@ -693,6 +713,63 @@ mod tests {
             err,
             AuditChainError::PrevHashMismatch { seq: 2 },
             "re-signing a tampered record must be detected at the NEXT record via PrevHashMismatch"
+        );
+    }
+
+    // ── 5b. Truncation (NOT caught by verify) & reorder (caught) ────────────────
+
+    /// Tail truncation is the documented limitation of `verify()`: dropping the last record
+    /// leaves an internally-consistent chain that still verifies `Ok`. It is caught ONLY by
+    /// comparing `head_hash()` to an externally anchored prior head. (module docs + verify docs)
+    #[test]
+    fn tail_truncation_passes_verify_but_changes_head_hash() {
+        let mut chain = AuditChain::new();
+        chain.append(make_entry("req_001"));
+        chain.append(make_entry("req_002"));
+        chain.append(make_entry("req_003"));
+
+        // An external anchor captured when the chain had all 3 records.
+        let anchor = chain.head_hash();
+
+        // Drop the last record (tail truncation).
+        chain.records.truncate(2);
+
+        // verify() still passes — the shorter chain is internally consistent.
+        assert!(
+            chain.verify().is_ok(),
+            "a truncated chain is internally consistent and verify() returns Ok"
+        );
+
+        // ...but the head no longer matches the anchor — THIS is how truncation is detected.
+        assert_ne!(
+            chain.head_hash(),
+            anchor,
+            "head_hash() must diverge from the prior anchor after truncation (anchor comparison \
+             is the only truncation/rollback detector)"
+        );
+    }
+
+    /// Swapping two adjacent records is detected: their `seq` fields move with them, so the
+    /// contiguity check trips at the first out-of-order position.
+    #[test]
+    fn adjacent_reorder_detected_as_seq_mismatch() {
+        let mut chain = AuditChain::new();
+        chain.append(make_entry("req_001"));
+        chain.append(make_entry("req_002"));
+        chain.append(make_entry("req_003"));
+
+        // Swap records at positions 1 and 2 (their seq fields, 1 and 2, swap with them).
+        chain.records.swap(1, 2);
+
+        // At index 1 the verifier expects seq 1 but finds the record carrying seq 2.
+        let err = chain.verify().unwrap_err();
+        assert_eq!(
+            err,
+            AuditChainError::SeqMismatch {
+                expected: 1,
+                found: 2
+            },
+            "an adjacent reorder must be detected (here via SeqMismatch at the first bad position)"
         );
     }
 
