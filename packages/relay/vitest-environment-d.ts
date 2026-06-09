@@ -9,7 +9,7 @@
  * `ProvidedEnv` is the mechanism by which the pool knows the Worker's binding types.
  * It must match the `Env` interface exported from `src/index.ts`.
  */
-import type { Env } from "./src/index.ts";
+import type { Env } from "./src/index.js";
 
 // @ts-expect-error: ambient module — resolved by the vitest-pool-workers runtime
 declare module "cloudflare:test" {

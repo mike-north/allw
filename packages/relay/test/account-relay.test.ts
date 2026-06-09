@@ -15,7 +15,7 @@
 
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
-import { AccountRelay, PAIRING_TTL_MS } from "../src/index.ts";
+import { AccountRelay, PAIRING_TTL_MS } from "../src/index.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -223,8 +223,8 @@ describe("AccountRelay — pairing", () => {
     const acct = "acct-bad-pubkey";
     const { data: startData } = await post<{ code: string }>(acct, "/pairing/start", {});
 
-    // 16 zero bytes — only 22 base64url chars (not 32 bytes)
-    const shortPubkey = "AAAAAAAAAAAAAAAAAAA"; // 14 bytes decoded
+    // 19 base64url chars (decodes to ~14 bytes) — not the 43 chars / 32 bytes a valid key needs.
+    const shortPubkey = "AAAAAAAAAAAAAAAAAAA";
 
     const { status, data } = await post<{ error: string }>(acct, "/pairing/complete", {
       code: startData.code,

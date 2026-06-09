@@ -129,6 +129,9 @@ function generatePairingCode(): string {
  * Returns the decoded bytes on success, or `null` on failure.
  */
 function validatePubkey(pubkey: string): Uint8Array | null {
+  // 32 bytes encode to exactly 43 base64url-unpadded chars (ceil(32*4/3)). Reject by length
+  // FIRST — cheap, and bounds the work for oversized inputs before any decode.
+  if (pubkey.length !== 43) return null;
   // base64url: A-Z a-z 0-9 - _ ; no = padding
   if (!/^[A-Za-z0-9\-_]+$/.test(pubkey)) return null;
 
@@ -283,8 +286,14 @@ export class AccountRelay implements DurableObject {
       return this.handleDeviceRevoke(path1);
     }
 
-    // Method not allowed for known top-level resource paths
-    if (path0 === "pairing" || path0 === "actors" || path0 === "devices") {
+    // 405 only for a KNOWN route path reached with an unsupported method; any other (unknown)
+    // sub-path is a 404 — e.g. `GET /devices/<id>` or `GET /pairing/unknown` are not routes.
+    const isKnownRoutePath =
+      (path0 === "pairing" && (path1 === "start" || path1 === "complete") && path2 === "") ||
+      (path0 === "actors" && path1 === "") ||
+      (path0 === "devices" && path1 === "") ||
+      (path0 === "devices" && path1 !== "" && path2 === "revoke" && (subSegments[3] ?? "") === "");
+    if (isKnownRoutePath) {
       return json({ error: "method not allowed" }, 405);
     }
 
@@ -374,7 +383,9 @@ export class AccountRelay implements DurableObject {
       `INSERT INTO device (device_id, pubkey, label, created_at) VALUES (?, ?, ?, ?)`,
       deviceId,
       pubkey,
-      label ?? null,
+      // Fall back to the label supplied at /pairing/start so that field stays meaningful when
+      // /pairing/complete omits its own.
+      label ?? pairing.label ?? null,
       now,
     );
 
