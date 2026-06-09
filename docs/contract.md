@@ -179,8 +179,30 @@ Every field of the `AuditRecord` is covered **except `record_hash` itself** (cir
 Domain tag `b"allw/audit-record/v1"` is distinct from the request-hash tag; the `/v1` suffix is the
 version knob.
 
+### verdict signature (EdDSA JWS)
+
+The verdict signature is a literal **EdDSA compact JWS** ([RFC 7515](https://www.rfc-editor.org/rfc/rfc7515) +
+[RFC 8037](https://www.rfc-editor.org/rfc/rfc8037)): `b64url(header) . b64url(payload) . b64url(sig)`, where the
+Ed25519 signature covers the ASCII signing input `b64url(header) . b64url(payload)` (sign-what-you-send — the
+transmitted bytes are authoritative, so no JCS is applied to the JWS payload). Pure-Rust on `ed25519-dalek`, so it
+compiles to `wasm32` (josekit/jsonwebtoken are OpenSSL/ring-based and cannot — see [architecture.md](./architecture.md)).
+
+Two JWS types, domain-separated by the `typ` header:
+
+- **Verdict JWS** — `typ: "allw-verdict+jws"`, `kid: <device_id>`, signed by the **device** key. Payload claims:
+  `request_id`, `request_hash` (b64url), `decision`, `decided_at`, `nonce` (b64url), and `challenge_response`?
+  (signed only when present). These signed claims are authoritative; the outer `Verdict` plaintext fields are a
+  decoded convenience and are cross-checked against the claims on verify.
+- **Device-cert JWS** — `typ: "allw-device-cert+jws"`, `kid: <account_id>`, signed by the **account root** key.
+  Payload: `account_id`, `device_id`, `device_pubkey` (b64url Ed25519 verifying key), `issued_at`, `expires_at`?.
+  Binds a device key to the account so verifiers need only the root.
+
+The `Verdict.sig` and `AuditRecord.sig` wire fields are therefore the **compact JWS string** (not raw bytes); the
+audit record carries the verdict's JWS verbatim for non-repudiation.
+
 ## Open decisions
 
 - **Account / device enrollment, key rotation & revocation** — needs its own mini-spec.
 - **JOSE vs COSE** on mobile (default JOSE for substrate consistency).
-- **Anti-replay** nonce store on the integrator side.
+- **Anti-replay** nonce store on the integrator side — v1: integrator-side `NonceStore` trait + in-memory impl;
+  persistence/expiry deferred.
