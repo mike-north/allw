@@ -9,6 +9,7 @@
   },
   "scripts": {
     "build": "pnpm -r build",
+    "build:wasm": "wasm-pack build crates/allw-wasm --target web --out-dir ../../packages/sdk/vendor/allw-wasm --release",
     "typecheck": "pnpm -r typecheck",
     "lint": "pnpm -r lint",
     "test": "pnpm -r test"

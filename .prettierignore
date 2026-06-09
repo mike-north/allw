@@ -1,0 +1,6 @@
+# Generated WASM build output (reproducible via `pnpm run build:wasm`).
+packages/sdk/vendor/
+
+# Build output
+dist/
+target/
