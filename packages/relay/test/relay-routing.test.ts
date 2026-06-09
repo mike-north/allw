@@ -33,6 +33,8 @@ const DEVICE_PUBKEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 /** Far-future expiry (2100-01-01Z, ms) — deterministic AND always > the relay's real `Date.now()`. */
 const FUTURE_EXPIRES_AT = 4102444800000;
+/** A past expiry (1970-01-01T00:00:01Z, ms) — always < the relay's real `Date.now()` (fail-closed tests). */
+const PAST_EXPIRES_AT = 1000;
 /** A fixed creation timestamp (2023-11-14Z, ms). */
 const CREATED_AT = 1700000000000;
 
@@ -568,6 +570,96 @@ describe("AccountRelay — routing negative paths", () => {
     });
     expect(resp.status).toBe(404);
   });
+
+  it("rejects a degenerate (non-object) verdict value", async () => {
+    const acct = "acct-neg-scalarverdict";
+    const deviceId = await enrollDevice(acct);
+    const device = await connectWs(acct, `/devices/${deviceId}/connect`);
+    await post(acct, "/requests", makeEnvelope("req-scalar"));
+    await device.next();
+    // A scalar the integrator could never JWS-verify must be refused before storage.
+    device.send({ type: "verdict", request_id: "req-scalar", verdict: 42 });
+    const err = await device.next();
+    expect(err.type).toBe("error");
+    const polled = await get<{ status: string }>(acct, "/requests/req-scalar");
+    expect(polled.data.status).toBe("pending");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fail-closed expiry (contract §Invariants #6)
+// ---------------------------------------------------------------------------
+
+describe("AccountRelay — fail-closed expiry", () => {
+  it("refuses a verdict for an expired request and does not resolve it", async () => {
+    const acct = "acct-exp-verdict";
+    await enrollDevice(acct);
+    const deviceId = await firstDeviceId(acct);
+    await seedExpiredRequest(acct, "req-exp-v");
+
+    const device = await connectWs(acct, `/devices/${deviceId}/connect`);
+    device.send({ type: "verdict", request_id: "req-exp-v", verdict: makeVerdict("req-exp-v") });
+
+    const ack = await device.next();
+    expect(ack.type).toBe("ack");
+    expect(ack.status).toBe("expired");
+
+    // The request is terminal `expired`, NOT `resolved` — a timed-out request is never approvable.
+    const polled = await get<{ status: string; verdict?: unknown }>(acct, "/requests/req-exp-v");
+    expect(polled.data.status).toBe("expired");
+    expect(polled.data.verdict).toBeUndefined();
+  });
+
+  it("does not re-flush a request that expired while queued", async () => {
+    const acct = "acct-exp-flush";
+    await enrollDevice(acct);
+    const deviceId = await firstDeviceId(acct);
+    await seedExpiredRequest(acct, "req-exp-q");
+
+    // Connecting must NOT deliver the expired queued request.
+    const device = await connectWs(acct, `/devices/${deviceId}/connect`);
+    await expect(device.next(500)).rejects.toThrow(/timeout/);
+  });
+
+  it("lazy-expires on poll: a past-deadline pending request reports terminal 'expired'", async () => {
+    const acct = "acct-exp-poll";
+    await seedExpiredRequest(acct, "req-exp-p");
+
+    const polled = await get<{ status: string }>(acct, "/requests/req-exp-p");
+    expect(polled.status).toBe(200);
+    expect(polled.data.status).toBe("expired");
+  });
+
+  it("lazy-expires on …/wait: pushes terminal 'expired' and closes", async () => {
+    const acct = "acct-exp-wait";
+    await seedExpiredRequest(acct, "req-exp-w");
+
+    const integrator = await connectWs(acct, "/requests/req-exp-w/wait");
+    const msg = await integrator.next();
+    expect(msg.type).toBe("expired");
+    expect(msg.request_id).toBe("req-exp-w");
+  });
+
+  it("refuses a verdict from a device whose enrollment was removed", async () => {
+    const acct = "acct-exp-revoked";
+    await enrollDevice(acct);
+    const deviceId = await firstDeviceId(acct);
+    const device = await connectWs(acct, `/devices/${deviceId}/connect`);
+
+    await post(acct, "/requests", makeEnvelope("req-rev-1"));
+    await device.next(); // request push
+
+    // Simulate a revoke whose hibernation socket outlived the best-effort close.
+    await deleteDeviceRow(acct, deviceId);
+    device.send({ type: "verdict", request_id: "req-rev-1", verdict: makeVerdict("req-rev-1") });
+
+    const err = await device.next();
+    expect(err.type).toBe("error");
+
+    // A de-enrolled device must not drive resolution — the request stays pending.
+    const polled = await get<{ status: string }>(acct, "/requests/req-rev-1");
+    expect(polled.data.status).toBe("pending");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -580,4 +672,38 @@ async function firstDeviceId(accountId: string): Promise<string> {
   const first = data.devices[0];
   if (!first) throw new Error(`no enrolled device for ${accountId}`);
   return first.device_id;
+}
+
+/**
+ * Seed a `pending` request whose `expires_at` is already in the past — `POST /requests` rejects an
+ * expired submit, so we insert directly via `runInDurableObject` to exercise the fail-closed paths.
+ * Returns the stored envelope.
+ */
+async function seedExpiredRequest(
+  accountId: string,
+  requestId: string,
+): Promise<Record<string, unknown>> {
+  const envelope = makeEnvelope(requestId, { expires_at: PAST_EXPIRES_AT });
+  const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
+  await runInDurableObject(stub, (instance: AccountRelay) => {
+    const relay = instance as unknown as { sql: SqlStorage };
+    relay.sql.exec(
+      `INSERT OR REPLACE INTO request (request_id, envelope, created_at, expires_at, status)
+       VALUES (?, ?, ?, ?, 'pending')`,
+      requestId,
+      JSON.stringify(envelope),
+      CREATED_AT,
+      PAST_EXPIRES_AT,
+    );
+  });
+  return envelope;
+}
+
+/** Delete a device row directly — simulates a revoke whose hibernation socket outlived the close. */
+async function deleteDeviceRow(accountId: string, deviceId: string): Promise<void> {
+  const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
+  await runInDurableObject(stub, (instance: AccountRelay) => {
+    const relay = instance as unknown as { sql: SqlStorage };
+    relay.sql.exec(`DELETE FROM device WHERE device_id = ?`, deviceId);
+  });
 }

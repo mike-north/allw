@@ -658,10 +658,16 @@ export class AccountRelay implements DurableObject {
     // Hibernation: the DO may be evicted while the socket stays open; handlers below re-attach it.
     this.ctx.acceptWebSocket(server, [DEVICE_TAG, deviceTag(deviceId)]);
 
-    // Flush the offline queue: every pending request, oldest first.
+    // Flush the offline queue: every still-live pending request, oldest first. Fail-closed: a
+    // request that expired while queued is excluded (`expires_at > now`), so a dead request is
+    // never re-pushed to a reconnecting device. (Submit fan-out needs no such guard — `handleSubmit`
+    // rejects an already-expired `expires_at`, so a freshly stored request is always future-dated.)
+    const now = Date.now();
     const pending = [
       ...this.sql.exec<RequestRow>(
-        `SELECT request_id, envelope FROM request WHERE status = 'pending' ORDER BY created_at ASC`,
+        `SELECT request_id, envelope FROM request
+         WHERE status = 'pending' AND expires_at > ? ORDER BY created_at ASC`,
+        now,
       ),
     ];
     for (const p of pending) {
@@ -754,22 +760,25 @@ export class AccountRelay implements DurableObject {
 
   /**
    * GET /requests/{request_id}
-   * Response: `{ request_id, status: "pending" }` while awaiting a verdict, or
-   *           `{ request_id, status: "resolved", verdict }` once a device has decided. 404 if unknown.
+   * Response: `{ request_id, status }` where status is `pending`, terminal `expired` (fail-closed,
+   *           past `expires_at`), or `resolved` (+ the signed `verdict`). 404 if unknown.
    *
    * The polling counterpart to `…/wait` — lets a disconnected integrator fetch a persisted verdict.
+   * Lazy-expires a past-deadline request on read so it never reports a perpetual `pending`.
    */
   private handleGetRequest(requestId: string): Response {
     const rows = [
       ...this.sql.exec<RequestRow>(
-        `SELECT request_id, status FROM request WHERE request_id = ?`,
+        `SELECT request_id, status, expires_at FROM request WHERE request_id = ?`,
         requestId,
       ),
     ];
     const req = rows[0];
     if (!req) return json({ error: "request not found" }, 404);
-    if (req.status !== "resolved") {
-      return json({ request_id: requestId, status: "pending" });
+    const status = this.expireIfDue(requestId, req.status, req.expires_at, Date.now());
+    if (status !== "resolved") {
+      // pending, or terminal `expired` (fail-closed) — never a verdict.
+      return json({ request_id: requestId, status });
     }
     return json({
       request_id: requestId,
@@ -782,27 +791,30 @@ export class AccountRelay implements DurableObject {
    * GET /requests/{request_id}/wait  (WebSocket upgrade)
    *
    * A live waiting integrator: the verdict is pushed the instant a device decides (or immediately
-   * if it already has), then the socket is closed. Returns 404 for an unknown request (a request
+   * if it already has), then the socket is closed. A past-deadline request is lazy-expired and the
+   * terminal status is pushed at once (fail-closed). Returns 404 for an unknown request (a request
    * without a WebSocket upgrade header is rejected earlier, at the router, with 426).
    *
-   * Protocol (relay → integrator): `{ type: "verdict", request_id, verdict }`.
+   * Protocol (relay → integrator): `{ type: "verdict", request_id, verdict }` or
+   * `{ type: "expired", request_id }` (terminal, no verdict will come).
    */
   private handleIntegratorWait(requestId: string): Response {
     const rows = [
       ...this.sql.exec<RequestRow>(
-        `SELECT request_id, status FROM request WHERE request_id = ?`,
+        `SELECT request_id, status, expires_at FROM request WHERE request_id = ?`,
         requestId,
       ),
     ];
     const req = rows[0];
     if (!req) return json({ error: "request not found" }, 404);
+    const status = this.expireIfDue(requestId, req.status, req.expires_at, Date.now());
 
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
     this.ctx.acceptWebSocket(server, ["integrator", integratorTag(requestId)]);
 
-    if (req.status === "resolved") {
+    if (status === "resolved") {
       trySendJson(server, {
         type: "verdict",
         request_id: requestId,
@@ -813,9 +825,34 @@ export class AccountRelay implements DurableObject {
       } catch {
         // already closing — ignore
       }
+    } else if (status === "expired") {
+      // Fail-closed terminal state — tell the waiter at once and close; no verdict will arrive.
+      trySendJson(server, { type: "expired", request_id: requestId });
+      try {
+        server.close(1000, "expired");
+      } catch {
+        // already closing — ignore
+      }
     }
 
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  /**
+   * Fail-closed lazy expiry (contract §Invariants #6): if a `pending` request is past its
+   * `expires_at`, transition it to the terminal `expired` status. Returns the effective status so
+   * read paths report `expired` — never a perpetual `pending` — the first time anyone looks after
+   * the deadline. The proactive `alarm()`-based sweep + device retract is tracked separately (#44).
+   */
+  private expireIfDue(requestId: string, status: string, expiresAt: number, now: number): string {
+    if (status === "pending" && now > expiresAt) {
+      this.sql.exec(
+        `UPDATE request SET status = 'expired' WHERE request_id = ? AND status = 'pending'`,
+        requestId,
+      );
+      return "expired";
+    }
+    return status;
   }
 
   /** Load and parse the stored (opaque) verdict for a request, or null if none recorded. */
@@ -897,19 +934,39 @@ export class AccountRelay implements DurableObject {
       return;
     }
 
+    // SECURITY (fail-closed): re-confirm the device is still enrolled. The socket tag proves which
+    // device opened the connection, but a revoke may have removed the enrollment while a hibernation
+    // socket survived the best-effort close — a de-enrolled device must not be able to drive a
+    // request to `resolved`. (The integrator's JWS verification is the real backstop; this keeps the
+    // relay's own state honest.)
+    const stillEnrolled = [
+      ...this.sql.exec<DeviceRow>(`SELECT device_id FROM device WHERE device_id = ?`, deviceId),
+    ];
+    if (stillEnrolled.length === 0) {
+      trySendJson(ws, { type: "error", error: "device is no longer enrolled" });
+      try {
+        ws.close(1008, "device revoked");
+      } catch {
+        // already closing — ignore
+      }
+      return;
+    }
+
     const requestId = requiredString(msg, "request_id");
     if (!requestId) {
       trySendJson(ws, { type: "error", error: "'request_id' is required (string)" });
       return;
     }
-    if (!("verdict" in msg) || msg.verdict === undefined || msg.verdict === null) {
-      trySendJson(ws, { type: "error", error: "'verdict' is required" });
+    // Require a JSON-object verdict (the contract Verdict shape). We never parse the JWS inside it,
+    // but a degenerate scalar (42, "x") could never be verified downstream — reject it outright.
+    if (!isPlainObject(msg.verdict)) {
+      trySendJson(ws, { type: "error", error: "'verdict' must be a JSON object" });
       return;
     }
 
     const reqRows = [
       ...this.sql.exec<RequestRow>(
-        `SELECT request_id, status FROM request WHERE request_id = ?`,
+        `SELECT request_id, status, expires_at FROM request WHERE request_id = ?`,
         requestId,
       ),
     ];
@@ -924,9 +981,17 @@ export class AccountRelay implements DurableObject {
       return;
     }
 
+    // Fail-closed (contract §Invariants #6): a request past its deadline must NEVER become
+    // approvable. Transition pending→expired and refuse to record the verdict.
+    const now = Date.now();
+    if (req.status === "expired" || (req.status === "pending" && now > req.expires_at)) {
+      this.expireIfDue(requestId, req.status, req.expires_at, now);
+      trySendJson(ws, { type: "ack", request_id: requestId, status: "expired" });
+      return;
+    }
+
     // SECURITY: the verdict is a JWS-signed decision, stored opaquely solely to route it back.
     const verdictJson = JSON.stringify(msg.verdict);
-    const now = Date.now();
     try {
       this.sql.exec(
         `INSERT INTO verdict (request_id, verdict, device_id, received_at) VALUES (?, ?, ?, ?)`,
