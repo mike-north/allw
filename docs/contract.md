@@ -63,13 +63,6 @@ reserved and null. The contract is **action-agnostic**: it transports and binds 
 
 ## Messages
 
-> **Implementation status.** This section reflects the model resolved in
-> [#28](https://github.com/mike-north/allw/issues/28). The merged v1 core (`crates/allw-core`) still implements the
-> pre-#28 shape — a flat `ApprovalRequest` with top-level `action`/`summary`/…, a four-field `request_hash`
-> (`request-hash/v1`), and a `context_digest` on `AuditRecord`. Bringing the code to the shape below (the
-> `ApprovalContext` split, the broadened `request-hash/v2`, and removing `context_digest`) is done in **#5** and a
-> small core refactor; this PR locks the contract first.
-
 The human-shown payload and the wire envelope are **separate** (resolved in
 [#28](https://github.com/mike-north/allw/issues/28)): everything human-facing is encrypted into an
 **`ApprovalContext`**; the **`ApprovalRequest`** the relay sees is a minimal routing/lifecycle envelope wrapping the
@@ -251,6 +244,22 @@ Two JWS types, domain-separated by the `typ` header:
 
 The `Verdict.sig` and `AuditRecord.sig` wire fields are therefore the **compact JWS string** (not raw bytes); the
 audit record carries the verdict's JWS verbatim for non-repudiation.
+
+### context_ciphertext (JWE)
+
+`context_ciphertext` is a multi-recipient **JWE in General JSON Serialization**
+([RFC 7516](https://www.rfc-editor.org/rfc/rfc7516) §7.2.1) encrypting the `ApprovalContext` (JSON) to the
+approver's device key(s). The `ApprovalContext` is encrypted **once** under a random content-encryption key (CEK)
+with `enc = "A256GCM"` ([RFC 7518](https://www.rfc-editor.org/rfc/rfc7518) §5.3; 96-bit IV; AAD =
+`ASCII(BASE64URL(protected_header))`). For **each** recipient device the CEK is wrapped independently with
+`alg = "ECDH-ES+A256KW"` (§4.6 + §4.4): an ephemeral X25519 keypair per recipient, `Z = ECDH(ephemeral, device)`
+([RFC 8037](https://www.rfc-editor.org/rfc/rfc8037) OKP/X25519), a 256-bit KEK via **Concat KDF** (§4.6.2,
+SHA-256), then AES-256 Key Wrap ([RFC 3394](https://www.rfc-editor.org/rfc/rfc3394)) of the CEK. The ephemeral
+public key is the recipient header's `epk` (`{kty:"OKP",crv:"X25519",x:<b64url>}`); the shared `protected` header
+carries only `enc`, while `alg`/`kid`/`epk` are per-recipient. So one ciphertext is shared and the CEK is wrapped
+once per device — a multi-device inbox decrypts the same context with each device's own key. Pure-Rust
+(`x25519-dalek` + RustCrypto `aes-gcm`/`aes-kw`/`concat-kdf`), so it compiles to `wasm32`. **Static ECDH for v1**
+(the device key is long-term); per-message forward secrecy is deferred. All base64url is unpadded (JOSE-consistent).
 
 ## Open decisions
 
