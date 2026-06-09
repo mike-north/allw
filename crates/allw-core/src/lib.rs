@@ -12,10 +12,14 @@
 //!
 //! See `docs/contract.md` and `docs/architecture.md`.
 //!
-//! **Status: skeleton.** Types sketch the contract; crypto and wire (de)serialization are TODO.
+//! **Status:** contract wire types landed (serde-backed, JOSE-consistent binary encoding,
+//! i64 ms timestamps). Crypto (JWE/JWS) and audit hash-chain construction are TODO.
 
 pub mod audit;
 pub mod contract;
 pub mod crypto;
 
-pub use contract::{ActionRecord, ApprovalRequest, Decision, Risk, Surface, Verdict};
+pub use contract::{
+    ActionRecord, Actor, ApprovalRequest, Approver, AuditRecord, Constraints, Decision,
+    PolicyBlock, PolicyDecision, Risk, Surface, SyntacticSubstrate, Verdict,
+};

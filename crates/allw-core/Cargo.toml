@@ -14,9 +14,10 @@ crate-type = ["rlib", "cdylib"] # rlib for Rust consumers; cdylib for FFI/WASM s
 workspace = true
 
 [dependencies]
-# Intentionally dependency-free for the initial skeleton.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
 # Planned as modules are implemented:
-#   serde + serde_json     — wire types
 #   josekit / rust JOSE     — JWE (context) + JWS (verdicts/rules)
 #   ed25519-dalek           — verdict/rule signatures
 #   x25519-dalek            — ECDH for E2EE context
