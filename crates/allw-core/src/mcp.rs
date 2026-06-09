@@ -26,7 +26,7 @@
 //!
 //! A coarse, name-based risk tier is assigned from the tool name:
 //!
-//! | Tool name prefix / suffix          | [`Risk`] assigned |
+//! | Tool name prefix                   | [`Risk`] assigned |
 //! |------------------------------------|-------------------|
 //! | starts with `delete`, `remove`, or `drop` | `High`     |
 //! | starts with `destroy`, `truncate`, or `purge` | `High` |
@@ -50,11 +50,12 @@ use crate::contract::{ActionRecord, Risk, Surface, SyntacticSubstrate};
 /// * `server` – MCP server name (e.g. `"omnifocus"`).
 /// * `tool`   – Tool name within the server (e.g. `"delete_project"`).
 /// * `params` – Tool call parameters as a [`serde_json::Value`]. Any JSON value is accepted
-///   (object, array, null, primitive). The value is preserved **verbatim** — no normalisation,
-///   no key reordering, no dropping of any field — so that instance-distinguishing values like
-///   `{"list": "Agent Inbox"}` survive a serde round-trip and remain matchable by policy rules
-///   of the form `params.list == "Agent Inbox"` (see `docs/policy-seam.md` §The approval →
-///   rule bridge).
+///   (object, array, null, primitive). All **keys and values are preserved** (no normalisation,
+///   no dropping of any field), so instance-distinguishing values like `{"list": "Agent Inbox"}`
+///   survive a serde round-trip and remain matchable by policy rules of the form
+///   `params.list == "Agent Inbox"` (see `docs/policy-seam.md` §The approval → rule bridge).
+///   Object **key order is not guaranteed** (serde_json's default `Map` sorts keys) and must not
+///   be relied upon — it is not semantically meaningful for `Value` equality or key lookup.
 ///
 /// # Returns
 ///
@@ -91,7 +92,10 @@ pub fn action_from_mcp_tool_call(
     tool: &str,
     params: serde_json::Value,
 ) -> ActionRecord {
-    let compact_params = serde_json::to_string(&params).unwrap_or_else(|_| "null".to_string());
+    // A serde_json::Value always serializes; surface any unexpected failure rather than
+    // silently emitting a `raw` that disagrees with `syntactic.params`.
+    let compact_params =
+        serde_json::to_string(&params).expect("serde_json::Value always serializes to a string");
     let raw = format!("{server}.{tool}({compact_params})");
     let risk = v1_risk_from_tool_name(tool);
 
@@ -162,12 +166,12 @@ mod tests {
     /// server="omnifocus", tool="delete_project",
     /// params={"project_id":"abc","list":"Agent Inbox"}.
     fn representative_record() -> ActionRecord {
+        // Key order here is irrelevant — `Value` equality and key lookup are order-independent,
+        // and tests must not depend on serde_json's serialization ordering.
         action_from_mcp_tool_call(
             "omnifocus",
             "delete_project",
-            // Keys deliberately ordered alphabetically ("list" < "project_id") to match
-            // serde_json's BTreeMap-backed sorted serialisation order.
-            json!({ "list": "Agent Inbox", "project_id": "abc" }),
+            json!({ "project_id": "abc", "list": "Agent Inbox" }),
         )
     }
 
@@ -234,19 +238,21 @@ mod tests {
     /// The raw field must match the documented display format:
     ///   "<server>.<tool>(<compact-json-params>)"
     ///
-    /// "Compact" means no extra whitespace — exactly serde_json::to_string output.
-    /// serde_json serializes Map keys in sorted (alphabetical) order, so "list" < "project_id".
+    /// The expected `raw` is built from the SAME params via `serde_json::to_string`, so this test
+    /// asserts the wrapping format and compactness WITHOUT assuming any serde_json key order
+    /// (it stays correct even if `preserve_order` is later enabled).
     #[test]
     fn raw_matches_documented_display_format() {
-        let r = representative_record();
-        // serde_json's BTreeMap-backed Map serializes keys in sorted order:
-        // "list" sorts before "project_id" alphabetically.
-        let expected_raw = r#"omnifocus.delete_project({"list":"Agent Inbox","project_id":"abc"})"#;
+        let params = json!({ "project_id": "abc", "list": "Agent Inbox" });
+        let r = action_from_mcp_tool_call("omnifocus", "delete_project", params.clone());
+        let expected_raw = format!(
+            "omnifocus.delete_project({})",
+            serde_json::to_string(&params).unwrap()
+        );
         assert_eq!(
             r.syntactic.raw.as_deref(),
-            Some(expected_raw),
-            "raw must match format '<server>.<tool>(<compact-json-params>)'; \
-             note: serde_json sorts Map keys alphabetically"
+            Some(expected_raw.as_str()),
+            "raw must be '<server>.<tool>(<compact-json-params>)' (compact, no whitespace)"
         );
     }
 
