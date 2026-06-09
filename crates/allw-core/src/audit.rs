@@ -222,6 +222,17 @@ impl AuditChain {
     ///   `record_hash` of the current head.
     /// - `record_hash` = [`compute_record_hash`] of the completed record.
     pub fn append(&mut self, input: AuditEntryInput) -> &AuditRecord {
+        // v1 invariant (docs/policy-seam.md §forward-compat req #4): every v1 audit record is
+        // written on the `escalate` path. The field is type-unconstrained so T3 can later write
+        // allow/deny, so we guard the v1 convention here rather than in the type. debug_assert
+        // (not a hard error) keeps `append` infallible and the field forward-compatible while
+        // catching v1 misuse in tests/debug builds.
+        debug_assert_eq!(
+            input.policy.decision,
+            crate::contract::PolicyDecision::Escalate,
+            "v1 audit records must write policy.decision = Escalate (policy-seam.md forward-compat req #4)"
+        );
+
         let seq = self.records.len() as u64;
         let prev_hash = self.head_hash();
 
