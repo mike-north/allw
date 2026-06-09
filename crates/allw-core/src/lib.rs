@@ -13,13 +13,16 @@
 //! See `docs/contract.md` and `docs/architecture.md`.
 //!
 //! **Status:** contract wire types landed (serde-backed, JOSE-consistent binary encoding,
-//! i64 ms timestamps). Crypto (JWE/JWS) and audit hash-chain construction are TODO.
+//! i64 ms timestamps). WYSIWYS request_hash implemented. Crypto (JWE/JWS) and audit
+//! hash-chain construction are TODO.
 
 pub mod audit;
 pub mod contract;
 pub mod crypto;
+pub mod hash;
 
 pub use contract::{
     ActionRecord, Actor, ApprovalRequest, Approver, AuditRecord, Constraints, Decision,
     PolicyBlock, PolicyDecision, Risk, Surface, SyntacticSubstrate, Verdict,
 };
+pub use hash::{canonical_request_bytes, compute_request_hash};
