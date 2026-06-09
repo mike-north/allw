@@ -94,6 +94,9 @@ const CEK_LEN: usize = 32;
 /// AES-GCM IV length (bytes) — 96 bits, the JWE-mandated GCM nonce size (RFC 7518 §5.3).
 const IV_LEN: usize = 12;
 
+/// AES-GCM authentication tag length (bytes) — 128 bits (RFC 7518 §5.3).
+const GCM_TAG_LEN: usize = 16;
+
 /// X25519 public/secret key length (bytes).
 const X25519_LEN: usize = 32;
 
@@ -340,7 +343,9 @@ fn derive_kek(z: &[u8; X25519_LEN]) -> [u8; KEK_LEN] {
 ///
 /// # Panics
 ///
-/// Panics only on internal invariants that cannot occur for well-formed inputs: serializing the
+/// Panics if `recipients` is empty — that would emit a JWE no device can ever decrypt, which is
+/// always a programmer error (encryption must target at least one enrolled device). Also panics
+/// only on internal invariants that cannot occur for well-formed inputs: serializing the
 /// (in-memory, always-serializable) [`ApprovalContext`] to JSON, AES-GCM encryption of an
 /// in-memory buffer, or AES-KW wrapping a 32-byte CEK. These are programming-error guards, not
 /// input-dependent failures.
@@ -350,6 +355,12 @@ pub fn encrypt_context(
     recipients: &[ContextRecipient<'_>],
     rng: &mut (impl RngCore + CryptoRng),
 ) -> String {
+    assert!(
+        !recipients.is_empty(),
+        "encrypt_context requires at least one recipient — an empty recipients list would \
+         produce a JWE that no device can decrypt"
+    );
+
     // Plaintext = JSON-serialized ApprovalContext. The contract types always serialize.
     let plaintext = serde_json::to_vec(context)
         .expect("ApprovalContext must serialize to JSON (infallible for contract types)");
@@ -381,8 +392,8 @@ pub fn encrypt_context(
             },
         )
         .expect("AES-256-GCM encryption of an in-memory buffer must not fail");
-    // RustCrypto returns ciphertext || tag (16-byte GCM tag appended).
-    let split = gcm_out.len() - 16;
+    // RustCrypto returns ciphertext || tag (the GCM tag appended).
+    let split = gcm_out.len() - GCM_TAG_LEN;
     let (ciphertext, tag) = gcm_out.split_at(split);
 
     // ── Per-recipient ECDH-ES+A256KW wrapping of the CEK ──
@@ -488,7 +499,9 @@ pub fn decrypt_context(
     if recipient.header.epk.kty != EPK_KTY_OKP || recipient.header.epk.crv != EPK_CRV_X25519 {
         return Err(JweError::BadEpk);
     }
-    let epk_bytes: [u8; X25519_LEN] = b64(&recipient.header.epk.x)?
+    let epk_bytes: [u8; X25519_LEN] = URL_SAFE_NO_PAD
+        .decode(&recipient.header.epk.x)
+        .map_err(|_| JweError::BadEpk)?
         .try_into()
         .map_err(|_| JweError::BadEpk)?;
     let epk = XPublicKey::from(epk_bytes);
@@ -514,8 +527,13 @@ pub fn decrypt_context(
     if iv.len() != IV_LEN {
         return Err(JweError::Malformed);
     }
+    let tag = b64(&parsed.tag)?;
+    if tag.len() != GCM_TAG_LEN {
+        // Distinguish a structurally-wrong tag (parse error) from a genuine auth failure.
+        return Err(JweError::Malformed);
+    }
     let mut combined = b64(&parsed.ciphertext)?;
-    combined.extend_from_slice(&b64(&parsed.tag)?); // RustCrypto expects ciphertext || tag
+    combined.extend_from_slice(&tag); // RustCrypto expects ciphertext || tag
 
     let cipher = Aes256Gcm::new_from_slice(&cek).map_err(|_| JweError::DecryptionFailed)?;
     let nonce = Nonce::from_slice(&iv);
@@ -857,6 +875,46 @@ mod tests {
         let err = decrypt_context(&tampered, DEV1_ID, &device(&DEV1_SEED))
             .expect_err("tampered encrypted_key must fail key unwrap");
         assert_eq!(err, JweError::KeyUnwrapFailed);
+    }
+
+    // ── Error precision: malformed epk / tag, and empty recipients (review #36) ───
+
+    /// A non-base64url `epk.x` is reported as `BadEpk` (a malformed recipient key), not the
+    /// generic `Malformed` — so callers/tests can rely on the variant.
+    #[test]
+    fn bad_epk_base64_is_bad_epk() {
+        let jwe = encrypt_to_one();
+        let mut val: Value = serde_json::from_str(&jwe).unwrap();
+        // '@' is not a base64url character.
+        val["recipients"][0]["header"]["epk"]["x"] = Value::String("@@@@".to_string());
+        let bad = serde_json::to_string(&val).unwrap();
+
+        let err = decrypt_context(&bad, DEV1_ID, &device(&DEV1_SEED))
+            .expect_err("a non-base64url epk.x must be rejected");
+        assert_eq!(err, JweError::BadEpk);
+    }
+
+    /// A structurally wrong-length `tag` (not 16 bytes) is a parse error (`Malformed`), distinct
+    /// from a genuine GCM auth failure (`DecryptionFailed`).
+    #[test]
+    fn wrong_length_tag_is_malformed() {
+        let jwe = encrypt_to_one();
+        let mut val: Value = serde_json::from_str(&jwe).unwrap();
+        // 8 bytes instead of the required 16 — valid base64url, wrong length.
+        val["tag"] = Value::String(URL_SAFE_NO_PAD.encode([0u8; 8]));
+        let bad = serde_json::to_string(&val).unwrap();
+
+        let err = decrypt_context(&bad, DEV1_ID, &device(&DEV1_SEED))
+            .expect_err("a wrong-length tag must be Malformed");
+        assert_eq!(err, JweError::Malformed);
+    }
+
+    /// `encrypt_context` with no recipients would emit a JWE no device can decrypt — a programmer
+    /// error, rejected early.
+    #[test]
+    #[should_panic(expected = "at least one recipient")]
+    fn empty_recipients_panics() {
+        let _ = encrypt_context(&make_context(), &[], &mut rng());
     }
 
     // ── Determinism given a fixed RNG (proves no hidden OS-RNG use) ───────────────
