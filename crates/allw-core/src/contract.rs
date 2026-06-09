@@ -60,12 +60,6 @@ mod wire_b64 {
     pub fn serialize_vec<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&encode(bytes))
     }
-
-    /// Deserialize a `Vec<u8>` from a base64url-unpadded string.
-    pub fn deserialize_vec<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-        let s = String::deserialize(d)?;
-        decode(&s).map_err(D::Error::custom)
-    }
 }
 
 // ── Enums ─────────────────────────────────────────────────────────────────────
@@ -388,10 +382,19 @@ pub struct Verdict {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub challenge_response: Option<String>,
 
-    /// Device-key signature (JWS/COSE) covering `(request_id, request_hash, decision,
-    /// decided_at, nonce)`. Signing is wired in issue #4.
-    #[serde(with = "wire_b64_vec")]
-    pub sig: Vec<u8>,
+    /// Device-key signature as an **EdDSA compact JWS** (RFC 7515 + RFC 8037).
+    ///
+    /// Format: `b64url(protected_header) + "." + b64url(payload) + "." + b64url(signature)`.
+    /// The protected header is `{"alg":"EdDSA","typ":"allw-verdict+jws","kid":<device_id>}`
+    /// and the payload is the signed [`crypto::VerdictClaims`] set — `request_id`,
+    /// `request_hash`, `decision`, `decided_at`, `nonce`, and (when present)
+    /// `challenge_response`. Those claims are what the signature authenticates; the outer
+    /// fields here are a decoded convenience and are cross-checked against the claims during
+    /// [`crypto::verify_verdict`]. See `docs/contract.md` §Wire encoding → verdict signature.
+    ///
+    /// [`crypto::VerdictClaims`]: crate::crypto::VerdictClaims
+    /// [`crypto::verify_verdict`]: crate::crypto::verify_verdict
+    pub sig: String,
 
     /// JWS/DID certificate chaining the device key to the account root.
     ///
@@ -503,9 +506,9 @@ pub struct AuditRecord {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub note: Option<String>,
 
-    /// The verdict's device-key signature, carried into the audit record for non-repudiation.
-    #[serde(with = "wire_b64_vec")]
-    pub sig: Vec<u8>,
+    /// The verdict's device-key signature — the **EdDSA compact JWS** string, carried into the
+    /// audit record verbatim for non-repudiation. Same format as [`Verdict::sig`].
+    pub sig: String,
 }
 
 // ── serde helper modules (newtype-style, used via `#[serde(with = ...)]`) ─────
@@ -520,19 +523,6 @@ mod wire_b64_32 {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
         super::wire_b64::deserialize_32(d)
-    }
-}
-
-/// `Vec<u8>` ↔ base64url-unpadded string.
-mod wire_b64_vec {
-    use serde::{Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
-        super::wire_b64::serialize_vec(bytes, s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-        super::wire_b64::deserialize_vec(d)
     }
 }
 
@@ -566,6 +556,11 @@ mod tests {
     const TS_EXPIRES: i64 = 1_700_003_600_000;
     // 2023-11-14T22:30:00Z
     const TS_DECIDED: i64 = 1_700_001_000_000;
+
+    /// A representative EdDSA compact JWS (`header.payload.signature`, three base64url parts).
+    /// These contract-layer tests only exercise the wire shape — `sig` is now an opaque JWS
+    /// `String`; cryptographic construction/verification is covered in `crypto.rs`.
+    const SAMPLE_JWS: &str = "eyJhbGciOiJFZERTQSJ9.eyJyZXF1ZXN0X2lkIjoicmVxXzEifQ.3q2-7w";
 
     fn make_actor() -> Actor {
         Actor {
@@ -645,7 +640,7 @@ mod tests {
             },
             note: None,
             challenge_response: None,
-            sig: vec![0xde, 0xad, 0xbe, 0xef],
+            sig: SAMPLE_JWS.to_string(),
             device_cert: None,
         }
     }
@@ -673,7 +668,7 @@ mod tests {
                 schema_version: 1,
             },
             note: None,
-            sig: vec![0xde, 0xad, 0xbe, 0xef],
+            sig: SAMPLE_JWS.to_string(),
         }
     }
 

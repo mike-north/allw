@@ -164,8 +164,9 @@ pub struct AuditEntryInput {
     pub policy: PolicyBlock,
     /// Optional free-form note from the approver.
     pub note: Option<String>,
-    /// The verdict's device-key signature, carried into the audit record for non-repudiation.
-    pub sig: Vec<u8>,
+    /// The verdict's device-key signature — the EdDSA compact JWS string — carried into the
+    /// audit record verbatim for non-repudiation.
+    pub sig: String,
 }
 
 // ── AuditChain ────────────────────────────────────────────────────────────────
@@ -457,7 +458,9 @@ mod tests {
             context_digest: [0x22u8; 32],
             policy: make_policy(),
             note: None,
-            sig: vec![0xde, 0xad, 0xbe, 0xef],
+            // Representative EdDSA compact JWS (header.payload.signature). The audit chain
+            // stores the verdict's signature verbatim; its shape is opaque to this module.
+            sig: "eyJhbGciOiJFZERTQSJ9.eyJyZXF1ZXN0X2lkIjoicmVxXzEifQ.3q2-7w".to_string(),
         }
     }
 

@@ -22,9 +22,14 @@ base64 = "0.22"
 # serde_jcs 0.2.0 — actively maintained, explicit RFC 8785 conformance, requires Rust ≥ 1.85.
 serde_jcs = "0.2"
 sha2 = "0.10"
+# Ed25519 verdict/device-cert signatures (pure-Rust → compiles to wasm32). Default features
+# only — the `rand_core`/`getrandom` features are intentionally NOT enabled so the core stays
+# deterministic and wasm-friendly; keys are derived from fixed seeds via SigningKey::from_bytes.
+# A hand-rolled EdDSA compact JWS (RFC 7515 + RFC 8037) is built on top — josekit/jsonwebtoken
+# are OpenSSL/ring-based and cannot target wasm32, so they are deliberately avoided.
+ed25519-dalek = "2"
 # Planned as modules are implemented:
-#   josekit / rust JOSE     — JWE (context) + JWS (verdicts/rules)
-#   ed25519-dalek           — verdict/rule signatures
+#   josekit / rust JOSE     — JWE (context); JWS verdicts/rules are hand-rolled on ed25519-dalek
 #   x25519-dalek            — ECDH for E2EE context
 #   uniffi                  — Swift/Kotlin bindings
 #   wasm-bindgen            — WASM for node/browser surfaces
