@@ -14,8 +14,8 @@
 //!
 //! **Status:** contract wire types landed (serde-backed, JOSE-consistent binary encoding,
 //! i64 ms timestamps). WYSIWYS request_hash implemented. Append-only audit hash-chain landed
-//! (`AuditChain`, `AuditEntryInput`, `AuditChainError`, `compute_record_hash`).
-//! Crypto (JWE/JWS) is TODO.
+//! (`AuditChain`, `AuditEntryInput`, `AuditChainError`, `compute_record_hash`). Verdict signing
+//! and verification landed via an EdDSA compact JWS over Ed25519. JWE (context E2EE) is TODO.
 
 pub mod audit;
 pub mod contract;
@@ -28,5 +28,10 @@ pub use audit::{
 pub use contract::{
     ActionRecord, Actor, ApprovalRequest, Approver, AuditRecord, Constraints, Decision,
     PolicyBlock, PolicyDecision, Risk, Surface, SyntacticSubstrate, Verdict,
+};
+pub use crypto::{
+    effective_allow, issue_device_cert, sign_verdict, verify_verdict, DeviceCertClaims,
+    InMemoryNonceStore, JwsError, KeyError, NonceStore, PublicKey, SigningKeyPair, UnsignedVerdict,
+    VerdictClaims, VerifiedVerdict, VerifyError,
 };
 pub use hash::{canonical_request_bytes, compute_request_hash};
