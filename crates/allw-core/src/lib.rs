@@ -13,14 +13,18 @@
 //! See `docs/contract.md` and `docs/architecture.md`.
 //!
 //! **Status:** contract wire types landed (serde-backed, JOSE-consistent binary encoding,
-//! i64 ms timestamps). WYSIWYS request_hash implemented. Crypto (JWE/JWS) and audit
-//! hash-chain construction are TODO.
+//! i64 ms timestamps). WYSIWYS request_hash implemented. Append-only audit hash-chain landed
+//! (`AuditChain`, `AuditEntryInput`, `AuditChainError`, `compute_record_hash`).
+//! Crypto (JWE/JWS) is TODO.
 
 pub mod audit;
 pub mod contract;
 pub mod crypto;
 pub mod hash;
 
+pub use audit::{
+    compute_record_hash, AuditChain, AuditChainError, AuditEntryInput, GENESIS_PREV_HASH,
+};
 pub use contract::{
     ActionRecord, Actor, ApprovalRequest, Approver, AuditRecord, Constraints, Decision,
     PolicyBlock, PolicyDecision, Risk, Surface, SyntacticSubstrate, Verdict,
