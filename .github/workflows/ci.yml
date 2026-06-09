@@ -38,5 +38,29 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm -r typecheck
       - run: pnpm -r lint
-      - run: pnpm exec prettier --check "**/*.{ts,js,json,md}"
+      - run: pnpm exec prettier --check "**/*.{ts,js,mjs,json,md}"
       - run: pnpm -r build
+
+  wasm:
+    name: WASM parity (Rust ↔ TS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # Build the wasm-bindgen shell (the .wasm + glue are generated, not committed).
+      - run: pnpm run build:wasm
+      # The node parity test feeds the shared cross-platform vector through the compiled wasm,
+      # asserting request-hash/v2 parity and verdict accept/reject (fail-closed).
+      - run: pnpm --filter @allw/sdk test
