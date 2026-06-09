@@ -169,6 +169,15 @@ The `0x00` byte separates the domain tag from the payload.
 **Versioning:** `b"allw/request-hash/v1"` is the domain separation tag and the version knob. Any change
 to the hashed subset, encoding, or recipe requires bumping `v1` → `v2`.
 
+### audit record_hash
+
+`record_hash = SHA-256( b"allw/audit-record/v1" || 0x00 || JCS(record_without_record_hash) )`
+
+Every field of the `AuditRecord` is covered **except `record_hash` itself** (circular). Critically
+`prev_hash` is included, so each record commits to its predecessor → tamper-evident chain.
+Domain tag `b"allw/audit-record/v1"` is distinct from the request-hash tag; the `/v1` suffix is the
+version knob.
+
 ## Open decisions
 
 - **Account / device enrollment, key rotation & revocation** — needs its own mini-spec.
