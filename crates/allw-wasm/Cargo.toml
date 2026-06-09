@@ -1,0 +1,35 @@
+[package]
+name = "allw-wasm"
+version = "0.0.0"
+description = "WASM (wasm-bindgen) bindings exposing allw-core to the TypeScript SDK / hook. Thin shell; all security-critical logic lives in allw-core."
+edition.workspace = true
+rust-version.workspace = true # MSRV 1.85 (inherited via allw-core / serde_jcs 0.2)
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+# cdylib only: this crate is consumed exclusively as a `.wasm` module (no Rust rlib consumers).
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# The single audited core. This crate adds NO crypto/contract logic of its own — it parses
+# JSON in, calls the core, and serializes JSON out. wasm-bindgen lives ONLY here, never in core.
+allw-core = { path = "../allw-core" }
+wasm-bindgen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+# CSPRNG for encrypt_context: the core injects randomness rather than linking an OS RNG
+# (docs/architecture.md). On wasm32, `rand`'s OsRng routes through `getrandom` with the `js`
+# feature (configured below) so it works under node and in the browser/worker.
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+
+# On wasm32, getrandom must use the JS crypto backend (crypto.getRandomValues / node webcrypto)
+# so OsRng works in both node (ESM) and the browser/worker. Native (test/host) builds use the
+# OS RNG directly and do NOT need this.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
