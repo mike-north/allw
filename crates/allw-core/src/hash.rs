@@ -323,7 +323,7 @@ mod tests {
     // ── Test 2: Hash = independent SHA-256 of the documented recipe ──────────
     //
     // Re-derives the documented recipe independently in the test body:
-    //   SHA-256( b"allw/request-hash/v1" || 0x00 || canonical_request_bytes(req) )
+    //   SHA-256( b"allw/request-hash/v2" || 0x00 || canonical_request_bytes(&ctx, expires_at) )
     // This is NOT circular: it independently applies the domain-tag + hash recipe and
     // asserts equality with compute_request_hash, verifying the implementation matches
     // the documented algorithm.

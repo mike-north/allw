@@ -717,7 +717,7 @@ impl std::error::Error for VerifyError {}
 ///    ([`VerifyError::DecidedAtOutOfWindow`]).
 /// 6. **Anti-replay** (checklist #4). The nonce must be unseen in `nonce_store`
 ///    ([`VerifyError::Replay`]).
-/// 7. **Challenge** (checklist #5). If `request.constraints.challenge_required`, a non-empty
+/// 7. **Challenge** (checklist #5). If `context.constraints.challenge_required`, a non-empty
 ///    `challenge_response` must be present in both the claims and the outer verdict
 ///    ([`VerifyError::ChallengeMissing`]).
 ///
