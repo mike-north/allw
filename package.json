@@ -13,6 +13,13 @@
     "lint": "pnpm -r lint",
     "test": "pnpm -r test"
   },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "sharp",
+      "workerd"
+    ]
+  },
   "devDependencies": {
     "typescript": "^5.7.0",
     "prettier": "^3.4.0",
