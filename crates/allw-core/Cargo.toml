@@ -3,6 +3,7 @@ name = "allw-core"
 version = "0.0.0"
 description = "Core types and crypto for the allw approval primitive: contract, verdict signing/verification, audit chaining."
 edition.workspace = true
+rust-version.workspace = true # MSRV 1.85 (serde_jcs 0.2)
 license.workspace = true
 repository.workspace = true
 authors.workspace = true

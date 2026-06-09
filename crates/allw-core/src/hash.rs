@@ -32,6 +32,11 @@
 //! | `actor.id`, `actor.kind` | Actor identity as shown — NOT `attestation` (that is for cryptographic verification, not display) |
 //! | `expires_at` | The expiry time shown to the human |
 //!
+//! **`request_hash` is not the complete WYSIWYS binding on its own.** It binds the structured
+//! [`ApprovalRequest`] fields above; the decrypted human-facing context is bound separately by the
+//! audit record's `context_digest`. Whether `request_hash ∧ context_digest` is the full picture —
+//! and exactly what is plaintext vs inside the E2EE envelope — is tracked in #28.
+//!
 //! # Excluded fields (and rationale)
 //!
 //! Everything else in [`ApprovalRequest`] is deliberately excluded:
@@ -618,6 +623,10 @@ mod tests {
 
         // Encode as lowercase hex for a human-readable, portable comparison
         let hex = hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
+
+        // Printed so `--nocapture` surfaces the value on SUCCESS too (used when regenerating the
+        // vector); without this the hex only appears in the assertion message on failure.
+        println!("frozen_cross_platform_vector: {hex}");
 
         assert_eq!(
             hex, FROZEN_HASH_HEX,

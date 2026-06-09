@@ -4,6 +4,9 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2021"
+# MSRV: serde_jcs 0.2 requires Rust >= 1.85. Pinned so CI fails on an MSRV regression
+# instead of only documenting it in prose.
+rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/mike-north/allw"
 authors = ["Mike North <michael.l.north@gmail.com>"]
