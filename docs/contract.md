@@ -131,9 +131,10 @@ isn't E2EE / is size-limited). Context is fetched as JWE and decrypted on-device
 
 ## Wire encoding
 
-- **Binary fields** (`request_hash`, `prev_hash`, `record_hash`, `context_digest`, `sig`, `device_cert`,
+- **Binary fields** (`request_hash`, `prev_hash`, `record_hash`, `context_digest`, `sig`,
   `attestation`) serialize as **base64url-unpadded JSON strings** (JOSE-consistent); enables byte-identical
-  output across the Rust core and the WASM/TS surface.
+  output across the Rust core and the WASM/TS surface. (`device_cert` is **not** a binary field — it is a
+  certificate string; once verdicts are signed it carries a compact JWS. See §Identity & keys.)
 - **Timestamps** (`created_at`, `expires_at`, `decided_at`) are `i64` Unix milliseconds (UTC) — deterministic
   for the WYSIWYS canonical hash and trivially identical Rust↔TS.
 

@@ -29,9 +29,20 @@ mod wire_b64 {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use serde::{de::Error, Deserialize, Deserializer, Serializer};
 
+    /// The single place the base64url engine choice lives — all binary wire fields route through
+    /// `encode`/`decode` so the encoding cannot drift between helpers.
+    pub fn encode(bytes: &[u8]) -> String {
+        URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    /// Decodes a base64url-unpadded string. Counterpart to [`encode`].
+    pub fn decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
+        URL_SAFE_NO_PAD.decode(s)
+    }
+
     /// Serialize a `[u8; 32]` as a base64url-unpadded string.
     pub fn serialize_32<S: Serializer>(bytes: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&URL_SAFE_NO_PAD.encode(bytes))
+        s.serialize_str(&encode(bytes))
     }
 
     /// Deserialize a `[u8; 32]` from a base64url-unpadded string.
@@ -39,7 +50,7 @@ mod wire_b64 {
     /// Returns an error if the string does not decode to exactly 32 bytes.
     pub fn deserialize_32<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
         let s = String::deserialize(d)?;
-        let bytes = URL_SAFE_NO_PAD.decode(&s).map_err(D::Error::custom)?;
+        let bytes = decode(&s).map_err(D::Error::custom)?;
         bytes
             .try_into()
             .map_err(|_| D::Error::custom("expected exactly 32 bytes after base64url decode"))
@@ -47,13 +58,13 @@ mod wire_b64 {
 
     /// Serialize a `Vec<u8>` as a base64url-unpadded string.
     pub fn serialize_vec<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&URL_SAFE_NO_PAD.encode(bytes))
+        s.serialize_str(&encode(bytes))
     }
 
     /// Deserialize a `Vec<u8>` from a base64url-unpadded string.
     pub fn deserialize_vec<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
         let s = String::deserialize(d)?;
-        URL_SAFE_NO_PAD.decode(&s).map_err(D::Error::custom)
+        decode(&s).map_err(D::Error::custom)
     }
 }
 
@@ -244,13 +255,10 @@ mod option_wire_b64_vec {
         let opt = Option::<String>::deserialize(d)?;
         match opt {
             None => Ok(None),
-            Some(s) => {
-                use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-                let bytes = URL_SAFE_NO_PAD
-                    .decode(&s)
-                    .map_err(serde::de::Error::custom)?;
-                Ok(Some(bytes))
-            }
+            // Route through wire_b64 so the base64url engine choice lives in exactly one place.
+            Some(s) => super::wire_b64::decode(&s)
+                .map(Some)
+                .map_err(serde::de::Error::custom),
         }
     }
 }
@@ -709,6 +717,42 @@ mod tests {
         let json = serde_json::to_string(&orig).unwrap();
         let back: SyntacticSubstrate = serde_json::from_str(&json).unwrap();
         assert_eq!(orig, back);
+    }
+
+    /// policy-seam.md §The action record: the substrate is a FLAT object whose command- and
+    /// mcp-surface fields coexist under their own snake_case keys. Pin the field names and the
+    /// flat shape so a rename or accidental nesting is caught.
+    #[test]
+    fn syntactic_substrate_is_flat_with_snake_case_field_names() {
+        let s = SyntacticSubstrate {
+            bin: Some("git".to_string()),
+            argv: None,
+            flags: None,
+            positionals: None,
+            cwd: None,
+            host: None,
+            env_refs: Some(vec!["AWS_PROFILE".to_string()]),
+            server: Some("omnifocus".to_string()),
+            tool: Some("delete_project".to_string()),
+            params: Some(json!({ "list": "Agent Inbox" })),
+            raw: Some("git status".to_string()),
+        };
+        let val: Value = serde_json::to_value(&s).unwrap();
+
+        // Flat: the command- and mcp-surface fields are siblings at the top level (no nesting).
+        assert!(val.get("bin").is_some(), "command field `bin` is top-level");
+        assert!(
+            val.get("server").is_some() && val.get("tool").is_some(),
+            "mcp fields `server`/`tool` coexist at the top level (flat substrate)"
+        );
+        // snake_case key name, not `envRefs`/`env-refs`.
+        assert_eq!(
+            val.get("env_refs"),
+            Some(&json!(["AWS_PROFILE"])),
+            "env_refs must serialize under the snake_case key `env_refs`"
+        );
+        // `params` is preserved as a structured JSON value (policy-seam.md: params as raw/structured).
+        assert_eq!(val["params"]["list"], json!("Agent Inbox"));
     }
 
     #[test]
