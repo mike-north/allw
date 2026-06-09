@@ -171,10 +171,10 @@ size-limited). The envelope's ciphertext is fetched as JWE and decrypted on-devi
 
 ## Wire encoding
 
-- **Binary fields** (`request_hash`, `prev_hash`, `record_hash`, `sig`,
-  `attestation`) serialize as **base64url-unpadded JSON strings** (JOSE-consistent); enables byte-identical
-  output across the Rust core and the WASM/TS surface. (`device_cert` is **not** a binary field — it is a
-  certificate string; once verdicts are signed it carries a compact JWS. See §Identity & keys.)
+- **Binary fields** (`request_hash`, `prev_hash`, `record_hash`, `attestation`) serialize as
+  **base64url-unpadded JSON strings** (JOSE-consistent); enables byte-identical output across the Rust core and the
+  WASM/TS surface. (`sig` and `device_cert` are **not** binary fields — they are compact-**JWS** strings (see
+  §verdict signature); `context_ciphertext` is a compact-**JWE** string.)
 - **Timestamps** (`created_at`, `expires_at`, `decided_at`) are `i64` Unix milliseconds (UTC) — deterministic
   for the WYSIWYS canonical hash and trivially identical Rust↔TS.
 

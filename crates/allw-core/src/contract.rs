@@ -6,9 +6,10 @@
 //!
 //! # Wire encoding decisions (pinned in docs/contract.md §Wire encoding)
 //!
-//! - **Binary fields** (`request_hash`, `prev_hash`, `record_hash`, `context_digest`, `sig`,
-//!   `device_cert`, `attestation`) serialize as **base64url-unpadded JSON strings** (JOSE-
-//!   consistent). See [`wire_b64`].
+//! - **Binary fields** (`request_hash`, `prev_hash`, `record_hash`, `attestation`) serialize as
+//!   **base64url-unpadded JSON strings** (JOSE-consistent). See [`wire_b64`]. (`sig` and
+//!   `device_cert` are NOT binary — they are compact-JWS strings; `context_ciphertext` is a
+//!   compact-JWE string.)
 //! - **Timestamps** (`created_at`, `expires_at`, `decided_at`) are `i64` Unix milliseconds (UTC).
 //!   No chrono/time dependency; computing "now"/expiry is a later issue.
 //! - **IDs** are plain `String`. Newtypes are deferred.
@@ -272,11 +273,57 @@ pub struct Constraints {
     pub challenge_required: bool,
 }
 
+// ── ApprovalContext ───────────────────────────────────────────────────────────
+
+/// The complete human-shown approval payload — the plaintext encrypted into the JWE.
+///
+/// Per `docs/contract.md` §Messages, this is the payload that is encrypted to the approver's
+/// device key(s) (the JWE — wired in issue #5) and carried inside an [`ApprovalRequest`]
+/// envelope as `context_ciphertext`. **The relay never sees this** — only the approver's
+/// devices (and the integrator, which builds it locally) hold the plaintext.
+///
+/// The WYSIWYS `request_hash` is computed over the canonical *request-hash input* — every
+/// field of this struct **plus** the envelope's `expires_at`, as one flat object
+/// (see `docs/contract.md` §Wire encoding → request_hash and [`crate::hash`]). The actor's
+/// `attestation` is excluded from that hash (it is a verification artifact the device checks
+/// separately, not shown content) but is carried here for the device to verify after decryption.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalContext {
+    /// The approvable action, in reduced matchable form.
+    pub action: ActionRecord,
+
+    /// Human-readable summary of what is being approved (shown in the inbox).
+    pub summary: String,
+
+    /// The automation requesting approval (identity + attestation).
+    pub actor: Actor,
+
+    /// Coarse risk classification.
+    pub risk: Risk,
+
+    /// Whether the action can be undone if approved.
+    pub reversible: bool,
+
+    /// Allowed decisions and challenge policy.
+    pub constraints: Constraints,
+
+    /// Upstream-gate IDs for audit-chain correlation. Omitted when absent.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub chain: Option<Vec<String>>,
+}
+
 // ── ApprovalRequest ───────────────────────────────────────────────────────────
 
-/// A request for a human decision on an [`ActionRecord`].
+/// The relay-visible **envelope** wrapping the encrypted [`ApprovalContext`].
 ///
-/// See `docs/contract.md` §Messages → ApprovalRequest for the full field list.
+/// Per `docs/contract.md` §Messages → ApprovalRequest, this carries only routing + lifecycle
+/// metadata plus the opaque `context_ciphertext`; **the relay never sees the
+/// [`ApprovalContext`]** (the `ActionRecord`, `summary`, `actor`, constraints, …) or any
+/// rendered content.
+///
+/// `request_hash` is **not** an envelope field: it is computed over the [`ApprovalContext`]
+/// (plus this envelope's `expires_at`) by the integrator pre-send and recomputed by the device
+/// post-decryption, and travels only inside the [`Verdict`]. See [`crate::hash`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     /// Protocol/schema version.
@@ -294,39 +341,11 @@ pub struct ApprovalRequest {
     /// Approver routing ID (maps to the approver's account/inbox on the relay).
     pub approver: String,
 
-    /// The automation requesting approval.
-    pub actor: Actor,
-
-    /// The approvable action, in reduced matchable form.
-    pub action: ActionRecord,
-
-    /// Human-readable summary of what is being approved (shown in the inbox).
-    pub summary: String,
-
-    /// Coarse risk classification (echoes `action.risk` for quick routing).
-    pub risk: Risk,
-
-    /// Whether the action can be undone if approved.
-    pub reversible: bool,
-
-    /// Compact-JWE string encrypting the full action context to the approver's device key(s).
+    /// Compact-JWE string encrypting the [`ApprovalContext`] to the approver's device key(s).
     ///
     /// `None` while encryption is not yet wired (see issue #5). Omitted from JSON when absent.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub context_ciphertext: Option<String>,
-
-    /// SHA-256 over the canonical plaintext the human will see (WYSIWYS binding).
-    ///
-    /// Computed in issue #2. Typed here as a 32-byte field; serializes as base64url-unpadded.
-    #[serde(with = "wire_b64_32")]
-    pub request_hash: [u8; 32],
-
-    /// Allowed decisions and challenge policy.
-    pub constraints: Constraints,
-
-    /// Upstream-gate IDs for audit-chain correlation. Omitted when absent.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub chain: Option<Vec<String>>,
 }
 
 // ── Approver ──────────────────────────────────────────────────────────────────
@@ -455,9 +474,9 @@ pub struct PolicyBlock {
 
 /// One entry in the append-only, hash-chained audit log.
 ///
-/// **Shape only** — hash-chain construction and verification are issue #3. The `prev_hash`,
-/// `record_hash`, and `context_digest` fields are present here as typed placeholders;
-/// computing them (SHA-256 over canonical JSON) is deferred to that issue.
+/// Per `docs/contract.md` §Messages → AuditRecord, `request_hash` (the hash of the canonical
+/// [`ApprovalContext`]) is the complete "prove-what-was-shown-without-storing-plaintext" proof;
+/// there is intentionally **no** separate `context_digest`.
 ///
 /// See `docs/contract.md` §Messages → AuditRecord.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -494,10 +513,6 @@ pub struct AuditRecord {
 
     /// The action that was approved/denied (full record for audit completeness).
     pub action: ActionRecord,
-
-    /// SHA-256 of the plaintext the human was shown (proves WYSIWYS without storing plaintext).
-    #[serde(with = "wire_b64_32")]
-    pub context_digest: [u8; 32],
 
     /// Reserved policy block. v1 always writes `escalate`. See [`PolicyBlock`].
     pub policy: PolicyBlock,
@@ -615,13 +630,17 @@ mod tests {
             created_at: TS_CREATED,
             expires_at: TS_EXPIRES,
             approver: "acc_01hk0000000000000000000001".to_string(),
-            actor: make_actor(),
+            context_ciphertext: None,
+        }
+    }
+
+    fn make_approval_context() -> ApprovalContext {
+        ApprovalContext {
             action: make_action_record(),
             summary: "Force-push to main branch".to_string(),
+            actor: make_actor(),
             risk: Risk::High,
             reversible: false,
-            context_ciphertext: None,
-            request_hash: HASH_A,
             constraints: make_constraints(),
             chain: None,
         }
@@ -660,7 +679,6 @@ mod tests {
             decision: Decision::Approved,
             decided_at: TS_DECIDED,
             action: make_action_record(),
-            context_digest: HASH_B,
             policy: PolicyBlock {
                 decision: PolicyDecision::Escalate,
                 rule_id: None,
@@ -795,6 +813,79 @@ mod tests {
     }
 
     #[test]
+    fn approval_context_round_trip() {
+        let orig = make_approval_context();
+        let json = serde_json::to_string(&orig).unwrap();
+        let back: ApprovalContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(orig, back);
+    }
+
+    /// docs/contract.md §Messages → ApprovalRequest: the envelope is routing + lifecycle +
+    /// the opaque ciphertext, nothing more. The human-facing fields and `request_hash` live
+    /// in the (encrypted) [`ApprovalContext`] / [`Verdict`] respectively, NOT the envelope.
+    #[test]
+    fn approval_request_envelope_omits_context_and_request_hash_keys() {
+        let req = make_approval_request();
+        let val: Value = serde_json::to_value(&req).unwrap();
+
+        // request_hash is computed over the ApprovalContext and carried in the Verdict, never
+        // on the envelope (#28).
+        assert!(
+            val.get("request_hash").is_none(),
+            "ApprovalRequest envelope must NOT carry request_hash (#28)"
+        );
+        // All human-facing context moved into the (encrypted) ApprovalContext.
+        for forbidden in &[
+            "action",
+            "summary",
+            "actor",
+            "risk",
+            "reversible",
+            "constraints",
+            "chain",
+        ] {
+            assert!(
+                val.get(forbidden).is_none(),
+                "ApprovalRequest envelope must NOT carry the context field \"{forbidden}\" (#28)"
+            );
+        }
+
+        // It DOES carry exactly the routing/lifecycle keys.
+        for required in &["v", "id", "created_at", "expires_at", "approver"] {
+            assert!(
+                val.get(required).is_some(),
+                "ApprovalRequest envelope must carry the routing/lifecycle key \"{required}\""
+            );
+        }
+    }
+
+    /// docs/contract.md §Messages → ApprovalContext: `actor.attestation` and the reserved
+    /// semantic `ActionRecord` fields are omitted from JSON when absent.
+    #[test]
+    fn approval_context_omits_attestation_and_reserved_fields_when_none() {
+        let ctx = make_approval_context(); // actor.attestation: None, capabilities/scope: None
+        let val: Value = serde_json::to_value(&ctx).unwrap();
+
+        assert!(
+            val["actor"].get("attestation").is_none(),
+            "actor.attestation: None must be omitted from JSON"
+        );
+        assert!(
+            val["action"].get("capabilities").is_none(),
+            "ActionRecord.capabilities: None must be omitted from JSON (reserved T3 field)"
+        );
+        assert!(
+            val["action"].get("scope").is_none(),
+            "ActionRecord.scope: None must be omitted from JSON (reserved T3 field)"
+        );
+        // chain: None is omitted too.
+        assert!(
+            val.get("chain").is_none(),
+            "ApprovalContext.chain: None must be omitted from JSON"
+        );
+    }
+
+    #[test]
     fn verdict_round_trip() {
         let orig = make_verdict();
         let json = serde_json::to_string(&orig).unwrap();
@@ -897,10 +988,11 @@ mod tests {
     /// docs/contract.md §Wire encoding:
     /// Binary fields serialize as base64url-unpadded JSON strings (not byte arrays).
     /// For a 32-byte value the unpadded base64url encoding is exactly 43 characters.
+    /// (`request_hash` now lives on the [`Verdict`], not the envelope — #28.)
     #[test]
     fn request_hash_serializes_as_base64url_string() {
-        let req = make_approval_request();
-        let val: Value = serde_json::to_value(&req).unwrap();
+        let verdict = make_verdict();
+        let val: Value = serde_json::to_value(&verdict).unwrap();
         let encoded = val["request_hash"]
             .as_str()
             .expect("request_hash must be a JSON string, not an array");
@@ -1067,16 +1159,12 @@ mod tests {
 
     #[test]
     fn approval_request_optional_none_fields_omitted() {
-        let req = make_approval_request(); // context_ciphertext: None, chain: None
+        let req = make_approval_request(); // context_ciphertext: None
         let val: Value = serde_json::to_value(&req).unwrap();
 
         assert!(
             val.get("context_ciphertext").is_none(),
             "context_ciphertext: None must be omitted from JSON"
-        );
-        assert!(
-            val.get("chain").is_none(),
-            "chain: None must be omitted from JSON"
         );
     }
 

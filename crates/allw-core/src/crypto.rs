@@ -56,7 +56,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-use crate::contract::{ApprovalRequest, Approver, Decision, Verdict};
+use crate::contract::{ApprovalContext, ApprovalRequest, Approver, Decision, Verdict};
 
 // ── JWS `typ` domain separators ─────────────────────────────────────────────────
 
@@ -707,16 +707,17 @@ impl std::error::Error for VerifyError {}
 ///    (`request_id`, `decision`, `decided_at`, `request_hash`, `challenge_response`) must equal
 ///    its signed claim ([`VerifyError::ClaimsMismatch`]).
 /// 4. **Binds the EXACT request — id AND hash** (checklist #2). `claims.request_id == request.id`
-///    ([`VerifyError::RequestIdMismatch`]) AND `claims.request_hash == request.request_hash`
-///    ([`VerifyError::RequestHashMismatch`]). The id check is essential because `request_hash`
-///    excludes `id`, so it alone cannot distinguish two requests that render identically — this
-///    is the "no swap" half of the binding invariant.
+///    ([`VerifyError::RequestIdMismatch`]) AND `claims.request_hash` equals the hash recomputed
+///    locally from the [`ApprovalContext`] + the envelope's `expires_at` (via
+///    [`crate::hash::compute_request_hash`]) ([`VerifyError::RequestHashMismatch`]). The id check
+///    is essential because `request_hash` excludes `id`, so it alone cannot distinguish two
+///    requests that render identically — this is the "no swap" half of the binding invariant.
 /// 5. **Freshness / window** (checklist #4). `now_ms <= request.expires_at`
 ///    ([`VerifyError::Expired`]); `created_at <= decided_at <= expires_at`
 ///    ([`VerifyError::DecidedAtOutOfWindow`]).
 /// 6. **Anti-replay** (checklist #4). The nonce must be unseen in `nonce_store`
 ///    ([`VerifyError::Replay`]).
-/// 7. **Challenge** (checklist #5). If `request.constraints.challenge_required`, a non-empty
+/// 7. **Challenge** (checklist #5). If `context.constraints.challenge_required`, a non-empty
 ///    `challenge_response` must be present in both the claims and the outer verdict
 ///    ([`VerifyError::ChallengeMissing`]).
 ///
@@ -740,6 +741,7 @@ impl std::error::Error for VerifyError {}
 pub fn verify_verdict(
     verdict: &Verdict,
     request: &ApprovalRequest,
+    context: &ApprovalContext,
     approver_root: &PublicKey,
     nonce_store: &mut dyn NonceStore,
     now_ms: i64,
@@ -825,7 +827,11 @@ pub fn verify_verdict(
     if claims.request_id != request.id {
         return Err(VerifyError::RequestIdMismatch);
     }
-    if claims.request_hash != request.request_hash {
+    // Recompute the WYSIWYS hash from the plaintext context the integrator holds (plus the
+    // envelope's expires_at) and bind the signed claim to it. The device computed and signed the
+    // same value from the decrypted ApprovalContext (#28 / request-hash/v2).
+    let expected = crate::hash::compute_request_hash(context, request.expires_at);
+    if claims.request_hash != expected {
         return Err(VerifyError::RequestHashMismatch);
     }
 
@@ -843,7 +849,7 @@ pub fn verify_verdict(
     }
 
     // ── Step 7: challenge presence (value validation deferred) ───────────────────
-    if request.constraints.challenge_required {
+    if context.constraints.challenge_required {
         // TODO(#follow-up): validate challenge value — match the signed challenge_response
         // against the expected number-match challenge once that derivation is specced. v1
         // only proves a challenge response was signed, not that it is the *correct* one.
@@ -907,8 +913,10 @@ pub fn effective_allow(
 mod tests {
     use super::*;
     use crate::contract::{
-        ActionRecord, Actor, ApprovalRequest, Constraints, Risk, Surface, SyntacticSubstrate,
+        ActionRecord, Actor, ApprovalContext, ApprovalRequest, Constraints, Risk, Surface,
+        SyntacticSubstrate,
     };
+    use crate::hash::compute_request_hash;
 
     // ── Fixed seeds (never rand) ──────────────────────────────────────────────────
     const ROOT_SEED: [u8; 32] = [0x11u8; 32];
@@ -931,7 +939,8 @@ mod tests {
     const NOW_OK: i64 = 1_700_001_500_000;
 
     // ── Fixed binding values ──────────────────────────────────────────────────────
-    const REQUEST_HASH: [u8; 32] = [0xAB; 32];
+    // A hash that deliberately does NOT match the canonical hash of the standard context, used
+    // for "bound to a different request" negative tests.
     const OTHER_REQUEST_HASH: [u8; 32] = [0xCD; 32];
     const NONCE: &[u8] = &[0x01, 0x02, 0x03, 0x04];
 
@@ -975,31 +984,42 @@ mod tests {
         }
     }
 
-    /// Builds a request bound to `request_hash`, with the given challenge requirement.
-    fn make_request(request_hash: [u8; 32], challenge_required: bool) -> ApprovalRequest {
+    /// Builds the relay-visible envelope (no `request_hash`, no human-shown context).
+    fn make_request() -> ApprovalRequest {
         ApprovalRequest {
             v: 1,
             id: REQUEST_ID.to_string(),
             created_at: TS_CREATED,
             expires_at: TS_EXPIRES,
             approver: ACCOUNT_ID.to_string(),
+            context_ciphertext: None,
+        }
+    }
+
+    /// Builds the human-shown [`ApprovalContext`] with the given challenge requirement.
+    fn make_context(challenge_required: bool) -> ApprovalContext {
+        ApprovalContext {
+            action: make_action(),
+            summary: "Force-push to main".to_string(),
             actor: Actor {
                 id: "machine:test".to_string(),
                 kind: "claude-code".to_string(),
                 attestation: None,
             },
-            action: make_action(),
-            summary: "Force-push to main".to_string(),
             risk: Risk::High,
             reversible: false,
-            context_ciphertext: None,
-            request_hash,
             constraints: Constraints {
                 allowed_decisions: vec![Decision::Approved, Decision::Denied],
                 challenge_required,
             },
             chain: None,
         }
+    }
+
+    /// The canonical WYSIWYS hash of the standard context bound to [`TS_EXPIRES`]. This is the
+    /// value a correctly-signed verdict must carry so [`verify_verdict`] accepts it.
+    fn canonical_hash(challenge_required: bool) -> [u8; 32] {
+        compute_request_hash(&make_context(challenge_required), TS_EXPIRES)
     }
 
     /// A device cert signed by `root`, certifying the standard device key, no expiry.
@@ -1033,11 +1053,12 @@ mod tests {
         }
     }
 
-    /// A fully signed, approved verdict bound to `REQUEST_HASH`, with a cert from the real root.
+    /// A fully signed, approved verdict bound to the canonical hash of the standard context
+    /// (challenge not required), with a cert from the real root.
     fn make_signed_approved() -> Verdict {
         let cert = make_cert(&root_key());
         sign_verdict(
-            &make_unsigned(Decision::Approved, REQUEST_HASH, None),
+            &make_unsigned(Decision::Approved, canonical_hash(false), None),
             &device_key(),
             NONCE,
             Some(cert),
@@ -1050,12 +1071,13 @@ mod tests {
     #[test]
     fn round_trip_happy_path_verifies() {
         let verdict = make_signed_approved();
-        let request = make_request(REQUEST_HASH, false);
+        let request = make_request();
+        let context = make_context(false);
         let root_pub = root_key().public_key();
         let mut store = InMemoryNonceStore::new();
 
-        let verified =
-            verify_verdict(&verdict, &request, &root_pub, &mut store, NOW_OK).expect("must verify");
+        let verified = verify_verdict(&verdict, &request, &context, &root_pub, &mut store, NOW_OK)
+            .expect("must verify");
 
         assert_eq!(verified.decision, Decision::Approved);
         assert_eq!(verified.device_id, DEVICE_ID);
@@ -1085,12 +1107,20 @@ mod tests {
     fn cert_signed_by_different_root_fails_cert_signature() {
         // Cert is signed by the REAL root, but we verify against a DIFFERENT root pubkey.
         let verdict = make_signed_approved();
-        let request = make_request(REQUEST_HASH, false);
+        let request = make_request();
+        let context = make_context(false);
         let wrong_root_pub = SigningKeyPair::from_seed(&OTHER_ROOT_SEED).public_key();
         let mut store = InMemoryNonceStore::new();
 
-        let err = verify_verdict(&verdict, &request, &wrong_root_pub, &mut store, NOW_OK)
-            .expect_err("a cert not signed by the trusted root must fail");
+        let err = verify_verdict(
+            &verdict,
+            &request,
+            &context,
+            &wrong_root_pub,
+            &mut store,
+            NOW_OK,
+        )
+        .expect_err("a cert not signed by the trusted root must fail");
         assert_eq!(err, VerifyError::CertSignatureInvalid);
     }
 
@@ -1107,17 +1137,19 @@ mod tests {
             None,
         );
         let verdict = sign_verdict(
-            &make_unsigned(Decision::Approved, REQUEST_HASH, None),
+            &make_unsigned(Decision::Approved, canonical_hash(false), None),
             &device_key(),
             NONCE,
             Some(cert),
         );
-        let request = make_request(REQUEST_HASH, false);
+        let request = make_request();
+        let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
 
         let err = verify_verdict(
             &verdict,
             &request,
+            &context,
             &root_key().public_key(),
             &mut store,
             NOW_OK,
@@ -1138,17 +1170,19 @@ mod tests {
             Some(TS_DECIDED), // cert expires before NOW_OK
         );
         let verdict = sign_verdict(
-            &make_unsigned(Decision::Approved, REQUEST_HASH, None),
+            &make_unsigned(Decision::Approved, canonical_hash(false), None),
             &device_key(),
             NONCE,
             Some(cert),
         );
-        let request = make_request(REQUEST_HASH, false);
+        let request = make_request();
+        let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
 
         let err = verify_verdict(
             &verdict,
             &request,
+            &context,
             &root_key().public_key(),
             &mut store,
             NOW_OK,
@@ -1161,17 +1195,19 @@ mod tests {
     #[test]
     fn missing_device_cert_detected() {
         let verdict = sign_verdict(
-            &make_unsigned(Decision::Approved, REQUEST_HASH, None),
+            &make_unsigned(Decision::Approved, canonical_hash(false), None),
             &device_key(),
             NONCE,
             None, // no cert
         );
-        let request = make_request(REQUEST_HASH, false);
+        let request = make_request();
+        let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
 
         let err = verify_verdict(
             &verdict,
             &request,
+            &context,
             &root_key().public_key(),
             &mut store,
             NOW_OK,
@@ -1196,12 +1232,14 @@ mod tests {
         sig_part.push(replacement);
         verdict.sig = parts.join(".");
 
-        let request = make_request(REQUEST_HASH, false);
+        let request = make_request();
+        let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
 
         let err = verify_verdict(
             &verdict,
             &request,
+            &context,
             &root_key().public_key(),
             &mut store,
             NOW_OK,
@@ -1223,12 +1261,14 @@ mod tests {
         let mut verdict = make_signed_approved();
         verdict.decision = Decision::Denied; // claim still says Approved
 
-        let request = make_request(REQUEST_HASH, false);
+        let request = make_request();
+        let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
 
         let err = verify_verdict(
             &verdict,
             &request,
+            &context,
             &root_key().public_key(),
             &mut store,
             NOW_OK,
@@ -1244,12 +1284,14 @@ mod tests {
         let mut verdict = make_signed_approved();
         verdict.request_hash = OTHER_REQUEST_HASH; // claim still says REQUEST_HASH
 
-        let request = make_request(REQUEST_HASH, false);
+        let request = make_request();
+        let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
 
         let err = verify_verdict(
             &verdict,
             &request,
+            &context,
             &root_key().public_key(),
             &mut store,
             NOW_OK,
@@ -1276,12 +1318,14 @@ mod tests {
             Some(cert),
         );
         // Request is bound to REQUEST_HASH, not OTHER_REQUEST_HASH.
-        let request = make_request(REQUEST_HASH, false);
+        let request = make_request();
+        let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
 
         let err = verify_verdict(
             &verdict,
             &request,
+            &context,
             &root_key().public_key(),
             &mut store,
             NOW_OK,
@@ -1309,12 +1353,14 @@ mod tests {
         parts[1] = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&forged).unwrap());
         verdict.device_cert = Some(parts.join("."));
 
-        let request = make_request(REQUEST_HASH, false);
+        let request = make_request();
+        let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
 
         let err = verify_verdict(
             &verdict,
             &request,
+            &context,
             &root_key().public_key(),
             &mut store,
             NOW_OK,
@@ -1335,7 +1381,7 @@ mod tests {
         let unsigned = UnsignedVerdict {
             v: 1,
             request_id: "req_OTHER".to_string(), // signed for a DIFFERENT request id...
-            request_hash: REQUEST_HASH,          // ...but identical hashed content
+            request_hash: canonical_hash(false), // ...but identical hashed content
             decision: Decision::Approved,
             decided_at: TS_DECIDED,
             approver: make_approver(),
@@ -1345,12 +1391,14 @@ mod tests {
         let verdict = sign_verdict(&unsigned, &device_key(), NONCE, Some(cert));
 
         // Request B: different id, SAME request_hash (renders identically).
-        let request = make_request(REQUEST_HASH, false); // id == REQUEST_ID
+        let request = make_request();
+        let context = make_context(false); // id == REQUEST_ID
         let mut store = InMemoryNonceStore::new();
 
         let err = verify_verdict(
             &verdict,
             &request,
+            &context,
             &root_key().public_key(),
             &mut store,
             NOW_OK,
@@ -1365,19 +1413,25 @@ mod tests {
     fn tampered_outer_challenge_response_detected() {
         let cert = make_cert(&root_key());
         let mut verdict = sign_verdict(
-            &make_unsigned(Decision::Approved, REQUEST_HASH, Some("42".to_string())),
+            &make_unsigned(
+                Decision::Approved,
+                canonical_hash(true),
+                Some("42".to_string()),
+            ),
             &device_key(),
             NONCE,
             Some(cert),
         );
         verdict.challenge_response = Some("99".to_string()); // tamper the OUTER field only
 
-        let request = make_request(REQUEST_HASH, true);
+        let request = make_request();
+        let context = make_context(true);
         let mut store = InMemoryNonceStore::new();
 
         let err = verify_verdict(
             &verdict,
             &request,
+            &context,
             &root_key().public_key(),
             &mut store,
             NOW_OK,
@@ -1409,17 +1463,19 @@ mod tests {
         };
         let cert = encode_compact_jws(&header, &claims, &root_key());
         let verdict = sign_verdict(
-            &make_unsigned(Decision::Approved, REQUEST_HASH, None),
+            &make_unsigned(Decision::Approved, canonical_hash(false), None),
             &device_key(),
             NONCE,
             Some(cert),
         );
-        let request = make_request(REQUEST_HASH, false);
+        let request = make_request();
+        let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
 
         let err = verify_verdict(
             &verdict,
             &request,
+            &context,
             &root_key().public_key(),
             &mut store,
             NOW_OK,
@@ -1436,17 +1492,19 @@ mod tests {
     fn authenticated_denial_returns_not_approved() {
         let cert = make_cert(&root_key());
         let verdict = sign_verdict(
-            &make_unsigned(Decision::Denied, REQUEST_HASH, None),
+            &make_unsigned(Decision::Denied, canonical_hash(false), None),
             &device_key(),
             NONCE,
             Some(cert),
         );
-        let request = make_request(REQUEST_HASH, false);
+        let request = make_request();
+        let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
 
         let err = verify_verdict(
             &verdict,
             &request,
+            &context,
             &root_key().public_key(),
             &mut store,
             NOW_OK,
@@ -1466,17 +1524,19 @@ mod tests {
     fn authenticated_expired_decision_returns_not_approved() {
         let cert = make_cert(&root_key());
         let verdict = sign_verdict(
-            &make_unsigned(Decision::Expired, REQUEST_HASH, None),
+            &make_unsigned(Decision::Expired, canonical_hash(false), None),
             &device_key(),
             NONCE,
             Some(cert),
         );
-        let request = make_request(REQUEST_HASH, false);
+        let request = make_request();
+        let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
 
         let err = verify_verdict(
             &verdict,
             &request,
+            &context,
             &root_key().public_key(),
             &mut store,
             NOW_OK,
@@ -1495,17 +1555,19 @@ mod tests {
     fn authenticated_aborted_decision_returns_not_approved() {
         let cert = make_cert(&root_key());
         let verdict = sign_verdict(
-            &make_unsigned(Decision::Aborted, REQUEST_HASH, None),
+            &make_unsigned(Decision::Aborted, canonical_hash(false), None),
             &device_key(),
             NONCE,
             Some(cert),
         );
-        let request = make_request(REQUEST_HASH, false);
+        let request = make_request();
+        let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
 
         let err = verify_verdict(
             &verdict,
             &request,
+            &context,
             &root_key().public_key(),
             &mut store,
             NOW_OK,
@@ -1525,12 +1587,14 @@ mod tests {
     #[test]
     fn now_past_expiry_detected() {
         let verdict = make_signed_approved();
-        let request = make_request(REQUEST_HASH, false);
+        let request = make_request();
+        let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
 
         let err = verify_verdict(
             &verdict,
             &request,
+            &context,
             &root_key().public_key(),
             &mut store,
             TS_EXPIRES + 1, // now is past expiry
@@ -1543,15 +1607,17 @@ mod tests {
     #[test]
     fn decided_at_before_created_detected() {
         let cert = make_cert(&root_key());
-        let mut unsigned = make_unsigned(Decision::Approved, REQUEST_HASH, None);
+        let mut unsigned = make_unsigned(Decision::Approved, canonical_hash(false), None);
         unsigned.decided_at = TS_CREATED - 1; // before the window opens
         let verdict = sign_verdict(&unsigned, &device_key(), NONCE, Some(cert));
-        let request = make_request(REQUEST_HASH, false);
+        let request = make_request();
+        let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
 
         let err = verify_verdict(
             &verdict,
             &request,
+            &context,
             &root_key().public_key(),
             &mut store,
             NOW_OK,
@@ -1564,10 +1630,11 @@ mod tests {
     #[test]
     fn decided_at_after_expiry_detected() {
         let cert = make_cert(&root_key());
-        let mut unsigned = make_unsigned(Decision::Approved, REQUEST_HASH, None);
+        let mut unsigned = make_unsigned(Decision::Approved, canonical_hash(false), None);
         unsigned.decided_at = TS_EXPIRES + 1; // after the window closes
         let verdict = sign_verdict(&unsigned, &device_key(), NONCE, Some(cert));
-        let request = make_request(REQUEST_HASH, false);
+        let request = make_request();
+        let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
 
         // Use a now that is itself past expiry-free: pick now == decided_at so the Expired check
@@ -1578,6 +1645,7 @@ mod tests {
         let err = verify_verdict(
             &verdict,
             &request,
+            &context,
             &root_key().public_key(),
             &mut store,
             TS_EXPIRES, // now == expires_at, so Expired (now>expiry) does NOT trip
@@ -1592,14 +1660,15 @@ mod tests {
     #[test]
     fn replay_detected_on_second_verification() {
         let verdict = make_signed_approved();
-        let request = make_request(REQUEST_HASH, false);
+        let request = make_request();
+        let context = make_context(false);
         let root_pub = root_key().public_key();
         let mut store = InMemoryNonceStore::new();
 
-        let first = verify_verdict(&verdict, &request, &root_pub, &mut store, NOW_OK);
+        let first = verify_verdict(&verdict, &request, &context, &root_pub, &mut store, NOW_OK);
         assert!(first.is_ok(), "first verification must succeed");
 
-        let err = verify_verdict(&verdict, &request, &root_pub, &mut store, NOW_OK)
+        let err = verify_verdict(&verdict, &request, &context, &root_pub, &mut store, NOW_OK)
             .expect_err("second verification with the same nonce must fail");
         assert_eq!(err, VerifyError::Replay);
     }
@@ -1609,13 +1678,23 @@ mod tests {
     /// checklist #5: challenge required but no challenge_response → ChallengeMissing.
     #[test]
     fn challenge_required_but_missing_detected() {
-        let verdict = make_signed_approved(); // no challenge_response
-        let request = make_request(REQUEST_HASH, true); // challenge_required = true
+        // Verdict bound to the challenge-required context's hash (so the request_hash binding
+        // passes and we reach the challenge check), but with NO challenge_response.
+        let cert = make_cert(&root_key());
+        let verdict = sign_verdict(
+            &make_unsigned(Decision::Approved, canonical_hash(true), None),
+            &device_key(),
+            NONCE,
+            Some(cert),
+        );
+        let request = make_request();
+        let context = make_context(true);
         let mut store = InMemoryNonceStore::new();
 
         let err = verify_verdict(
             &verdict,
             &request,
+            &context,
             &root_key().public_key(),
             &mut store,
             NOW_OK,
@@ -1629,17 +1708,23 @@ mod tests {
     fn challenge_required_and_present_passes() {
         let cert = make_cert(&root_key());
         let verdict = sign_verdict(
-            &make_unsigned(Decision::Approved, REQUEST_HASH, Some("42".to_string())),
+            &make_unsigned(
+                Decision::Approved,
+                canonical_hash(true),
+                Some("42".to_string()),
+            ),
             &device_key(),
             NONCE,
             Some(cert),
         );
-        let request = make_request(REQUEST_HASH, true);
+        let request = make_request();
+        let context = make_context(true);
         let mut store = InMemoryNonceStore::new();
 
         let verified = verify_verdict(
             &verdict,
             &request,
+            &context,
             &root_key().public_key(),
             &mut store,
             NOW_OK,
@@ -1653,17 +1738,23 @@ mod tests {
     fn challenge_required_empty_response_treated_as_missing() {
         let cert = make_cert(&root_key());
         let verdict = sign_verdict(
-            &make_unsigned(Decision::Approved, REQUEST_HASH, Some(String::new())),
+            &make_unsigned(
+                Decision::Approved,
+                canonical_hash(true),
+                Some(String::new()),
+            ),
             &device_key(),
             NONCE,
             Some(cert),
         );
-        let request = make_request(REQUEST_HASH, true);
+        let request = make_request();
+        let context = make_context(true);
         let mut store = InMemoryNonceStore::new();
 
         let err = verify_verdict(
             &verdict,
             &request,
+            &context,
             &root_key().public_key(),
             &mut store,
             NOW_OK,
@@ -1725,17 +1816,19 @@ mod tests {
         // ...but the verdict is signed by a DIFFERENT device key.
         let imposter = SigningKeyPair::from_seed(&[0x99u8; 32]);
         let verdict = sign_verdict(
-            &make_unsigned(Decision::Approved, REQUEST_HASH, None),
+            &make_unsigned(Decision::Approved, canonical_hash(false), None),
             &imposter,
             NONCE,
             Some(cert),
         );
-        let request = make_request(REQUEST_HASH, false);
+        let request = make_request();
+        let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
 
         let err = verify_verdict(
             &verdict,
             &request,
+            &context,
             &root_key().public_key(),
             &mut store,
             NOW_OK,
