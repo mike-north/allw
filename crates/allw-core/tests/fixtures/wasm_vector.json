@@ -1,0 +1,10 @@
+{
+  "context_json": "{\"action\":{\"record_schema_version\":1,\"surface\":\"command\",\"syntactic\":{\"bin\":\"git\",\"raw\":\"git push\"},\"risk\":\"high\"},\"summary\":\"push to main\",\"actor\":{\"id\":\"machine:x\",\"kind\":\"claude-code\"},\"risk\":\"high\",\"reversible\":false,\"constraints\":{\"allowed_decisions\":[\"approved\",\"denied\"],\"challenge_required\":false}}",
+  "expires_at": 1700003600000,
+  "expected_request_hash_hex": "809fe4763353e8b10417f118581b510ebfe52b0725d35842f391f3d0c3d47be7",
+  "expected_request_hash_b64": "gJ_kdjNT6LEEF_EYWBtRDr_lKwcl01hC85Hz0MPUe-c",
+  "verdict_json": "{\"v\":1,\"request_id\":\"req_wasm_vector_01\",\"request_hash\":\"gJ_kdjNT6LEEF_EYWBtRDr_lKwcl01hC85Hz0MPUe-c\",\"decision\":\"approved\",\"decided_at\":1700001000000,\"approver\":{\"account_id\":\"acc_wasm_vector_01\",\"device_id\":\"dev_wasm_vector_01\"},\"sig\":\"eyJhbGciOiJFZERTQSIsInR5cCI6ImFsbHctdmVyZGljdCtqd3MiLCJraWQiOiJkZXZfd2FzbV92ZWN0b3JfMDEifQ.eyJyZXF1ZXN0X2lkIjoicmVxX3dhc21fdmVjdG9yXzAxIiwicmVxdWVzdF9oYXNoIjoiZ0pfa2RqTlQ2TEVFRl9FWVdCdFJEcl9sS3djbDAxaEM4NUh6ME1QVWUtYyIsImRlY2lzaW9uIjoiYXBwcm92ZWQiLCJkZWNpZGVkX2F0IjoxNzAwMDAxMDAwMDAwLCJub25jZSI6Im9iTEQxQSJ9.s__-4DWA3xFB-QOqBdKTYI13Z-Ym8I_LIz0N60D4I9VjCu9LMGeGIJ9rvMiYU3R5m47kxc7ticE4iDRzJHJLAw\",\"device_cert\":\"eyJhbGciOiJFZERTQSIsInR5cCI6ImFsbHctZGV2aWNlLWNlcnQrandzIiwia2lkIjoiYWNjX3dhc21fdmVjdG9yXzAxIn0.eyJhY2NvdW50X2lkIjoiYWNjX3dhc21fdmVjdG9yXzAxIiwiZGV2aWNlX2lkIjoiZGV2X3dhc21fdmVjdG9yXzAxIiwiZGV2aWNlX3B1YmtleSI6Im9KcWw5SHBuV1lBdi1WWDQzQzBxRktYSm5TTy1sX2hrRW5fNU9EUlZwUEEiLCJpc3N1ZWRfYXQiOjE3MDAwMDAwMDAwMDB9.7W-sbmeCIe72fvPJ3XAiwLS4IZTnQjRqvwQyyNU130YCgVwaKIZRMyD_ETNxlELLEnms59ZX1zcQZbA0bQvRAA\"}",
+  "request_json": "{\"v\":1,\"id\":\"req_wasm_vector_01\",\"created_at\":1700000000000,\"expires_at\":1700003600000,\"approver\":\"acc_wasm_vector_01\"}",
+  "approver_root_pubkey_b64": "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc",
+  "now_ms": 1700001500000
+}
