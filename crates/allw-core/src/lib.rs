@@ -21,6 +21,7 @@ pub mod audit;
 pub mod contract;
 pub mod crypto;
 pub mod hash;
+pub mod mcp;
 
 pub use audit::{
     compute_record_hash, AuditChain, AuditChainError, AuditEntryInput, GENESIS_PREV_HASH,
@@ -35,3 +36,4 @@ pub use crypto::{
     VerdictClaims, VerifiedVerdict, VerifyError,
 };
 pub use hash::{canonical_request_bytes, compute_request_hash};
+pub use mcp::action_from_mcp_tool_call;
