@@ -9,11 +9,14 @@
     "deploy": "wrangler deploy",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint src",
-    "test": "echo \"no tests yet\" && exit 0",
+    "test": "vitest run",
     "build": "echo \"relay builds via wrangler\" && exit 0"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20260101.0",
+    "@cloudflare/vitest-pool-workers": "^0.16.14",
+    "@cloudflare/workers-types": "^4.20260609.1",
+    "@types/node": "^22.0.0",
+    "vitest": "^4.1.0",
     "wrangler": "^4.0.0"
   },
   "license": "MIT"
