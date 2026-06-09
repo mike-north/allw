@@ -17,8 +17,10 @@ Thin in surface, rich in contract. Companion to [architecture.md](./architecture
    key(s); the verdict is signed by a device key.
 2. **Verifiable verdict** — a signed artifact any party can verify _without trusting the relay_, cryptographically
    **bound to the exact request** (no replay, no swap).
-3. **WYSIWYS (what you see is what you sign)** — the verdict binds to a hash of the _plaintext the human was
-   shown_, computed device-side after decryption. Closes the context/action TOCTOU gap.
+3. **WYSIWYS (what you see is what you sign)** — the verdict binds to a single `request_hash` over the _entire_
+   human-shown payload — the canonical `ApprovalContext` **plus** the shown `expires_at`, as one flat object (the
+   _request-hash input_; see §Wire encoding) — computed device-side after decryption. One hash, complete binding
+   (no separate `context_digest`). Closes the context/action TOCTOU gap.
 4. **Requester attestation** — every request carries an attestable actor identity (v1: **actor-key**), so the
    approver sees a cryptographically-verified origin.
 5. **Chain-composable & monotonic** — the primitive **never returns "allow."** It returns _"the human verifiably
@@ -46,11 +48,14 @@ reserved and null. The contract is **action-agnostic**: it transports and binds 
 
 ## Lifecycle
 
-1. Integrator builds an **ApprovalRequest** (actor identity + `ActionRecord` + constraints).
-2. Encrypts the sensitive context to the approver's device key(s) → `context_ciphertext` (JWE). Computes
-   `request_hash` over the canonical plaintext.
-3. Submits to relay → push **wakeup (request id only)** → device fetches ciphertext.
-4. Device decrypts, **renders** (WYSIWYS), human decides; destructive ops may require a **number-match** challenge.
+1. Integrator builds an **ApprovalContext** (actor identity + `ActionRecord` + `summary` + `risk` + `reversible` +
+   constraints) and computes `request_hash` over the canonical _request-hash input_ — the `ApprovalContext` fields
+   **plus** the shown `expires_at`, as one flat object (see §Wire encoding).
+2. Encrypts the `ApprovalContext` to the approver's device key(s) → `context_ciphertext` (JWE), and wraps it in an
+   **ApprovalRequest** envelope (routing + lifecycle only).
+3. Submits to relay → push **wakeup (request id only)** → device fetches the envelope's ciphertext.
+4. Device decrypts the `ApprovalContext`, verifies the actor `attestation`, **renders** (WYSIWYS), recomputes
+   `request_hash`, human decides; destructive ops may require a **number-match** challenge.
 5. Device emits a **Verdict** signed (JWS/COSE) over `(request_id, request_hash, decision, decided_at, nonce)`.
 6. Integrator **verifies** (checklist below), composes with its own + upstream policy, appends an **AuditRecord**.
 
@@ -58,13 +63,39 @@ reserved and null. The contract is **action-agnostic**: it transports and binds 
 
 ## Messages
 
-### ApprovalRequest
+> **Implementation status.** This section reflects the model resolved in
+> [#28](https://github.com/mike-north/allw/issues/28). The merged v1 core (`crates/allw-core`) still implements the
+> pre-#28 shape — a flat `ApprovalRequest` with top-level `action`/`summary`/…, a four-field `request_hash`
+> (`request-hash/v1`), and a `context_digest` on `AuditRecord`. Bringing the code to the shape below (the
+> `ApprovalContext` split, the broadened `request-hash/v2`, and removing `context_digest`) is done in **#5** and a
+> small core refactor; this PR locks the contract first.
 
-`v` · `id` · `created_at` · `expires_at` · `approver` (routing id) ·
-`actor` { `id`, `kind`, `attestation`: actor-key signature } ·
-`action`: **`ActionRecord`** · `summary` · `risk`(low|med|high|critical) · `reversible` ·
-`context_ciphertext` (JWE to device key[s]) · `request_hash` ·
-`constraints` { allowed verdicts, challenge policy } · `chain`? (upstream-gate ids, audit correlation only).
+The human-shown payload and the wire envelope are **separate** (resolved in
+[#28](https://github.com/mike-north/allw/issues/28)): everything human-facing is encrypted into an
+**`ApprovalContext`**; the **`ApprovalRequest`** the relay sees is a minimal routing/lifecycle envelope wrapping the
+ciphertext. **The relay never sees the `ActionRecord` or any rendered content.**
+
+### ApprovalRequest — _envelope (plaintext; relay-visible)_
+
+`v` · `id` · `created_at` · `expires_at` · `approver` (routing id) · `context_ciphertext` (JWE to device key[s]).
+
+Routing + lifecycle + the opaque ciphertext, nothing more. `request_hash` is **not** an envelope field — it is
+computed over the `ApprovalContext` (below) by the integrator (locally, pre-send) and recomputed by the device
+(post-decryption), and travels only inside the **Verdict**. (A separate transport signature over the envelope
+proves the sender is an enrolled actor; that is a relay concern and needs no visibility into content.)
+
+### ApprovalContext — _inside the JWE; the approver's devices only_
+
+`action`: **`ActionRecord`** · `summary` · `actor` { `id`, `kind`, `attestation`: actor-key signature } ·
+`risk`(low|med|high|critical) · `reversible` · `constraints` { allowed verdicts, challenge policy } ·
+`chain`? (upstream-gate ids, audit correlation only).
+
+This is the **complete human-shown payload**; `request_hash` is computed over the canonical _request-hash input_ —
+these `ApprovalContext` fields **plus** the shown `expires_at`, as one flat object (see §Wire encoding) — so that
+one hash is the complete WYSIWYS binding. The actor's `attestation` is verified by the **device** after decryption
+(the relay never sees it); the integrator still holds the plaintext `ApprovalContext`
+locally (it builds it and runs its policy engine before escalating), so this split only changes what crosses the
+wire to the relay.
 
 ### Verdict — _one-shot and scope-free_
 
@@ -77,16 +108,23 @@ reserved and null. The contract is **action-agnostic**: it transports and binds 
 ### AuditRecord — _append-only, hash-chained_
 
 `seq` · `prev_hash` · `record_hash` · `request_id` · `request_hash` · `actor` · `approver` · `decision` ·
-`decided_at` · `action`(ActionRecord) · `context_digest` (proves what was shown without storing plaintext) ·
+`decided_at` · `action`(ActionRecord) ·
 `policy` { decision, rule_id?, tier, schema_version } (reserved; v1 writes `escalate`) · `note`? ·
 verdict `sig` (+ optional integrator counter-sign). Periodically anchor the head hash for non-repudiation.
+
+> No `context_digest` — `request_hash` (the hash of the canonical `ApprovalContext`) **is** the
+> "prove-what-was-shown-without-storing-plaintext" proof, so a second digest is redundant
+> ([#28](https://github.com/mike-north/allw/issues/28)).
 
 ---
 
 ## Verification checklist (integrator MUST)
 
 1. Signature valid against the approver's device/account root key.
-2. `request_hash` matches the request the integrator issued (binds verdict ↔ exact context).
+2. Bound to the **exact request** (no swap): the verdict's `request_id` equals the request's `id`, **and** its
+   `request_hash` equals the integrator's locally-computed hash of the canonical `ApprovalContext`. Both are
+   required — `request_hash` excludes `id`, so two content-identical requests share a hash; the `id` check
+   distinguishes them.
 3. `decision == approved`.
 4. Not expired; `decided_at` within window; nonce unseen (anti-replay).
 5. If destructive & challenge required: `challenge_response` correct.
@@ -117,8 +155,10 @@ device(s) once any surface resolves, and **dedupe** across transports. See [arch
 
 ## Transport
 
-Relay routes only. Push (APNs / FCM; **Web Push later**) carries a wakeup + request id — **never context** (push
-isn't E2EE / is size-limited). Context is fetched as JWE and decrypted on-device.
+Relay routes only — it sees the **ApprovalRequest envelope** (routing + lifecycle + the opaque
+`context_ciphertext`) and never the `ApprovalContext` (the `ActionRecord`, `summary`, `actor`, constraints, …).
+Push (APNs / FCM; **Web Push later**) carries a wakeup + request id — **never context** (push isn't E2EE / is
+size-limited). The envelope's ciphertext is fetched as JWE and decrypted on-device.
 
 ---
 
@@ -131,7 +171,7 @@ isn't E2EE / is size-limited). Context is fetched as JWE and decrypted on-device
 
 ## Wire encoding
 
-- **Binary fields** (`request_hash`, `prev_hash`, `record_hash`, `context_digest`, `sig`,
+- **Binary fields** (`request_hash`, `prev_hash`, `record_hash`, `sig`,
   `attestation`) serialize as **base64url-unpadded JSON strings** (JOSE-consistent); enables byte-identical
   output across the Rust core and the WASM/TS surface. (`device_cert` is **not** a binary field — it is a
   certificate string; once verdicts are signed it carries a compact JWS. See §Identity & keys.)
@@ -140,35 +180,47 @@ isn't E2EE / is size-limited). Context is fetched as JWE and decrypted on-device
 
 ### request_hash (WYSIWYS canonicalization)
 
-`request_hash` binds a [`Verdict`] to the exact content the human was shown. Both the integrator
-(pre-send) and the device (post-decrypt) compute the value independently from the same plaintext;
-the WASM binding must reproduce the same bytes.
+`request_hash` binds a [`Verdict`] to the exact content the human was shown, and is the **complete** WYSIWYS
+binding — there is no separate `context_digest` ([#28](https://github.com/mike-north/allw/issues/28)). Both the
+integrator (pre-send) and the device (post-decrypt) compute it independently and **must produce identical bytes**
+(the WASM binding too), so the hashed structure is pinned exactly below.
 
-**Hashed subset** — exactly four fields:
+**Hashed input — the `request-hash input`: a single flat JSON object** containing every `ApprovalContext` field
+**plus** `expires_at` as a **sibling top-level key** (NOT nested under another key). Exactly these keys, no others:
 
-| Field                          | Rationale                                                                                           |
-| ------------------------------ | --------------------------------------------------------------------------------------------------- |
-| `action` (full `ActionRecord`) | What the human approved                                                                             |
-| `summary`                      | Human-readable description shown in the inbox                                                       |
-| `actor.id`, `actor.kind`       | Actor identity as displayed — `attestation` is excluded (used for crypto verification, not display) |
-| `expires_at`                   | The deadline shown to the human                                                                     |
+```
+{
+  action,        // full ActionRecord
+  summary,       // string
+  actor,         // { id, kind } ONLY — attestation excluded
+  risk,          // "low" | "medium" | "high" | "critical"
+  reversible,    // bool
+  constraints,   // { allowed_decisions, challenge_required }
+  chain,         // string[] — key omitted entirely when absent
+  expires_at     // i64 ms — read from the envelope (relay needs it for lifecycle), bound here
+                 //          so a tampered deadline fails verification
+}
+```
 
-Everything else is excluded: `request_hash` itself (circular), `context_ciphertext` (ciphertext; plaintext
-is captured above), `actor.attestation`, `constraints`, `chain`, `id`/`created_at`, `approver` routing id,
-top-level `risk`/`reversible` (echoed from `action`), `v`.
+So `expires_at` sits at the same level as `action`/`summary`/… — implementations must NOT wrap the
+`ApprovalContext` under a sub-key (e.g. `{ context: {...}, expires_at }` is wrong). The device reads `expires_at`
+from the plaintext envelope and the rest from the decrypted `ApprovalContext`, then assembles this one object.
+
+Excluded: `actor.attestation` (a verification artifact the device checks separately, not shown content), the
+envelope's other routing/lifecycle fields (`id`, `created_at`, `approver`, `v`), and `context_ciphertext` itself.
 
 **Recipe:**
 
 ```
-request_hash = SHA-256( b"allw/request-hash/v1" || 0x00 || JCS(subset) )
+request_hash = SHA-256( b"allw/request-hash/v2" || 0x00 || JCS(request-hash input) )
 ```
 
-where `JCS(subset)` is the [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785) JSON Canonicalization
-Scheme encoding of `{ action, actor: { id, kind }, expires_at, summary }` (keys in JCS-sorted order).
-The `0x00` byte separates the domain tag from the payload.
+where `JCS(...)` is the [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785) JSON Canonicalization Scheme encoding of
+the single flat object above (object keys lexicographically sorted by JCS; `expires_at` canonicalizes as a sibling
+of `action`/`summary`/…). The `0x00` byte separates the domain tag from the payload.
 
-**Versioning:** `b"allw/request-hash/v1"` is the domain separation tag and the version knob. Any change
-to the hashed subset, encoding, or recipe requires bumping `v1` → `v2`.
+**Versioning:** the broadened input is a breaking change from the four-field v1, so the domain tag bumps to
+`b"allw/request-hash/v2"`; the frozen cross-platform vector is re-pinned when this lands in code.
 
 ### audit record_hash
 
