@@ -434,6 +434,36 @@ describe("AccountRelay — zero-knowledge (routing)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Authenticity: only device sockets may resolve a request
+// ---------------------------------------------------------------------------
+
+describe("AccountRelay — verdict authenticity", () => {
+  it("rejects a verdict sent from a non-device (integrator …/wait) socket", async () => {
+    const acct = "acct-sec-verdict";
+    await enrollDevice(acct);
+    const device = await connectWs(acct, `/devices/${await firstDeviceId(acct)}/connect`);
+
+    await post(acct, "/requests", makeEnvelope("req-sec-1"));
+    await device.next(); // drain the request push to the legitimate device
+
+    // A non-device client opens the integrator wait socket and tries to forge a verdict.
+    const integrator = await connectWs(acct, "/requests/req-sec-1/wait");
+    integrator.send({
+      type: "verdict",
+      request_id: "req-sec-1",
+      verdict: makeVerdict("req-sec-1"),
+    });
+
+    const resp = await integrator.next();
+    expect(resp.type).toBe("error");
+
+    // The request must remain pending — the forged verdict did NOT resolve it.
+    const polled = await get<{ status: string }>(acct, "/requests/req-sec-1");
+    expect(polled.data.status).toBe("pending");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Negative paths
 // ---------------------------------------------------------------------------
 
@@ -443,6 +473,27 @@ describe("AccountRelay — routing negative paths", () => {
     const body = makeEnvelope("req-noct");
     delete body.context_ciphertext;
     const { status } = await post(acct, "/requests", body);
+    expect(status).toBe(400);
+  });
+
+  it("rejects an envelope carrying an unexpected key (zero-knowledge guard) (400)", async () => {
+    // A stray plaintext-looking field must be refused so it can never be persisted by the relay.
+    const body = { ...makeEnvelope("req-extra"), summary: "rm -rf / — please approve" };
+    const { status } = await post("acct-neg-extra", "/requests", body);
+    expect(status).toBe(400);
+  });
+
+  it("rejects a submit missing approver (400)", async () => {
+    const body = makeEnvelope("req-noappr");
+    delete body.approver;
+    const { status } = await post("acct-neg-noappr", "/requests", body);
+    expect(status).toBe(400);
+  });
+
+  it("rejects a submit missing v (400)", async () => {
+    const body = makeEnvelope("req-nov");
+    delete body.v;
+    const { status } = await post("acct-neg-nov", "/requests", body);
     expect(status).toBe(400);
   });
 

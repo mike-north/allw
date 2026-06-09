@@ -228,6 +228,10 @@ const DEVICE_TAG = "device";
 const deviceTag = (deviceId: string): string => `device:${deviceId}`;
 const integratorTag = (requestId: string): string => `integrator:${requestId}`;
 
+// The exact, exhaustive set of ApprovalRequest envelope keys the relay accepts (contract.md
+// §Messages). Anything else is rejected at submit time to keep plaintext out of the relay.
+const ENVELOPE_KEYS = ["v", "id", "created_at", "expires_at", "approver", "context_ciphertext"];
+
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
@@ -633,7 +637,8 @@ export class AccountRelay implements DurableObject {
    *
    * Opens a hibernatable presence socket for an enrolled device and immediately flushes every
    * still-pending request (the offline queue): a device that was offline when a request arrived
-   * receives it on reconnect. Returns 404 (no upgrade) if the device is not enrolled.
+   * receives it on reconnect. Returns 404 if the device is not enrolled (a request without a
+   * WebSocket upgrade header is rejected earlier, at the router, with 426).
    *
    * Protocol (relay → device): `{ type: "request", request_id, envelope }` (ciphertext to fetch),
    * `{ type: "retract", request_id }` (another surface resolved it).
@@ -678,42 +683,65 @@ export class AccountRelay implements DurableObject {
    *
    * Stores the request and fans the ciphertext out to every online device. If no device is
    * connected it stays queued and is delivered on the next `…/connect` (see handleDeviceConnect).
-   * - 400: missing/invalid `id`, `context_ciphertext`, or `expires_at`; or already expired.
+   * - 400: not exactly the contract's envelope fields, or already expired.
    * - 409: a request with this `id` was already submitted.
    */
   private async handleSubmit(request: Request): Promise<Response> {
     const envelope = await parseJsonBody(request);
     if (!envelope) return json({ error: "invalid JSON body" }, 400);
 
-    const id = requiredString(envelope, "id");
-    if (!id) return json({ error: "'id' is required (string)" }, 400);
-
-    // The ciphertext is opaque to the relay — present and a string is all we check.
-    const ciphertext = requiredString(envelope, "context_ciphertext");
-    if (!ciphertext) {
-      return json({ error: "'context_ciphertext' is required (opaque JWE string)" }, 400);
+    // SECURITY (zero-knowledge): the ApprovalRequest envelope must be EXACTLY the contract's
+    // routing/lifecycle fields wrapping the opaque ciphertext (contract.md §Messages). Rejecting
+    // any unexpected key prevents an integrator from persisting plaintext `ApprovalContext` fields
+    // (action, summary, actor, …) in the relay — the relay must only ever hold ciphertext + routing.
+    const extraneous = Object.keys(envelope).filter((k) => !ENVELOPE_KEYS.includes(k));
+    if (extraneous.length > 0) {
+      return json({ error: `unexpected envelope field(s): ${extraneous.join(", ")}` }, 400);
     }
 
+    const id = requiredString(envelope, "id");
+    if (!id) return json({ error: "'id' is required (string)" }, 400);
+    if (requiredNumber(envelope, "v") === null) {
+      return json({ error: "'v' is required (number)" }, 400);
+    }
+    if (requiredNumber(envelope, "created_at") === null) {
+      return json({ error: "'created_at' is required (i64 ms)" }, 400);
+    }
+    if (!requiredString(envelope, "approver")) {
+      return json({ error: "'approver' is required (string)" }, 400);
+    }
+    // The ciphertext is opaque to the relay — present and a string is all we check.
+    if (!requiredString(envelope, "context_ciphertext")) {
+      return json({ error: "'context_ciphertext' is required (opaque JWE string)" }, 400);
+    }
     const expiresAt = requiredNumber(envelope, "expires_at");
     if (expiresAt === null) return json({ error: "'expires_at' is required (i64 ms)" }, 400);
 
+    const now = Date.now();
+    if (expiresAt <= now) return json({ error: "request already expired" }, 400);
+
+    // Fast-path duplicate rejection. The INSERT below is ALSO guarded: `handleSubmit` awaits the
+    // JSON parse, so two concurrent submits for the same id can interleave past this SELECT and
+    // race on the primary key — the catch maps that to the same 409, never a 500.
     const existing = [
       ...this.sql.exec<RequestRow>(`SELECT request_id FROM request WHERE request_id = ?`, id),
     ];
     if (existing.length > 0) return json({ error: "request already submitted" }, 409);
 
-    const now = Date.now();
-    if (expiresAt <= now) return json({ error: "request already expired" }, 400);
-
     // SECURITY: the whole envelope is routing/lifecycle + the opaque ciphertext — no plaintext.
-    this.sql.exec(
-      `INSERT INTO request (request_id, envelope, created_at, expires_at, status)
-       VALUES (?, ?, ?, ?, 'pending')`,
-      id,
-      JSON.stringify(envelope),
-      now,
-      expiresAt,
-    );
+    try {
+      this.sql.exec(
+        `INSERT INTO request (request_id, envelope, created_at, expires_at, status)
+         VALUES (?, ?, ?, ?, 'pending')`,
+        id,
+        JSON.stringify(envelope),
+        now,
+        expiresAt,
+      );
+    } catch {
+      // Primary-key conflict: a concurrent submit with this id won the race → consistently a 409.
+      return json({ error: "request already submitted" }, 409);
+    }
 
     // Fan out to every online device.
     let delivered = 0;
@@ -754,7 +782,8 @@ export class AccountRelay implements DurableObject {
    * GET /requests/{request_id}/wait  (WebSocket upgrade)
    *
    * A live waiting integrator: the verdict is pushed the instant a device decides (or immediately
-   * if it already has), then the socket is closed. Returns 404 (no upgrade) for an unknown request.
+   * if it already has), then the socket is closed. Returns 404 for an unknown request (a request
+   * without a WebSocket upgrade header is rejected earlier, at the router, with 426).
    *
    * Protocol (relay → integrator): `{ type: "verdict", request_id, verdict }`.
    */
@@ -858,6 +887,16 @@ export class AccountRelay implements DurableObject {
    * cross-device race or a retry) is acknowledged but does not overwrite the recorded decision.
    */
   private onDeviceVerdict(ws: WebSocket, msg: Record<string, unknown>): void {
+    // SECURITY: only a device presence socket may submit a verdict. An integrator `…/wait` socket
+    // (or any other non-device client) carries no `device:<id>` tag — it must NEVER be able to
+    // resolve a request by sending a forged verdict payload. Authenticity of the verdict body is
+    // additionally guaranteed by its JWS signature, verified downstream by the integrator.
+    const deviceId = this.deviceIdForSocket(ws);
+    if (deviceId === null) {
+      trySendJson(ws, { type: "error", error: "verdicts are only accepted from device sockets" });
+      return;
+    }
+
     const requestId = requiredString(msg, "request_id");
     if (!requestId) {
       trySendJson(ws, { type: "error", error: "'request_id' is required (string)" });
@@ -887,15 +926,21 @@ export class AccountRelay implements DurableObject {
 
     // SECURITY: the verdict is a JWS-signed decision, stored opaquely solely to route it back.
     const verdictJson = JSON.stringify(msg.verdict);
-    const deviceId = this.deviceIdForSocket(ws);
     const now = Date.now();
-    this.sql.exec(
-      `INSERT INTO verdict (request_id, verdict, device_id, received_at) VALUES (?, ?, ?, ?)`,
-      requestId,
-      verdictJson,
-      deviceId,
-      now,
-    );
+    try {
+      this.sql.exec(
+        `INSERT INTO verdict (request_id, verdict, device_id, received_at) VALUES (?, ?, ?, ?)`,
+        requestId,
+        verdictJson,
+        deviceId,
+        now,
+      );
+    } catch {
+      // Primary-key conflict: a verdict for this request already landed (a concurrent resolve).
+      // First verdict wins — ack as already_resolved rather than throwing out of the DO event.
+      trySendJson(ws, { type: "ack", request_id: requestId, status: "already_resolved" });
+      return;
+    }
     this.sql.exec(`UPDATE request SET status = 'resolved' WHERE request_id = ?`, requestId);
 
     const verdictValue = JSON.parse(verdictJson) as unknown;
