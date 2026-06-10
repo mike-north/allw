@@ -153,6 +153,35 @@ Relay routes only — it sees the **ApprovalRequest envelope** (routing + lifecy
 Push (APNs / FCM; **Web Push later**) carries a wakeup + request id — **never context** (push isn't E2EE / is
 size-limited). The envelope's ciphertext is fetched as JWE and decrypted on-device.
 
+### Relay routing API (v1)
+
+The per-account Durable Object exposes routing under `/{account_id}/…`. It persists **only** the opaque envelope
+and the signed verdict — never plaintext, never a key it could sign with.
+
+| Method / path                     | Who        | Purpose                                                              |
+| --------------------------------- | ---------- | -------------------------------------------------------------------- |
+| `POST /requests`                  | integrator | Submit an ApprovalRequest envelope; fans out to online devices.      |
+| `GET  /requests/{id}`             | integrator | Poll status → `pending` / terminal `expired` / `resolved` + verdict. |
+| `GET  /requests/{id}/wait` (WS)   | integrator | Block for the verdict; it is pushed the instant a device decides.    |
+| `GET  /devices/{id}/connect` (WS) | device     | Presence socket (hibernatable); flushes the offline queue on open.   |
+
+**Device socket messages** (JSON): relay → device `{ type: "request", request_id, envelope }` and
+`{ type: "retract", request_id }` (another surface resolved it); device → relay
+`{ type: "verdict", request_id, verdict }` (the signed [`Verdict`](#verdict--one-shot-and-scope-free)), answered
+with `{ type: "ack", request_id, status }`. **First verdict wins** — a later verdict for a resolved request is
+acked as `already_resolved` and does not overwrite. A device that was offline when a request arrived receives it
+on its next `connect` (the queue), so delivery survives reconnect.
+
+**Fail-closed expiry** (§Invariants #6): once a request is past `expires_at` it can never become approvable. A
+verdict for an expired request is refused (acked `expired`, not stored); the offline-queue flush skips expired
+requests (no dead request is re-pushed); and a read after the deadline **lazy-expires** the row — poll returns the
+terminal `expired` status and `…/wait` is pushed `{ type: "expired", request_id }`. (A proactive `alarm()` sweep
+that retracts expired requests from devices without waiting for a read is tracked in
+[#44](https://github.com/mike-north/allw/issues/44).) Verdicts are accepted **only** from a socket whose device is
+still enrolled — a revoked device cannot drive a request to `resolved`. Because `GET /requests/{id}` returns the
+verdict to any holder of `{account_id, request_id}`, integrators MUST use high-entropy request ids (UUIDv4+) until
+endpoint authn lands (enrollment spec, §Open decisions).
+
 ---
 
 ## v1 scope
