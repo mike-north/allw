@@ -139,3 +139,94 @@ test("compute_request_hash throws on invalid context JSON", async () => {
     "malformed context JSON must surface as a thrown JS error",
   );
 });
+
+// ── signing surface (issue #41 unblock): derive keys → cert → sign → verify ───────────
+
+/**
+ * Build a self-contained approver: an account-root key, a device key it certifies, and a verdict
+ * the device signs — all through the WASM surface. Reuses the shared vector's request/context so
+ * the recomputed `request_hash` and the verify window line up with a known-good pair.
+ */
+function approverFixture(wasm) {
+  const v = loadVector();
+  const accountSeed = Buffer.alloc(32, 7).toString("base64url");
+  const deviceSeed = Buffer.alloc(32, 9).toString("base64url");
+  const accountRootPub = wasm.ed25519_public_key(accountSeed);
+  const devicePub = wasm.ed25519_public_key(deviceSeed);
+
+  const request = JSON.parse(v.request_json);
+  const requestHash = wasm.compute_request_hash(v.context_json, request.expires_at);
+  // Reuse the vector's decided_at/now_ms — a pair already known to be inside the verify window.
+  const decidedAt = JSON.parse(v.verdict_json).decided_at;
+
+  const cert = wasm.issue_device_cert(accountSeed, "acct_rt", "dev_rt", devicePub, 1700000000000);
+
+  const unsigned = {
+    v: 1,
+    request_id: request.id,
+    request_hash: requestHash,
+    decision: "approved",
+    decided_at: decidedAt,
+    approver: { account_id: "acct_rt", device_id: "dev_rt" },
+  };
+  const nonce = Buffer.alloc(16, 3).toString("base64url");
+  return { v, accountSeed, deviceSeed, accountRootPub, devicePub, cert, unsigned, nonce, request };
+}
+
+test("ed25519/x25519 public-key derivation returns 43-char base64url keys", async () => {
+  const wasm = await loadWasm();
+  const seed = Buffer.alloc(32, 1).toString("base64url");
+  const ed = wasm.ed25519_public_key(seed);
+  const x = wasm.x25519_public_key(seed);
+  // 32 bytes → 43 base64url-unpadded chars; deterministic from the seed.
+  assert.equal(ed.length, 43, "Ed25519 pubkey is 43 base64url chars");
+  assert.equal(x.length, 43, "X25519 pubkey is 43 base64url chars");
+  assert.equal(wasm.ed25519_public_key(seed), ed, "derivation is deterministic");
+  assert.notEqual(ed, x, "Ed25519 and X25519 keys differ for the same seed");
+});
+
+test("sign_verdict + issue_device_cert produce a verdict verify_verdict accepts", async () => {
+  const wasm = await loadWasm();
+  const f = approverFixture(wasm);
+
+  const verdictJson = wasm.sign_verdict(JSON.stringify(f.unsigned), f.deviceSeed, f.nonce, f.cert);
+
+  const result = JSON.parse(
+    wasm.verify_verdict(
+      verdictJson,
+      f.v.request_json,
+      f.v.context_json,
+      f.accountRootPub,
+      f.v.now_ms,
+    ),
+  );
+  assert.equal(result.approved, true, "the freshly signed verdict must verify as approved");
+  assert.equal(result.device_id, "dev_rt", "device_id comes from the verified verdict");
+});
+
+test("verify rejects a verdict whose signing key the device-cert did not certify", async () => {
+  const wasm = await loadWasm();
+  const f = approverFixture(wasm);
+
+  // Sign with a DIFFERENT device seed than the cert certifies — the cert binds dev_rt to f.devicePub,
+  // so a signature from another key must not chain to the account root. Fail-closed → throw.
+  const wrongDeviceSeed = Buffer.alloc(32, 0x5a).toString("base64url");
+  const forged = wasm.sign_verdict(JSON.stringify(f.unsigned), wrongDeviceSeed, f.nonce, f.cert);
+
+  assert.throws(
+    () =>
+      wasm.verify_verdict(forged, f.v.request_json, f.v.context_json, f.accountRootPub, f.v.now_ms),
+    /verify_verdict failed/,
+    "a verdict signed by an uncertified key must not verify",
+  );
+});
+
+test("sign_verdict throws on a non-32-byte device seed", async () => {
+  const wasm = await loadWasm();
+  const f = approverFixture(wasm);
+  assert.throws(
+    () => wasm.sign_verdict(JSON.stringify(f.unsigned), "tooshort", f.nonce, f.cert),
+    /device_seed_b64 must decode to exactly 32 bytes/,
+    "a malformed signing seed must surface as a thrown JS error",
+  );
+});
