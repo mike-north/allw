@@ -41,20 +41,66 @@ function readStringArray(record: Record<string, unknown>, key: string): string[]
 }
 
 /**
+ * Quote/escape a single command token **for display** so the human can see its exact boundaries.
+ * A token containing whitespace or shell-significant characters is wrapped in single quotes (with
+ * embedded single quotes escaped POSIX-style), so `["rm","-rf","my dir"]` renders as
+ * `rm -rf 'my dir'` — visually distinct from three separate args. Empty tokens render as `''`.
+ *
+ * This is **display-only**: it never changes the bytes bound into `request_hash` (those come from
+ * the substrate the core hashed). It only disambiguates what the human is reading.
+ */
+function quoteToken(token: string): string {
+  // Shell-significant set (and whitespace) — if a token contains any of these its boundaries are
+  // ambiguous when bare, so quote it. Plain tokens (e.g. `--force`, `origin`) render unquoted.
+  if (token !== "" && !/[\s'"\\$`&|;<>(){}[\]*?#~!]/.test(token)) {
+    return token;
+  }
+  // POSIX single-quote escaping: ' → '\'' (close, escaped quote, reopen).
+  return `'${token.replace(/'/g, "'\\''")}'`;
+}
+
+/** Join argv tokens into one unambiguous, display-safe command line. */
+function renderArgv(argv: readonly string[]): string {
+  return argv.map(quoteToken).join(" ");
+}
+
+/**
  * Render the action's syntactic substrate into the literal command / tool call the agent attempted,
- * as one display line. We surface `raw` when present, else reconstruct from `argv`, else a compact
- * JSON fallback so nothing is ever silently dropped. NOTE: this is the *headline* line only —
- * meaning-changing fields (`cwd`, `host`, `env_refs`, MCP `params`) are rendered as their own
- * labeled lines by {@link substrateDetailLines}, so a `raw`-only headline never hides them.
+ * as one display line. NOTE: this is the *headline* line only — meaning-changing fields (`cwd`,
+ * `host`, `env_refs`, MCP `params`) are rendered as their own labeled lines by
+ * {@link substrateDetailLines}, so a `raw`-only headline never hides them.
+ *
+ * For the command surface the line is built to be **unambiguous**:
+ * - tokens are quoted/escaped when they contain whitespace or shell metacharacters
+ *   (so `my dir` is visibly one argument, not two), and
+ * - the binary name (`bin`) is included when the substrate carries it separately from `argv` and
+ *   `argv` does not already lead with it — the human must never see args without the program they
+ *   belong to (per `docs/policy-seam.md`, `bin` and `argv` are distinct substrate fields).
+ *
+ * `raw` (the agent's original string form) is preferred when present; otherwise we reconstruct from
+ * `bin`/`argv`; otherwise an MCP `server :: tool` headline; otherwise a compact JSON fallback so
+ * nothing is ever silently dropped.
  */
 function renderActionHeadline(action: ActionRecord): string {
   const syntactic = action.syntactic;
   if (isRecord(syntactic)) {
     const raw = readString(syntactic, "raw");
     if (raw !== undefined) return raw;
+
     const argv = readStringArray(syntactic, "argv");
-    if (argv !== undefined) return argv.join(" ");
-    // MCP headline when there is no raw/argv: "server :: tool".
+    const bin = readString(syntactic, "bin");
+    if (argv !== undefined && argv.length > 0) {
+      // Include `bin` unless argv already leads with it (argv conventionally includes the binary).
+      const tokens = bin !== undefined && argv[0] !== bin ? [bin, ...argv] : argv;
+      return renderArgv(tokens);
+    }
+    // No argv: still show `bin` (+ any positionals) rather than dropping the program name.
+    if (bin !== undefined) {
+      const positionals = readStringArray(syntactic, "positionals");
+      return renderArgv(positionals !== undefined ? [bin, ...positionals] : [bin]);
+    }
+
+    // MCP headline when there is no command form: "server :: tool".
     const tool = readString(syntactic, "tool");
     if (tool !== undefined) {
       const server = readString(syntactic, "server");

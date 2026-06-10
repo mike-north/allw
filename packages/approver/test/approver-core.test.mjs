@@ -427,6 +427,102 @@ test("renderRequest surfaces MCP params (not hidden behind raw) — review fix #
   assert.match(rendered, /\/etc\/passwd/, "the MCP params payload is shown in full, not elided");
 });
 
+test("renderRequest disambiguates argv args containing whitespace (WYSIWYS — review item #1)", async () => {
+  const wasm = await loadWasm();
+  const { keyfile } = pairedApprover(wasm);
+
+  // An argv where one arg contains a space: `["rm","-rf","my dir"]`. Bare space-join would render
+  // `rm -rf my dir` — indistinguishable from three args. The human must see the arg boundary.
+  const ctx = {
+    action: {
+      record_schema_version: 1,
+      surface: "command",
+      syntactic: { argv: ["rm", "-rf", "my dir"] },
+      risk: "high",
+    },
+    summary: "remove a directory whose name has a space",
+    actor: { id: "machine:ci", kind: "claude-code" },
+    risk: "high",
+    reversible: false,
+    constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
+  };
+  const ctxJson = JSON.stringify(ctx);
+  const jwe = wasm.encrypt_context(
+    ctxJson,
+    JSON.stringify([{ device_id: DEVICE_ID, public_key_b64: keyfile.device_encryption_pubkey }]),
+  );
+  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
+  const rendered = renderRequest(prepared);
+
+  // The space-containing arg is quoted so its boundary is visible; plain args stay unquoted.
+  assert.match(rendered, /rm -rf 'my dir'/, "an arg with a space is quoted to disambiguate it");
+  assert.doesNotMatch(rendered, /rm -rf my dir/, "the ambiguous bare-join form must NOT appear");
+});
+
+test("renderRequest includes bin when the substrate carries it separately from argv (review item #1)", async () => {
+  const wasm = await loadWasm();
+  const { keyfile } = pairedApprover(wasm);
+
+  // Substrate with `bin` separate from argv that does NOT lead with the binary: the human must see
+  // the program name, not just the args (per docs/policy-seam.md, bin and argv are distinct).
+  const ctx = {
+    action: {
+      record_schema_version: 1,
+      surface: "command",
+      syntactic: { bin: "git", argv: ["push", "--force", "origin", "main"] },
+      risk: "high",
+    },
+    summary: "force push",
+    actor: { id: "machine:ci", kind: "claude-code" },
+    risk: "high",
+    reversible: false,
+    constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
+  };
+  const ctxJson = JSON.stringify(ctx);
+  const jwe = wasm.encrypt_context(
+    ctxJson,
+    JSON.stringify([{ device_id: DEVICE_ID, public_key_b64: keyfile.device_encryption_pubkey }]),
+  );
+  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
+  const rendered = renderRequest(prepared);
+
+  // The fully-qualified command line leads with the binary name.
+  assert.match(
+    rendered,
+    /Action:\s+git push --force origin main/,
+    "the binary name is prepended when argv omits it",
+  );
+});
+
+test("renderRequest does not double the bin when argv already leads with it (review item #1)", async () => {
+  const wasm = await loadWasm();
+  const { keyfile } = pairedApprover(wasm);
+
+  const ctx = {
+    action: {
+      record_schema_version: 1,
+      surface: "command",
+      syntactic: { bin: "git", argv: ["git", "status"] },
+      risk: "low",
+    },
+    summary: "git status",
+    actor: { id: "machine:ci", kind: "claude-code" },
+    risk: "low",
+    reversible: true,
+    constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
+  };
+  const ctxJson = JSON.stringify(ctx);
+  const jwe = wasm.encrypt_context(
+    ctxJson,
+    JSON.stringify([{ device_id: DEVICE_ID, public_key_b64: keyfile.device_encryption_pubkey }]),
+  );
+  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
+  const rendered = renderRequest(prepared);
+
+  assert.match(rendered, /Action:\s+git status/, "argv that already includes bin is not doubled");
+  assert.doesNotMatch(rendered, /git git status/, "the binary name must not be duplicated");
+});
+
 test("nonce is a fresh, high-entropy (≥16-byte) value per verdict", async () => {
   const wasm = await loadWasm();
   const { keyfile, jwe } = pairedApprover(wasm);

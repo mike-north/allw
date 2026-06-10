@@ -102,17 +102,48 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-/** True when `obj[key]` is a non-empty string. */
-function hasString(obj: Record<string, unknown>, key: string): boolean {
-  const value = obj[key];
-  return typeof value === "string" && value.length > 0;
+/** The six required base64url 32-byte key fields (three seeds + three derived pubkeys). */
+const KEY_FIELDS = [
+  "account_root_seed",
+  "device_signing_seed",
+  "device_encryption_seed",
+  "account_root_pubkey",
+  "device_signing_pubkey",
+  "device_encryption_pubkey",
+] as const;
+
+/** The optional string fields populated by `pair` (validated as strings when present). */
+const OPTIONAL_STRING_FIELDS = [
+  "relay_url",
+  "account_id",
+  "device_id",
+  "label",
+  "device_cert",
+] as const;
+
+/**
+ * Validate that `value` is a base64url-unpadded string decoding to **exactly 32 bytes** — the shape
+ * of every seed and derived public key (Ed25519 / X25519 are 32-byte). A corrupt keyfile must fail
+ * here (clearly), not later at first crypto use with an opaque WASM error.
+ */
+function isBase64Url32Bytes(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  // 32 bytes → 43 base64url-unpadded chars; reject by length first (cheap, bounds the work).
+  if (value.length !== 43) return false;
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) return false;
+  // Decode and confirm exactly 32 bytes (length alone can't catch every malformed 43-char string).
+  return Buffer.from(value, "base64url").length === 32;
 }
 
 /**
  * Validate a parsed keyfile fail-closed: a corrupt/partial keyfile must abort rather than be
- * silently "repaired" (a missing seed could otherwise let the approver sign with the wrong key).
+ * silently "repaired" (a missing/garbled seed could otherwise let the approver sign with the wrong
+ * key, or fail opaquely deep inside the WASM core).
  *
- * @throws if any required field is missing or of the wrong type, or the version is unsupported.
+ * Checks, in order: object shape → version → each seed/pubkey is well-formed base64url-32-bytes →
+ * each optional pairing field is a string when present.
+ *
+ * @throws if the value is not a valid keyfile (with a message naming the offending field).
  */
 export function validateKeyfile(value: unknown): Keyfile {
   if (!isRecord(value)) {
@@ -123,33 +154,68 @@ export function validateKeyfile(value: unknown): Keyfile {
       `unsupported keyfile version ${String(value.version)} (expected ${String(KEYFILE_VERSION)})`,
     );
   }
-  const required = [
-    "account_root_seed",
-    "device_signing_seed",
-    "device_encryption_seed",
-    "account_root_pubkey",
-    "device_signing_pubkey",
-    "device_encryption_pubkey",
-  ];
-  for (const key of required) {
-    if (!hasString(value, key)) {
+  for (const key of KEY_FIELDS) {
+    const field = value[key];
+    if (typeof field !== "string" || field.length === 0) {
       throw new Error(`keyfile is missing required field '${key}'`);
     }
+    if (!isBase64Url32Bytes(field)) {
+      throw new Error(
+        `keyfile field '${key}' is not a valid base64url-unpadded 32-byte key (corrupt keyfile)`,
+      );
+    }
   }
-  // The narrowing above proves the required string fields are present; the optional pairing
-  // fields are validated structurally where they are consumed.
+  // Optional pairing fields: present-but-wrong-typed is corruption, not "unpaired" — reject it so a
+  // garbled relay_url/device_id can never flow into routing or signing (review item #6).
+  for (const key of OPTIONAL_STRING_FIELDS) {
+    if (key in value && value[key] !== undefined && typeof value[key] !== "string") {
+      throw new Error(`keyfile field '${key}' must be a string when present (corrupt keyfile)`);
+    }
+  }
+  // Every required field is a validated 32-byte key and every present optional field is a string.
   return value as unknown as Keyfile;
 }
 
-/** Read and validate the keyfile at `path`. @throws if it is absent, unreadable, or invalid. */
-export function readKeyfile(path: string): Keyfile {
+/** Node augments I/O errors with a string `code` (e.g. `"ENOENT"`); narrow to read it safely. */
+function errorCode(err: unknown): string | undefined {
+  if (typeof err === "object" && err !== null && "code" in err) {
+    const { code } = err;
+    return typeof code === "string" ? code : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * The result of attempting to load a keyfile, distinguishing the three cases a caller must treat
+ * differently (review items #2 + #4): the file genuinely does not exist (`pair`/`keygen` may mint a
+ * fresh identity), the file is present and valid, or the file is present but unreadable/corrupt
+ * (must fail loudly — NEVER silently discarded and replaced with a new identity).
+ */
+export type KeyfileLoad =
+  | { readonly kind: "absent" }
+  | { readonly kind: "ok"; readonly keyfile: Keyfile };
+
+/**
+ * Load the keyfile at `path`, distinguishing "absent" (ENOENT) from every other failure.
+ *
+ * - **ENOENT** → returns `{ kind: "absent" }` (the only case a caller may treat as "no keyfile").
+ * - **Present + valid** → returns `{ kind: "ok", keyfile }`.
+ * - **Any other error** (EACCES/permission, EISDIR, invalid JSON, failed validation) → **throws**
+ *   with context. A permission or parse error must not be misreported as "not found" (review #2),
+ *   and an existing-but-corrupt identity must not be silently replaced (review #4).
+ *
+ * @throws on any non-ENOENT read error, invalid JSON, or failed validation.
+ */
+export function loadKeyfile(path: string): KeyfileLoad {
   let raw: string;
   try {
     raw = readFileSync(path, "utf8");
-  } catch {
-    throw new Error(
-      `no keyfile at ${path} — run 'allw-approver pair' (or 'keygen') to create one first`,
-    );
+  } catch (err) {
+    if (errorCode(err) === "ENOENT") {
+      return { kind: "absent" };
+    }
+    // EACCES, EISDIR, etc. — surface the real failure rather than masking it as "no keyfile".
+    throw new Error(`failed to read keyfile at ${path}: ${(err as Error).message}`);
   }
   let parsed: unknown;
   try {
@@ -157,7 +223,23 @@ export function readKeyfile(path: string): Keyfile {
   } catch (err) {
     throw new Error(`keyfile at ${path} is not valid JSON: ${(err as Error).message}`);
   }
-  return validateKeyfile(parsed);
+  return { kind: "ok", keyfile: validateKeyfile(parsed) };
+}
+
+/**
+ * Read and validate the keyfile at `path`. A missing keyfile is an error here (callers that want to
+ * mint a fresh one on absence use {@link loadKeyfile} and branch on `kind`).
+ *
+ * @throws if the keyfile is absent, unreadable, or invalid.
+ */
+export function readKeyfile(path: string): Keyfile {
+  const loaded = loadKeyfile(path);
+  if (loaded.kind === "absent") {
+    throw new Error(
+      `no keyfile at ${path} — run 'allw-approver pair' (or 'keygen') to create one first`,
+    );
+  }
+  return loaded.keyfile;
 }
 
 /**

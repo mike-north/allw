@@ -17,7 +17,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -218,4 +218,29 @@ test("deviceConnectWsUrl upgrades http(s)→ws(s) and builds the presence path",
     deviceConnectWsUrl("http://127.0.0.1:8787/", "acct-9", "dev 9"),
     "ws://127.0.0.1:8787/acct-9/devices/dev%209/connect",
   );
+});
+
+test("runPair refuses to overwrite a CORRUPT keyfile with a fresh identity (review item #4)", async () => {
+  const wasm = await loadWasm();
+  const relay = await startFakeRelay();
+  try {
+    await withTempKeyfile(async (keyfilePath) => {
+      // A pre-existing but corrupt keyfile (invalid JSON) must NOT be silently discarded and
+      // replaced with a new identity — that could orphan a relay-registered device.
+      writeFileSync(keyfilePath, "{ corrupt keyfile");
+      await assert.rejects(
+        () => runPair(wasm, { relayUrl: relay.url, accountId: "acct-x", keyfilePath }, () => {}),
+        /not valid JSON/,
+        "pair must fail loudly on a corrupt keyfile, not mint a new identity over it",
+      );
+      // The relay must never have been contacted (we bailed before any registration).
+      assert.equal(
+        relay.requests.length,
+        0,
+        "no relay registration happens when the existing keyfile is corrupt",
+      );
+    });
+  } finally {
+    await relay.close();
+  }
 });

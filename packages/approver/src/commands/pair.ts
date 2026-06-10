@@ -13,7 +13,7 @@
  *    (the integrator's trust anchor, #12).
  */
 
-import { generateKeyfile, readKeyfile, writeKeyfile, type Keyfile } from "../lib/keyfile.js";
+import { generateKeyfile, loadKeyfile, writeKeyfile, type Keyfile } from "../lib/keyfile.js";
 import { pairingComplete, pairingStart } from "../lib/relay-client.js";
 import type { AllwWasm } from "../lib/wasm.js";
 
@@ -32,14 +32,20 @@ export interface PairOptions {
 /** A sink for human-facing output (stdout by default; captured in tests). */
 export type Logger = (line: string) => void;
 
-/** Load the keyfile at `path`, or generate a fresh one if none exists yet. */
+/**
+ * Load the existing keyfile, or generate a fresh identity ONLY when none exists.
+ *
+ * A fresh identity is minted **exclusively** when the keyfile is genuinely absent (ENOENT). On any
+ * other load failure — invalid JSON, failed validation, a permission/I/O error — `loadKeyfile`
+ * throws and we let it propagate: silently regenerating would discard an existing (possibly
+ * relay-registered) identity and its only copy of the seeds (review item #4).
+ */
 function loadOrGenerate(wasm: AllwWasm, path: string): { keyfile: Keyfile; fresh: boolean } {
-  try {
-    return { keyfile: readKeyfile(path), fresh: false };
-  } catch {
-    // No (valid) keyfile yet — generate a fresh identity. `pair` then fills in relay/account/cert.
+  const loaded = loadKeyfile(path); // throws on corrupt/unreadable — do NOT regenerate over it
+  if (loaded.kind === "absent") {
     return { keyfile: { ...generateKeyfile(wasm) }, fresh: true };
   }
+  return { keyfile: loaded.keyfile, fresh: false };
 }
 
 /**

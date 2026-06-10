@@ -33,10 +33,11 @@ export type {
   VerdictOutboundMessage,
 } from "./lib/types.js";
 
-export type { Keyfile, FreshKeyfile } from "./lib/keyfile.js";
+export type { Keyfile, FreshKeyfile, KeyfileLoad } from "./lib/keyfile.js";
 export {
   KEYFILE_VERSION,
   generateKeyfile,
+  loadKeyfile,
   readKeyfile,
   validateKeyfile,
   writeKeyfile,

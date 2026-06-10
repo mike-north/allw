@@ -172,6 +172,11 @@ export async function runWatch(
   },
 ): Promise<void> {
   const log = deps.log ?? defaultLogger;
+  // readKeyfile returns a VALIDATED Keyfile (validateKeyfile): the required seeds/pubkeys are
+  // well-formed base64url-32-byte keys and every optional pairing field is a string-or-absent. So a
+  // present relay_url/account_id/device_id is guaranteed a string here — a corrupt non-string field
+  // would have thrown during load (review item #6). The checks below only distinguish unpaired
+  // (field absent) from paired.
   const keyfile = readKeyfile(options.keyfilePath);
 
   const relayUrl = options.relayUrl ?? keyfile.relay_url;
