@@ -507,3 +507,80 @@ test("submitted envelope carries EXACTLY the contract's key set (no plaintext le
   }
   assert.equal(env.expires_at, NOW_MS + TIMEOUT_MS, "expires_at = now + timeoutMs");
 });
+
+test("(g) a verdict signed for a DIFFERENT envelope id resolves denied (no-swap binding)", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const req = sampleRequest();
+
+  // The device returns a genuine, fully-signed verdict — but bound to a different request id than
+  // the SDK generated. Verification uses the SDK's LOCAL id, so the id mismatch must reject (a
+  // content-identical request shares a request_hash; only the id distinguishes them — contract
+  // §Verification checklist #2). Pins that approval can't be replayed onto another envelope.
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: {
+      poll: (env) =>
+        env
+          ? signVerdict(
+              wasm,
+              approver,
+              req,
+              { ...env, id: "00000000-0000-4000-8000-000000000000" },
+              { decision: "approved" },
+            )
+          : null,
+    },
+  });
+
+  const verdict = await pollClient(approver, relay).requestApproval(req);
+  assert.equal(
+    verdict.decision,
+    "denied",
+    "a verdict bound to a different id must not be approved",
+  );
+  assert.equal(await verdict.verify(approver.accountRootPub), false);
+});
+
+test("(h) WS closes without a verdict → poll fallback delivers the approval", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const req = sampleRequest();
+
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: {
+      poll: (env) => (env ? signVerdict(wasm, approver, req, env, { decision: "approved" }) : null),
+    },
+  });
+
+  // A WebSocket that immediately closes with no terminal frame must degrade to polling, not fail.
+  const closingWebSocketFactory = (url) => {
+    const listeners = { message: [], open: [], error: [], close: [] };
+    queueMicrotask(() => {
+      for (const l of listeners.close) l();
+    });
+    return {
+      url,
+      addEventListener: (type, l) => listeners[type].push(l),
+      close: () => {},
+    };
+  };
+
+  const client = createClient({
+    relayUrl: RELAY_URL,
+    accountId: ACCOUNT_ID,
+    approverRootKey: approver.accountRootPub,
+    fetchImpl: relay.fetchImpl,
+    nowImpl: () => NOW_MS,
+    webSocketFactory: closingWebSocketFactory,
+    pollIntervalMs: 5,
+  });
+
+  const verdict = await client.requestApproval(req);
+  assert.equal(
+    verdict.decision,
+    "approved",
+    "WS close falls back to polling, which delivers approval",
+  );
+});

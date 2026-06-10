@@ -25,6 +25,13 @@ import {
 import { awaitVerdict, type WebSocketFactory } from "./wait.js";
 import { loadWasm, type AllwWasm } from "./wasm.js";
 
+/**
+ * A verdict decision. In v0 `requestApproval` only ever *resolves* to `approved` (verified),
+ * `denied` (a verified human "no" or a fail-closed synthesis), or `expired` (timeout / past
+ * deadline). `aborted` is part of the wire vocabulary but originates **only from a signed device
+ * verdict** — there is no client-side cancellation (`AbortSignal`) in v0, so the SDK never
+ * synthesizes it.
+ */
 export type Decision = "approved" | "denied" | "expired" | "aborted";
 export type Risk = "low" | "medium" | "high" | "critical";
 
@@ -250,6 +257,11 @@ function isAuthenticatedNonApproval(message: string): boolean {
  *   (`denied`/`expired`/`aborted`), defaulting to `denied` if unreadable.
  * - It throws anything else (forgery, tamper, bad sig, replay, window) ⇒ unverifiable ⇒ `null`
  *   (the caller fails closed to a synthesized `denied`).
+ *
+ * NOTE (replay): the WASM `verify_verdict` uses a fresh single-shot nonce store per call, so this
+ * SDK does **not** provide cross-request replay protection on its own — guarding against a replayed
+ * verdict across requests is the integrator's responsibility (a persistent nonce store) until the
+ * SDK threads one through (#48). Not required for the v0 walking skeleton.
  */
 function verifyToDecision(
   wasm: AllwWasm,
