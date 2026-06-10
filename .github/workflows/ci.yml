@@ -64,6 +64,10 @@ jobs:
       # The node parity test feeds the shared cross-platform vector through the compiled wasm,
       # asserting request-hash/v2 parity and verdict accept/reject (fail-closed).
       - run: pnpm --filter @allw/sdk test
+      # The stand-in approver's integration tests run the same compiled wasm (decrypt → recompute
+      # request_hash → sign → verify_verdict round-trip). It imports from dist/, so build first.
+      - run: pnpm --filter @allw/approver build
+      - run: pnpm --filter @allw/approver test
 
   relay:
     name: Relay (workers-pool)
