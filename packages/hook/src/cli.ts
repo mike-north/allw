@@ -39,10 +39,15 @@ import { loadWasm } from "./lib/wasm.js";
  * Test-only transport seams for the SDK client. Production passes none of these (the SDK uses the
  * global `fetch`/`WebSocket` and the real clock); tests inject a relay double + a fixed clock to
  * drive the full stdin→stdout path deterministically against a WASM-signed verdict.
+ *
+ * Every field is optional (`Partial`): `runHook`'s `overrides = {}` default must type-check, and
+ * each seam is independently injectable, so a test can override just the ones it needs.
  */
-export type RunHookOverrides = Pick<
-  ClientConfig,
-  "fetchImpl" | "nowImpl" | "webSocketFactory" | "pollIntervalMs" | "scheduleImpl"
+export type RunHookOverrides = Partial<
+  Pick<
+    ClientConfig,
+    "fetchImpl" | "nowImpl" | "webSocketFactory" | "pollIntervalMs" | "scheduleImpl"
+  >
 >;
 
 /** Read all of stdin to a string (the hook input is a single JSON object). */
