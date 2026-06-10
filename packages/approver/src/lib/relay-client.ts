@@ -1,0 +1,100 @@
+/**
+ * Thin HTTP client for the relay's device-facing endpoints (`docs/contract.md` §Transport →
+ * Relay routing API). Pairing only — the presence WebSocket is handled in `watch.ts`. The client
+ * sends only public key material + routing metadata; it never sends a seed (zero-knowledge relay).
+ */
+
+/** Trim a trailing slash so `${base}/path` never doubles up. */
+function normalizeBase(url: string): string {
+  return url.replace(/\/+$/, "");
+}
+
+/** POST JSON and parse the JSON response, surfacing non-2xx as a thrown error with the body. */
+async function postJson(url: string, body: unknown): Promise<unknown> {
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const text = await resp.text();
+  let parsed: unknown;
+  try {
+    parsed = text ? JSON.parse(text) : null;
+  } catch {
+    parsed = text;
+  }
+  if (!resp.ok) {
+    const detail =
+      parsed && typeof parsed === "object" && "error" in parsed ? String(parsed.error) : text;
+    throw new Error(`relay ${url} → HTTP ${String(resp.status)}: ${detail}`);
+  }
+  return parsed;
+}
+
+/** Result of `POST /:acct/pairing/start`. */
+export interface PairingStartResult {
+  readonly code: string;
+  readonly expires_at: number;
+}
+
+/** Start a pairing: ask the relay for a short code (the account owner runs this in production). */
+export async function pairingStart(
+  relayUrl: string,
+  accountId: string,
+  label?: string,
+): Promise<PairingStartResult> {
+  const url = `${normalizeBase(relayUrl)}/${encodeURIComponent(accountId)}/pairing/start`;
+  const body = label === undefined ? {} : { label };
+  const result = await postJson(url, body);
+  if (
+    typeof result !== "object" ||
+    result === null ||
+    typeof (result as { code: unknown }).code !== "string"
+  ) {
+    throw new Error(`relay pairing/start returned an unexpected shape: ${JSON.stringify(result)}`);
+  }
+  return result as unknown as PairingStartResult;
+}
+
+/**
+ * Complete a pairing: redeem `code` and register the device public key, returning the relay-issued
+ * `device_id`.
+ *
+ * **Single-key relay surface (#10).** `POST /pairing/complete` registers exactly one `pubkey` per
+ * device row. The approver holds two device keys (X25519 for decryption, Ed25519 for verdict
+ * signing); the relay only needs the **X25519** key to route ciphertext as a JWE recipient, and
+ * the Ed25519 verifying key reaches verifiers via the account-root **device_cert** (not the relay
+ * registry). So we register the X25519 key here and rely on the cert for the signing-key trust
+ * chain. See the PR "Decisions" note.
+ */
+export async function pairingComplete(
+  relayUrl: string,
+  accountId: string,
+  code: string,
+  encryptionPubkey: string,
+  label?: string,
+): Promise<string> {
+  const url = `${normalizeBase(relayUrl)}/${encodeURIComponent(accountId)}/pairing/complete`;
+  const body: Record<string, string> = { code, pubkey: encryptionPubkey };
+  if (label !== undefined) body.label = label;
+  const result = await postJson(url, body);
+  if (
+    typeof result !== "object" ||
+    result === null ||
+    typeof (result as { device_id: unknown }).device_id !== "string"
+  ) {
+    throw new Error(
+      `relay pairing/complete returned an unexpected shape: ${JSON.stringify(result)}`,
+    );
+  }
+  return (result as { device_id: string }).device_id;
+}
+
+/**
+ * Build the device presence WebSocket URL (`GET /:acct/devices/:deviceId/connect`). `http(s)` is
+ * upgraded to `ws(s)` so the same relay base works for both HTTP pairing and the WS presence link.
+ */
+export function deviceConnectWsUrl(relayUrl: string, accountId: string, deviceId: string): string {
+  const base = normalizeBase(relayUrl).replace(/^http/, "ws");
+  return `${base}/${encodeURIComponent(accountId)}/devices/${encodeURIComponent(deviceId)}/connect`;
+}
