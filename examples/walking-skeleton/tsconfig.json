@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "types": ["node"],
+    // This harness is an application that runs the WASM core under node and uses the WHATWG
+    // `fetch`/`Response` globals the SDK relies on (Node 24 implements them). `WebWorker` supplies
+    // those — and the `WebAssembly` namespace — without pulling in the full DOM surface, matching
+    // the sibling surfaces (`packages/sdk`, `packages/approver`, `packages/hook`).
+    "lib": ["ES2023", "WebWorker"]
+  },
+  "include": ["src"]
+}

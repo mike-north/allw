@@ -20,6 +20,13 @@ Polyglot monorepo — one audited Rust core, thin surfaces around it.
 | `packages/sdk`     | TypeScript SDK (`@allw/sdk`) — the integrator call site; wraps the core via WASM. |
 | `packages/relay`   | Zero-knowledge relay (`@allw/relay`) — Cloudflare Workers + Durable Objects.      |
 
+### Demo
+
+[`examples/walking-skeleton`](./examples/walking-skeleton) — the v0 **walking skeleton**: one real
+Claude Code action approved from a second surface, end-to-end over the zero-knowledge relay,
+fail-closed and cryptographically verified. It composes every surface and is reproducible from its
+README (a mostly one-command live demo plus an all-real-crypto CI round-trip).
+
 ### Develop
 
 ```sh
