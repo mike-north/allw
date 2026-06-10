@@ -159,6 +159,26 @@ test("gated Bash missing tool_input.command → deny (fail-closed)", async () =>
   assert.equal(decisionOf(output), "deny");
 });
 
+test("regression (#49): a malformed mcp__-prefixed tool name → deny, approver NOT called", async () => {
+  // The `mcp__.*` settings matcher routes these to the hook; before the fix they passed through as
+  // `allow`. They must now deny (fail-closed) — and must never even reach the approver.
+  const wasm = await loadWasm();
+  for (const toolName of ["mcp__server__", "mcp__onlytwo"]) {
+    const approver = recording("approved");
+    const output = await decide(
+      { hookEventName: "PreToolUse", toolName, toolInput: { x: 1 } },
+      { wasm, config: CONFIG, requestApproval: approver.fn },
+      HOSTNAME,
+    );
+    assert.equal(decisionOf(output), "deny", `${toolName} must fail closed (not allow)`);
+    assert.equal(
+      approver.calls.length,
+      0,
+      "a name we can't build a record for never asks the human",
+    );
+  }
+});
+
 test("MCP tool call is gated; approved → allow, with the request built from the parsed name/params", async () => {
   const wasm = await loadWasm();
   const approver = recording("approved");

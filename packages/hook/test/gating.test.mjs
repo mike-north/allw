@@ -42,6 +42,41 @@ test("Bash and MCP tools are gated; everything else is not", () => {
   }
 });
 
+// ── Regression (#49 review, Copilot): fail-open gap on malformed mcp__-prefixed names ────────────
+//
+// The recommended .claude/settings.json matcher is `mcp__.*`, so Claude Code routes EVERY
+// mcp__-prefixed name to the hook — including malformed ones that don't parse as
+// `mcp__<server>__<tool>` (e.g. `mcp__server__`, `mcp__onlytwo`). Before the fix, `isGatedTool`
+// returned false for these (→ pass-through allow) and `gateToolCall` fell through to pass-through —
+// silently ALLOWING an MCP call, breaking fail-closed. They must now be gated and DENIED.
+
+test("a malformed mcp__-prefixed name is GATED (not silently passed through)", () => {
+  // Each of these is mcp__-prefixed but not a well-formed mcp__<server>__<tool>.
+  for (const t of ["mcp__server__", "mcp__onlytwo", "mcp__", "mcp____tool"]) {
+    assert.equal(isGatedTool(t), true, `${t} is mcp__-prefixed → must be gated (fail-closed)`);
+  }
+});
+
+test("gateToolCall(malformed mcp__ name) → build-error (fail-closed deny), NOT pass-through", async () => {
+  const wasm = await loadWasm();
+  for (const t of ["mcp__server__", "mcp__onlytwo", "mcp____tool"]) {
+    const out = gateToolCall(wasm, t, { x: 1 }, "/repo");
+    assert.equal(
+      out.kind,
+      "build-error",
+      `${t} must be a build-error (deny), never pass-through (the pre-fix fail-open bug)`,
+    );
+    assert.ok(/not a well-formed/.test(out.reason), "the deny reason explains the malformed name");
+  }
+});
+
+test("a well-formed mcp__server__tool still parses and gates normally (no regression)", async () => {
+  const wasm = await loadWasm();
+  assert.equal(isGatedTool("mcp__omnifocus__delete_project"), true);
+  const out = gateToolCall(wasm, "mcp__omnifocus__delete_project", { id: "abc" }, undefined);
+  assert.equal(out.kind, "gated", "a well-formed MCP name still gates and builds a record");
+});
+
 // ── gate outcomes (real WASM) ───────────────────────────────────────────────────────────────────
 
 test("gateToolCall(Bash) → gated with a command ActionRecord and a one-line summary", async () => {

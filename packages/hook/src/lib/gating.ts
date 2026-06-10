@@ -73,9 +73,23 @@ export function parseMcpToolName(toolName: string): { server: string; tool: stri
   return { server, tool };
 }
 
-/** True if a tool name is one this hook gates (Bash or any MCP tool). */
+/** True if a tool name carries the `mcp__` prefix — whether or not it fully parses. */
+function hasMcpPrefix(toolName: string): boolean {
+  return toolName.startsWith(MCP_TOOL_PREFIX);
+}
+
+/**
+ * True if a tool name is one this hook gates: `Bash`, or **any** `mcp__`-prefixed name.
+ *
+ * Crucially, gating an MCP name does NOT require it to fully parse as `mcp__<server>__<tool>`. The
+ * recommended `.claude/settings.json` matcher is `mcp__.*`, so Claude Code routes every
+ * `mcp__`-prefixed name — including malformed ones like `mcp__server__` or `mcp__onlytwo` — to this
+ * hook. Treating a malformed MCP name as non-gated would pass it through as `allow`, breaking
+ * fail-closed for MCP calls. So the prefix alone gates; `gateToolCall` then denies the ones that
+ * cannot be reduced to an `ActionRecord`.
+ */
 export function isGatedTool(toolName: string): boolean {
-  return toolName === BASH_TOOL_NAME || parseMcpToolName(toolName) !== null;
+  return toolName === BASH_TOOL_NAME || hasMcpPrefix(toolName);
 }
 
 /** Truncate a summary so a long command/params blob stays a one-liner in the notification. */
@@ -122,8 +136,17 @@ export function gateToolCall(
     }
   }
 
-  const mcp = parseMcpToolName(toolName);
-  if (mcp) {
+  if (hasMcpPrefix(toolName)) {
+    const mcp = parseMcpToolName(toolName);
+    if (mcp === null) {
+      // The name is `mcp__`-prefixed (so the `mcp__.*` matcher routed it here) but does NOT parse
+      // as `mcp__<server>__<tool>` (e.g. `mcp__server__`, `mcp__onlytwo`). It is still an MCP call;
+      // we cannot build a record for it, so we DENY rather than pass through (fail-closed).
+      return {
+        kind: "build-error",
+        reason: `allw: MCP tool name '${toolName}' is not a well-formed 'mcp__<server>__<tool>' (fail-closed deny)`,
+      };
+    }
     // The MCP tool params are the raw `tool_input` object; serialize verbatim for the core.
     const paramsJson = JSON.stringify(toolInput ?? {});
     try {
@@ -143,6 +166,7 @@ export function gateToolCall(
     }
   }
 
+  // A genuinely non-Bash, non-MCP tool (Read/Edit/Grep/…) is not gated — pass through as before.
   return {
     kind: "pass-through",
     reason: `allw: tool '${toolName}' is not gated by allw; passing through`,
