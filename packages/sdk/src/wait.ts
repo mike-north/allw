@@ -49,7 +49,10 @@ function parseFrame(data: unknown): Record<string, unknown> | null {
   } else if (data instanceof ArrayBuffer) {
     text = new TextDecoder().decode(data);
   } else if (ArrayBuffer.isView(data)) {
-    text = new TextDecoder().decode(data.buffer);
+    // Decode the exact bytes the view covers — passing the view (not `.buffer`) makes TextDecoder
+    // honor `byteOffset`/`byteLength`, so a frame carried in a subarray isn't polluted by
+    // neighbouring bytes of a shared backing buffer.
+    text = new TextDecoder().decode(data);
   } else {
     return null;
   }
@@ -85,7 +88,8 @@ const DEFAULT_SCHEDULE = (fn: () => void, ms: number): void => {
 /**
  * Await a verdict, returning a terminal {@link VerdictOutcome}. Never throws for a verdict that did
  * not arrive — the deadline path resolves to `timeout` (fail-closed). Relay/transport errors during
- * polling propagate (the caller maps them to a denied verdict).
+ * polling propagate; the caller (`requestApproval`) catches them and fails closed to a non-approving
+ * verdict (the timeout path → `expired`), never an approval.
  */
 export async function awaitVerdict(requestId: string, deps: WaitDeps): Promise<VerdictOutcome> {
   const schedule = deps.schedule ?? DEFAULT_SCHEDULE;

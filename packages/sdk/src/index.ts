@@ -43,12 +43,25 @@ export interface ActionRecord {
   readonly risk: Risk;
 }
 
-/** The automation requesting approval — shown to the human as a verified origin. */
+/**
+ * The automation requesting approval — shown to the human as the request's origin.
+ *
+ * v1 carries identity (`id`/`kind`); the actor-key `attestation` that lets the **device**
+ * cryptographically verify that origin (contract §Identity & keys) is a reserved, optional slot —
+ * its verifying-key enrollment and verification semantics are deferred (#16). Until then the shown
+ * origin is asserted, not yet device-verified.
+ */
 export interface Actor {
   /** Stable actor identity (e.g. `"machine:macbook-pro"`). */
   readonly id: string;
   /** Actor kind (e.g. `"claude-code"`). */
   readonly kind: string;
+  /**
+   * Optional actor-key attestation (base64url-unpadded signature), carried inside the encrypted
+   * `ApprovalContext` for the device to verify after decryption. Reserved for #16; excluded from
+   * the WYSIWYS `request_hash` (the core omits it from the canonicalization).
+   */
+  readonly attestation?: string;
 }
 
 /** Which decisions the approver may select, and whether a number-match challenge is required. */
@@ -61,8 +74,6 @@ export interface ApprovalRequest {
   readonly action: ActionRecord;
   /** One-line, human-readable summary shown in the notification. */
   readonly summary: string;
-  /** Routing target — the approver's inbox (the relay account id). */
-  readonly approver: string;
   /** The automation requesting approval (identity shown to the human). */
   readonly actor: Actor;
   /** Coarse risk classification shown to the human. */
@@ -158,7 +169,7 @@ interface WireApprovalContext {
     readonly risk: Risk;
   };
   readonly summary: string;
-  readonly actor: { readonly id: string; readonly kind: string };
+  readonly actor: { readonly id: string; readonly kind: string; readonly attestation?: string };
   readonly risk: Risk;
   readonly reversible: boolean;
   readonly constraints: {
@@ -186,7 +197,13 @@ function toWireContext(req: ApprovalRequest): WireApprovalContext {
       risk: req.action.risk,
     },
     summary: req.summary,
-    actor: { id: req.actor.id, kind: req.actor.kind },
+    actor: {
+      id: req.actor.id,
+      kind: req.actor.kind,
+      // Attestation is carried in the encrypted context when supplied (reserved for #16); omitted
+      // when absent so the canonicalization stays byte-identical (the core excludes it from the hash).
+      ...(req.actor.attestation !== undefined ? { attestation: req.actor.attestation } : {}),
+    },
     risk: req.risk,
     reversible: req.reversible,
     constraints: {
@@ -265,7 +282,11 @@ function verifyToDecision(
 export function createClient(config: ClientConfig): Client {
   const fetchImpl = config.fetchImpl ?? globalThis.fetch.bind(globalThis);
   const now: NowImpl = config.nowImpl ?? Date.now;
-  const webSocketFactory = config.webSocketFactory ?? defaultWebSocketFactory();
+  // An explicitly-present `webSocketFactory` key is authoritative — passing `undefined` disables
+  // WebSockets (poll-only), even on Node ≥22 where a global `WebSocket` exists. Only a fully absent
+  // key falls back to the global. This keeps the poll-only path (and tests) free of real WS dials.
+  const webSocketFactory =
+    "webSocketFactory" in config ? config.webSocketFactory : defaultWebSocketFactory();
   const pollIntervalMs = config.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   const relay = new RelayClient(config.relayUrl, config.accountId, fetchImpl);
 
@@ -302,7 +323,10 @@ export function createClient(config: ClientConfig): Client {
       id,
       created_at: createdAt,
       expires_at: expiresAt,
-      approver: req.approver,
+      // The client is bound to one account; the envelope's routing `approver` IS that account. Using
+      // `config.accountId` (not a per-request field) removes the footgun where a request could be
+      // POSTed to one account DO while claiming a different approver in the verified request JSON.
+      approver: config.accountId,
       context_ciphertext: contextCiphertext,
     };
     await relay.submit(envelope);

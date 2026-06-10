@@ -65,7 +65,6 @@ function sampleRequest(overrides = {}) {
       risk: "high",
     },
     summary: "Force-push to main",
-    approver: ACCOUNT_ID,
     actor: { id: "machine:macbook-pro", kind: "claude-code" },
     risk: "high",
     reversible: false,
