@@ -330,7 +330,7 @@ struct WasmUnsignedVerdict {
 /// - `unsigned_json` — a JSON [`WasmUnsignedVerdict`] (the verdict fields the human decided).
 /// - `device_seed_b64` — the device signing-key seed, base64url-unpadded 32 bytes. **v0 stand-in:**
 ///   a software-held seed; production device keys live in Secure Enclave / StrongBox and never
-///   serialize (`docs/architecture.md` §Identity & keys).
+///   serialize (`docs/contract.md` §Identity & keys).
 /// - `nonce_b64` — the per-verdict anti-replay nonce, base64url-unpadded (arbitrary length); it is
 ///   signed into the claims and checked against a [`NonceStore`](allw_core::NonceStore) on verify.
 /// - `device_cert` — the device→account-root certificate JWS (from [`issue_device_cert`]); pass an
