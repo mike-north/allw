@@ -38,9 +38,10 @@
 
 use allw_core::{
     compute_request_hash as core_compute_request_hash, decrypt_context as core_decrypt_context,
-    encrypt_context as core_encrypt_context, verify_verdict as core_verify_verdict,
-    ApprovalContext, ApprovalRequest, ContextRecipient, PublicKey, Verdict, X25519KeyPair,
-    X25519PublicKey,
+    encrypt_context as core_encrypt_context, issue_device_cert as core_issue_device_cert,
+    sign_verdict as core_sign_verdict, verify_verdict as core_verify_verdict, ApprovalContext,
+    ApprovalRequest, Approver, ContextRecipient, Decision, PublicKey, SigningKeyPair,
+    UnsignedVerdict, Verdict, X25519KeyPair, X25519PublicKey,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::rngs::OsRng;
@@ -70,6 +71,14 @@ fn decode_b64_32(s: &str, what: &str) -> Result<[u8; 32], JsError> {
     bytes
         .try_into()
         .map_err(|_| JsError::new(&format!("{what} must decode to exactly 32 bytes")))
+}
+
+/// Decodes a base64url-unpadded string into a byte vector of arbitrary length (e.g. a verdict
+/// nonce). Errors if the string is not valid base64url.
+fn decode_b64_vec(s: &str, what: &str) -> Result<Vec<u8>, JsError> {
+    URL_SAFE_NO_PAD
+        .decode(s)
+        .map_err(|e| JsError::new(&format!("{what} is not valid base64url: {e}")))
 }
 
 /// JS `Number.MAX_SAFE_INTEGER` = 2^53 − 1. Integer `f64`s within `±MAX_SAFE_INTEGER` are the
@@ -291,4 +300,160 @@ pub fn verify_verdict(
         },
         "VerifyResult",
     )
+}
+
+// ── sign_verdict ──────────────────────────────────────────────────────────────────────
+
+/// The signing input for [`sign_verdict`]: every [`Verdict`](allw_core::Verdict) field except the
+/// crypto-derived `sig`/`device_cert`. Mirrors the core
+/// [`UnsignedVerdict`](allw_core::UnsignedVerdict); `request_hash` is a base64url-unpadded 32-byte
+/// string (the wire encoding) and `decided_at` is an integer millisecond timestamp.
+#[derive(Deserialize)]
+struct WasmUnsignedVerdict {
+    v: u32,
+    request_id: String,
+    /// WYSIWYS binding hash — base64url-unpadded 32 bytes (echoes the request's `request_hash`).
+    request_hash: String,
+    decision: Decision,
+    decided_at: i64,
+    approver: Approver,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    challenge_response: Option<String>,
+}
+
+/// Signs a verdict with the approver's **device** Ed25519 key and returns the full
+/// [`Verdict`](allw_core::Verdict) JSON (its `sig` is an EdDSA compact JWS). This is the approver
+/// device's half of the round-trip — the integrator counterpart is [`verify_verdict`].
+///
+/// - `unsigned_json` — a JSON [`WasmUnsignedVerdict`] (the verdict fields the human decided).
+/// - `device_seed_b64` — the device signing-key seed, base64url-unpadded 32 bytes. **v0 stand-in:**
+///   a software-held seed; production device keys live in Secure Enclave / StrongBox and never
+///   serialize (`docs/contract.md` §Identity & keys).
+/// - `nonce_b64` — the per-verdict anti-replay nonce, base64url-unpadded. The decoder is
+///   length-agnostic, but anti-replay security depends on a **high-entropy** nonce: callers (the
+///   SDK, #12) MUST generate **≥16 cryptographically-random bytes** per verdict. It is signed into
+///   the claims and checked against a [`NonceStore`](allw_core::NonceStore) on verify.
+/// - `device_cert` — the device→account-root certificate JWS (from [`issue_device_cert`]); pass an
+///   empty string for none, though [`verify_verdict`] requires one to chain the device key to root.
+///
+/// # Errors
+///
+/// Throws if any JSON/seed/nonce input is malformed (invalid JSON, a non-32-byte seed, a
+/// non-base64url nonce, or a `request_hash` that is not 32 base64url bytes).
+#[wasm_bindgen]
+pub fn sign_verdict(
+    unsigned_json: &str,
+    device_seed_b64: &str,
+    nonce_b64: &str,
+    device_cert: &str,
+) -> Result<String, JsError> {
+    let u: WasmUnsignedVerdict = parse_json(unsigned_json, "UnsignedVerdict")?;
+    let request_hash = decode_b64_32(&u.request_hash, "request_hash")?;
+    let seed = decode_b64_32(device_seed_b64, "device_seed_b64")?;
+    let nonce = decode_b64_vec(nonce_b64, "nonce_b64")?;
+    let device_key = SigningKeyPair::from_seed(&seed);
+
+    let unsigned = UnsignedVerdict {
+        v: u.v,
+        request_id: u.request_id,
+        request_hash,
+        decision: u.decision,
+        decided_at: u.decided_at,
+        approver: u.approver,
+        note: u.note,
+        challenge_response: u.challenge_response,
+    };
+
+    // An empty `device_cert` means "no cert" — though a verifiable verdict needs one.
+    let cert = if device_cert.is_empty() {
+        None
+    } else {
+        Some(device_cert.to_string())
+    };
+
+    let verdict: Verdict = core_sign_verdict(&unsigned, &device_key, &nonce, cert);
+    to_json(&verdict, "Verdict")
+}
+
+// ── issue_device_cert ─────────────────────────────────────────────────────────────────
+
+/// Issues a device certificate — an EdDSA compact JWS signed by the **account-root** key binding a
+/// device public key to `(account_id, device_id)` — returned as the compact JWS string. A verifier
+/// holding only the account-root key can then trust the device key it certifies
+/// (`docs/contract.md` §Identity & keys), which is why a verdict's `device_cert` is required.
+///
+/// - `account_root_seed_b64` — the account-root signing seed, base64url-unpadded 32 bytes.
+/// - `device_pubkey_b64` — the device Ed25519 public key being certified, base64url-unpadded 32 bytes.
+/// - `issued_at` / `expires_at` — Unix-millisecond timestamps; `expires_at` may be omitted (no expiry).
+///
+/// # Errors
+///
+/// Throws if a seed/pubkey is not a 32-byte base64url value, the device pubkey is not a valid
+/// Ed25519 key, or a timestamp is not an in-range integer millisecond value.
+#[wasm_bindgen]
+pub fn issue_device_cert(
+    account_root_seed_b64: &str,
+    account_id: &str,
+    device_id: &str,
+    device_pubkey_b64: &str,
+    issued_at: f64,
+    expires_at: Option<f64>,
+) -> Result<String, JsError> {
+    let root_seed = decode_b64_32(account_root_seed_b64, "account_root_seed_b64")?;
+    let account_root = SigningKeyPair::from_seed(&root_seed);
+    let device_pubkey_bytes = decode_b64_32(device_pubkey_b64, "device_pubkey_b64")?;
+    let device_pubkey = PublicKey::from_bytes(&device_pubkey_bytes).map_err(|e| {
+        JsError::new(&format!(
+            "device_pubkey_b64 is not a valid Ed25519 key: {e}"
+        ))
+    })?;
+    let issued_at = ms_to_i64(issued_at, "issued_at")?;
+    let expires_at = match expires_at {
+        Some(ms) => Some(ms_to_i64(ms, "expires_at")?),
+        None => None,
+    };
+
+    Ok(core_issue_device_cert(
+        &account_root,
+        account_id,
+        device_id,
+        &device_pubkey,
+        issued_at,
+        expires_at,
+    ))
+}
+
+// ── key derivation (v0 software keys) ──────────────────────────────────────────────────
+
+/// Derives the Ed25519 **public** (verifying) key for a 32-byte signing seed, returned as a
+/// base64url-unpadded string — used to register a device/account signing key with the relay.
+///
+/// **v0 stand-in:** seeds are software-held; production signing keys are hardware-backed and never
+/// leave the device.
+///
+/// # Errors
+///
+/// Throws if `seed_b64` is not a 32-byte base64url value.
+#[wasm_bindgen]
+pub fn ed25519_public_key(seed_b64: &str) -> Result<String, JsError> {
+    let seed = decode_b64_32(seed_b64, "seed_b64")?;
+    let pubkey = SigningKeyPair::from_seed(&seed).public_key();
+    Ok(URL_SAFE_NO_PAD.encode(pubkey.to_bytes()))
+}
+
+/// Derives the X25519 **public** key for a 32-byte secret seed, returned as a base64url-unpadded
+/// string — used to register a device's encryption key (a recipient for [`encrypt_context`]).
+///
+/// **v0 stand-in:** seeds are software-held; production encryption keys are hardware-backed.
+///
+/// # Errors
+///
+/// Throws if `seed_b64` is not a 32-byte base64url value.
+#[wasm_bindgen]
+pub fn x25519_public_key(seed_b64: &str) -> Result<String, JsError> {
+    let seed = decode_b64_32(seed_b64, "seed_b64")?;
+    let pubkey = X25519KeyPair::from_seed(&seed).public_key();
+    Ok(URL_SAFE_NO_PAD.encode(pubkey.to_bytes()))
 }
