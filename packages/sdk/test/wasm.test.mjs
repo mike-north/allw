@@ -230,3 +230,120 @@ test("sign_verdict throws on a non-32-byte device seed", async () => {
     "a malformed signing seed must surface as a thrown JS error",
   );
 });
+
+test("sign_verdict carries an optional note through to a verifiable verdict", async () => {
+  const wasm = await loadWasm();
+  const f = approverFixture(wasm);
+
+  // Exercise the "sign optional fields only when present" path through the wasm boundary.
+  const unsigned = { ...f.unsigned, note: "approved from the cabin" };
+  const verdictJson = wasm.sign_verdict(JSON.stringify(unsigned), f.deviceSeed, f.nonce, f.cert);
+
+  const verdict = JSON.parse(verdictJson);
+  assert.equal(
+    verdict.note,
+    "approved from the cabin",
+    "the optional note is carried on the verdict",
+  );
+
+  const result = JSON.parse(
+    wasm.verify_verdict(
+      verdictJson,
+      f.v.request_json,
+      f.v.context_json,
+      f.accountRootPub,
+      f.v.now_ms,
+    ),
+  );
+  assert.equal(result.approved, true, "a verdict carrying an optional note still verifies");
+});
+
+test("verify rejects a verdict whose device-cert has expired", async () => {
+  const wasm = await loadWasm();
+  const f = approverFixture(wasm);
+
+  // Cert that expired long before now_ms (issued_at=1000, expires_at=2000 ms — both in 1970).
+  // This is the only test that threads issue_device_cert's 6th (expires_at) parameter.
+  const expiredCert = wasm.issue_device_cert(
+    f.accountSeed,
+    "acct_rt",
+    "dev_rt",
+    f.devicePub,
+    1000,
+    2000,
+  );
+  const verdictJson = wasm.sign_verdict(
+    JSON.stringify(f.unsigned),
+    f.deviceSeed,
+    f.nonce,
+    expiredCert,
+  );
+
+  assert.throws(
+    () =>
+      wasm.verify_verdict(
+        verdictJson,
+        f.v.request_json,
+        f.v.context_json,
+        f.accountRootPub,
+        f.v.now_ms,
+      ),
+    /verify_verdict failed/,
+    "an expired device-cert must break the chain to the account root",
+  );
+});
+
+test("verify rejects a verdict whose device-cert was tampered", async () => {
+  const wasm = await loadWasm();
+  const f = approverFixture(wasm);
+
+  // Flip one char of the cert's payload segment → its account-root signature no longer verifies.
+  const parts = f.cert.split(".");
+  const last = parts[1].slice(-1);
+  parts[1] = parts[1].slice(0, -1) + (last === "A" ? "B" : "A");
+  const tamperedCert = parts.join(".");
+  const verdictJson = wasm.sign_verdict(
+    JSON.stringify(f.unsigned),
+    f.deviceSeed,
+    f.nonce,
+    tamperedCert,
+  );
+
+  assert.throws(
+    () =>
+      wasm.verify_verdict(
+        verdictJson,
+        f.v.request_json,
+        f.v.context_json,
+        f.accountRootPub,
+        f.v.now_ms,
+      ),
+    /verify_verdict failed/,
+    "a tampered device-cert must not verify under the account root",
+  );
+});
+
+test("verify rejects a device-cert presented as the verdict signature (typ domain separation)", async () => {
+  const wasm = await loadWasm();
+  const f = approverFixture(wasm);
+
+  const verdict = JSON.parse(
+    wasm.sign_verdict(JSON.stringify(f.unsigned), f.deviceSeed, f.nonce, f.cert),
+  );
+  // Swap the verdict JWS for the device-cert JWS: wrong `typ` (device-cert vs verdict) AND wrong
+  // signing key (root vs device). Either alone must reject — pins domain separation across the FFI.
+  verdict.sig = f.cert;
+
+  assert.throws(
+    () =>
+      wasm.verify_verdict(
+        JSON.stringify(verdict),
+        f.v.request_json,
+        f.v.context_json,
+        f.accountRootPub,
+        f.v.now_ms,
+      ),
+    /verify_verdict failed/,
+    "a device-cert used as a verdict signature must be rejected",
+  );
+});

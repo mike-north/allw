@@ -331,8 +331,10 @@ struct WasmUnsignedVerdict {
 /// - `device_seed_b64` — the device signing-key seed, base64url-unpadded 32 bytes. **v0 stand-in:**
 ///   a software-held seed; production device keys live in Secure Enclave / StrongBox and never
 ///   serialize (`docs/contract.md` §Identity & keys).
-/// - `nonce_b64` — the per-verdict anti-replay nonce, base64url-unpadded (arbitrary length); it is
-///   signed into the claims and checked against a [`NonceStore`](allw_core::NonceStore) on verify.
+/// - `nonce_b64` — the per-verdict anti-replay nonce, base64url-unpadded. The decoder is
+///   length-agnostic, but anti-replay security depends on a **high-entropy** nonce: callers (the
+///   SDK, #12) MUST generate **≥16 cryptographically-random bytes** per verdict. It is signed into
+///   the claims and checked against a [`NonceStore`](allw_core::NonceStore) on verify.
 /// - `device_cert` — the device→account-root certificate JWS (from [`issue_device_cert`]); pass an
 ///   empty string for none, though [`verify_verdict`] requires one to chain the device key to root.
 ///
