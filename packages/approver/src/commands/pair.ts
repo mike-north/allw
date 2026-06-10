@@ -33,12 +33,12 @@ export interface PairOptions {
 export type Logger = (line: string) => void;
 
 /** Load the keyfile at `path`, or generate a fresh one if none exists yet. */
-function loadOrGenerate(wasm: AllwWasm, path: string): Keyfile {
+function loadOrGenerate(wasm: AllwWasm, path: string): { keyfile: Keyfile; fresh: boolean } {
   try {
-    return readKeyfile(path);
+    return { keyfile: readKeyfile(path), fresh: false };
   } catch {
     // No (valid) keyfile yet — generate a fresh identity. `pair` then fills in relay/account/cert.
-    return { ...generateKeyfile(wasm) };
+    return { keyfile: { ...generateKeyfile(wasm) }, fresh: true };
   }
 }
 
@@ -52,7 +52,15 @@ export async function runPair(
   log: Logger = console.log,
 ): Promise<Keyfile> {
   const now = options.now ?? Date.now();
-  const existing = loadOrGenerate(wasm, options.keyfilePath);
+  const { keyfile: existing, fresh } = loadOrGenerate(wasm, options.keyfilePath);
+
+  // 0. Crash-safety: if we just generated the seeds, persist the (unpaired) keyfile to disk BEFORE
+  // registering with the relay. Otherwise a crash between registration and the final write would
+  // leave a device enrolled on the relay whose only copy of the seeds was lost — unrecoverable.
+  // A subsequent re-run reuses these persisted seeds (loadOrGenerate reads them back).
+  if (fresh) {
+    writeKeyfile(options.keyfilePath, existing);
+  }
 
   // 1. Obtain a pairing code (supplied or self-driven).
   let code = options.code;

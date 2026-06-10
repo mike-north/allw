@@ -62,17 +62,27 @@ allw-approver watch          # alias: serve
 
 For each incoming request the approver:
 
+0. **refuses an expired request** before decrypting or prompting (device-side fail-closed expiry —
+   see below),
 1. **decrypts** the `context_ciphertext` with the device X25519 key (via the WASM core),
 2. **recomputes** the WYSIWYS `request_hash` over the decrypted context + the envelope's
    `expires_at` — identical bytes to the integrator's pre-send hash,
-3. **renders** the exact action, summary, actor, risk, reversibility, expiry, and `request_hash`,
+3. **renders** the **complete** action substrate (command/argv **plus** `cwd`, `host`, `env_refs`,
+   or MCP `params` when present — all bound into `request_hash`), summary, actor, risk,
+   reversibility, expiry, and `request_hash`,
 4. prompts **Approve / Deny / Skip**,
-5. on a decision, **signs** the verdict (Ed25519, fresh ≥16-byte nonce, with the device cert) and
+5. **re-checks expiry** after the human decides and before signing (a prompt left open past the
+   deadline emits nothing),
+6. on a decision, **signs** the verdict (Ed25519, fresh ≥16-byte nonce, with the device cert) and
    sends `{ type: "verdict", request_id, verdict }` over the socket.
 
 A `{ type: "retract" }` (another device resolved it) clears the pending prompt.
 
 #### WYSIWYS render
+
+The full meaning-changing substrate is shown — never elided behind a `raw` summary. `cwd`/`host`/
+`env_refs`/`params` change what an otherwise-identical command does, so they get their own labeled
+lines (the same fields the `request_hash` binds):
 
 ```
 ────────────────────────────────────────────────────────────────────────
@@ -82,7 +92,10 @@ A `{ type: "retract" }` (another device resolved it) clears the pending prompt.
   Summary:    force push to main
   Action:     git push --force origin main
   Surface:    command
+  Cwd:        /home/me/project
+  Env refs:   GIT_SSH_COMMAND
   Actor:      machine:laptop (claude-code)
+              ⚠ UNVERIFIED in v0 — origin is unauthenticated plaintext (#16)
   Risk:       high
   Reversible: no
   Expires:    2023-11-14T23:13:20.000Z
@@ -90,6 +103,21 @@ A `{ type: "retract" }` (another device resolved it) clears the pending prompt.
 ────────────────────────────────────────────────────────────────────────
 Approve / Deny / Skip? [a/d/s]
 ```
+
+#### ⚠ Actor origin is UNVERIFIED in v0
+
+The contract promises a **cryptographically-verified** requester origin (Invariant #4, actor-key
+attestation). v0 **cannot** verify it — actor-key verification is
+[#16](https://github.com/mike-north/allw/issues/16), still open — so the rendered actor line is
+explicitly marked `UNVERIFIED`. Treat the shown `machine:… (…)` as **spoofable plaintext**, not an
+authenticated identity, until #16 lands.
+
+#### Device-side fail-closed expiry
+
+The **device** (not just the relay) refuses a dead request: `prepareRequest` throws when
+`expires_at <= now` before any decrypt/render, and the watch loop re-checks after the human decides
+and before signing. A stale-but-signed approval can therefore never be produced, regardless of an
+integrator's clock-skew window ([`docs/contract.md` §Invariants #6](../../docs/contract.md)).
 
 ## Fail-closed
 

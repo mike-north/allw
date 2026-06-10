@@ -4,6 +4,9 @@
  * sends only public key material + routing metadata; it never sends a seed (zero-knowledge relay).
  */
 
+/** Pairing HTTP requests are short; bound them so a hung relay can't stall the CLI indefinitely. */
+const PAIRING_TIMEOUT_MS = 15_000;
+
 /** Trim a trailing slash so `${base}/path` never doubles up. */
 function normalizeBase(url: string): string {
   return url.replace(/\/+$/, "");
@@ -15,6 +18,8 @@ async function postJson(url: string, body: unknown): Promise<unknown> {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    // Fail-closed on a hung/unreachable relay rather than blocking forever (aborts after timeout).
+    signal: AbortSignal.timeout(PAIRING_TIMEOUT_MS),
   });
   const text = await resp.text();
   let parsed: unknown;

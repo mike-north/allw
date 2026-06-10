@@ -71,21 +71,37 @@ function parseEnvelope(value: unknown): ApprovalRequest {
  * Decrypt and prepare an inbound request for rendering (`docs/contract.md` §Lifecycle step 4):
  *
  * 1. Validate the envelope (fail-closed).
- * 2. `decrypt_context` the `context_ciphertext` with the **device X25519 seed** (via the core).
- * 3. Recompute `request_hash` over the decrypted context + the envelope's `expires_at` (the core
+ * 2. **Device-side fail-closed expiry** (`docs/contract.md` §Invariants #6): refuse a request whose
+ *    `expires_at <= nowMs` BEFORE decrypting/rendering. A dead request must never be presented to
+ *    the human or signed — the device, not just the relay (#43), enforces this, so a generous
+ *    integrator clock-skew window can never accept a stale-but-signed approval.
+ * 3. `decrypt_context` the `context_ciphertext` with the **device X25519 seed** (via the core).
+ * 4. Recompute `request_hash` over the decrypted context + the envelope's `expires_at` (the core
  *    pins the canonicalization; the integrator computed the same bytes pre-send — WYSIWYS).
  *
  * The recomputed hash IS the binding the human's verdict will carry, so by signing over it the
  * approver proves it saw exactly the bytes it rendered. Any failure throws (deny-by-default).
  *
- * @throws on a malformed envelope, a JWE the device key cannot decrypt, or a malformed context.
+ * @param nowMs current time in Unix ms — injected so expiry is deterministic/testable (no
+ *   wall-clock read inside).
+ * @throws on a malformed envelope, an **already-expired** request, a JWE the device key cannot
+ *   decrypt, or a malformed context.
  */
 export function prepareRequest(
   wasm: AllwWasm,
   keyfile: Keyfile,
   rawEnvelope: unknown,
+  nowMs: number,
 ): RenderableRequest {
   const envelope = parseEnvelope(rawEnvelope);
+
+  // Fail-closed expiry — refuse a dead request before any decrypt/render/sign work.
+  if (envelope.expires_at <= nowMs) {
+    throw new Error(
+      `request ${envelope.id} is expired (expires_at ${String(envelope.expires_at)} <= now ${String(nowMs)})`,
+    );
+  }
+
   const ciphertext = envelope.context_ciphertext;
   if (ciphertext === undefined) {
     // Unreachable after parseEnvelope, but keeps the type narrow without a non-null assertion.

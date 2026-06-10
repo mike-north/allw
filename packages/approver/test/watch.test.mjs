@@ -239,3 +239,75 @@ test("fail-closed: an undecryptable request is skipped, emits no verdict, and is
     "the skip is reported to the user",
   );
 });
+
+// ── Device-side fail-closed expiry in the watch loop (review fix #2) ──────────────────────────
+
+test("fail-closed: an already-expired request emits no verdict and is NOT prompted", async () => {
+  const wasm = await loadWasm();
+  const { keyfile, jwe } = pairedApprover(wasm);
+  const ws = stubSocket();
+  const log = recordingLogger();
+  let prompted = false;
+  const prompter = {
+    decide() {
+      prompted = true;
+      return Promise.resolve("approved");
+    },
+  };
+
+  // Seeded clock already past the deadline → prepareRequest refuses before any prompt (no Date.now).
+  const decision = await handleRequest(
+    wasm,
+    keyfile,
+    ws,
+    prompter,
+    makeEnvelope(jwe),
+    log,
+    () => EXPIRES_AT + 1,
+  );
+
+  assert.equal(decision, null, "an expired request yields no decision");
+  assert.equal(ws.sent.length, 0, "no verdict is emitted for an expired request");
+  assert.equal(prompted, false, "the human is never prompted for an already-expired request");
+});
+
+test("fail-closed: a request that expires WHILE the human deliberates emits no verdict", async () => {
+  const wasm = await loadWasm();
+  const { keyfile, jwe } = pairedApprover(wasm);
+  const ws = stubSocket();
+  const log = recordingLogger();
+
+  // Stateful seeded clock: the FIRST read (prepareRequest) is before the deadline so the request is
+  // rendered + prompted; the prompt then "takes a long time" and every subsequent read (the
+  // post-decision re-check, and signing) is AFTER the deadline. The approver must discard it.
+  let firstRead = true;
+  const now = () => {
+    if (firstRead) {
+      firstRead = false;
+      return EXPIRES_AT - 1000; // live at arrival
+    }
+    return EXPIRES_AT + 1000; // expired by the time the human answered
+  };
+
+  let prompted = false;
+  const prompter = {
+    decide() {
+      prompted = true;
+      return Promise.resolve("approved"); // the human DID approve — but too late
+    },
+  };
+
+  const decision = await handleRequest(wasm, keyfile, ws, prompter, makeEnvelope(jwe), log, now);
+
+  assert.equal(prompted, true, "the human was prompted (it was live when it arrived)");
+  assert.equal(decision, null, "a request that expired during the prompt yields no decision");
+  assert.equal(
+    ws.sent.length,
+    0,
+    "no stale-but-signed approval is emitted once the deadline passes mid-prompt",
+  );
+  assert.ok(
+    log._warn.some((l) => /expired while awaiting a decision/i.test(l)),
+    "the post-decision expiry is reported (fail-closed)",
+  );
+});

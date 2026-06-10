@@ -121,7 +121,7 @@ test("approved round-trip: decrypt → recompute request_hash → sign → verif
   const wasm = await loadWasm();
   const { keyfile, jwe } = pairedApprover(wasm);
 
-  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe));
+  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
 
   // (a) The recomputed WYSIWYS hash equals the integrator's pre-send hash (no separate digest).
   const integratorHash = wasm.compute_request_hash(CONTEXT_JSON, EXPIRES_AT);
@@ -155,7 +155,7 @@ test("approved round-trip: decrypt → recompute request_hash → sign → verif
 test("denied round-trip: a signed denial verifies as a verified 'no' (verify_verdict throws)", async () => {
   const wasm = await loadWasm();
   const { keyfile, jwe } = pairedApprover(wasm);
-  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe));
+  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
 
   const verdict = signDecision(wasm, keyfile, prepared, "denied", DECIDED_AT);
   assert.equal(verdict.decision, "denied", "the signed verdict carries the denied decision");
@@ -187,7 +187,7 @@ test("fail-closed: a malformed ciphertext aborts the request (throws, no verdict
   // approver emits no verdict and the integrator's gate stays closed.
   const envelope = makeEnvelope("eyJhbGciOiJFQ0RILUVTK0EyNTZLVyJ9.NOT-A-REAL.JWE");
   assert.throws(
-    () => prepareRequest(wasm, keyfile, envelope),
+    () => prepareRequest(wasm, keyfile, envelope, NOW_MS),
     /decrypt/i,
     "a malformed ciphertext must throw (fail-closed), never yield a forged context",
   );
@@ -206,7 +206,7 @@ test("fail-closed: a ciphertext encrypted to a DIFFERENT device key cannot be de
   );
 
   assert.throws(
-    () => prepareRequest(wasm, keyfile, makeEnvelope(jweForStranger)),
+    () => prepareRequest(wasm, keyfile, makeEnvelope(jweForStranger), NOW_MS),
     /decrypt/i,
     "a context encrypted to another device must fail to decrypt (fail-closed)",
   );
@@ -219,7 +219,7 @@ test("fail-closed: an envelope missing context_ciphertext is rejected before any
   delete envelope.context_ciphertext;
 
   assert.throws(
-    () => prepareRequest(wasm, keyfile, envelope),
+    () => prepareRequest(wasm, keyfile, envelope, NOW_MS),
     /context_ciphertext/,
     "a malformed envelope must be rejected fail-closed",
   );
@@ -228,7 +228,7 @@ test("fail-closed: an envelope missing context_ciphertext is rejected before any
 test("fail-closed: signing is refused when the keyfile has no device_cert", async () => {
   const wasm = await loadWasm();
   const { keyfile, jwe } = pairedApprover(wasm);
-  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe));
+  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
 
   // Strip the cert — without it the verdict cannot chain to the account root, so we must refuse to
   // sign rather than emit an unverifiable verdict.
@@ -240,12 +240,93 @@ test("fail-closed: signing is refused when the keyfile has no device_cert", asyn
   );
 });
 
+// ── Device-side fail-closed expiry (review fix #2) ───────────────────────────────────────────
+
+test("fail-closed expiry: prepareRequest refuses an expired request (no decrypt, no prompt)", async () => {
+  const wasm = await loadWasm();
+  const { keyfile, jwe } = pairedApprover(wasm);
+
+  // now == expires_at: at-or-past the deadline must be refused (boundary is inclusive: <=).
+  assert.throws(
+    () => prepareRequest(wasm, keyfile, makeEnvelope(jwe), EXPIRES_AT),
+    /expired/,
+    "a request at its deadline must be refused (device-side fail-closed, not just the relay)",
+  );
+  // now well past the deadline: also refused.
+  assert.throws(
+    () => prepareRequest(wasm, keyfile, makeEnvelope(jwe), EXPIRES_AT + 60_000),
+    /expired/,
+    "a request past its deadline must be refused",
+  );
+});
+
+test("fail-closed expiry: a request one ms before the deadline is still accepted", async () => {
+  const wasm = await loadWasm();
+  const { keyfile, jwe } = pairedApprover(wasm);
+  // Boundary: now = expires_at - 1 is still live, so prepare succeeds and yields a renderable.
+  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), EXPIRES_AT - 1);
+  assert.equal(prepared.requestId, REQUEST_ID, "a not-yet-expired request prepares normally");
+});
+
+// ── Fail-closed: WYSIWYS tamper between encrypt and render (review fix, non-blocking) ─────────
+
+test("tamper-mismatch: a mutated context yields a request_hash that fails the integrator's check", async () => {
+  const wasm = await loadWasm();
+  const { keyfile } = pairedApprover(wasm);
+
+  // Simulate tampering between encrypt and render: the human-shown context the device decrypts
+  // differs from what the integrator hashed pre-send (here the cwd/summary were altered). The
+  // device recomputes the hash over the bytes it actually saw — which must NOT equal the
+  // integrator's hash of the ORIGINAL context, so the eventual verify_verdict (which binds the
+  // integrator's original request_hash) cannot accept it. Proves the WYSIWYS binding catches a swap.
+  const tamperedContext = {
+    ...CONTEXT,
+    summary: "innocuous: list files",
+    action: {
+      ...CONTEXT.action,
+      syntactic: { bin: "git", raw: "git push --force origin main", cwd: "/etc" },
+    },
+  };
+  const tamperedJson = JSON.stringify(tamperedContext);
+  const jwe = wasm.encrypt_context(
+    tamperedJson,
+    JSON.stringify([{ device_id: DEVICE_ID, public_key_b64: keyfile.device_encryption_pubkey }]),
+  );
+
+  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
+
+  // The integrator's pre-send hash was computed over the ORIGINAL context; the device's recomputed
+  // hash is over the tampered one → they differ, so the binding is broken (no silent acceptance).
+  const integratorHashOriginal = wasm.compute_request_hash(CONTEXT_JSON, EXPIRES_AT);
+  assert.notEqual(
+    prepared.requestHash,
+    integratorHashOriginal,
+    "a tampered context must produce a DIFFERENT request_hash than the integrator's original",
+  );
+
+  // And concretely: a verdict the device signs over its (tampered) hash fails verify_verdict when
+  // the integrator verifies against the ORIGINAL context it holds — fail-closed end to end.
+  const verdict = signDecision(wasm, keyfile, prepared, "approved", DECIDED_AT);
+  assert.throws(
+    () =>
+      wasm.verify_verdict(
+        JSON.stringify(verdict),
+        makeRequestJson(),
+        CONTEXT_JSON, // integrator's ORIGINAL context
+        keyfile.account_root_pubkey,
+        NOW_MS,
+      ),
+    /verify_verdict failed/,
+    "a verdict bound to a tampered context must not verify against the integrator's original",
+  );
+});
+
 // ── WYSIWYS render shows the EXACT action ────────────────────────────────────────────────────
 
 test("renderRequest shows the exact action, actor, risk, expiry, and request_hash", async () => {
   const wasm = await loadWasm();
   const { keyfile, jwe } = pairedApprover(wasm);
-  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe));
+  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
 
   const rendered = renderRequest(prepared);
   // Every WYSIWYS field the human signs over must appear verbatim in the rendered block.
@@ -259,12 +340,97 @@ test("renderRequest shows the exact action, actor, risk, expiry, and request_has
     rendered.includes(prepared.requestHash),
     "the request_hash is shown verbatim for out-of-band verification",
   );
+  // Review fix #3: the actor origin must be marked UNVERIFIED (v0 cannot verify — #16).
+  assert.match(
+    rendered,
+    /UNVERIFIED in v0/,
+    "the actor origin is shown as unverified, not trusted (#16 still open)",
+  );
+});
+
+test("renderRequest surfaces cwd and env_refs (WYSIWYS completeness — review fix #1)", async () => {
+  const wasm = await loadWasm();
+  const { keyfile } = pairedApprover(wasm);
+
+  // A command whose meaning hinges on cwd + env_refs — both bound into request_hash, so both MUST
+  // appear in the rendered output (the TOCTOU gap a `raw`-only summary would reopen).
+  const ctx = {
+    action: {
+      record_schema_version: 1,
+      surface: "command",
+      syntactic: {
+        bin: "rm",
+        argv: ["rm", "-rf", "build"],
+        raw: "rm -rf build",
+        cwd: "/etc",
+        env_refs: ["AWS_SECRET_ACCESS_KEY", "DEPLOY_TOKEN"],
+      },
+      risk: "critical",
+    },
+    summary: "remove the build directory",
+    actor: { id: "machine:ci", kind: "claude-code" },
+    risk: "critical",
+    reversible: false,
+    constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
+  };
+  const ctxJson = JSON.stringify(ctx);
+  const jwe = wasm.encrypt_context(
+    ctxJson,
+    JSON.stringify([{ device_id: DEVICE_ID, public_key_b64: keyfile.device_encryption_pubkey }]),
+  );
+  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
+  const rendered = renderRequest(prepared);
+
+  assert.match(
+    rendered,
+    /Cwd:\s+\/etc/,
+    "the cwd is rendered (a /etc vs /tmp distinction matters)",
+  );
+  assert.match(
+    rendered,
+    /Env refs:\s+AWS_SECRET_ACCESS_KEY, DEPLOY_TOKEN/,
+    "the referenced env var names are rendered",
+  );
+});
+
+test("renderRequest surfaces MCP params (not hidden behind raw) — review fix #1", async () => {
+  const wasm = await loadWasm();
+  const { keyfile } = pairedApprover(wasm);
+
+  const ctx = {
+    action: {
+      record_schema_version: 1,
+      surface: "mcp_tool_call",
+      syntactic: {
+        server: "filesystem",
+        tool: "write_file",
+        params: { path: "/etc/passwd", contents: "pwned" },
+      },
+      risk: "critical",
+    },
+    summary: "write a file via MCP",
+    actor: { id: "machine:agent", kind: "claude-code" },
+    risk: "critical",
+    reversible: false,
+    constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
+  };
+  const ctxJson = JSON.stringify(ctx);
+  const jwe = wasm.encrypt_context(
+    ctxJson,
+    JSON.stringify([{ device_id: DEVICE_ID, public_key_b64: keyfile.device_encryption_pubkey }]),
+  );
+  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
+  const rendered = renderRequest(prepared);
+
+  // The headline shows server :: tool; the full params (the entire payload) are shown explicitly.
+  assert.match(rendered, /filesystem :: write_file/, "the MCP server/tool headline is shown");
+  assert.match(rendered, /\/etc\/passwd/, "the MCP params payload is shown in full, not elided");
 });
 
 test("nonce is a fresh, high-entropy (≥16-byte) value per verdict", async () => {
   const wasm = await loadWasm();
   const { keyfile, jwe } = pairedApprover(wasm);
-  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe));
+  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
 
   // Two signatures over the same unsigned verdict differ because each carries a fresh random nonce
   // — proving anti-replay nonces are generated per verdict (not reused).

@@ -98,9 +98,12 @@ export async function handleRequest(
 ): Promise<Decision | null> {
   let prepared: RenderableRequest;
   try {
-    prepared = prepareRequest(wasm, keyfile, rawEnvelope);
+    // Pass the current clock so prepareRequest can fail-closed on an already-expired request
+    // (refused before the human is ever prompted).
+    prepared = prepareRequest(wasm, keyfile, rawEnvelope, now());
   } catch (err) {
-    // Fail-closed: a request we cannot decrypt/verify yields NO verdict (gate stays closed).
+    // Fail-closed: a request we cannot decrypt/verify (or that is already expired) yields NO
+    // verdict (the integrator's gate stays closed). The human is not prompted.
     log.warn(`Skipping request — could not decrypt/verify: ${(err as Error).message}`);
     return null;
   }
@@ -109,6 +112,16 @@ export async function handleRequest(
   const decision = await prompter.decide(rendered, prepared);
   if (decision === null) {
     log.info(`No decision recorded for ${prepared.requestId} — leaving it pending.`);
+    return null;
+  }
+
+  // Fail-closed re-check (long-idle prompt): a prompt may have sat open past the deadline while the
+  // human deliberated. Re-read the clock AFTER the decision and BEFORE signing — a request that
+  // expired during the prompt must emit nothing, never a stale-but-signed approval.
+  if (prepared.expiresAt <= now()) {
+    log.warn(
+      `Request ${prepared.requestId} expired while awaiting a decision — discarding (fail-closed).`,
+    );
     return null;
   }
 
@@ -173,6 +186,8 @@ export async function runWatch(
 
   const url = deviceConnectWsUrl(relayUrl, accountId, deviceId);
   log.info(`Connecting to ${url} …`);
+  // TODO(#41 v0): no reconnect/backoff — on close the loop simply exits (re-run `watch` to
+  // reconnect). A resilient reconnect-with-backoff loop is out of scope for the v0 skeleton.
   const ws = deps.connect(url);
 
   // Serialize request handling: prompts are interactive, so process one at a time.
@@ -197,6 +212,9 @@ export async function runWatch(
           ),
         );
       } else if (msg.type === "retract") {
+        // TODO(#41 v0): a retract that arrives mid-prompt only logs — the human can still answer the
+        // now-dead prompt, but the relay acks the late verdict `already_resolved` (first-verdict-
+        // wins), so it is harmless. Aborting the active prompter on retract is a v0+ refinement.
         log.info(`Request ${msg.request_id} was retracted (resolved elsewhere).`);
       } else if (msg.type === "ack") {
         log.info(`Relay ack for ${msg.request_id}: ${msg.status}`);
