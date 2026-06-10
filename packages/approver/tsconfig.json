@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "types": ["node"],
+    // The approver is an application (not a library), and runs WASM under node. It needs the
+    // `WebAssembly` namespace and the WHATWG `WebSocket`/`fetch` globals (Node 24 implements them).
+    // `WebWorker` supplies `WebAssembly` + `WebSocket` without pulling in the full DOM surface.
+    "lib": ["ES2023", "WebWorker"]
+  },
+  "include": ["src"]
+}
