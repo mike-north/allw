@@ -18,7 +18,10 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint src",
-    "test": "node --test \"test/**/*.test.mjs\""
+    "test": "tsc -p tsconfig.json && node --test \"test/**/*.test.mjs\""
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
   },
   "license": "MIT"
 }

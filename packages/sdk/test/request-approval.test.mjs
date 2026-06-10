@@ -1,0 +1,586 @@
+/**
+ * End-to-end tests for `@allw/sdk` `requestApproval` (issue #12).
+ *
+ * These exercise the real compiled SDK (`dist/index.js`) and the real WASM core against a
+ * **test double** of the relay's HTTP/WS surface. The double mirrors the contract's Relay routing
+ * API (`docs/contract.md` §Transport): `GET /:acct/devices`, `POST /:acct/requests`,
+ * `GET /:acct/requests/:id` (poll), and the `…/wait` WebSocket. A valid signed verdict is minted
+ * in-process through the WASM signing surface (`sign_verdict` / `issue_device_cert` / key
+ * derivation), so the happy path verifies for real — no stubbed crypto.
+ *
+ * The matrix (issue #12 acceptance):
+ *  (a) happy WS round-trip → resolves `approved`, `verify()` re-passes;
+ *  (a') happy poll round-trip (no WebSocket) → resolves `approved`;
+ *  (b) timeout (no verdict) → resolves `expired`, never approved, `verify()` false;
+ *  (b') relay `expired` terminal → resolves `expired`;
+ *  (c) tampered / forged verdict → never approved (synthesized `denied`), `verify()` false;
+ *  (c-sig) verdict from an uncertified key → never approved;
+ *  (c') authenticated human "denied" → resolves `denied` (the verified decision), `verify()` false;
+ *  (d) negative: no devices, relay submit error;
+ *  plus a zero-leak envelope-shape assertion.
+ *
+ * Run order (the wasm must be built and the SDK compiled first):
+ *   pnpm run build:wasm                # from repo root
+ *   pnpm --filter @allw/sdk build      # tsc → dist
+ *   pnpm --filter @allw/sdk test
+ *
+ * @see ../../../docs/contract.md (§Lifecycle, §Messages, §Verification checklist, §Transport)
+ * @see ../../relay/src/index.ts (the routing surface this double mirrors)
+ */
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { dirname, join } from "node:path";
+
+import { createClient } from "../dist/index.js";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const vendorDir = join(here, "..", "vendor", "allw-wasm");
+
+/** Load the `--target web` wasm synchronously (mirrors test/wasm.test.mjs). */
+async function loadWasm() {
+  const glue = await import(pathToFileURL(join(vendorDir, "allw_wasm.js")).href);
+  const bytes = readFileSync(join(vendorDir, "allw_wasm_bg.wasm"));
+  glue.initSync({ module: new WebAssembly.Module(bytes) });
+  return glue;
+}
+
+// ── Deterministic fixtures (never Date.now() in data — fixed-dates rule) ──────────────
+
+/** A fixed "now" so expires_at = NOW + timeout is deterministic and inside the verify window. */
+const NOW_MS = 1700001000000; // 2023-11-14T22:30:00Z
+const TIMEOUT_MS = 60_000;
+const ACCOUNT_ID = "acct_sdk_test_01";
+const RELAY_URL = "https://relay.allw.test";
+
+/** A representative ApprovalRequest in the SDK's ergonomic camelCase shape. */
+function sampleRequest(overrides = {}) {
+  return {
+    action: {
+      recordSchemaVersion: 1,
+      surface: "command",
+      syntactic: { bin: "git", raw: "git push --force" },
+      risk: "high",
+    },
+    summary: "Force-push to main",
+    actor: { id: "machine:macbook-pro", kind: "claude-code" },
+    risk: "high",
+    reversible: false,
+    timeoutMs: TIMEOUT_MS,
+    ...overrides,
+  };
+}
+
+/**
+ * The snake_case wire context the SDK builds internally (mirrors `toWireContext`). The test signs
+ * a verdict bound to the request_hash computed from THIS object — identical bytes to the SDK's.
+ */
+function wireContext(req) {
+  const constraints = req.constraints ?? {
+    allowedDecisions: ["approved", "denied"],
+    challengeRequired: false,
+  };
+  const ctx = {
+    action: {
+      record_schema_version: req.action.recordSchemaVersion,
+      surface: req.action.surface,
+      syntactic: req.action.syntactic,
+      risk: req.action.risk,
+    },
+    summary: req.summary,
+    actor: { id: req.actor.id, kind: req.actor.kind },
+    risk: req.risk,
+    reversible: req.reversible,
+    constraints: {
+      allowed_decisions: constraints.allowedDecisions,
+      challenge_required: constraints.challengeRequired,
+    },
+  };
+  if (req.chain !== undefined) ctx.chain = req.chain;
+  return ctx;
+}
+
+/**
+ * Build an approver: account-root key, a device key it certifies, and the device's X25519
+ * encryption pubkey (a JWE recipient). All derived through the WASM surface.
+ */
+function makeApprover(wasm) {
+  const accountSeed = Buffer.alloc(32, 7).toString("base64url");
+  const deviceSeed = Buffer.alloc(32, 9).toString("base64url");
+  const deviceX25519Seed = Buffer.alloc(32, 11).toString("base64url");
+  const accountRootPub = wasm.ed25519_public_key(accountSeed);
+  const devicePub = wasm.ed25519_public_key(deviceSeed);
+  const deviceX25519Pub = wasm.x25519_public_key(deviceX25519Seed);
+  const deviceId = "dev_sdk_test_01";
+  const cert = wasm.issue_device_cert(accountSeed, ACCOUNT_ID, deviceId, devicePub, NOW_MS - 1000);
+  return { accountSeed, deviceSeed, deviceX25519Pub, accountRootPub, devicePub, deviceId, cert };
+}
+
+/** One enrolled device record as the relay's `GET /:acct/devices` returns it. */
+function deviceRecord(approver) {
+  return {
+    device_id: approver.deviceId,
+    pubkey: approver.deviceX25519Pub,
+    label: null,
+    created_at: 0,
+  };
+}
+
+/**
+ * Mint a signed verdict for a captured envelope, bound to the SDK's context. `decision` controls
+ * approved/denied/etc. Uses the device key the cert certifies (a genuine, verifiable verdict).
+ */
+function signVerdict(wasm, approver, req, capturedEnvelope, { decision = "approved" } = {}) {
+  const requestHash = wasm.compute_request_hash(
+    JSON.stringify(wireContext(req)),
+    capturedEnvelope.expires_at,
+  );
+  const unsigned = {
+    v: 1,
+    request_id: capturedEnvelope.id,
+    request_hash: requestHash,
+    decision,
+    decided_at: NOW_MS, // inside [created_at, expires_at]
+    approver: { account_id: ACCOUNT_ID, device_id: approver.deviceId },
+  };
+  const nonce = Buffer.alloc(16, 3).toString("base64url");
+  const verdictJson = wasm.sign_verdict(
+    JSON.stringify(unsigned),
+    approver.deviceSeed,
+    nonce,
+    approver.cert,
+  );
+  return JSON.parse(verdictJson);
+}
+
+// ── Relay test double ─────────────────────────────────────────────────────────────────
+
+/**
+ * A configurable fake of the relay routing surface. `behavior.poll(envelope)` returns either a
+ * verdict object (resolved), `"expired"`, or `null` (stay pending). The double captures the
+ * submitted envelope so a test can mint a matching verdict afterwards.
+ */
+function makeRelayDouble({ devices, behavior }) {
+  const state = { captured: null, submitted: false };
+
+  const fetchImpl = async (url, init = {}) => {
+    const u = new URL(url);
+    const path = u.pathname;
+    const method = (init.method ?? "GET").toUpperCase();
+
+    if (method === "GET" && path.endsWith("/devices")) {
+      return jsonResponse({ devices });
+    }
+    if (method === "POST" && path.endsWith("/requests")) {
+      const envelope = JSON.parse(init.body);
+      state.captured = envelope;
+      state.submitted = true;
+      if (behavior.submitStatus && behavior.submitStatus !== 202) {
+        return jsonResponse({ error: "rejected" }, behavior.submitStatus);
+      }
+      return jsonResponse({ request_id: envelope.id, status: "pending", delivered_to: 1 }, 202);
+    }
+    if (method === "GET" && path.includes("/requests/")) {
+      const outcome = behavior.poll(state.captured);
+      if (outcome === null) return jsonResponse({ request_id: "x", status: "pending" });
+      if (outcome === "expired") return jsonResponse({ request_id: "x", status: "expired" });
+      return jsonResponse({ request_id: "x", status: "resolved", verdict: outcome });
+    }
+    return jsonResponse({ error: "not found" }, 404);
+  };
+
+  return { fetchImpl, state };
+}
+
+function jsonResponse(data, status = 200) {
+  return { ok: status >= 200 && status < 300, status, json: () => Promise.resolve(data) };
+}
+
+/**
+ * A fake WebSocket that, on construction, asynchronously emits the configured terminal frame (or
+ * nothing). Mirrors the `…/wait` push protocol. `frameFor()` is called lazily so the frame can be
+ * built from the already-captured envelope.
+ */
+function makeWebSocketFactory(frameFor) {
+  return (url) => new FakeWebSocket(url, frameFor);
+}
+
+class FakeWebSocket {
+  constructor(url, frameFor) {
+    this.url = url;
+    this.listeners = { message: [], open: [], error: [], close: [] };
+    this.closed = false;
+    // Emit after listeners are attached (the SDK attaches synchronously post-construction).
+    queueMicrotask(() => {
+      if (this.closed) return;
+      const frame = frameFor();
+      if (frame === undefined) return;
+      for (const l of this.listeners.message) l({ data: JSON.stringify(frame) });
+    });
+  }
+  addEventListener(type, listener) {
+    this.listeners[type].push(listener);
+  }
+  close() {
+    this.closed = true;
+  }
+}
+
+/**
+ * A clock for the fail-closed **timeout** test. Each scheduled callback advances the virtual clock
+ * by its delay and fires on a microtask (no real waiting). The deadline timer's delay is the full
+ * `TIMEOUT_MS`, so the first `schedule` advances `now` to the deadline; the poll loop then
+ * self-terminates to `timeout` on its next iteration (`now() >= deadline`). Deterministic, with no
+ * real timers and no dangling event-loop starvation.
+ */
+function makeTimeoutClock() {
+  let current = NOW_MS;
+  return {
+    now: () => current,
+    schedule: (fn, ms) => {
+      current += ms;
+      queueMicrotask(fn);
+    },
+  };
+}
+
+/** Shared client config for the poll-only (real-timer, fixed-now) tests. */
+function pollClient(approver, relay) {
+  return createClient({
+    relayUrl: RELAY_URL,
+    accountId: ACCOUNT_ID,
+    approverRootKey: approver.accountRootPub,
+    fetchImpl: relay.fetchImpl,
+    nowImpl: () => NOW_MS,
+    webSocketFactory: undefined, // poll-only path
+    pollIntervalMs: 5,
+  });
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────────────
+
+test("(a) happy WS round-trip → approved, verify() re-passes", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const req = sampleRequest();
+
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: { poll: () => null },
+  });
+
+  // The WS frame is built lazily AFTER the envelope is captured, so the verdict binds to the real id.
+  const wsFactory = makeWebSocketFactory(() => ({
+    type: "verdict",
+    request_id: relay.state.captured.id,
+    verdict: signVerdict(wasm, approver, req, relay.state.captured, { decision: "approved" }),
+  }));
+
+  const client = createClient({
+    relayUrl: RELAY_URL,
+    accountId: ACCOUNT_ID,
+    approverRootKey: approver.accountRootPub,
+    fetchImpl: relay.fetchImpl,
+    nowImpl: () => NOW_MS,
+    webSocketFactory: wsFactory,
+  });
+
+  const verdict = await client.requestApproval(req);
+  assert.equal(
+    verdict.decision,
+    "approved",
+    "a delivered, verified, approved verdict resolves approved",
+  );
+  assert.equal(typeof verdict.requestId, "string");
+  assert.equal(
+    await verdict.verify(approver.accountRootPub),
+    true,
+    "verify() re-passes against the root key",
+  );
+  const wrongRoot = wasm.ed25519_public_key(Buffer.alloc(32, 0x5a).toString("base64url"));
+  assert.equal(await verdict.verify(wrongRoot), false, "verify() fails under a different root key");
+});
+
+test("(a') happy poll round-trip (no WebSocket) → approved", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const req = sampleRequest();
+
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: {
+      poll: (env) => (env ? signVerdict(wasm, approver, req, env, { decision: "approved" }) : null),
+    },
+  });
+
+  const verdict = await pollClient(approver, relay).requestApproval(req);
+  assert.equal(verdict.decision, "approved", "poll fallback verifies an approved verdict");
+});
+
+test("(b) timeout (no verdict ever) → expired, never approved, verify() false", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const req = sampleRequest();
+
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: { poll: () => null },
+  });
+  const clock = makeTimeoutClock();
+
+  const client = createClient({
+    relayUrl: RELAY_URL,
+    accountId: ACCOUNT_ID,
+    approverRootKey: approver.accountRootPub,
+    fetchImpl: relay.fetchImpl,
+    nowImpl: clock.now,
+    webSocketFactory: undefined,
+    pollIntervalMs: 5,
+    scheduleImpl: clock.schedule,
+  });
+
+  const verdict = await client.requestApproval(req);
+  assert.notEqual(verdict.decision, "approved", "a timed-out request is NEVER approved");
+  assert.equal(verdict.decision, "expired", "fail-closed timeout resolves to expired");
+  assert.equal(
+    await verdict.verify(approver.accountRootPub),
+    false,
+    "no artifact → verify() is false",
+  );
+});
+
+test("(b') relay reports terminal 'expired' → resolves expired", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: { poll: () => "expired" },
+  });
+
+  const verdict = await pollClient(approver, relay).requestApproval(sampleRequest());
+  assert.equal(
+    verdict.decision,
+    "expired",
+    "a relay 'expired' terminal resolves expired, never approved",
+  );
+});
+
+test("(c) tampered verdict (outer decision flipped) → never approved, synthesized denied", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const req = sampleRequest();
+
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: {
+      poll: (env) => {
+        if (!env) return null;
+        const verdict = signVerdict(wasm, approver, req, env, { decision: "approved" });
+        verdict.decision = "denied"; // forge: outer diverges from the signed claim (ClaimsMismatch)
+        return verdict;
+      },
+    },
+  });
+
+  const verdict = await pollClient(approver, relay).requestApproval(req);
+  assert.notEqual(verdict.decision, "approved", "a forged verdict must NEVER resolve approved");
+  assert.equal(verdict.decision, "denied", "an unverifiable verdict fails closed to denied");
+  assert.equal(
+    await verdict.verify(approver.accountRootPub),
+    false,
+    "verify() rejects the forgery",
+  );
+});
+
+test("(c-sig) verdict signed by an uncertified key → never approved", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const req = sampleRequest();
+
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: {
+      poll: (env) => {
+        if (!env) return null;
+        const requestHash = wasm.compute_request_hash(
+          JSON.stringify(wireContext(req)),
+          env.expires_at,
+        );
+        const unsigned = {
+          v: 1,
+          request_id: env.id,
+          request_hash: requestHash,
+          decision: "approved",
+          decided_at: NOW_MS,
+          approver: { account_id: ACCOUNT_ID, device_id: approver.deviceId },
+        };
+        const wrongSeed = Buffer.alloc(32, 0x42).toString("base64url"); // not the certified key
+        const nonce = Buffer.alloc(16, 4).toString("base64url");
+        return JSON.parse(
+          wasm.sign_verdict(JSON.stringify(unsigned), wrongSeed, nonce, approver.cert),
+        );
+      },
+    },
+  });
+
+  const verdict = await pollClient(approver, relay).requestApproval(req);
+  assert.equal(
+    verdict.decision,
+    "denied",
+    "a verdict from an uncertified key fails closed to denied",
+  );
+  assert.equal(await verdict.verify(approver.accountRootPub), false);
+});
+
+test("(c') authenticated human 'denied' → resolves denied (the verified decision), verify() false", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const req = sampleRequest();
+
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: {
+      poll: (env) => (env ? signVerdict(wasm, approver, req, env, { decision: "denied" }) : null),
+    },
+  });
+
+  const verdict = await pollClient(approver, relay).requestApproval(req);
+  assert.equal(
+    verdict.decision,
+    "denied",
+    "a verified human denial surfaces the real 'denied' decision",
+  );
+  assert.equal(
+    await verdict.verify(approver.accountRootPub),
+    false,
+    "verify() is true only for approved",
+  );
+});
+
+test("(d) no enrolled devices → requestApproval rejects (cannot encrypt)", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const relay = makeRelayDouble({ devices: [], behavior: { poll: () => null } });
+
+  await assert.rejects(
+    () => pollClient(approver, relay).requestApproval(sampleRequest()),
+    /no enrolled devices/,
+    "a request to an account with no devices must reject (no recipient to encrypt to)",
+  );
+});
+
+test("(d') relay submit error (409 duplicate id) → requestApproval rejects", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: { poll: () => null, submitStatus: 409 },
+  });
+
+  await assert.rejects(
+    () => pollClient(approver, relay).requestApproval(sampleRequest()),
+    /relay submit failed/,
+    "a relay submit failure surfaces as a rejected promise",
+  );
+});
+
+test("submitted envelope carries EXACTLY the contract's key set (no plaintext leak)", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const req = sampleRequest();
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: { poll: (env) => (env ? signVerdict(wasm, approver, req, env, {}) : null) },
+  });
+
+  await pollClient(approver, relay).requestApproval(req);
+  const env = relay.state.captured;
+  assert.deepEqual(
+    Object.keys(env).sort(),
+    ["approver", "context_ciphertext", "created_at", "expires_at", "id", "v"],
+    "the envelope must be exactly the relay-visible routing/lifecycle key set + ciphertext",
+  );
+  for (const leak of ["action", "summary", "actor", "risk", "reversible", "constraints"]) {
+    assert.equal(env[leak], undefined, `plaintext field '${leak}' must NOT be on the envelope`);
+  }
+  assert.equal(env.expires_at, NOW_MS + TIMEOUT_MS, "expires_at = now + timeoutMs");
+});
+
+test("(g) a verdict signed for a DIFFERENT envelope id resolves denied (no-swap binding)", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const req = sampleRequest();
+
+  // The device returns a genuine, fully-signed verdict — but bound to a different request id than
+  // the SDK generated. Verification uses the SDK's LOCAL id, so the id mismatch must reject (a
+  // content-identical request shares a request_hash; only the id distinguishes them — contract
+  // §Verification checklist #2). Pins that approval can't be replayed onto another envelope.
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: {
+      poll: (env) =>
+        env
+          ? signVerdict(
+              wasm,
+              approver,
+              req,
+              { ...env, id: "00000000-0000-4000-8000-000000000000" },
+              { decision: "approved" },
+            )
+          : null,
+    },
+  });
+
+  const verdict = await pollClient(approver, relay).requestApproval(req);
+  assert.equal(
+    verdict.decision,
+    "denied",
+    "a verdict bound to a different id must not be approved",
+  );
+  assert.equal(await verdict.verify(approver.accountRootPub), false);
+});
+
+test("(h) WS closes without a verdict → poll fallback delivers the approval", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const req = sampleRequest();
+
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: {
+      poll: (env) => (env ? signVerdict(wasm, approver, req, env, { decision: "approved" }) : null),
+    },
+  });
+
+  // A WebSocket that immediately closes with no terminal frame must degrade to polling, not fail.
+  const closingWebSocketFactory = (url) => {
+    const listeners = { message: [], open: [], error: [], close: [] };
+    queueMicrotask(() => {
+      for (const l of listeners.close) l();
+    });
+    return {
+      url,
+      addEventListener: (type, l) => listeners[type].push(l),
+      close: () => {},
+    };
+  };
+
+  const client = createClient({
+    relayUrl: RELAY_URL,
+    accountId: ACCOUNT_ID,
+    approverRootKey: approver.accountRootPub,
+    fetchImpl: relay.fetchImpl,
+    nowImpl: () => NOW_MS,
+    webSocketFactory: closingWebSocketFactory,
+    pollIntervalMs: 5,
+  });
+
+  const verdict = await client.requestApproval(req);
+  assert.equal(
+    verdict.decision,
+    "approved",
+    "WS close falls back to polling, which delivers approval",
+  );
+});
