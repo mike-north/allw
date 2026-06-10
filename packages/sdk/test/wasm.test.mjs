@@ -347,3 +347,95 @@ test("verify rejects a device-cert presented as the verdict signature (typ domai
     "a device-cert used as a verdict signature must be rejected",
   );
 });
+
+// ── ActionRecord builders (issue #13: the hook's syntactic substrate via the WASM core) ───────
+
+test("action_from_command builds a command ActionRecord (surface=command, tokenized + cwd)", async () => {
+  const wasm = await loadWasm();
+
+  const json = wasm.action_from_command("git push --force origin main", "/home/dev/repo");
+  const record = JSON.parse(json);
+
+  // policy-seam.md §The three tiers (T1): the command surface captures the syntactic substrate.
+  assert.equal(record.surface, "command", "surface must be 'command'");
+  assert.equal(record.record_schema_version, 1, "v1 record schema version");
+  assert.equal(record.syntactic.bin, "git", "bin is argv[0]");
+  assert.deepEqual(
+    record.syntactic.argv,
+    ["git", "push", "--force", "origin", "main"],
+    "argv is the full token vector",
+  );
+  assert.ok(
+    record.syntactic.flags.includes("--force"),
+    "flags include the force flag (starts with '-')",
+  );
+  assert.deepEqual(
+    record.syntactic.positionals,
+    ["push", "origin", "main"],
+    "positionals are the non-flag tokens after argv[0]",
+  );
+  assert.equal(record.syntactic.cwd, "/home/dev/repo", "cwd is threaded through from the hook");
+  assert.equal(record.syntactic.raw, "git push --force origin main", "raw is the original command");
+  // git push --force → High (command.rs risk heuristic).
+  assert.equal(record.risk, "high", "git push --force is High risk");
+  // T1 forward-compat: semantic slots reserved (policy-seam.md §forward-compat req #3). A `None`
+  // serializes as an ABSENT key (skip_serializing_if), so the keys must not be present at all.
+  assert.ok(!("capabilities" in record), "capabilities reserved (absent) in v1");
+  assert.ok(!("scope" in record), "scope reserved (absent) in v1");
+});
+
+test("action_from_command omits cwd when not provided (cwd unknown)", async () => {
+  const wasm = await loadWasm();
+
+  // Passing no cwd (undefined) maps to Rust `None` → the substrate's cwd is absent.
+  const record = JSON.parse(wasm.action_from_command("ls -la"));
+  assert.equal(record.surface, "command");
+  assert.ok(
+    record.syntactic.cwd === undefined || record.syntactic.cwd === null,
+    "cwd is absent when the caller does not supply one",
+  );
+});
+
+test("action_from_command throws on a malformed command (unmatched quote)", async () => {
+  const wasm = await loadWasm();
+
+  // Fail-closed at the boundary: an unmatched quote is invalid shell syntax → the hook denies.
+  assert.throws(
+    () => wasm.action_from_command('echo "hello world', "/tmp"),
+    /action_from_command failed/,
+    "an unmatched quote must surface as a thrown JS error (fail-closed)",
+  );
+});
+
+test("action_from_mcp_tool_call builds an mcp ActionRecord (surface=mcp_tool_call, params verbatim)", async () => {
+  const wasm = await loadWasm();
+
+  const params = { project_id: "abc", list: "Agent Inbox" };
+  const record = JSON.parse(
+    wasm.action_from_mcp_tool_call("omnifocus", "delete_project", JSON.stringify(params)),
+  );
+
+  assert.equal(record.surface, "mcp_tool_call", "surface must be 'mcp_tool_call'");
+  assert.equal(record.record_schema_version, 1, "v1 record schema version");
+  assert.equal(record.syntactic.server, "omnifocus", "server is preserved");
+  assert.equal(record.syntactic.tool, "delete_project", "tool is preserved");
+  assert.deepEqual(
+    record.syntactic.params,
+    params,
+    "params are preserved verbatim (instance-distinguishing values stay matchable)",
+  );
+  // delete* prefix → High (mcp.rs risk heuristic).
+  assert.equal(record.risk, "high", "delete_project → High risk");
+  assert.ok(!("capabilities" in record), "capabilities reserved (absent) in v1");
+  assert.ok(!("scope" in record), "scope reserved (absent) in v1");
+});
+
+test("action_from_mcp_tool_call throws on malformed params JSON (fail-closed)", async () => {
+  const wasm = await loadWasm();
+
+  assert.throws(
+    () => wasm.action_from_mcp_tool_call("server", "tool", "{not json"),
+    /invalid MCP tool params JSON/,
+    "unparseable params must surface as a thrown JS error (fail-closed)",
+  );
+});

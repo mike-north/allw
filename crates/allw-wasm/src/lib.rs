@@ -37,11 +37,13 @@
 //! lost in practice. A non-integer or out-of-`i64`-range value is rejected with a `JsError`.
 
 use allw_core::{
+    action_from_command as core_action_from_command,
+    action_from_mcp_tool_call as core_action_from_mcp_tool_call,
     compute_request_hash as core_compute_request_hash, decrypt_context as core_decrypt_context,
     encrypt_context as core_encrypt_context, issue_device_cert as core_issue_device_cert,
     sign_verdict as core_sign_verdict, verify_verdict as core_verify_verdict, ApprovalContext,
-    ApprovalRequest, Approver, ContextRecipient, Decision, PublicKey, SigningKeyPair,
-    UnsignedVerdict, Verdict, X25519KeyPair, X25519PublicKey,
+    ApprovalRequest, Approver, CommandContext, ContextRecipient, Decision, PublicKey,
+    SigningKeyPair, UnsignedVerdict, Verdict, X25519KeyPair, X25519PublicKey,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::rngs::OsRng;
@@ -456,4 +458,54 @@ pub fn x25519_public_key(seed_b64: &str) -> Result<String, JsError> {
     let seed = decode_b64_32(seed_b64, "seed_b64")?;
     let pubkey = X25519KeyPair::from_seed(&seed).public_key();
     Ok(URL_SAFE_NO_PAD.encode(pubkey.to_bytes()))
+}
+
+// ── ActionRecord builders (the hook's syntactic substrate) ──────────────────────────────
+
+/// Builds an [`ActionRecord`](allw_core::ActionRecord) from a raw shell command line, returning it
+/// as JSON. This is the **command** surface (`docs/policy-seam.md` §The three tiers, T1): the core
+/// tokenizes the command (POSIX word-splitting), captures the syntactic substrate (bin / argv /
+/// flags / positionals / cwd / host / env-refs), and assigns a coarse v1 risk tier. The semantic
+/// `capabilities`/`scope` slots stay `null` (reserved for T3). The Claude Code hook calls this to
+/// reduce a pending `Bash` tool call into the matchable record it submits for approval.
+///
+/// - `command_line` — the raw shell command (e.g. `"rm -rf build"`).
+/// - `cwd` — the working directory at invocation, or `None` if the caller didn't capture it.
+///
+/// # Errors
+///
+/// Throws if the command string has unmatched quotes / invalid shell syntax
+/// ([`CommandError::InvalidShellSyntax`](allw_core::CommandError)) — fail-closed at the boundary, so
+/// the hook denies rather than guessing at a malformed command.
+#[wasm_bindgen]
+pub fn action_from_command(command_line: &str, cwd: Option<String>) -> Result<String, JsError> {
+    let ctx = CommandContext { cwd };
+    let record = core_action_from_command(command_line, &ctx)
+        .map_err(|e| JsError::new(&format!("action_from_command failed: {e}")))?;
+    to_json(&record, "ActionRecord")
+}
+
+/// Builds an [`ActionRecord`](allw_core::ActionRecord) for an MCP tool call, returning it as JSON.
+/// This is the **mcp_tool_call** surface (`docs/policy-seam.md` §The three tiers, T1): the core
+/// preserves the `server`/`tool`/`params` verbatim (so instance-distinguishing values stay
+/// matchable) and assigns a coarse v1 risk tier from the tool name. The hook calls this to reduce a
+/// pending `mcp__<server>__<tool>` call into the record it submits for approval.
+///
+/// - `server` — the MCP server name (e.g. `"omnifocus"`).
+/// - `tool` — the tool name within that server (e.g. `"delete_project"`).
+/// - `params_json` — the tool-call parameters as a JSON value (any JSON: object, array, primitive).
+///
+/// # Errors
+///
+/// Throws if `params_json` is not valid JSON — fail-closed: the hook denies rather than submitting a
+/// record built from unparseable parameters.
+#[wasm_bindgen]
+pub fn action_from_mcp_tool_call(
+    server: &str,
+    tool: &str,
+    params_json: &str,
+) -> Result<String, JsError> {
+    let params: serde_json::Value = parse_json(params_json, "MCP tool params")?;
+    let record = core_action_from_mcp_tool_call(server, tool, params);
+    to_json(&record, "ActionRecord")
 }

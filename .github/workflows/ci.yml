@@ -36,10 +36,13 @@ jobs:
           node-version: "24"
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # Build first (topological order): packages that consume another package's *types* — e.g.
+      # @allw/hook importing @allw/sdk — need that dependency's built `dist/*.d.ts` to exist before
+      # they typecheck/lint. `pnpm -r build` respects the workspace dependency graph.
+      - run: pnpm -r build
       - run: pnpm -r typecheck
       - run: pnpm -r lint
       - run: pnpm exec prettier --check "**/*.{ts,js,mjs,json,md}"
-      - run: pnpm -r build
 
   wasm:
     name: WASM parity (Rust ↔ TS)
@@ -68,6 +71,12 @@ jobs:
       # request_hash → sign → verify_verdict round-trip). It imports from dist/, so build first.
       - run: pnpm --filter @allw/approver build
       - run: pnpm --filter @allw/approver test
+      # The Claude Code hook (the v1 beachhead) runs the same compiled wasm: it builds ActionRecords
+      # via the core and runs the full SDK round-trip against a relay double. It imports from dist/
+      # (and depends on @allw/sdk's dist), so build the SDK then the hook first.
+      - run: pnpm --filter @allw/sdk build
+      - run: pnpm --filter @allw/hook build
+      - run: pnpm --filter @allw/hook test
 
   relay:
     name: Relay (workers-pool)
