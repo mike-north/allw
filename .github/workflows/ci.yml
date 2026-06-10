@@ -68,6 +68,12 @@ jobs:
       # request_hash → sign → verify_verdict round-trip). It imports from dist/, so build first.
       - run: pnpm --filter @allw/approver build
       - run: pnpm --filter @allw/approver test
+      # The Claude Code hook (the v1 beachhead) runs the same compiled wasm: it builds ActionRecords
+      # via the core and runs the full SDK round-trip against a relay double. It imports from dist/
+      # (and depends on @allw/sdk's dist), so build the SDK then the hook first.
+      - run: pnpm --filter @allw/sdk build
+      - run: pnpm --filter @allw/hook build
+      - run: pnpm --filter @allw/hook test
 
   relay:
     name: Relay (workers-pool)
