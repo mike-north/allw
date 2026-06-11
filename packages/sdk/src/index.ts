@@ -17,6 +17,7 @@
 
 import {
   RelayClient,
+  RelayTimeoutError,
   type ApprovalRequestEnvelope,
   type DeviceRecord,
   type FetchImpl,
@@ -137,6 +138,12 @@ export interface ClientConfig {
   readonly webSocketFactory?: WebSocketFactory;
   /** Poll cadence in ms for the fallback path. Defaults to 1000. */
   readonly pollIntervalMs?: number;
+  /**
+   * Per-request relay-fetch timeout in ms — bounds every individual `fetch` (device list, submit,
+   * each poll) so a hung connect/read can never wedge `requestApproval` indefinitely (issue #52).
+   * Defaults to {@link DEFAULT_FETCH_TIMEOUT_MS}; must be well under the overall `timeoutMs` deadline.
+   */
+  readonly fetchTimeoutMs?: number;
   /**
    * Override the timer used to schedule the poll cadence and the fail-closed deadline (tests).
    * Defaults to `setTimeout`. Exposed so the fail-closed timing can be driven deterministically by
@@ -288,6 +295,26 @@ function verifyToDecision(
 }
 
 /**
+ * Classify an error thrown by the pre-deadline relay round-trip (`fetchDevices`/`submit`) as a
+ * **transport** failure that should fail closed to a `Verdict` rather than reject.
+ *
+ * - {@link RelayTimeoutError} — a hung connect/read we bounded and aborted (the #52 case).
+ * - A bare `TypeError` from `fetch` — a connection-level failure (DNS, refused, reset) that never
+ *   produced an HTTP response; WHATWG `fetch` rejects with a `TypeError` for these.
+ *
+ * A {@link RelayError} (a real HTTP status from the relay) and the explicit no-devices `Error` are
+ * **not** transport failures — they signal integrator/protocol misconfiguration and keep throwing so
+ * the caller (the hook) surfaces a precise deny reason.
+ */
+function isPreDeadlineTransportFailure(err: unknown): boolean {
+  if (err instanceof RelayTimeoutError) return true;
+  // A connection-level fetch failure (no HTTP response). `RelayError extends Error` but not
+  // `TypeError`, so the `instanceof TypeError` check correctly excludes it.
+  if (err instanceof TypeError) return true;
+  return false;
+}
+
+/**
  * Construct a relay-bound client. The returned {@link Client.requestApproval} runs the full
  * E2EE round-trip and resolves to a verified {@link Verdict} — never a bare "allow".
  */
@@ -300,7 +327,11 @@ export function createClient(config: ClientConfig): Client {
   const webSocketFactory =
     "webSocketFactory" in config ? config.webSocketFactory : defaultWebSocketFactory();
   const pollIntervalMs = config.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
-  const relay = new RelayClient(config.relayUrl, config.accountId, fetchImpl);
+  const relay = new RelayClient(config.relayUrl, config.accountId, fetchImpl, {
+    ...(config.fetchTimeoutMs !== undefined ? { fetchTimeoutMs: config.fetchTimeoutMs } : {}),
+    // Share the fail-closed timer seam so a fake clock drives the fetch timeouts deterministically.
+    ...(config.scheduleImpl ? { schedule: config.scheduleImpl } : {}),
+  });
 
   async function requestApproval(req: ApprovalRequest): Promise<Verdict> {
     const wasm = await loadWasm();
@@ -315,42 +346,63 @@ export function createClient(config: ClientConfig): Client {
     // `compute_request_hash` throws on a malformed context — surfaces as a rejected promise.
     wasm.compute_request_hash(contextJson, expiresAt);
 
-    // 3. Fetch the approver's enrolled devices and encrypt the context to their keys (JWE).
-    const devices = await relay.fetchDevices();
-    if (devices.length === 0) {
-      throw new Error(
-        `allw: approver account '${config.accountId}' has no enrolled devices to encrypt to`,
-      );
-    }
-    const recipients = devices.map((d: DeviceRecord) => ({
-      device_id: d.device_id,
-      public_key_b64: d.pubkey,
-    }));
-    const contextCiphertext = wasm.encrypt_context(contextJson, JSON.stringify(recipients));
-
-    // 4. Build the relay-visible envelope (exactly the contract's key set) and submit it.
+    // The request id is generated up front so a fail-closed `Verdict` (below) can carry it even if
+    // the pre-deadline relay round-trip never completes.
     const id = newRequestId();
-    const envelope: ApprovalRequestEnvelope = {
-      v: PROTOCOL_VERSION,
-      id,
-      created_at: createdAt,
-      expires_at: expiresAt,
-      // The client is bound to one account; the envelope's routing `approver` IS that account. Using
-      // `config.accountId` (not a per-request field) removes the footgun where a request could be
-      // POSTed to one account DO while claiming a different approver in the verified request JSON.
-      approver: config.accountId,
-      context_ciphertext: contextCiphertext,
-    };
-    await relay.submit(envelope);
+
+    // 3–4. Fetch devices, encrypt, and submit. These run BEFORE the await-verdict deadline timer is
+    // armed, so a hung relay (TCP-accepted but never responding) would otherwise wedge the call
+    // forever. The per-request fetch timeout (RelayClient) bounds each fetch; here we additionally
+    // ensure a *transport* failure on these calls fails closed to a `Verdict` (expired) instead of
+    // rejecting — the same fail-closed terminal a wait-stage timeout produces (issue #52,
+    // contract §Invariants #6). HTTP-level errors (a relay `RelayError` with a real status) and a
+    // no-devices account still throw, surfacing integrator/protocol misconfiguration loudly.
+    let contextCiphertext: string;
+    try {
+      const devices = await relay.fetchDevices();
+      if (devices.length === 0) {
+        throw new Error(
+          `allw: approver account '${config.accountId}' has no enrolled devices to encrypt to`,
+        );
+      }
+      const recipients = devices.map((d: DeviceRecord) => ({
+        device_id: d.device_id,
+        public_key_b64: d.pubkey,
+      }));
+      contextCiphertext = wasm.encrypt_context(contextJson, JSON.stringify(recipients));
+
+      // Build the relay-visible envelope (exactly the contract's key set) and submit it.
+      const envelope: ApprovalRequestEnvelope = {
+        v: PROTOCOL_VERSION,
+        id,
+        created_at: createdAt,
+        expires_at: expiresAt,
+        // The client is bound to one account; the envelope's routing `approver` IS that account.
+        // Using `config.accountId` (not a per-request field) removes the footgun where a request
+        // could be POSTed to one account DO while claiming a different approver in the request JSON.
+        approver: config.accountId,
+        context_ciphertext: contextCiphertext,
+      };
+      await relay.submit(envelope);
+    } catch (err) {
+      if (isPreDeadlineTransportFailure(err)) {
+        // A hung/black-holed connection or a bare network error before the deadline ⇒ no verified
+        // verdict is obtainable ⇒ fail closed to an `expired` Verdict (never approved). This is the
+        // load-bearing fix for #52: the call resolves deterministically instead of hanging forever.
+        return makeVerdict(id, "expired", { kind: "timeout" }, "", "", now);
+      }
+      // HTTP/protocol error or no-devices ⇒ rethrow (the hook's try/catch maps it to a deny).
+      throw err;
+    }
 
     // The `request_json` the core verifies against is the envelope WITHOUT the ciphertext — the
     // verifier reads only routing/lifecycle (`v`, `id`, `created_at`, `expires_at`, `approver`).
     const requestJson = JSON.stringify({
-      v: envelope.v,
-      id: envelope.id,
-      created_at: envelope.created_at,
-      expires_at: envelope.expires_at,
-      approver: envelope.approver,
+      v: PROTOCOL_VERSION,
+      id,
+      created_at: createdAt,
+      expires_at: expiresAt,
+      approver: config.accountId,
     });
 
     // 5. Await the verdict (WS-preferred, poll fallback), fail-closed at `expires_at`.
