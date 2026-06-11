@@ -25,20 +25,31 @@ Polyglot workspace: a Cargo workspace (Rust) **and** a pnpm workspace (TypeScrip
 cargo check                       # type-check
 cargo fmt                         # format (cargo fmt --check to verify)
 cargo clippy --all-targets        # lint
-cargo test -p allw-core           # tests (append a name to run one)
+cargo test --locked               # unit + integration tests, including shared Rust/WASM vectors
 
 # TypeScript surfaces
 pnpm install
+pnpm run build:wasm               # builds the vendored WASM used by SDK/approver/hook tests
+pnpm -r build                     # topological dist build for packages that import workspace deps
 pnpm -r typecheck                 # tsc --noEmit across packages
 pnpm -r lint                      # ESLint (type-checked)
-pnpm -r build
+pnpm -r test                      # package tests: node:test plus relay Vitest workers-pool tests
 pnpm exec prettier --check "**/*.{ts,js,json,md}"   # --write to fix
 pnpm --filter @allw/relay typecheck                 # a single package
 ```
 
-**Verification gate before declaring work done:** `cargo check` + `cargo clippy` + `pnpm -r typecheck` +
-`pnpm -r lint` + `prettier --check` must all pass. No test runner is wired yet — package `test` scripts are
-placeholders; Rust uses `cargo test`.
+**Verification gate before declaring work done:** `cargo fmt --check` + `cargo clippy --all-targets --locked -- -D warnings` +
+`cargo check --locked` + `cargo test --locked` + `pnpm run build:wasm` + `pnpm -r build` + `pnpm -r typecheck` +
+`pnpm -r lint` + `pnpm -r test` + `prettier --check` must pass for broad changes. For narrow changes, run the
+focused package/crate commands first, then the matching CI-level gate before opening a PR.
+
+Testing conventions:
+
+- Rust tests live as in-module unit tests and integration tests under `crates/*/tests/`.
+- Cross-platform fixtures live with the Rust core, e.g. `crates/allw-core/tests/wasm_vector.rs`, and are consumed by
+  the WASM/TS surface tests.
+- TS packages use `node:test` for SDK/approver/hook/example tests; the relay uses Vitest with the Cloudflare
+  Workers pool.
 
 ## Architecture: the load-bearing ideas
 
