@@ -46,7 +46,12 @@ import { loadWasm } from "./lib/wasm.js";
 export type RunHookOverrides = Partial<
   Pick<
     ClientConfig,
-    "fetchImpl" | "nowImpl" | "webSocketFactory" | "pollIntervalMs" | "scheduleImpl"
+    | "fetchImpl"
+    | "nowImpl"
+    | "webSocketFactory"
+    | "pollIntervalMs"
+    | "fetchTimeoutMs"
+    | "scheduleImpl"
   >
 >;
 
@@ -105,7 +110,7 @@ export async function runHook(
     relayUrl: config.relayUrl,
     accountId: config.accountId,
     approverRootKey: config.approverRootKey,
-    ...(config.timeoutMs !== undefined ? { timeoutMs: config.timeoutMs } : {}),
+    ...(config.fetchTimeoutMs !== undefined ? { fetchTimeoutMs: config.fetchTimeoutMs } : {}),
     ...overrides,
   });
   const requestApproval: RequestApprovalFn = (req) =>

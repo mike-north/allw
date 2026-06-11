@@ -26,6 +26,7 @@ The hook reads its configuration from the environment, so there is no config fil
 | `ALLW_ACCOUNT_ID`        | yes      | The approver's relay account id (routes to their devices).                                                                                                              |
 | `ALLW_APPROVER_ROOT_KEY` | yes      | The approver account-root Ed25519 public key (base64url).                                                                                                               |
 | `ALLW_TIMEOUT_MS`        | no       | Fail-closed deadline in ms (default `300000` = 5 minutes; must be **below `420000`** — see [the timeout-ordering invariant](#the-timeout-ordering-invariant-issue-52)). |
+| `ALLW_FETCH_TIMEOUT_MS`  | no       | Per-relay-fetch timeout in ms (default/max `30000`); may lower the SDK default for faster fail-closed decisions, but may not raise it.                                  |
 
 Pair an approver device first (e.g. with [`@allw/approver`](../approver)) to obtain the account id and
 the account-root public key.
@@ -90,6 +91,8 @@ The hook enforces this at two points:
 Independently, `@allw/sdk` bounds **every** relay `fetch` (device list, submit, each poll) with a
 per-request timeout, so a relay that accepts the connection but never responds can no longer wedge
 `requestApproval` indefinitely; it fails closed to a non-approving verdict well within the deadline.
+`ALLW_FETCH_TIMEOUT_MS` can lower that per-fetch timeout (for example, in UAT or stricter local
+installs), but the hook rejects values above `30000` so config cannot erode the margin above.
 
 The hook is built with the workspace and depends on the vendored WASM core. From the repo root:
 
