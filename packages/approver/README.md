@@ -67,9 +67,10 @@ For each incoming request the approver:
 1. **decrypts** the `context_ciphertext` with the device X25519 key (via the WASM core),
 2. **recomputes** the WYSIWYS `request_hash` over the decrypted context + the envelope's
    `expires_at` — identical bytes to the integrator's pre-send hash,
-3. **renders** the **complete** action substrate (command/argv **plus** `cwd`, `host`, `env_refs`,
-   or MCP `params` when present — all bound into `request_hash`), summary, actor, risk,
-   reversibility, expiry, and `request_hash`,
+3. **renders** the **complete** action substrate — the command/argv headline **plus** every other
+   hash-bound field: a divergent reconstructed `argv` (when a benign `raw` would otherwise mask it),
+   `flags`, `positionals`, `cwd`, `host`, `env_refs`, or MCP `params` when present — followed by the
+   summary, actor, risk, reversibility, expiry, and `request_hash`,
 4. prompts **Approve / Deny / Skip**,
 5. **re-checks expiry** after the human decides and before signing (a prompt left open past the
    deadline emits nothing),
@@ -80,9 +81,12 @@ A `{ type: "retract" }` (another device resolved it) clears the pending prompt.
 
 #### WYSIWYS render
 
-The full meaning-changing substrate is shown — never elided behind a `raw` summary. `cwd`/`host`/
-`env_refs`/`params` change what an otherwise-identical command does, so they get their own labeled
-lines (the same fields the `request_hash` binds):
+The full meaning-changing substrate is shown — never elided behind a `raw` summary. The reconstructed
+command (or MCP `server :: tool`) is the **`Action:` headline**; the remaining hash-bound fields —
+`flags`, `positionals`, `cwd`, `host`, `env_refs`, MCP `server`/`tool`, and MCP `params` — each get
+their own labeled line when present, so the headline alone is never the whole story. (`argv` is
+normally the headline itself; it only also appears on a separate `Argv:` line when it **diverges**
+from a `raw` headline — see below.)
 
 ```
 ────────────────────────────────────────────────────────────────────────
@@ -92,6 +96,8 @@ lines (the same fields the `request_hash` binds):
   Summary:    force push to main
   Action:     git push --force origin main
   Surface:    command
+  Flags:      --force
+  Positionals: origin main
   Cwd:        /home/me/project
   Env refs:   GIT_SSH_COMMAND
   Actor:      machine:laptop (claude-code)
@@ -103,6 +109,33 @@ lines (the same fields the `request_hash` binds):
 ────────────────────────────────────────────────────────────────────────
 Approve / Deny / Skip? [a/d/s]
 ```
+
+#### Anti-divergence: a benign `raw` can never hide a dangerous `argv`
+
+`raw` is only **one** of the hash-bound substrate fields. A buggy or malicious integrator could send
+a benign `raw` ("git status") alongside a divergent, dangerous `argv` (`git push --force …`) — both
+covered by `request_hash`, but a `raw`-only headline would show the human only the benign string
+while a downstream executor acts on `argv`. The device is the last line of defense against exactly
+that field mismatch, so when the reconstructed `bin`/`argv` command **diverges** from `raw`, the
+renderer surfaces the reconstructed form on a labeled `Argv:` line:
+
+```
+  Action:     git status
+  Surface:    command
+  Argv:       git push --force origin main      ← hash-bound argv, surfaced because it diverges from raw
+```
+
+The same hiding vector exists on the **MCP surface**: a benign `raw` ("echo hello") can co-exist with
+a hash-bound `server`/`tool` (`fs :: delete_all_files`) and **no `params`**, so `server`/`tool` get
+their own unconditional labeled line whenever present:
+
+```
+  Action:     echo hello
+  Surface:    mcp_tool_call
+  MCP:        fs :: delete_all_files            ← hash-bound server/tool, surfaced even behind a benign raw
+```
+
+This is **display-only** — it never changes the bytes bound into `request_hash`.
 
 #### ⚠ Actor origin is UNVERIFIED in v0
 

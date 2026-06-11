@@ -5,21 +5,31 @@
  */
 
 /** Pairing HTTP requests are short; bound them so a hung relay can't stall the CLI indefinitely. */
-const PAIRING_TIMEOUT_MS = 15_000;
+export const PAIRING_TIMEOUT_MS = 15_000;
 
 /** Trim a trailing slash so `${base}/path` never doubles up. */
 function normalizeBase(url: string): string {
   return url.replace(/\/+$/, "");
 }
 
-/** POST JSON and parse the JSON response, surfacing non-2xx as a thrown error with the body. */
-async function postJson(url: string, body: unknown): Promise<unknown> {
+/**
+ * POST JSON and parse the JSON response, surfacing non-2xx as a thrown error with the body.
+ *
+ * `timeoutMs` bounds a hung/unreachable relay (a relay that accepts the connection but never
+ * responds would otherwise stall the CLI forever); it defaults to {@link PAIRING_TIMEOUT_MS} and is
+ * parameterized so the fail-closed abort can be exercised in tests without a multi-second wait.
+ */
+async function postJson(
+  url: string,
+  body: unknown,
+  timeoutMs: number = PAIRING_TIMEOUT_MS,
+): Promise<unknown> {
   const resp = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
     // Fail-closed on a hung/unreachable relay rather than blocking forever (aborts after timeout).
-    signal: AbortSignal.timeout(PAIRING_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   const text = await resp.text();
   let parsed: unknown;
@@ -42,15 +52,21 @@ export interface PairingStartResult {
   readonly expires_at: number;
 }
 
-/** Start a pairing: ask the relay for a short code (the account owner runs this in production). */
+/**
+ * Start a pairing: ask the relay for a short code (the account owner runs this in production).
+ *
+ * `timeoutMs` (default {@link PAIRING_TIMEOUT_MS}) bounds a hung relay; it is parameterized so the
+ * fail-closed abort is testable without a multi-second wait.
+ */
 export async function pairingStart(
   relayUrl: string,
   accountId: string,
   label?: string,
+  timeoutMs: number = PAIRING_TIMEOUT_MS,
 ): Promise<PairingStartResult> {
   const url = `${normalizeBase(relayUrl)}/${encodeURIComponent(accountId)}/pairing/start`;
   const body = label === undefined ? {} : { label };
-  const result = await postJson(url, body);
+  const result = await postJson(url, body, timeoutMs);
   if (
     typeof result !== "object" ||
     result === null ||

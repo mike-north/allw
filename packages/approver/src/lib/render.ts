@@ -52,6 +52,16 @@ function readStringArray(record: Record<string, unknown>, key: string): string[]
 function quoteToken(token: string): string {
   // Shell-significant set (and whitespace) — if a token contains any of these its boundaries are
   // ambiguous when bare, so quote it. Plain tokens (e.g. `--force`, `origin`) render unquoted.
+  //
+  // RATIONALE for the hand-curated set: the goal here is **boundary disambiguation for a human
+  // reader**, not producing a shell-safe string (this output is never executed). A token must be
+  // quoted iff a reader could otherwise misjudge where it begins/ends or mistake it for shell
+  // structure. We therefore quote on: whitespace (the only true token-splitter), quoting/escape
+  // characters (`'"\`), and the shell metacharacters that visually imply structure
+  // (`$\`&|;<>(){}[]*?#~!`). We intentionally OMIT `=` `:` `,` `@` `%` — none split a token or
+  // read as shell structure, so quoting them would only add noise (e.g. `KEY=value`, `a:b`,
+  // `user@host`, `50%` stay legible bare). If a future surface makes one of those ambiguous, widen
+  // the set and extend the table-driven quoting test alongside it.
   if (token !== "" && !/[\s'"\\$`&|;<>(){}[\]*?#~!]/.test(token)) {
     return token;
   }
@@ -62,6 +72,30 @@ function quoteToken(token: string): string {
 /** Join argv tokens into one unambiguous, display-safe command line. */
 function renderArgv(argv: readonly string[]): string {
   return argv.map(quoteToken).join(" ");
+}
+
+/**
+ * Reconstruct the unambiguous command line from the `bin`/`argv` substrate, or `undefined` when
+ * there is no command form (no `argv` and no `bin`). This is the single source of truth shared by
+ * the headline ({@link renderActionHeadline}) and the divergence detail line
+ * ({@link substrateDetailLines}) so they can never disagree about what argv reconstructs to.
+ *
+ * `bin` is prepended unless `argv` already leads with it (argv conventionally includes the binary),
+ * so the human never sees args without the program they belong to.
+ */
+function reconstructCommand(syntactic: Record<string, unknown>): string | undefined {
+  const argv = readStringArray(syntactic, "argv");
+  const bin = readString(syntactic, "bin");
+  if (argv !== undefined && argv.length > 0) {
+    const tokens = bin !== undefined && argv[0] !== bin ? [bin, ...argv] : argv;
+    return renderArgv(tokens);
+  }
+  // No argv: still show `bin` (+ any positionals) rather than dropping the program name.
+  if (bin !== undefined) {
+    const positionals = readStringArray(syntactic, "positionals");
+    return renderArgv(positionals !== undefined ? [bin, ...positionals] : [bin]);
+  }
+  return undefined;
 }
 
 /**
@@ -80,6 +114,15 @@ function renderArgv(argv: readonly string[]): string {
  * `raw` (the agent's original string form) is preferred when present; otherwise we reconstruct from
  * `bin`/`argv`; otherwise an MCP `server :: tool` headline; otherwise a compact JSON fallback so
  * nothing is ever silently dropped.
+ *
+ * SECURITY (`docs/contract.md` §Invariant #3): the **full** `bin`/`argv` substrate is bound into
+ * `request_hash` (`crates/allw-core/src/hash.rs`), but `raw` is just one substrate field. A buggy
+ * or malicious integrator could send a benign `raw` ("git status") alongside a divergent, dangerous
+ * `argv` (`git push --force …`) — both hashed, but the human would only see the benign string. The
+ * device must not rely on integrator honesty for *which* field it shows, so when `raw` is present
+ * AND the reconstructed `bin`/`argv` command diverges from it, {@link substrateDetailLines} also
+ * surfaces the reconstructed form as a labeled `Argv:` line. Display-only — it never changes the
+ * hash.
  */
 function renderActionHeadline(action: ActionRecord): string {
   const syntactic = action.syntactic;
@@ -87,18 +130,9 @@ function renderActionHeadline(action: ActionRecord): string {
     const raw = readString(syntactic, "raw");
     if (raw !== undefined) return raw;
 
-    const argv = readStringArray(syntactic, "argv");
-    const bin = readString(syntactic, "bin");
-    if (argv !== undefined && argv.length > 0) {
-      // Include `bin` unless argv already leads with it (argv conventionally includes the binary).
-      const tokens = bin !== undefined && argv[0] !== bin ? [bin, ...argv] : argv;
-      return renderArgv(tokens);
-    }
-    // No argv: still show `bin` (+ any positionals) rather than dropping the program name.
-    if (bin !== undefined) {
-      const positionals = readStringArray(syntactic, "positionals");
-      return renderArgv(positionals !== undefined ? [bin, ...positionals] : [bin]);
-    }
+    // No `raw`: reconstruct the command from `bin`/`argv` (+ `positionals` when there is no argv).
+    const reconstructed = reconstructCommand(syntactic);
+    if (reconstructed !== undefined) return reconstructed;
 
     // MCP headline when there is no command form: "server :: tool".
     const tool = readString(syntactic, "tool");
@@ -114,11 +148,43 @@ function renderActionHeadline(action: ActionRecord): string {
  * The labeled detail lines for the meaning-changing substrate fields. These are bound into
  * `request_hash` and so MUST be shown verbatim whenever present. Returns an empty array when none
  * apply (e.g. a bare `raw` command with no cwd/env).
+ *
+ * Includes the **anti-divergence** lines (`docs/contract.md` §Invariant #3): `argv`/`flags`/
+ * `positionals` (command surface) and `server`/`tool` (MCP surface) are all bound into
+ * `request_hash` but were not previously rendered on the `raw` path — so a benign `raw` (e.g.
+ * `"echo hello"`) could mask a dangerous hashed `argv` OR a dangerous `server`/`tool`
+ * (`fs :: delete_all_files`). The `Argv:` line appears whenever the reconstructed `bin`/`argv`
+ * command **diverges** from the `raw` headline; `Flags:`, `Positionals:`, and the `MCP:` line always
+ * appear when present, regardless of which headline path ran. All are display-only — never the hash.
  */
 function substrateDetailLines(action: ActionRecord): string[] {
   const syntactic = action.syntactic;
   if (!isRecord(syntactic)) return [];
   const lines: string[] = [];
+
+  // Anti-divergence: when `raw` is shown as the headline but the hash-bound `bin`/`argv`
+  // reconstructs to a DIFFERENT command, surface that reconstructed form so a benign `raw` can
+  // never hide a dangerous argv. (When there is no `raw`, the headline already IS the reconstructed
+  // command, so the line would be redundant and is omitted.)
+  const raw = readString(syntactic, "raw");
+  if (raw !== undefined) {
+    const reconstructed = reconstructCommand(syntactic);
+    if (reconstructed !== undefined && reconstructed !== raw) {
+      lines.push(`  Argv:       ${reconstructed}`);
+    }
+  }
+
+  // `flags` / `positionals` are bound into the hash but were never rendered on any path before;
+  // surface them verbatim (quoted for boundary clarity) whenever present.
+  const flags = readStringArray(syntactic, "flags");
+  if (flags !== undefined && flags.length > 0) {
+    lines.push(`  Flags:      ${renderArgv(flags)}`);
+  }
+
+  const positionals = readStringArray(syntactic, "positionals");
+  if (positionals !== undefined && positionals.length > 0) {
+    lines.push(`  Positionals: ${renderArgv(positionals)}`);
+  }
 
   const cwd = readString(syntactic, "cwd");
   if (cwd !== undefined) lines.push(`  Cwd:        ${cwd}`);
@@ -129,6 +195,15 @@ function substrateDetailLines(action: ActionRecord): string[] {
   const envRefs = readStringArray(syntactic, "env_refs");
   if (envRefs !== undefined && envRefs.length > 0) {
     lines.push(`  Env refs:   ${envRefs.join(", ")}`);
+  }
+
+  // MCP server/tool are hash-bound but were rendered on NO line when a `raw` headline ran — so a
+  // benign `raw` ("echo hello") could mask a dangerous `fs :: delete_all_files`. Surface them on an
+  // unconditional labeled line whenever both are present (mirrors the command-surface fix; #56).
+  const tool = readString(syntactic, "tool");
+  const server = readString(syntactic, "server");
+  if (server !== undefined && tool !== undefined) {
+    lines.push(`  MCP:        ${server} :: ${tool}`);
   }
 
   // MCP params are the entire call payload — show them in full (compact JSON), never elided.

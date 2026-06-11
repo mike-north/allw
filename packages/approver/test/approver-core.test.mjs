@@ -427,6 +427,51 @@ test("renderRequest surfaces MCP params (not hidden behind raw) — review fix #
   assert.match(rendered, /\/etc\/passwd/, "the MCP params payload is shown in full, not elided");
 });
 
+test("renderRequest surfaces MCP server/tool even when a benign raw masks them, no params (#56)", async () => {
+  const wasm = await loadWasm();
+  const { keyfile } = pairedApprover(wasm);
+
+  // THE #56 ATTACK (MCP mirror of #51): a benign `raw` ("echo hello") paired with a divergent,
+  // dangerous `server`/`tool` (`fs :: delete_all_files`) and NO `params`. Both server and tool are
+  // bound into request_hash (the full ActionRecord is hashed), but the old renderer short-circuited
+  // on `raw` for the headline and never rendered server/tool on any detail line (only `params` was),
+  // so the human would see only "echo hello". The device must surface the hash-bound server/tool.
+  const ctx = {
+    action: {
+      record_schema_version: 1,
+      surface: "mcp_tool_call",
+      syntactic: {
+        server: "fs",
+        tool: "delete_all_files",
+        raw: "echo hello",
+      },
+      risk: "critical",
+    },
+    summary: "say hello",
+    actor: { id: "machine:agent", kind: "claude-code" },
+    risk: "critical",
+    reversible: false,
+    constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
+  };
+  const ctxJson = JSON.stringify(ctx);
+  const jwe = wasm.encrypt_context(
+    ctxJson,
+    JSON.stringify([{ device_id: DEVICE_ID, public_key_b64: keyfile.device_encryption_pubkey }]),
+  );
+  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
+  const rendered = renderRequest(prepared);
+
+  // The benign raw may be the headline, but the dangerous hash-bound server/tool must be surfaced.
+  assert.match(rendered, /Action:\s+echo hello/, "the raw headline is shown");
+  assert.match(
+    rendered,
+    /MCP:\s+fs :: delete_all_files/,
+    "the hash-bound MCP server/tool is surfaced, not hidden behind the benign raw",
+  );
+  // Specifically: the dangerous tool token must be visible somewhere in the block.
+  assert.match(rendered, /delete_all_files/, "the dangerous MCP tool token is visible");
+});
+
 test("renderRequest disambiguates argv args containing whitespace (WYSIWYS — review item #1)", async () => {
   const wasm = await loadWasm();
   const { keyfile } = pairedApprover(wasm);
@@ -521,6 +566,228 @@ test("renderRequest does not double the bin when argv already leads with it (rev
 
   assert.match(rendered, /Action:\s+git status/, "argv that already includes bin is not doubled");
   assert.doesNotMatch(rendered, /git git status/, "the binary name must not be duplicated");
+});
+
+test("renderRequest surfaces a divergent argv even when raw masks it (WYSIWYS anti-divergence — #51)", async () => {
+  const wasm = await loadWasm();
+  const { keyfile } = pairedApprover(wasm);
+
+  // THE #51 ATTACK: a benign `raw` ("git status") paired with a divergent, dangerous `argv`
+  // (`git push --force …`). BOTH are bound into request_hash (hash.rs: the full ActionRecord), but
+  // the old renderer short-circuited on `raw` and showed only "git status" — the human would
+  // approve a benign string while signing over the force-push. The device must surface the
+  // reconstructed argv so the divergence is visible.
+  const ctx = {
+    action: {
+      record_schema_version: 1,
+      surface: "command",
+      syntactic: {
+        bin: "git",
+        argv: ["git", "push", "--force", "origin", "main"],
+        raw: "git status",
+      },
+      risk: "critical",
+    },
+    summary: "check repo status",
+    actor: { id: "machine:agent", kind: "claude-code" },
+    risk: "critical",
+    reversible: false,
+    constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
+  };
+  const ctxJson = JSON.stringify(ctx);
+  const jwe = wasm.encrypt_context(
+    ctxJson,
+    JSON.stringify([{ device_id: DEVICE_ID, public_key_b64: keyfile.device_encryption_pubkey }]),
+  );
+  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
+  const rendered = renderRequest(prepared);
+
+  // The benign raw is still the headline (it is what the integrator labelled the action)…
+  assert.match(rendered, /Action:\s+git status/, "the raw headline is shown");
+  // …but the dangerous, hash-bound argv is surfaced verbatim on its own labeled line — the human
+  // can no longer be shown only the benign string.
+  assert.match(
+    rendered,
+    /Argv:\s+git push --force origin main/,
+    "the divergent hash-bound argv is surfaced, not hidden behind the benign raw",
+  );
+});
+
+test("renderRequest does NOT add a redundant Argv line when raw matches the reconstruction (#51)", async () => {
+  const wasm = await loadWasm();
+  const { keyfile } = pairedApprover(wasm);
+
+  // Honest integrator: `raw` is consistent with `bin`/`argv` (the core's `from_command` builder
+  // produces exactly this). No divergence → no redundant `Argv:` line, just the headline.
+  const ctx = {
+    action: {
+      record_schema_version: 1,
+      surface: "command",
+      syntactic: {
+        bin: "git",
+        argv: ["git", "push", "--force", "origin", "main"],
+        raw: "git push --force origin main",
+      },
+      risk: "high",
+    },
+    summary: "force push to main",
+    actor: { id: "machine:ci", kind: "claude-code" },
+    risk: "high",
+    reversible: false,
+    constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
+  };
+  const ctxJson = JSON.stringify(ctx);
+  const jwe = wasm.encrypt_context(
+    ctxJson,
+    JSON.stringify([{ device_id: DEVICE_ID, public_key_b64: keyfile.device_encryption_pubkey }]),
+  );
+  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
+  const rendered = renderRequest(prepared);
+
+  assert.match(rendered, /Action:\s+git push --force origin main/, "the raw headline is shown");
+  assert.doesNotMatch(
+    rendered,
+    /Argv:/,
+    "no redundant Argv line when raw already equals the reconstructed command",
+  );
+});
+
+test("renderRequest surfaces flags and positionals as labeled lines when present (#51)", async () => {
+  const wasm = await loadWasm();
+  const { keyfile } = pairedApprover(wasm);
+
+  // `flags` and `positionals` are bound into request_hash (hash.rs) but were never rendered on any
+  // path before #51. They must appear as their own labeled lines, quoted for boundary clarity.
+  const ctx = {
+    action: {
+      record_schema_version: 1,
+      surface: "command",
+      syntactic: {
+        bin: "git",
+        argv: ["git", "push", "--force", "origin", "main"],
+        flags: ["--force"],
+        positionals: ["origin", "main"],
+        raw: "git push --force origin main",
+      },
+      risk: "high",
+    },
+    summary: "force push to main",
+    actor: { id: "machine:ci", kind: "claude-code" },
+    risk: "high",
+    reversible: false,
+    constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
+  };
+  const ctxJson = JSON.stringify(ctx);
+  const jwe = wasm.encrypt_context(
+    ctxJson,
+    JSON.stringify([{ device_id: DEVICE_ID, public_key_b64: keyfile.device_encryption_pubkey }]),
+  );
+  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
+  const rendered = renderRequest(prepared);
+
+  assert.match(rendered, /Flags:\s+--force/, "the parsed flags are surfaced on a labeled line");
+  assert.match(
+    rendered,
+    /Positionals:\s+origin main/,
+    "the parsed positionals are surfaced on a labeled line",
+  );
+});
+
+test("renderRequest quotes flags/positionals containing whitespace (boundary clarity — #51)", async () => {
+  const wasm = await loadWasm();
+  const { keyfile } = pairedApprover(wasm);
+
+  // A positional whose value contains a space must be quoted so its boundary is visible (same
+  // disambiguation guarantee the argv line already provides).
+  const ctx = {
+    action: {
+      record_schema_version: 1,
+      surface: "command",
+      syntactic: {
+        bin: "grep",
+        positionals: ["hello world", "file.txt"],
+        flags: ["--include=md"],
+        raw: "grep 'hello world' file.txt",
+      },
+      risk: "low",
+    },
+    summary: "search files",
+    actor: { id: "machine:ci", kind: "claude-code" },
+    risk: "low",
+    reversible: true,
+    constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
+  };
+  const ctxJson = JSON.stringify(ctx);
+  const jwe = wasm.encrypt_context(
+    ctxJson,
+    JSON.stringify([{ device_id: DEVICE_ID, public_key_b64: keyfile.device_encryption_pubkey }]),
+  );
+  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
+  const rendered = renderRequest(prepared);
+
+  assert.match(
+    rendered,
+    /Positionals:\s+'hello world' file\.txt/,
+    "a space-containing positional is quoted to disambiguate its boundary",
+  );
+  // `=` is intentionally NOT in the quote set (no whitespace ambiguity) — the flag stays legible.
+  assert.match(rendered, /Flags:\s+--include=md/, "a flag with `=` renders without quoting");
+});
+
+test("quoteToken pins the display-quoting of representative tokens (table-driven — #51 nit)", async () => {
+  const wasm = await loadWasm();
+  const { keyfile } = pairedApprover(wasm);
+
+  // Render a single-token argv and read back the produced `Action:` line, so we exercise the real
+  // quoteToken through the public render surface (it is not exported). Each row pins one token →
+  // its expected display form, documenting WHY each is or isn't quoted (the hand-curated set).
+  const renderToken = (token) => {
+    const ctx = {
+      action: {
+        record_schema_version: 1,
+        surface: "command",
+        syntactic: { argv: [token] },
+        risk: "low",
+      },
+      summary: "token quoting probe",
+      actor: { id: "machine:ci", kind: "claude-code" },
+      risk: "low",
+      reversible: true,
+      constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
+    };
+    const jwe = wasm.encrypt_context(
+      JSON.stringify(ctx),
+      JSON.stringify([{ device_id: DEVICE_ID, public_key_b64: keyfile.device_encryption_pubkey }]),
+    );
+    const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
+    const line = renderRequest(prepared)
+      .split("\n")
+      .find((l) => l.startsWith("  Action:"));
+    return line.replace(/^ {2}Action:\s+/, "");
+  };
+
+  /** [input token, expected display form, why]. */
+  const cases = [
+    ["--force", "--force", "plain flag — no metacharacters, stays bare"],
+    ["origin", "origin", "plain word — stays bare"],
+    ["my dir", "'my dir'", "whitespace splits tokens — must be quoted"],
+    ["", "''", "empty token would vanish — rendered as explicit ''"],
+    ["a'b", "'a'\\''b'", "embedded single quote — POSIX close/escape/reopen"],
+    ["$(rm -rf /)", "'$(rm -rf /)'", "shell substitution — quoted (also has whitespace)"],
+    ["a;b", "'a;b'", "command separator — quoted"],
+    ["a|b", "'a|b'", "pipe — quoted"],
+    ["wild*", "'wild*'", "glob star — quoted"],
+    // Intentionally OMITTED from the quote set (no whitespace ambiguity, not shell structure):
+    ["KEY=value", "KEY=value", "`=` omitted — stays bare and legible"],
+    ["a:b", "a:b", "`:` omitted — stays bare"],
+    ["a,b", "a,b", "`,` omitted — stays bare"],
+    ["user@host", "user@host", "`@` omitted — stays bare"],
+    ["50%", "50%", "`%` omitted — stays bare"],
+  ];
+
+  for (const [input, expected, why] of cases) {
+    assert.equal(renderToken(input), expected, why);
+  }
 });
 
 test("nonce is a fresh, high-entropy (≥16-byte) value per verdict", async () => {
