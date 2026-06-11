@@ -37,6 +37,8 @@ const FUTURE_EXPIRES_AT = 4102444800000;
 const PAST_EXPIRES_AT = 1000;
 /** A fixed creation timestamp (2023-11-14Z, ms). */
 const CREATED_AT = 1700000000000;
+/** Retention cutoff fixture: far enough in the past to be swept deterministically. */
+const OLD_TERMINAL_AT = 2000;
 
 /**
  * Build an ApprovalRequest envelope. By the contract this is the ONLY relay-visible structure:
@@ -640,6 +642,61 @@ describe("AccountRelay — fail-closed expiry", () => {
     expect(msg.request_id).toBe("req-exp-w");
   });
 
+  it("alarm proactively expires overdue pending requests, retracts devices, and wakes waiters", async () => {
+    const acct = "acct-exp-alarm";
+    await enrollDevice(acct);
+    const deviceId = await firstDeviceId(acct);
+    const device = await connectWs(acct, `/devices/${deviceId}/connect`);
+
+    const submit = await post(acct, "/requests", makeEnvelope("req-exp-alarm"));
+    expect(submit.status).toBe(202);
+    expect((await device.next()).request_id).toBe("req-exp-alarm");
+
+    const integrator = await connectWs(acct, "/requests/req-exp-alarm/wait");
+
+    await forceExpireAndRunAlarm(acct, "req-exp-alarm");
+
+    const retract = await device.next();
+    expect(retract.type).toBe("retract");
+    expect(retract.request_id).toBe("req-exp-alarm");
+
+    const expired = await integrator.next();
+    expect(expired.type).toBe("expired");
+    expect(expired.request_id).toBe("req-exp-alarm");
+
+    const status = await readRequestStatus(acct, "req-exp-alarm");
+    expect(status).toBe("expired");
+  });
+
+  it("alarm tracks the nearest pending expiry and clears itself when no pending work remains", async () => {
+    const acct = "acct-exp-rearm";
+    const firstExpiry = 4102444800000;
+    const secondExpiry = firstExpiry + 60_000;
+    await post(acct, "/requests", makeEnvelope("req-exp-a", { expires_at: firstExpiry }));
+    await post(acct, "/requests", makeEnvelope("req-exp-b", { expires_at: secondExpiry }));
+
+    expect(await readScheduledAlarm(acct)).toBe(firstExpiry);
+
+    await forceExpireAndRunAlarm(acct, "req-exp-a");
+    expect(await readRequestStatus(acct, "req-exp-a")).toBe("expired");
+    expect(await readScheduledAlarm(acct)).toBe(secondExpiry);
+
+    await forceExpireAndRunAlarm(acct, "req-exp-b");
+    expect(await readRequestStatus(acct, "req-exp-b")).toBe("expired");
+    expect(await readScheduledAlarm(acct)).toBeNull();
+  });
+
+  it("alarm retention sweep deletes old terminal rows and their verdicts", async () => {
+    const acct = "acct-exp-retention";
+    await seedOldTerminalRows(acct);
+
+    await runAlarm(acct);
+
+    const rows = await listRequestAndVerdictIds(acct);
+    expect(rows.requests).toEqual(["req-fresh-expired", "req-fresh-resolved"]);
+    expect(rows.verdicts).toEqual(["req-fresh-resolved"]);
+  });
+
   it("refuses a verdict from a device whose enrollment was removed", async () => {
     const acct = "acct-exp-revoked";
     await enrollDevice(acct);
@@ -688,8 +745,9 @@ async function seedExpiredRequest(
   await runInDurableObject(stub, (instance: AccountRelay) => {
     const relay = instance as unknown as { sql: SqlStorage };
     relay.sql.exec(
-      `INSERT OR REPLACE INTO request (request_id, envelope, created_at, expires_at, status)
-       VALUES (?, ?, ?, ?, 'pending')`,
+      `INSERT OR REPLACE INTO request
+       (request_id, envelope, created_at, expires_at, status, terminal_at)
+       VALUES (?, ?, ?, ?, 'pending', NULL)`,
       requestId,
       JSON.stringify(envelope),
       CREATED_AT,
@@ -697,6 +755,138 @@ async function seedExpiredRequest(
     );
   });
   return envelope;
+}
+
+async function runAlarm(accountId: string): Promise<void> {
+  const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
+  await runInDurableObject(stub, async (instance: AccountRelay) => {
+    await instance.alarm();
+  });
+}
+
+async function forceExpireAndRunAlarm(accountId: string, requestId: string): Promise<void> {
+  const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
+  await runInDurableObject(stub, async (instance: AccountRelay) => {
+    const relay = instance as unknown as { sql: SqlStorage; alarm(): Promise<void> };
+    relay.sql.exec(
+      `UPDATE request SET expires_at = ? WHERE request_id = ?`,
+      PAST_EXPIRES_AT,
+      requestId,
+    );
+    await relay.alarm();
+  });
+}
+
+async function readScheduledAlarm(accountId: string): Promise<number | null> {
+  const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
+  return runInDurableObject(stub, async (instance: AccountRelay) => {
+    const relay = instance as unknown as { ctx: DurableObjectState };
+    return relay.ctx.storage.getAlarm();
+  });
+}
+
+async function readRequestStatus(accountId: string, requestId: string): Promise<string | null> {
+  const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
+  return runInDurableObject(stub, (instance: AccountRelay) => {
+    const relay = instance as unknown as { sql: SqlStorage };
+    const rows = [
+      ...relay.sql.exec<{ status: string }>(
+        `SELECT status FROM request WHERE request_id = ?`,
+        requestId,
+      ),
+    ];
+    return rows[0]?.status ?? null;
+  });
+}
+
+async function seedOldTerminalRows(accountId: string): Promise<void> {
+  const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
+  await runInDurableObject(stub, (instance: AccountRelay) => {
+    const relay = instance as unknown as { sql: SqlStorage };
+    const rows = [
+      {
+        request_id: "req-old-expired",
+        envelope: makeEnvelope("req-old-expired", { expires_at: OLD_TERMINAL_AT }),
+        created_at: OLD_TERMINAL_AT - 1000,
+        expires_at: OLD_TERMINAL_AT,
+        status: "expired",
+        terminal_at: OLD_TERMINAL_AT,
+      },
+      {
+        request_id: "req-fresh-expired",
+        envelope: makeEnvelope("req-fresh-expired"),
+        created_at: CREATED_AT,
+        expires_at: FUTURE_EXPIRES_AT,
+        status: "expired",
+        terminal_at: FUTURE_EXPIRES_AT,
+      },
+      {
+        request_id: "req-old-resolved",
+        envelope: makeEnvelope("req-old-resolved", { expires_at: OLD_TERMINAL_AT }),
+        created_at: OLD_TERMINAL_AT - 1000,
+        expires_at: OLD_TERMINAL_AT,
+        status: "resolved",
+        terminal_at: OLD_TERMINAL_AT,
+      },
+      {
+        request_id: "req-fresh-resolved",
+        envelope: makeEnvelope("req-fresh-resolved"),
+        created_at: CREATED_AT,
+        expires_at: FUTURE_EXPIRES_AT,
+        status: "resolved",
+        terminal_at: FUTURE_EXPIRES_AT,
+      },
+    ];
+    for (const row of rows) {
+      relay.sql.exec(
+        `INSERT OR REPLACE INTO request
+         (request_id, envelope, created_at, expires_at, status, terminal_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        row.request_id,
+        JSON.stringify(row.envelope),
+        row.created_at,
+        row.expires_at,
+        row.status,
+        row.terminal_at,
+      );
+    }
+    relay.sql.exec(
+      `INSERT OR REPLACE INTO verdict (request_id, verdict, device_id, received_at)
+       VALUES (?, ?, ?, ?)`,
+      "req-old-resolved",
+      JSON.stringify(makeVerdict("req-old-resolved")),
+      "dev-old",
+      OLD_TERMINAL_AT,
+    );
+    relay.sql.exec(
+      `INSERT OR REPLACE INTO verdict (request_id, verdict, device_id, received_at)
+       VALUES (?, ?, ?, ?)`,
+      "req-fresh-resolved",
+      JSON.stringify(makeVerdict("req-fresh-resolved")),
+      "dev-fresh",
+      FUTURE_EXPIRES_AT,
+    );
+  });
+}
+
+async function listRequestAndVerdictIds(
+  accountId: string,
+): Promise<{ requests: string[]; verdicts: string[] }> {
+  const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
+  return runInDurableObject(stub, (instance: AccountRelay) => {
+    const relay = instance as unknown as { sql: SqlStorage };
+    const requests = [
+      ...relay.sql.exec<{ request_id: string }>(
+        `SELECT request_id FROM request ORDER BY request_id ASC`,
+      ),
+    ].map((row) => row.request_id);
+    const verdicts = [
+      ...relay.sql.exec<{ request_id: string }>(
+        `SELECT request_id FROM verdict ORDER BY request_id ASC`,
+      ),
+    ].map((row) => row.request_id);
+    return { requests, verdicts };
+  });
 }
 
 /** Delete a device row directly — simulates a revoke whose hibernation socket outlived the close. */
