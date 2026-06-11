@@ -9,7 +9,7 @@
  */
 
 import { prepareRequest, signDecision } from "@allw/approver";
-import type { AllwWasm, Decision, Keyfile } from "@allw/approver";
+import type { AllwWasm, ApprovalContext, Decision, Keyfile } from "@allw/approver";
 
 import type { DeviceConnection } from "./in-process-relay.js";
 
@@ -25,6 +25,12 @@ export interface DecisionLogEntry {
   readonly requestId: string;
   /** The WYSIWYS `request_hash` the approver recomputed device-side over the decrypted context. */
   readonly requestHash: string;
+  /**
+   * The **decrypted** human-shown `ApprovalContext` the approver rendered (the plaintext the relay
+   * never saw), or `null` if decryption failed. Surfaced so a test can assert WYSIWYS directly —
+   * that the command/cwd the approver saw equals exactly what was sent (acceptance criterion #2).
+   */
+  readonly context: ApprovalContext | null;
   /** The decision sent (or `null` when the mode left it to time out). */
   readonly decision: Decision | null;
 }
@@ -59,20 +65,30 @@ export function attachAutoApprover(
     } catch {
       // A request we cannot decrypt/verify (or that is already expired) yields NO verdict — the
       // integrator's gate stays closed (deny-by-default). Mirrors the watch loop's skip-on-error.
-      log.push({ requestId, requestHash: "", decision: null });
+      log.push({ requestId, requestHash: "", context: null, decision: null });
       return;
     }
 
     if (mode === "timeout") {
       // Unattended "never answer" — the request will expire and the integrator fails closed.
-      log.push({ requestId, requestHash: prepared.requestHash, decision: null });
+      log.push({
+        requestId,
+        requestHash: prepared.requestHash,
+        context: prepared.context,
+        decision: null,
+      });
       return;
     }
 
     // Sign the verdict (Ed25519 + device cert) over the recomputed hash and return it.
     const verdict = signDecision(wasm, keyfile, prepared, mode, now());
     connection.sendVerdict(requestId, verdict);
-    log.push({ requestId, requestHash: prepared.requestHash, decision: mode });
+    log.push({
+      requestId,
+      requestHash: prepared.requestHash,
+      context: prepared.context,
+      decision: mode,
+    });
   });
 
   return { log };

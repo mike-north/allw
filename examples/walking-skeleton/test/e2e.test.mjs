@@ -140,6 +140,21 @@ test("approve: a gated destructive command → human approves → hook emits all
   assert.equal(log.length, 1, "the approver handled exactly one escalated request");
   assert.equal(log[0].decision, "approved");
   assert.ok(log[0].requestHash.length > 0, "the approver recomputed a WYSIWYS request_hash");
+
+  // Acceptance criterion #2 (WYSIWYS), asserted DIRECTLY: the plaintext the approver decrypted —
+  // never seen by the relay — must be byte-for-byte the action that was sent. We read the rendered
+  // command (argv / cwd / raw) out of the decrypted context, proving the human-shown content equals
+  // exactly `git push --force origin main` in `/workspace/project` (not merely that *a* hash matched).
+  const context = log[0].context;
+  assert.ok(context, "the approver decrypted the human-shown context");
+  const syntactic = context.action.syntactic;
+  assert.deepEqual(
+    syntactic.argv,
+    ["git", "push", "--force", "origin", "main"],
+    "the decrypted, human-shown argv is exactly the destructive command that was sent",
+  );
+  assert.equal(syntactic.cwd, PROJECT_CWD, "the decrypted, human-shown cwd matches what was sent");
+  assert.equal(syntactic.raw, DESTRUCTIVE_COMMAND, "the rendered raw command line matches exactly");
 });
 
 // ── Acceptance item 3 (fail-closed): Deny → deny ─────────────────────────────────────────────────
@@ -168,7 +183,9 @@ test("timeout (fail-closed): no human response by the deadline → hook emits de
   // which the hook maps to `deny`. Drive it with a near-zero timeout so the test does not wait.
   const { identity, relay, log } = await harness("timeout");
 
-  const env = { ...hookEnv(identity), ALLW_TIMEOUT_MS: "20" };
+  // ~50ms is the one wall-clock dependency in the suite — short enough to stay fast, with enough
+  // CI headroom that the deadline reliably elapses before assertion (less flake than a ~20ms margin).
+  const env = { ...hookEnv(identity), ALLW_TIMEOUT_MS: "50" };
   // Use the real clock for the deadline race here (the request is created "now" and must expire);
   // the approver still refuses to answer, so the only terminal outcome is a fail-closed timeout.
   const output = await runHook(bashStdin(DESTRUCTIVE_COMMAND, PROJECT_CWD), env, {

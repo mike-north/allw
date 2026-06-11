@@ -73,6 +73,13 @@ The primitive **never returns a bare "allow"** — the integrator composes it
 Approve is the **only** path to `allow`, and only for a verdict that verifies against the approver's
 account-root key. Deny and timeout both block.
 
+> The **unverifiable / forged** row is exercised here at the `Verdict.verify()` boolean (the no-swap
+> test asserts a verdict does **not** verify against a different root key). The forged-verdict path
+> _through `runHook`_ — a forged/tampered verdict from the relay being mapped to `deny` — is owned by
+> the [`@allw/sdk`](../../packages/sdk) and [`@allw/hook`](../../packages/hook) test suites (the SDK
+> synthesizes `denied` for any unverifiable verdict, which the hook maps to `deny`), so this example
+> does not re-assert it at the hook level — keeping the doc/test mapping tight.
+
 ## Observe the zero-knowledge property
 
 The relay routes **ciphertext + signed verdicts only** — it never sees the plaintext
