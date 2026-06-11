@@ -32,13 +32,17 @@ keys and routing metadata only.
 ```
 account_id
   current account root key  ──signs──▶ device_cert(device_id, device signing key)
-                             └signs──▶ actor_cert(actor_id, actor signing key)  [v1 target]
 
 relay account object
   device registry: device_id -> X25519 encryption public key + metadata
   actor registry:  actor_id  -> actor attestation public key + metadata
   request/verdict routing state
 ```
+
+The relay device registry and the signed account-state document are deliberately separate. The registry is the
+online routing/encryption view the relay enforces; signed account state is the verifier/device trust view that
+includes revocation, device signing keys, actor keys, and root rotation state. The relay may store the latest
+account state, but it cannot author it.
 
 The approval primitive has two independent device keys:
 
@@ -79,7 +83,9 @@ The v1 pairing flow is:
 
 1. Account owner starts a short-lived pairing: `POST /{account_id}/pairing/start`.
 2. Relay returns `{ code, expires_at }`; the code is shown out-of-band to the device.
-3. Device completes pairing with `{ code, pubkey, label? }`, where `pubkey` is its X25519 encryption public key.
+3. Device completes pairing with `{ code, encryption_pubkey, signing_pubkey, label? }`, where
+   `encryption_pubkey` is its X25519 encryption public key and `signing_pubkey` is the Ed25519 public key to
+   certify for verdict and policy-rule signatures.
 4. Relay consumes the code exactly once, creates `device_id`, and stores only public key material.
 5. Account root signs a `device_cert` for the device signing key:
 
@@ -106,7 +112,9 @@ into hardware-backed or recovery-protected stores without changing the wire prot
 Given a verdict and configured account-root public key, a verifier must:
 
 1. Require `verdict.device_cert`; missing cert is deny.
-2. Parse it as compact JWS with `typ: "allw-device-cert+jws"` and `kid == account_id`.
+2. Parse it as compact JWS with `typ: "allw-device-cert+jws"` and `kid == account_id`. In this protocol `kid`
+   names the account trust domain, not an arbitrary key-record identifier, so verifiers select the configured
+   account-root trust anchor before checking claims.
 3. Verify the cert signature against an acceptable account root for `account_id`.
 4. Require cert claims `account_id == verdict.approver.account_id`.
 5. Require cert claims `device_id == verdict.approver.device_id`.
@@ -156,6 +164,10 @@ Enrollment requirements:
 - Actor revocation prevents future requests from being shown as verified for that actor.
 - The relay may help distribute actor public keys, but the device must treat actor trust as account-state data,
   not as a relay assertion.
+
+Whether actor enrollment is represented as a root-signed `actor_cert` artifact, only as entries in signed
+account-state, or both is deferred to #16. This document requires the actor public key to be account-root trusted
+before an origin is displayed as verified, but does not pin the final wire artifact.
 
 ## Account State
 
