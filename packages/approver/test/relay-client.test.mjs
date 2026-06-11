@@ -23,7 +23,12 @@ import { join } from "node:path";
 
 import { loadWasm } from "../dist/index.js";
 import { readKeyfile } from "../dist/lib/keyfile.js";
-import { deviceConnectWsUrl, pairingStart, pairingComplete } from "../dist/lib/relay-client.js";
+import {
+  deviceConnectWsUrl,
+  pairingStart,
+  pairingComplete,
+  PAIRING_TIMEOUT_MS,
+} from "../dist/lib/relay-client.js";
 import { runPair } from "../dist/commands/pair.js";
 
 const PAIRING_CODE = "ABC23456";
@@ -65,6 +70,36 @@ function startFakeRelay() {
         url: `http://127.0.0.1:${port}`,
         requests,
         close: () => new Promise((r) => server.close(r)),
+      });
+    });
+  });
+}
+
+/**
+ * Start a relay that ACCEPTS the connection but NEVER responds (it holds the socket open and writes
+ * nothing). This is the "hung relay" failure mode the `AbortSignal.timeout` guard exists for — a
+ * dead-but-listening relay, distinct from connection-refused. Returns { url, close }.
+ */
+function startHungRelay() {
+  const sockets = new Set();
+  const server = createServer((req, _res) => {
+    // Consume the request but deliberately never call res.end()/write() — the client must abort.
+    req.resume();
+  });
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address();
+      resolve({
+        url: `http://127.0.0.1:${port}`,
+        close: () =>
+          new Promise((r) => {
+            for (const s of sockets) s.destroy();
+            server.close(r);
+          }),
       });
     });
   });
@@ -203,6 +238,30 @@ test("runPair self-drives start+complete, mints a device_cert, and persists pair
         "the minted device_cert chains the signing key to the account root",
       );
     });
+  } finally {
+    await relay.close();
+  }
+});
+
+test("pairingStart ABORTS against a hung relay (fail-closed AbortSignal.timeout — #51 nit)", async () => {
+  await loadWasm();
+  const relay = await startHungRelay();
+  try {
+    // The relay accepts the socket but never responds. Without the abort, this would hang forever;
+    // with it, the request must reject (aborted) rather than block. A short timeout proves the
+    // pairing is wired through `AbortSignal.timeout` without making the test wait 15s.
+    const started = Date.now();
+    await assert.rejects(
+      () => pairingStart(relay.url, "acct-hung", undefined, 150),
+      (err) => err instanceof Error,
+      "a hung relay must abort the pairing request, not block indefinitely",
+    );
+    // Sanity: it aborted promptly (well under the production 15s default), proving the timeout fired
+    // rather than some other transport error resolving instantly by luck.
+    assert.ok(
+      Date.now() - started < PAIRING_TIMEOUT_MS,
+      "the request aborted via the timeout, not after the full production window",
+    );
   } finally {
     await relay.close();
   }

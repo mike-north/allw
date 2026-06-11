@@ -67,9 +67,10 @@ For each incoming request the approver:
 1. **decrypts** the `context_ciphertext` with the device X25519 key (via the WASM core),
 2. **recomputes** the WYSIWYS `request_hash` over the decrypted context + the envelope's
    `expires_at` — identical bytes to the integrator's pre-send hash,
-3. **renders** the **complete** action substrate (command/argv **plus** `cwd`, `host`, `env_refs`,
-   or MCP `params` when present — all bound into `request_hash`), summary, actor, risk,
-   reversibility, expiry, and `request_hash`,
+3. **renders** the **complete** action substrate — the command/argv headline **plus** every other
+   hash-bound field: a divergent reconstructed `argv` (when a benign `raw` would otherwise mask it),
+   `flags`, `positionals`, `cwd`, `host`, `env_refs`, or MCP `params` when present — followed by the
+   summary, actor, risk, reversibility, expiry, and `request_hash`,
 4. prompts **Approve / Deny / Skip**,
 5. **re-checks expiry** after the human decides and before signing (a prompt left open past the
    deadline emits nothing),
@@ -80,9 +81,10 @@ A `{ type: "retract" }` (another device resolved it) clears the pending prompt.
 
 #### WYSIWYS render
 
-The full meaning-changing substrate is shown — never elided behind a `raw` summary. `cwd`/`host`/
-`env_refs`/`params` change what an otherwise-identical command does, so they get their own labeled
-lines (the same fields the `request_hash` binds):
+The full meaning-changing substrate is shown — never elided behind a `raw` summary. The `argv`,
+`flags`, `positionals`, `cwd`, `host`, `env_refs`, and MCP `params` fields all change what an
+otherwise-identical command does and are **all bound into `request_hash`**, so each gets its own
+labeled line (the headline alone is never the whole story):
 
 ```
 ────────────────────────────────────────────────────────────────────────
@@ -92,6 +94,8 @@ lines (the same fields the `request_hash` binds):
   Summary:    force push to main
   Action:     git push --force origin main
   Surface:    command
+  Flags:      --force
+  Positionals: origin main
   Cwd:        /home/me/project
   Env refs:   GIT_SSH_COMMAND
   Actor:      machine:laptop (claude-code)
@@ -103,6 +107,23 @@ lines (the same fields the `request_hash` binds):
 ────────────────────────────────────────────────────────────────────────
 Approve / Deny / Skip? [a/d/s]
 ```
+
+#### Anti-divergence: a benign `raw` can never hide a dangerous `argv`
+
+`raw` is only **one** of the hash-bound substrate fields. A buggy or malicious integrator could send
+a benign `raw` ("git status") alongside a divergent, dangerous `argv` (`git push --force …`) — both
+covered by `request_hash`, but a `raw`-only headline would show the human only the benign string
+while a downstream executor acts on `argv`. The device is the last line of defense against exactly
+that field mismatch, so when the reconstructed `bin`/`argv` command **diverges** from `raw`, the
+renderer surfaces the reconstructed form on a labeled `Argv:` line:
+
+```
+  Action:     git status
+  Surface:    command
+  Argv:       git push --force origin main      ← hash-bound argv, surfaced because it diverges from raw
+```
+
+This is **display-only** — it never changes the bytes bound into `request_hash`.
 
 #### ⚠ Actor origin is UNVERIFIED in v0
 
