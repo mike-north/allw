@@ -393,6 +393,112 @@ test("renderRequest surfaces cwd and env_refs (WYSIWYS completeness — review f
   );
 });
 
+test("renderRequest surfaces argv when raw could hide a divergent command (#51)", async () => {
+  // `raw` is human-authored display text, but `argv` is also hash-bound substrate. A buggy or
+  // malicious integrator can diverge them; the approver must show both so the human does not sign a
+  // hidden executable command while only seeing benign raw text.
+  const ctx = {
+    action: {
+      record_schema_version: 1,
+      surface: "command",
+      syntactic: {
+        raw: "git status",
+        bin: "git",
+        argv: ["git", "push", "--force", "origin", "main"],
+      },
+      risk: "critical",
+    },
+    summary: "review a git command",
+    actor: { id: "machine:ci", kind: "claude-code" },
+    risk: "critical",
+    reversible: false,
+    constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
+  };
+  const rendered = renderRequest({
+    context: ctx,
+    requestId: REQUEST_ID,
+    expiresAt: EXPIRES_AT,
+    requestHash: "hash-bound-to-hidden-argv",
+  });
+
+  assert.match(rendered, /Action:\s+git status/, "the raw headline remains visible");
+  assert.match(
+    rendered,
+    /Argv:\s+git push --force origin main/,
+    "the divergent hash-bound argv is shown as its own detail line",
+  );
+});
+
+test("renderRequest surfaces flags and positionals when present (#51)", async () => {
+  // Flags and positionals are hash-bound syntactic substrate, so the device must not depend on a
+  // best-effort raw headline to communicate them.
+  const ctx = {
+    action: {
+      record_schema_version: 1,
+      surface: "command",
+      syntactic: {
+        raw: "deploy",
+        flags: { force: true, env: "prod" },
+        positionals: ["service-a", "us-west-2"],
+      },
+      risk: "high",
+    },
+    summary: "deploy a service",
+    actor: { id: "machine:ci", kind: "claude-code" },
+    risk: "high",
+    reversible: false,
+    constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
+  };
+  const rendered = renderRequest({
+    context: ctx,
+    requestId: REQUEST_ID,
+    expiresAt: EXPIRES_AT,
+    requestHash: "hash-bound-to-flags-positionals",
+  });
+
+  assert.match(rendered, /Positionals:\s+service-a us-west-2/, "positionals are shown");
+  assert.match(
+    rendered,
+    /Flags:\s+\{"force":true,"env":"prod"\}/,
+    "flags are shown in full compact JSON form",
+  );
+});
+
+test("renderRequest surfaces MCP server/tool when raw could hide them (#56)", async () => {
+  // MCP server/tool are hash-bound substrate. If `raw` is present, the headline can look like an
+  // innocent shell command while the MCP executor receives a different server/tool pair.
+  const ctx = {
+    action: {
+      record_schema_version: 1,
+      surface: "mcp_tool_call",
+      syntactic: {
+        raw: "echo hello",
+        server: "fs",
+        tool: "delete_all_files",
+      },
+      risk: "critical",
+    },
+    summary: "review an MCP tool call",
+    actor: { id: "machine:ci", kind: "claude-code" },
+    risk: "critical",
+    reversible: false,
+    constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
+  };
+  const rendered = renderRequest({
+    context: ctx,
+    requestId: REQUEST_ID,
+    expiresAt: EXPIRES_AT,
+    requestHash: "hash-bound-to-mcp-server-tool",
+  });
+
+  assert.match(rendered, /Action:\s+echo hello/, "the raw headline remains visible");
+  assert.match(
+    rendered,
+    /MCP:\s+fs :: delete_all_files/,
+    "the hash-bound MCP server/tool pair is shown as its own detail line",
+  );
+});
+
 test("renderRequest surfaces MCP params (not hidden behind raw) — review fix #1", async () => {
   const wasm = await loadWasm();
   const { keyfile } = pairedApprover(wasm);

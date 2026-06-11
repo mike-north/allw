@@ -65,6 +65,29 @@ function renderArgv(argv: readonly string[]): string {
 }
 
 /**
+ * Reconstruct the hash-bound argv command using the same display quoting as the headline path.
+ * `bin` is included when `argv` omits it because `bin` and `argv` are independently hash-bound
+ * substrate fields; hiding either one can change what the human believes they are approving.
+ */
+function renderHashBoundArgv(syntactic: Record<string, unknown>): string | undefined {
+  const argv = readStringArray(syntactic, "argv");
+  if (argv === undefined || argv.length === 0) return undefined;
+
+  const bin = readString(syntactic, "bin");
+  const tokens = bin !== undefined && argv[0] !== bin ? [bin, ...argv] : argv;
+  return renderArgv(tokens);
+}
+
+/** Render the hash-bound MCP routing pair; server is optional but must be shown when present. */
+function renderMcpTarget(syntactic: Record<string, unknown>): string | undefined {
+  const tool = readString(syntactic, "tool");
+  if (tool === undefined) return undefined;
+
+  const server = readString(syntactic, "server");
+  return server !== undefined ? `${server} :: ${tool}` : tool;
+}
+
+/**
  * Render the action's syntactic substrate into the literal command / tool call the agent attempted,
  * as one display line. NOTE: this is the *headline* line only — meaning-changing fields (`cwd`,
  * `host`, `env_refs`, MCP `params`) are rendered as their own labeled lines by
@@ -87,13 +110,10 @@ function renderActionHeadline(action: ActionRecord): string {
     const raw = readString(syntactic, "raw");
     if (raw !== undefined) return raw;
 
-    const argv = readStringArray(syntactic, "argv");
+    const argvLine = renderHashBoundArgv(syntactic);
     const bin = readString(syntactic, "bin");
-    if (argv !== undefined && argv.length > 0) {
-      // Include `bin` unless argv already leads with it (argv conventionally includes the binary).
-      const tokens = bin !== undefined && argv[0] !== bin ? [bin, ...argv] : argv;
-      return renderArgv(tokens);
-    }
+    if (argvLine !== undefined) return argvLine;
+
     // No argv: still show `bin` (+ any positionals) rather than dropping the program name.
     if (bin !== undefined) {
       const positionals = readStringArray(syntactic, "positionals");
@@ -101,11 +121,8 @@ function renderActionHeadline(action: ActionRecord): string {
     }
 
     // MCP headline when there is no command form: "server :: tool".
-    const tool = readString(syntactic, "tool");
-    if (tool !== undefined) {
-      const server = readString(syntactic, "server");
-      return server !== undefined ? `${server} :: ${tool}` : tool;
-    }
+    const mcpTarget = renderMcpTarget(syntactic);
+    if (mcpTarget !== undefined) return mcpTarget;
   }
   return JSON.stringify(syntactic);
 }
@@ -113,12 +130,32 @@ function renderActionHeadline(action: ActionRecord): string {
 /**
  * The labeled detail lines for the meaning-changing substrate fields. These are bound into
  * `request_hash` and so MUST be shown verbatim whenever present. Returns an empty array when none
- * apply (e.g. a bare `raw` command with no cwd/env).
+ * apply (e.g. a bare `raw` command with no additional substrate).
  */
 function substrateDetailLines(action: ActionRecord): string[] {
   const syntactic = action.syntactic;
   if (!isRecord(syntactic)) return [];
   const lines: string[] = [];
+
+  const raw = readString(syntactic, "raw");
+  const argvLine = renderHashBoundArgv(syntactic);
+  if (raw !== undefined && argvLine !== undefined) {
+    lines.push(`  Argv:       ${argvLine}`);
+  }
+
+  const positionals = readStringArray(syntactic, "positionals");
+  if (positionals !== undefined && positionals.length > 0) {
+    lines.push(`  Positionals: ${renderArgv(positionals)}`);
+  }
+
+  if ("flags" in syntactic && syntactic.flags !== undefined && syntactic.flags !== null) {
+    lines.push(`  Flags:      ${JSON.stringify(syntactic.flags)}`);
+  }
+
+  const mcpTarget = renderMcpTarget(syntactic);
+  if (mcpTarget !== undefined) {
+    lines.push(`  MCP:        ${mcpTarget}`);
+  }
 
   const cwd = readString(syntactic, "cwd");
   if (cwd !== undefined) lines.push(`  Cwd:        ${cwd}`);
@@ -156,8 +193,8 @@ export function renderRequest(prepared: RenderableRequest): string {
   lines.push(`  Summary:    ${context.summary}`);
   lines.push(`  Action:     ${renderActionHeadline(context.action)}`);
   lines.push(`  Surface:    ${context.action.surface}`);
-  // Meaning-changing substrate fields (cwd/host/env_refs/params) — bound into request_hash, so
-  // shown explicitly. A human must never sign over a cwd/params they could not see.
+  // Meaning-changing substrate fields — bound into request_hash, so shown explicitly. A human must
+  // never sign over command tokens, cwd, env refs, or params they could not see.
   for (const detail of substrateDetailLines(context.action)) {
     lines.push(detail);
   }
