@@ -247,15 +247,18 @@ struct VerifyResult {
     device_id: String,
     /// The decision time — Unix milliseconds (UTC).
     decided_at: i64,
+    /// The signed anti-replay nonce, base64url-unpadded, for SDK/client-level replay stores.
+    nonce_b64: String,
 }
 
 /// Verifies a [`Verdict`](allw_core::Verdict) against the request it answers, the human-shown
 /// context, and the approver's account-root Ed25519 public key.
 ///
-/// On success returns a JSON `{ "approved": true, "device_id": string, "decided_at": number }`.
-/// Uses a fresh single-shot [`InMemoryNonceStore`](allw_core::InMemoryNonceStore) — anti-replay
-/// across calls is the integrator's responsibility (a persistent store), not this stateless
-/// binding's.
+/// On success returns a JSON
+/// `{ "approved": true, "device_id": string, "decided_at": number, "nonce_b64": string }`.
+/// Uses a fresh single-shot [`InMemoryNonceStore`](allw_core::InMemoryNonceStore), then returns the
+/// verified nonce so SDK/client code can enforce cross-call replay protection in a long-lived
+/// store.
 ///
 /// # Errors
 ///
@@ -299,6 +302,7 @@ pub fn verify_verdict(
             approved: true,
             device_id: verified.device_id,
             decided_at: verified.decided_at,
+            nonce_b64: URL_SAFE_NO_PAD.encode(verified.nonce),
         },
         "VerifyResult",
     )

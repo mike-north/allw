@@ -563,6 +563,9 @@ pub struct VerifiedVerdict {
     pub approver: Approver,
     /// The decision time — Unix milliseconds (UTC), taken from the signed claims.
     pub decided_at: i64,
+    /// The signed anti-replay nonce, returned so bindings can thread freshness into their own
+    /// long-lived stores after the core has authenticated the verdict.
+    pub nonce: Vec<u8>,
 }
 
 /// Why a verdict failed verification. Every variant is a **deny** (fail-closed).
@@ -878,6 +881,7 @@ pub fn verify_verdict(
         device_id: verdict.approver.device_id.clone(),
         approver: verdict.approver.clone(),
         decided_at: claims.decided_at,
+        nonce: claims.nonce.clone(),
     })
 }
 

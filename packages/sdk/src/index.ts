@@ -111,9 +111,27 @@ export interface Verdict {
   /**
    * Re-run full verification against the approver's account-root Ed25519 public key (base64url).
    * Returns `true` only for an authenticated, bound, fresh, **approved** verdict; `false` for any
-   * non-approval, forgery, or transport-synthesized denial. Never throws.
+   * non-approval, forgery, replay, or transport-synthesized denial. Re-verifying the same Verdict
+   * object is idempotent: the nonce accepted by `requestApproval` does not self-trip this method.
+   * Never throws.
    */
   verify(approverRootKey: string): Promise<boolean>;
+}
+
+/**
+ * Integrator-owned anti-replay store for verdict nonces.
+ *
+ * Nonces are signed by the device and returned by the core only after the verdict is authenticated,
+ * bound to the request, within its freshness window, and approved. The SDK stores that verified
+ * base64url nonce here so a captured verdict cannot be replayed to the same long-lived client.
+ */
+export interface NonceStore {
+  /**
+   * Atomically records a freshly verified verdict nonce and returns true iff it was not already
+   * present. Durable stores should implement this as a unique insert / conditional write, not as
+   * separate read-then-write operations, so concurrent replay attempts cannot both be accepted.
+   */
+  checkAndInsert(nonceB64: string): boolean | Promise<boolean>;
 }
 
 /** Configuration for {@link createClient}. */
@@ -145,6 +163,11 @@ export interface ClientConfig {
    */
   readonly fetchTimeoutMs?: number;
   /**
+   * Anti-replay store for verified verdict nonces. Defaults to an in-memory per-client store that
+   * persists across `requestApproval` and `Verdict.verify()` calls for this client instance.
+   */
+  readonly nonceStore?: NonceStore;
+  /**
    * Override the timer used to schedule the poll cadence and the fail-closed deadline (tests).
    * Defaults to `setTimeout`. Exposed so the fail-closed timing can be driven deterministically by
    * a fake clock instead of waiting in real time.
@@ -162,6 +185,19 @@ const PROTOCOL_VERSION = 1;
 /** Default fail-closed timeout when a request omits `timeoutMs`. */
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_POLL_INTERVAL_MS = 1000;
+
+/** Per-client in-memory nonce store used when the integrator does not provide a durable store. */
+class InMemoryNonceStore implements NonceStore {
+  private readonly seen = new Set<string>();
+
+  checkAndInsert(nonceB64: string): boolean {
+    if (this.seen.has(nonceB64)) return false;
+    // This intentionally grows for the client lifetime. Persistent retention/expiry belongs to
+    // integrator-provided durable stores once replay retention policy is specified.
+    this.seen.add(nonceB64);
+    return true;
+  }
+}
 
 /** The default WebSocket factory: the global `WebSocket` if the runtime provides one, else none. */
 function defaultWebSocketFactory(): WebSocketFactory | undefined {
@@ -256,6 +292,38 @@ function isAuthenticatedNonApproval(message: string): boolean {
   return message.includes("verified human decision was not");
 }
 
+interface VerifiedDecision {
+  readonly decision: Decision;
+  readonly nonceB64?: string;
+}
+
+interface VerifiedWasmResult {
+  readonly nonceB64: string;
+}
+
+/** Parse the WASM verification JSON and normalize its snake_case nonce field for SDK use. */
+function readVerifiedWasmResult(json: string): VerifiedWasmResult {
+  const value = JSON.parse(json) as { nonce_b64?: unknown };
+  if (typeof value.nonce_b64 !== "string" || value.nonce_b64.length === 0) {
+    throw new Error("allw: verify_verdict result did not include a nonce_b64");
+  }
+  return { nonceB64: value.nonce_b64 };
+}
+
+/**
+ * Accept a nonce into the client replay store. `acceptedNonceB64` is the nonce already accepted for
+ * this exact public Verdict object, which keeps `verdict.verify()` idempotent without allowing the
+ * same signed verdict to be accepted by a later request.
+ */
+async function acceptVerifiedNonce(
+  nonceStore: NonceStore,
+  nonceB64: string,
+  acceptedNonceB64?: string,
+): Promise<boolean> {
+  if (acceptedNonceB64 !== undefined && nonceB64 === acceptedNonceB64) return true;
+  return nonceStore.checkAndInsert(nonceB64);
+}
+
 /**
  * Verify a (possibly null) verdict value through the WASM core and reduce it to a {@link Decision}.
  *
@@ -264,32 +332,38 @@ function isAuthenticatedNonApproval(message: string): boolean {
  *   (`denied`/`expired`/`aborted`), defaulting to `denied` if unreadable.
  * - It throws anything else (forgery, tamper, bad sig, replay, window) ⇒ unverifiable ⇒ `null`
  *   (the caller fails closed to a synthesized `denied`).
- *
- * NOTE (replay): the WASM `verify_verdict` uses a fresh single-shot nonce store per call, so this
- * SDK does **not** provide cross-request replay protection on its own — guarding against a replayed
- * verdict across requests is the integrator's responsibility (a persistent nonce store) until the
- * SDK threads one through (#48). Not required for the v0 walking skeleton.
  */
-function verifyToDecision(
+async function verifyToDecision(
   wasm: AllwWasm,
   verdictValue: unknown,
   requestJson: string,
   contextJson: string,
   approverRootKey: string,
   nowMs: number,
-): Decision | null {
+  nonceStore: NonceStore,
+  acceptedNonceB64?: string,
+): Promise<VerifiedDecision | null> {
   if (verdictValue === null || verdictValue === undefined) return null;
   const verdictJson = JSON.stringify(verdictValue);
+  let verifyJson: string;
   try {
-    wasm.verify_verdict(verdictJson, requestJson, contextJson, approverRootKey, nowMs);
-    return "approved";
+    verifyJson = wasm.verify_verdict(verdictJson, requestJson, contextJson, approverRootKey, nowMs);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (isAuthenticatedNonApproval(message)) {
       // Authenticated, bound, fresh — but the human did not approve. Report the verified decision.
-      return readDecision(verdictValue) ?? "denied";
+      return { decision: readDecision(verdictValue) ?? "denied" };
     }
     // Forgery / tamper / expiry-window / replay — unverifiable. Fail closed.
+    return null;
+  }
+
+  try {
+    const { nonceB64 } = readVerifiedWasmResult(verifyJson);
+    if (!(await acceptVerifiedNonce(nonceStore, nonceB64, acceptedNonceB64))) return null;
+    return { decision: "approved", nonceB64 };
+  } catch {
+    // A malformed binding result or nonce-store failure cannot be treated as approved.
     return null;
   }
 }
@@ -327,6 +401,7 @@ export function createClient(config: ClientConfig): Client {
   const webSocketFactory =
     "webSocketFactory" in config ? config.webSocketFactory : defaultWebSocketFactory();
   const pollIntervalMs = config.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+  const nonceStore = config.nonceStore ?? new InMemoryNonceStore();
   const relay = new RelayClient(config.relayUrl, config.accountId, fetchImpl, {
     ...(config.fetchTimeoutMs !== undefined ? { fetchTimeoutMs: config.fetchTimeoutMs } : {}),
     // Share the fail-closed timer seam so a fake clock drives the fetch timeouts deterministically.
@@ -389,7 +464,7 @@ export function createClient(config: ClientConfig): Client {
         // A hung/black-holed connection or a bare network error before the deadline ⇒ no verified
         // verdict is obtainable ⇒ fail closed to an `expired` Verdict (never approved). This is the
         // load-bearing fix for #52: the call resolves deterministically instead of hanging forever.
-        return makeVerdict(id, "expired", { kind: "timeout" }, "", "", now);
+        return makeVerdict(id, "expired", { kind: "timeout" }, "", "", now, nonceStore);
       }
       // HTTP/protocol error or no-devices ⇒ rethrow (the hook's try/catch maps it to a deny).
       throw err;
@@ -424,17 +499,20 @@ export function createClient(config: ClientConfig): Client {
     // 6. Reduce the outcome to a verified decision. Only a delivered, fully-verified verdict can
     //    be "approved"; every other path is a deny (contract §Invariants #6).
     let decision: Decision;
+    let acceptedNonceB64: string | undefined;
     if (outcome.kind === "verdict") {
-      const verified = verifyToDecision(
+      const verified = await verifyToDecision(
         wasm,
         outcome.value,
         requestJson,
         contextJson,
         config.approverRootKey,
         now(),
+        nonceStore,
       );
       // Unverifiable verdict ⇒ synthesized `denied` (never surface a forged decision as truth).
-      decision = verified ?? "denied";
+      decision = verified?.decision ?? "denied";
+      acceptedNonceB64 = verified?.nonceB64;
     } else if (outcome.kind === "expired") {
       decision = "expired";
     } else {
@@ -443,7 +521,16 @@ export function createClient(config: ClientConfig): Client {
     }
 
     // 7. Resolve to a Verdict whose decision reflects reality; `verify()` re-runs the full check.
-    return makeVerdict(id, decision, outcome, requestJson, contextJson, now);
+    return makeVerdict(
+      id,
+      decision,
+      outcome,
+      requestJson,
+      contextJson,
+      now,
+      nonceStore,
+      acceptedNonceB64,
+    );
   }
 
   return { requestApproval };
@@ -461,6 +548,8 @@ function makeVerdict(
   requestJson: string,
   contextJson: string,
   now: NowImpl,
+  nonceStore: NonceStore,
+  acceptedNonceB64?: string,
 ): Verdict {
   const verdictValue = outcome.kind === "verdict" ? outcome.value : null;
   return {
@@ -470,15 +559,17 @@ function makeVerdict(
       // A synthesized (non-delivered) outcome has no verifiable artifact — it can never be approved.
       if (verdictValue === null || verdictValue === undefined) return false;
       const wasm = await loadWasm();
-      const result = verifyToDecision(
+      const result = await verifyToDecision(
         wasm,
         verdictValue,
         requestJson,
         contextJson,
         approverRootKey,
         now(),
+        nonceStore,
+        acceptedNonceB64,
       );
-      return result === "approved";
+      return result?.decision === "approved";
     },
   };
 }

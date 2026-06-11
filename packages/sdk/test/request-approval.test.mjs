@@ -259,6 +259,28 @@ function pollClient(approver, relay) {
   });
 }
 
+/** Run a test body with deterministic request ids so replay behavior is not masked by id binding. */
+async function withFixedRequestId(id, fn) {
+  const hadOwn = Object.prototype.hasOwnProperty.call(globalThis.crypto, "randomUUID");
+  const original = globalThis.crypto.randomUUID;
+  Object.defineProperty(globalThis.crypto, "randomUUID", {
+    configurable: true,
+    value: () => id,
+  });
+  try {
+    return await fn();
+  } finally {
+    if (hadOwn) {
+      Object.defineProperty(globalThis.crypto, "randomUUID", {
+        configurable: true,
+        value: original,
+      });
+    } else {
+      delete globalThis.crypto.randomUUID;
+    }
+  }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────────────
 
 test("(a) happy WS round-trip → approved, verify() re-passes", async () => {
@@ -540,6 +562,126 @@ test("(g) a verdict signed for a DIFFERENT envelope id resolves denied (no-swap 
     "a verdict bound to a different id must not be approved",
   );
   assert.equal(await verdict.verify(approver.accountRootPub), false);
+});
+
+test("(g') a replayed approved verdict nonce is rejected on the same client (#48)", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const req = sampleRequest();
+  let replayedVerdict = null;
+
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: {
+      poll: (env) => {
+        if (!env) return null;
+        replayedVerdict ??= signVerdict(wasm, approver, req, env, { decision: "approved" });
+        return replayedVerdict;
+      },
+    },
+  });
+  const client = pollClient(approver, relay);
+
+  await withFixedRequestId("00000000-0000-4000-8000-000000000048", async () => {
+    const first = await client.requestApproval(req);
+    assert.equal(first.decision, "approved", "the first presentation of the nonce is accepted");
+    assert.equal(
+      await first.verify(approver.accountRootPub),
+      true,
+      "re-verifying the same Verdict object is idempotent",
+    );
+    assert.equal(
+      await first.verify(approver.accountRootPub),
+      true,
+      "a second verify() call on the same object still does not self-trip replay protection",
+    );
+
+    const second = await client.requestApproval(req);
+    assert.equal(
+      second.decision,
+      "denied",
+      "the same signed verdict replayed to a later identical request fails closed",
+    );
+    assert.equal(
+      await second.verify(approver.accountRootPub),
+      false,
+      "replayed nonce is not fresh",
+    );
+  });
+});
+
+test("(g'') a custom async NonceStore is honored atomically (#48 review)", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const req = sampleRequest();
+  const seen = new Set();
+  const acceptedNonces = [];
+  const nonceStore = {
+    async checkAndInsert(nonceB64) {
+      acceptedNonces.push(nonceB64);
+      await Promise.resolve();
+      if (seen.has(nonceB64)) return false;
+      seen.add(nonceB64);
+      return true;
+    },
+  };
+
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: {
+      poll: (env) => (env ? signVerdict(wasm, approver, req, env, { decision: "approved" }) : null),
+    },
+  });
+
+  const client = createClient({
+    relayUrl: RELAY_URL,
+    accountId: ACCOUNT_ID,
+    approverRootKey: approver.accountRootPub,
+    fetchImpl: relay.fetchImpl,
+    nowImpl: () => NOW_MS,
+    webSocketFactory: undefined,
+    pollIntervalMs: 5,
+    nonceStore,
+  });
+
+  const verdict = await client.requestApproval(req);
+  assert.equal(verdict.decision, "approved");
+  assert.equal(await verdict.verify(approver.accountRootPub), true);
+  assert.equal(
+    acceptedNonces.length,
+    1,
+    "requestApproval accepts the verified nonce once; verify() on the same Verdict is idempotent",
+  );
+});
+
+test("(g''') default nonce stores are per-client, not global (#48 review)", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const req = sampleRequest();
+  let replayedVerdict = null;
+
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: {
+      poll: (env) => {
+        if (!env) return null;
+        replayedVerdict ??= signVerdict(wasm, approver, req, env, { decision: "approved" });
+        return replayedVerdict;
+      },
+    },
+  });
+
+  await withFixedRequestId("00000000-0000-4000-8000-000000000049", async () => {
+    const first = await pollClient(approver, relay).requestApproval(req);
+    assert.equal(first.decision, "approved");
+
+    const second = await pollClient(approver, relay).requestApproval(req);
+    assert.equal(
+      second.decision,
+      "approved",
+      "a fresh default client has an independent in-memory nonce store",
+    );
+  });
 });
 
 test("(h) WS closes without a verdict → poll fallback delivers the approval", async () => {
