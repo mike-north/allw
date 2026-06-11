@@ -1,8 +1,8 @@
 use allw_core::{
     action_from_argv, action_from_mcp_tool_call, evaluate, evaluate_for_actor, sign_policy_rule,
     verify_policy_rule, Actor, Approver, CommandContext, Decision, PolicyDecision, PolicyEffect,
-    PolicyPredicate, PolicyProvenance, PolicyRuleScope, PolicyTier, Risk, SigningKeyPair, Surface,
-    SyntacticSubstrate, UnsignedPolicyRule, Verdict,
+    PolicyPredicate, PolicyProvenance, PolicyRuleError, PolicyRuleScope, PolicyTier, Risk,
+    SigningKeyPair, Surface, SyntacticSubstrate, UnsignedPolicyRule, Verdict,
 };
 use serde_json::json;
 
@@ -126,6 +126,40 @@ fn signed_policy_rule_rejects_tampering_and_wrong_device_key() {
     assert!(
         verify_policy_rule(&signed_rule, &key.public_key()).is_err(),
         "changing policy fields after signing must invalidate the rule"
+    );
+}
+
+#[test]
+fn signed_policy_rule_rejects_unenforced_expiry_and_bounds() {
+    let key = device_key();
+    let base = UnsignedPolicyRule {
+        id: "allow-git".to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate::command_bin("git"),
+        effect: PolicyEffect::Allow,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    };
+
+    let mut expiring = base.clone();
+    expiring.expires_at = Some(1_700_000_060_000);
+    let signed_expiring = sign_policy_rule(&expiring, "device:phone", &key);
+    assert_eq!(
+        verify_policy_rule(&signed_expiring, &key.public_key()),
+        Err(PolicyRuleError::UnsupportedBounds),
+        "expires_at must not silently no-op until evaluate has a clock"
+    );
+
+    let mut bounded = base;
+    bounded.bounds = Some(json!({ "max_uses": 1 }));
+    let signed_bounded = sign_policy_rule(&bounded, "device:phone", &key);
+    assert_eq!(
+        verify_policy_rule(&signed_bounded, &key.public_key()),
+        Err(PolicyRuleError::UnsupportedBounds),
+        "bounds must not silently no-op until evaluate has usage state"
     );
 }
 

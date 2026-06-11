@@ -415,6 +415,7 @@ pub enum PolicyRuleError {
     UnexpectedTyp,
     BadSignature,
     PayloadMismatch,
+    UnsupportedBounds,
 }
 
 impl std::fmt::Display for PolicyRuleError {
@@ -425,6 +426,10 @@ impl std::fmt::Display for PolicyRuleError {
             Self::UnexpectedTyp => write!(f, "unexpected policy-rule JWS typ"),
             Self::BadSignature => write!(f, "invalid policy-rule signature"),
             Self::PayloadMismatch => write!(f, "policy-rule JWS payload does not match outer rule"),
+            Self::UnsupportedBounds => write!(
+                f,
+                "policy-rule expires_at/bounds are unsupported until enforcement is implemented"
+            ),
         }
     }
 }
@@ -492,6 +497,9 @@ pub fn verify_policy_rule(
     let decoded = decode_and_verify_policy_jws(&rule.sig, device_public_key)?;
     if decoded.claims != rule.unsigned() {
         return Err(PolicyRuleError::PayloadMismatch);
+    }
+    if rule.expires_at.is_some() || rule.bounds.is_some() {
+        return Err(PolicyRuleError::UnsupportedBounds);
     }
     Ok(VerifiedPolicyRule {
         rule: rule.clone(),

@@ -389,6 +389,34 @@ test("evaluate_policy verifies signed rules and applies deny over ask over allow
   );
 });
 
+test("evaluate_policy rejects policy rules with unenforced expiry or bounds", async () => {
+  const wasm = await loadWasm();
+  const deviceSeed = Buffer.alloc(32, 0x42).toString("base64url");
+  const devicePubkey = wasm.ed25519_public_key(deviceSeed);
+  const actor = { id: "machine:macbook", kind: "claude-code" };
+  const actionJson = wasm.action_from_command("git push --force origin main", null);
+  const unsigned = {
+    id: "allow-expiring-git",
+    subject: { kind: "any" },
+    match: { surface: "command", command: { bin: "git" } },
+    effect: "allow",
+    provenance: "manual",
+    tier: "syntactic",
+    created_at: 1700000000000,
+    expires_at: 1700000600000,
+  };
+  const rule = JSON.parse(
+    wasm.sign_policy_rule(JSON.stringify(unsigned), "device:phone", deviceSeed),
+  );
+
+  assert.throws(
+    () =>
+      wasm.evaluate_policy(actionJson, JSON.stringify(actor), JSON.stringify([rule]), devicePubkey),
+    /expires_at\/bounds are unsupported/,
+    "time-boxed policy rules must fail closed until evaluate can enforce time",
+  );
+});
+
 test("sign_verdict + issue_device_cert produce a verdict verify_verdict accepts", async () => {
   const wasm = await loadWasm();
   const f = approverFixture(wasm);
