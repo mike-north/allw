@@ -167,8 +167,11 @@ impl X25519KeyPair {
 ///
 /// `was_contributory()` is constant-time (it compares the Montgomery point against the identity in
 /// constant time), so this guard adds **no** secret-dependent timing signal beyond the single
-/// pass/fail bit, and that bit (`DegenerateSharedSecret`) is reported uniformly on both the encrypt
-/// and decrypt paths — see the oracle note in [`decrypt_context`].
+/// pass/fail bit. This helper returns the same `DegenerateSharedSecret` on both the encrypt and
+/// decrypt paths; the two callers then **surface** it differently per their contract —
+/// [`decrypt_context`] propagates it as an error (the `epk` is attacker-controlled), while
+/// [`encrypt_context`] panics (a low-order *recipient* enrollment key is a programmer/enrollment
+/// error, not a runtime condition). See the oracle note in [`decrypt_context`].
 fn checked_shared_secret(shared: &SharedSecret) -> Result<[u8; X25519_LEN], JweError> {
     if shared.was_contributory() {
         Ok(shared.to_bytes())
