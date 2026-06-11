@@ -6,8 +6,9 @@
 requestApproval(ActionRecord) → verifiable Verdict + AuditRecord     [over an E2EE channel]
 ```
 
-Thin in surface, rich in contract. Companion to [architecture.md](./architecture.md) (stack) and
-[policy-seam.md](./policy-seam.md) (the `ActionRecord` and the policy layer that sits in front of this primitive).
+Thin in surface, rich in contract. Companion to [architecture.md](./architecture.md) (stack),
+[policy-seam.md](./policy-seam.md) (the `ActionRecord` and the policy layer that sits in front of this primitive),
+and [enrollment.md](./enrollment.md) (account/device enrollment, rotation, revocation, and recovery).
 
 ---
 
@@ -132,7 +133,8 @@ verdict `sig` (+ optional integrator counter-sign). Periodically anchor the head
   a verified origin ("Claude Code · macbook-pro"). No IdP dependency. (OAuth 2.1 / MCP-token interop deferred.)
 - **Approver:** an account with enrolled **devices**; each device holds a keypair in **Secure Enclave / StrongBox**,
   with **biometric-gated signing** (the verdict key is released by Face ID / Touch ID and never leaves hardware).
-  A `device_cert` chains each device key to an account root so verifiers need only the root.
+  A `device_cert` chains each device key to an account root so verifiers need only the root; see
+  [enrollment.md](./enrollment.md) for pairing, rotation, revocation, and recovery.
 - **Crypto:** **JOSE** — JWE (X25519 ECDH) for context, JWS (Ed25519) for verdicts/rules — reusing vaultkeeper's
   substrate. Static ECDH for v1; forward secrecy later.
 
@@ -180,7 +182,7 @@ that retracts expired requests from devices without waiting for a read is tracke
 [#44](https://github.com/mike-north/allw/issues/44).) Verdicts are accepted **only** from a socket whose device is
 still enrolled — a revoked device cannot drive a request to `resolved`. Because `GET /requests/{id}` returns the
 verdict to any holder of `{account_id, request_id}`, integrators MUST use high-entropy request ids (UUIDv4+) until
-endpoint authn lands (enrollment spec, §Open decisions).
+the endpoint authentication rules in [enrollment.md](./enrollment.md) are implemented.
 
 ---
 
@@ -292,7 +294,6 @@ once per device — a multi-device inbox decrypts the same context with each dev
 
 ## Open decisions
 
-- **Account / device enrollment, key rotation & revocation** — needs its own mini-spec.
 - **JOSE vs COSE** on mobile (default JOSE for substrate consistency).
 - **Anti-replay** nonce store on the integrator side — v1: integrator-side `NonceStore` trait + in-memory impl;
   persistence/expiry deferred.

@@ -8,6 +8,7 @@ governance layer that grows around it. See [`docs/`](./docs):
 - [positioning.md](./docs/positioning.md) — what allw is and why it's different.
 - [architecture.md](./docs/architecture.md) — tech stack and system design.
 - [contract.md](./docs/contract.md) — the approval-primitive contract (the keystone).
+- [enrollment.md](./docs/enrollment.md) — account/device enrollment, rotation, revocation, and recovery.
 - [policy-seam.md](./docs/policy-seam.md) — the seam to the (later) policy layer.
 - [threat-model.md](./docs/threat-model.md) — adversaries, residual risks, and the security review checklist.
 
