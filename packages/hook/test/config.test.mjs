@@ -132,3 +132,56 @@ test("(#52) an oversized ALLW_TIMEOUT_MS (900000 = 15 min) → fail-closed deny"
   assert.equal(result.ok, false);
   assert.ok(/too large/.test(result.reason));
 });
+
+// ── ALLW_FETCH_TIMEOUT_MS (issue #54 — CI-fast knob: a shorter per-relay-fetch timeout) ───────────
+
+test("(#54) ALLW_FETCH_TIMEOUT_MS is absent by default → fetchTimeoutMs undefined (SDK default applies)", () => {
+  const result = readConfig(FULL);
+  assert.equal(result.ok, true);
+  assert.equal(result.config.fetchTimeoutMs, undefined);
+});
+
+test("(#54) a valid ALLW_FETCH_TIMEOUT_MS below the deadline is accepted", () => {
+  const result = readConfig({ ...FULL, ALLW_FETCH_TIMEOUT_MS: "200" });
+  assert.equal(result.ok, true);
+  assert.equal(result.config.fetchTimeoutMs, 200, "a short fetch timeout (200ms) is honored");
+});
+
+test("(#54) non-numeric ALLW_FETCH_TIMEOUT_MS → fail-closed deny", () => {
+  const result = readConfig({ ...FULL, ALLW_FETCH_TIMEOUT_MS: "soon" });
+  assert.equal(result.ok, false);
+  assert.ok(/ALLW_FETCH_TIMEOUT_MS must be a positive integer/.test(result.reason));
+});
+
+test("(#54) zero / negative / non-integer ALLW_FETCH_TIMEOUT_MS → fail-closed deny", () => {
+  assert.equal(readConfig({ ...FULL, ALLW_FETCH_TIMEOUT_MS: "0" }).ok, false);
+  assert.equal(readConfig({ ...FULL, ALLW_FETCH_TIMEOUT_MS: "-1" }).ok, false);
+  assert.equal(readConfig({ ...FULL, ALLW_FETCH_TIMEOUT_MS: "1.5" }).ok, false);
+});
+
+test("(#54) ALLW_FETCH_TIMEOUT_MS at/above the default deadline → fail-closed deny", () => {
+  // With no ALLW_TIMEOUT_MS the deadline is the 5-minute default; a fetch timeout >= it is pointless
+  // (the overall deadline would fire first) and signals a misconfiguration.
+  const atDeadline = readConfig({ ...FULL, ALLW_FETCH_TIMEOUT_MS: String(DEFAULT_TIMEOUT_MS) });
+  assert.equal(atDeadline.ok, false);
+  assert.ok(/strictly below the fail-closed deadline/.test(atDeadline.reason));
+
+  const aboveDeadline = readConfig({
+    ...FULL,
+    ALLW_FETCH_TIMEOUT_MS: String(DEFAULT_TIMEOUT_MS + 1),
+  });
+  assert.equal(aboveDeadline.ok, false);
+});
+
+test("(#54) ALLW_FETCH_TIMEOUT_MS is validated against a configured ALLW_TIMEOUT_MS deadline", () => {
+  // The deadline the fetch timeout is checked against is the *resolved* one: the configured
+  // ALLW_TIMEOUT_MS when present, not the default. 500ms is below the 5-min default but >= a 400ms
+  // configured deadline, so it must be rejected.
+  const result = readConfig({
+    ...FULL,
+    ALLW_TIMEOUT_MS: "400",
+    ALLW_FETCH_TIMEOUT_MS: "500",
+  });
+  assert.equal(result.ok, false, "fetch timeout >= the configured deadline is rejected");
+  assert.ok(/strictly below the fail-closed deadline of 400ms/.test(result.reason));
+});

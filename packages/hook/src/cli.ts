@@ -46,7 +46,12 @@ import { loadWasm } from "./lib/wasm.js";
 export type RunHookOverrides = Partial<
   Pick<
     ClientConfig,
-    "fetchImpl" | "nowImpl" | "webSocketFactory" | "pollIntervalMs" | "scheduleImpl"
+    | "fetchImpl"
+    | "nowImpl"
+    | "webSocketFactory"
+    | "pollIntervalMs"
+    | "scheduleImpl"
+    | "fetchTimeoutMs"
   >
 >;
 
@@ -106,6 +111,10 @@ export async function runHook(
     accountId: config.accountId,
     approverRootKey: config.approverRootKey,
     ...(config.timeoutMs !== undefined ? { timeoutMs: config.timeoutMs } : {}),
+    // A shorter-than-default per-relay-fetch timeout (e.g. for a fast fail-closed UAT) when the
+    // operator set `ALLW_FETCH_TIMEOUT_MS`; otherwise the SDK's production default applies. Listed
+    // before `overrides` so a test seam can still override it explicitly.
+    ...(config.fetchTimeoutMs !== undefined ? { fetchTimeoutMs: config.fetchTimeoutMs } : {}),
     ...overrides,
   });
   const requestApproval: RequestApprovalFn = (req) =>

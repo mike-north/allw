@@ -6,13 +6,24 @@
  *
  * | Variable                 | Required | Meaning                                                      |
  * | ------------------------ | -------- | ------------------------------------------------------------ |
- * | `ALLW_RELAY_URL`         | yes      | Base URL of the zero-knowledge relay.                        |
- * | `ALLW_ACCOUNT_ID`        | yes      | The approver's relay account id (routes to their devices).   |
- * | `ALLW_APPROVER_ROOT_KEY` | yes      | The approver account-root Ed25519 public key (base64url).    |
- * | `ALLW_TIMEOUT_MS`        | no       | Fail-closed deadline in ms (default 300000 = 5 min, capped). |
+ * | `ALLW_RELAY_URL`         | yes      | Base URL of the zero-knowledge relay.                          |
+ * | `ALLW_ACCOUNT_ID`        | yes      | The approver's relay account id (routes to their devices).     |
+ * | `ALLW_APPROVER_ROOT_KEY` | yes      | The approver account-root Ed25519 public key (base64url).      |
+ * | `ALLW_TIMEOUT_MS`        | no       | Fail-closed deadline in ms (default 300000 = 5 min, capped).   |
+ * | `ALLW_FETCH_TIMEOUT_MS`  | no       | Per-relay-fetch timeout in ms (SDK default 30000; must be < the deadline). |
  *
  * **Fail-closed:** any missing required var yields a parse error the caller turns into a `deny`
  * with an actionable reason (which var to set) — the hook never proceeds on partial config.
+ *
+ * # `ALLW_FETCH_TIMEOUT_MS` (per-relay-fetch timeout)
+ * The SDK bounds **every** individual relay `fetch` (device list, submit, each poll) with a
+ * per-request timeout so a relay that accepts the connection but never responds can't wedge the hook
+ * indefinitely (issue #52). The SDK's default is 30s — fine for production, but too slow for a
+ * process-level fail-closed UAT that must land a hung-relay `deny` in well under a second. This var
+ * lets the hook drive a **shorter** fetch timeout without weakening the SDK's production default. It
+ * is validated (positive integer, strictly below the resolved deadline) and fails closed on a bad
+ * value; a value at or above the deadline would let the overall deadline fire first, making the knob
+ * pointless, so it is rejected.
  *
  * # Timeout-ordering invariant (issue #52)
  * The hook's safety must NOT depend on what Claude Code does when a hook fails to emit a decision.
@@ -36,6 +47,11 @@ export interface HookConfig {
   readonly approverRootKey: string;
   /** Present only when `ALLW_TIMEOUT_MS` is set to a valid positive integer. */
   readonly timeoutMs?: number;
+  /**
+   * Per-relay-fetch timeout in ms. Present only when `ALLW_FETCH_TIMEOUT_MS` is set to a valid
+   * positive integer strictly below the resolved deadline. When absent, the SDK's default applies.
+   */
+  readonly fetchTimeoutMs?: number;
 }
 
 /** The result of reading config: a resolved config or a fail-closed reason naming the problem. */
@@ -120,6 +136,35 @@ export function readConfig(env: Env): ConfigResult {
     timeoutMs = parsed;
   }
 
+  // The overall fail-closed deadline the fetch timeout must stay strictly under: the configured
+  // `ALLW_TIMEOUT_MS` when present, otherwise the SDK/hook default.
+  const resolvedDeadlineMs = timeoutMs ?? DEFAULT_TIMEOUT_MS;
+
+  const rawFetchTimeout = env.ALLW_FETCH_TIMEOUT_MS;
+  let fetchTimeoutMs: number | undefined;
+  if (rawFetchTimeout !== undefined && rawFetchTimeout.trim().length > 0) {
+    const parsed = Number(rawFetchTimeout);
+    if (!Number.isInteger(parsed) || parsed <= 0) {
+      return {
+        ok: false,
+        reason: `allw: ALLW_FETCH_TIMEOUT_MS must be a positive integer number of milliseconds, got '${rawFetchTimeout}' (fail-closed deny)`,
+      };
+    }
+    if (parsed >= resolvedDeadlineMs) {
+      // A per-fetch timeout at or above the overall deadline is pointless (the deadline fires first)
+      // and signals a misconfiguration; refuse it rather than silently ignore the knob.
+      return {
+        ok: false,
+        reason: `allw: ALLW_FETCH_TIMEOUT_MS=${String(
+          parsed,
+        )}ms must be strictly below the fail-closed deadline of ${String(
+          resolvedDeadlineMs,
+        )}ms (so a hung relay fetch rejects before the overall deadline) (fail-closed deny)`,
+      };
+    }
+    fetchTimeoutMs = parsed;
+  }
+
   return {
     ok: true,
     config: {
@@ -127,6 +172,7 @@ export function readConfig(env: Env): ConfigResult {
       accountId,
       approverRootKey,
       ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      ...(fetchTimeoutMs !== undefined ? { fetchTimeoutMs } : {}),
     },
   };
 }
