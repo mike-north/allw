@@ -84,6 +84,9 @@ jobs:
       # script, not CI (see examples/walking-skeleton/README.md → Test layers).
       - run: pnpm --filter @allw/example-walking-skeleton build
       - run: pnpm --filter @allw/example-walking-skeleton test
+      # Workspace-level TS test gate (#15). This intentionally runs after build:wasm + dist builds
+      # above because several package tests load the generated WASM glue or compiled workspace deps.
+      - run: pnpm -r test
 
   relay:
     name: Relay (workers-pool)
