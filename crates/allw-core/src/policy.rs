@@ -6,15 +6,16 @@
 //! infers from the reserved semantic `capabilities` / `scope` fields; those belong to the
 //! deferred T3 engine.
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 
 use crate::contract::{ActionRecord, Actor, PolicyDecision, Surface};
-use crate::crypto::{PublicKey, SigningKeyPair};
+use crate::crypto::{
+    decode_and_verify_jws, encode_compact_jws, verify_certified_device, DeviceCertError, JwsError,
+    JwsHeader, PublicKey, SigningKeyPair, ALG_EDDSA,
+};
 
 const POLICY_SCHEMA_VERSION: u32 = 1;
 const TYP_POLICY_RULE: &str = "allw-policy-rule+jws";
-const ALG_EDDSA: &str = "EdDSA";
 
 /// Which actor a rule applies to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -322,6 +323,8 @@ impl ParamMatcher {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UnsignedPolicyRule {
     pub id: String,
+    /// Account whose root must certify the device key that signed this standing rule.
+    pub account_id: String,
     pub subject: ActorMatcher,
     #[serde(rename = "match")]
     pub predicate: PolicyPredicate,
@@ -339,6 +342,7 @@ impl UnsignedPolicyRule {
     /// Build the rule emitted by the "approve and don't ask again" affordance.
     pub fn from_approval(
         id: &str,
+        account_id: &str,
         actor: &Actor,
         action: &ActionRecord,
         scope: PolicyRuleScope,
@@ -346,6 +350,7 @@ impl UnsignedPolicyRule {
     ) -> Result<Self, PolicyRuleBuildError> {
         Ok(Self {
             id: id.to_string(),
+            account_id: account_id.to_string(),
             subject: ActorMatcher::Id {
                 id: actor.id.clone(),
             },
@@ -364,6 +369,8 @@ impl UnsignedPolicyRule {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PolicyRule {
     pub id: String,
+    /// Account whose root must certify the device key that signed this standing rule.
+    pub account_id: String,
     pub subject: ActorMatcher,
     #[serde(rename = "match")]
     pub predicate: PolicyPredicate,
@@ -377,12 +384,16 @@ pub struct PolicyRule {
     pub expires_at: Option<i64>,
     /// Device-key compact JWS over the unsigned rule payload.
     pub sig: String,
+    /// Account-root-signed certificate binding the signing device key to `account_id`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub device_cert: Option<String>,
 }
 
 impl PolicyRule {
     fn unsigned(&self) -> UnsignedPolicyRule {
         UnsignedPolicyRule {
             id: self.id.clone(),
+            account_id: self.account_id.clone(),
             subject: self.subject.clone(),
             predicate: self.predicate.clone(),
             effect: self.effect,
@@ -414,6 +425,11 @@ pub struct PolicyEvaluation {
 /// Errors returned while verifying a signed policy rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyRuleError {
+    MissingDeviceCert,
+    CertSignatureInvalid,
+    CertAccountMismatch,
+    CertDeviceMismatch,
+    CertExpired,
     MalformedJws,
     UnexpectedAlg,
     UnexpectedTyp,
@@ -426,6 +442,23 @@ pub enum PolicyRuleError {
 impl std::fmt::Display for PolicyRuleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::MissingDeviceCert => write!(
+                f,
+                "policy rule has no device_cert; cannot chain device key to account root"
+            ),
+            Self::CertSignatureInvalid => {
+                write!(
+                    f,
+                    "policy-rule device cert did not verify against the account root key"
+                )
+            }
+            Self::CertAccountMismatch => {
+                write!(f, "policy-rule device cert account_id does not match rule")
+            }
+            Self::CertDeviceMismatch => {
+                write!(f, "policy-rule JWS kid does not match the certified device")
+            }
+            Self::CertExpired => write!(f, "policy-rule device cert has expired"),
             Self::MalformedJws => write!(f, "malformed policy-rule JWS"),
             Self::UnexpectedAlg => write!(f, "unexpected policy-rule JWS alg"),
             Self::UnexpectedTyp => write!(f, "unexpected policy-rule JWS typ"),
@@ -461,21 +494,15 @@ impl std::fmt::Display for PolicyRuleBuildError {
 
 impl std::error::Error for PolicyRuleBuildError {}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PolicyJwsHeader {
-    alg: String,
-    typ: String,
-    kid: String,
-}
-
 /// Sign a policy rule with a device key.
 #[must_use]
 pub fn sign_policy_rule(
     rule: &UnsignedPolicyRule,
     device_id: &str,
     device_key: &SigningKeyPair,
+    device_cert: Option<String>,
 ) -> PolicyRule {
-    let header = PolicyJwsHeader {
+    let header = JwsHeader {
         alg: ALG_EDDSA.to_string(),
         typ: TYP_POLICY_RULE.to_string(),
         kid: device_id.to_string(),
@@ -483,6 +510,7 @@ pub fn sign_policy_rule(
     let sig = encode_compact_jws(&header, rule, device_key);
     PolicyRule {
         id: rule.id.clone(),
+        account_id: rule.account_id.clone(),
         subject: rule.subject.clone(),
         predicate: rule.predicate.clone(),
         effect: rule.effect,
@@ -492,15 +520,37 @@ pub fn sign_policy_rule(
         created_at: rule.created_at,
         expires_at: rule.expires_at,
         sig,
+        device_cert,
     }
 }
 
-/// Verify a signed policy rule against the expected device public key.
+/// Verify a signed policy rule against an account root, chaining through its device certificate.
 pub fn verify_policy_rule(
     rule: &PolicyRule,
-    device_public_key: &PublicKey,
+    account_root: &PublicKey,
+    now_ms: i64,
 ) -> Result<VerifiedPolicyRule, PolicyRuleError> {
-    let decoded = decode_and_verify_policy_jws(&rule.sig, device_public_key)?;
+    let cert = rule
+        .device_cert
+        .as_deref()
+        .ok_or(PolicyRuleError::MissingDeviceCert)?;
+    let certified = verify_certified_device(cert, &rule.account_id, account_root, now_ms).map_err(
+        |e| match e {
+            DeviceCertError::SignatureInvalid => PolicyRuleError::CertSignatureInvalid,
+            DeviceCertError::AccountMismatch => PolicyRuleError::CertAccountMismatch,
+            DeviceCertError::CertExpired => PolicyRuleError::CertExpired,
+        },
+    )?;
+
+    let decoded = decode_and_verify_jws::<UnsignedPolicyRule>(
+        &rule.sig,
+        TYP_POLICY_RULE,
+        &certified.public_key,
+    )
+    .map_err(policy_jws_error)?;
+    if decoded.header.kid != certified.device_id {
+        return Err(PolicyRuleError::CertDeviceMismatch);
+    }
     if decoded.claims != rule.unsigned() {
         return Err(PolicyRuleError::PayloadMismatch);
     }
@@ -512,7 +562,7 @@ pub fn verify_policy_rule(
     }
     Ok(VerifiedPolicyRule {
         rule: rule.clone(),
-        device_id: decoded.header.kid,
+        device_id: certified.device_id,
     })
 }
 
@@ -736,65 +786,16 @@ fn glob_matches(value: &str, pattern: &str) -> bool {
     pattern[pattern_idx..].iter().all(|ch| *ch == '*')
 }
 
-fn encode_compact_jws<T: Serialize>(
-    header: &PolicyJwsHeader,
-    claims: &T,
-    key: &SigningKeyPair,
-) -> String {
-    let header_b64 = URL_SAFE_NO_PAD.encode(
-        serde_json::to_vec(header).expect("PolicyJwsHeader must serialize without failure"),
-    );
-    let claims_b64 =
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).expect("policy claims must serialize"));
-    let signing_input = format!("{header_b64}.{claims_b64}");
-    let sig = key.sign_bytes(signing_input.as_bytes());
-    let sig_b64 = URL_SAFE_NO_PAD.encode(sig);
-    format!("{signing_input}.{sig_b64}")
-}
-
-struct DecodedPolicyJws {
-    header: PolicyJwsHeader,
-    claims: UnsignedPolicyRule,
-}
-
-fn decode_and_verify_policy_jws(
-    compact: &str,
-    key: &PublicKey,
-) -> Result<DecodedPolicyJws, PolicyRuleError> {
-    let mut parts = compact.split('.');
-    let header_b64 = parts.next().ok_or(PolicyRuleError::MalformedJws)?;
-    let claims_b64 = parts.next().ok_or(PolicyRuleError::MalformedJws)?;
-    let sig_b64 = parts.next().ok_or(PolicyRuleError::MalformedJws)?;
-    if parts.next().is_some() {
-        return Err(PolicyRuleError::MalformedJws);
+fn policy_jws_error(err: JwsError) -> PolicyRuleError {
+    match err {
+        JwsError::MalformedStructure
+        | JwsError::InvalidBase64
+        | JwsError::InvalidHeader
+        | JwsError::InvalidPayload => PolicyRuleError::MalformedJws,
+        JwsError::UnexpectedAlg => PolicyRuleError::UnexpectedAlg,
+        JwsError::UnexpectedTyp => PolicyRuleError::UnexpectedTyp,
+        JwsError::BadSignature => PolicyRuleError::BadSignature,
     }
-
-    let header_json = URL_SAFE_NO_PAD
-        .decode(header_b64)
-        .map_err(|_| PolicyRuleError::MalformedJws)?;
-    let header: PolicyJwsHeader =
-        serde_json::from_slice(&header_json).map_err(|_| PolicyRuleError::MalformedJws)?;
-    if header.alg != ALG_EDDSA {
-        return Err(PolicyRuleError::UnexpectedAlg);
-    }
-    if header.typ != TYP_POLICY_RULE {
-        return Err(PolicyRuleError::UnexpectedTyp);
-    }
-
-    let sig = URL_SAFE_NO_PAD
-        .decode(sig_b64)
-        .map_err(|_| PolicyRuleError::MalformedJws)?;
-    let sig: [u8; 64] = sig.try_into().map_err(|_| PolicyRuleError::BadSignature)?;
-    let signing_input = format!("{header_b64}.{claims_b64}");
-    if !key.verify_bytes(signing_input.as_bytes(), &sig) {
-        return Err(PolicyRuleError::BadSignature);
-    }
-
-    let claims_json = URL_SAFE_NO_PAD
-        .decode(claims_b64)
-        .map_err(|_| PolicyRuleError::MalformedJws)?;
-    let claims = serde_json::from_slice(&claims_json).map_err(|_| PolicyRuleError::MalformedJws)?;
-    Ok(DecodedPolicyJws { header, claims })
 }
 
 #[cfg(test)]

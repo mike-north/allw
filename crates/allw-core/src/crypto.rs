@@ -61,13 +61,13 @@ use crate::contract::{ApprovalContext, ApprovalRequest, Approver, Decision, Verd
 // ── JWS `typ` domain separators ─────────────────────────────────────────────────
 
 /// `typ` header value for a verdict JWS (signed by a device key).
-const TYP_VERDICT: &str = "allw-verdict+jws";
+pub(crate) const TYP_VERDICT: &str = "allw-verdict+jws";
 
 /// `typ` header value for a device-cert JWS (signed by the account root key).
-const TYP_DEVICE_CERT: &str = "allw-device-cert+jws";
+pub(crate) const TYP_DEVICE_CERT: &str = "allw-device-cert+jws";
 
 /// The only signature algorithm accepted: EdDSA over Ed25519 (RFC 8037).
-const ALG_EDDSA: &str = "EdDSA";
+pub(crate) const ALG_EDDSA: &str = "EdDSA";
 
 // ── Key abstractions ────────────────────────────────────────────────────────────
 
@@ -175,10 +175,10 @@ impl std::error::Error for KeyError {}
 /// `alg` is always `"EdDSA"`; `typ` is one of [`TYP_VERDICT`] / [`TYP_DEVICE_CERT`]; `kid`
 /// identifies the signing key (device id or account id).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct JwsHeader {
-    alg: String,
-    typ: String,
-    kid: String,
+pub(crate) struct JwsHeader {
+    pub(crate) alg: String,
+    pub(crate) typ: String,
+    pub(crate) kid: String,
 }
 
 // ── Claim sets (JWS payloads) ────────────────────────────────────────────────────
@@ -322,7 +322,7 @@ impl std::error::Error for JwsError {}
 ///
 /// Returns `b64url(header) || "." || b64url(payload) || "." || b64url(sig)`, where `sig` is the
 /// Ed25519 signature over the ASCII signing input `b64url(header) || "." || b64url(payload)`.
-fn encode_compact_jws<T: Serialize>(
+pub(crate) fn encode_compact_jws<T: Serialize>(
     header: &JwsHeader,
     payload: &T,
     key: &SigningKeyPair,
@@ -344,16 +344,16 @@ fn encode_compact_jws<T: Serialize>(
 }
 
 /// The decoded, signature-verified parts of a compact JWS.
-struct DecodedJws<T> {
-    header: JwsHeader,
-    claims: T,
+pub(crate) struct DecodedJws<T> {
+    pub(crate) header: JwsHeader,
+    pub(crate) claims: T,
 }
 
 /// Decodes a compact JWS, checks `alg`/`typ`, and verifies the signature against `key`.
 ///
 /// On success the returned [`DecodedJws`] is authenticated: the signature covered exactly the
 /// header+payload bytes present in `compact`.
-fn decode_and_verify_jws<T: for<'de> Deserialize<'de>>(
+pub(crate) fn decode_and_verify_jws<T: for<'de> Deserialize<'de>>(
     compact: &str,
     expected_typ: &str,
     key: &PublicKey,
@@ -690,6 +690,59 @@ impl std::fmt::Display for VerifyError {
 
 impl std::error::Error for VerifyError {}
 
+/// A device key authenticated through an account-root-signed device certificate.
+///
+/// This is the shared cert-chain result used by both verdict and policy-rule verification: callers
+/// pass the account root, expected account id, and current time, then verify their artifact's JWS
+/// with the returned certified device key.
+pub(crate) struct CertifiedDevice {
+    pub(crate) device_id: String,
+    pub(crate) public_key: PublicKey,
+}
+
+/// Device-cert verification failures, factored away from verdict-specific error enums.
+pub(crate) enum DeviceCertError {
+    SignatureInvalid,
+    AccountMismatch,
+    CertExpired,
+}
+
+/// Verify a device certificate against the account root and return the certified device key.
+///
+/// The certificate must be an `allw-device-cert+jws` signed by `account_root`, its header `kid`
+/// must name the same account as the signed claims, and the signed `account_id` must match
+/// `expected_account_id`. The helper intentionally does not compare device ids; each caller checks
+/// that its own artifact header or outer identity matches the certified device id.
+pub(crate) fn verify_certified_device(
+    device_cert: &str,
+    expected_account_id: &str,
+    account_root: &PublicKey,
+    now_ms: i64,
+) -> Result<CertifiedDevice, DeviceCertError> {
+    let cert: DecodedJws<DeviceCertClaims> =
+        decode_and_verify_jws(device_cert, TYP_DEVICE_CERT, account_root)
+            .map_err(|_| DeviceCertError::SignatureInvalid)?;
+
+    if cert.header.kid != cert.claims.account_id || cert.claims.account_id != expected_account_id {
+        return Err(DeviceCertError::AccountMismatch);
+    }
+    if cert
+        .claims
+        .expires_at
+        .is_some_and(|expires_at| now_ms > expires_at)
+    {
+        return Err(DeviceCertError::CertExpired);
+    }
+
+    let public_key = PublicKey::from_bytes(&cert.claims.device_pubkey)
+        .map_err(|_| DeviceCertError::SignatureInvalid)?;
+
+    Ok(CertifiedDevice {
+        device_id: cert.claims.device_id,
+        public_key,
+    })
+}
+
 /// Verifies a [`Verdict`] against the request it answers and the approver's account root key,
 /// returning a [`VerifiedVerdict`] only when the verdict is authenticated, bound, fresh, and
 /// approved.
@@ -755,38 +808,30 @@ pub fn verify_verdict(
         .as_deref()
         .ok_or(VerifyError::MissingDeviceCert)?;
 
-    let cert: DecodedJws<DeviceCertClaims> =
-        decode_and_verify_jws(cert_compact, TYP_DEVICE_CERT, approver_root)
-            .map_err(|_| VerifyError::CertSignatureInvalid)?;
+    let certified = verify_certified_device(
+        cert_compact,
+        &verdict.approver.account_id,
+        approver_root,
+        now_ms,
+    )
+    .map_err(|e| match e {
+        DeviceCertError::SignatureInvalid => VerifyError::CertSignatureInvalid,
+        DeviceCertError::AccountMismatch => VerifyError::CertAccountMismatch,
+        DeviceCertError::CertExpired => VerifyError::CertExpired,
+    })?;
 
-    // The cert's signed `kid` must name the account it certifies (docs: device-cert uses
-    // `kid: <account_id>`). Checking it rejects key-id confusion before we trust the claims.
-    if cert.header.kid != cert.claims.account_id {
-        return Err(VerifyError::CertAccountMismatch);
-    }
-    if cert.claims.account_id != verdict.approver.account_id {
-        return Err(VerifyError::CertAccountMismatch);
-    }
-    if cert.claims.device_id != verdict.approver.device_id {
+    if certified.device_id != verdict.approver.device_id {
         return Err(VerifyError::CertDeviceMismatch);
     }
-    if let Some(expires_at) = cert.claims.expires_at {
-        if now_ms > expires_at {
-            return Err(VerifyError::CertExpired);
-        }
-    }
-
-    // The certified device key — the *only* key trusted to have signed the verdict. A bad
-    // encoding here means the cert (though root-signed) carries an invalid key → reject.
-    let device_key = PublicKey::from_bytes(&cert.claims.device_pubkey)
-        .map_err(|_| VerifyError::CertSignatureInvalid)?;
 
     // ── Step 2: verdict signature verifies under the certified device key ─────────
     let verdict_jws: DecodedJws<VerdictClaims> =
-        decode_and_verify_jws(&verdict.sig, TYP_VERDICT, &device_key).map_err(|e| match e {
-            JwsError::BadSignature => VerifyError::VerdictSignatureInvalid,
-            _ => VerifyError::MalformedJws,
-        })?;
+        decode_and_verify_jws(&verdict.sig, TYP_VERDICT, &certified.public_key).map_err(
+            |e| match e {
+                JwsError::BadSignature => VerifyError::VerdictSignatureInvalid,
+                _ => VerifyError::MalformedJws,
+            },
+        )?;
 
     // The header kid must name the same device the cert certified.
     if verdict_jws.header.kid != verdict.approver.device_id {

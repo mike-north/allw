@@ -173,6 +173,20 @@ function approverFixture(wasm) {
   return { v, accountSeed, deviceSeed, accountRootPub, devicePub, cert, unsigned, nonce, request };
 }
 
+/** Policy rules are verified by chaining the rule's device cert to this account root. */
+function policyFixture(wasm) {
+  const accountSeed = Buffer.alloc(32, 0x07).toString("base64url");
+  const deviceSeed = Buffer.alloc(32, 0x42).toString("base64url");
+  const accountRootPub = wasm.ed25519_public_key(accountSeed);
+  const devicePub = wasm.ed25519_public_key(deviceSeed);
+  const accountId = "acct_policy";
+  const deviceId = "device:phone";
+  const createdAt = 1700000000000;
+  const nowMs = createdAt + 1000;
+  const cert = wasm.issue_device_cert(accountSeed, accountId, deviceId, devicePub, createdAt);
+  return { accountId, deviceId, deviceSeed, accountRootPub, cert, createdAt, nowMs };
+}
+
 test("ed25519/x25519 public-key derivation returns 43-char base64url keys", async () => {
   const wasm = await loadWasm();
   const seed = Buffer.alloc(32, 1).toString("base64url");
@@ -187,19 +201,20 @@ test("ed25519/x25519 public-key derivation returns 43-char base64url keys", asyn
 
 test("policy_rule_from_approval signs an exact-call rule evaluate_policy can auto-allow", async () => {
   const wasm = await loadWasm();
-  const deviceSeed = Buffer.alloc(32, 0x42).toString("base64url");
-  const devicePubkey = wasm.ed25519_public_key(deviceSeed);
+  const f = policyFixture(wasm);
   const actor = { id: "machine:macbook", kind: "claude-code" };
   const actionJson = wasm.action_from_command("git push --force origin main", null);
 
   const ruleJson = wasm.policy_rule_from_approval(
     "approval-exact",
+    f.accountId,
     JSON.stringify(actor),
     actionJson,
     JSON.stringify({ kind: "exact_call" }),
-    1700000000000,
-    "device:phone",
-    deviceSeed,
+    f.createdAt,
+    f.deviceId,
+    f.deviceSeed,
+    f.cert,
   );
   const rule = JSON.parse(ruleJson);
   assert.equal(rule.provenance, "from_approval", "approval-derived rules carry provenance");
@@ -207,7 +222,13 @@ test("policy_rule_from_approval signs an exact-call rule evaluate_policy can aut
   assert.match(rule.sig, /^[^.]+\.[^.]+\.[^.]+$/, "policy rule is signed as compact JWS");
 
   const allowed = JSON.parse(
-    wasm.evaluate_policy(actionJson, JSON.stringify(actor), JSON.stringify([rule]), devicePubkey),
+    wasm.evaluate_policy(
+      actionJson,
+      JSON.stringify(actor),
+      JSON.stringify([rule]),
+      f.accountRootPub,
+      f.nowMs,
+    ),
   );
   assert.equal(allowed.decision, "allow");
   assert.equal(allowed.rule_id, "approval-exact");
@@ -221,7 +242,8 @@ test("policy_rule_from_approval signs an exact-call rule evaluate_policy can aut
       changedActionJson,
       JSON.stringify(actor),
       JSON.stringify([rule]),
-      devicePubkey,
+      f.accountRootPub,
+      f.nowMs,
     ),
   );
   assert.equal(escalated.decision, "escalate", "exact-call rules must not become scoped verdicts");
@@ -229,8 +251,7 @@ test("policy_rule_from_approval signs an exact-call rule evaluate_policy can aut
 
 test("policy_rule_from_approval keeps raw-only exact command rules narrow", async () => {
   const wasm = await loadWasm();
-  const deviceSeed = Buffer.alloc(32, 0x42).toString("base64url");
-  const devicePubkey = wasm.ed25519_public_key(deviceSeed);
+  const f = policyFixture(wasm);
   const actor = { id: "machine:macbook", kind: "claude-code" };
   const action = {
     record_schema_version: 1,
@@ -242,12 +263,14 @@ test("policy_rule_from_approval keeps raw-only exact command rules narrow", asyn
   const rule = JSON.parse(
     wasm.policy_rule_from_approval(
       "approval-raw-exact",
+      f.accountId,
       JSON.stringify(actor),
       JSON.stringify(action),
       JSON.stringify({ kind: "exact_call" }),
-      1700000000000,
-      "device:phone",
-      deviceSeed,
+      f.createdAt,
+      f.deviceId,
+      f.deviceSeed,
+      f.cert,
     ),
   );
   assert.equal(
@@ -261,7 +284,8 @@ test("policy_rule_from_approval keeps raw-only exact command rules narrow", asyn
       JSON.stringify(action),
       JSON.stringify(actor),
       JSON.stringify([rule]),
-      devicePubkey,
+      f.accountRootPub,
+      f.nowMs,
     ),
   );
   assert.equal(allowed.decision, "allow");
@@ -275,7 +299,8 @@ test("policy_rule_from_approval keeps raw-only exact command rules narrow", asyn
       JSON.stringify(changedAction),
       JSON.stringify(actor),
       JSON.stringify([rule]),
-      devicePubkey,
+      f.accountRootPub,
+      f.nowMs,
     ),
   );
   assert.equal(escalated.decision, "escalate", "changed raw command text must not match");
@@ -283,7 +308,7 @@ test("policy_rule_from_approval keeps raw-only exact command rules narrow", asyn
 
 test("policy_rule_from_approval rejects bin-only exact command rules", async () => {
   const wasm = await loadWasm();
-  const deviceSeed = Buffer.alloc(32, 0x42).toString("base64url");
+  const f = policyFixture(wasm);
   const actor = { id: "machine:macbook", kind: "claude-code" };
   const action = {
     record_schema_version: 1,
@@ -296,12 +321,14 @@ test("policy_rule_from_approval rejects bin-only exact command rules", async () 
     () =>
       wasm.policy_rule_from_approval(
         "approval-bin-only",
+        f.accountId,
         JSON.stringify(actor),
         JSON.stringify(action),
         JSON.stringify({ kind: "exact_call" }),
-        1700000000000,
-        "device:phone",
-        deviceSeed,
+        f.createdAt,
+        f.deviceId,
+        f.deviceSeed,
+        f.cert,
       ),
     /exact command policy requires either argv or raw command text/,
     "bin-only commands are too broad for exact-call policy emission",
@@ -310,13 +337,13 @@ test("policy_rule_from_approval rejects bin-only exact command rules", async () 
 
 test("evaluate_policy verifies signed rules and applies deny over ask over allow", async () => {
   const wasm = await loadWasm();
-  const deviceSeed = Buffer.alloc(32, 0x42).toString("base64url");
-  const devicePubkey = wasm.ed25519_public_key(deviceSeed);
+  const f = policyFixture(wasm);
   const actor = { id: "machine:macbook", kind: "claude-code" };
   const actionJson = wasm.action_from_command("git push --force origin main", null);
 
   const unsignedAllow = {
     id: "allow-git",
+    account_id: f.accountId,
     subject: { kind: "any" },
     match: { surface: "command", command: { bin: "git" } },
     effect: "allow",
@@ -326,6 +353,7 @@ test("evaluate_policy verifies signed rules and applies deny over ask over allow
   };
   const unsignedAsk = {
     id: "ask-force",
+    account_id: f.accountId,
     subject: { kind: "any" },
     match: { surface: "command", command: { bin: "git", args_any_globs: ["*force*"] } },
     effect: "ask",
@@ -335,6 +363,7 @@ test("evaluate_policy verifies signed rules and applies deny over ask over allow
   };
   const unsignedDeny = {
     id: "deny-force",
+    account_id: f.accountId,
     subject: { kind: "id", id: actor.id },
     match: { surface: "command", command: { bin: "git", args_any_globs: ["*force*"] } },
     effect: "deny",
@@ -344,13 +373,13 @@ test("evaluate_policy verifies signed rules and applies deny over ask over allow
   };
 
   const allow = JSON.parse(
-    wasm.sign_policy_rule(JSON.stringify(unsignedAllow), "device:phone", deviceSeed),
+    wasm.sign_policy_rule(JSON.stringify(unsignedAllow), f.deviceId, f.deviceSeed, f.cert),
   );
   const ask = JSON.parse(
-    wasm.sign_policy_rule(JSON.stringify(unsignedAsk), "device:phone", deviceSeed),
+    wasm.sign_policy_rule(JSON.stringify(unsignedAsk), f.deviceId, f.deviceSeed, f.cert),
   );
   const deny = JSON.parse(
-    wasm.sign_policy_rule(JSON.stringify(unsignedDeny), "device:phone", deviceSeed),
+    wasm.sign_policy_rule(JSON.stringify(unsignedDeny), f.deviceId, f.deviceSeed, f.cert),
   );
 
   const askWins = JSON.parse(
@@ -358,7 +387,8 @@ test("evaluate_policy verifies signed rules and applies deny over ask over allow
       actionJson,
       JSON.stringify(actor),
       JSON.stringify([allow, ask]),
-      devicePubkey,
+      f.accountRootPub,
+      f.nowMs,
     ),
   );
   assert.equal(askWins.decision, "escalate");
@@ -369,7 +399,8 @@ test("evaluate_policy verifies signed rules and applies deny over ask over allow
       actionJson,
       JSON.stringify(actor),
       JSON.stringify([allow, ask, deny]),
-      devicePubkey,
+      f.accountRootPub,
+      f.nowMs,
     ),
   );
   assert.equal(denyWins.decision, "deny");
@@ -382,7 +413,8 @@ test("evaluate_policy verifies signed rules and applies deny over ask over allow
         actionJson,
         JSON.stringify(actor),
         JSON.stringify([tampered]),
-        devicePubkey,
+        f.accountRootPub,
+        f.nowMs,
       ),
     /verify_policy_rule failed/,
     "policy evaluation must fail closed on a tampered signed rule",
@@ -391,12 +423,12 @@ test("evaluate_policy verifies signed rules and applies deny over ask over allow
 
 test("evaluate_policy rejects policy rules with unenforced expiry or bounds", async () => {
   const wasm = await loadWasm();
-  const deviceSeed = Buffer.alloc(32, 0x42).toString("base64url");
-  const devicePubkey = wasm.ed25519_public_key(deviceSeed);
+  const f = policyFixture(wasm);
   const actor = { id: "machine:macbook", kind: "claude-code" };
   const actionJson = wasm.action_from_command("git push --force origin main", null);
   const unsigned = {
     id: "allow-expiring-git",
+    account_id: f.accountId,
     subject: { kind: "any" },
     match: { surface: "command", command: { bin: "git" } },
     effect: "allow",
@@ -406,12 +438,18 @@ test("evaluate_policy rejects policy rules with unenforced expiry or bounds", as
     expires_at: 1700000600000,
   };
   const rule = JSON.parse(
-    wasm.sign_policy_rule(JSON.stringify(unsigned), "device:phone", deviceSeed),
+    wasm.sign_policy_rule(JSON.stringify(unsigned), f.deviceId, f.deviceSeed, f.cert),
   );
 
   assert.throws(
     () =>
-      wasm.evaluate_policy(actionJson, JSON.stringify(actor), JSON.stringify([rule]), devicePubkey),
+      wasm.evaluate_policy(
+        actionJson,
+        JSON.stringify(actor),
+        JSON.stringify([rule]),
+        f.accountRootPub,
+        f.nowMs,
+      ),
     /expires_at\/bounds are unsupported/,
     "time-boxed policy rules must fail closed until evaluate can enforce time",
   );

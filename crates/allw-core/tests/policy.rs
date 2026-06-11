@@ -1,13 +1,22 @@
 use allw_core::{
-    action_from_argv, action_from_mcp_tool_call, evaluate, evaluate_for_actor, sign_policy_rule,
-    verify_policy_rule, Actor, Approver, CommandContext, Decision, PolicyDecision, PolicyEffect,
-    PolicyPredicate, PolicyProvenance, PolicyRuleError, PolicyRuleScope, PolicyTier, Risk,
-    SigningKeyPair, Surface, SyntacticSubstrate, UnsignedPolicyRule, Verdict,
+    action_from_argv, action_from_mcp_tool_call, evaluate, evaluate_for_actor, issue_device_cert,
+    sign_policy_rule, verify_policy_rule, Actor, Approver, CommandContext, Decision,
+    PolicyDecision, PolicyEffect, PolicyPredicate, PolicyProvenance, PolicyRuleError,
+    PolicyRuleScope, PolicyTier, Risk, SigningKeyPair, Surface, SyntacticSubstrate,
+    UnsignedPolicyRule, Verdict,
 };
 use serde_json::json;
 
 const DEVICE_SEED: [u8; 32] = [0x42; 32];
 const OTHER_DEVICE_SEED: [u8; 32] = [0x24; 32];
+const ROOT_SEED: [u8; 32] = [0x07; 32];
+const OTHER_ROOT_SEED: [u8; 32] = [0x08; 32];
+const ACCOUNT_ID: &str = "acct-policy";
+const OTHER_ACCOUNT_ID: &str = "acct-other";
+const DEVICE_ID: &str = "device:phone";
+const OTHER_DEVICE_ID: &str = "device:watch";
+const CREATED_AT: i64 = 1_700_000_000_000;
+const NOW_OK: i64 = CREATED_AT + 1_000;
 
 fn actor() -> Actor {
     Actor {
@@ -21,10 +30,29 @@ fn device_key() -> SigningKeyPair {
     SigningKeyPair::from_seed(&DEVICE_SEED)
 }
 
+fn root_key() -> SigningKeyPair {
+    SigningKeyPair::from_seed(&ROOT_SEED)
+}
+
+fn other_root_key() -> SigningKeyPair {
+    SigningKeyPair::from_seed(&OTHER_ROOT_SEED)
+}
+
+fn device_cert() -> String {
+    issue_device_cert(
+        &root_key(),
+        ACCOUNT_ID,
+        DEVICE_ID,
+        &device_key().public_key(),
+        CREATED_AT,
+        None,
+    )
+}
+
 fn signed(rule: UnsignedPolicyRule) -> allw_core::VerifiedPolicyRule {
     let key = device_key();
-    let signed = sign_policy_rule(&rule, "device:phone", &key);
-    verify_policy_rule(&signed, &key.public_key()).expect("test rule must verify")
+    let signed = sign_policy_rule(&rule, DEVICE_ID, &key, Some(device_cert()));
+    verify_policy_rule(&signed, &root_key().public_key(), NOW_OK).expect("test rule must verify")
 }
 
 fn git_force_action() -> allw_core::ActionRecord {
@@ -50,6 +78,7 @@ fn precedence_is_deny_then_ask_then_allow_and_no_match_escalates() {
 
     let allow_git = signed(UnsignedPolicyRule {
         id: "allow-git".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::command_bin("git"),
         effect: PolicyEffect::Allow,
@@ -61,6 +90,7 @@ fn precedence_is_deny_then_ask_then_allow_and_no_match_escalates() {
     });
     let ask_force = signed(UnsignedPolicyRule {
         id: "ask-force".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::command_bin("git")
             .with_flag("--force")
@@ -74,6 +104,7 @@ fn precedence_is_deny_then_ask_then_allow_and_no_match_escalates() {
     });
     let deny_force = signed(UnsignedPolicyRule {
         id: "deny-force".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
         subject: allw_core::ActorMatcher::Id {
             id: "machine:macbook".to_string(),
         },
@@ -104,6 +135,7 @@ fn signed_policy_rule_rejects_tampering_and_wrong_device_key() {
     let other_key = SigningKeyPair::from_seed(&OTHER_DEVICE_SEED);
     let unsigned = UnsignedPolicyRule {
         id: "allow-ls".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::command_bin("ls"),
         effect: PolicyEffect::Allow,
@@ -114,18 +146,78 @@ fn signed_policy_rule_rejects_tampering_and_wrong_device_key() {
         expires_at: None,
     };
 
-    let mut signed_rule = sign_policy_rule(&unsigned, "device:phone", &key);
-    verify_policy_rule(&signed_rule, &key.public_key()).expect("freshly signed rule verifies");
+    let mut signed_rule = sign_policy_rule(&unsigned, DEVICE_ID, &key, Some(device_cert()));
+    verify_policy_rule(&signed_rule, &root_key().public_key(), NOW_OK)
+        .expect("freshly signed rule verifies");
 
+    let forged = sign_policy_rule(&unsigned, DEVICE_ID, &other_key, Some(device_cert()));
     assert!(
-        verify_policy_rule(&signed_rule, &other_key.public_key()).is_err(),
-        "a different device key must not verify the signed rule"
+        verify_policy_rule(&forged, &root_key().public_key(), NOW_OK).is_err(),
+        "a policy rule signed by an uncertified device key must not verify"
     );
 
     signed_rule.effect = PolicyEffect::Deny;
     assert!(
-        verify_policy_rule(&signed_rule, &key.public_key()).is_err(),
+        verify_policy_rule(&signed_rule, &root_key().public_key(), NOW_OK).is_err(),
         "changing policy fields after signing must invalidate the rule"
+    );
+}
+
+#[test]
+fn signed_policy_rule_requires_account_root_cert_chain_and_matching_kid() {
+    let unsigned = UnsignedPolicyRule {
+        id: "allow-ls".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate::command_bin("ls"),
+        effect: PolicyEffect::Allow,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: CREATED_AT,
+        expires_at: None,
+    };
+
+    let valid = sign_policy_rule(&unsigned, DEVICE_ID, &device_key(), Some(device_cert()));
+    assert_eq!(
+        verify_policy_rule(&valid, &other_root_key().public_key(), NOW_OK),
+        Err(PolicyRuleError::CertSignatureInvalid),
+        "a policy rule must not verify under the wrong account root"
+    );
+
+    let wrong_account = UnsignedPolicyRule {
+        account_id: OTHER_ACCOUNT_ID.to_string(),
+        ..unsigned.clone()
+    };
+    let wrong_account_rule = sign_policy_rule(
+        &wrong_account,
+        DEVICE_ID,
+        &device_key(),
+        Some(device_cert()),
+    );
+    assert_eq!(
+        verify_policy_rule(&wrong_account_rule, &root_key().public_key(), NOW_OK),
+        Err(PolicyRuleError::CertAccountMismatch),
+        "the signed policy account_id must match the certified account"
+    );
+
+    let wrong_kid = sign_policy_rule(
+        &unsigned,
+        OTHER_DEVICE_ID,
+        &device_key(),
+        Some(device_cert()),
+    );
+    assert_eq!(
+        verify_policy_rule(&wrong_kid, &root_key().public_key(), NOW_OK),
+        Err(PolicyRuleError::CertDeviceMismatch),
+        "the policy JWS kid must match the certified device id"
+    );
+
+    let missing_cert = sign_policy_rule(&unsigned, DEVICE_ID, &device_key(), None);
+    assert_eq!(
+        verify_policy_rule(&missing_cert, &root_key().public_key(), NOW_OK),
+        Err(PolicyRuleError::MissingDeviceCert),
+        "policy rules must carry a device cert so verification chains to the account root"
     );
 }
 
@@ -134,6 +226,7 @@ fn signed_policy_rule_rejects_unenforced_expiry_and_bounds() {
     let key = device_key();
     let base = UnsignedPolicyRule {
         id: "allow-git".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::command_bin("git"),
         effect: PolicyEffect::Allow,
@@ -146,18 +239,18 @@ fn signed_policy_rule_rejects_unenforced_expiry_and_bounds() {
 
     let mut expiring = base.clone();
     expiring.expires_at = Some(1_700_000_060_000);
-    let signed_expiring = sign_policy_rule(&expiring, "device:phone", &key);
+    let signed_expiring = sign_policy_rule(&expiring, DEVICE_ID, &key, Some(device_cert()));
     assert_eq!(
-        verify_policy_rule(&signed_expiring, &key.public_key()),
+        verify_policy_rule(&signed_expiring, &root_key().public_key(), NOW_OK),
         Err(PolicyRuleError::UnsupportedBounds),
         "expires_at must not silently no-op until evaluate has a clock"
     );
 
     let mut bounded = base;
     bounded.bounds = Some(json!({ "max_uses": 1 }));
-    let signed_bounded = sign_policy_rule(&bounded, "device:phone", &key);
+    let signed_bounded = sign_policy_rule(&bounded, DEVICE_ID, &key, Some(device_cert()));
     assert_eq!(
-        verify_policy_rule(&signed_bounded, &key.public_key()),
+        verify_policy_rule(&signed_bounded, &root_key().public_key(), NOW_OK),
         Err(PolicyRuleError::UnsupportedBounds),
         "bounds must not silently no-op until evaluate has usage state"
     );
@@ -246,6 +339,7 @@ fn from_approval_exact_call_round_trips_and_allows_only_the_same_command() {
     let action = git_force_action();
     let unsigned = UnsignedPolicyRule::from_approval(
         "approval-exact",
+        ACCOUNT_ID,
         &actor,
         &action,
         PolicyRuleScope::ExactCall,
@@ -257,11 +351,11 @@ fn from_approval_exact_call_round_trips_and_allows_only_the_same_command() {
     assert_eq!(unsigned.effect, PolicyEffect::Allow);
 
     let key = device_key();
-    let signed_rule = sign_policy_rule(&unsigned, "device:phone", &key);
+    let signed_rule = sign_policy_rule(&unsigned, DEVICE_ID, &key, Some(device_cert()));
     let json = serde_json::to_string(&signed_rule).expect("policy rule serializes");
     let round_tripped = serde_json::from_str(&json).expect("policy rule deserializes");
-    let verified =
-        verify_policy_rule(&round_tripped, &key.public_key()).expect("round trip verifies");
+    let verified = verify_policy_rule(&round_tripped, &root_key().public_key(), NOW_OK)
+        .expect("round trip verifies");
 
     assert_eq!(
         evaluate_for_actor(&actor, &action, std::slice::from_ref(&verified)).decision,
@@ -296,6 +390,7 @@ fn from_approval_exact_call_uses_raw_command_when_argv_is_unavailable() {
     let verified = signed(
         UnsignedPolicyRule::from_approval(
             "approval-raw-exact",
+            ACCOUNT_ID,
             &actor,
             &action,
             PolicyRuleScope::ExactCall,
@@ -341,6 +436,7 @@ fn from_approval_exact_call_rejects_unrepresentable_command_shape() {
     assert!(
         UnsignedPolicyRule::from_approval(
             "approval-bin-only",
+            ACCOUNT_ID,
             &actor,
             &action,
             PolicyRuleScope::ExactCall,
@@ -362,6 +458,7 @@ fn from_approval_mcp_param_rule_allows_matching_future_call_only() {
     let verified = signed(
         UnsignedPolicyRule::from_approval(
             "approval-param",
+            ACCOUNT_ID,
             &actor,
             &action,
             PolicyRuleScope::McpParamEquals {
@@ -401,6 +498,7 @@ fn syntactic_policy_ignores_reserved_semantic_fields() {
 
     let verified = signed(UnsignedPolicyRule {
         id: "allow-git".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::command_bin("git"),
         effect: PolicyEffect::Allow,
