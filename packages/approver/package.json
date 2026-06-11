@@ -20,9 +20,10 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "lint": "eslint src",
-    "test": "node --test \"test/**/*.test.mjs\""
+    "build:deps": "pnpm --filter @allw/sdk build",
+    "typecheck": "pnpm run build:deps && tsc -p tsconfig.json --noEmit",
+    "lint": "pnpm run build:deps && eslint src",
+    "test": "pnpm run build:deps && tsc -p tsconfig.json && node --test \"test/**/*.test.mjs\""
   },
   "dependencies": {
     "@allw/sdk": "workspace:*"

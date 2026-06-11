@@ -10,9 +10,10 @@
   "scripts": {
     "build": "pnpm -r build",
     "build:wasm": "wasm-pack build crates/allw-wasm --target web --out-dir ../../packages/sdk/vendor/allw-wasm --release",
+    "test:recursive-scripts": "node --test scripts/recursive-scripts.test.mjs",
     "typecheck": "pnpm -r typecheck",
     "lint": "pnpm -r lint",
-    "test": "pnpm -r test"
+    "test": "pnpm run test:recursive-scripts && pnpm -r test"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
