@@ -126,10 +126,12 @@ export interface Verdict {
  * base64url nonce here so a captured verdict cannot be replayed to the same long-lived client.
  */
 export interface NonceStore {
-  /** Returns true when this verified verdict nonce has already been accepted. */
-  has(nonceB64: string): boolean | Promise<boolean>;
-  /** Records a freshly accepted verified verdict nonce. */
-  add(nonceB64: string): void | Promise<void>;
+  /**
+   * Atomically records a freshly verified verdict nonce and returns true iff it was not already
+   * present. Durable stores should implement this as a unique insert / conditional write, not as
+   * separate read-then-write operations, so concurrent replay attempts cannot both be accepted.
+   */
+  checkAndInsert(nonceB64: string): boolean | Promise<boolean>;
 }
 
 /** Configuration for {@link createClient}. */
@@ -188,12 +190,12 @@ const DEFAULT_POLL_INTERVAL_MS = 1000;
 class InMemoryNonceStore implements NonceStore {
   private readonly seen = new Set<string>();
 
-  has(nonceB64: string): boolean {
-    return this.seen.has(nonceB64);
-  }
-
-  add(nonceB64: string): void {
+  checkAndInsert(nonceB64: string): boolean {
+    if (this.seen.has(nonceB64)) return false;
+    // This intentionally grows for the client lifetime. Persistent retention/expiry belongs to
+    // integrator-provided durable stores once replay retention policy is specified.
     this.seen.add(nonceB64);
+    return true;
   }
 }
 
@@ -319,9 +321,7 @@ async function acceptVerifiedNonce(
   acceptedNonceB64?: string,
 ): Promise<boolean> {
   if (acceptedNonceB64 !== undefined && nonceB64 === acceptedNonceB64) return true;
-  if (await nonceStore.has(nonceB64)) return false;
-  await nonceStore.add(nonceB64);
-  return true;
+  return nonceStore.checkAndInsert(nonceB64);
 }
 
 /**

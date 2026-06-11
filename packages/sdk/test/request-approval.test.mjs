@@ -610,6 +610,80 @@ test("(g') a replayed approved verdict nonce is rejected on the same client (#48
   });
 });
 
+test("(g'') a custom async NonceStore is honored atomically (#48 review)", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const req = sampleRequest();
+  const seen = new Set();
+  const acceptedNonces = [];
+  const nonceStore = {
+    async checkAndInsert(nonceB64) {
+      acceptedNonces.push(nonceB64);
+      await Promise.resolve();
+      if (seen.has(nonceB64)) return false;
+      seen.add(nonceB64);
+      return true;
+    },
+  };
+
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: {
+      poll: (env) => (env ? signVerdict(wasm, approver, req, env, { decision: "approved" }) : null),
+    },
+  });
+
+  const client = createClient({
+    relayUrl: RELAY_URL,
+    accountId: ACCOUNT_ID,
+    approverRootKey: approver.accountRootPub,
+    fetchImpl: relay.fetchImpl,
+    nowImpl: () => NOW_MS,
+    webSocketFactory: undefined,
+    pollIntervalMs: 5,
+    nonceStore,
+  });
+
+  const verdict = await client.requestApproval(req);
+  assert.equal(verdict.decision, "approved");
+  assert.equal(await verdict.verify(approver.accountRootPub), true);
+  assert.equal(
+    acceptedNonces.length,
+    1,
+    "requestApproval accepts the verified nonce once; verify() on the same Verdict is idempotent",
+  );
+});
+
+test("(g''') default nonce stores are per-client, not global (#48 review)", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const req = sampleRequest();
+  let replayedVerdict = null;
+
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: {
+      poll: (env) => {
+        if (!env) return null;
+        replayedVerdict ??= signVerdict(wasm, approver, req, env, { decision: "approved" });
+        return replayedVerdict;
+      },
+    },
+  });
+
+  await withFixedRequestId("00000000-0000-4000-8000-000000000049", async () => {
+    const first = await pollClient(approver, relay).requestApproval(req);
+    assert.equal(first.decision, "approved");
+
+    const second = await pollClient(approver, relay).requestApproval(req);
+    assert.equal(
+      second.decision,
+      "approved",
+      "a fresh default client has an independent in-memory nonce store",
+    );
+  });
+});
+
 test("(h) WS closes without a verdict → poll fallback delivers the approval", async () => {
   const wasm = await loadWasm();
   const approver = makeApprover(wasm);
