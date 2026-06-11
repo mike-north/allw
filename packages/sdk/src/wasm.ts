@@ -57,6 +57,32 @@ export interface AllwWasm {
     approverRootPubkeyB64: string,
     nowMs: number,
   ): string;
+  /** Derive the Ed25519 public key for a 32-byte signing seed (base64url). */
+  ed25519_public_key(seedB64: string): string;
+  /** Build an ActionRecord JSON for a shell command using the core T1 command parser. */
+  action_from_command(commandLine: string, cwd?: string | null): string;
+  /** Sign an unsigned PolicyRule JSON with a device key, returning the signed PolicyRule JSON. */
+  sign_policy_rule(unsignedRuleJson: string, deviceId: string, deviceSeedB64: string): string;
+  /**
+   * Emit a signed allow PolicyRule from an approved action plus syntactic scope choice.
+   * `scopeJson` is a PolicyRuleScope JSON value such as `{ "kind": "exact_call" }`.
+   */
+  policy_rule_from_approval(
+    id: string,
+    actorJson: string,
+    actionJson: string,
+    scopeJson: string,
+    createdAt: number,
+    deviceId: string,
+    deviceSeedB64: string,
+  ): string;
+  /** Verify signed PolicyRule JSON objects and evaluate them against one ActionRecord JSON. */
+  evaluate_policy(
+    actionJson: string,
+    actorJson: string | null | undefined,
+    signedRulesJson: string,
+    devicePubkeyB64: string,
+  ): string;
 }
 
 /** The init surface the generated `--target web` glue exposes alongside the FFI functions. */

@@ -40,10 +40,13 @@ use allw_core::{
     action_from_command as core_action_from_command,
     action_from_mcp_tool_call as core_action_from_mcp_tool_call,
     compute_request_hash as core_compute_request_hash, decrypt_context as core_decrypt_context,
-    encrypt_context as core_encrypt_context, issue_device_cert as core_issue_device_cert,
-    sign_verdict as core_sign_verdict, verify_verdict as core_verify_verdict, ApprovalContext,
-    ApprovalRequest, Approver, CommandContext, ContextRecipient, Decision, PublicKey,
-    SigningKeyPair, UnsignedVerdict, Verdict, X25519KeyPair, X25519PublicKey,
+    encrypt_context as core_encrypt_context, evaluate as core_evaluate,
+    evaluate_for_actor as core_evaluate_for_actor, issue_device_cert as core_issue_device_cert,
+    sign_policy_rule as core_sign_policy_rule, sign_verdict as core_sign_verdict,
+    verify_policy_rule as core_verify_policy_rule, verify_verdict as core_verify_verdict,
+    ActionRecord, Actor, ApprovalContext, ApprovalRequest, Approver, CommandContext,
+    ContextRecipient, Decision, PolicyRule, PolicyRuleScope, PublicKey, SigningKeyPair,
+    UnsignedPolicyRule, UnsignedVerdict, Verdict, X25519KeyPair, X25519PublicKey,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::rngs::OsRng;
@@ -429,6 +432,107 @@ pub fn issue_device_cert(
         issued_at,
         expires_at,
     ))
+}
+
+// ── policy rules ──────────────────────────────────────────────────────────────────────
+
+/// Signs an unsigned [`PolicyRule`](allw_core::PolicyRule) payload with a device Ed25519 key,
+/// returning the full signed policy rule JSON. This is the lower-level rule-emission helper for
+/// manual policies; the approval-derived affordance should use [`policy_rule_from_approval`].
+///
+/// # Errors
+///
+/// Throws if `unsigned_rule_json` is not a valid [`UnsignedPolicyRule`](allw_core::UnsignedPolicyRule)
+/// or the device seed is not a 32-byte base64url value.
+#[wasm_bindgen]
+pub fn sign_policy_rule(
+    unsigned_rule_json: &str,
+    device_id: &str,
+    device_seed_b64: &str,
+) -> Result<String, JsError> {
+    let unsigned: UnsignedPolicyRule = parse_json(unsigned_rule_json, "UnsignedPolicyRule")?;
+    let seed = decode_b64_32(device_seed_b64, "device_seed_b64")?;
+    let device_key = SigningKeyPair::from_seed(&seed);
+    let rule = core_sign_policy_rule(&unsigned, device_id, &device_key);
+    to_json(&rule, "PolicyRule")
+}
+
+/// Emits a signed allow [`PolicyRule`](allw_core::PolicyRule) from an approved action and a
+/// syntactic scope choice. This preserves the primitive's one-shot verdict invariant: standing
+/// autonomy is encoded as a signed policy rule, not as extra scope on a verdict.
+///
+/// `scope_json` is a [`PolicyRuleScope`](allw_core::PolicyRuleScope), for example
+/// `{ "kind": "exact_call" }` or `{ "kind": "mcp_param_equals", "path": "list" }`.
+///
+/// # Errors
+///
+/// Throws if actor/action/scope JSON is malformed, `created_at` is not a safe integer millisecond
+/// timestamp, or the device seed is not a 32-byte base64url value.
+#[wasm_bindgen]
+pub fn policy_rule_from_approval(
+    id: &str,
+    actor_json: &str,
+    action_json: &str,
+    scope_json: &str,
+    created_at: f64,
+    device_id: &str,
+    device_seed_b64: &str,
+) -> Result<String, JsError> {
+    let actor: Actor = parse_json(actor_json, "Actor")?;
+    let action: ActionRecord = parse_json(action_json, "ActionRecord")?;
+    let scope: PolicyRuleScope = parse_json(scope_json, "PolicyRuleScope")?;
+    let created_at = ms_to_i64(created_at, "created_at")?;
+    let seed = decode_b64_32(device_seed_b64, "device_seed_b64")?;
+    let device_key = SigningKeyPair::from_seed(&seed);
+
+    let unsigned = UnsignedPolicyRule::from_approval(id, &actor, &action, scope, created_at);
+    let rule = core_sign_policy_rule(&unsigned, device_id, &device_key);
+    to_json(&rule, "PolicyRule")
+}
+
+/// Verifies signed policy rules and evaluates them against one action. Returns a
+/// [`PolicyEvaluation`](allw_core::PolicyEvaluation) JSON object.
+///
+/// `signed_rules_json` is a JSON array of signed [`PolicyRule`](allw_core::PolicyRule) objects.
+/// All supplied rules are verified against `device_pubkey_b64`; any invalid rule throws rather
+/// than being ignored, so callers fail closed on policy tampering.
+///
+/// # Errors
+///
+/// Throws if the action/actor/rules JSON is malformed, the public key is not a valid Ed25519 key,
+/// or any signed policy rule fails verification.
+#[wasm_bindgen]
+pub fn evaluate_policy(
+    action_json: &str,
+    actor_json: Option<String>,
+    signed_rules_json: &str,
+    device_pubkey_b64: &str,
+) -> Result<String, JsError> {
+    let action: ActionRecord = parse_json(action_json, "ActionRecord")?;
+    let actor: Option<Actor> = actor_json
+        .as_deref()
+        .map(|json| parse_json(json, "Actor"))
+        .transpose()?;
+    let rules: Vec<PolicyRule> = parse_json(signed_rules_json, "PolicyRule[]")?;
+    let device_pubkey_bytes = decode_b64_32(device_pubkey_b64, "device_pubkey_b64")?;
+    let device_pubkey = PublicKey::from_bytes(&device_pubkey_bytes).map_err(|e| {
+        JsError::new(&format!(
+            "device_pubkey_b64 is not a valid Ed25519 key: {e}"
+        ))
+    })?;
+    let verified = rules
+        .iter()
+        .map(|rule| {
+            core_verify_policy_rule(rule, &device_pubkey)
+                .map_err(|e| JsError::new(&format!("verify_policy_rule failed: {e}")))
+        })
+        .collect::<Result<Vec<_>, JsError>>()?;
+
+    let evaluation = match actor.as_ref() {
+        Some(actor) => core_evaluate_for_actor(actor, &action, &verified),
+        None => core_evaluate(&action, &verified),
+    };
+    to_json(&evaluation, "PolicyEvaluation")
 }
 
 // ── key derivation (v0 software keys) ──────────────────────────────────────────────────
