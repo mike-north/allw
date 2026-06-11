@@ -25,6 +25,7 @@ pub mod crypto;
 pub mod hash;
 pub mod jwe;
 pub mod mcp;
+pub mod policy;
 
 pub use audit::{
     compute_record_hash, AuditChain, AuditChainError, AuditEntryInput, GENESIS_PREV_HASH,
@@ -44,3 +45,9 @@ pub use jwe::{
     decrypt_context, encrypt_context, ContextRecipient, JweError, X25519KeyPair, X25519PublicKey,
 };
 pub use mcp::action_from_mcp_tool_call;
+pub use policy::{
+    evaluate, evaluate_for_actor, sign_policy_rule, verify_policy_rule, ActorMatcher,
+    CommandMatcher, McpMatcher, ParamMatcher, PolicyEffect, PolicyEvaluation, PolicyPredicate,
+    PolicyProvenance, PolicyRule, PolicyRuleBuildError, PolicyRuleError, PolicyRuleScope,
+    PolicyTier, UnsignedPolicyRule, VerifiedPolicyRule,
+};

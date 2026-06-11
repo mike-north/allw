@@ -109,7 +109,7 @@ impl SigningKeyPair {
     }
 
     /// Signs `msg` and returns the raw 64-byte Ed25519 signature.
-    fn sign_bytes(&self, msg: &[u8]) -> [u8; 64] {
+    pub(crate) fn sign_bytes(&self, msg: &[u8]) -> [u8; 64] {
         self.inner.sign(msg).to_bytes()
     }
 }
@@ -145,7 +145,7 @@ impl PublicKey {
     /// Uses `verify_strict` (not `verify`): it rejects non-canonical `S` and small-order
     /// public keys, giving signature-malleability resistance and stronger cross-implementation
     /// verification consensus — important for the "any party can verify" invariant.
-    fn verify_bytes(&self, msg: &[u8], sig: &[u8; 64]) -> bool {
+    pub(crate) fn verify_bytes(&self, msg: &[u8], sig: &[u8; 64]) -> bool {
         let signature = Signature::from_bytes(sig);
         self.inner.verify_strict(msg, &signature).is_ok()
     }
