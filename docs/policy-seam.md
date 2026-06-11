@@ -51,10 +51,13 @@ rules are a strict subset of semantic, so nothing written at T1/T2 breaks when T
 context and the `AuditRecord`. **v1 populates the syntactic fields; the semantic fields are reserved (null) and
 filled later by the T3 engine** — adding them must not break the wire format.
 
+`actor` is not part of `ActionRecord`: it is carried at the `ApprovalRequest` / `AuditRecord` envelope level, and
+policy evaluation receives `actor` plus `ActionRecord` as separate inputs (`PolicyRule.subject` matches the actor;
+`PolicyRule.match` matches the action).
+
 ```
 ActionRecord {
   record_schema_version: int
-  actor:   { id, kind }                       // attested
 
   surface: "command" | "mcp_tool_call"        // interception paradigm (more added as needed:
                                               //   agent_tool_call, delegated_fetch …)
