@@ -33,7 +33,7 @@ That generality is what made Flow expensive. So we tier it:
 
 | Tier                                | What it matches                                                                                                                                                  | Needs                                                                | allw                                |
 | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- | ----------------------------------- |
-| **T1 — pure syntactic**             | command name, `command_pattern` globs, `args_any` (substring/glob), flags, env; MCP `server`/`tool`/`params`-as-strings                                          | nothing (no schema)                                                  | **v1 lives here**                   |
+| **T1 — pure syntactic**             | command name, `command_pattern` globs, `args_any` (exact-token/glob), flags, env; MCP `server`/`tool`/`params`-as-strings                                        | nothing (no schema)                                                  | **v1 lives here**                   |
 | **T2 — curated-command syntactic**  | precise positional / path / target matching for ~15–20 high-value dangerous commands (`rm`, `find`, `git`, `curl`, `chmod`, `dd`, `kubectl`, key MCP CRUD tools) | hand-written arg grammar for _that curated set only_                 | optional early stretch              |
 | **T3 — full semantic / capability** | abstract capabilities (`delete`, `network`, …) + named fields/scope, generalized across hundreds of commands ("`rm` _means_ delete; arg1 _is a path_")           | per-command schema DB, capability inference, doc-extraction pipeline | **deferred north star (paid tier)** |
 
@@ -114,6 +114,13 @@ PolicyRule {
 ```
 
 **Precedence within a policy:** `deny` > `ask` > `allow`. **No match ⇒ `ask` (Escalate).** Unknown is fail-safe.
+
+An empty `match: {}` is invalid. A rule must constrain the action through at least one surface,
+command, or MCP predicate field; otherwise it would become an accidental match-everything grant.
+For command argument matching, `args_any_globs` runs only against structured `argv` / positional
+tokens, never raw shell text. Patterns without `*` or `?` are exact token matches; explicit glob
+patterns are still anchored to one structured token and cannot span whitespace or shell
+metacharacter boundaries.
 
 ---
 

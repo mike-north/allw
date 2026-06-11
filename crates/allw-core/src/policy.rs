@@ -70,7 +70,7 @@ pub enum PolicyRuleScope {
     CommandOrToolAnyArgs,
     /// Match an MCP tool call only when the value at `path` equals the approved call's value.
     McpParamEquals { path: String },
-    /// Match a command when any argv/positional/raw token satisfies this glob.
+    /// Match a command when any structured argv/positional token satisfies this pattern.
     ArgsAnyGlob { pattern: String },
 }
 
@@ -126,7 +126,7 @@ impl PolicyPredicate {
         self
     }
 
-    /// Require at least one syntactic argument token to match this substring/glob pattern.
+    /// Require at least one structured argument token to match this exact string or glob pattern.
     #[must_use]
     pub fn with_args_any_glob(mut self, pattern: &str) -> Self {
         let command = self.command.get_or_insert_with(CommandMatcher::default);
@@ -153,6 +153,10 @@ impl PolicyPredicate {
         }
         true
     }
+
+    fn is_empty(&self) -> bool {
+        self.surface.is_none() && self.command.is_none() && self.mcp.is_none()
+    }
 }
 
 /// Command-surface T1 matcher.
@@ -174,7 +178,7 @@ pub struct CommandMatcher {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub flags: Vec<String>,
 
-    /// Substring/glob patterns; each pattern must match at least one syntactic token.
+    /// Exact/glob patterns; each pattern must match at least one structured syntactic token.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub args_any_globs: Vec<String>,
 }
@@ -416,6 +420,7 @@ pub enum PolicyRuleError {
     BadSignature,
     PayloadMismatch,
     UnsupportedBounds,
+    EmptyPredicate,
 }
 
 impl std::fmt::Display for PolicyRuleError {
@@ -430,6 +435,7 @@ impl std::fmt::Display for PolicyRuleError {
                 f,
                 "policy-rule expires_at/bounds are unsupported until enforcement is implemented"
             ),
+            Self::EmptyPredicate => write!(f, "policy-rule predicate must constrain the action"),
         }
     }
 }
@@ -500,6 +506,9 @@ pub fn verify_policy_rule(
     }
     if rule.expires_at.is_some() || rule.bounds.is_some() {
         return Err(PolicyRuleError::UnsupportedBounds);
+    }
+    if rule.predicate.is_empty() {
+        return Err(PolicyRuleError::EmptyPredicate);
     }
     Ok(VerifiedPolicyRule {
         rule: rule.clone(),
@@ -671,9 +680,8 @@ fn command_candidates(action: &ActionRecord) -> Vec<&str> {
     if let Some(positionals) = &action.syntactic.positionals {
         candidates.extend(positionals.iter().map(String::as_str));
     }
-    if let Some(raw) = &action.syntactic.raw {
-        candidates.push(raw.as_str());
-    }
+    // Deliberately exclude raw shell text: glob matching must stay token-anchored and must not
+    // span whitespace, shell metacharacters, or parser-visible token boundaries.
     candidates
 }
 
@@ -692,7 +700,7 @@ fn string_matches_pattern(value: &str, pattern: &str) -> bool {
     if pattern.contains('*') || pattern.contains('?') {
         glob_matches(value, pattern)
     } else {
-        value.contains(pattern)
+        value == pattern
     }
 }
 
