@@ -10,6 +10,7 @@
  * | `ALLW_ACCOUNT_ID`        | yes      | The approver's relay account id (routes to their devices).   |
  * | `ALLW_APPROVER_ROOT_KEY` | yes      | The approver account-root Ed25519 public key (base64url).    |
  * | `ALLW_TIMEOUT_MS`        | no       | Fail-closed deadline in ms (default 300000 = 5 min, capped). |
+ * | `ALLW_FETCH_TIMEOUT_MS`  | no       | Per-relay-fetch timeout in ms (default/max 30000).           |
  *
  * **Fail-closed:** any missing required var yields a parse error the caller turns into a `deny`
  * with an actionable reason (which var to set) — the hook never proceeds on partial config.
@@ -26,7 +27,9 @@
  * {@link MAX_TIMEOUT_MS} — strictly below the pinned hook timeout, with margin for the SDK's
  * per-request relay-fetch timeouts to fire too. An oversized `ALLW_TIMEOUT_MS` is rejected at
  * config-read time (fail-closed `deny`) rather than silently accepted into a regime where Claude
- * Code could kill the hook before it decides.
+ * Code could kill the hook before it decides. `ALLW_FETCH_TIMEOUT_MS` may lower (but not raise)
+ * the SDK's production per-fetch timeout, which lets UATs prove the hung-relay path quickly without
+ * weakening the production timeout-ordering margin.
  */
 
 /** The fully-resolved hook config. */
@@ -36,6 +39,8 @@ export interface HookConfig {
   readonly approverRootKey: string;
   /** Present only when `ALLW_TIMEOUT_MS` is set to a valid positive integer. */
   readonly timeoutMs?: number;
+  /** Present only when `ALLW_FETCH_TIMEOUT_MS` lowers the SDK's default per-fetch timeout. */
+  readonly fetchTimeoutMs?: number;
 }
 
 /** The result of reading config: a resolved config or a fail-closed reason naming the problem. */
@@ -65,6 +70,13 @@ export const PINNED_HOOK_TIMEOUT_MS = 480_000; // 480s — see README install bl
  */
 export const MAX_TIMEOUT_MS = 420_000; // 420s; PINNED − MAX = 60s margin (> the 30s fetch timeout)
 
+/**
+ * The SDK's production per-relay-fetch timeout (ms), duplicated here as the hook's maximum accepted
+ * `ALLW_FETCH_TIMEOUT_MS`. The env var is an escape hatch for faster end-to-end/UAT failures; it
+ * can only make relay fetches fail sooner, never extend them beyond the timeout-ordering budget.
+ */
+export const MAX_FETCH_TIMEOUT_MS = 30_000;
+
 /** An environment map (injectable for tests; defaults to `process.env`). */
 export type Env = Record<string, string | undefined>;
 
@@ -72,6 +84,25 @@ export type Env = Record<string, string | undefined>;
 function required(env: Env, key: string): string | null {
   const value = env[key];
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+/** Read an optional positive-integer millisecond env var. */
+function optionalMs(
+  env: Env,
+  key: string,
+): { ok: true; value?: number } | { ok: false; reason: string } {
+  const raw = env[key];
+  if (raw === undefined || raw.trim().length === 0) {
+    return { ok: true };
+  }
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return {
+      ok: false,
+      reason: `allw: ${key} must be a positive integer number of milliseconds, got '${raw}' (fail-closed deny)`,
+    };
+  }
+  return { ok: true, value: parsed };
 }
 
 /**
@@ -94,30 +125,37 @@ export function readConfig(env: Env): ConfigResult {
     return { ok: false, reason: "allw: ALLW_APPROVER_ROOT_KEY is not set (fail-closed deny)" };
   }
 
-  const rawTimeout = env.ALLW_TIMEOUT_MS;
-  let timeoutMs: number | undefined;
-  if (rawTimeout !== undefined && rawTimeout.trim().length > 0) {
-    const parsed = Number(rawTimeout);
-    if (!Number.isInteger(parsed) || parsed <= 0) {
-      return {
-        ok: false,
-        reason: `allw: ALLW_TIMEOUT_MS must be a positive integer number of milliseconds, got '${rawTimeout}' (fail-closed deny)`,
-      };
-    }
-    if (parsed >= MAX_TIMEOUT_MS) {
+  const timeout = optionalMs(env, "ALLW_TIMEOUT_MS");
+  if (!timeout.ok) return timeout;
+  const timeoutMs = timeout.value;
+  if (timeoutMs !== undefined) {
+    if (timeoutMs >= MAX_TIMEOUT_MS) {
       // An oversized deadline would let Claude Code's pinned hook timeout fire before the hook emits
       // its explicit deny — at which point the outcome rides on Claude Code's undocumented
       // timeout behavior (a non-blocking error → the tool PROCEEDS = fail-OPEN). Refuse it.
       return {
         ok: false,
-        reason: `allw: ALLW_TIMEOUT_MS=${String(parsed)}ms is too large — it must be below ${String(
+        reason: `allw: ALLW_TIMEOUT_MS=${String(timeoutMs)}ms is too large — it must be below ${String(
           MAX_TIMEOUT_MS,
         )}ms (the pinned Claude Code hook timeout of ${String(
           PINNED_HOOK_TIMEOUT_MS,
         )}ms minus margin for relay-fetch timeouts), so the hook always decides before Claude Code can kill it (fail-closed deny)`,
       };
     }
-    timeoutMs = parsed;
+  }
+
+  const fetchTimeout = optionalMs(env, "ALLW_FETCH_TIMEOUT_MS");
+  if (!fetchTimeout.ok) return fetchTimeout;
+  const fetchTimeoutMs = fetchTimeout.value;
+  if (fetchTimeoutMs !== undefined && fetchTimeoutMs > MAX_FETCH_TIMEOUT_MS) {
+    return {
+      ok: false,
+      reason: `allw: ALLW_FETCH_TIMEOUT_MS=${String(
+        fetchTimeoutMs,
+      )}ms is too large — it must be at or below ${String(
+        MAX_FETCH_TIMEOUT_MS,
+      )}ms so relay fetches cannot outlive the hook timeout-ordering margin (fail-closed deny)`,
+    };
   }
 
   return {
@@ -127,6 +165,7 @@ export function readConfig(env: Env): ConfigResult {
       accountId,
       approverRootKey,
       ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      ...(fetchTimeoutMs !== undefined ? { fetchTimeoutMs } : {}),
     },
   };
 }

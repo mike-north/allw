@@ -2,7 +2,8 @@
  * Tests for the hook's env-sourced config (`readConfig`).
  *
  * Fail-closed: a missing required var must report `{ ok: false }` with an actionable reason naming
- * the var. `ALLW_TIMEOUT_MS` is optional but, when present, must be a positive integer.
+ * the var. `ALLW_TIMEOUT_MS` and `ALLW_FETCH_TIMEOUT_MS` are optional but, when present, must be
+ * positive integers.
  */
 
 import { test } from "node:test";
@@ -10,6 +11,7 @@ import assert from "node:assert/strict";
 
 import {
   DEFAULT_TIMEOUT_MS,
+  MAX_FETCH_TIMEOUT_MS,
   MAX_TIMEOUT_MS,
   PINNED_HOOK_TIMEOUT_MS,
   readConfig,
@@ -34,6 +36,12 @@ test("reads a valid ALLW_TIMEOUT_MS", () => {
   const result = readConfig({ ...FULL, ALLW_TIMEOUT_MS: "120000" });
   assert.equal(result.ok, true);
   assert.equal(result.config.timeoutMs, 120000);
+});
+
+test("(#54) reads a valid ALLW_FETCH_TIMEOUT_MS", () => {
+  const result = readConfig({ ...FULL, ALLW_FETCH_TIMEOUT_MS: "100" });
+  assert.equal(result.ok, true);
+  assert.equal(result.config.fetchTimeoutMs, 100);
 });
 
 test("the default timeout constant is 5 minutes (documented contract default)", () => {
@@ -88,6 +96,24 @@ test("zero / negative ALLW_TIMEOUT_MS → not ok", () => {
 
 test("non-integer ALLW_TIMEOUT_MS → not ok", () => {
   assert.equal(readConfig({ ...FULL, ALLW_TIMEOUT_MS: "1.5" }).ok, false);
+});
+
+test("(#54) invalid ALLW_FETCH_TIMEOUT_MS → not ok", () => {
+  for (const value of ["soon", "0", "-5", "1.5"]) {
+    const result = readConfig({ ...FULL, ALLW_FETCH_TIMEOUT_MS: value });
+    assert.equal(result.ok, false, `ALLW_FETCH_TIMEOUT_MS=${value} should fail closed`);
+    assert.ok(/ALLW_FETCH_TIMEOUT_MS must be a positive integer/.test(result.reason));
+  }
+});
+
+test("(#54) ALLW_FETCH_TIMEOUT_MS can lower but not raise the SDK default", () => {
+  const atMax = readConfig({ ...FULL, ALLW_FETCH_TIMEOUT_MS: String(MAX_FETCH_TIMEOUT_MS) });
+  assert.equal(atMax.ok, true);
+  assert.equal(atMax.config.fetchTimeoutMs, MAX_FETCH_TIMEOUT_MS);
+
+  const overMax = readConfig({ ...FULL, ALLW_FETCH_TIMEOUT_MS: String(MAX_FETCH_TIMEOUT_MS + 1) });
+  assert.equal(overMax.ok, false);
+  assert.ok(/ALLW_FETCH_TIMEOUT_MS=.*too large/.test(overMax.reason));
 });
 
 // ── fail-closed: ALLW_TIMEOUT_MS cap (issue #52 — must fire before Claude Code's hook timeout) ────
