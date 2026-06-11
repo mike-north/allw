@@ -15,7 +15,10 @@
 
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
-import { AccountRelay, PAIRING_TTL_MS } from "../src/index.js";
+import { AccountRelay } from "../src/index.js";
+// PAIRING_TTL_MS lives in a sibling module (not the worker entrypoint) so `wrangler dev` can boot:
+// workerd validates every named export of the entrypoint as a handler/DO class (see constants.ts).
+import { PAIRING_TTL_MS } from "../src/constants.js";
 
 // ---------------------------------------------------------------------------
 // Helpers

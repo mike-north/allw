@@ -77,6 +77,13 @@ jobs:
       - run: pnpm --filter @allw/sdk build
       - run: pnpm --filter @allw/hook build
       - run: pnpm --filter @allw/hook test
+      # The v0 walking-skeleton e2e composes the SAME compiled wasm through the real sdk + approver +
+      # hook in one round-trip (approve→allow, deny→deny, timeout→expired, integrator re-verify, and
+      # the zero-knowledge storage assertion). It imports from dist/ (and depends on sdk/approver/hook
+      # dist), so build it after them. The genuinely-live workerd stack is the local `demo:e2e`
+      # script, not CI (see examples/walking-skeleton/README.md → Test layers).
+      - run: pnpm --filter @allw/example-walking-skeleton build
+      - run: pnpm --filter @allw/example-walking-skeleton test
 
   relay:
     name: Relay (workers-pool)

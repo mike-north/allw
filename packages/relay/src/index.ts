@@ -15,6 +15,8 @@
  * will be added alongside the enrollment mini-spec from `docs/contract.md §Open decisions`.
  */
 
+import { PAIRING_TTL_MS } from "./constants.js";
+
 export interface Env {
   readonly ACCOUNT: DurableObjectNamespace;
 }
@@ -92,12 +94,6 @@ interface ActorRecord {
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-/**
- * Pairing code TTL in milliseconds.
- * Exported so tests can seed deterministically-expired rows without waiting.
- */
-export const PAIRING_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 /**
  * Alphabet for human-enterable pairing codes: Crockford base32 (32 characters).

@@ -1,0 +1,37 @@
+{
+  "name": "@allw/example-walking-skeleton",
+  "version": "0.0.0",
+  "description": "v0 walking-skeleton demo + integration harness: composes @allw/sdk, @allw/approver, and @allw/hook end-to-end (no crypto of its own).",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src",
+    "test": "tsc -p tsconfig.json && node --test \"test/**/*.test.mjs\"",
+    "demo:e2e": "node scripts/demo-e2e.mjs",
+    "demo:approve": "node scripts/demo-e2e.mjs --decision approve",
+    "demo:deny": "node scripts/demo-e2e.mjs --decision deny",
+    "demo:timeout": "node scripts/demo-e2e.mjs --decision timeout"
+  },
+  "dependencies": {
+    "@allw/approver": "workspace:*",
+    "@allw/hook": "workspace:*",
+    "@allw/sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  },
+  "license": "MIT"
+}

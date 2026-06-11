@@ -24,6 +24,22 @@ importers:
         specifier: ^8.0.0
         version: 8.61.0(eslint@9.39.4)(typescript@5.9.3)
 
+  examples/walking-skeleton:
+    dependencies:
+      '@allw/approver':
+        specifier: workspace:*
+        version: link:../../packages/approver
+      '@allw/hook':
+        specifier: workspace:*
+        version: link:../../packages/hook
+      '@allw/sdk':
+        specifier: workspace:*
+        version: link:../../packages/sdk
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.19.20
+
   packages/approver:
     dependencies:
       '@allw/sdk':
