@@ -417,6 +417,93 @@ test("evaluate_policy rejects policy rules with unenforced expiry or bounds", as
   );
 });
 
+test("evaluate_policy rejects empty predicates and token-anchors args_any_globs", async () => {
+  const wasm = await loadWasm();
+  const deviceSeed = Buffer.alloc(32, 0x42).toString("base64url");
+  const devicePubkey = wasm.ed25519_public_key(deviceSeed);
+  const actor = { id: "machine:macbook", kind: "claude-code" };
+
+  const emptyPredicate = {
+    id: "empty-predicate",
+    subject: { kind: "any" },
+    match: {},
+    effect: "allow",
+    provenance: "manual",
+    tier: "syntactic",
+    created_at: 1700000000000,
+  };
+  const signedEmpty = JSON.parse(
+    wasm.sign_policy_rule(JSON.stringify(emptyPredicate), "device:phone", deviceSeed),
+  );
+  assert.throws(
+    () =>
+      wasm.evaluate_policy(
+        wasm.action_from_command("git status", null),
+        JSON.stringify(actor),
+        JSON.stringify([signedEmpty]),
+        devicePubkey,
+      ),
+    /predicate must constrain the action/,
+    "manual {} predicates must not become match-everything allow rules",
+  );
+
+  const tokenRule = {
+    id: "allow-build-token",
+    subject: { kind: "any" },
+    match: { surface: "command", command: { bin: "rm", args_any_globs: ["build"] } },
+    effect: "allow",
+    provenance: "manual",
+    tier: "syntactic",
+    created_at: 1700000000000,
+  };
+  const signedTokenRule = JSON.parse(
+    wasm.sign_policy_rule(JSON.stringify(tokenRule), "device:phone", deviceSeed),
+  );
+  const exactToken = JSON.parse(
+    wasm.evaluate_policy(
+      wasm.action_from_command("rm -rf build", null),
+      JSON.stringify(actor),
+      JSON.stringify([signedTokenRule]),
+      devicePubkey,
+    ),
+  );
+  assert.equal(exactToken.decision, "allow");
+
+  const prefixedToken = JSON.parse(
+    wasm.evaluate_policy(
+      wasm.action_from_command("rm -rf build-prod", null),
+      JSON.stringify(actor),
+      JSON.stringify([signedTokenRule]),
+      devicePubkey,
+    ),
+  );
+  assert.equal(
+    prefixedToken.decision,
+    "escalate",
+    "non-glob args_any_globs must not substring-match structured tokens",
+  );
+
+  const rawOnly = {
+    record_schema_version: 1,
+    surface: "command",
+    syntactic: { bin: "rm", raw: "rm -rf build" },
+    risk: "high",
+  };
+  const rawOnlyResult = JSON.parse(
+    wasm.evaluate_policy(
+      JSON.stringify(rawOnly),
+      JSON.stringify(actor),
+      JSON.stringify([signedTokenRule]),
+      devicePubkey,
+    ),
+  );
+  assert.equal(
+    rawOnlyResult.decision,
+    "escalate",
+    "args_any_globs must not match against raw shell text",
+  );
+});
+
 test("sign_verdict + issue_device_cert produce a verdict verify_verdict accepts", async () => {
   const wasm = await loadWasm();
   const f = approverFixture(wasm);

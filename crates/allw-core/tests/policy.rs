@@ -164,6 +164,83 @@ fn signed_policy_rule_rejects_unenforced_expiry_and_bounds() {
 }
 
 #[test]
+fn signed_policy_rule_rejects_empty_predicate() {
+    let key = device_key();
+    let empty_match = UnsignedPolicyRule {
+        id: "empty-predicate".to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate {
+            surface: None,
+            command: None,
+            mcp: None,
+        },
+        effect: PolicyEffect::Allow,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    };
+    let signed_empty = sign_policy_rule(&empty_match, "device:phone", &key);
+
+    assert_eq!(
+        verify_policy_rule(&signed_empty, &key.public_key()),
+        Err(PolicyRuleError::EmptyPredicate),
+        "a signed manual policy with an empty predicate must not become a match-everything allow"
+    );
+}
+
+#[test]
+fn args_any_glob_matches_structured_tokens_not_raw_or_substrings() {
+    let rule = signed(UnsignedPolicyRule {
+        id: "allow-build-dir".to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate::command_bin("rm").with_args_any_glob("build"),
+        effect: PolicyEffect::Allow,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    });
+
+    let exact_token = ["rm", "-rf", "build"].map(String::from);
+    let exact_token_action = action_from_argv(&exact_token, &CommandContext::default());
+    assert_eq!(
+        evaluate(&exact_token_action, std::slice::from_ref(&rule)).decision,
+        PolicyDecision::Allow,
+        "a non-glob pattern matches the exact structured token"
+    );
+
+    let prefixed_token = ["rm", "-rf", "build-prod"].map(String::from);
+    let prefixed_token_action = action_from_argv(&prefixed_token, &CommandContext::default());
+    assert_eq!(
+        evaluate(&prefixed_token_action, std::slice::from_ref(&rule)).decision,
+        PolicyDecision::Escalate,
+        "a non-glob pattern must not substring-match another token"
+    );
+
+    let raw_only = command_action_with_syntactic(SyntacticSubstrate {
+        bin: Some("rm".to_string()),
+        argv: None,
+        flags: None,
+        positionals: None,
+        cwd: None,
+        host: None,
+        env_refs: None,
+        server: None,
+        tool: None,
+        params: None,
+        raw: Some("rm -rf build".to_string()),
+    });
+    assert_eq!(
+        evaluate(&raw_only, &[rule]).decision,
+        PolicyDecision::Escalate,
+        "args_any_globs must not match across raw shell text"
+    );
+}
+
+#[test]
 fn from_approval_exact_call_round_trips_and_allows_only_the_same_command() {
     let actor = actor();
     let action = git_force_action();

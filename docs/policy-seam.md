@@ -115,6 +115,13 @@ PolicyRule {
 
 **Precedence within a policy:** `deny` > `ask` > `allow`. **No match ⇒ `ask` (Escalate).** Unknown is fail-safe.
 
+An empty `match: {}` is invalid. A rule must constrain the action through at least one surface,
+command, or MCP predicate field; otherwise it would become an accidental match-everything grant.
+For command argument matching, `args_any_globs` runs only against structured `argv` / positional
+tokens, never raw shell text. Patterns without `*` or `?` are exact token matches; explicit glob
+patterns are still anchored to one structured token and cannot span whitespace or shell
+metacharacter boundaries.
+
 ---
 
 ## The approval → rule bridge ("approve & don't ask again")
