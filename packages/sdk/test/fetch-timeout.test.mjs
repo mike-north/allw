@@ -78,7 +78,12 @@ function makeApprover(wasm) {
 }
 
 function deviceRecord(approver) {
-  return { device_id: approver.deviceId, pubkey: approver.deviceX25519Pub, label: null, created_at: 0 };
+  return {
+    device_id: approver.deviceId,
+    pubkey: approver.deviceX25519Pub,
+    label: null,
+    created_at: 0,
+  };
 }
 
 function jsonResponse(data, status = 200) {

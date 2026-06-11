@@ -83,8 +83,8 @@ const DEFAULT_SCHEDULE: ScheduleImpl = (fn, ms) => {
 };
 
 /**
- * A relay-fetch timeout that fired before its `fetch` settled — i.e. a hung connect/read. Carries a
- * sentinel `status` of 0 (no HTTP response was ever received) so the caller can recognise it as a
+ * A relay-fetch timeout that fired before its `fetch` settled — i.e. a hung connect/read (no HTTP
+ * response was ever received). Callers use `instanceof RelayTimeoutError` to identify it as a
  * transport failure to fail closed on, distinct from a relay {@link RelayError} HTTP status.
  */
 export class RelayTimeoutError extends Error {

@@ -308,9 +308,8 @@ function verifyToDecision(
  */
 function isPreDeadlineTransportFailure(err: unknown): boolean {
   if (err instanceof RelayTimeoutError) return true;
-  // A connection-level fetch failure (no HTTP response). RelayError extends Error but is caught by
-  // the explicit instanceof above being false for it — guard on the name to avoid treating an
-  // HTTP-status RelayError as transport.
+  // A connection-level fetch failure (no HTTP response). `RelayError extends Error` but not
+  // `TypeError`, so the `instanceof TypeError` check correctly excludes it.
   if (err instanceof TypeError) return true;
   return false;
 }
