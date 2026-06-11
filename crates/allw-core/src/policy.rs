@@ -166,6 +166,10 @@ pub struct CommandMatcher {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub argv_exact: Option<Vec<String>>,
 
+    /// Exact raw command string, used only when an integrator cannot provide argv.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub raw_exact: Option<String>,
+
     /// Required flag tokens.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub flags: Vec<String>,
@@ -189,6 +193,13 @@ impl CommandMatcher {
             .argv_exact
             .as_ref()
             .is_some_and(|argv| syntactic.argv.as_ref() != Some(argv))
+        {
+            return false;
+        }
+        if self
+            .raw_exact
+            .as_ref()
+            .is_some_and(|raw| syntactic.raw.as_ref() != Some(raw))
         {
             return false;
         }
@@ -322,27 +333,26 @@ pub struct UnsignedPolicyRule {
 
 impl UnsignedPolicyRule {
     /// Build the rule emitted by the "approve and don't ask again" affordance.
-    #[must_use]
     pub fn from_approval(
         id: &str,
         actor: &Actor,
         action: &ActionRecord,
         scope: PolicyRuleScope,
         created_at: i64,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, PolicyRuleBuildError> {
+        Ok(Self {
             id: id.to_string(),
             subject: ActorMatcher::Id {
                 id: actor.id.clone(),
             },
-            predicate: predicate_from_approval(action, scope),
+            predicate: predicate_from_approval(action, scope)?,
             effect: PolicyEffect::Allow,
             bounds: None,
             provenance: PolicyProvenance::FromApproval,
             tier: PolicyTier::Syntactic,
             created_at,
             expires_at: None,
-        }
+        })
     }
 }
 
@@ -420,6 +430,25 @@ impl std::fmt::Display for PolicyRuleError {
 }
 
 impl std::error::Error for PolicyRuleError {}
+
+/// Errors returned while deriving a standing policy rule from a one-shot approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyRuleBuildError {
+    UnrepresentableExactCommand,
+}
+
+impl std::fmt::Display for PolicyRuleBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnrepresentableExactCommand => write!(
+                f,
+                "exact command policy requires either argv or raw command text"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PolicyRuleBuildError {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PolicyJwsHeader {
@@ -532,34 +561,43 @@ fn evaluate_inner(
     }
 }
 
-fn predicate_from_approval(action: &ActionRecord, scope: PolicyRuleScope) -> PolicyPredicate {
+fn predicate_from_approval(
+    action: &ActionRecord,
+    scope: PolicyRuleScope,
+) -> Result<PolicyPredicate, PolicyRuleBuildError> {
     match scope {
         PolicyRuleScope::ExactCall => exact_call_predicate(action),
-        PolicyRuleScope::CommandOrToolAnyArgs => command_or_tool_predicate(action),
-        PolicyRuleScope::McpParamEquals { path } => mcp_param_equals_predicate(action, &path),
+        PolicyRuleScope::CommandOrToolAnyArgs => Ok(command_or_tool_predicate(action)),
+        PolicyRuleScope::McpParamEquals { path } => Ok(mcp_param_equals_predicate(action, &path)),
         PolicyRuleScope::ArgsAnyGlob { pattern } => {
             let mut predicate = command_or_tool_predicate(action);
             if action.surface == Surface::Command {
                 predicate = predicate.with_args_any_glob(&pattern);
             }
-            predicate
+            Ok(predicate)
         }
     }
 }
 
-fn exact_call_predicate(action: &ActionRecord) -> PolicyPredicate {
+fn exact_call_predicate(action: &ActionRecord) -> Result<PolicyPredicate, PolicyRuleBuildError> {
     match action.surface {
         Surface::Command => {
             let mut matcher = CommandMatcher::default();
             matcher.bin.clone_from(&action.syntactic.bin);
-            matcher.argv_exact.clone_from(&action.syntactic.argv);
-            PolicyPredicate {
+            if let Some(argv) = &action.syntactic.argv {
+                matcher.argv_exact = Some(argv.clone());
+            } else if let Some(raw) = &action.syntactic.raw {
+                matcher.raw_exact = Some(raw.clone());
+            } else {
+                return Err(PolicyRuleBuildError::UnrepresentableExactCommand);
+            }
+            Ok(PolicyPredicate {
                 surface: Some(Surface::Command),
                 command: Some(matcher),
                 mcp: None,
-            }
+            })
         }
-        Surface::McpToolCall => PolicyPredicate {
+        Surface::McpToolCall => Ok(PolicyPredicate {
             surface: Some(Surface::McpToolCall),
             command: None,
             mcp: Some(McpMatcher {
@@ -568,7 +606,7 @@ fn exact_call_predicate(action: &ActionRecord) -> PolicyPredicate {
                 params_exact: action.syntactic.params.clone(),
                 params: Vec::new(),
             }),
-        },
+        }),
     }
 }
 

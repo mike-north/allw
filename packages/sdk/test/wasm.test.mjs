@@ -227,6 +227,87 @@ test("policy_rule_from_approval signs an exact-call rule evaluate_policy can aut
   assert.equal(escalated.decision, "escalate", "exact-call rules must not become scoped verdicts");
 });
 
+test("policy_rule_from_approval keeps raw-only exact command rules narrow", async () => {
+  const wasm = await loadWasm();
+  const deviceSeed = Buffer.alloc(32, 0x42).toString("base64url");
+  const devicePubkey = wasm.ed25519_public_key(deviceSeed);
+  const actor = { id: "machine:macbook", kind: "claude-code" };
+  const action = {
+    record_schema_version: 1,
+    surface: "command",
+    syntactic: { raw: "git push --force origin main" },
+    risk: "high",
+  };
+
+  const rule = JSON.parse(
+    wasm.policy_rule_from_approval(
+      "approval-raw-exact",
+      JSON.stringify(actor),
+      JSON.stringify(action),
+      JSON.stringify({ kind: "exact_call" }),
+      1700000000000,
+      "device:phone",
+      deviceSeed,
+    ),
+  );
+  assert.equal(
+    rule.match.command.raw_exact,
+    action.syntactic.raw,
+    "raw-only exact rules bind to the exact raw command text",
+  );
+
+  const allowed = JSON.parse(
+    wasm.evaluate_policy(
+      JSON.stringify(action),
+      JSON.stringify(actor),
+      JSON.stringify([rule]),
+      devicePubkey,
+    ),
+  );
+  assert.equal(allowed.decision, "allow");
+
+  const changedAction = {
+    ...action,
+    syntactic: { raw: "git push --force-with-lease origin main" },
+  };
+  const escalated = JSON.parse(
+    wasm.evaluate_policy(
+      JSON.stringify(changedAction),
+      JSON.stringify(actor),
+      JSON.stringify([rule]),
+      devicePubkey,
+    ),
+  );
+  assert.equal(escalated.decision, "escalate", "changed raw command text must not match");
+});
+
+test("policy_rule_from_approval rejects bin-only exact command rules", async () => {
+  const wasm = await loadWasm();
+  const deviceSeed = Buffer.alloc(32, 0x42).toString("base64url");
+  const actor = { id: "machine:macbook", kind: "claude-code" };
+  const action = {
+    record_schema_version: 1,
+    surface: "command",
+    syntactic: { bin: "git" },
+    risk: "high",
+  };
+
+  assert.throws(
+    () =>
+      wasm.policy_rule_from_approval(
+        "approval-bin-only",
+        JSON.stringify(actor),
+        JSON.stringify(action),
+        JSON.stringify({ kind: "exact_call" }),
+        1700000000000,
+        "device:phone",
+        deviceSeed,
+      ),
+    /exact command policy requires either argv or raw command text/,
+    "bin-only commands are too broad for exact-call policy emission",
+  );
+});
+
 test("evaluate_policy verifies signed rules and applies deny over ask over allow", async () => {
   const wasm = await loadWasm();
   const deviceSeed = Buffer.alloc(32, 0x42).toString("base64url");

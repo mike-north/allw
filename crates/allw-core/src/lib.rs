@@ -48,6 +48,6 @@ pub use mcp::action_from_mcp_tool_call;
 pub use policy::{
     evaluate, evaluate_for_actor, sign_policy_rule, verify_policy_rule, ActorMatcher,
     CommandMatcher, McpMatcher, ParamMatcher, PolicyEffect, PolicyEvaluation, PolicyPredicate,
-    PolicyProvenance, PolicyRule, PolicyRuleError, PolicyRuleScope, PolicyTier, UnsignedPolicyRule,
-    VerifiedPolicyRule,
+    PolicyProvenance, PolicyRule, PolicyRuleBuildError, PolicyRuleError, PolicyRuleScope,
+    PolicyTier, UnsignedPolicyRule, VerifiedPolicyRule,
 };

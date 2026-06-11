@@ -1,8 +1,8 @@
 use allw_core::{
     action_from_argv, action_from_mcp_tool_call, evaluate, evaluate_for_actor, sign_policy_rule,
     verify_policy_rule, Actor, Approver, CommandContext, Decision, PolicyDecision, PolicyEffect,
-    PolicyPredicate, PolicyProvenance, PolicyRuleScope, PolicyTier, SigningKeyPair,
-    UnsignedPolicyRule, Verdict,
+    PolicyPredicate, PolicyProvenance, PolicyRuleScope, PolicyTier, Risk, SigningKeyPair, Surface,
+    SyntacticSubstrate, UnsignedPolicyRule, Verdict,
 };
 use serde_json::json;
 
@@ -30,6 +30,17 @@ fn signed(rule: UnsignedPolicyRule) -> allw_core::VerifiedPolicyRule {
 fn git_force_action() -> allw_core::ActionRecord {
     let argv = ["git", "push", "--force", "origin", "main"].map(String::from);
     action_from_argv(&argv, &CommandContext::default())
+}
+
+fn command_action_with_syntactic(syntactic: SyntacticSubstrate) -> allw_core::ActionRecord {
+    allw_core::ActionRecord {
+        record_schema_version: 1,
+        surface: Surface::Command,
+        syntactic,
+        risk: Risk::High,
+        capabilities: None,
+        scope: None,
+    }
 }
 
 #[test]
@@ -128,7 +139,8 @@ fn from_approval_exact_call_round_trips_and_allows_only_the_same_command() {
         &action,
         PolicyRuleScope::ExactCall,
         1_700_000_000_000,
-    );
+    )
+    .expect("tokenized command can emit an exact-call rule");
     assert_eq!(unsigned.provenance, PolicyProvenance::FromApproval);
     assert_eq!(unsigned.tier, PolicyTier::Syntactic);
     assert_eq!(unsigned.effect, PolicyEffect::Allow);
@@ -155,6 +167,80 @@ fn from_approval_exact_call_round_trips_and_allows_only_the_same_command() {
 }
 
 #[test]
+fn from_approval_exact_call_uses_raw_command_when_argv_is_unavailable() {
+    let actor = actor();
+    let action = command_action_with_syntactic(SyntacticSubstrate {
+        bin: None,
+        argv: None,
+        flags: None,
+        positionals: None,
+        cwd: None,
+        host: None,
+        env_refs: None,
+        server: None,
+        tool: None,
+        params: None,
+        raw: Some("git push --force origin main".to_string()),
+    });
+    let verified = signed(
+        UnsignedPolicyRule::from_approval(
+            "approval-raw-exact",
+            &actor,
+            &action,
+            PolicyRuleScope::ExactCall,
+            1_700_000_000_000,
+        )
+        .expect("raw command text is enough to emit an exact-call rule"),
+    );
+
+    assert_eq!(
+        evaluate_for_actor(&actor, &action, std::slice::from_ref(&verified)).decision,
+        PolicyDecision::Allow,
+        "the exact-call rule should match the raw command it was emitted from"
+    );
+
+    let changed_action = command_action_with_syntactic(SyntacticSubstrate {
+        raw: Some("git push --force-with-lease origin main".to_string()),
+        ..action.syntactic
+    });
+    assert_eq!(
+        evaluate_for_actor(&actor, &changed_action, &[verified]).decision,
+        PolicyDecision::Escalate,
+        "raw-only exact-call rules must not widen to every command"
+    );
+}
+
+#[test]
+fn from_approval_exact_call_rejects_unrepresentable_command_shape() {
+    let actor = actor();
+    let action = command_action_with_syntactic(SyntacticSubstrate {
+        bin: Some("git".to_string()),
+        argv: None,
+        flags: None,
+        positionals: None,
+        cwd: None,
+        host: None,
+        env_refs: None,
+        server: None,
+        tool: None,
+        params: None,
+        raw: None,
+    });
+
+    assert!(
+        UnsignedPolicyRule::from_approval(
+            "approval-bin-only",
+            &actor,
+            &action,
+            PolicyRuleScope::ExactCall,
+            1_700_000_000_000,
+        )
+        .is_err(),
+        "a bin-only command cannot safely become an exact-call allow rule"
+    );
+}
+
+#[test]
 fn from_approval_mcp_param_rule_allows_matching_future_call_only() {
     let actor = actor();
     let action = action_from_mcp_tool_call(
@@ -162,15 +248,18 @@ fn from_approval_mcp_param_rule_allows_matching_future_call_only() {
         "delete_project",
         json!({ "project_id": "abc", "list": "Agent Inbox" }),
     );
-    let verified = signed(UnsignedPolicyRule::from_approval(
-        "approval-param",
-        &actor,
-        &action,
-        PolicyRuleScope::McpParamEquals {
-            path: "list".to_string(),
-        },
-        1_700_000_000_000,
-    ));
+    let verified = signed(
+        UnsignedPolicyRule::from_approval(
+            "approval-param",
+            &actor,
+            &action,
+            PolicyRuleScope::McpParamEquals {
+                path: "list".to_string(),
+            },
+            1_700_000_000_000,
+        )
+        .expect("MCP param rule can be emitted from an MCP action"),
+    );
 
     let matching = action_from_mcp_tool_call(
         "omnifocus",

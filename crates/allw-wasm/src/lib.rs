@@ -485,7 +485,8 @@ pub fn policy_rule_from_approval(
     let seed = decode_b64_32(device_seed_b64, "device_seed_b64")?;
     let device_key = SigningKeyPair::from_seed(&seed);
 
-    let unsigned = UnsignedPolicyRule::from_approval(id, &actor, &action, scope, created_at);
+    let unsigned = UnsignedPolicyRule::from_approval(id, &actor, &action, scope, created_at)
+        .map_err(|e| JsError::new(&format!("policy_rule_from_approval failed: {e}")))?;
     let rule = core_sign_policy_rule(&unsigned, device_id, &device_key);
     to_json(&rule, "PolicyRule")
 }
