@@ -46,8 +46,9 @@ export interface AllwWasm {
   /**
    * Verifies a `Verdict` JSON against the request, the human-shown context, and the approver's
    * account-root Ed25519 public key (base64url). Returns
-   * `{ approved: true, device_id, decided_at }` JSON on success; **throws** on any verification
-   * failure — including an authenticated non-approval (the message names the verified decision).
+   * `{ approved: true, device_id, decided_at, nonce_b64 }` JSON on success; **throws** on any
+   * verification failure — including an authenticated non-approval (the message names the verified
+   * decision).
    */
   verify_verdict(
     verdictJson: string,
