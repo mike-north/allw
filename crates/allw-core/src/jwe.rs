@@ -64,7 +64,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand_core::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
+use x25519_dalek::{PublicKey as XPublicKey, SharedSecret, StaticSecret};
 
 use crate::contract::ApprovalContext;
 
@@ -141,9 +141,39 @@ impl X25519KeyPair {
         }
     }
 
-    /// ECDH against `their_public` → the 32-byte shared secret `Z`.
-    fn diffie_hellman(&self, their_public: &XPublicKey) -> [u8; X25519_LEN] {
-        self.secret.diffie_hellman(their_public).to_bytes()
+    /// ECDH against `their_public` → the raw [`SharedSecret`].
+    ///
+    /// Returns the dalek `SharedSecret` (not yet the bytes) so the caller can enforce the
+    /// non-contributory check via [`checked_shared_secret`] before the value is used. X25519 is
+    /// infallible (RFC 7748), so this never errors — a *degenerate* (all-zero / low-order) result
+    /// is rejected one layer up.
+    fn diffie_hellman(&self, their_public: &XPublicKey) -> SharedSecret {
+        self.secret.diffie_hellman(their_public)
+    }
+}
+
+/// Rejects a **non-contributory** (degenerate) ECDH shared secret before it is used to derive a
+/// KEK, returning the 32-byte `Z` only when the exchange was contributory.
+///
+/// # Why this guard exists (RFC 7748 §6.1, RFC 7518 §4.6)
+///
+/// The peer's public point (`epk` on decrypt; the recipient key on encrypt) is **attacker- or
+/// caller-controlled**, and the device key is **long-term static**. For a *low-order* peer point
+/// X25519 produces a fixed, publicly-known shared secret `Z` — the all-zero output is the point at
+/// infinity. [`SharedSecret::was_contributory`] is exactly the check for this: it is `false` iff
+/// the resulting point is the identity (the low-order / all-zero case). Deriving a KEK from such a
+/// `Z` is the standard ECDH hardening gap (RFC 7748 §6.1: "implementations MAY reject ... the
+/// all-zero output"), so we reject **before** [`derive_kek`] ever sees `Z`.
+///
+/// `was_contributory()` is constant-time (it compares the Montgomery point against the identity in
+/// constant time), so this guard adds **no** secret-dependent timing signal beyond the single
+/// pass/fail bit, and that bit (`DegenerateSharedSecret`) is reported uniformly on both the encrypt
+/// and decrypt paths — see the oracle note in [`decrypt_context`].
+fn checked_shared_secret(shared: &SharedSecret) -> Result<[u8; X25519_LEN], JweError> {
+    if shared.was_contributory() {
+        Ok(shared.to_bytes())
+    } else {
+        Err(JweError::DegenerateSharedSecret)
     }
 }
 
@@ -200,6 +230,11 @@ pub enum JweError {
     NoRecipientForDevice,
     /// The recipient's `epk` was not a well-formed `{kty:"OKP",crv:"X25519",x:<32 bytes>}`.
     BadEpk,
+    /// The X25519 ECDH against `epk` (decrypt) or the recipient key (encrypt) produced a
+    /// **non-contributory** shared secret — a low-order / all-zero `Z` (the point at infinity).
+    /// Deriving a KEK from such a `Z` is rejected (RFC 7748 §6.1); `epk` is attacker-controllable,
+    /// so this is a security gate, not a benign malformed-input case.
+    DegenerateSharedSecret,
     /// AES Key Wrap unwrap of `encrypted_key` failed (wrong KEK → wrong device key).
     KeyUnwrapFailed,
     /// AES-256-GCM authentication/decryption failed (wrong CEK, or tampered iv/ct/tag/AAD).
@@ -216,6 +251,9 @@ impl std::fmt::Display for JweError {
             Self::UnsupportedEnc => "protected header enc is not A256GCM",
             Self::NoRecipientForDevice => "no recipient header kid matches the requested device id",
             Self::BadEpk => "recipient epk is not a valid OKP/X25519 public key",
+            Self::DegenerateSharedSecret => {
+                "X25519 ECDH produced a non-contributory (low-order / all-zero) shared secret"
+            }
             Self::KeyUnwrapFailed => "AES key-wrap unwrap of the encrypted_key failed",
             Self::DecryptionFailed => "AES-256-GCM authentication/decryption failed",
             Self::InvalidPlaintext => "decrypted plaintext is not a valid ApprovalContext",
@@ -344,7 +382,9 @@ fn derive_kek(z: &[u8; X25519_LEN]) -> [u8; KEK_LEN] {
 /// # Panics
 ///
 /// Panics if `recipients` is empty — that would emit a JWE no device can ever decrypt, which is
-/// always a programmer error (encryption must target at least one enrolled device). Also panics
+/// always a programmer error (encryption must target at least one enrolled device). Also panics if
+/// a recipient's X25519 public key is a low-order point (the ECDH shared secret is degenerate /
+/// non-contributory) — a bad enrollment key, not a runtime-input failure. Also panics
 /// only on internal invariants that cannot occur for well-formed inputs: serializing the
 /// (in-memory, always-serializable) [`ApprovalContext`] to JSON, AES-GCM encryption of an
 /// in-memory buffer, or AES-KW wrapping a 32-byte CEK. These are programming-error guards, not
@@ -405,10 +445,20 @@ pub fn encrypt_context(
         let eph_secret = StaticSecret::from(eph_seed);
         let eph_public = XPublicKey::from(&eph_secret);
 
-        // Z = ECDH(ephemeral_secret, device_static_public)
-        let z = eph_secret
-            .diffie_hellman(&recipient.public_key.inner)
-            .to_bytes();
+        // Z = ECDH(ephemeral_secret, device_static_public). Reject a non-contributory (low-order /
+        // all-zero) Z *before* deriving the KEK — same guard as the decrypt path. On encrypt a
+        // degenerate Z means the recipient public key is a low-order point, i.e. a bad/forged
+        // enrollment key; that is a programmer/enrollment error (encryption targets are vetted at
+        // enrollment), so we fail loud rather than emit a JWE whose KEK is derived from a publicly-
+        // known Z. See `checked_shared_secret` for the rationale (RFC 7748 §6.1).
+        let shared = eph_secret.diffie_hellman(&recipient.public_key.inner);
+        let z = checked_shared_secret(&shared).unwrap_or_else(|_| {
+            panic!(
+                "encrypt_context: recipient '{}' has a low-order X25519 public key (degenerate \
+                 ECDH shared secret) — encryption targets must be valid enrolled device keys",
+                recipient.device_id
+            )
+        });
         // KEK = ConcatKDF(SHA-256, Z, 256, OtherInfo)
         let kek_bytes = derive_kek(&z);
         // encrypted_key = AES-256-KeyWrap(KEK, CEK)
@@ -460,7 +510,9 @@ fn b64(field: &str) -> Result<Vec<u8>, JweError> {
 /// 1. Parse the General JWE JSON and the base64url protected header; require `enc == "A256GCM"`.
 /// 2. Find the recipient whose `kid == device_id` ([`JweError::NoRecipientForDevice`]); require
 ///    its `alg == "ECDH-ES+A256KW"`.
-/// 3. `Z = ECDH(device_static_secret, recipient.epk)`; `KEK = ConcatKDF(SHA-256, Z, 256, …)`.
+/// 3. `Z = ECDH(device_static_secret, recipient.epk)`, **rejecting a non-contributory (low-order /
+///    all-zero) `Z`** ([`JweError::DegenerateSharedSecret`]); then `KEK = ConcatKDF(SHA-256, Z,
+///    256, …)`.
 /// 4. `CEK = AES-256-KeyUnwrap(KEK, encrypted_key)` ([`JweError::KeyUnwrapFailed`]).
 /// 5. AES-256-GCM-decrypt `ciphertext`/`tag` with `iv` and `AAD = ASCII(b64url(protected))`
 ///    ([`JweError::DecryptionFailed`]).
@@ -470,6 +522,22 @@ fn b64(field: &str) -> Result<Vec<u8>, JweError> {
 ///
 /// Returns the first matching [`JweError`] variant (see the step list above). A wrong device key
 /// surfaces as [`JweError::KeyUnwrapFailed`] or [`JweError::DecryptionFailed`] — never a panic.
+///
+/// # Error-variant distinguishability (ECDH oracle)
+///
+/// This path returns *distinct* variants at successive steps (`BadEpk` →
+/// `DegenerateSharedSecret` → `KeyUnwrapFailed` → `DecryptionFailed`), which is a small oracle for
+/// a party that can submit crafted JWEs and observe outcomes. The security-relevant case — a
+/// **low-order `epk`** forcing a publicly-known `Z` — is now rejected uniformly at step 3 with
+/// `DegenerateSharedSecret` *before* any key material is derived from `Z`, so it leaks no
+/// secret-dependent information (it is a deterministic property of the public `epk` alone, computed
+/// in constant time by [`SharedSecret::was_contributory`]). The remaining `KeyUnwrapFailed` vs
+/// `DecryptionFailed` distinction reflects only *which authenticated stage* failed for a
+/// **contributory** `Z`; neither outcome is a function of the device secret beyond the single
+/// "is this the right key" bit that any AEAD necessarily exposes, so it is not an additional ECDH
+/// oracle. Folding those two into one opaque variant was considered and deliberately not done: it
+/// would degrade diagnosability without closing a real channel. Constant-time discipline beyond the
+/// `was_contributory` check is out of scope for v1 (see issue #38).
 pub fn decrypt_context(
     jwe: &str,
     device_id: &str,
@@ -507,7 +575,12 @@ pub fn decrypt_context(
     let epk = XPublicKey::from(epk_bytes);
 
     // ── Step 3: Z = ECDH(device_secret, epk); KEK = ConcatKDF(SHA-256, Z, …) ──
-    let z = device_key.diffie_hellman(&epk);
+    // `epk` is attacker-controllable (a malicious/compromised relay can replay a crafted JWE), and
+    // the device key is long-term static. Reject a non-contributory (low-order / all-zero) Z here,
+    // *before* deriving the KEK, so we never key-wrap-unwrap against a publicly-known Z (RFC 7748
+    // §6.1). See `checked_shared_secret` for the rationale and the constant-time property.
+    let shared = device_key.diffie_hellman(&epk);
+    let z = checked_shared_secret(&shared)?;
     let kek_bytes = derive_kek(&z);
 
     // ── Step 4: unwrap the CEK ──
@@ -1068,6 +1141,122 @@ mod tests {
         let err = decrypt_context(&bad, DEV1_ID, &device(&DEV1_SEED))
             .expect_err("a 16-byte epk must be rejected");
         assert_eq!(err, JweError::BadEpk);
+    }
+
+    // ── Degenerate ECDH: low-order epk forces an all-zero / non-contributory Z (issue #38) ──
+    //
+    // X25519 has a cofactor-8 small subgroup; a handful of canonical low-order Montgomery-u points
+    // drive the ECDH result to the point at infinity (an all-zero shared secret) for ANY scalar.
+    // These are the standard RFC 7748 §6.1 / libsodium blocklist points. A relay/sender that
+    // replays a JWE with such an `epk` must be rejected at `DegenerateSharedSecret` BEFORE any KEK
+    // is derived from the publicly-known Z — otherwise the wrap/unwrap proceeds against a Z the
+    // attacker dictates.
+    //
+    // @see https://www.rfc-editor.org/rfc/rfc7748#section-6.1
+    // @see https://cr.yp.to/ecdh.html (the low-order points of Curve25519)
+
+    /// The canonical low-order X25519 u-coordinates whose ECDH output is the identity (all-zero Z)
+    /// for every scalar. Drawn from the RFC 7748 / libsodium small-subgroup blocklist.
+    const LOW_ORDER_POINTS: &[[u8; X25519_LEN]] = &[
+        // 0 — the all-zero point (order 1: point at infinity). RFC 7748 §6.1 names this explicitly.
+        [0u8; X25519_LEN],
+        // 1 — order 4.
+        {
+            let mut p = [0u8; X25519_LEN];
+            p[0] = 1;
+            p
+        },
+        // The order-8 point 325606250916557431795983626356110631294008115727848805560023387167927233504.
+        [
+            0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f,
+            0xc4, 0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16,
+            0x5f, 0x49, 0xb8, 0x00,
+        ],
+        // The order-8 point 39382357235489614581723060781553021112529911719440698176882885853963445705823.
+        [
+            0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83,
+            0xef, 0x5b, 0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd,
+            0xd0, 0x9f, 0x11, 0x57,
+        ],
+        // p-1 (the largest valid u), order 2: 2^255 - 20.
+        [
+            0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0x7f,
+        ],
+    ];
+
+    /// Re-encodes `jwe` with the recipient[0] `epk.x` replaced by `point` (kty/crv left intact).
+    fn jwe_with_epk(jwe: &str, point: &[u8; X25519_LEN]) -> String {
+        let mut val: Value = serde_json::from_str(jwe).unwrap();
+        val["recipients"][0]["header"]["epk"]["x"] = Value::String(URL_SAFE_NO_PAD.encode(point));
+        serde_json::to_string(&val).unwrap()
+    }
+
+    /// Unit-level: every canonical low-order point yields a non-contributory shared secret against a
+    /// real device key, so `checked_shared_secret` rejects it. This pins the mechanism (the
+    /// `was_contributory` bit) independently of the JWE plumbing.
+    #[test]
+    fn low_order_points_are_non_contributory() {
+        let device = device(&DEV1_SEED);
+        for point in LOW_ORDER_POINTS {
+            let epk = XPublicKey::from(*point);
+            let shared = device.diffie_hellman(&epk);
+            assert!(
+                !shared.was_contributory(),
+                "low-order point {point:02x?} must produce a non-contributory (degenerate) Z"
+            );
+            assert_eq!(
+                checked_shared_secret(&shared),
+                Err(JweError::DegenerateSharedSecret),
+                "checked_shared_secret must reject the degenerate Z for {point:02x?}"
+            );
+        }
+    }
+
+    /// End-to-end decrypt: a JWE whose `epk` is a canonical low-order X25519 point is rejected with
+    /// `DegenerateSharedSecret` — BEFORE key-unwrap/GCM, so it is NOT misreported as the generic
+    /// `KeyUnwrapFailed`/`DecryptionFailed` (which would leak a different oracle bit). This is the
+    /// core security assertion for issue #38.
+    #[test]
+    fn decrypt_rejects_low_order_epk() {
+        let jwe = encrypt_to_one();
+        for point in LOW_ORDER_POINTS {
+            let bad = jwe_with_epk(&jwe, point);
+            let err = decrypt_context(&bad, DEV1_ID, &device(&DEV1_SEED))
+                .expect_err("a low-order epk must be rejected before KEK derivation");
+            assert_eq!(
+                err,
+                JweError::DegenerateSharedSecret,
+                "low-order epk {point:02x?} must reject as DegenerateSharedSecret, not a \
+                 downstream unwrap/GCM failure"
+            );
+        }
+    }
+
+    /// The all-zero `epk` (the point at infinity, RFC 7748 §6.1's named case) is the canonical
+    /// probe: it must be caught at step 3, not silently used to derive a publicly-known KEK.
+    #[test]
+    fn decrypt_rejects_all_zero_epk() {
+        let jwe = encrypt_to_one();
+        let bad = jwe_with_epk(&jwe, &[0u8; X25519_LEN]);
+        let err = decrypt_context(&bad, DEV1_ID, &device(&DEV1_SEED))
+            .expect_err("an all-zero epk must be rejected");
+        assert_eq!(err, JweError::DegenerateSharedSecret);
+    }
+
+    /// `encrypt_context` panics when a recipient public key is a low-order point: a degenerate Z on
+    /// the encrypt side is a bad/forged enrollment key (programmer error), not a runtime failure.
+    #[test]
+    #[should_panic(expected = "low-order X25519 public key")]
+    fn encrypt_rejects_low_order_recipient_key() {
+        // The all-zero u-coordinate as a recipient device public key.
+        let bad_pub = X25519PublicKey::from_bytes(&[0u8; X25519_LEN]);
+        let recipients = [ContextRecipient {
+            device_id: DEV1_ID,
+            public_key: &bad_pub,
+        }];
+        let _ = encrypt_context(&make_context(), &recipients, &mut rng());
     }
 
     /// Garbage (non-JSON) input → Malformed (clean, no panic).
