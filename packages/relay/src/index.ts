@@ -12,7 +12,7 @@
  * # Auth note (deferred — issue #10 scope)
  * The endpoints below implement registry mechanics only. Endpoint authn/authz — who is allowed
  * to start a pairing, enroll an actor key, or revoke a device — is out of scope for #10 and
- * will be added alongside the enrollment mini-spec from `docs/contract.md §Open decisions`.
+ * must follow `docs/enrollment.md`.
  */
 
 import { PAIRING_TTL_MS } from "./constants.js";
@@ -248,8 +248,7 @@ function json(data: unknown, status = 200): Response {
  *
  * # Auth note (deferred — issue #10 scope)
  * Endpoint authn/authz (who may start pairing, enroll actors, revoke devices) is deliberately
- * out of scope for this PR. It will be added with the enrollment mini-spec referenced in
- * `docs/contract.md §Open decisions: "Account / device enrollment, key rotation & revocation."
+ * out of scope for this PR. The production rules are specified in `docs/enrollment.md`.
  */
 export class AccountRelay implements DurableObject {
   private readonly sql: SqlStorage;

@@ -10,6 +10,7 @@ code is currently a skeleton built down from those decisions. **Read the relevan
 implementing** — the architecture only makes sense across several docs together:
 
 - `docs/contract.md` — the approval-primitive contract (the keystone everything else consumes).
+- `docs/enrollment.md` — account/device enrollment, rotation, revocation, and recovery.
 - `docs/policy-seam.md` — the policy layer's `ActionRecord` and its syntactic-first tiering.
 - `docs/architecture.md` — tech-stack and system-design decisions (and their rationale).
 - `docs/positioning.md` — the product thesis (why decisions are shaped the way they are).
