@@ -150,10 +150,12 @@ function renderActionHeadline(action: ActionRecord): string {
  * apply (e.g. a bare `raw` command with no cwd/env).
  *
  * Includes the **anti-divergence** lines (`docs/contract.md` §Invariant #3): `argv`/`flags`/
- * `positionals` are all bound into `request_hash` but were not previously rendered on the `raw`
- * path. The `Argv:` line appears whenever the reconstructed `bin`/`argv` command **diverges** from
- * the `raw` headline (a benign `raw` can otherwise mask a dangerous hashed `argv`); `Flags:` and
- * `Positionals:` always appear when present. All are display-only and never change the hash.
+ * `positionals` (command surface) and `server`/`tool` (MCP surface) are all bound into
+ * `request_hash` but were not previously rendered on the `raw` path — so a benign `raw` (e.g.
+ * `"echo hello"`) could mask a dangerous hashed `argv` OR a dangerous `server`/`tool`
+ * (`fs :: delete_all_files`). The `Argv:` line appears whenever the reconstructed `bin`/`argv`
+ * command **diverges** from the `raw` headline; `Flags:`, `Positionals:`, and the `MCP:` line always
+ * appear when present, regardless of which headline path ran. All are display-only — never the hash.
  */
 function substrateDetailLines(action: ActionRecord): string[] {
   const syntactic = action.syntactic;
@@ -193,6 +195,15 @@ function substrateDetailLines(action: ActionRecord): string[] {
   const envRefs = readStringArray(syntactic, "env_refs");
   if (envRefs !== undefined && envRefs.length > 0) {
     lines.push(`  Env refs:   ${envRefs.join(", ")}`);
+  }
+
+  // MCP server/tool are hash-bound but were rendered on NO line when a `raw` headline ran — so a
+  // benign `raw` ("echo hello") could mask a dangerous `fs :: delete_all_files`. Surface them on an
+  // unconditional labeled line whenever both are present (mirrors the command-surface fix; #56).
+  const tool = readString(syntactic, "tool");
+  const server = readString(syntactic, "server");
+  if (server !== undefined && tool !== undefined) {
+    lines.push(`  MCP:        ${server} :: ${tool}`);
   }
 
   // MCP params are the entire call payload — show them in full (compact JSON), never elided.

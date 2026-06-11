@@ -81,10 +81,12 @@ A `{ type: "retract" }` (another device resolved it) clears the pending prompt.
 
 #### WYSIWYS render
 
-The full meaning-changing substrate is shown — never elided behind a `raw` summary. The `argv`,
-`flags`, `positionals`, `cwd`, `host`, `env_refs`, and MCP `params` fields all change what an
-otherwise-identical command does and are **all bound into `request_hash`**, so each gets its own
-labeled line (the headline alone is never the whole story):
+The full meaning-changing substrate is shown — never elided behind a `raw` summary. The reconstructed
+command (or MCP `server :: tool`) is the **`Action:` headline**; the remaining hash-bound fields —
+`flags`, `positionals`, `cwd`, `host`, `env_refs`, MCP `server`/`tool`, and MCP `params` — each get
+their own labeled line when present, so the headline alone is never the whole story. (`argv` is
+normally the headline itself; it only also appears on a separate `Argv:` line when it **diverges**
+from a `raw` headline — see below.)
 
 ```
 ────────────────────────────────────────────────────────────────────────
@@ -121,6 +123,16 @@ renderer surfaces the reconstructed form on a labeled `Argv:` line:
   Action:     git status
   Surface:    command
   Argv:       git push --force origin main      ← hash-bound argv, surfaced because it diverges from raw
+```
+
+The same hiding vector exists on the **MCP surface**: a benign `raw` ("echo hello") can co-exist with
+a hash-bound `server`/`tool` (`fs :: delete_all_files`) and **no `params`**, so `server`/`tool` get
+their own unconditional labeled line whenever present:
+
+```
+  Action:     echo hello
+  Surface:    mcp_tool_call
+  MCP:        fs :: delete_all_files            ← hash-bound server/tool, surfaced even behind a benign raw
 ```
 
 This is **display-only** — it never changes the bytes bound into `request_hash`.

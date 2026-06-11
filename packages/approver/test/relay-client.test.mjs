@@ -246,21 +246,34 @@ test("runPair self-drives start+complete, mints a device_cert, and persists pair
 test("pairingStart ABORTS against a hung relay (fail-closed AbortSignal.timeout — #51 nit)", async () => {
   await loadWasm();
   const relay = await startHungRelay();
+  // Inject a short timeout so the abort is provable without waiting the production 15s. The
+  // assertions below are pinned to THIS value (not the 15s default), so they actually prove the
+  // INJECTED timeout fired — any sub-15s failure would otherwise pass vacuously.
+  const INJECTED_TIMEOUT_MS = 150;
+  // The default must be the real production window — guards against the injected value silently
+  // becoming the default (which would make the timing assertion meaningless).
+  assert.ok(
+    PAIRING_TIMEOUT_MS > INJECTED_TIMEOUT_MS,
+    "the production default must exceed the injected test timeout",
+  );
   try {
     // The relay accepts the socket but never responds. Without the abort, this would hang forever;
-    // with it, the request must reject (aborted) rather than block. A short timeout proves the
-    // pairing is wired through `AbortSignal.timeout` without making the test wait 15s.
+    // with it, the request must reject (aborted via AbortSignal.timeout) rather than block.
     const started = Date.now();
     await assert.rejects(
-      () => pairingStart(relay.url, "acct-hung", undefined, 150),
-      (err) => err instanceof Error,
-      "a hung relay must abort the pairing request, not block indefinitely",
+      () => pairingStart(relay.url, "acct-hung", undefined, INJECTED_TIMEOUT_MS),
+      // Node surfaces an AbortSignal.timeout as a TimeoutError (name), not a generic Error message —
+      // assert specifically so this can't pass on some unrelated transport rejection.
+      (err) => err instanceof Error && err.name === "TimeoutError",
+      "a hung relay must abort the pairing request with a timeout, not block indefinitely",
     );
-    // Sanity: it aborted promptly (well under the production 15s default), proving the timeout fired
-    // rather than some other transport error resolving instantly by luck.
+    // Pinned to the INJECTED timeout: the request must reject within a small multiple of 150ms,
+    // proving the injected timeout (not luck or some 14s-later failure) drove the abort. The slack
+    // (a few × the timeout) absorbs CI scheduling jitter while staying far below the 15s default.
+    const elapsed = Date.now() - started;
     assert.ok(
-      Date.now() - started < PAIRING_TIMEOUT_MS,
-      "the request aborted via the timeout, not after the full production window",
+      elapsed < INJECTED_TIMEOUT_MS * 5,
+      `the request aborted within ~5× the injected ${String(INJECTED_TIMEOUT_MS)}ms timeout (was ${String(elapsed)}ms), proving the injected timeout fired`,
     );
   } finally {
     await relay.close();

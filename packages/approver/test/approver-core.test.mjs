@@ -427,6 +427,51 @@ test("renderRequest surfaces MCP params (not hidden behind raw) — review fix #
   assert.match(rendered, /\/etc\/passwd/, "the MCP params payload is shown in full, not elided");
 });
 
+test("renderRequest surfaces MCP server/tool even when a benign raw masks them, no params (#56)", async () => {
+  const wasm = await loadWasm();
+  const { keyfile } = pairedApprover(wasm);
+
+  // THE #56 ATTACK (MCP mirror of #51): a benign `raw` ("echo hello") paired with a divergent,
+  // dangerous `server`/`tool` (`fs :: delete_all_files`) and NO `params`. Both server and tool are
+  // bound into request_hash (the full ActionRecord is hashed), but the old renderer short-circuited
+  // on `raw` for the headline and never rendered server/tool on any detail line (only `params` was),
+  // so the human would see only "echo hello". The device must surface the hash-bound server/tool.
+  const ctx = {
+    action: {
+      record_schema_version: 1,
+      surface: "mcp_tool_call",
+      syntactic: {
+        server: "fs",
+        tool: "delete_all_files",
+        raw: "echo hello",
+      },
+      risk: "critical",
+    },
+    summary: "say hello",
+    actor: { id: "machine:agent", kind: "claude-code" },
+    risk: "critical",
+    reversible: false,
+    constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
+  };
+  const ctxJson = JSON.stringify(ctx);
+  const jwe = wasm.encrypt_context(
+    ctxJson,
+    JSON.stringify([{ device_id: DEVICE_ID, public_key_b64: keyfile.device_encryption_pubkey }]),
+  );
+  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
+  const rendered = renderRequest(prepared);
+
+  // The benign raw may be the headline, but the dangerous hash-bound server/tool must be surfaced.
+  assert.match(rendered, /Action:\s+echo hello/, "the raw headline is shown");
+  assert.match(
+    rendered,
+    /MCP:\s+fs :: delete_all_files/,
+    "the hash-bound MCP server/tool is surfaced, not hidden behind the benign raw",
+  );
+  // Specifically: the dangerous tool token must be visible somewhere in the block.
+  assert.match(rendered, /delete_all_files/, "the dangerous MCP tool token is visible");
+});
+
 test("renderRequest disambiguates argv args containing whitespace (WYSIWYS — review item #1)", async () => {
   const wasm = await loadWasm();
   const { keyfile } = pairedApprover(wasm);
