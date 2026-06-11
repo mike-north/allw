@@ -8,7 +8,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { DEFAULT_TIMEOUT_MS, readConfig } from "../dist/lib/config.js";
+import {
+  DEFAULT_TIMEOUT_MS,
+  MAX_TIMEOUT_MS,
+  PINNED_HOOK_TIMEOUT_MS,
+  readConfig,
+} from "../dist/lib/config.js";
 
 const FULL = {
   ALLW_RELAY_URL: "https://relay.allw.test",
@@ -83,4 +88,47 @@ test("zero / negative ALLW_TIMEOUT_MS → not ok", () => {
 
 test("non-integer ALLW_TIMEOUT_MS → not ok", () => {
   assert.equal(readConfig({ ...FULL, ALLW_TIMEOUT_MS: "1.5" }).ok, false);
+});
+
+// ── fail-closed: ALLW_TIMEOUT_MS cap (issue #52 — must fire before Claude Code's hook timeout) ────
+
+test("(#52) the pinned hook timeout is below Claude Code's 600s default, the cap below the pin", () => {
+  // The whole ordering invariant: ALLW_TIMEOUT_MS cap < pinned hook timeout < Claude Code default.
+  const CC_DEFAULT_HOOK_TIMEOUT_MS = 600_000;
+  assert.ok(
+    PINNED_HOOK_TIMEOUT_MS < CC_DEFAULT_HOOK_TIMEOUT_MS,
+    "pinned hook timeout must be below Claude Code's 600s default",
+  );
+  assert.ok(
+    MAX_TIMEOUT_MS < PINNED_HOOK_TIMEOUT_MS,
+    "the ALLW_TIMEOUT_MS cap must be strictly below the pinned hook timeout",
+  );
+  assert.ok(
+    PINNED_HOOK_TIMEOUT_MS - MAX_TIMEOUT_MS >= 30_000,
+    "the margin must cover at least one SDK relay-fetch timeout (30s)",
+  );
+  assert.ok(
+    DEFAULT_TIMEOUT_MS < MAX_TIMEOUT_MS,
+    "the default deadline must sit comfortably under the cap",
+  );
+});
+
+test("(#52) ALLW_TIMEOUT_MS just below the cap is accepted", () => {
+  const result = readConfig({ ...FULL, ALLW_TIMEOUT_MS: String(MAX_TIMEOUT_MS - 1) });
+  assert.equal(result.ok, true);
+  assert.equal(result.config.timeoutMs, MAX_TIMEOUT_MS - 1);
+});
+
+test("(#52) ALLW_TIMEOUT_MS exactly at the cap → fail-closed deny", () => {
+  const result = readConfig({ ...FULL, ALLW_TIMEOUT_MS: String(MAX_TIMEOUT_MS) });
+  assert.equal(result.ok, false, "a value at the cap is rejected (must be strictly below)");
+  assert.ok(/too large/.test(result.reason));
+});
+
+test("(#52) an oversized ALLW_TIMEOUT_MS (900000 = 15 min) → fail-closed deny", () => {
+  // The motivating case: a user setting "give me time to reach my phone" (15 min) would push the SDK
+  // deadline past Claude Code's hook timeout, where the outcome rides on undocumented CC behavior.
+  const result = readConfig({ ...FULL, ALLW_TIMEOUT_MS: "900000" });
+  assert.equal(result.ok, false);
+  assert.ok(/too large/.test(result.reason));
 });

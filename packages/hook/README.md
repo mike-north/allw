@@ -20,12 +20,12 @@ hook reimplements none of it. See [`docs/architecture.md`](../../docs/architectu
 
 The hook reads its configuration from the environment, so there is no config file of its own:
 
-| Variable                 | Required | Meaning                                                    |
-| ------------------------ | -------- | ---------------------------------------------------------- |
-| `ALLW_RELAY_URL`         | yes      | Base URL of the zero-knowledge relay.                      |
-| `ALLW_ACCOUNT_ID`        | yes      | The approver's relay account id (routes to their devices). |
-| `ALLW_APPROVER_ROOT_KEY` | yes      | The approver account-root Ed25519 public key (base64url).  |
-| `ALLW_TIMEOUT_MS`        | no       | Fail-closed deadline in ms (default `300000` = 5 minutes). |
+| Variable                 | Required | Meaning                                                                                                                                                                 |
+| ------------------------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ALLW_RELAY_URL`         | yes      | Base URL of the zero-knowledge relay.                                                                                                                                   |
+| `ALLW_ACCOUNT_ID`        | yes      | The approver's relay account id (routes to their devices).                                                                                                              |
+| `ALLW_APPROVER_ROOT_KEY` | yes      | The approver account-root Ed25519 public key (base64url).                                                                                                               |
+| `ALLW_TIMEOUT_MS`        | no       | Fail-closed deadline in ms (default `300000` = 5 minutes; must be **below `420000`** — see [the timeout-ordering invariant](#the-timeout-ordering-invariant-issue-52)). |
 
 Pair an approver device first (e.g. with [`@allw/approver`](../approver)) to obtain the account id and
 the account-root public key.
@@ -43,7 +43,8 @@ call:
         "hooks": [
           {
             "type": "command",
-            "command": "node /absolute/path/to/packages/hook/dist/cli.js"
+            "command": "node /absolute/path/to/packages/hook/dist/cli.js",
+            "timeout": 480
           }
         ]
       }
@@ -54,6 +55,41 @@ call:
 
 > Use an absolute path to `dist/cli.js` (or the resolved `allw-hook` bin). The `command` is run under
 > `node`; there is no native binary to sign or allow-list.
+
+> **Always pin `"timeout"`** (here `480`, in seconds). Without it the hook inherits Claude Code's
+> 600s default, and a too-large `ALLW_TIMEOUT_MS` could let that timeout fire before the hook decides
+> — see [the timeout-ordering invariant](#the-timeout-ordering-invariant-issue-52) below.
+
+### The timeout-ordering invariant (issue #52)
+
+`allw` is fail-closed only because the hook **always emits an explicit `allow`/`deny` (exit 0)
+before any external timeout fires.** This must never depend on what Claude Code does when a hook
+fails to emit a decision, because that behavior is fail-**open** and partly undocumented:
+
+- Claude Code's command-hook `timeout` defaults to **600 seconds**.
+- A hook **timeout** is treated as a _non-blocking error_ → **the tool proceeds** (fail-open). Claude
+  Code's exact behavior on hook timeout is otherwise undocumented and version-dependent.
+- (Likewise, a non-zero, non-2 hook _exit code_ is a non-blocking error → the tool proceeds.)
+
+So we never rely on it. The invariant we control:
+
+> **SDK deadline (`ALLW_TIMEOUT_MS`) + the SDK's per-request relay-fetch timeouts MUST all fire
+> before Claude Code's hook timeout** — otherwise the tool's fate depends on Claude Code internals
+> we don't control.
+
+The hook enforces this at two points:
+
+1. The install block above **pins** the hook `timeout` to `480` seconds (well below the 600s default,
+   well above the 5-minute `ALLW_TIMEOUT_MS` default).
+2. `readConfig` **caps** `ALLW_TIMEOUT_MS` strictly below the pinned timeout (must be **`< 420000`**
+   ms, i.e. ≥ `420000` is rejected), leaving a 60s margin for the relay-fetch timeouts to fire too.
+   An oversized value is a **fail-closed `deny`** at config-read time, not a silent acceptance into a
+   regime where Claude Code could kill the hook before it decides. (A user setting `900000` —
+   "give me time to reach my phone" — is refused with an actionable reason.)
+
+Independently, `@allw/sdk` bounds **every** relay `fetch` (device list, submit, each poll) with a
+per-request timeout, so a relay that accepts the connection but never responds can no longer wedge
+`requestApproval` indefinitely; it fails closed to a non-approving verdict well within the deadline.
 
 The hook is built with the workspace and depends on the vendored WASM core. From the repo root:
 
