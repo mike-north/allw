@@ -632,6 +632,31 @@ describe("AccountRelay — fail-closed expiry", () => {
     expect(polled.data.status).toBe("expired");
   });
 
+  it("lazy-expires on poll: retracts devices and wakes existing waiters", async () => {
+    const acct = "acct-exp-poll-notify";
+    await enrollDevice(acct);
+    const deviceId = await firstDeviceId(acct);
+    const device = await connectWs(acct, `/devices/${deviceId}/connect`);
+
+    await post(acct, "/requests", makeEnvelope("req-exp-poll-notify"));
+    expect((await device.next()).request_id).toBe("req-exp-poll-notify");
+
+    const integrator = await connectWs(acct, "/requests/req-exp-poll-notify/wait");
+    await forceExpireRequest(acct, "req-exp-poll-notify");
+
+    const polled = await get<{ status: string }>(acct, "/requests/req-exp-poll-notify");
+    expect(polled.status).toBe(200);
+    expect(polled.data.status).toBe("expired");
+
+    const retract = await device.next();
+    expect(retract.type).toBe("retract");
+    expect(retract.request_id).toBe("req-exp-poll-notify");
+
+    const expired = await integrator.next();
+    expect(expired.type).toBe("expired");
+    expect(expired.request_id).toBe("req-exp-poll-notify");
+  });
+
   it("lazy-expires on …/wait: pushes terminal 'expired' and closes", async () => {
     const acct = "acct-exp-wait";
     await seedExpiredRequest(acct, "req-exp-w");
@@ -774,6 +799,18 @@ async function forceExpireAndRunAlarm(accountId: string, requestId: string): Pro
       requestId,
     );
     await relay.alarm();
+  });
+}
+
+async function forceExpireRequest(accountId: string, requestId: string): Promise<void> {
+  const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
+  await runInDurableObject(stub, (instance: AccountRelay) => {
+    const relay = instance as unknown as { sql: SqlStorage };
+    relay.sql.exec(
+      `UPDATE request SET expires_at = ? WHERE request_id = ?`,
+      PAST_EXPIRES_AT,
+      requestId,
+    );
   });
 }
 

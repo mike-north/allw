@@ -861,10 +861,16 @@ export class AccountRelay implements DurableObject {
    * Fail-closed lazy expiry (contract §Invariants #6): if a `pending` request is past its
    * `expires_at`, transition it to the terminal `expired` status. Returns the effective status so
    * read paths report `expired` — never a perpetual `pending` — the first time anyone looks after
-   * the deadline. The proactive `alarm()` path performs the same transition without read traffic
-   * and additionally retracts stale requests from connected devices.
+   * the deadline. This shared transition also notifies live clients so a poll or late verdict cannot
+   * clear the alarm while leaving existing waiters/devices stuck on the stale pending request.
    */
-  private expireIfDue(requestId: string, status: string, expiresAt: number, now: number): string {
+  private expireIfDue(
+    requestId: string,
+    status: string,
+    expiresAt: number,
+    now: number,
+    options: { skipDeviceSocket?: WebSocket } = {},
+  ): string {
     if (status === "pending" && now > expiresAt) {
       this.sql.exec(
         `UPDATE request SET status = 'expired', terminal_at = ?
@@ -872,6 +878,7 @@ export class AccountRelay implements DurableObject {
         now,
         requestId,
       );
+      this.notifyExpiredRequest(requestId, options.skipDeviceSocket);
       this.ctx.waitUntil(this.armExpiryAlarm());
       return "expired";
     }
@@ -1008,7 +1015,7 @@ export class AccountRelay implements DurableObject {
     // approvable. Transition pending→expired and refuse to record the verdict.
     const now = Date.now();
     if (req.status === "expired" || (req.status === "pending" && now > req.expires_at)) {
-      this.expireIfDue(requestId, req.status, req.expires_at, now);
+      this.expireIfDue(requestId, req.status, req.expires_at, now, { skipDeviceSocket: ws });
       trySendJson(ws, { type: "ack", request_id: requestId, status: "expired" });
       return;
     }
@@ -1106,8 +1113,9 @@ export class AccountRelay implements DurableObject {
   }
 
   /** Fan out terminal expiry to surfaces that might still be showing or waiting on the request. */
-  private notifyExpiredRequest(requestId: string): void {
+  private notifyExpiredRequest(requestId: string, skipDeviceSocket?: WebSocket): void {
     for (const sock of this.ctx.getWebSockets(DEVICE_TAG)) {
+      if (sock === skipDeviceSocket) continue;
       trySendJson(sock, { type: "retract", request_id: requestId });
     }
     for (const sock of this.ctx.getWebSockets(integratorTag(requestId))) {
