@@ -9,6 +9,7 @@ governance layer that grows around it. See [`docs/`](./docs):
 - [architecture.md](./docs/architecture.md) — tech stack and system design.
 - [contract.md](./docs/contract.md) — the approval-primitive contract (the keystone).
 - [policy-seam.md](./docs/policy-seam.md) — the seam to the (later) policy layer.
+- [threat-model.md](./docs/threat-model.md) — adversaries, residual risks, and the security review checklist.
 
 ## Workspace
 

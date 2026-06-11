@@ -12,6 +12,7 @@ implementing** — the architecture only makes sense across several docs togethe
 - `docs/contract.md` — the approval-primitive contract (the keystone everything else consumes).
 - `docs/policy-seam.md` — the policy layer's `ActionRecord` and its syntactic-first tiering.
 - `docs/architecture.md` — tech-stack and system-design decisions (and their rationale).
+- `docs/threat-model.md` — adversaries, residual risks, and the security review checklist.
 - `docs/positioning.md` — the product thesis (why decisions are shaped the way they are).
 
 When you change a design decision, update the doc that owns it in the same change.
