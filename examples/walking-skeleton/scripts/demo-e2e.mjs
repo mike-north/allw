@@ -26,10 +26,10 @@
  *   node scripts/demo-e2e.mjs [--decision approve|deny|timeout] [--port 8787] [--keep]
  *   (pnpm run demo:approve | demo:deny | demo:timeout wrap the three decision modes.)
  *
- * @see ../../packages/relay        (the relay served here by `wrangler dev`)
- * @see ../../packages/approver     (the watch loop driven by src/lib/live-approver.ts)
- * @see ../../packages/hook         (the `bin` invoked as a subprocess)
- * @see ../../../docs/contract.md   (§Transport, §Lifecycle, §Invariants #6)
+ * @see ../../../packages/relay        (the relay served here by `wrangler dev`)
+ * @see ../../../packages/approver     (the watch loop driven by src/lib/live-approver.ts)
+ * @see ../../../packages/hook         (the `bin` invoked as a subprocess)
+ * @see ../../../docs/contract.md       (§Transport, §Lifecycle, §Invariants #6)
  */
 
 import { spawn } from "node:child_process";
@@ -160,7 +160,16 @@ function runHookBin(env, stdinJson) {
     child.stdout.on("data", (d) => (stdout += String(d)));
     child.stderr.on("data", (d) => process.stderr.write(`[hook] ${d}`));
     child.on("error", rejectP);
-    child.on("close", () => {
+    child.on("close", (code) => {
+      // The hook always exits 0 with a parseable decision (it speaks in decisions, not error codes).
+      // A non-zero exit means it crashed before emitting — fail fast rather than parsing partial
+      // output, which would surface as a misleading parse error or a false pass.
+      if (code !== 0) {
+        rejectP(
+          new Error(`hook exited ${code} (expected 0); stdout so far: ${stdout || "<none>"}`),
+        );
+        return;
+      }
       try {
         resolveP(JSON.parse(stdout));
       } catch (err) {

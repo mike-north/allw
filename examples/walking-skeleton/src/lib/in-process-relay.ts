@@ -172,8 +172,10 @@ export class InProcessRelay {
   /**
    * `POST /requests` — store the opaque envelope and fan it out to online devices.
    *
-   * Enforces the zero-knowledge guard (reject any non-{@link ENVELOPE_KEYS} key) and fail-closed
-   * expiry (reject an already-past `expires_at`), exactly like `handleSubmit` in the real relay.
+   * Mirrors the real relay's `handleSubmit` observable contract: the zero-knowledge guard (reject
+   * any non-{@link ENVELOPE_KEYS} key), every required routing/lifecycle field (`v`, `id`,
+   * `created_at`, `expires_at`, `approver`, `context_ciphertext`), the duplicate-id 409, and
+   * fail-closed expiry (reject an already-past `expires_at`).
    */
   private handleSubmit(body: BodyInit | null | undefined): Response {
     let parsed: unknown;
@@ -196,16 +198,32 @@ export class InProcessRelay {
       return this.json({ error: `unexpected envelope field(s): ${extraneous.join(", ")}` }, 400);
     }
 
+    // Required-field validation in the SAME order and with the same checks as the real relay's
+    // `handleSubmit` (`packages/relay/src/index.ts`), so the double mirrors the observable submit
+    // contract and catches the same SDK/approver regressions.
     const id = envelope.id;
     if (typeof id !== "string" || id.length === 0) {
       return this.json({ error: "'id' is required (string)" }, 400);
     }
+    if (typeof envelope.v !== "number" || !Number.isFinite(envelope.v)) {
+      return this.json({ error: "'v' is required (number)" }, 400);
+    }
+    if (typeof envelope.created_at !== "number" || !Number.isFinite(envelope.created_at)) {
+      return this.json({ error: "'created_at' is required (i64 ms)" }, 400);
+    }
+    if (typeof envelope.approver !== "string" || envelope.approver.length === 0) {
+      return this.json({ error: "'approver' is required (string)" }, 400);
+    }
+    // The ciphertext is opaque to the relay — present and a string is all we check.
+    if (
+      typeof envelope.context_ciphertext !== "string" ||
+      envelope.context_ciphertext.length === 0
+    ) {
+      return this.json({ error: "'context_ciphertext' is required (opaque JWE string)" }, 400);
+    }
     const expiresAt = envelope.expires_at;
     if (typeof expiresAt !== "number" || !Number.isFinite(expiresAt)) {
       return this.json({ error: "'expires_at' is required (i64 ms)" }, 400);
-    }
-    if (typeof envelope.context_ciphertext !== "string") {
-      return this.json({ error: "'context_ciphertext' is required (opaque JWE string)" }, 400);
     }
     if (expiresAt <= this.now()) {
       return this.json({ error: "request already expired" }, 400);
@@ -285,22 +303,46 @@ export class InProcessRelay {
   }
 }
 
-/** The concrete device connection; the relay holds these to fan out and retract. */
+/**
+ * The concrete device connection; the relay holds these to fan out and retract.
+ *
+ * # Why deliveries are buffered until the handler attaches
+ * A caller does `const conn = relay.connectDevice()` and only *then* `conn.onRequest(...)`. The
+ * relay, meanwhile, flushes the offline queue synchronously **inside** `connectDevice()` and fans
+ * out submits the instant they arrive — both before the caller has had a chance to register its
+ * handler. The real relay never loses these because the WebSocket buffers server pushes until the
+ * client reads them; this double mirrors that by queuing any `deliver`/`retract` that arrives before
+ * the corresponding handler is set and flushing it on registration. Without this, an offline-queued
+ * request (the reconnect path the docstring claims to mirror) would be silently dropped.
+ */
 class InternalDeviceConnection implements DeviceConnection {
   private requestHandler: ((requestId: string, envelope: Record<string, unknown>) => void) | null =
     null;
   private retractHandler: ((requestId: string) => void) | null = null;
   private verdictSink: ((requestId: string, verdict: unknown) => { status: string }) | null = null;
   private closed = false;
+  /** Requests delivered before `onRequest` was attached (flushed on registration). */
+  private readonly pendingRequests: { requestId: string; envelope: Record<string, unknown> }[] = [];
+  /** Retracts delivered before `onRetract` was attached (flushed on registration). */
+  private readonly pendingRetracts: string[] = [];
 
   constructor(private readonly onClose: () => void) {}
 
   onRequest(handler: (requestId: string, envelope: Record<string, unknown>) => void): void {
     this.requestHandler = handler;
+    // Flush anything that arrived (offline-queue flush / fan-out) before this handler existed.
+    const buffered = this.pendingRequests.splice(0, this.pendingRequests.length);
+    for (const { requestId, envelope } of buffered) {
+      if (!this.closed) handler(requestId, envelope);
+    }
   }
 
   onRetract(handler: (requestId: string) => void): void {
     this.retractHandler = handler;
+    const buffered = this.pendingRetracts.splice(0, this.pendingRetracts.length);
+    for (const requestId of buffered) {
+      if (!this.closed) handler(requestId);
+    }
   }
 
   setVerdictSink(sink: (requestId: string, verdict: unknown) => { status: string }): void {
@@ -312,14 +354,28 @@ class InternalDeviceConnection implements DeviceConnection {
     return this.verdictSink(requestId, verdict);
   }
 
-  /** Relay-internal: deliver a request push to the device (no-op if closed or no handler yet). */
+  /**
+   * Relay-internal: deliver a request push to the device. If the device has not attached its
+   * `onRequest` handler yet, buffer the push and flush it on registration (mirrors the WS buffering
+   * the real relay relies on, so an offline-queued request is never dropped).
+   */
   deliver(requestId: string, envelope: Record<string, unknown>): void {
-    if (!this.closed) this.requestHandler?.(requestId, envelope);
+    if (this.closed) return;
+    if (this.requestHandler === null) {
+      this.pendingRequests.push({ requestId, envelope });
+      return;
+    }
+    this.requestHandler(requestId, envelope);
   }
 
-  /** Relay-internal: deliver a retract to the device. */
+  /** Relay-internal: deliver a retract to the device (buffered until `onRetract` is attached). */
   retract(requestId: string): void {
-    if (!this.closed) this.retractHandler?.(requestId);
+    if (this.closed) return;
+    if (this.retractHandler === null) {
+      this.pendingRetracts.push(requestId);
+      return;
+    }
+    this.retractHandler(requestId);
   }
 
   close(): void {

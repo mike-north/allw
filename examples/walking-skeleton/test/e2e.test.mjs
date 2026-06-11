@@ -30,8 +30,8 @@
  * Deterministic: fixed clock (no `Date.now()` in fixtures), no real network, no WebSocket.
  *
  * @see ../../../docs/contract.md  (§Lifecycle, §Verification checklist, §Transport, §Invariants #6)
- * @see ../../packages/hook/test/integration.test.mjs  (the hook's own real-crypto round-trip)
- * @see ../../packages/relay/test/relay-routing.test.ts (the relay's zero-knowledge proof in workerd)
+ * @see ../../../packages/hook/test/integration.test.mjs  (the hook's own real-crypto round-trip)
+ * @see ../../../packages/relay/test/relay-routing.test.ts (the relay's zero-knowledge proof in workerd)
  */
 
 import { test } from "node:test";
