@@ -67,6 +67,7 @@ interface RequestRow extends Record<string, string | number | null | ArrayBuffer
   created_at: number;
   expires_at: number;
   status: string;
+  terminal_at: number | null;
 }
 
 interface VerdictRow extends Record<string, string | number | null | ArrayBuffer> {
@@ -108,6 +109,7 @@ if (PAIRING_ALPHABET.length !== 32) {
 }
 
 const PAIRING_CODE_LENGTH = 8;
+const REQUEST_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -258,6 +260,9 @@ export class AccountRelay implements DurableObject {
     this.ctx = ctx;
     this.sql = ctx.storage.sql;
     this.initSchema();
+    // On reactivation, restore the alarm from persisted pending rows in case the previous
+    // isolate exited after a write but before the scheduled alarm was durably restored.
+    this.ctx.waitUntil(this.armExpiryAlarm());
   }
 
   // ---------------------------------------------------------------------------
@@ -299,7 +304,8 @@ export class AccountRelay implements DurableObject {
         envelope   TEXT    NOT NULL,
         created_at INTEGER NOT NULL,
         expires_at INTEGER NOT NULL,
-        status     TEXT    NOT NULL DEFAULT 'pending'
+        status     TEXT    NOT NULL DEFAULT 'pending',
+        terminal_at INTEGER
       );
 
       -- Signed device verdicts, stored solely to relay back to the integrator.
@@ -312,6 +318,23 @@ export class AccountRelay implements DurableObject {
         device_id   TEXT,
         received_at INTEGER NOT NULL
       );
+    `);
+    try {
+      this.sql.exec(`ALTER TABLE request ADD COLUMN terminal_at INTEGER`);
+    } catch {
+      // Existing fresh schemas already have the column; older local DO state is migrated above.
+    }
+    this.sql.exec(`
+      UPDATE request
+      SET terminal_at = expires_at
+      WHERE status = 'expired' AND terminal_at IS NULL;
+
+      UPDATE request
+      SET terminal_at = COALESCE(
+        (SELECT received_at FROM verdict WHERE verdict.request_id = request.request_id),
+        expires_at
+      )
+      WHERE status = 'resolved' AND terminal_at IS NULL;
     `);
   }
 
@@ -732,8 +755,8 @@ export class AccountRelay implements DurableObject {
     // SECURITY: the whole envelope is routing/lifecycle + the opaque ciphertext — no plaintext.
     try {
       this.sql.exec(
-        `INSERT INTO request (request_id, envelope, created_at, expires_at, status)
-         VALUES (?, ?, ?, ?, 'pending')`,
+        `INSERT INTO request (request_id, envelope, created_at, expires_at, status, terminal_at)
+         VALUES (?, ?, ?, ?, 'pending', NULL)`,
         id,
         JSON.stringify(envelope),
         now,
@@ -743,6 +766,7 @@ export class AccountRelay implements DurableObject {
       // Primary-key conflict: a concurrent submit with this id won the race → consistently a 409.
       return json({ error: "request already submitted" }, 409);
     }
+    await this.armExpiryAlarm();
 
     // Fan out to every online device.
     let delivered = 0;
@@ -837,14 +861,25 @@ export class AccountRelay implements DurableObject {
    * Fail-closed lazy expiry (contract §Invariants #6): if a `pending` request is past its
    * `expires_at`, transition it to the terminal `expired` status. Returns the effective status so
    * read paths report `expired` — never a perpetual `pending` — the first time anyone looks after
-   * the deadline. The proactive `alarm()`-based sweep + device retract is tracked separately (#44).
+   * the deadline. This shared transition also notifies live clients so a poll or late verdict cannot
+   * clear the alarm while leaving existing waiters/devices stuck on the stale pending request.
    */
-  private expireIfDue(requestId: string, status: string, expiresAt: number, now: number): string {
+  private expireIfDue(
+    requestId: string,
+    status: string,
+    expiresAt: number,
+    now: number,
+    options: { skipDeviceSocket?: WebSocket } = {},
+  ): string {
     if (status === "pending" && now > expiresAt) {
       this.sql.exec(
-        `UPDATE request SET status = 'expired' WHERE request_id = ? AND status = 'pending'`,
+        `UPDATE request SET status = 'expired', terminal_at = ?
+         WHERE request_id = ? AND status = 'pending'`,
+        now,
         requestId,
       );
+      this.notifyExpiredRequest(requestId, options.skipDeviceSocket);
+      this.ctx.waitUntil(this.armExpiryAlarm());
       return "expired";
     }
     return status;
@@ -980,7 +1015,7 @@ export class AccountRelay implements DurableObject {
     // approvable. Transition pending→expired and refuse to record the verdict.
     const now = Date.now();
     if (req.status === "expired" || (req.status === "pending" && now > req.expires_at)) {
-      this.expireIfDue(requestId, req.status, req.expires_at, now);
+      this.expireIfDue(requestId, req.status, req.expires_at, now, { skipDeviceSocket: ws });
       trySendJson(ws, { type: "ack", request_id: requestId, status: "expired" });
       return;
     }
@@ -1001,7 +1036,12 @@ export class AccountRelay implements DurableObject {
       trySendJson(ws, { type: "ack", request_id: requestId, status: "already_resolved" });
       return;
     }
-    this.sql.exec(`UPDATE request SET status = 'resolved' WHERE request_id = ?`, requestId);
+    this.sql.exec(
+      `UPDATE request SET status = 'resolved', terminal_at = ? WHERE request_id = ?`,
+      now,
+      requestId,
+    );
+    this.ctx.waitUntil(this.armExpiryAlarm());
 
     const verdictValue = JSON.parse(verdictJson) as unknown;
 
@@ -1022,5 +1062,80 @@ export class AccountRelay implements DurableObject {
     }
 
     trySendJson(ws, { type: "ack", request_id: requestId, status: "resolved" });
+  }
+
+  /**
+   * Durable Object alarm: proactively fail-closes expired pending requests, retracts them from
+   * connected devices, wakes live integrator waiters, and then schedules the next pending expiry.
+   */
+  async alarm(): Promise<void> {
+    const now = Date.now();
+    const expired = this.expirePendingDue(now);
+    for (const request of expired) {
+      this.notifyExpiredRequest(request.request_id);
+    }
+    this.sweepTerminalRows(now);
+    await this.armExpiryAlarm();
+  }
+
+  /** Schedule the alarm to the nearest pending expiry, or clear it when no pending request remains. */
+  private async armExpiryAlarm(): Promise<void> {
+    const next = [
+      ...this.sql.exec<{ expires_at: number }>(
+        `SELECT expires_at FROM request WHERE status = 'pending' ORDER BY expires_at ASC LIMIT 1`,
+      ),
+    ][0];
+    if (!next) {
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    await this.ctx.storage.setAlarm(Math.max(next.expires_at, Date.now()));
+  }
+
+  /** Mark every overdue pending request expired and return the rows that changed state. */
+  private expirePendingDue(now: number): RequestRow[] {
+    const overdue = [
+      ...this.sql.exec<RequestRow>(
+        `SELECT request_id, envelope, created_at, expires_at, status, terminal_at FROM request
+         WHERE status = 'pending' AND expires_at <= ? ORDER BY expires_at ASC`,
+        now,
+      ),
+    ];
+    for (const request of overdue) {
+      this.sql.exec(
+        `UPDATE request SET status = 'expired', terminal_at = ?
+         WHERE request_id = ? AND status = 'pending'`,
+        now,
+        request.request_id,
+      );
+    }
+    return overdue;
+  }
+
+  /** Fan out terminal expiry to surfaces that might still be showing or waiting on the request. */
+  private notifyExpiredRequest(requestId: string, skipDeviceSocket?: WebSocket): void {
+    for (const sock of this.ctx.getWebSockets(DEVICE_TAG)) {
+      if (sock === skipDeviceSocket) continue;
+      trySendJson(sock, { type: "retract", request_id: requestId });
+    }
+    for (const sock of this.ctx.getWebSockets(integratorTag(requestId))) {
+      trySendJson(sock, { type: "expired", request_id: requestId });
+      try {
+        sock.close(1000, "expired");
+      } catch {
+        // already closing — ignore
+      }
+    }
+  }
+
+  /** Bound storage growth by removing old terminal request rows and their stored verdicts. */
+  private sweepTerminalRows(now: number): void {
+    const cutoff = now - REQUEST_RETENTION_MS;
+    this.sql.exec(
+      `DELETE FROM request
+       WHERE status IN ('expired', 'resolved') AND terminal_at IS NOT NULL AND terminal_at < ?`,
+      cutoff,
+    );
+    this.sql.exec(`DELETE FROM verdict WHERE request_id NOT IN (SELECT request_id FROM request)`);
   }
 }
