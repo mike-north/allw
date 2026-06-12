@@ -196,6 +196,39 @@ test("verified expiry from prepare controls lifecycle instead of relay-visible e
   assert.equal(fakeRuntime.signCalls.length, 0, "core-expired requests are never signed");
 });
 
+test("verified expiry is rechecked after sync before signing a decision", async () => {
+  let now = NOW;
+  const expiresAfterSync = envelope("req-expire-after-sync", { expires_at: NOW + 60_000 });
+  const fakeRuntime = runtime(
+    new Map([
+      [
+        expiresAfterSync.id,
+        {
+          requestHash: "hash-expire-after-sync",
+          context: context(),
+          expiresAt: NOW + 1_000,
+        },
+      ],
+    ]),
+  );
+  const controller = new WebApproverController({
+    runtime: fakeRuntime,
+    nowMs: () => now,
+  });
+
+  await controller.sync([expiresAfterSync]);
+
+  assert.equal(controller.detail("req-expire-after-sync")?.status, "pending");
+  assert.equal(controller.canApprove("req-expire-after-sync"), true);
+
+  now = NOW + 1_001;
+
+  assert.equal(controller.canApprove("req-expire-after-sync"), false);
+  assert.equal(controller.detail("req-expire-after-sync")?.status, "expired");
+  await assert.rejects(() => controller.decide("req-expire-after-sync", "approved"), /expired/);
+  assert.equal(fakeRuntime.signCalls.length, 0, "requests expired after sync are never signed");
+});
+
 test("number-match challenge gates approval and is included in the signed verdict", async () => {
   const challenged = envelope("req-challenge");
   const fakeRuntime = runtime(
