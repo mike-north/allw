@@ -485,6 +485,30 @@ fn args_any_glob_matches_structured_tokens_not_raw_or_substrings() {
 }
 
 #[test]
+fn args_any_glob_over_length_cap_fails_closed_to_escalate() {
+    let oversized = "a".repeat(4097);
+    let rule = signed(UnsignedPolicyRule {
+        id: "allow-oversized-token".to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate::command_bin("tool").with_args_any_glob(&oversized),
+        effect: PolicyEffect::Allow,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    });
+    let argv = ["tool".to_string(), oversized];
+    let action = action_from_argv(&argv, &CommandContext::default());
+
+    assert_eq!(
+        evaluate(&action, &[rule]).decision,
+        PolicyDecision::Escalate,
+        "over-cap glob inputs must fail closed rather than auto-allowing the action"
+    );
+}
+
+#[test]
 fn from_approval_exact_call_round_trips_and_allows_only_the_same_command() {
     let actor = actor();
     let action = git_force_action();

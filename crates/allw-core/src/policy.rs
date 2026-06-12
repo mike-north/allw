@@ -779,7 +779,15 @@ fn json_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_j
     Some(current)
 }
 
+// Bound signed policy matcher work: the glob engine is O(pattern * value), so
+// over-budget inputs fail closed to "no match" rather than spending verifier time.
+const MAX_PATTERN_MATCH_BYTES: usize = 4096;
+
 fn string_matches_pattern(value: &str, pattern: &str) -> bool {
+    if value.len() > MAX_PATTERN_MATCH_BYTES || pattern.len() > MAX_PATTERN_MATCH_BYTES {
+        return false;
+    }
+
     if pattern.contains('*') || pattern.contains('?') {
         glob_matches(value, pattern)
     } else {
@@ -835,13 +843,52 @@ fn policy_jws_error(err: JwsError) -> PolicyRuleError {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::glob_matches;
+    use super::{glob_matches, string_matches_pattern};
 
     #[test]
     fn glob_matches_preserves_star_and_question_mark_semantics() {
         assert!(glob_matches("--force", "*force*"));
         assert!(glob_matches("build-prod", "build-????"));
         assert!(!glob_matches("build-prod", "build-???"));
+    }
+
+    #[test]
+    fn glob_matches_pins_edge_case_semantics() {
+        assert!(
+            glob_matches("abc", "abc*"),
+            "trailing star matches an empty suffix"
+        );
+        assert!(
+            glob_matches("abc", "*bc"),
+            "leading star can consume a prefix"
+        );
+        assert!(
+            !glob_matches("", "*?"),
+            "star-question still requires one code point"
+        );
+        assert!(
+            glob_matches("abc", "***"),
+            "consecutive stars collapse to match any value"
+        );
+        assert!(glob_matches("", ""), "empty pattern matches empty value");
+        assert!(
+            !glob_matches("abc", ""),
+            "empty pattern does not match a non-empty value"
+        );
+        assert!(
+            glob_matches("café", "caf?"),
+            "question mark matches one Unicode code point"
+        );
+    }
+
+    #[test]
+    fn string_matches_pattern_rejects_inputs_over_the_matcher_ceiling() {
+        let oversized = "a".repeat(4097);
+
+        assert!(
+            !string_matches_pattern(&oversized, &oversized),
+            "over-cap exact patterns fail closed instead of spending verifier budget"
+        );
     }
 
     #[test]
