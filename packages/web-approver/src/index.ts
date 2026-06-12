@@ -54,6 +54,8 @@ export interface ApprovalContext {
 
 export interface PreparedApproval {
   readonly requestHash: string;
+  /** Core-verified request expiry; lifecycle state must not trust the relay-visible envelope timestamp. */
+  readonly expiresAt: number;
   readonly context: ApprovalContext;
   /** MUST be set only from a core-verified terminal Verdict. */
   readonly resolvedDecision?: ApprovalDecision;
@@ -115,6 +117,7 @@ export interface ApprovalDetail extends ApprovalListItem {
 
 interface ApprovalRecord {
   readonly envelope: ApprovalEnvelope;
+  readonly expiresAt: number;
   readonly prepared?: PreparedApproval;
   readonly verificationError?: string;
   status: ApprovalStatus;
@@ -216,18 +219,23 @@ export class WebApproverController {
   async #prepare(envelope: ApprovalEnvelope): Promise<ApprovalRecord> {
     try {
       const prepared = await this.#runtime.prepare(envelope);
+      if (!Number.isFinite(prepared.expiresAt)) {
+        throw new Error("prepared approval is missing a core-verified expiry");
+      }
       const resolvedDecision = prepared.resolvedDecision;
       if (resolvedDecision) {
-        return { envelope, prepared, status: resolvedDecision };
+        return { envelope, expiresAt: prepared.expiresAt, prepared, status: resolvedDecision };
       }
       return {
         envelope,
+        expiresAt: prepared.expiresAt,
         prepared,
-        status: envelope.expires_at <= this.#nowMs() ? "expired" : "pending",
+        status: prepared.expiresAt <= this.#nowMs() ? "expired" : "pending",
       };
     } catch (error) {
       return {
         envelope,
+        expiresAt: envelope.expires_at,
         status: "unverified",
         verificationError: error instanceof Error ? error.message : String(error),
       };
@@ -254,8 +262,8 @@ export class WebApproverController {
       actor: context?.actor.display ?? "Unverified request",
       riskLevel: context?.risk.level ?? "unknown",
       summary: context ? actionSummary(context) : "Unable to verify or decrypt this request",
-      expiresAt: record.envelope.expires_at,
-      countdownMs: Math.max(0, record.envelope.expires_at - this.#nowMs()),
+      expiresAt: record.expiresAt,
+      countdownMs: Math.max(0, record.expiresAt - this.#nowMs()),
       denyOnly: record.status === "unverified" || record.status === "expired",
     };
   }
