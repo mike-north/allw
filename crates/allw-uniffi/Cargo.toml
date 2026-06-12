@@ -1,0 +1,27 @@
+[package]
+name = "allw-uniffi"
+version = "0.0.0"
+description = "UniFFI bindings exposing allw-core to Swift and Kotlin native apps."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+allw-core = { path = "../allw-core" }
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uniffi = { version = "0.31.1", features = ["cli"] }
