@@ -64,6 +64,23 @@ This is the Codex-parallel install path for developers who already have a paired
    a Codex-scoped approval request (`actor.id = "codex:<hostname>"`), and Codex proceeds only after
    a verified allw approval.
 
+## UAT Checklist
+
+Before making the Codex hook PR ready, run a live Codex session against an enrolled second device
+and record the result on the PR:
+
+1. **Approve path**: ask Codex to run a harmless gated Bash command, approve it on the second
+   device, and confirm Codex proceeds.
+2. **Deny path**: ask Codex to run another gated Bash command, deny it on the second device, and
+   confirm Codex receives `permissionDecision: "deny"` and does not run the tool.
+3. **Timeout path**: set a short `ALLW_TIMEOUT_MS`, leave the approval unanswered, and confirm
+   Codex denies before its 480 second hook timeout.
+4. **Actor identity**: confirm the approval inbox shows the request as `codex:<hostname>` rather
+   than the Claude Code actor.
+
+The automated tests cover the same SDK/WASM verification path with a relay double; this checklist
+is the remaining product acceptance proof that Codex itself invokes the hook and honors the result.
+
 The matcher intentionally matches the Claude Code hook's v1 surface:
 
 - `Bash` commands are converted to command `ActionRecord`s through the WASM core.
