@@ -33,6 +33,37 @@ Recommended hook configuration:
 }
 ```
 
+## Quickstart
+
+This is the Codex-parallel install path for developers who already have a paired allw approver:
+
+1. Build the Node + WASM surfaces:
+
+   ```sh
+   pnpm install
+   pnpm run build:wasm
+   pnpm --filter @allw/codex-hook build
+   ```
+
+2. Export the relay and account trust anchor:
+
+   ```sh
+   export ALLW_RELAY_URL="https://relay.example"
+   export ALLW_ACCOUNT_ID="acct_..."
+   export ALLW_APPROVER_ROOT_KEY="..."
+   ```
+
+3. Add the `PreToolUse` block above to `~/.codex/hooks.json` or a trusted project
+   `.codex/hooks.json`, replacing the command path with the absolute path to
+   `packages/codex-hook/dist/cli.js`.
+
+4. Start Codex, run `/hooks`, review the hook, and trust it. Codex skips untrusted non-managed
+   hooks by design.
+
+5. Trigger a gated action such as a Bash command or `mcp__<server>__<tool>` call. The hook submits
+   a Codex-scoped approval request (`actor.id = "codex:<hostname>"`), and Codex proceeds only after
+   a verified allw approval.
+
 The matcher intentionally matches the Claude Code hook's v1 surface:
 
 - `Bash` commands are converted to command `ActionRecord`s through the WASM core.

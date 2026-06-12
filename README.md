@@ -16,11 +16,13 @@ governance layer that grows around it. See [`docs/`](./docs):
 
 Polyglot monorepo — one audited Rust core, thin surfaces around it.
 
-| Path               | What                                                                              |
-| ------------------ | --------------------------------------------------------------------------------- |
-| `crates/allw-core` | Rust core: contract types, crypto, verdict signing/verification, audit chaining.  |
-| `packages/sdk`     | TypeScript SDK (`@allw/sdk`) — the integrator call site; wraps the core via WASM. |
-| `packages/relay`   | Zero-knowledge relay (`@allw/relay`) — Cloudflare Workers + Durable Objects.      |
+| Path                  | What                                                                              |
+| --------------------- | --------------------------------------------------------------------------------- |
+| `crates/allw-core`    | Rust core: contract types, crypto, verdict signing/verification, audit chaining.  |
+| `packages/sdk`        | TypeScript SDK (`@allw/sdk`) — the integrator call site; wraps the core via WASM. |
+| `packages/relay`      | Zero-knowledge relay (`@allw/relay`) — Cloudflare Workers + Durable Objects.      |
+| `packages/hook`       | Claude Code `PreToolUse` hook — gates Bash/MCP through allw, fail-closed.         |
+| `packages/codex-hook` | Codex `PreToolUse` hook — same allw gate with a distinct Codex actor identity.    |
 
 ### Demo
 
