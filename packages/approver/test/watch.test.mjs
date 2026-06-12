@@ -17,7 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { loadWasm } from "../dist/index.js";
-import { generateKeyfile, writeKeyfile } from "../dist/lib/keyfile.js";
+import { generateKeyfile, readKeyfile, writeKeyfile } from "../dist/lib/keyfile.js";
 import { handleRequest, runWatch } from "../dist/commands/watch.js";
 
 const ACCOUNT_ID = "acct-watch-test";
@@ -596,6 +596,83 @@ test("origin fail-closed: relay max_sequence above verified docs renders ⚠ UNV
     "a relay max_sequence not backed by root-verified docs must downgrade the origin",
   );
   assert.match(prompter.renders[0], /max_sequence 2 exceeds highest root-verified sequence 1/);
+});
+
+test("origin fail-closed: persisted account-state floor rejects compromised relay rollback", async () => {
+  const wasm = await loadWasm();
+  const actorSeed = Buffer.alloc(32, 0x44).toString("base64url");
+  const actorPub = wasm.ed25519_public_key(actorSeed);
+  const { keyfile, jwe } = pairedApproverWithAttestation(wasm, { actorSeed });
+  const ws = stubSocket();
+  const prompter = capturingPrompter("approved");
+
+  const rollbackState = signedAccountState(wasm, keyfile, actorPub, { sequence: 1 });
+  const resolveAccountStates = () =>
+    Promise.resolve({ accountStates: [rollbackState], maxSequence: 1 });
+
+  await handleRequest(
+    wasm,
+    { ...keyfile, account_state_highest_sequence: 2 },
+    ws,
+    prompter,
+    makeEnvelope(jwe),
+    recordingLogger(),
+    () => DECIDED_AT,
+    resolveAccountStates,
+  );
+
+  assert.equal(prompter.renders.length, 1, "the human was prompted with a rendered block");
+  assert.match(
+    prompter.renders[0],
+    /⚠ UNVERIFIED/,
+    "a relay rollback below the persisted floor must downgrade the origin",
+  );
+  assert.match(prompter.renders[0], /below persisted account-state sequence floor 2/);
+});
+
+test("runWatch persists the highest root-verified account-state sequence", async () => {
+  const wasm = await loadWasm();
+  const actorSeed = Buffer.alloc(32, 0x44).toString("base64url");
+  const actorPub = wasm.ed25519_public_key(actorSeed);
+  const { keyfile, jwe } = pairedApproverWithAttestation(wasm, { actorSeed });
+  const accountState = signedAccountState(wasm, keyfile, actorPub, { sequence: 7 });
+  const prompter = capturingPrompter("approved");
+  const log = recordingLogger();
+  const socket = requestThenCloseSocket(makeEnvelope(jwe));
+  const dir = mkdtempSync(join(tmpdir(), "allw-watch-"));
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ account_states: [accountState], max_sequence: 7 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+
+    const keyfilePath = join(dir, "keyfile.json");
+    writeKeyfile(keyfilePath, { ...keyfile, device_auth_token: "device-secret-token" });
+
+    await runWatch(
+      wasm,
+      { keyfilePath },
+      {
+        connect() {
+          return socket;
+        },
+        prompter,
+        log,
+        now: () => DECIDED_AT,
+      },
+    );
+
+    assert.equal(
+      readKeyfile(keyfilePath).account_state_highest_sequence,
+      7,
+      "the accepted root-verified sequence is durably stored in the keyfile",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("origin fail-closed: a resolver error still renders the request as ⚠ UNVERIFIED (#16)", async () => {
