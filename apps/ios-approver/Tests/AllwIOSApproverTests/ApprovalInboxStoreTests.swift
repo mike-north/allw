@@ -1,6 +1,10 @@
 import AllwIOSApprover
 import Foundation
 
+#if canImport(Security)
+import Security
+#endif
+
 @main
 struct ApprovalInboxStoreTests {
     static func main() async throws {
@@ -16,6 +20,10 @@ struct ApprovalInboxStoreTests {
         try await testCredentialStorePersistsPairedDeviceCredentials()
         try await testAccountStateFloorRejectsRollbackBelowStoredSequence()
         try await testAccountStateFloorRequiresRelayMaxSequenceToBeVerified()
+        #if canImport(Security)
+        try await testKeychainAccountStateFloorRejectsMalformedPersistedData()
+        try await testKeychainAccountStateFloorRejectsNegativePersistedSequence()
+        #endif
     }
 
     static func testSyncUsesPreparedExpiryInsteadOfRelayEnvelopeExpiry() async throws {
@@ -274,6 +282,46 @@ struct ApprovalInboxStoreTests {
         }
         try expectEqual(storage.accountStateFloors["acct-1"], nil)
     }
+
+    #if canImport(Security)
+    static func testKeychainAccountStateFloorRejectsMalformedPersistedData() async throws {
+        let service = "dev.allw.ios-approver.tests.\(UUID().uuidString)"
+        let accountId = "acct-1"
+        let store = NativeCredentialStore(storage: KeychainNativeCredentialStorage(service: service))
+        try saveRawKeychainAccountStateFloor(service: service, accountId: accountId, data: Data("not-an-int".utf8))
+
+        defer {
+            deleteKeychainAccount(service: service, account: "account-state-floor:\(accountId)")
+        }
+
+        try await expectCredentialStoreError(.keychainFailure) {
+            try await store.acceptVerifiedAccountState(
+                accountId: accountId,
+                relayMaxSequence: nil,
+                verifiedSequence: 1
+            )
+        }
+    }
+
+    static func testKeychainAccountStateFloorRejectsNegativePersistedSequence() async throws {
+        let service = "dev.allw.ios-approver.tests.\(UUID().uuidString)"
+        let accountId = "acct-1"
+        let store = NativeCredentialStore(storage: KeychainNativeCredentialStorage(service: service))
+        try saveRawKeychainAccountStateFloor(service: service, accountId: accountId, data: Data("-1".utf8))
+
+        defer {
+            deleteKeychainAccount(service: service, account: "account-state-floor:\(accountId)")
+        }
+
+        try await expectCredentialStoreError(.invalidAccountStateSequence) {
+            try await store.acceptVerifiedAccountState(
+                accountId: accountId,
+                relayMaxSequence: nil,
+                verifiedSequence: 1
+            )
+        }
+    }
+    #endif
 }
 
 private final class RecordingRuntime: ApproverCoreRuntime {
@@ -482,6 +530,32 @@ private func expectCredentialStoreError(
     }
 }
 
+#if canImport(Security)
+private func saveRawKeychainAccountStateFloor(service: String, accountId: String, data: Data) throws {
+    let account = "account-state-floor:\(accountId)"
+    deleteKeychainAccount(service: service, account: account)
+    let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: service,
+        kSecAttrAccount as String: account,
+        kSecValueData as String: data,
+    ]
+    let status = SecItemAdd(query as CFDictionary, nil)
+    guard status == errSecSuccess else {
+        throw TestFailure("Keychain test fixture add failed with status \(status)")
+    }
+}
+
+private func deleteKeychainAccount(service: String, account: String) {
+    let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: service,
+        kSecAttrAccount as String: account,
+    ]
+    SecItemDelete(query as CFDictionary)
+}
+#endif
+
 private enum ApprovalInboxErrorKind: CustomStringConvertible {
     case alreadyDeciding
     case decisionNotAllowed
@@ -507,11 +581,17 @@ private enum ApprovalInboxErrorKind: CustomStringConvertible {
 }
 
 private enum NativeCredentialStoreErrorKind: CustomStringConvertible {
+    case invalidAccountStateSequence
+    case keychainFailure
     case staleAccountStateSequence
     case unverifiedRelayAccountState
 
     var description: String {
         switch self {
+        case .invalidAccountStateSequence:
+            return "invalidAccountStateSequence"
+        case .keychainFailure:
+            return "keychainFailure"
         case .staleAccountStateSequence:
             return "staleAccountStateSequence"
         case .unverifiedRelayAccountState:
@@ -521,7 +601,9 @@ private enum NativeCredentialStoreErrorKind: CustomStringConvertible {
 
     func matches(_ error: NativeCredentialStoreError) -> Bool {
         switch (self, error) {
-        case (.staleAccountStateSequence, .staleAccountStateSequence),
+        case (.invalidAccountStateSequence, .invalidAccountStateSequence),
+            (.keychainFailure, .keychainFailure),
+            (.staleAccountStateSequence, .staleAccountStateSequence),
             (.unverifiedRelayAccountState, .unverifiedRelayAccountState):
             return true
         default:
