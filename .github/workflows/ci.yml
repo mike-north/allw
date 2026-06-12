@@ -112,6 +112,48 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
+      # Cache the network installs so a transient brew/Maven outage can't fail the job (#90).
+      - uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: brew-kotlin-${{ runner.os }}
+      - uses: actions/cache@v4
+        id: jna-cache
+        with:
+          path: jna-cache/jna-5.17.0.jar
+          key: jna-5.17.0
+      - if: steps.jna-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p jna-cache
+          curl --fail --silent --show-error --location \
+            "https://repo1.maven.org/maven2/net/java/dev/jna/jna/5.17.0/jna-5.17.0.jar" \
+            --output jna-cache/jna-5.17.0.jar
       - run: brew install kotlin
       - run: cargo test --locked -p allw-uniffi
       - run: ./scripts/uniffi-smoke.sh
+        env:
+          JNA_JAR: ${{ github.workspace }}/jna-cache/jna-5.17.0.jar
+
+  packaged-install:
+    name: Packaged install (pack → npm install → smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Rust + wasm-pack so build:wasm produces the artifact that must be BUNDLED into the @allw/sdk
+      # tarball (the install path under test ships the wasm; it must not need a toolchain itself).
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build:wasm
+      - run: pnpm -r build
+      - run: pnpm run smoke:packaged-install
