@@ -1,0 +1,116 @@
+/* allw — design tokens. Warm calm-fintech neutrals + electric-blue trust accent.
+   Themes are applied via .theme-light / .theme-dark on a container. */
+
+:root {
+  --font-ui: "Hanken Grotesk", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 18px;
+  --r-xl: 26px;
+  --r-pill: 999px;
+
+  --step-1: 4px;
+  --step-2: 8px;
+  --step-3: 12px;
+  --step-4: 16px;
+  --step-5: 22px;
+  --step-6: 30px;
+  --step-7: 40px;
+
+  --ease: cubic-bezier(.22,.61,.36,1);
+  --ease-spring: cubic-bezier(.34,1.56,.64,1);
+}
+
+/* ---------- LIGHT (warm paper) ---------- */
+.theme-light {
+  --bg: #F1EDE4;
+  --bg-tint: #EAE5D9;
+  --surface: #FFFFFF;
+  --surface-2: #FAF7F0;
+  --surface-sunk: #F3EFE6;
+  --ink: #1C1A15;
+  --ink-2: #5C574C;
+  --ink-3: #908A7C;
+  --border: #E6E0D3;
+  --border-strong: #D6CFBE;
+  --accent: #3B5BFF;
+  --accent-press: #2E49E0;
+  --accent-soft: rgba(59, 91, 255, .10);
+  --accent-ink: #FFFFFF;
+  --shadow-sm: 0 1px 2px rgba(28,26,21,.05), 0 1px 1px rgba(28,26,21,.04);
+  --shadow-md: 0 1px 2px rgba(28,26,21,.04), 0 10px 28px -8px rgba(28,26,21,.14);
+  --shadow-lg: 0 2px 4px rgba(28,26,21,.05), 0 24px 60px -16px rgba(28,26,21,.22);
+  --code-bg: #15140F;
+  --code-ink: #EFEDE6;
+  --code-dim: #9A958A;
+  --code-line: rgba(255,255,255,.07);
+
+  --risk-low-fg: #1A7F52;   --risk-low-bg: rgba(26,127,82,.10);   --risk-low-edge: rgba(26,127,82,.28);
+  --risk-med-fg: #9A6B12;   --risk-med-bg: rgba(154,107,18,.10);  --risk-med-edge: rgba(154,107,18,.28);
+  --risk-high-fg: #BE531F;  --risk-high-bg: rgba(190,83,31,.10);  --risk-high-edge: rgba(190,83,31,.28);
+  --risk-crit-fg: #C0392B;  --risk-crit-bg: rgba(192,57,43,.10);  --risk-crit-edge: rgba(192,57,43,.30);
+
+  --ok: #128A4E; --ok-press: #0E7342; --ok-ink: #fff; --ok-soft: rgba(18,138,78,.10); --ok-edge: rgba(18,138,78,.30);
+  --no: #CF3B2A; --no-press: #B33122; --no-ink: #fff; --no-soft: rgba(207,59,42,.10); --no-edge: rgba(207,59,42,.32);
+
+  color-scheme: light;
+}
+
+/* ---------- DARK (warm charcoal) ---------- */
+.theme-dark {
+  --bg: #080807;
+  --bg-tint: #040403;
+  --surface: #232120;
+  --surface-2: #302D2A;
+  --surface-sunk: #161413;
+  --ink: #F8F5EE;
+  --ink-2: #C7C1B5;
+  --ink-3: #948D80;
+  --border: #423E38;
+  --border-strong: #5C574E;
+  --accent: #7B91FF;
+  --accent-press: #93A6FF;
+  --accent-soft: rgba(123, 145, 255, .20);
+  --accent-ink: #0A0A0A;
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.6), 0 0 0 1px rgba(0,0,0,.3);
+  --shadow-md: 0 2px 6px rgba(0,0,0,.5), 0 20px 48px -12px rgba(0,0,0,.8);
+  --shadow-lg: 0 4px 12px rgba(0,0,0,.6), 0 40px 90px -22px rgba(0,0,0,.9);
+  --code-bg: #050505;
+  --code-ink: #F3F1EA;
+  --code-dim: #989183;
+  --code-line: rgba(255,255,255,.09);
+
+  --risk-low-fg: #62E0A4;   --risk-low-bg: rgba(98,224,164,.16);   --risk-low-edge: rgba(98,224,164,.40);
+  --risk-med-fg: #F5C96B;   --risk-med-bg: rgba(245,201,107,.16);  --risk-med-edge: rgba(245,201,107,.40);
+  --risk-high-fg: #FFA579;  --risk-high-bg: rgba(255,165,121,.16); --risk-high-edge: rgba(255,165,121,.42);
+  --risk-crit-fg: #FF8D7E;  --risk-crit-bg: rgba(255,141,126,.18); --risk-crit-edge: rgba(255,141,126,.46);
+
+  --ok: #2BB56E; --ok-press: #46C884; --ok-ink: #06140C; --ok-soft: rgba(43,181,110,.18); --ok-edge: rgba(43,181,110,.42);
+  --no: #F0594A; --no-press: #FF6E5F; --no-ink: #1A0604; --no-soft: rgba(240,89,74,.18); --no-edge: rgba(240,89,74,.46);
+
+  color-scheme: dark;
+}
+/* dark: give every raised surface a faint top highlight so card edges read */
+.theme-dark .req-card,
+.theme-dark .slip,
+.theme-dark .seal,
+.theme-dark .signed-card,
+.theme-dark .empty-core,
+.theme-dark .code,
+.theme-dark .term,
+.theme-dark .digit,
+.theme-dark .key,
+.theme-dark .code-cell,
+.theme-dark .scan-btn,
+.theme-dark .empty-status,
+.theme-dark .expired-badge {
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.05), var(--shadow-sm);
+}
+
+/* risk helper — set data-risk on an element and read these */
+[data-risk="low"]  { --risk-fg: var(--risk-low-fg);  --risk-bg: var(--risk-low-bg);  --risk-edge: var(--risk-low-edge); }
+[data-risk="medium"]{ --risk-fg: var(--risk-med-fg);  --risk-bg: var(--risk-med-bg);  --risk-edge: var(--risk-med-edge); }
+[data-risk="high"] { --risk-fg: var(--risk-high-fg); --risk-bg: var(--risk-high-bg); --risk-edge: var(--risk-high-edge); }
+[data-risk="critical"]{ --risk-fg: var(--risk-crit-fg); --risk-bg: var(--risk-crit-bg); --risk-edge: var(--risk-crit-edge); }
