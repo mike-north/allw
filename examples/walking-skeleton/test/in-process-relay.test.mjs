@@ -44,6 +44,15 @@ async function submit(relay, body) {
   return { status: resp.status, body: await resp.json() };
 }
 
+/** Poll a stored request with an optional relay-scoped bearer token. */
+async function poll(relay, requestId, token) {
+  const resp = await relay.fetchImpl(`https://relay.test/acct-double/requests/${requestId}`, {
+    method: "GET",
+    ...(token === undefined ? {} : { headers: { Authorization: `Bearer ${token}` } }),
+  });
+  return { status: resp.status, body: await resp.json() };
+}
+
 // ── Offline-queue flush (finding #1: queued-while-offline must be delivered on connect) ──────────
 
 test("offline queue: a request submitted while offline is delivered once the device connects", async () => {
@@ -154,4 +163,19 @@ test("submit validation: accepts a complete valid envelope (202 pending)", async
   assert.equal(status, 202);
   assert.equal(body.status, "pending");
   assert.equal(body.request_id, "req-ok");
+  assert.equal(typeof body.request_auth_token, "string");
+  assert.ok(body.request_auth_token.length > 0, "submit returns the token needed to poll");
+});
+
+test("poll auth: requires the request-scoped bearer token returned by submit", async () => {
+  const relay = new InProcessRelay({ now });
+  const { body } = await submit(relay, envelope({ id: "req-auth" }));
+
+  assert.equal((await poll(relay, "req-auth")).status, 401, "missing bearer token is refused");
+  assert.equal((await poll(relay, "req-auth", "wrong")).status, 403, "wrong token is refused");
+
+  const { status, body: pollBody } = await poll(relay, "req-auth", body.request_auth_token);
+  assert.equal(status, 200);
+  assert.equal(pollBody.status, "pending");
+  assert.equal(pollBody.request_id, "req-auth");
 });

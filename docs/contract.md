@@ -156,11 +156,13 @@ Relay routes only — it sees the **ApprovalRequest envelope** (routing + lifecy
 Push (APNs / FCM; **Web Push later**) carries a wakeup + request id — **never context** (push isn't E2EE / is
 size-limited). The envelope's ciphertext is fetched as JWE and decrypted on-device.
 
-Push tokens are registered during pairing by including `push_tokens` on `POST /pairing/complete`. Each token has
-`transport` (`apns`, `fcm`, or future `webpush`) plus the opaque vendor token. Tokens are relay routing metadata:
-they are stored only to wake an enrolled device and are not exposed by `GET /devices`. `POST /requests` fans a
-request-id-only wakeup through the configured transport registry and still queues the ciphertext envelope for
-polling / WebSocket delivery.
+Push tokens are registered during pairing by including `push_tokens` on authenticated
+`POST /pairing/complete`. Each token has `transport` (`apns`, `fcm`, or future `webpush`) plus the
+opaque vendor token. APNs tokens are 64-character hex strings; FCM tokens are restricted to the
+provider token alphabet the relay accepts (`A-Z`, `a-z`, `0-9`, `_`, `-`, `:`). Tokens are relay
+routing metadata: they are stored only to wake an enrolled device and are not exposed by
+`GET /devices`. `POST /requests` fans a request-id-only wakeup through the configured transport
+registry and still queues the ciphertext envelope for polling / WebSocket delivery.
 
 ### Relay routing API (v1)
 
@@ -174,6 +176,13 @@ and the signed verdict — never plaintext, never a key it could sign with.
 | `GET  /requests/{id}/wait` (WS)                | integrator | Block for the verdict; it is pushed the instant a device decides.                                                                                                         |
 | `GET  /devices/{id}/connect?surface_id=…` (WS) | device     | Presence socket (hibernatable); flushes the offline queue on open. `surface_id` is optional visible-screen topology for deduping mirrored/native notification transports. |
 
+`POST /pairing/start` returns `{ code, expires_at, pairing_auth_token }`; `POST /pairing/complete`
+must present that token as `Authorization: Bearer …` and returns `{ device_id, device_auth_token }`.
+Device-scoped endpoints such as `GET /devices/{id}/connect` and
+`POST /devices/{id}/revoke` require that device token (header or `auth` query for WebSocket
+upgrades). `POST /requests` returns `request_auth_token`; `GET /requests/{id}` and
+`GET /requests/{id}/wait` require it. The relay stores only SHA-256 hashes of these bearer tokens.
+
 **Device socket messages** (JSON): relay → device `{ type: "request", request_id, envelope }` and
 `{ type: "retract", request_id }` (another surface resolved it); device → relay
 `{ type: "verdict", request_id, verdict }` (the signed [`Verdict`](#verdict--one-shot-and-scope-free)), answered
@@ -183,8 +192,8 @@ on its next `connect` (the queue), so delivery survives reconnect. If a device c
 the relay fans out and flushes queued requests to at most one live socket per `surface_id`, preventing a single
 visible screen from showing both a native prompt and a mirrored prompt. Retractions still go to all live device
 sockets so stale surfaces clear.
-`surface_id` is caller-asserted, account-global topology metadata; it is trusted only under the user-owned-device
-assumption and will be hardened when endpoint authentication lands (#10).
+`surface_id` is caller-asserted, account-global topology metadata; it is trusted only from a
+connection authenticated with that enrolled device's relay bearer token (#89).
 
 **Fail-closed expiry** (§Invariants #6): once a request is past `expires_at` it can never become approvable. A
 verdict for an expired request is refused (acked `expired`, not stored); the offline-queue flush skips expired
@@ -192,9 +201,9 @@ requests (no dead request is re-pushed); and a read after the deadline **lazy-ex
 terminal `expired` status and `…/wait` is pushed `{ type: "expired", request_id }`. (A proactive `alarm()` sweep
 that retracts expired requests from devices without waiting for a read is tracked in
 [#44](https://github.com/mike-north/allw/issues/44).) Verdicts are accepted **only** from a socket whose device is
-still enrolled — a revoked device cannot drive a request to `resolved`. Because `GET /requests/{id}` returns the
-verdict to any holder of `{account_id, request_id}`, integrators MUST use high-entropy request ids (UUIDv4+) until
-the endpoint authentication rules in [enrollment.md](./enrollment.md) are implemented.
+still enrolled — a revoked device cannot drive a request to `resolved`. `GET /requests/{id}` no longer treats
+`request_id` alone as sufficient authority; callers must also present the request token returned by
+`POST /requests` (#89).
 
 ---
 

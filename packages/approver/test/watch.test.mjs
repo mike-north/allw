@@ -12,10 +12,13 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { loadWasm } from "../dist/index.js";
-import { generateKeyfile } from "../dist/lib/keyfile.js";
-import { handleRequest } from "../dist/commands/watch.js";
+import { generateKeyfile, writeKeyfile } from "../dist/lib/keyfile.js";
+import { handleRequest, runWatch } from "../dist/commands/watch.js";
 
 const ACCOUNT_ID = "acct-watch-test";
 const DEVICE_ID = "dev-watch-test";
@@ -101,6 +104,66 @@ function recordingLogger() {
   const warn = [];
   return { info: (l) => info.push(l), warn: (l) => warn.push(l), _info: info, _warn: warn };
 }
+
+/** A minimal socket that opens and closes after runWatch attaches its event listeners. */
+function selfClosingSocket() {
+  const listeners = { open: [], message: [], error: [], close: [] };
+  const emit = (type) => {
+    for (const listener of listeners[type]) listener({});
+  };
+  queueMicrotask(() => {
+    emit("open");
+    emit("close");
+  });
+  return {
+    addEventListener(type, listener) {
+      listeners[type].push(listener);
+    },
+    send() {},
+    close() {
+      emit("close");
+    },
+  };
+}
+
+test("runWatch logs a redacted device presence URL while connecting with the auth token", async () => {
+  const wasm = await loadWasm();
+  const { keyfile } = pairedApprover(wasm);
+  const dir = mkdtempSync(join(tmpdir(), "allw-watch-"));
+  try {
+    const keyfilePath = join(dir, "keyfile.json");
+    const pairedKeyfile = { ...keyfile, device_auth_token: "device-secret-token" };
+    writeKeyfile(keyfilePath, pairedKeyfile);
+
+    const log = recordingLogger();
+    let connectedUrl = "";
+    await runWatch(
+      wasm,
+      { keyfilePath },
+      {
+        connect(url) {
+          connectedUrl = url;
+          return selfClosingSocket();
+        },
+        prompter: { decide: () => Promise.resolve(null) },
+        log,
+      },
+    );
+
+    assert.match(connectedUrl, /\?auth=device-secret-token$/, "the socket uses the real token URL");
+    assert.ok(
+      log._info.some((line) => line.startsWith("Connecting to ")),
+      "the connection attempt is still logged",
+    );
+    assert.equal(
+      log._info.some((line) => line.includes("device-secret-token") || line.includes("?auth=")),
+      false,
+      "logs must not expose the device bearer token or auth query string",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("Approve → emits a verdict message whose verdict verifies against the account root", async () => {
   const wasm = await loadWasm();

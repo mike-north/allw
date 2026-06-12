@@ -13,9 +13,10 @@
  *
  * - `GET  /:acct/devices`            → the enrolled device pubkey list (JWE recipients).
  * - `POST /:acct/requests`           → store the opaque envelope; reject any non-contract key
- *   (the zero-knowledge guard) and an already-expired `expires_at`; fan out to online devices.
+ *   (the zero-knowledge guard) and an already-expired `expires_at`; fan out to online devices;
+ *   return the request-scoped bearer token used by the poll path.
  * - `GET  /:acct/requests/:id`       → poll status (`pending` / terminal `expired` / `resolved`
- *   + verdict); lazy-expire a past-deadline request on read (fail-closed).
+ *   + verdict) after bearer-token auth; lazy-expire a past-deadline request on read (fail-closed).
  * - device presence socket           → relay → device `{ type: "request", … }`; device → relay
  *   `{ type: "verdict", … }` answered with `{ type: "ack", status }`; **first verdict wins**; a
  *   verdict for an expired request is acked `expired` and never stored.
@@ -58,6 +59,8 @@ export interface RelayDevice {
 /** A stored request row (the opaque envelope + lifecycle status). */
 interface StoredRequest {
   readonly envelope: Record<string, unknown>;
+  /** Relay-scoped capability token required to read this request's poll status. */
+  readonly authToken: string;
   status: "pending" | "resolved" | "expired";
   readonly expiresAt: number;
 }
@@ -85,6 +88,22 @@ export interface DeviceConnection {
 export interface InProcessRelayOptions {
   /** The clock (ms). Injected so expiry is deterministic in tests (no wall-clock read). */
   readonly now: () => number;
+}
+
+/** Extract `Authorization` from the fetch-compatible header shapes Node/browser tests may pass. */
+function authHeader(headers: HeadersInit | undefined): string | null {
+  if (headers === undefined) return null;
+  if (headers instanceof Headers) return headers.get("Authorization");
+  if (Array.isArray(headers)) {
+    for (const [key, value] of headers) {
+      if (key.toLowerCase() === "authorization") return value;
+    }
+    return null;
+  }
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === "authorization") return value;
+  }
+  return null;
 }
 
 /**
@@ -147,7 +166,7 @@ export class InProcessRelay {
     const pollMatch = /\/requests\/([^/]+)$/.exec(url);
     if (pollMatch && method === "GET") {
       const requestId = decodeURIComponent(pollMatch[1] ?? "");
-      return Promise.resolve(this.handlePoll(requestId));
+      return Promise.resolve(this.handlePoll(requestId, authHeader(init?.headers)));
     }
     return Promise.resolve(this.json({ error: "not found" }, 404));
   };
@@ -232,7 +251,10 @@ export class InProcessRelay {
       return this.json({ error: "request already submitted" }, 409);
     }
 
-    this.requests.set(id, { envelope, status: "pending", expiresAt });
+    // The real relay returns this opaque token once on submit; clients must present it when polling
+    // request status. Deterministic derivation keeps the test double reproducible.
+    const authToken = `request-token-${id}`;
+    this.requests.set(id, { envelope, authToken, status: "pending", expiresAt });
 
     // Fan out to every online device.
     let delivered = 0;
@@ -240,16 +262,23 @@ export class InProcessRelay {
       conn.deliver(id, envelope);
       delivered++;
     }
-    return this.json({ request_id: id, status: "pending", delivered_to: delivered }, 202);
+    return this.json(
+      { request_id: id, status: "pending", delivered_to: delivered, request_auth_token: authToken },
+      202,
+    );
   }
 
   /**
    * `GET /requests/:id` — poll status, lazy-expiring a past-deadline pending request (fail-closed).
    * Returns the verdict only when `resolved`.
    */
-  private handlePoll(requestId: string): Response {
+  private handlePoll(requestId: string, authorization: string | null): Response {
     const req = this.requests.get(requestId);
     if (!req) return this.json({ error: "request not found" }, 404);
+    if (authorization === null) return this.json({ error: "missing bearer token" }, 401);
+    if (authorization !== `Bearer ${req.authToken}`) {
+      return this.json({ error: "authorization denied" }, 403);
+    }
     const status = this.expireIfDue(req);
     if (status !== "resolved") {
       return this.json({ request_id: requestId, status });

@@ -1,12 +1,12 @@
 /**
  * `allw-approver pair` — enroll this software approver as a device on an account.
  *
- * Flow (`docs/contract.md` §Lifecycle / §Transport → pairing; relay #10):
+ * Flow (`docs/contract.md` §Lifecycle / §Transport → pairing; relay #89 auth):
  * 1. Load (or generate) the local keyfile — three software-held seeds + derived pubkeys.
  * 2. Obtain a pairing code: use `--code <code>` if supplied, else drive `POST /pairing/start`
- *    ourselves (fine for the v0 skeleton — in production the account owner starts the pairing).
+ *    ourselves. The matching pairing auth token authorizes `/pairing/complete`.
  * 3. `POST /pairing/complete` registering the device **X25519** public key → relay-assigned
- *    `device_id`.
+ *    `device_id` and relay `device_auth_token`.
  * 4. Mint a **device_cert** (`issue_device_cert`): the account-root key signs the device Ed25519
  *    verifying key → cert, so verifiers need only the account-root key.
  * 5. Persist relay/account/device + cert into the keyfile, and print the **account-root pubkey**
@@ -25,6 +25,8 @@ export interface PairOptions {
   readonly label?: string;
   /** An existing pairing code (account owner ran `/pairing/start`); omit to self-drive start. */
   readonly code?: string;
+  /** Bearer token returned with an externally-started pairing code. */
+  readonly pairingAuthToken?: string;
   /** Current time (ms) — injectable for deterministic tests; defaults to `Date.now()`. */
   readonly now?: number;
 }
@@ -70,20 +72,26 @@ export async function runPair(
 
   // 1. Obtain a pairing code (supplied or self-driven).
   let code = options.code;
+  let pairingAuthToken = options.pairingAuthToken;
   if (code === undefined) {
     const started = await pairingStart(options.relayUrl, options.accountId, options.label);
     code = started.code;
+    pairingAuthToken = started.pairing_auth_token;
     log(`Started pairing — code ${code} (expires ${new Date(started.expires_at).toISOString()})`);
+  } else if (pairingAuthToken === undefined) {
+    throw new Error("an externally supplied pairing code also requires its pairing auth token");
   }
 
   // 2. Complete pairing: register the device X25519 (encryption) key → device_id.
-  const deviceId = await pairingComplete(
+  const paired = await pairingComplete(
     options.relayUrl,
     options.accountId,
     code,
+    pairingAuthToken,
     existing.device_encryption_pubkey,
     options.label,
   );
+  const deviceId = paired.device_id;
   log(`Paired — device_id ${deviceId}`);
 
   // 3. Mint the device certificate: account-root signs the device Ed25519 verifying key.
@@ -101,6 +109,7 @@ export async function runPair(
     relay_url: options.relayUrl,
     account_id: options.accountId,
     device_id: deviceId,
+    device_auth_token: paired.device_auth_token,
     device_cert: deviceCert,
     ...(options.label !== undefined ? { label: options.label } : {}),
   };

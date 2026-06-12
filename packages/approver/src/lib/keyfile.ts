@@ -52,6 +52,8 @@ export interface Keyfile {
   account_id?: string;
   /** Device id assigned by the relay at `/pairing/complete` (set by `pair`). */
   device_id?: string;
+  /** Relay bearer token for this device's device-scoped endpoints (set by `pair`). */
+  device_auth_token?: string;
   /** Optional human label for this device. */
   label?: string;
   /** Device→account-root certificate (compact JWS) minted at pairing (set by `pair`). */
@@ -61,7 +63,7 @@ export interface Keyfile {
 /** A freshly generated, not-yet-paired identity (seeds + derived pubkeys only). */
 export type FreshKeyfile = Omit<
   Keyfile,
-  "relay_url" | "account_id" | "device_id" | "label" | "device_cert"
+  "relay_url" | "account_id" | "device_id" | "device_auth_token" | "label" | "device_cert"
 >;
 
 /** base64url-unpadded encode raw bytes (JOSE-consistent — matches every wire field). */
@@ -117,6 +119,7 @@ const OPTIONAL_STRING_FIELDS = [
   "relay_url",
   "account_id",
   "device_id",
+  "device_auth_token",
   "label",
   "device_cert",
 ] as const;

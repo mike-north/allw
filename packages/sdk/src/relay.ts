@@ -125,6 +125,7 @@ export class RelayClient {
   private readonly fetchImpl: FetchImpl;
   private readonly fetchTimeoutMs: number;
   private readonly schedule: ScheduleImpl;
+  private readonly requestAuthTokens = new Map<string, string>();
 
   constructor(
     relayUrl: string,
@@ -233,6 +234,18 @@ export class RelayClient {
         resp.status,
       );
     }
+    const body: unknown = await resp.json();
+    if (
+      typeof body !== "object" ||
+      body === null ||
+      typeof (body as { request_auth_token?: unknown }).request_auth_token !== "string"
+    ) {
+      throw new RelayError("relay submit returned a malformed auth body", resp.status);
+    }
+    this.requestAuthTokens.set(
+      envelope.id,
+      (body as { request_auth_token: string }).request_auth_token,
+    );
   }
 
   /**
@@ -242,8 +255,10 @@ export class RelayClient {
    * @throws {RelayError} on a non-2xx response (e.g. 404 unknown request).
    */
   async poll(requestId: string): Promise<VerdictOutcome | null> {
+    const token = this.requestAuthTokens.get(requestId);
     const resp = await this.timedFetch(`${this.base}/requests/${encodeURIComponent(requestId)}`, {
       method: "GET",
+      ...(token === undefined ? {} : { headers: { Authorization: `Bearer ${token}` } }),
     });
     if (!resp.ok) {
       throw new RelayError(`relay poll failed (HTTP ${String(resp.status)})`, resp.status);
@@ -266,6 +281,8 @@ export class RelayClient {
 
   /** The WebSocket URL for the live verdict-wait socket (`GET /:acct/requests/:id/wait`). */
   waitUrl(requestId: string): string {
-    return `${toWsUrl(this.base)}/requests/${encodeURIComponent(requestId)}/wait`;
+    const path = `${toWsUrl(this.base)}/requests/${encodeURIComponent(requestId)}/wait`;
+    const token = this.requestAuthTokens.get(requestId);
+    return token === undefined ? path : `${path}?auth=${encodeURIComponent(token)}`;
   }
 }

@@ -76,6 +76,7 @@ function nonce() {
 function relayDouble(wasm, approver, decision) {
   /** @type {Record<string, unknown> | null} */
   let captured = null;
+  let requestAuthToken = null;
 
   const json = (body, status = 200) =>
     new Response(JSON.stringify(body), {
@@ -101,15 +102,29 @@ function relayDouble(wasm, approver, decision) {
       });
     }
 
-    // POST /:acct/requests — capture the opaque envelope.
+    // POST /:acct/requests — capture the opaque envelope and issue the relay-scoped poll token.
     if (url.endsWith("/requests") && method === "POST") {
       captured = JSON.parse(String(init?.body));
-      return json({ ok: true });
+      requestAuthToken = `token-${captured.id}`;
+      return json(
+        {
+          request_id: captured.id,
+          status: "pending",
+          delivered_to: 1,
+          request_auth_token: requestAuthToken,
+        },
+        202,
+      );
     }
 
     // GET /:acct/requests/:id — sign + return a verdict bound to the captured envelope.
     if (/\/requests\/[^/]+$/.test(url) && method === "GET") {
       assert.ok(captured, "the request must have been submitted before polling");
+      assert.equal(
+        init?.headers?.Authorization,
+        `Bearer ${requestAuthToken}`,
+        "polling must use the request-scoped bearer token returned by submit",
+      );
       const env = captured;
 
       // The approver decrypts the human-shown context from the JWE it was sent (zero-knowledge

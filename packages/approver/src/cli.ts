@@ -41,7 +41,9 @@ pair OPTIONS:
   --account <id>     Account id to pair with (required).
   --label <name>     Human label for this device (optional).
   --code <code>      Use an existing pairing code (account owner ran /pairing/start). If omitted,
-                     the CLI drives /pairing/start itself (fine for the v0 skeleton).
+                     the CLI drives /pairing/start itself.
+  --pairing-token <token>
+                     Bearer token returned with an existing pairing code.
 
 watch OPTIONS:
   --relay <url>      Override the paired relay URL (defaults to the keyfile's relay_url).
@@ -84,6 +86,7 @@ async function main(): Promise<void> {
       account: { type: "string" },
       label: { type: "string" },
       code: { type: "string" },
+      "pairing-token": { type: "string" },
       force: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
@@ -109,6 +112,9 @@ async function main(): Promise<void> {
         keyfilePath,
         ...(values.label !== undefined ? { label: values.label } : {}),
         ...(values.code !== undefined ? { code: values.code } : {}),
+        ...(values["pairing-token"] !== undefined
+          ? { pairingAuthToken: values["pairing-token"] }
+          : {}),
       });
       return;
     }

@@ -23,10 +23,11 @@ async function postJson(
   url: string,
   body: unknown,
   timeoutMs: number = PAIRING_TIMEOUT_MS,
+  headers: Record<string, string> = {},
 ): Promise<unknown> {
   const resp = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...headers },
     body: JSON.stringify(body),
     // Fail-closed on a hung/unreachable relay rather than blocking forever (aborts after timeout).
     signal: AbortSignal.timeout(timeoutMs),
@@ -50,6 +51,12 @@ async function postJson(
 export interface PairingStartResult {
   readonly code: string;
   readonly expires_at: number;
+  readonly pairing_auth_token: string;
+}
+
+export interface PairingCompleteResult {
+  readonly device_id: string;
+  readonly device_auth_token: string;
 }
 
 /**
@@ -70,7 +77,8 @@ export async function pairingStart(
   if (
     typeof result !== "object" ||
     result === null ||
-    typeof (result as { code: unknown }).code !== "string"
+    typeof (result as { code: unknown }).code !== "string" ||
+    typeof (result as { pairing_auth_token: unknown }).pairing_auth_token !== "string"
   ) {
     throw new Error(`relay pairing/start returned an unexpected shape: ${JSON.stringify(result)}`);
   }
@@ -79,9 +87,9 @@ export async function pairingStart(
 
 /**
  * Complete a pairing: redeem `code` and register the device public key, returning the relay-issued
- * `device_id`.
+ * `device_id` plus the relay bearer token for device-scoped endpoints.
  *
- * **Single-key relay surface (#10).** `POST /pairing/complete` registers exactly one `pubkey` per
+ * **Single-key relay surface.** `POST /pairing/complete` registers exactly one `pubkey` per
  * device row. The approver holds two device keys (X25519 for decryption, Ed25519 for verdict
  * signing); the relay only needs the **X25519** key to route ciphertext as a JWE recipient, and
  * the Ed25519 verifying key reaches verifiers via the account-root **device_cert** (not the relay
@@ -92,30 +100,39 @@ export async function pairingComplete(
   relayUrl: string,
   accountId: string,
   code: string,
+  pairingAuthToken: string,
   encryptionPubkey: string,
   label?: string,
-): Promise<string> {
+): Promise<PairingCompleteResult> {
   const url = `${normalizeBase(relayUrl)}/${encodeURIComponent(accountId)}/pairing/complete`;
   const body: Record<string, string> = { code, pubkey: encryptionPubkey };
   if (label !== undefined) body.label = label;
-  const result = await postJson(url, body);
+  const result = await postJson(url, body, PAIRING_TIMEOUT_MS, {
+    Authorization: `Bearer ${pairingAuthToken}`,
+  });
   if (
     typeof result !== "object" ||
     result === null ||
-    typeof (result as { device_id: unknown }).device_id !== "string"
+    typeof (result as { device_id: unknown }).device_id !== "string" ||
+    typeof (result as { device_auth_token: unknown }).device_auth_token !== "string"
   ) {
     throw new Error(
       `relay pairing/complete returned an unexpected shape: ${JSON.stringify(result)}`,
     );
   }
-  return (result as { device_id: string }).device_id;
+  return result as unknown as PairingCompleteResult;
 }
 
 /**
  * Build the device presence WebSocket URL (`GET /:acct/devices/:deviceId/connect`). `http(s)` is
  * upgraded to `ws(s)` so the same relay base works for both HTTP pairing and the WS presence link.
  */
-export function deviceConnectWsUrl(relayUrl: string, accountId: string, deviceId: string): string {
+export function deviceConnectWsUrl(
+  relayUrl: string,
+  accountId: string,
+  deviceId: string,
+  deviceAuthToken: string,
+): string {
   const base = normalizeBase(relayUrl).replace(/^http/, "ws");
-  return `${base}/${encodeURIComponent(accountId)}/devices/${encodeURIComponent(deviceId)}/connect`;
+  return `${base}/${encodeURIComponent(accountId)}/devices/${encodeURIComponent(deviceId)}/connect?auth=${encodeURIComponent(deviceAuthToken)}`;
 }

@@ -9,10 +9,10 @@
  * This module ONLY stores public keys and routing metadata. Private keys and plaintext secrets
  * MUST NEVER appear here. `AccountRelay` is a registry of public key material, nothing more.
  *
- * # Auth note (deferred — issue #10 scope)
- * The endpoints below implement registry mechanics only. Endpoint authn/authz — who is allowed
- * to start a pairing, enroll an actor key, or revoke a device — is out of scope for #10 and
- * must follow `docs/enrollment.md`.
+ * # Endpoint auth
+ * Registry and request endpoints use relay-scoped bearer capability tokens. Tokens are random,
+ * short protocol secrets; the DO stores only SHA-256 hashes so persisted state cannot be replayed
+ * as a bearer credential. See issue #89 and `docs/enrollment.md`.
  */
 
 import { PAIRING_TTL_MS } from "./constants.js";
@@ -59,6 +59,7 @@ interface DeviceRow extends Record<string, string | number | null | ArrayBuffer>
   pubkey: string;
   label: string | null;
   created_at: number;
+  auth_token_hash: string | null;
 }
 
 interface DevicePushTokenRow extends Record<string, string | number | null | ArrayBuffer> {
@@ -86,6 +87,7 @@ interface PairingRow extends Record<string, string | number | null | ArrayBuffer
   created_at: number;
   expires_at: number;
   used: number;
+  auth_token_hash: string | null;
 }
 
 interface RequestRow extends Record<string, string | number | null | ArrayBuffer> {
@@ -95,6 +97,7 @@ interface RequestRow extends Record<string, string | number | null | ArrayBuffer
   expires_at: number;
   status: string;
   terminal_at: number | null;
+  auth_token_hash: string | null;
 }
 
 interface VerdictRow extends Record<string, string | number | null | ArrayBuffer> {
@@ -137,6 +140,7 @@ if (PAIRING_ALPHABET.length !== 32) {
 
 const PAIRING_CODE_LENGTH = 8;
 const REQUEST_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const AUTH_TOKEN_BYTES = 32;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -161,6 +165,55 @@ function generatePairingCode(): string {
   }
 
   return result;
+}
+
+function base64UrlEncode(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+/** Generate a high-entropy bearer token for relay-local endpoint authorization. */
+function generateAuthToken(): string {
+  const bytes = new Uint8Array(AUTH_TOKEN_BYTES);
+  crypto.getRandomValues(bytes);
+  return base64UrlEncode(bytes);
+}
+
+/** Store only a stable hash of bearer tokens so SQLite rows are not reusable credentials. */
+async function hashAuthToken(token: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
+  return base64UrlEncode(new Uint8Array(digest));
+}
+
+function timingSafeEqual(a: string, b: string): boolean {
+  let diff = a.length ^ b.length;
+  const max = Math.max(a.length, b.length);
+  for (let i = 0; i < max; i++) {
+    diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  }
+  return diff === 0;
+}
+
+function bearerToken(request: Request): string | null {
+  const auth = request.headers.get("Authorization") ?? "";
+  const match = /^Bearer ([A-Za-z0-9_-]+)$/.exec(auth);
+  if (match) return match[1] ?? null;
+  const queryToken = new URL(request.url).searchParams.get("auth");
+  return queryToken && /^[A-Za-z0-9_-]+$/.test(queryToken) ? queryToken : null;
+}
+
+function authError(status: 401 | 403): Response {
+  return json(
+    { error: status === 401 ? "authorization required" : "authorization denied" },
+    status,
+  );
+}
+
+async function tokenMatches(storedHash: string | null, token: string | null): Promise<boolean> {
+  if (storedHash === null) return false;
+  if (token === null) return false;
+  return timingSafeEqual(storedHash, await hashAuthToken(token));
 }
 
 /**
@@ -235,6 +288,8 @@ function optionalPushTokens(body: Record<string, unknown>): IncomingPushToken[] 
     const token = item.token;
     if (typeof transport !== "string" || !isPushTransportKind(transport)) return null;
     if (typeof token !== "string" || token.length < 1 || token.length > 4096) return null;
+    if (transport === "apns" && !/^[0-9a-fA-F]{64}$/.test(token)) return null;
+    if (transport === "fcm" && !/^[A-Za-z0-9:_-]{1,4096}$/.test(token)) return null;
     // Duplicate registrations are idempotent for one device; collapse them before DB mutation so
     // a repeated token cannot half-complete pairing by tripping the push-token primary key.
     const tokenKey = `${transport}\0${token}`;
@@ -306,9 +361,10 @@ function parseSurfaceId(request: Request): string | null | undefined {
  * ONLY public keys and routing metadata are stored here. Private keys and plaintext secrets
  * must NEVER be written to any SQLite table in this class.
  *
- * # Auth note (deferred — issue #10 scope)
- * Endpoint authn/authz (who may start pairing, enroll actors, revoke devices) is deliberately
- * out of scope for this PR. The production rules are specified in `docs/enrollment.md`.
+ * # Endpoint auth
+ * Pairing completion, device presence, actor enrollment, device revocation, and request poll/wait
+ * use relay-scoped bearer capability tokens introduced by #89. Token hashes are stored in SQLite;
+ * plaintext bearer values are returned once to the caller.
  */
 export class AccountRelay implements DurableObject {
   private readonly sql: SqlStorage;
@@ -337,7 +393,8 @@ export class AccountRelay implements DurableObject {
         device_id  TEXT    PRIMARY KEY,
         pubkey     TEXT    NOT NULL,
         label      TEXT,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        auth_token_hash TEXT
       );
 
       CREATE TABLE IF NOT EXISTS device_push_token (
@@ -360,7 +417,8 @@ export class AccountRelay implements DurableObject {
         label      TEXT,
         created_at INTEGER NOT NULL,
         expires_at INTEGER NOT NULL,
-        used       INTEGER NOT NULL DEFAULT 0
+        used       INTEGER NOT NULL DEFAULT 0,
+        auth_token_hash TEXT
       );
 
       -- Pending approval requests awaiting a device verdict.
@@ -373,7 +431,8 @@ export class AccountRelay implements DurableObject {
         created_at INTEGER NOT NULL,
         expires_at INTEGER NOT NULL,
         status     TEXT    NOT NULL DEFAULT 'pending',
-        terminal_at INTEGER
+        terminal_at INTEGER,
+        auth_token_hash TEXT
       );
 
       -- Signed device verdicts, stored solely to relay back to the integrator.
@@ -391,6 +450,17 @@ export class AccountRelay implements DurableObject {
       this.sql.exec(`ALTER TABLE request ADD COLUMN terminal_at INTEGER`);
     } catch {
       // Existing fresh schemas already have the column; older local DO state is migrated above.
+    }
+    for (const migration of [
+      `ALTER TABLE device ADD COLUMN auth_token_hash TEXT`,
+      `ALTER TABLE pairing ADD COLUMN auth_token_hash TEXT`,
+      `ALTER TABLE request ADD COLUMN auth_token_hash TEXT`,
+    ]) {
+      try {
+        this.sql.exec(migration);
+      } catch {
+        // Fresh schemas already have the column; older local DO state is migrated above.
+      }
     }
     this.sql.exec(`
       UPDATE request
@@ -448,7 +518,7 @@ export class AccountRelay implements DurableObject {
 
     // POST /devices/{device_id}/revoke
     if (method === "POST" && path0 === "devices" && path1 !== "" && path2 === "revoke") {
-      return this.handleDeviceRevoke(path1);
+      return this.handleDeviceRevoke(path1, request);
     }
 
     // GET /devices/{device_id}/connect (WebSocket) — device presence + offline-queue flush.
@@ -469,12 +539,12 @@ export class AccountRelay implements DurableObject {
       if (!isWebSocketUpgrade(request)) {
         return json({ error: "WebSocket upgrade required" }, 426);
       }
-      return this.handleIntegratorWait(path1);
+      return this.handleIntegratorWait(path1, request);
     }
 
     // GET /requests/{request_id} — integrator polls request status / fetches the verdict.
     if (method === "GET" && path0 === "requests" && path1 !== "" && path2 === "") {
-      return this.handleGetRequest(path1);
+      return this.handleGetRequest(path1, request);
     }
 
     // 405 only for a KNOWN route path reached with an unsupported method; any other (unknown)
@@ -505,6 +575,35 @@ export class AccountRelay implements DurableObject {
   // Route handlers
   // ---------------------------------------------------------------------------
 
+  private async authorizeStoredHash(
+    request: Request,
+    storedHash: string | null | undefined,
+  ): Promise<Response | null> {
+    // A missing hash is a legacy/migration row, not proof of authorization. Fail closed and require
+    // re-pairing or re-submission so no endpoint silently falls back to unauthenticated access.
+    if (storedHash === null || storedHash === undefined) return authError(401);
+    const token = bearerToken(request);
+    if (token === null) return authError(401);
+    return (await tokenMatches(storedHash, token)) ? null : authError(403);
+  }
+
+  private async authorizedDeviceId(request: Request): Promise<string | Response> {
+    const token = bearerToken(request);
+    if (token === null) return authError(401);
+    const tokenHash = await hashAuthToken(token);
+    const rows = [
+      ...this.sql.exec<DeviceRow>(
+        `SELECT device_id, auth_token_hash FROM device WHERE auth_token_hash IS NOT NULL`,
+      ),
+    ];
+    for (const row of rows) {
+      if (row.auth_token_hash !== null && timingSafeEqual(row.auth_token_hash, tokenHash)) {
+        return row.device_id;
+      }
+    }
+    return authError(403);
+  }
+
   /**
    * POST /pairing/start
    * Body: { label?: string }
@@ -518,19 +617,22 @@ export class AccountRelay implements DurableObject {
     const label = body ? optionalString(body, "label") : undefined;
 
     const code = generatePairingCode();
+    const pairingAuthToken = generateAuthToken();
+    const pairingAuthTokenHash = await hashAuthToken(pairingAuthToken);
     const now = Date.now();
     const expiresAt = now + PAIRING_TTL_MS;
 
     this.sql.exec(
-      `INSERT INTO pairing (code, label, created_at, expires_at, used)
-       VALUES (?, ?, ?, ?, 0)`,
+      `INSERT INTO pairing (code, label, created_at, expires_at, used, auth_token_hash)
+       VALUES (?, ?, ?, ?, 0, ?)`,
       code,
       label ?? null,
       now,
       expiresAt,
+      pairingAuthTokenHash,
     );
 
-    return json({ code, expires_at: expiresAt }, 201);
+    return json({ code, expires_at: expiresAt, pairing_auth_token: pairingAuthToken }, 201);
   }
 
   /**
@@ -568,31 +670,37 @@ export class AccountRelay implements DurableObject {
     // Look up the pairing row
     const rows = [
       ...this.sql.exec<PairingRow>(
-        `SELECT code, label, created_at, expires_at, used FROM pairing WHERE code = ?`,
+        `SELECT code, label, created_at, expires_at, used, auth_token_hash FROM pairing WHERE code = ?`,
         code,
       ),
     ];
     const pairing = rows[0];
     if (!pairing) return json({ error: "pairing code not found" }, 404);
+    const authFailure = await this.authorizeStoredHash(request, pairing.auth_token_hash);
+    if (authFailure) return authFailure;
     if (pairing.used !== 0) return json({ error: "pairing code already used" }, 409);
     if (Date.now() > pairing.expires_at) {
       return json({ error: "pairing code expired" }, 410);
     }
 
     const deviceId = crypto.randomUUID();
+    const deviceAuthToken = generateAuthToken();
+    const deviceAuthTokenHash = await hashAuthToken(deviceAuthToken);
     const now = Date.now();
 
     // Mark the code as used and insert the device record atomically.
     // SECURITY: only the public key (pubkey) is stored — no private key ever touches this table.
     this.sql.exec(`UPDATE pairing SET used = 1 WHERE code = ?`, code);
     this.sql.exec(
-      `INSERT INTO device (device_id, pubkey, label, created_at) VALUES (?, ?, ?, ?)`,
+      `INSERT INTO device (device_id, pubkey, label, created_at, auth_token_hash)
+       VALUES (?, ?, ?, ?, ?)`,
       deviceId,
       pubkey,
       // Fall back to the label supplied at /pairing/start so that field stays meaningful when
       // /pairing/complete omits its own.
       label ?? pairing.label ?? null,
       now,
+      deviceAuthTokenHash,
     );
     for (const pushToken of pushTokens) {
       this.sql.exec(
@@ -605,7 +713,7 @@ export class AccountRelay implements DurableObject {
       );
     }
 
-    return json({ device_id: deviceId }, 201);
+    return json({ device_id: deviceId, device_auth_token: deviceAuthToken }, 201);
   }
 
   /**
@@ -617,6 +725,9 @@ export class AccountRelay implements DurableObject {
    * SECURITY: only the public key is stored (zero-knowledge invariant).
    */
   private async handleActorEnroll(request: Request): Promise<Response> {
+    const authorizedDevice = await this.authorizedDeviceId(request);
+    if (authorizedDevice instanceof Response) return authorizedDevice;
+
     const body = await parseJsonBody(request);
     if (!body) return json({ error: "invalid JSON body" }, 400);
 
@@ -709,12 +820,17 @@ export class AccountRelay implements DurableObject {
    *
    * Removes the device record. Returns 404 if the device is not enrolled.
    */
-  private handleDeviceRevoke(deviceId: string): Response {
+  private async handleDeviceRevoke(deviceId: string, request: Request): Promise<Response> {
+    const authorizedDevice = await this.authorizedDeviceId(request);
+    if (authorizedDevice instanceof Response) return authorizedDevice;
     const existing = [
       ...this.sql.exec<DeviceRow>(`SELECT device_id FROM device WHERE device_id = ?`, deviceId),
     ];
     if (existing.length === 0) {
       return json({ error: "device not found" }, 404);
+    }
+    if (authorizedDevice !== deviceId) {
+      return authError(403);
     }
 
     this.sql.exec(`DELETE FROM device WHERE device_id = ?`, deviceId);
@@ -748,13 +864,19 @@ export class AccountRelay implements DurableObject {
    * `{ type: "retract", request_id }` (another surface resolved it).
    * Protocol (device → relay): `{ type: "verdict", request_id, verdict }` (signed decision).
    */
-  private handleDeviceConnect(deviceId: string, request: Request): Response {
+  private async handleDeviceConnect(deviceId: string, request: Request): Promise<Response> {
     const enrolled = [
-      ...this.sql.exec<DeviceRow>(`SELECT device_id FROM device WHERE device_id = ?`, deviceId),
+      ...this.sql.exec<DeviceRow>(
+        `SELECT device_id, auth_token_hash FROM device WHERE device_id = ?`,
+        deviceId,
+      ),
     ];
-    if (enrolled.length === 0) {
+    const device = enrolled[0];
+    if (!device) {
       return json({ error: "device not enrolled" }, 404);
     }
+    const authFailure = await this.authorizeStoredHash(request, device.auth_token_hash);
+    if (authFailure) return authFailure;
     const surfaceId = parseSurfaceId(request);
     if (surfaceId === null) {
       return json({ error: "surface_id must be 1-128 URL-safe identifier chars" }, 400);
@@ -840,6 +962,8 @@ export class AccountRelay implements DurableObject {
 
     const now = Date.now();
     if (expiresAt <= now) return json({ error: "request already expired" }, 400);
+    const requestAuthToken = generateAuthToken();
+    const requestAuthTokenHash = await hashAuthToken(requestAuthToken);
 
     // Fast-path duplicate rejection. The INSERT below is ALSO guarded: `handleSubmit` awaits the
     // JSON parse, so two concurrent submits for the same id can interleave past this SELECT and
@@ -852,12 +976,14 @@ export class AccountRelay implements DurableObject {
     // SECURITY: the whole envelope is routing/lifecycle + the opaque ciphertext — no plaintext.
     try {
       this.sql.exec(
-        `INSERT INTO request (request_id, envelope, created_at, expires_at, status, terminal_at)
-         VALUES (?, ?, ?, ?, 'pending', NULL)`,
+        `INSERT INTO request
+         (request_id, envelope, created_at, expires_at, status, terminal_at, auth_token_hash)
+         VALUES (?, ?, ?, ?, 'pending', NULL, ?)`,
         id,
         JSON.stringify(envelope),
         now,
         expiresAt,
+        requestAuthTokenHash,
       );
     } catch {
       // Primary-key conflict: a concurrent submit with this id won the race → consistently a 409.
@@ -868,8 +994,43 @@ export class AccountRelay implements DurableObject {
     const delivered = this.sendRequestToOneSocketPerSurface(id, envelope);
     const pushWakeups = await this.sendPushWakeups(accountId, id);
 
+    return this.requestSubmitResponse(id, delivered, pushWakeups, requestAuthToken);
+  }
+
+  private async authorizeRequestRead(
+    requestId: string,
+    request: Request,
+  ): Promise<{ row: RequestRow; status: string } | Response> {
+    const rows = [
+      ...this.sql.exec<RequestRow>(
+        `SELECT request_id, status, expires_at, auth_token_hash FROM request WHERE request_id = ?`,
+        requestId,
+      ),
+    ];
+    const req = rows[0];
+    if (!req) return json({ error: "request not found" }, 404);
+    const authFailure = await this.authorizeStoredHash(request, req.auth_token_hash);
+    if (authFailure) return authFailure;
+    return {
+      row: req,
+      status: this.expireIfDue(requestId, req.status, req.expires_at, Date.now()),
+    };
+  }
+
+  private requestSubmitResponse(
+    id: string,
+    delivered: number,
+    pushWakeups: number,
+    requestAuthToken: string,
+  ): Response {
     return json(
-      { request_id: id, status: "pending", delivered_to: delivered, push_wakeups: pushWakeups },
+      {
+        request_id: id,
+        status: "pending",
+        delivered_to: delivered,
+        push_wakeups: pushWakeups,
+        request_auth_token: requestAuthToken,
+      },
       202,
     );
   }
@@ -896,16 +1057,10 @@ export class AccountRelay implements DurableObject {
    * The polling counterpart to `…/wait` — lets a disconnected integrator fetch a persisted verdict.
    * Lazy-expires a past-deadline request on read so it never reports a perpetual `pending`.
    */
-  private handleGetRequest(requestId: string): Response {
-    const rows = [
-      ...this.sql.exec<RequestRow>(
-        `SELECT request_id, status, expires_at FROM request WHERE request_id = ?`,
-        requestId,
-      ),
-    ];
-    const req = rows[0];
-    if (!req) return json({ error: "request not found" }, 404);
-    const status = this.expireIfDue(requestId, req.status, req.expires_at, Date.now());
+  private async handleGetRequest(requestId: string, request: Request): Promise<Response> {
+    const authorized = await this.authorizeRequestRead(requestId, request);
+    if (authorized instanceof Response) return authorized;
+    const status = authorized.status;
     if (status !== "resolved") {
       // pending, or terminal `expired` (fail-closed) — never a verdict.
       return json({ request_id: requestId, status });
@@ -928,16 +1083,10 @@ export class AccountRelay implements DurableObject {
    * Protocol (relay → integrator): `{ type: "verdict", request_id, verdict }` or
    * `{ type: "expired", request_id }` (terminal, no verdict will come).
    */
-  private handleIntegratorWait(requestId: string): Response {
-    const rows = [
-      ...this.sql.exec<RequestRow>(
-        `SELECT request_id, status, expires_at FROM request WHERE request_id = ?`,
-        requestId,
-      ),
-    ];
-    const req = rows[0];
-    if (!req) return json({ error: "request not found" }, 404);
-    const status = this.expireIfDue(requestId, req.status, req.expires_at, Date.now());
+  private async handleIntegratorWait(requestId: string, request: Request): Promise<Response> {
+    const authorized = await this.authorizeRequestRead(requestId, request);
+    if (authorized instanceof Response) return authorized;
+    const status = authorized.status;
 
     const pair = new WebSocketPair();
     const client = pair[0];
