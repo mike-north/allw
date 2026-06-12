@@ -21,7 +21,7 @@ import {
   verifyActorOrigin,
   type RenderableRequest,
 } from "../lib/approver-core.js";
-import { readKeyfile, type Keyfile } from "../lib/keyfile.js";
+import { readKeyfile, writeKeyfile, type Keyfile } from "../lib/keyfile.js";
 import { deviceConnectWsUrl, fetchAccountStatesWithMetadata } from "../lib/relay-client.js";
 import { renderRequest } from "../lib/render.js";
 import type { AllwWasm } from "../lib/wasm.js";
@@ -165,6 +165,7 @@ export async function handleRequest(
   log: WatchLogger,
   now: () => number = Date.now,
   resolveAccountStates: AccountStateResolver = () => Promise.resolve([]),
+  recordAccountStateSequence: (sequence: number) => void = () => {},
 ): Promise<Decision | null> {
   let prepared: RenderableRequest;
   try {
@@ -203,10 +204,11 @@ export async function handleRequest(
   }
   let origin;
   try {
+    const sequenceFloor = keyfile.account_state_highest_sequence ?? 0;
     // The relay is zero-knowledge and does not parse account-state JWS payloads. Therefore its
     // monotonic metadata is only useful if the device confirms it is backed by root-verified docs.
     const verifiedHighestSequence =
-      relayMaxSequence !== undefined && relayMaxSequence > 0
+      relayMaxSequence !== undefined || sequenceFloor > 0
         ? highestVerifiedAccountStateSequence(
             wasm,
             accountStates,
@@ -225,7 +227,20 @@ export async function handleRequest(
           `relay account-state max_sequence ${String(relayMaxSequence)} exceeds highest ` +
           `root-verified sequence ${String(verifiedHighestSequence ?? "none")}`,
       };
+    } else if (
+      sequenceFloor > 0 &&
+      (verifiedHighestSequence === null || verifiedHighestSequence < sequenceFloor)
+    ) {
+      origin = {
+        verified: false as const,
+        reason:
+          `highest root-verified account-state sequence ${String(verifiedHighestSequence ?? "none")} ` +
+          `is below persisted account-state sequence floor ${String(sequenceFloor)}`,
+      };
     } else {
+      if (verifiedHighestSequence !== null && verifiedHighestSequence > sequenceFloor) {
+        recordAccountStateSequence(verifiedHighestSequence);
+      }
       origin = verifyActorOrigin(
         wasm,
         prepared,
@@ -311,7 +326,7 @@ export async function runWatch(
   // present relay_url/account_id/device_id is guaranteed a string here — a corrupt non-string field
   // would have thrown during load (review item #6). The checks below only distinguish unpaired
   // (field absent) from paired.
-  const keyfile = readKeyfile(options.keyfilePath);
+  let keyfile = readKeyfile(options.keyfilePath);
 
   const relayUrl = options.relayUrl ?? keyfile.relay_url;
   const accountId = keyfile.account_id;
@@ -341,6 +356,11 @@ export async function runWatch(
   // failures are caught by `handleRequest` and downgrade the render to ⚠ UNVERIFIED.
   const resolveAccountStates: AccountStateResolver = () =>
     fetchAccountStatesWithMetadata(relayUrl, accountId, deviceAuthToken);
+  const recordAccountStateSequence = (sequence: number): void => {
+    if (sequence <= (keyfile.account_state_highest_sequence ?? 0)) return;
+    keyfile = { ...keyfile, account_state_highest_sequence: sequence };
+    writeKeyfile(options.keyfilePath, keyfile);
+  };
 
   // Serialize request handling: prompts are interactive, so process one at a time.
   let chain: Promise<unknown> = Promise.resolve();
@@ -366,6 +386,7 @@ export async function runWatch(
             log,
             deps.now,
             resolveAccountStates,
+            recordAccountStateSequence,
           ).catch((err: unknown) => {
             log.warn(`Unexpected error handling a request: ${(err as Error).message}`);
           }),
