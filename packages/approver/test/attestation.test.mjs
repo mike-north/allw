@@ -172,13 +172,7 @@ function prepareWithAttestation(
 }
 
 function verify(wasm, keyfile, prepared, accountStates) {
-  return verifyActorOrigin(
-    wasm,
-    prepared,
-    ACCOUNT_ID,
-    keyfile.account_root_pubkey,
-    accountStates,
-  );
+  return verifyActorOrigin(wasm, prepared, ACCOUNT_ID, keyfile.account_root_pubkey, accountStates);
 }
 
 // ── Verified origin: sign → root-anchor via account state → verify → render shows ✓ VERIFIED ──
@@ -190,7 +184,11 @@ test("verified origin: a root-anchored attestation renders ✓ VERIFIED", async 
   const prepared = prepareWithAttestation(wasm, keyfile);
   const origin = verify(wasm, keyfile, prepared, enrolledStates(wasm, keyfile));
 
-  assert.equal(origin.verified, true, "the attestation verifies against the root-anchored actor key");
+  assert.equal(
+    origin.verified,
+    true,
+    "the attestation verifies against the root-anchored actor key",
+  );
   // docs/contract.md §Identity & keys: "{kind} · {id}".
   assert.equal(origin.origin, "claude-code · machine:macbook-pro", "verified origin string");
 
@@ -230,7 +228,11 @@ test("relay key substitution: account state enrolling a DIFFERENT key renders �
   ];
   const origin = verify(wasm, keyfile, prepared, substituted);
 
-  assert.equal(origin.verified, false, "an enrolled key that does not match the signature must fail");
+  assert.equal(
+    origin.verified,
+    false,
+    "an enrolled key that does not match the signature must fail",
+  );
   const rendered = renderRequest({ ...prepared, origin });
   assert.match(rendered, /⚠ UNVERIFIED/, "a substituted key renders UNVERIFIED");
 });
@@ -245,7 +247,11 @@ test("no account state: a correctly-signed attestation with no root anchor rende
   // No account-state documents → no root anchor → unverified (NOT an abort).
   const origin = verify(wasm, keyfile, prepared, []);
 
-  assert.equal(origin.verified, false, "with no root-signed account state there is no trust anchor");
+  assert.equal(
+    origin.verified,
+    false,
+    "with no root-signed account state there is no trust anchor",
+  );
   assert.match(origin.reason, /root-signed account state/, "the reason names the missing anchor");
 
   const rendered = renderRequest({ ...prepared, origin });
@@ -389,7 +395,11 @@ test("tampered account state: a doc signed by a non-root key renders ⚠ UNVERIF
   const forgedJws = wasm.sign_account_state(JSON.stringify(forgedState), OTHER_SEED);
   const origin = verify(wasm, keyfile, prepared, [forgedJws]);
 
-  assert.equal(origin.verified, false, "an account-state doc not signed by the trusted root must fail");
+  assert.equal(
+    origin.verified,
+    false,
+    "an account-state doc not signed by the trusted root must fail",
+  );
   const rendered = renderRequest({ ...prepared, origin });
   assert.match(rendered, /⚠ UNVERIFIED/, "a tampered account-state doc renders UNVERIFIED");
 });

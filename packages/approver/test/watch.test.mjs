@@ -440,7 +440,12 @@ function signedAccountState(wasm, keyfile, actorPubkey) {
     previous_roots: [],
     devices: [],
     actors: [
-      { actor_id: CONTEXT.actor.id, kind: CONTEXT.actor.kind, pubkey: actorPubkey, status: "active" },
+      {
+        actor_id: CONTEXT.actor.id,
+        kind: CONTEXT.actor.kind,
+        pubkey: actorPubkey,
+        status: "active",
+      },
     ],
     revocations: [],
   };
