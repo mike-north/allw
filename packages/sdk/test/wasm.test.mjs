@@ -23,6 +23,13 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
+import {
+  evaluatePolicyWithAccountStates,
+  signAccountState,
+  verifyAccountState,
+  verifyPolicyRuleWithAccountStates,
+  verifyVerdictWithAccountStates,
+} from "../dist/index.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const vendorDir = join(here, "..", "vendor", "allw-wasm");
@@ -184,7 +191,62 @@ function policyFixture(wasm) {
   const createdAt = 1700000000000;
   const nowMs = createdAt + 1000;
   const cert = wasm.issue_device_cert(accountSeed, accountId, deviceId, devicePub, createdAt);
-  return { accountId, deviceId, deviceSeed, accountRootPub, cert, createdAt, nowMs };
+  return { accountId, deviceId, accountSeed, deviceSeed, accountRootPub, cert, createdAt, nowMs };
+}
+
+function signedAccountState(
+  wasm,
+  {
+    accountSeed,
+    accountId,
+    currentRoot,
+    sequence,
+    revokedDeviceIds = [],
+    revokedAt = 1700002000000,
+  },
+) {
+  return wasm.sign_account_state(
+    JSON.stringify({
+      v: 1,
+      account_id: accountId,
+      sequence,
+      current_root: currentRoot,
+      previous_roots: [],
+      devices: [],
+      actors: [],
+      revocations: revokedDeviceIds.map((id) => ({
+        kind: "device",
+        id,
+        revoked_at: revokedAt,
+        reason: "test revocation",
+      })),
+    }),
+    accountSeed,
+  );
+}
+
+function unsignedAccountState({
+  accountId,
+  currentRoot,
+  sequence,
+  revokedDeviceIds = [],
+  revokedAt = 1700002000000,
+}) {
+  return {
+    v: 1,
+    account_id: accountId,
+    sequence,
+    current_root: currentRoot,
+    previous_roots: [],
+    devices: [],
+    actors: [],
+    revocations: revokedDeviceIds.map((id) => ({
+      kind: "device",
+      id,
+      revoked_at: revokedAt,
+      reason: "test revocation",
+    })),
+  };
 }
 
 test("ed25519/x25519 public-key derivation returns 43-char base64url keys", async () => {
@@ -547,6 +609,34 @@ test("evaluate_policy rejects empty predicates and token-anchors args_any_globs"
   );
 });
 
+test("verify_account_state accepts valid root-signed state and rejects wrong account/root", async () => {
+  const wasm = await loadWasm();
+  const f = approverFixture(wasm);
+  const valid = signedAccountState(wasm, {
+    accountSeed: f.accountSeed,
+    accountId: "acct_rt",
+    currentRoot: f.accountRootPub,
+    sequence: 3,
+  });
+
+  const verified = JSON.parse(wasm.verify_account_state(valid, "acct_rt", f.accountRootPub));
+  assert.equal(verified.account_id, "acct_rt");
+  assert.equal(verified.sequence, 3);
+
+  assert.throws(
+    () => wasm.verify_account_state(valid, "acct_other", f.accountRootPub),
+    /account[- ]state/i,
+    "account states for another account must be rejected",
+  );
+
+  const otherRootPub = wasm.ed25519_public_key(Buffer.alloc(32, 0x77).toString("base64url"));
+  assert.throws(
+    () => wasm.verify_account_state(valid, "acct_rt", otherRootPub),
+    /account[- ]state/i,
+    "account states signed for a different root must be rejected",
+  );
+});
+
 test("sign_verdict + issue_device_cert produce a verdict verify_verdict accepts", async () => {
   const wasm = await loadWasm();
   const f = approverFixture(wasm);
@@ -564,6 +654,242 @@ test("sign_verdict + issue_device_cert produce a verdict verify_verdict accepts"
   );
   assert.equal(result.approved, true, "the freshly signed verdict must verify as approved");
   assert.equal(result.device_id, "dev_rt", "device_id comes from the verified verdict");
+});
+
+test("verify_verdict_with_account_states rejects revoked devices and stale rollback", async () => {
+  const wasm = await loadWasm();
+  const f = approverFixture(wasm);
+  const verdictJson = wasm.sign_verdict(JSON.stringify(f.unsigned), f.deviceSeed, f.nonce, f.cert);
+  const staleWithoutRevocation = signedAccountState(wasm, {
+    accountSeed: f.accountSeed,
+    accountId: "acct_rt",
+    currentRoot: f.accountRootPub,
+    sequence: 4,
+  });
+  const newerRevocation = signedAccountState(wasm, {
+    accountSeed: f.accountSeed,
+    accountId: "acct_rt",
+    currentRoot: f.accountRootPub,
+    sequence: 5,
+    revokedDeviceIds: ["dev_rt"],
+  });
+
+  assert.throws(
+    () =>
+      wasm.verify_verdict_with_account_states(
+        verdictJson,
+        f.v.request_json,
+        f.v.context_json,
+        f.accountRootPub,
+        f.v.now_ms,
+        JSON.stringify([newerRevocation]),
+      ),
+    /device id is revoked/,
+    "a revoked signing device must not verify",
+  );
+
+  assert.throws(
+    () =>
+      wasm.verify_verdict_with_account_states(
+        verdictJson,
+        f.v.request_json,
+        f.v.context_json,
+        f.accountRootPub,
+        f.v.now_ms,
+        JSON.stringify([newerRevocation, staleWithoutRevocation]),
+      ),
+    /device id is revoked/,
+    "a lower-sequence state must not roll back a newer revocation",
+  );
+});
+
+test("verify_policy_rule_with_account_states rejects revoked signing devices", async () => {
+  const wasm = await loadWasm();
+  const f = policyFixture(wasm);
+  const unsigned = {
+    id: "allow-status",
+    account_id: f.accountId,
+    subject: { kind: "any" },
+    match: { surface: "command", command: { bin: "git", args_any_globs: ["status"] } },
+    effect: "allow",
+    provenance: "manual",
+    tier: "syntactic",
+    created_at: f.createdAt,
+  };
+  const signedRule = wasm.sign_policy_rule(
+    JSON.stringify(unsigned),
+    f.deviceId,
+    f.deviceSeed,
+    f.cert,
+  );
+  const revoked = signedAccountState(wasm, {
+    accountSeed: f.accountSeed,
+    accountId: f.accountId,
+    currentRoot: f.accountRootPub,
+    sequence: 2,
+    revokedDeviceIds: [f.deviceId],
+  });
+
+  assert.throws(
+    () =>
+      wasm.verify_policy_rule_with_account_states(
+        signedRule,
+        f.accountRootPub,
+        f.nowMs,
+        JSON.stringify([revoked]),
+      ),
+    /policy-rule signing device is revoked/,
+    "policy rules signed by revoked devices must be rejected",
+  );
+
+  assert.throws(
+    () =>
+      wasm.evaluate_policy_with_account_states(
+        wasm.action_from_command("git status", null),
+        JSON.stringify({ id: "machine:macbook", kind: "claude-code" }),
+        JSON.stringify([JSON.parse(signedRule)]),
+        f.accountRootPub,
+        f.nowMs,
+        JSON.stringify([revoked]),
+      ),
+    /policy-rule signing device is revoked/,
+    "policy evaluation must fail closed when a signed rule's device is revoked",
+  );
+});
+
+test("@allw/sdk account-state helpers verify documents and reject revoked verdicts", async () => {
+  const wasm = await loadWasm();
+  const f = approverFixture(wasm);
+  const state = unsignedAccountState({
+    accountId: "acct_rt",
+    currentRoot: f.accountRootPub,
+    sequence: 7,
+  });
+  const stateJws = await signAccountState(state, f.accountSeed);
+
+  const verifiedState = await verifyAccountState(stateJws, "acct_rt", f.accountRootPub);
+  assert.equal(verifiedState.account_id, "acct_rt");
+  assert.equal(verifiedState.sequence, 7);
+
+  const verdict = JSON.parse(
+    wasm.sign_verdict(JSON.stringify(f.unsigned), f.deviceSeed, f.nonce, f.cert),
+  );
+  const request = JSON.parse(f.v.request_json);
+  const context = JSON.parse(f.v.context_json);
+  const verifiedVerdict = await verifyVerdictWithAccountStates({
+    verdict,
+    request,
+    context,
+    approverRootKey: f.accountRootPub,
+    nowMs: f.v.now_ms,
+    accountStates: [stateJws],
+  });
+  assert.equal(verifiedVerdict.approved, true);
+  assert.equal(verifiedVerdict.deviceId, "dev_rt");
+
+  const revokedStateJws = await signAccountState(
+    unsignedAccountState({
+      accountId: "acct_rt",
+      currentRoot: f.accountRootPub,
+      sequence: 8,
+      revokedDeviceIds: ["dev_rt"],
+    }),
+    f.accountSeed,
+  );
+  await assert.rejects(
+    () =>
+      verifyVerdictWithAccountStates({
+        verdict,
+        request,
+        context,
+        approverRootKey: f.accountRootPub,
+        nowMs: f.v.now_ms,
+        accountStates: [revokedStateJws, stateJws],
+      }),
+    /device id is revoked/,
+    "SDK verdict verification must enforce highest-sequence account-state revocation",
+  );
+});
+
+test("@allw/sdk policy helpers reject rules from revoked devices", async () => {
+  const wasm = await loadWasm();
+  const f = policyFixture(wasm);
+  const actor = { id: "machine:macbook", kind: "claude-code" };
+  const action = JSON.parse(wasm.action_from_command("git status", null));
+  const unsigned = {
+    id: "allow-status-sdk",
+    account_id: f.accountId,
+    subject: { kind: "any" },
+    match: { surface: "command", command: { bin: "git", args_any_globs: ["status"] } },
+    effect: "allow",
+    provenance: "manual",
+    tier: "syntactic",
+    created_at: f.createdAt,
+  };
+  const signedRule = JSON.parse(
+    wasm.sign_policy_rule(JSON.stringify(unsigned), f.deviceId, f.deviceSeed, f.cert),
+  );
+  const activeState = await signAccountState(
+    unsignedAccountState({
+      accountId: f.accountId,
+      currentRoot: f.accountRootPub,
+      sequence: 1,
+    }),
+    f.accountSeed,
+  );
+
+  const verifiedRule = await verifyPolicyRuleWithAccountStates({
+    rule: signedRule,
+    accountRootKey: f.accountRootPub,
+    nowMs: f.nowMs,
+    accountStates: [activeState],
+  });
+  assert.equal(verifiedRule.deviceId, f.deviceId);
+
+  const evaluation = await evaluatePolicyWithAccountStates({
+    action,
+    actor,
+    signedRules: [signedRule],
+    accountRootKey: f.accountRootPub,
+    nowMs: f.nowMs,
+    accountStates: [activeState],
+  });
+  assert.equal(evaluation.decision, "allow");
+  assert.equal(evaluation.ruleId, "allow-status-sdk");
+
+  const revokedState = await signAccountState(
+    unsignedAccountState({
+      accountId: f.accountId,
+      currentRoot: f.accountRootPub,
+      sequence: 2,
+      revokedDeviceIds: [f.deviceId],
+    }),
+    f.accountSeed,
+  );
+  await assert.rejects(
+    () =>
+      verifyPolicyRuleWithAccountStates({
+        rule: signedRule,
+        accountRootKey: f.accountRootPub,
+        nowMs: f.nowMs,
+        accountStates: [revokedState, activeState],
+      }),
+    /policy-rule signing device is revoked/,
+    "SDK policy-rule verification must enforce account-state revocation",
+  );
+  await assert.rejects(
+    () =>
+      evaluatePolicyWithAccountStates({
+        action,
+        actor,
+        signedRules: [signedRule],
+        accountRootKey: f.accountRootPub,
+        nowMs: f.nowMs,
+        accountStates: [revokedState, activeState],
+      }),
+    /policy-rule signing device is revoked/,
+    "SDK policy evaluation must fail closed when a signed rule's device is revoked",
+  );
 });
 
 test("verify rejects a verdict whose signing key the device-cert did not certify", async () => {

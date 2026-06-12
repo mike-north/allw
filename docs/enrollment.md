@@ -226,6 +226,11 @@ Validation:
 - The relay cannot make a revoked key active by omitting the revocation from an older state document; verifiers
   keep the highest valid sequence they have seen.
 
+SDK callers that use the revocation-aware `*_with_account_states` verification APIs must supply all known
+account-state JWS documents, or must first enforce a durably stored highest sequence for the account. The SDK and
+WASM core reject stale lower-sequence rollback within one supplied set, but monotonic persistence across calls is
+integrator-owned in v1.
+
 ## Key Rotation
 
 ### Device-Key Rotation

@@ -57,6 +57,27 @@ export interface AllwWasm {
     approverRootPubkeyB64: string,
     nowMs: number,
   ): string;
+  /**
+   * Verifies a verdict and rejects it when the signing device appears revoked in the
+   * highest-sequence valid account state. `accountStatesJson` is a JSON array of compact
+   * root-signed account-state JWS strings.
+   */
+  verify_verdict_with_account_states(
+    verdictJson: string,
+    requestJson: string,
+    contextJson: string,
+    approverRootPubkeyB64: string,
+    nowMs: number,
+    accountStatesJson: string,
+  ): string;
+  /** Sign a root-authored account-state JSON document, returning a compact account-state JWS. */
+  sign_account_state(stateJson: string, accountRootSeedB64: string): string;
+  /** Verify a compact account-state JWS and return the verified AccountState JSON. */
+  verify_account_state(
+    accountStateJws: string,
+    expectedAccountId: string,
+    accountRootPubkeyB64: string,
+  ): string;
   /** Derive the Ed25519 public key for a 32-byte signing seed (base64url). */
   ed25519_public_key(seedB64: string): string;
   /** Build an ActionRecord JSON for a shell command using the core T1 command parser. */
@@ -90,6 +111,22 @@ export interface AllwWasm {
     signedRulesJson: string,
     accountRootPubkeyB64: string,
     nowMs: number,
+  ): string;
+  /** Verify one signed PolicyRule JSON object with account-state revocation enforcement. */
+  verify_policy_rule_with_account_states(
+    ruleJson: string,
+    accountRootPubkeyB64: string,
+    nowMs: number,
+    accountStatesJson: string,
+  ): string;
+  /** Verify signed PolicyRule JSON objects with account-state revocation and evaluate one action. */
+  evaluate_policy_with_account_states(
+    actionJson: string,
+    actorJson: string | null | undefined,
+    signedRulesJson: string,
+    accountRootPubkeyB64: string,
+    nowMs: number,
+    accountStatesJson: string,
   ): string;
 }
 
