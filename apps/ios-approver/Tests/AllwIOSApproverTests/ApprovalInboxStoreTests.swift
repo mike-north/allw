@@ -13,6 +13,9 @@ struct ApprovalInboxStoreTests {
         try await testDoubleSubmitProducesOnlyOneSignature()
         try await testDeniedOnlyRequestRejectsApproval()
         try await testTerminalDecisionSurvivesLaterEmptySync()
+        try await testCredentialStorePersistsPairedDeviceCredentials()
+        try await testAccountStateFloorRejectsRollbackBelowStoredSequence()
+        try await testAccountStateFloorRequiresRelayMaxSequenceToBeVerified()
     }
 
     static func testSyncUsesPreparedExpiryInsteadOfRelayEnvelopeExpiry() async throws {
@@ -228,6 +231,49 @@ struct ApprovalInboxStoreTests {
         try expect(store.inbox.isEmpty)
         try expectEqual(store.history.map(\.id), ["req-history"])
     }
+
+    static func testCredentialStorePersistsPairedDeviceCredentials() async throws {
+        let storage = MemoryNativeCredentialStorage()
+        let store = NativeCredentialStore(storage: storage)
+        let credentials = NativeDeviceCredentials.fixture()
+
+        try await store.savePairedDevice(credentials)
+
+        try await expectEqual(store.loadPairedDevice(), credentials)
+    }
+
+    static func testAccountStateFloorRejectsRollbackBelowStoredSequence() async throws {
+        let storage = MemoryNativeCredentialStorage()
+        let store = NativeCredentialStore(storage: storage)
+
+        try await expectEqual(
+            store.acceptVerifiedAccountState(accountId: "acct-1", relayMaxSequence: 7, verifiedSequence: 7),
+            7
+        )
+
+        try await expectCredentialStoreError(.staleAccountStateSequence) {
+            try await store.acceptVerifiedAccountState(
+                accountId: "acct-1",
+                relayMaxSequence: 6,
+                verifiedSequence: 6
+            )
+        }
+        try expectEqual(storage.accountStateFloors["acct-1"], 7)
+    }
+
+    static func testAccountStateFloorRequiresRelayMaxSequenceToBeVerified() async throws {
+        let storage = MemoryNativeCredentialStorage()
+        let store = NativeCredentialStore(storage: storage)
+
+        try await expectCredentialStoreError(.unverifiedRelayAccountState) {
+            try await store.acceptVerifiedAccountState(
+                accountId: "acct-1",
+                relayMaxSequence: 9,
+                verifiedSequence: 8
+            )
+        }
+        try expectEqual(storage.accountStateFloors["acct-1"], nil)
+    }
 }
 
 private final class RecordingRuntime: ApproverCoreRuntime {
@@ -293,6 +339,39 @@ private final class SuspendingRuntime: ApproverCoreRuntime {
     func completeSigning(_ verdict: SignedVerdict) {
         signContinuation?.resume(returning: verdict)
         signContinuation = nil
+    }
+}
+
+private final class MemoryNativeCredentialStorage: NativeCredentialStorage {
+    var credentials: NativeDeviceCredentials?
+    var accountStateFloors: [String: Int64] = [:]
+
+    func loadCredentials() async throws -> NativeDeviceCredentials? {
+        credentials
+    }
+
+    func saveCredentials(_ credentials: NativeDeviceCredentials) async throws {
+        self.credentials = credentials
+    }
+
+    func loadHighestAccountStateSequence(accountId: String) async throws -> Int64? {
+        accountStateFloors[accountId]
+    }
+
+    func saveHighestAccountStateSequence(accountId: String, sequence: Int64) async throws {
+        accountStateFloors[accountId] = sequence
+    }
+}
+
+private extension NativeDeviceCredentials {
+    static func fixture() -> NativeDeviceCredentials {
+        NativeDeviceCredentials(
+            accountId: "acct-1",
+            deviceId: "dev-1",
+            deviceAuthToken: "device-token",
+            deviceSigningSeedB64: "signing-seed",
+            deviceCert: "device-cert"
+        )
     }
 }
 
@@ -389,6 +468,20 @@ private func expectInboxError(
     }
 }
 
+private func expectCredentialStoreError(
+    _ expected: NativeCredentialStoreErrorKind,
+    _ expression: () async throws -> some Sendable
+) async throws {
+    do {
+        _ = try await expression()
+        throw TestFailure("expected expression to throw \(expected)")
+    } catch let error as NativeCredentialStoreError {
+        try expect(expected.matches(error), "expected \(expected), got \(error)")
+    } catch {
+        throw TestFailure("expected \(expected), got \(error)")
+    }
+}
+
 private enum ApprovalInboxErrorKind: CustomStringConvertible {
     case alreadyDeciding
     case decisionNotAllowed
@@ -406,6 +499,30 @@ private enum ApprovalInboxErrorKind: CustomStringConvertible {
         switch (self, error) {
         case (.alreadyDeciding, .alreadyDeciding),
             (.decisionNotAllowed, .decisionNotAllowed):
+            return true
+        default:
+            return false
+        }
+    }
+}
+
+private enum NativeCredentialStoreErrorKind: CustomStringConvertible {
+    case staleAccountStateSequence
+    case unverifiedRelayAccountState
+
+    var description: String {
+        switch self {
+        case .staleAccountStateSequence:
+            return "staleAccountStateSequence"
+        case .unverifiedRelayAccountState:
+            return "unverifiedRelayAccountState"
+        }
+    }
+
+    func matches(_ error: NativeCredentialStoreError) -> Bool {
+        switch (self, error) {
+        case (.staleAccountStateSequence, .staleAccountStateSequence),
+            (.unverifiedRelayAccountState, .unverifiedRelayAccountState):
             return true
         default:
             return false
