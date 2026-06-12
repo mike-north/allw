@@ -66,6 +66,9 @@ pub(crate) const TYP_VERDICT: &str = "allw-verdict+jws";
 /// `typ` header value for a device-cert JWS (signed by the account root key).
 pub(crate) const TYP_DEVICE_CERT: &str = "allw-device-cert+jws";
 
+/// `typ` header value for an account-state JWS (signed by the account root key).
+pub(crate) const TYP_ACCOUNT_STATE: &str = "allw-account-state+jws";
+
 /// The only signature algorithm accepted: EdDSA over Ed25519 (RFC 8037).
 pub(crate) const ALG_EDDSA: &str = "EdDSA";
 
@@ -241,6 +244,87 @@ pub struct DeviceCertClaims {
     /// Optional expiry — Unix milliseconds (UTC). `None` means the cert does not expire in v1.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub expires_at: Option<i64>,
+}
+
+/// Root-signed account trust state used by offline verifiers for revocation.
+///
+/// This mirrors `docs/enrollment.md` §Account State. The relay may distribute this document,
+/// but only the account root can author it because verifiers accept it only inside an
+/// `allw-account-state+jws` signature from the configured root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountState {
+    /// Schema version. v1 is the only version accepted.
+    pub v: u32,
+    /// Account whose trust state this document describes.
+    pub account_id: String,
+    /// Monotonic sequence; verifiers use the highest valid sequence they have seen.
+    pub sequence: u64,
+    /// Current account root public key.
+    #[serde(with = "b64_32")]
+    pub current_root: [u8; 32],
+    /// Previous roots retained during root-rotation grace periods.
+    #[serde(default)]
+    pub previous_roots: Vec<AccountStatePreviousRoot>,
+    /// Known devices for the account.
+    #[serde(default)]
+    pub devices: Vec<AccountStateDevice>,
+    /// Known actors for the account.
+    #[serde(default)]
+    pub actors: Vec<AccountStateActor>,
+    /// Device and actor revocation records.
+    #[serde(default)]
+    pub revocations: Vec<AccountStateRevocation>,
+}
+
+/// A previous account root retained during a rotation grace period.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountStatePreviousRoot {
+    /// Previous Ed25519 account root public key.
+    #[serde(with = "b64_32")]
+    pub root: [u8; 32],
+    /// Last Unix millisecond timestamp for accepting this previous root.
+    pub valid_until: i64,
+}
+
+/// A device entry in account state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountStateDevice {
+    pub device_id: String,
+    #[serde(with = "b64_32")]
+    pub encryption_pubkey: [u8; 32],
+    #[serde(with = "b64_32")]
+    pub signing_pubkey: [u8; 32],
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cert_expires_at: Option<i64>,
+}
+
+/// An actor entry in account state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountStateActor {
+    pub actor_id: String,
+    pub kind: String,
+    #[serde(with = "b64_32")]
+    pub pubkey: [u8; 32],
+    pub status: String,
+}
+
+/// Kind of account-state revocation entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountStateRevocationKind {
+    Device,
+    Actor,
+}
+
+/// A root-signed account-state revocation record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountStateRevocation {
+    pub kind: AccountStateRevocationKind,
+    pub id: String,
+    pub revoked_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reason: Option<String>,
 }
 
 // ── base64url serde helpers (local to this module) ───────────────────────────────
@@ -507,6 +591,106 @@ pub fn issue_device_cert(
     encode_compact_jws(&header, &claims, account_root)
 }
 
+/// Errors while verifying a root-signed account-state document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountStateError {
+    /// The compact JWS was malformed, had the wrong `typ`/`alg`, or failed signature checks.
+    InvalidSignature,
+    /// The signed account id or JWS `kid` did not match the expected account.
+    AccountMismatch,
+    /// The document's `current_root` does not match the configured trust anchor.
+    RootMismatch,
+    /// The account-state schema version is not supported.
+    UnsupportedVersion,
+}
+
+impl std::fmt::Display for AccountStateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSignature => write!(f, "account-state JWS did not verify"),
+            Self::AccountMismatch => write!(f, "account-state account_id does not match"),
+            Self::RootMismatch => write!(f, "account-state root does not match trust anchor"),
+            Self::UnsupportedVersion => write!(f, "unsupported account-state version"),
+        }
+    }
+}
+
+impl std::error::Error for AccountStateError {}
+
+/// Signs account trust state with the account root.
+#[must_use]
+pub fn sign_account_state(state: &AccountState, account_root: &SigningKeyPair) -> String {
+    let header = JwsHeader {
+        alg: ALG_EDDSA.to_string(),
+        typ: TYP_ACCOUNT_STATE.to_string(),
+        kid: state.account_id.clone(),
+    };
+    encode_compact_jws(&header, state, account_root)
+}
+
+/// Verifies a root-signed account-state document for `expected_account_id`.
+///
+/// Root rotation is intentionally not learned here yet; the caller supplies the configured root
+/// trust anchor, and the signed document's `current_root` must match it.
+pub fn verify_account_state(
+    compact: &str,
+    expected_account_id: &str,
+    account_root: &PublicKey,
+) -> Result<AccountState, AccountStateError> {
+    let decoded = decode_and_verify_jws::<AccountState>(compact, TYP_ACCOUNT_STATE, account_root)
+        .map_err(|_| AccountStateError::InvalidSignature)?;
+
+    if decoded.header.kid != decoded.claims.account_id
+        || decoded.claims.account_id != expected_account_id
+    {
+        return Err(AccountStateError::AccountMismatch);
+    }
+    if decoded.claims.v != 1 {
+        return Err(AccountStateError::UnsupportedVersion);
+    }
+    if decoded.claims.current_root != account_root.to_bytes() {
+        return Err(AccountStateError::RootMismatch);
+    }
+
+    Ok(decoded.claims)
+}
+
+pub(crate) fn account_state_revokes_device(
+    account_states: &[&str],
+    expected_account_id: &str,
+    account_root: &PublicKey,
+    device_id: &str,
+) -> Result<bool, AccountStateError> {
+    let mut highest_sequence = None;
+    let mut revoked_at_highest = false;
+
+    for compact in account_states {
+        let state = verify_account_state(compact, expected_account_id, account_root)?;
+        let state_revokes_device = state.revocations.iter().any(|revocation| {
+            revocation.kind == AccountStateRevocationKind::Device && revocation.id == device_id
+        });
+
+        match highest_sequence {
+            None => {
+                highest_sequence = Some(state.sequence);
+                revoked_at_highest = state_revokes_device;
+            }
+            Some(sequence) if state.sequence > sequence => {
+                highest_sequence = Some(state.sequence);
+                revoked_at_highest = state_revokes_device;
+            }
+            Some(sequence) if state.sequence == sequence => {
+                // Conflicting same-sequence states are fail-closed: if any highest sequence
+                // valid state says the device is revoked, treat it as revoked.
+                revoked_at_highest |= state_revokes_device;
+            }
+            Some(_) => {}
+        }
+    }
+
+    Ok(revoked_at_highest)
+}
+
 // ── Anti-replay nonce store ──────────────────────────────────────────────────────
 
 /// An anti-replay store for verdict nonces, owned by the integrator.
@@ -583,6 +767,10 @@ pub enum VerifyError {
     CertDeviceMismatch,
     /// Step 1 — the cert has expired (`now_ms > expires_at`).
     CertExpired,
+    /// Step 1 — supplied account state was invalid, stale trust material, or not root-signed.
+    AccountStateInvalid,
+    /// Step 1 — the highest-sequence account state revokes this device id.
+    DeviceRevoked,
     /// Step 2 — the verdict JWS signature did not verify against the certified device key.
     VerdictSignatureInvalid,
     /// Step 2 — the verdict JWS was structurally malformed, or its `kid`/`typ`/`alg` was wrong.
@@ -640,6 +828,13 @@ impl std::fmt::Display for VerifyError {
                 )
             }
             Self::CertExpired => write!(f, "device cert has expired"),
+            Self::AccountStateInvalid => write!(f, "account state is invalid"),
+            Self::DeviceRevoked => {
+                write!(
+                    f,
+                    "device id is revoked by the highest-sequence account state"
+                )
+            }
             Self::VerdictSignatureInvalid => {
                 write!(
                     f,
@@ -802,6 +997,34 @@ pub fn verify_verdict(
     nonce_store: &mut dyn NonceStore,
     now_ms: i64,
 ) -> Result<VerifiedVerdict, VerifyError> {
+    verify_verdict_with_account_states(
+        verdict,
+        request,
+        context,
+        approver_root,
+        nonce_store,
+        now_ms,
+        &[],
+    )
+}
+
+/// Like [`verify_verdict`], but also enforces root-signed account-state revocations.
+///
+/// When multiple valid account-state documents are supplied, the highest `sequence` wins. A
+/// lower-sequence document that omits a revocation cannot roll back a newer revocation.
+///
+/// Callers must supply all known account-state documents, or at least their durably stored highest
+/// sequence. Persisting monotonic state across verification calls is the integrator's
+/// responsibility; passing only a stale document can make stale trust material look current.
+pub fn verify_verdict_with_account_states(
+    verdict: &Verdict,
+    request: &ApprovalRequest,
+    context: &ApprovalContext,
+    approver_root: &PublicKey,
+    nonce_store: &mut dyn NonceStore,
+    now_ms: i64,
+    account_states: &[&str],
+) -> Result<VerifiedVerdict, VerifyError> {
     // ── Step 1: device cert chains to the account root ───────────────────────────
     let cert_compact = verdict
         .device_cert
@@ -822,6 +1045,16 @@ pub fn verify_verdict(
 
     if certified.device_id != verdict.approver.device_id {
         return Err(VerifyError::CertDeviceMismatch);
+    }
+    if account_state_revokes_device(
+        account_states,
+        &verdict.approver.account_id,
+        approver_root,
+        &certified.device_id,
+    )
+    .map_err(|_| VerifyError::AccountStateInvalid)?
+    {
+        return Err(VerifyError::DeviceRevoked);
     }
 
     // ── Step 2: verdict signature verifies under the certified device key ─────────
@@ -1780,6 +2013,156 @@ mod tests {
         )
         .expect("present challenge response must pass");
         assert_eq!(verified.decision, Decision::Approved);
+    }
+
+    fn signed_account_state(sequence: u64, revoked_device_ids: &[&str]) -> String {
+        sign_account_state(
+            &account_state_claims(1, ACCOUNT_ID, sequence, &root_key(), revoked_device_ids),
+            &root_key(),
+        )
+    }
+
+    fn account_state_claims(
+        version: u32,
+        account_id: &str,
+        sequence: u64,
+        current_root: &SigningKeyPair,
+        revoked_device_ids: &[&str],
+    ) -> AccountState {
+        AccountState {
+            v: version,
+            account_id: account_id.to_string(),
+            sequence,
+            current_root: current_root.public_key().to_bytes(),
+            previous_roots: Vec::new(),
+            devices: Vec::new(),
+            actors: Vec::new(),
+            revocations: revoked_device_ids
+                .iter()
+                .map(|device_id| AccountStateRevocation {
+                    kind: AccountStateRevocationKind::Device,
+                    id: (*device_id).to_string(),
+                    revoked_at: NOW_OK - 1,
+                    reason: Some("test revocation".to_string()),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn account_state_rejects_wrong_account_id() {
+        let state = account_state_claims(1, "acc_other", 1, &root_key(), &[]);
+        let compact = sign_account_state(&state, &root_key());
+
+        let err = verify_account_state(&compact, ACCOUNT_ID, &root_key().public_key())
+            .expect_err("account state for another account must fail closed");
+        assert_eq!(err, AccountStateError::AccountMismatch);
+    }
+
+    #[test]
+    fn account_state_rejects_wrong_signing_key() {
+        let state = account_state_claims(1, ACCOUNT_ID, 1, &root_key(), &[]);
+        let compact = sign_account_state(&state, &device_key());
+
+        let err = verify_account_state(&compact, ACCOUNT_ID, &root_key().public_key())
+            .expect_err("account state not signed by the root must fail closed");
+        assert_eq!(err, AccountStateError::InvalidSignature);
+    }
+
+    #[test]
+    fn account_state_rejects_wrong_current_root() {
+        let other_root = SigningKeyPair::from_seed(&OTHER_ROOT_SEED);
+        let state = account_state_claims(1, ACCOUNT_ID, 1, &other_root, &[]);
+        let compact = sign_account_state(&state, &root_key());
+
+        let err = verify_account_state(&compact, ACCOUNT_ID, &root_key().public_key())
+            .expect_err("account state with a different current root must fail closed");
+        assert_eq!(err, AccountStateError::RootMismatch);
+    }
+
+    #[test]
+    fn account_state_rejects_unsupported_version() {
+        let state = account_state_claims(2, ACCOUNT_ID, 1, &root_key(), &[]);
+        let compact = sign_account_state(&state, &root_key());
+
+        let err = verify_account_state(&compact, ACCOUNT_ID, &root_key().public_key())
+            .expect_err("unknown account-state versions must fail closed");
+        assert_eq!(err, AccountStateError::UnsupportedVersion);
+    }
+
+    #[test]
+    fn account_state_rejects_cross_typ_device_cert_jws() {
+        let cert = make_cert(&root_key());
+
+        let err = verify_account_state(&cert, ACCOUNT_ID, &root_key().public_key())
+            .expect_err("device cert JWS must not verify as account state");
+        assert_eq!(err, AccountStateError::InvalidSignature);
+    }
+
+    #[test]
+    fn account_state_rejects_malformed_compact_jws() {
+        let err = verify_account_state(
+            "not.a.valid.compact.jws",
+            ACCOUNT_ID,
+            &root_key().public_key(),
+        )
+        .expect_err("malformed compact JWS must fail closed");
+        assert_eq!(err, AccountStateError::InvalidSignature);
+    }
+
+    #[test]
+    fn revoked_device_verdict_is_rejected_by_account_state() {
+        let cert = make_cert(&root_key());
+        let verdict = sign_verdict(
+            &make_unsigned(Decision::Approved, canonical_hash(false), None),
+            &device_key(),
+            NONCE,
+            Some(cert),
+        );
+        let request = make_request();
+        let context = make_context(false);
+        let mut store = InMemoryNonceStore::new();
+        let revoked = signed_account_state(2, &[DEVICE_ID]);
+
+        let err = verify_verdict_with_account_states(
+            &verdict,
+            &request,
+            &context,
+            &root_key().public_key(),
+            &mut store,
+            NOW_OK,
+            &[revoked.as_str()],
+        )
+        .expect_err("a revoked device's verdict must fail closed");
+        assert_eq!(err, VerifyError::DeviceRevoked);
+    }
+
+    #[test]
+    fn stale_account_state_does_not_override_newer_device_revocation() {
+        let cert = make_cert(&root_key());
+        let verdict = sign_verdict(
+            &make_unsigned(Decision::Approved, canonical_hash(false), None),
+            &device_key(),
+            NONCE,
+            Some(cert),
+        );
+        let request = make_request();
+        let context = make_context(false);
+        let mut store = InMemoryNonceStore::new();
+        let newer_revocation = signed_account_state(5, &[DEVICE_ID]);
+        let stale_without_revocation = signed_account_state(4, &[]);
+
+        let err = verify_verdict_with_account_states(
+            &verdict,
+            &request,
+            &context,
+            &root_key().public_key(),
+            &mut store,
+            NOW_OK,
+            &[newer_revocation.as_str(), stale_without_revocation.as_str()],
+        )
+        .expect_err("lower-sequence account state must not roll back a device revocation");
+        assert_eq!(err, VerifyError::DeviceRevoked);
     }
 
     /// An empty challenge response is treated as missing (presence must be non-empty).
