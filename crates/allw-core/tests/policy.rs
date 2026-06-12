@@ -298,6 +298,36 @@ fn signed_policy_rule_rejects_revoked_device_from_account_state() {
 }
 
 #[test]
+fn signed_policy_rule_rejects_stale_account_state_rollback() {
+    let unsigned = UnsignedPolicyRule {
+        id: "allow-ls".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate::command_bin("ls"),
+        effect: PolicyEffect::Allow,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: CREATED_AT,
+        expires_at: None,
+    };
+    let rule = sign_policy_rule(&unsigned, DEVICE_ID, &device_key(), Some(device_cert()));
+    let stale_without_revocation = account_state(8, &[]);
+    let newer_revocation = account_state(9, &[DEVICE_ID]);
+
+    assert_eq!(
+        verify_policy_rule_with_account_states(
+            &rule,
+            &root_key().public_key(),
+            NOW_OK,
+            &[stale_without_revocation.as_str(), newer_revocation.as_str()]
+        ),
+        Err(PolicyRuleError::DeviceRevoked),
+        "a lower-sequence account state must not roll back policy-rule revocation"
+    );
+}
+
+#[test]
 fn signed_policy_rule_rejects_cross_typ_jws_confusion() {
     let unsigned = UnsignedPolicyRule {
         id: "allow-ls".to_string(),

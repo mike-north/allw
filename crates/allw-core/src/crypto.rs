@@ -1012,6 +1012,10 @@ pub fn verify_verdict(
 ///
 /// When multiple valid account-state documents are supplied, the highest `sequence` wins. A
 /// lower-sequence document that omits a revocation cannot roll back a newer revocation.
+///
+/// Callers must supply all known account-state documents, or at least their durably stored highest
+/// sequence. Persisting monotonic state across verification calls is the integrator's
+/// responsibility; passing only a stale document can make stale trust material look current.
 pub fn verify_verdict_with_account_states(
     verdict: &Verdict,
     request: &ApprovalRequest,
@@ -2012,11 +2016,24 @@ mod tests {
     }
 
     fn signed_account_state(sequence: u64, revoked_device_ids: &[&str]) -> String {
-        let state = AccountState {
-            v: 1,
-            account_id: ACCOUNT_ID.to_string(),
+        sign_account_state(
+            &account_state_claims(1, ACCOUNT_ID, sequence, &root_key(), revoked_device_ids),
+            &root_key(),
+        )
+    }
+
+    fn account_state_claims(
+        version: u32,
+        account_id: &str,
+        sequence: u64,
+        current_root: &SigningKeyPair,
+        revoked_device_ids: &[&str],
+    ) -> AccountState {
+        AccountState {
+            v: version,
+            account_id: account_id.to_string(),
             sequence,
-            current_root: root_key().public_key().to_bytes(),
+            current_root: current_root.public_key().to_bytes(),
             previous_roots: Vec::new(),
             devices: Vec::new(),
             actors: Vec::new(),
@@ -2029,8 +2046,68 @@ mod tests {
                     reason: Some("test revocation".to_string()),
                 })
                 .collect(),
-        };
-        sign_account_state(&state, &root_key())
+        }
+    }
+
+    #[test]
+    fn account_state_rejects_wrong_account_id() {
+        let state = account_state_claims(1, "acc_other", 1, &root_key(), &[]);
+        let compact = sign_account_state(&state, &root_key());
+
+        let err = verify_account_state(&compact, ACCOUNT_ID, &root_key().public_key())
+            .expect_err("account state for another account must fail closed");
+        assert_eq!(err, AccountStateError::AccountMismatch);
+    }
+
+    #[test]
+    fn account_state_rejects_wrong_signing_key() {
+        let state = account_state_claims(1, ACCOUNT_ID, 1, &root_key(), &[]);
+        let compact = sign_account_state(&state, &device_key());
+
+        let err = verify_account_state(&compact, ACCOUNT_ID, &root_key().public_key())
+            .expect_err("account state not signed by the root must fail closed");
+        assert_eq!(err, AccountStateError::InvalidSignature);
+    }
+
+    #[test]
+    fn account_state_rejects_wrong_current_root() {
+        let other_root = SigningKeyPair::from_seed(&OTHER_ROOT_SEED);
+        let state = account_state_claims(1, ACCOUNT_ID, 1, &other_root, &[]);
+        let compact = sign_account_state(&state, &root_key());
+
+        let err = verify_account_state(&compact, ACCOUNT_ID, &root_key().public_key())
+            .expect_err("account state with a different current root must fail closed");
+        assert_eq!(err, AccountStateError::RootMismatch);
+    }
+
+    #[test]
+    fn account_state_rejects_unsupported_version() {
+        let state = account_state_claims(2, ACCOUNT_ID, 1, &root_key(), &[]);
+        let compact = sign_account_state(&state, &root_key());
+
+        let err = verify_account_state(&compact, ACCOUNT_ID, &root_key().public_key())
+            .expect_err("unknown account-state versions must fail closed");
+        assert_eq!(err, AccountStateError::UnsupportedVersion);
+    }
+
+    #[test]
+    fn account_state_rejects_cross_typ_device_cert_jws() {
+        let cert = make_cert(&root_key());
+
+        let err = verify_account_state(&cert, ACCOUNT_ID, &root_key().public_key())
+            .expect_err("device cert JWS must not verify as account state");
+        assert_eq!(err, AccountStateError::InvalidSignature);
+    }
+
+    #[test]
+    fn account_state_rejects_malformed_compact_jws() {
+        let err = verify_account_state(
+            "not.a.valid.compact.jws",
+            ACCOUNT_ID,
+            &root_key().public_key(),
+        )
+        .expect_err("malformed compact JWS must fail closed");
+        assert_eq!(err, AccountStateError::InvalidSignature);
     }
 
     #[test]

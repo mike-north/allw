@@ -543,6 +543,10 @@ pub fn verify_policy_rule(
 /// Verify a signed policy rule and reject rules signed by devices revoked in account state.
 ///
 /// When multiple valid account-state documents are supplied, the highest `sequence` wins.
+///
+/// Callers must supply all known account-state documents, or at least their durably stored highest
+/// sequence. Persisting monotonic state across verification calls is the integrator's
+/// responsibility; passing only a stale document can make stale trust material look current.
 pub fn verify_policy_rule_with_account_states(
     rule: &PolicyRule,
     account_root: &PublicKey,
