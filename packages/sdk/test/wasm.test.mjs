@@ -83,6 +83,41 @@ test("verify_verdict accepts the known-good signed verdict", async () => {
   assert.equal(result.decided_at, 1700001000000, "decided_at echoes the signed claim");
 });
 
+test("verify_verdict_for_account rejects a wrong expected account id", async () => {
+  const wasm = await loadWasm();
+  const f = approverFixture(wasm);
+  const verdictJson = wasm.sign_verdict(JSON.stringify(f.unsigned), f.deviceSeed, f.nonce, f.cert);
+
+  assert.equal(
+    JSON.parse(
+      wasm.verify_verdict_for_account(
+        verdictJson,
+        f.v.request_json,
+        f.v.context_json,
+        f.accountRootPub,
+        f.v.now_ms,
+        "acct_rt",
+      ),
+    ).approved,
+    true,
+    "matching expected account must preserve verdict verification",
+  );
+
+  assert.throws(
+    () =>
+      wasm.verify_verdict_for_account(
+        verdictJson,
+        f.v.request_json,
+        f.v.context_json,
+        f.accountRootPub,
+        f.v.now_ms,
+        "acct_other",
+      ),
+    /CertAccountMismatch|account_id/,
+    "wrong expected account must fail closed",
+  );
+});
+
 test("verify_verdict rejects a verdict whose decision was flipped to denied", async () => {
   const wasm = await loadWasm();
   const v = loadVector();
@@ -418,6 +453,52 @@ test("evaluate_policy verifies signed rules and applies deny over ask over allow
       ),
     /verify_policy_rule failed/,
     "policy evaluation must fail closed on a tampered signed rule",
+  );
+});
+
+test("evaluate_policy_for_account rejects rules for the wrong expected account id", async () => {
+  const wasm = await loadWasm();
+  const f = policyFixture(wasm);
+  const actor = { id: "machine:macbook", kind: "claude-code" };
+  const actionJson = wasm.action_from_command("git push --force origin main", null);
+  const unsigned = {
+    id: "allow-expected-account",
+    account_id: f.accountId,
+    subject: { kind: "any" },
+    match: { surface: "command", command: { bin: "git" } },
+    effect: "allow",
+    provenance: "manual",
+    tier: "syntactic",
+    created_at: f.createdAt,
+  };
+  const rule = JSON.parse(
+    wasm.sign_policy_rule(JSON.stringify(unsigned), f.deviceId, f.deviceSeed, f.cert),
+  );
+
+  const allowed = JSON.parse(
+    wasm.evaluate_policy_for_account(
+      actionJson,
+      JSON.stringify(actor),
+      JSON.stringify([rule]),
+      f.accountRootPub,
+      f.nowMs,
+      f.accountId,
+    ),
+  );
+  assert.equal(allowed.decision, "allow");
+
+  assert.throws(
+    () =>
+      wasm.evaluate_policy_for_account(
+        actionJson,
+        JSON.stringify(actor),
+        JSON.stringify([rule]),
+        f.accountRootPub,
+        f.nowMs,
+        "acct_other",
+      ),
+    /verify_policy_rule failed/,
+    "wrong expected account must reject the policy rule before evaluation",
   );
 });
 

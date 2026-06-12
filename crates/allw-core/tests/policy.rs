@@ -1,9 +1,9 @@
 use allw_core::{
     action_from_argv, action_from_mcp_tool_call, evaluate, evaluate_for_actor, issue_device_cert,
-    sign_policy_rule, sign_verdict, verify_policy_rule, Actor, Approver, CommandContext, Decision,
-    PolicyDecision, PolicyEffect, PolicyPredicate, PolicyProvenance, PolicyRuleError,
-    PolicyRuleScope, PolicyTier, Risk, SigningKeyPair, Surface, SyntacticSubstrate,
-    UnsignedPolicyRule, UnsignedVerdict, Verdict,
+    sign_policy_rule, sign_verdict, verify_policy_rule, verify_policy_rule_with_expected_account,
+    Actor, Approver, CommandContext, Decision, PolicyDecision, PolicyEffect, PolicyPredicate,
+    PolicyProvenance, PolicyRuleError, PolicyRuleScope, PolicyTier, Risk, SigningKeyPair, Surface,
+    SyntacticSubstrate, UnsignedPolicyRule, UnsignedVerdict, Verdict,
 };
 use serde_json::json;
 
@@ -241,6 +241,27 @@ fn signed_policy_rule_requires_account_root_cert_chain_and_matching_kid() {
         verify_policy_rule(&expired_cert_rule, &root_key().public_key(), NOW_OK),
         Err(PolicyRuleError::CertExpired),
         "policy rules must reject expired device certs on the policy verification path"
+    );
+
+    assert!(
+        verify_policy_rule_with_expected_account(
+            &valid,
+            &root_key().public_key(),
+            NOW_OK,
+            Some(ACCOUNT_ID),
+        )
+        .is_ok(),
+        "matching expected account must preserve policy verification"
+    );
+    assert_eq!(
+        verify_policy_rule_with_expected_account(
+            &valid,
+            &root_key().public_key(),
+            NOW_OK,
+            Some(OTHER_ACCOUNT_ID),
+        ),
+        Err(PolicyRuleError::CertAccountMismatch),
+        "a caller-supplied expected account must fail closed when it does not match the rule"
     );
 }
 

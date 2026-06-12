@@ -57,6 +57,18 @@ export interface AllwWasm {
     approverRootPubkeyB64: string,
     nowMs: number,
   ): string;
+  /**
+   * Verifies a `Verdict` JSON like `verify_verdict`, additionally rejecting when the certified
+   * account id does not match the caller's expected account id.
+   */
+  verify_verdict_for_account(
+    verdictJson: string,
+    requestJson: string,
+    contextJson: string,
+    approverRootPubkeyB64: string,
+    nowMs: number,
+    expectedAccountId: string,
+  ): string;
   /** Derive the Ed25519 public key for a 32-byte signing seed (base64url). */
   ed25519_public_key(seedB64: string): string;
   /** Build an ActionRecord JSON for a shell command using the core T1 command parser. */
@@ -90,6 +102,15 @@ export interface AllwWasm {
     signedRulesJson: string,
     accountRootPubkeyB64: string,
     nowMs: number,
+  ): string;
+  /** Evaluate policy like `evaluate_policy`, but require every rule to match `expectedAccountId`. */
+  evaluate_policy_for_account(
+    actionJson: string,
+    actorJson: string | null | undefined,
+    signedRulesJson: string,
+    accountRootPubkeyB64: string,
+    nowMs: number,
+    expectedAccountId: string,
   ): string;
 }
 

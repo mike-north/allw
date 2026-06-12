@@ -802,23 +802,47 @@ pub fn verify_verdict(
     nonce_store: &mut dyn NonceStore,
     now_ms: i64,
 ) -> Result<VerifiedVerdict, VerifyError> {
+    verify_verdict_with_expected_account(
+        verdict,
+        request,
+        context,
+        approver_root,
+        nonce_store,
+        now_ms,
+        None,
+    )
+}
+
+/// Like [`verify_verdict`], with an optional caller-asserted account id for multi-account
+/// verifiers. When supplied, both the verdict's outer approver account and the root-signed device
+/// certificate must match `expected_account_id`; otherwise verification fails closed.
+pub fn verify_verdict_with_expected_account(
+    verdict: &Verdict,
+    request: &ApprovalRequest,
+    context: &ApprovalContext,
+    approver_root: &PublicKey,
+    nonce_store: &mut dyn NonceStore,
+    now_ms: i64,
+    expected_account_id: Option<&str>,
+) -> Result<VerifiedVerdict, VerifyError> {
     // ── Step 1: device cert chains to the account root ───────────────────────────
     let cert_compact = verdict
         .device_cert
         .as_deref()
         .ok_or(VerifyError::MissingDeviceCert)?;
+    let expected_account_id = expected_account_id.unwrap_or(&verdict.approver.account_id);
+    if verdict.approver.account_id != expected_account_id {
+        return Err(VerifyError::CertAccountMismatch);
+    }
 
-    let certified = verify_certified_device(
-        cert_compact,
-        &verdict.approver.account_id,
-        approver_root,
-        now_ms,
-    )
-    .map_err(|e| match e {
-        DeviceCertError::SignatureInvalid => VerifyError::CertSignatureInvalid,
-        DeviceCertError::AccountMismatch => VerifyError::CertAccountMismatch,
-        DeviceCertError::CertExpired => VerifyError::CertExpired,
-    })?;
+    let certified =
+        verify_certified_device(cert_compact, expected_account_id, approver_root, now_ms).map_err(
+            |e| match e {
+                DeviceCertError::SignatureInvalid => VerifyError::CertSignatureInvalid,
+                DeviceCertError::AccountMismatch => VerifyError::CertAccountMismatch,
+                DeviceCertError::CertExpired => VerifyError::CertExpired,
+            },
+        )?;
 
     if certified.device_id != verdict.approver.device_id {
         return Err(VerifyError::CertDeviceMismatch);
@@ -1132,6 +1156,39 @@ mod tests {
         assert_eq!(verified.device_id, DEVICE_ID);
         assert_eq!(verified.approver, make_approver());
         assert_eq!(verified.decided_at, TS_DECIDED);
+    }
+
+    #[test]
+    fn expected_account_id_is_enforced_for_verdicts() {
+        let verdict = make_signed_approved();
+        let request = make_request();
+        let context = make_context(false);
+        let root_pub = root_key().public_key();
+
+        let mut store = InMemoryNonceStore::new();
+        verify_verdict_with_expected_account(
+            &verdict,
+            &request,
+            &context,
+            &root_pub,
+            &mut store,
+            NOW_OK,
+            Some(ACCOUNT_ID),
+        )
+        .expect("matching expected account must verify");
+
+        let mut store = InMemoryNonceStore::new();
+        let err = verify_verdict_with_expected_account(
+            &verdict,
+            &request,
+            &context,
+            &root_pub,
+            &mut store,
+            NOW_OK,
+            Some("acc_OTHER"),
+        )
+        .expect_err("wrong expected account must fail closed");
+        assert_eq!(err, VerifyError::CertAccountMismatch);
     }
 
     /// The signed `sig` is a three-part compact JWS, and the protected header declares the

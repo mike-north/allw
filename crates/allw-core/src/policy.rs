@@ -530,17 +530,32 @@ pub fn verify_policy_rule(
     account_root: &PublicKey,
     now_ms: i64,
 ) -> Result<VerifiedPolicyRule, PolicyRuleError> {
+    verify_policy_rule_with_expected_account(rule, account_root, now_ms, None)
+}
+
+/// Like [`verify_policy_rule`], with an optional caller-asserted account id for multi-account
+/// verifiers. When supplied, both the rule account and the root-signed device certificate must match
+/// `expected_account_id`; otherwise verification fails closed.
+pub fn verify_policy_rule_with_expected_account(
+    rule: &PolicyRule,
+    account_root: &PublicKey,
+    now_ms: i64,
+    expected_account_id: Option<&str>,
+) -> Result<VerifiedPolicyRule, PolicyRuleError> {
     let cert = rule
         .device_cert
         .as_deref()
         .ok_or(PolicyRuleError::MissingDeviceCert)?;
-    let certified = verify_certified_device(cert, &rule.account_id, account_root, now_ms).map_err(
-        |e| match e {
+    let expected_account_id = expected_account_id.unwrap_or(&rule.account_id);
+    if rule.account_id != expected_account_id {
+        return Err(PolicyRuleError::CertAccountMismatch);
+    }
+    let certified = verify_certified_device(cert, expected_account_id, account_root, now_ms)
+        .map_err(|e| match e {
             DeviceCertError::SignatureInvalid => PolicyRuleError::CertSignatureInvalid,
             DeviceCertError::AccountMismatch => PolicyRuleError::CertAccountMismatch,
             DeviceCertError::CertExpired => PolicyRuleError::CertExpired,
-        },
-    )?;
+        })?;
 
     let decoded = decode_and_verify_jws::<UnsignedPolicyRule>(
         &rule.sig,

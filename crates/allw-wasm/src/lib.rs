@@ -43,7 +43,8 @@ use allw_core::{
     encrypt_context as core_encrypt_context, evaluate as core_evaluate,
     evaluate_for_actor as core_evaluate_for_actor, issue_device_cert as core_issue_device_cert,
     sign_policy_rule as core_sign_policy_rule, sign_verdict as core_sign_verdict,
-    verify_policy_rule as core_verify_policy_rule, verify_verdict as core_verify_verdict,
+    verify_policy_rule_with_expected_account as core_verify_policy_rule_with_expected_account,
+    verify_verdict_with_expected_account as core_verify_verdict_with_expected_account,
     ActionRecord, Actor, ApprovalContext, ApprovalRequest, Approver, CommandContext,
     ContextRecipient, Decision, PolicyRule, PolicyRuleScope, PublicKey, SigningKeyPair,
     UnsignedPolicyRule, UnsignedVerdict, Verdict, X25519KeyPair, X25519PublicKey,
@@ -278,6 +279,49 @@ pub fn verify_verdict(
     approver_root_pubkey_b64: &str,
     now_ms: f64,
 ) -> Result<String, JsError> {
+    verify_verdict_impl(
+        verdict_json,
+        request_json,
+        context_json,
+        approver_root_pubkey_b64,
+        now_ms,
+        None,
+    )
+}
+
+/// Verifies a verdict like [`verify_verdict`], additionally requiring the certified account id to
+/// equal `expected_account_id`. This is for multi-account verifiers that already know which account
+/// they intended to verify under and want to fail closed on a wrong root/account pairing.
+#[wasm_bindgen]
+pub fn verify_verdict_for_account(
+    verdict_json: &str,
+    request_json: &str,
+    context_json: &str,
+    approver_root_pubkey_b64: &str,
+    now_ms: f64,
+    expected_account_id: &str,
+) -> Result<String, JsError> {
+    if expected_account_id.is_empty() {
+        return Err(JsError::new("expected_account_id is required"));
+    }
+    verify_verdict_impl(
+        verdict_json,
+        request_json,
+        context_json,
+        approver_root_pubkey_b64,
+        now_ms,
+        Some(expected_account_id),
+    )
+}
+
+fn verify_verdict_impl(
+    verdict_json: &str,
+    request_json: &str,
+    context_json: &str,
+    approver_root_pubkey_b64: &str,
+    now_ms: f64,
+    expected_account_id: Option<&str>,
+) -> Result<String, JsError> {
     let verdict: Verdict = parse_json(verdict_json, "Verdict")?;
     let request: ApprovalRequest = parse_json(request_json, "ApprovalRequest")?;
     let context: ApprovalContext = parse_json(context_json, "ApprovalContext")?;
@@ -290,13 +334,14 @@ pub fn verify_verdict(
     let now_ms = ms_to_i64(now_ms, "now_ms")?;
 
     let mut nonce_store = allw_core::InMemoryNonceStore::new();
-    let verified = core_verify_verdict(
+    let verified = core_verify_verdict_with_expected_account(
         &verdict,
         &request,
         &context,
         &root,
         &mut nonce_store,
         now_ms,
+        expected_account_id,
     )
     .map_err(|e| JsError::new(&format!("verify_verdict failed: {e}")))?;
 
@@ -532,6 +577,48 @@ pub fn evaluate_policy(
     account_root_pubkey_b64: &str,
     now_ms: f64,
 ) -> Result<String, JsError> {
+    evaluate_policy_impl(
+        action_json,
+        actor_json,
+        signed_rules_json,
+        account_root_pubkey_b64,
+        now_ms,
+        None,
+    )
+}
+
+/// Evaluates policy like [`evaluate_policy`], additionally requiring every signed rule's account id
+/// and device certificate to match `expected_account_id`.
+#[wasm_bindgen]
+pub fn evaluate_policy_for_account(
+    action_json: &str,
+    actor_json: Option<String>,
+    signed_rules_json: &str,
+    account_root_pubkey_b64: &str,
+    now_ms: f64,
+    expected_account_id: &str,
+) -> Result<String, JsError> {
+    if expected_account_id.is_empty() {
+        return Err(JsError::new("expected_account_id is required"));
+    }
+    evaluate_policy_impl(
+        action_json,
+        actor_json,
+        signed_rules_json,
+        account_root_pubkey_b64,
+        now_ms,
+        Some(expected_account_id),
+    )
+}
+
+fn evaluate_policy_impl(
+    action_json: &str,
+    actor_json: Option<String>,
+    signed_rules_json: &str,
+    account_root_pubkey_b64: &str,
+    now_ms: f64,
+    expected_account_id: Option<&str>,
+) -> Result<String, JsError> {
     let action: ActionRecord = parse_json(action_json, "ActionRecord")?;
     let actor: Option<Actor> = actor_json
         .as_deref()
@@ -548,8 +635,13 @@ pub fn evaluate_policy(
     let verified = rules
         .iter()
         .map(|rule| {
-            core_verify_policy_rule(rule, &root_pubkey, now_ms)
-                .map_err(|e| JsError::new(&format!("verify_policy_rule failed: {e}")))
+            core_verify_policy_rule_with_expected_account(
+                rule,
+                &root_pubkey,
+                now_ms,
+                expected_account_id,
+            )
+            .map_err(|e| JsError::new(&format!("verify_policy_rule failed: {e}")))
         })
         .collect::<Result<Vec<_>, JsError>>()?;
 
