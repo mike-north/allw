@@ -22,7 +22,7 @@ import {
   type RenderableRequest,
 } from "../lib/approver-core.js";
 import { readKeyfile, type Keyfile } from "../lib/keyfile.js";
-import { deviceConnectWsUrl } from "../lib/relay-client.js";
+import { deviceConnectWsUrl, fetchAccountStates } from "../lib/relay-client.js";
 import { renderRequest } from "../lib/render.js";
 import type { AllwWasm } from "../lib/wasm.js";
 import type { Decision, DeviceInboundMessage } from "../lib/types.js";
@@ -262,14 +262,10 @@ export async function runWatch(
 
   // Resolve the root-signed account-state documents that root-anchor an actor key (#16). A
   // relay-supplied `/actors` key is NOT a trust anchor (a malicious relay could forge it), so the
-  // verified origin is driven only by account state the configured account root signed.
-  //
-  // TODO(#104): wire a relay account-state distribution endpoint (the relay may serve
-  // root-signed account state it cannot author). Until that lands, no root-anchored account state is
-  // available at runtime, so origins render ⚠ UNVERIFIED (fail-closed) — never falsely ✓ VERIFIED
-  // off a relay key. The verification path itself is complete and exercised end-to-end in tests that
-  // supply a root-signed account-state document.
-  const resolveAccountStates: AccountStateResolver = () => Promise.resolve([]);
+  // verified origin is driven only by account state the configured account root signed. Relay fetch
+  // failures are caught by `handleRequest` and downgrade the render to ⚠ UNVERIFIED.
+  const resolveAccountStates: AccountStateResolver = () =>
+    fetchAccountStates(relayUrl, accountId, deviceAuthToken);
 
   // Serialize request handling: prompts are interactive, so process one at a time.
   let chain: Promise<unknown> = Promise.resolve();

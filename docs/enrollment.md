@@ -237,6 +237,17 @@ The account-state document is signed by the current account root. A root-rotatio
 cross-signed by the previous root so verifiers that still trust the old root can learn the new root during the
 grace period.
 
+Authoring and distribution flow:
+
+1. A root-authorized account-state author builds the next document with a monotonic `sequence`.
+2. The account root signs it as a compact JWS (`typ = "allw-account-state+jws"`).
+3. An enrolled device publishes the signed document set to `POST /{account_id}/account-states` with its
+   `device_auth_token`. Publishing replaces the relay's current cached set for that account.
+4. Approver devices fetch `GET /{account_id}/account-states` with their `device_auth_token` before rendering a
+   request origin. The relay returns opaque compact JWS strings and does not inspect or author them.
+5. The device verifies the account-root signature and highest valid sequence locally. Missing, stale, tampered, or
+   relay-substituted state can only render `⚠ UNVERIFIED`; it cannot produce a verified origin.
+
 Validation:
 
 - `sequence` must be monotonic per `account_id`; a lower sequence is stale.
@@ -377,6 +388,8 @@ Current relay mechanics cover the registry subset and #89 adds relay-scoped endp
 | `POST /devices/{device_id}/revoke` | Remove an active device and close its live socket.                                      |
 | `POST /actors`                     | Enroll an actor public key.                                                             |
 | `GET /actors`                      | List enrolled actor public keys.                                                        |
+| `POST /account-states`             | Publish the root-signed account-state document set for relay distribution.              |
+| `GET /account-states`              | Fetch relay-distributed root-signed account-state documents for local verification.     |
 
 Endpoint authentication and authorization rules:
 
@@ -390,7 +403,9 @@ Endpoint authentication and authorization rules:
 - request polling and wait sockets require the `request_auth_token` returned by `POST /requests`;
 - legacy rows without a stored relay auth-token hash fail closed with `401`; devices must re-pair and pending
   requests must be re-submitted rather than becoming unauthenticated;
-- serving account state requires integrity but not confidentiality, because it contains public keys and metadata.
+- publishing and fetching account state require an enrolled device token. Account state contains public keys and
+  metadata, so confidentiality is not required, but authentication prevents open account enumeration and keeps the
+  relay cache scoped to paired devices.
 
 ## Test Implications
 
@@ -410,12 +425,11 @@ Implementation PRs for this spec should add fixtures or tests for:
   hardware security key.
 - Account-state transport format: compact JWS payload versus JSON document plus detached signature.
 - Root-transition grace-period defaults.
-- Relay distribution of root-signed account state to devices: the verification path anchors on account-state
-  documents the device holds; a relay endpoint that serves (but cannot author) the latest root-signed account state
-  is not yet wired (#104). Until then, devices with no root-anchored account state render origins
-  `⚠ UNVERIFIED` (fail-closed).
 
 Resolved (was deferred):
 
 - Whether actor keys are anchored via a root-signed `actor_cert` or via signed account-state: **#16 chose signed
   account-state** (`actors` entries), reusing the device-trust/revocation machinery.
+- Relay distribution of root-signed account state to devices: **#104 added authenticated
+  `POST /account-states` and `GET /account-states`**. The relay serves opaque signed documents, but verified-origin
+  trust still comes only from local account-root signature verification.
