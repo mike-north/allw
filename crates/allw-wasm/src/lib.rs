@@ -110,6 +110,17 @@ fn ms_to_i64(ms: f64, what: &str) -> Result<i64, JsError> {
     Ok(ms as i64)
 }
 
+/// Policy-rule signing must always emit verifiable rules. Treat an empty certificate as caller
+/// error at the JS boundary instead of silently constructing a rule that verification must reject.
+fn required_policy_device_cert(device_cert: &str) -> Result<String, JsError> {
+    if device_cert.is_empty() {
+        return Err(JsError::new(
+            "device_cert is required for policy rule signing",
+        ));
+    }
+    Ok(device_cert.to_string())
+}
+
 // ── compute_request_hash ────────────────────────────────────────────────────────────
 
 /// Computes the WYSIWYS `request_hash` for an [`ApprovalContext`](allw_core::ApprovalContext)
@@ -442,10 +453,10 @@ pub fn issue_device_cert(
 ///
 /// # Errors
 ///
-/// Throws if `unsigned_rule_json` is not a valid [`UnsignedPolicyRule`](allw_core::UnsignedPolicyRule)
-/// or the device seed is not a 32-byte base64url value. `device_cert` is the
-/// account-root-signed certificate for this device; pass an empty string only to construct an
-/// intentionally unverifiable rule for negative tests.
+/// Throws if `unsigned_rule_json` is not a valid [`UnsignedPolicyRule`](allw_core::UnsignedPolicyRule),
+/// the device seed is not a 32-byte base64url value, or `device_cert` is empty. `device_cert` is the
+/// account-root-signed certificate for this device; certless test fixtures should be constructed in
+/// Rust core tests, not accidentally emitted through the production JS signing boundary.
 #[wasm_bindgen]
 pub fn sign_policy_rule(
     unsigned_rule_json: &str,
@@ -456,12 +467,8 @@ pub fn sign_policy_rule(
     let unsigned: UnsignedPolicyRule = parse_json(unsigned_rule_json, "UnsignedPolicyRule")?;
     let seed = decode_b64_32(device_seed_b64, "device_seed_b64")?;
     let device_key = SigningKeyPair::from_seed(&seed);
-    let cert = if device_cert.is_empty() {
-        None
-    } else {
-        Some(device_cert.to_string())
-    };
-    let rule = core_sign_policy_rule(&unsigned, device_id, &device_key, cert);
+    let cert = required_policy_device_cert(device_cert)?;
+    let rule = core_sign_policy_rule(&unsigned, device_id, &device_key, Some(cert));
     to_json(&rule, "PolicyRule")
 }
 
@@ -475,7 +482,7 @@ pub fn sign_policy_rule(
 /// # Errors
 ///
 /// Throws if actor/action/scope JSON is malformed, `created_at` is not a safe integer millisecond
-/// timestamp, or the device seed is not a 32-byte base64url value.
+/// timestamp, the device seed is not a 32-byte base64url value, or `device_cert` is empty.
 #[wasm_bindgen]
 #[allow(
     clippy::too_many_arguments,
@@ -502,12 +509,8 @@ pub fn policy_rule_from_approval(
     let unsigned =
         UnsignedPolicyRule::from_approval(id, account_id, &actor, &action, scope, created_at)
             .map_err(|e| JsError::new(&format!("policy_rule_from_approval failed: {e}")))?;
-    let cert = if device_cert.is_empty() {
-        None
-    } else {
-        Some(device_cert.to_string())
-    };
-    let rule = core_sign_policy_rule(&unsigned, device_id, &device_key, cert);
+    let cert = required_policy_device_cert(device_cert)?;
+    let rule = core_sign_policy_rule(&unsigned, device_id, &device_key, Some(cert));
     to_json(&rule, "PolicyRule")
 }
 

@@ -335,6 +335,46 @@ test("policy_rule_from_approval rejects bin-only exact command rules", async () 
   );
 });
 
+test("policy rule signing rejects empty-string device certificates", async () => {
+  const wasm = await loadWasm();
+  const f = policyFixture(wasm);
+  const actor = { id: "machine:macbook", kind: "claude-code" };
+  const actionJson = wasm.action_from_command("git push --force origin main", null);
+  const unsigned = {
+    id: "allow-empty-cert",
+    account_id: f.accountId,
+    subject: { kind: "any" },
+    match: { surface: "command", command: { bin: "git" } },
+    effect: "allow",
+    provenance: "manual",
+    tier: "syntactic",
+    created_at: f.createdAt,
+  };
+
+  assert.throws(
+    () => wasm.sign_policy_rule(JSON.stringify(unsigned), f.deviceId, f.deviceSeed, ""),
+    /device_cert is required/,
+    "manual policy signing must not silently emit unverifiable certless rules",
+  );
+
+  assert.throws(
+    () =>
+      wasm.policy_rule_from_approval(
+        "approval-empty-cert",
+        f.accountId,
+        JSON.stringify(actor),
+        actionJson,
+        JSON.stringify({ kind: "exact_call" }),
+        f.createdAt,
+        f.deviceId,
+        f.deviceSeed,
+        "",
+      ),
+    /device_cert is required/,
+    "approval-derived policy signing must reject accidental empty-string device_cert values",
+  );
+});
+
 test("evaluate_policy verifies signed rules and applies deny over ask over allow", async () => {
   const wasm = await loadWasm();
   const f = policyFixture(wasm);

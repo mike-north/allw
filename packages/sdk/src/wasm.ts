@@ -61,7 +61,7 @@ export interface AllwWasm {
   ed25519_public_key(seedB64: string): string;
   /** Build an ActionRecord JSON for a shell command using the core T1 command parser. */
   action_from_command(commandLine: string, cwd?: string | null): string;
-  /** Sign an unsigned PolicyRule JSON with a device key and cert, returning signed JSON. */
+  /** Sign an unsigned PolicyRule JSON with a device key and non-empty device cert. */
   sign_policy_rule(
     unsignedRuleJson: string,
     deviceId: string,
@@ -71,6 +71,7 @@ export interface AllwWasm {
   /**
    * Emit a signed allow PolicyRule from an approved action plus syntactic scope choice.
    * `scopeJson` is a PolicyRuleScope JSON value such as `{ "kind": "exact_call" }`.
+   * `deviceCert` must be the non-empty account-root-signed certificate for the signing device.
    */
   policy_rule_from_approval(
     id: string,
