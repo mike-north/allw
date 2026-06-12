@@ -25,6 +25,7 @@
  * @see https://code.claude.com/docs/en/hooks
  */
 
+import { realpathSync } from "node:fs";
 import { hostname as osHostname } from "node:os";
 import { pathToFileURL } from "node:url";
 
@@ -35,6 +36,7 @@ import { decide, type RequestApprovalFn } from "./lib/decide.js";
 import { isGatedTool } from "./lib/gating.js";
 import { allowOutput, denyOutput, parseHookInput, type PreToolUseOutput } from "./lib/hook-io.js";
 import { loadWasm } from "./lib/wasm.js";
+import { getVersion } from "./version.js";
 
 /**
  * Test-only transport seams for the SDK client. Production passes none of these (the SDK uses the
@@ -121,8 +123,29 @@ export async function runHook(
   return decide(parsed.input, { wasm, config, requestApproval }, osHostname());
 }
 
+/**
+ * Diagnostic, non-hook invocations the hook answers **before** touching stdin: `--version`/`-v`
+ * prints the version (read from this package's own package.json — never a hardcoded literal, see
+ * ./version.ts) and exits 0. Returns `true` when it handled a flag (the caller must not proceed to
+ * the stdin hook path).
+ *
+ * This never runs on the hook hot path: Claude Code invokes the hook with no argv flags and pipes
+ * the tool call on stdin, so `argv` is empty there and this is a no-op.
+ */
+function handleDiagnosticFlags(argv: readonly string[]): boolean {
+  if (argv.includes("--version") || argv.includes("-v")) {
+    process.stdout.write(`${getVersion()}\n`);
+    return true;
+  }
+  return false;
+}
+
 /** The process entrypoint: read stdin, decide, emit, exit 0. Any throw ⇒ a fail-closed deny. */
 async function main(): Promise<void> {
+  if (handleDiagnosticFlags(process.argv.slice(2))) {
+    process.exit(0);
+  }
+
   let output: PreToolUseOutput;
   try {
     const raw = await readStdin();
@@ -141,9 +164,27 @@ async function main(): Promise<void> {
   process.exit(0);
 }
 
-// Only run when invoked as the entrypoint (not when imported by tests). Compare via a file:// URL
-// so the check is correct cross-platform (a bare path is not a valid ESM specifier on Windows).
-const entrypoint = process.argv[1];
-if (entrypoint !== undefined && import.meta.url === pathToFileURL(entrypoint).href) {
+/**
+ * Decide whether this module was invoked as the process entrypoint (run the hook) vs. imported by a
+ * test (do nothing). Comparing `process.argv[1]` directly is wrong for a published install: the
+ * `allw-hook` bin is a **symlink** in `node_modules/.bin`, so `argv[1]` is the symlink path while
+ * `import.meta.url` is the real `dist/cli.js`, and a naive compare would never run `main()` (the bin
+ * would silently print nothing). We therefore resolve `argv[1]` through `realpathSync` (following
+ * the bin symlink) before comparing, and compare via a `file://` URL so it is correct cross-platform
+ * (a bare path is not a valid ESM specifier on Windows). Regression-tested by the packaged-install
+ * smoke test (`scripts/smoke-packaged-install.mjs`).
+ */
+function isMainEntrypoint() {
+  const argv1 = process.argv[1];
+  if (argv1 === undefined) return false;
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(argv1)).href;
+  } catch {
+    // `realpathSync` throws if argv[1] is not a real path (unusual); fall back to a raw compare.
+    return import.meta.url === pathToFileURL(argv1).href;
+  }
+}
+
+if (isMainEntrypoint()) {
   void main();
 }
