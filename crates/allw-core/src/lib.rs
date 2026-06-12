@@ -16,8 +16,11 @@
 //! i64 ms timestamps). WYSIWYS request_hash implemented. Append-only audit hash-chain landed
 //! (`AuditChain`, `AuditEntryInput`, `AuditChainError`, `compute_record_hash`). Verdict signing
 //! and verification landed via an EdDSA compact JWS over Ed25519. JWE context E2EE landed
-//! (multi-recipient JOSE JWE — `ECDH-ES+A256KW` X25519 → A256GCM; see [`jwe`]).
+//! (multi-recipient JOSE JWE — `ECDH-ES+A256KW` X25519 → A256GCM; see [`jwe`]). Actor-key request
+//! attestation landed (verified request origin, bound to `request_id` + `request_hash`, with the
+//! actor key anchored in root-signed account state; see [`attestation`]).
 
+pub mod attestation;
 pub mod audit;
 pub mod command;
 pub mod contract;
@@ -27,6 +30,10 @@ pub mod jwe;
 pub mod mcp;
 pub mod policy;
 
+pub use attestation::{
+    sign_actor_attestation, verified_origin_string, verify_actor_attestation,
+    verify_actor_attestation_with_account_states, ActorAttestationClaims, AttestationError,
+};
 pub use audit::{
     compute_record_hash, AuditChain, AuditChainError, AuditEntryInput, GENESIS_PREV_HASH,
 };
