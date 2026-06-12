@@ -2,10 +2,10 @@ use allw_core::{
     action_from_argv, action_from_mcp_tool_call, evaluate, evaluate_for_actor, issue_device_cert,
     sign_account_state, sign_policy_rule, sign_verdict, verify_policy_rule,
     verify_policy_rule_with_account_states, AccountState, AccountStateRevocation,
-    AccountStateRevocationKind, Actor, Approver, CommandContext, Decision, PolicyDecision,
-    PolicyEffect, PolicyPredicate, PolicyProvenance, PolicyRuleError, PolicyRuleScope, PolicyTier,
-    Risk, SigningKeyPair, Surface, SyntacticSubstrate, UnsignedPolicyRule, UnsignedVerdict,
-    Verdict,
+    AccountStateRevocationKind, Actor, Approver, CommandContext, Decision, McpMatcher,
+    ParamMatcher, PolicyDecision, PolicyEffect, PolicyPredicate, PolicyProvenance, PolicyRuleError,
+    PolicyRuleScope, PolicyTier, Risk, SigningKeyPair, Surface, SyntacticSubstrate,
+    UnsignedPolicyRule, UnsignedVerdict, Verdict,
 };
 use serde_json::json;
 
@@ -486,11 +486,12 @@ fn args_any_glob_matches_structured_tokens_not_raw_or_substrings() {
 
 #[test]
 fn args_any_glob_over_length_cap_fails_closed_to_escalate() {
-    let oversized = "a".repeat(4097);
+    let oversized = format!("secret-{}", "a".repeat(4097));
     let rule = signed(UnsignedPolicyRule {
-        id: "allow-oversized-token".to_string(),
+        id: "allow-secret-token".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
         subject: allw_core::ActorMatcher::Any,
-        predicate: PolicyPredicate::command_bin("tool").with_args_any_glob(&oversized),
+        predicate: PolicyPredicate::command_bin("tool").with_args_any_glob("*secret*"),
         effect: PolicyEffect::Allow,
         bounds: None,
         provenance: PolicyProvenance::Manual,
@@ -505,6 +506,155 @@ fn args_any_glob_over_length_cap_fails_closed_to_escalate() {
         evaluate(&action, &[rule]).decision,
         PolicyDecision::Escalate,
         "over-cap glob inputs must fail closed rather than auto-allowing the action"
+    );
+}
+
+#[test]
+fn oversized_action_token_cannot_bypass_deny_with_broad_allow() {
+    let oversized = format!("secret-{}", "a".repeat(4097));
+    let deny_secret = signed(UnsignedPolicyRule {
+        id: "deny-secret".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate::command_bin("tool").with_args_any_glob("*secret*"),
+        effect: PolicyEffect::Deny,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    });
+    let allow_tool = signed(UnsignedPolicyRule {
+        id: "allow-tool".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate::command_bin("tool"),
+        effect: PolicyEffect::Allow,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    });
+    let argv = ["tool".to_string(), oversized];
+    let action = action_from_argv(&argv, &CommandContext::default());
+
+    assert_eq!(
+        evaluate(&action, &[deny_secret, allow_tool]).decision,
+        PolicyDecision::Escalate,
+        "over-cap action tokens must escalate before a broad allow can bypass a deny"
+    );
+}
+
+#[test]
+fn signed_policy_rule_rejects_over_length_glob_pattern() {
+    let key = device_key();
+    let oversized = "a".repeat(4097);
+    let unsigned = UnsignedPolicyRule {
+        id: "allow-oversized-pattern".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate::command_bin("tool").with_args_any_glob(&oversized),
+        effect: PolicyEffect::Allow,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    };
+    let signed = sign_policy_rule(&unsigned, DEVICE_ID, &key, Some(device_cert()));
+
+    assert_eq!(
+        verify_policy_rule(&signed, &root_key().public_key(), NOW_OK),
+        Err(PolicyRuleError::UnsupportedBounds),
+        "over-cap signed glob patterns must not silently become inert"
+    );
+}
+
+#[test]
+fn oversized_mcp_param_cannot_bypass_deny_with_broad_allow() {
+    let oversized = format!("secret-{}", "a".repeat(4097));
+    let deny_secret = signed(UnsignedPolicyRule {
+        id: "deny-secret-param".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate {
+            surface: Some(Surface::McpToolCall),
+            command: None,
+            mcp: Some(McpMatcher {
+                server: Some("github".to_string()),
+                tool: Some("create_issue".to_string()),
+                params_exact: None,
+                params: vec![ParamMatcher {
+                    path: "title".to_string(),
+                    equals: None,
+                    string_glob: Some("*secret*".to_string()),
+                }],
+            }),
+        },
+        effect: PolicyEffect::Deny,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    });
+    let allow_tool = signed(UnsignedPolicyRule {
+        id: "allow-create-issue".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate::mcp_tool("github", "create_issue"),
+        effect: PolicyEffect::Allow,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    });
+    let action = action_from_mcp_tool_call("github", "create_issue", json!({ "title": oversized }));
+
+    assert_eq!(
+        evaluate(&action, &[deny_secret, allow_tool]).decision,
+        PolicyDecision::Escalate,
+        "over-cap MCP params must escalate before a broad allow can bypass a deny"
+    );
+}
+
+#[test]
+fn signed_policy_rule_rejects_over_length_mcp_glob_pattern() {
+    let key = device_key();
+    let oversized = "a".repeat(4097);
+    let unsigned = UnsignedPolicyRule {
+        id: "allow-oversized-mcp-pattern".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate {
+            surface: Some(Surface::McpToolCall),
+            command: None,
+            mcp: Some(McpMatcher {
+                server: Some("github".to_string()),
+                tool: Some("create_issue".to_string()),
+                params_exact: None,
+                params: vec![ParamMatcher {
+                    path: "title".to_string(),
+                    equals: None,
+                    string_glob: Some(oversized),
+                }],
+            }),
+        },
+        effect: PolicyEffect::Allow,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    };
+    let signed = sign_policy_rule(&unsigned, DEVICE_ID, &key, Some(device_cert()));
+
+    assert_eq!(
+        verify_policy_rule(&signed, &root_key().public_key(), NOW_OK),
+        Err(PolicyRuleError::UnsupportedBounds),
+        "over-cap signed MCP glob patterns must not silently become inert"
     );
 }
 
