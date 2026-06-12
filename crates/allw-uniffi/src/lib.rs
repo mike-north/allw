@@ -77,14 +77,20 @@ fn decode_b64_32(value: &str, what: &str) -> Result<[u8; 32], AllwFfiError> {
         .map_err(|_| AllwFfiError::failure(format!("{what} must decode to exactly 32 bytes")))
 }
 
-/// Decode a 32-byte **secret seed** from base64url, scrubbing every intermediate copy.
+/// Decode a 32-byte **secret seed** from base64url, scrubbing the copies this function owns.
 ///
 /// Seed material (signing/encryption device seeds, the account root seed) crosses the FFI as a
 /// base64 string and is decoded here into bytes that key derivation reads. Unlike [`decode_b64_32`]
 /// (used for *public* values — pubkeys, request hashes), this wraps the decoded `Vec<u8>` and the
 /// returned `[u8; 32]` in [`Zeroizing`] so both the heap buffer and the stack array are wiped on
 /// drop (issue #90). The caller must keep the result in a `Zeroizing` binding (not copy the inner
-/// `[u8; 32]` out) for the guarantee to hold.
+/// `[u8; 32]` out) for the returned-seed guarantee to hold.
+///
+/// Scope of the guarantee: only the buffers owned here are scrubbed. The **caller-owned base64
+/// `&str`** (still live after this returns) and any **scratch buffers allocated internally by the
+/// base64 decoder** are outside our control and are *not* wiped. Callers holding the seed string
+/// must zeroize it themselves; full end-to-end scrubbing arrives with the native key-custody story
+/// (Secure Enclave / StrongBox, #23), where seeds never materialize as host strings at all.
 fn decode_seed_b64_32(value: &str, what: &str) -> Result<Zeroizing<[u8; 32]>, AllwFfiError> {
     // `Zeroizing<Vec<u8>>` wipes the heap-decoded bytes when this function returns, regardless of
     // which branch (Ok/Err) is taken.
