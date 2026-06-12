@@ -136,13 +136,18 @@ public final class KeychainNativeCredentialStorage: NativeCredentialStorage {
     }
 
     public func loadHighestAccountStateSequence(accountId: String) async throws -> Int64? {
-        guard
-            let data = try loadData(account: accountStateFloorAccount(accountId)),
-            let raw = String(data: data, encoding: .utf8)
-        else {
+        guard let data = try loadData(account: accountStateFloorAccount(accountId)) else {
             return nil
         }
-        return Int64(raw)
+        guard let raw = String(data: data, encoding: .utf8), let sequence = Int64(raw) else {
+            throw NativeCredentialStoreError.keychainFailure(
+                "Keychain account-state floor for account '\(accountId)' is malformed"
+            )
+        }
+        if sequence < 0 {
+            throw NativeCredentialStoreError.invalidAccountStateSequence(accountId: accountId, sequence: sequence)
+        }
+        return sequence
     }
 
     public func saveHighestAccountStateSequence(accountId: String, sequence: Int64) async throws {
