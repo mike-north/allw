@@ -133,6 +133,9 @@ jobs:
       - run: ./scripts/uniffi-smoke.sh
         env:
           JNA_JAR: ${{ github.workspace }}/jna-cache/jna-5.17.0.jar
+      # iOS approver state-machine tests (swiftc-based script; SPM `swift test` is intentionally
+      # avoided — the suite is an executable target so it runs on CommandLineTools-only hosts too).
+      - run: bash apps/ios-approver/scripts/test-ios-approver.sh
 
   packaged-install:
     name: Packaged install (pack → npm install → smoke)
