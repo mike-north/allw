@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "types": ["node"],
+    // The Codex hook is a Node application over the shared WASM core. `WebWorker` supplies the
+    // WebAssembly/fetch/WebSocket globals the SDK and loader types need without importing the DOM.
+    "lib": ["ES2023", "WebWorker"]
+  },
+  "include": ["src"]
+}
