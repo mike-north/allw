@@ -514,11 +514,11 @@ function pairedApproverWithAttestation(wasm, { actorSeed }) {
  * keyfile's account root. This is the device's root-anchored trust input (#16); a relay-supplied
  * key is never trusted. `docs/enrollment.md` §Account State.
  */
-function signedAccountState(wasm, keyfile, actorPubkey) {
+function signedAccountState(wasm, keyfile, actorPubkey, { sequence = 1 } = {}) {
   const state = {
     v: 1,
     account_id: ACCOUNT_ID,
-    sequence: 1,
+    sequence,
     current_root: keyfile.account_root_pubkey,
     previous_roots: [],
     devices: [],
@@ -565,6 +565,37 @@ test("verified origin: a root-anchored key renders ✓ VERIFIED in the watch loo
     /✓ VERIFIED origin — claude-code · machine:ci/,
     "the rendered block shows the cryptographically-verified, root-anchored origin",
   );
+});
+
+test("origin fail-closed: relay max_sequence above verified docs renders ⚠ UNVERIFIED", async () => {
+  const wasm = await loadWasm();
+  const actorSeed = Buffer.alloc(32, 0x44).toString("base64url");
+  const actorPub = wasm.ed25519_public_key(actorSeed);
+  const { keyfile, jwe } = pairedApproverWithAttestation(wasm, { actorSeed });
+  const ws = stubSocket();
+  const prompter = capturingPrompter("approved");
+
+  const accountStates = [signedAccountState(wasm, keyfile, actorPub, { sequence: 1 })];
+  const resolveAccountStates = () => Promise.resolve({ accountStates, maxSequence: 2 });
+
+  await handleRequest(
+    wasm,
+    keyfile,
+    ws,
+    prompter,
+    makeEnvelope(jwe),
+    recordingLogger(),
+    () => DECIDED_AT,
+    resolveAccountStates,
+  );
+
+  assert.equal(prompter.renders.length, 1, "the human was prompted with a rendered block");
+  assert.match(
+    prompter.renders[0],
+    /⚠ UNVERIFIED/,
+    "a relay max_sequence not backed by root-verified docs must downgrade the origin",
+  );
+  assert.match(prompter.renders[0], /max_sequence 2 exceeds highest root-verified sequence 1/);
 });
 
 test("origin fail-closed: a resolver error still renders the request as ⚠ UNVERIFIED (#16)", async () => {

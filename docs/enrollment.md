@@ -242,11 +242,16 @@ Authoring and distribution flow:
 1. A root-authorized account-state author builds the next document with a monotonic `sequence`.
 2. The account root signs it as a compact JWS (`typ = "allw-account-state+jws"`).
 3. An enrolled device publishes the signed document set to `POST /{account_id}/account-states` with its
-   `device_auth_token`. Publishing replaces the relay's current cached set for that account.
+   `device_auth_token` and the highest sequence in the set as `max_sequence`. The relay treats the
+   compact JWS docs as opaque, but stores that asserted max sequence as monotonic metadata and rejects
+   lower-sequence republishes with `409`.
 4. Approver devices fetch `GET /{account_id}/account-states` with their `device_auth_token` before rendering a
-   request origin. The relay returns opaque compact JWS strings and does not inspect or author them.
-5. The device verifies the account-root signature and highest valid sequence locally. Missing, stale, tampered, or
-   relay-substituted state can only render `⚠ UNVERIFIED`; it cannot produce a verified origin.
+   request origin. The relay returns opaque compact JWS strings plus the stored `max_sequence` metadata and does
+   not inspect or author the docs.
+5. The device verifies the account-root signature and highest valid sequence locally, and downgrades the origin
+   to `⚠ UNVERIFIED` if the relay's `max_sequence` is not backed by a root-verified document at least that new.
+   Missing, tampered, or relay-substituted state renders `⚠ UNVERIFIED`; relay-side monotonic publish metadata
+   prevents enrolled devices from rolling the cache back to a lower asserted sequence.
 
 Validation:
 
@@ -388,8 +393,8 @@ Current relay mechanics cover the registry subset and #89 adds relay-scoped endp
 | `POST /devices/{device_id}/revoke` | Remove an active device and close its live socket.                                      |
 | `POST /actors`                     | Enroll an actor public key.                                                             |
 | `GET /actors`                      | List enrolled actor public keys.                                                        |
-| `POST /account-states`             | Publish the root-signed account-state document set for relay distribution.              |
-| `GET /account-states`              | Fetch relay-distributed root-signed account-state documents for local verification.     |
+| `POST /account-states`             | Publish the root-signed account-state document set with monotonic `max_sequence`.       |
+| `GET /account-states`              | Fetch relay-distributed account-state docs plus `max_sequence` metadata.                |
 
 Endpoint authentication and authorization rules:
 
@@ -431,5 +436,6 @@ Resolved (was deferred):
 - Whether actor keys are anchored via a root-signed `actor_cert` or via signed account-state: **#16 chose signed
   account-state** (`actors` entries), reusing the device-trust/revocation machinery.
 - Relay distribution of root-signed account state to devices: **#104 added authenticated
-  `POST /account-states` and `GET /account-states`**. The relay serves opaque signed documents, but verified-origin
-  trust still comes only from local account-root signature verification.
+  `POST /account-states` and `GET /account-states`**. The relay serves opaque signed documents and stores only an
+  asserted `max_sequence` guard for rollback resistance; verified-origin trust still comes only from local
+  account-root signature verification.

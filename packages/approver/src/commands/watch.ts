@@ -22,7 +22,7 @@ import {
   type RenderableRequest,
 } from "../lib/approver-core.js";
 import { readKeyfile, type Keyfile } from "../lib/keyfile.js";
-import { deviceConnectWsUrl, fetchAccountStates } from "../lib/relay-client.js";
+import { deviceConnectWsUrl, fetchAccountStatesWithMetadata } from "../lib/relay-client.js";
 import { renderRequest } from "../lib/render.js";
 import type { AllwWasm } from "../lib/wasm.js";
 import type { Decision, DeviceInboundMessage } from "../lib/types.js";
@@ -106,7 +106,40 @@ function parseInbound(data: unknown): DeviceInboundMessage | null {
  * resolver can fetch them from a relay account-state endpoint; the trust is the root signature, not
  * the relay.
  */
-export type AccountStateResolver = (actorId: string) => Promise<readonly string[]>;
+export interface AccountStateResolution {
+  readonly accountStates: readonly string[];
+  readonly maxSequence?: number;
+}
+
+export type AccountStateResolver = (
+  actorId: string,
+) => Promise<readonly string[] | AccountStateResolution>;
+
+function normalizeAccountStateResolution(
+  resolution: readonly string[] | AccountStateResolution,
+): AccountStateResolution {
+  if (Array.isArray(resolution)) return { accountStates: resolution };
+  return resolution as AccountStateResolution;
+}
+
+function highestVerifiedAccountStateSequence(
+  wasm: AllwWasm,
+  accountStates: readonly string[],
+  accountId: string,
+  accountRootPubkey: string,
+): number | null {
+  let highest: number | null = null;
+  for (const accountState of accountStates) {
+    const verified = JSON.parse(
+      wasm.verify_account_state(accountState, accountId, accountRootPubkey),
+    ) as { sequence?: unknown };
+    if (typeof verified.sequence !== "number" || !Number.isSafeInteger(verified.sequence)) {
+      return null;
+    }
+    highest = highest === null ? verified.sequence : Math.max(highest, verified.sequence);
+  }
+  return highest;
+}
 
 /**
  * Handle a single decrypted request: render, prompt, sign, and send the verdict. Isolated and
@@ -150,21 +183,63 @@ export async function handleRequest(
   // downgrades to an unverified origin rather than aborting — the human must still see the action;
   // the origin is just explicitly marked ⚠.
   let accountStates: readonly string[] = [];
+  let relayMaxSequence: number | undefined;
   try {
-    accountStates = await resolveAccountStates(prepared.context.actor.id);
+    const resolved = normalizeAccountStateResolution(
+      await resolveAccountStates(prepared.context.actor.id),
+    );
+    accountStates = resolved.accountStates;
+    relayMaxSequence = resolved.maxSequence;
   } catch (err) {
     log.warn(
       `Could not resolve account state for '${prepared.context.actor.id}' — rendering origin as unverified: ${(err as Error).message}`,
     );
     accountStates = [];
   }
-  const origin = verifyActorOrigin(
-    wasm,
-    prepared,
-    keyfile.account_id ?? "",
-    keyfile.account_root_pubkey,
-    accountStates,
-  );
+  const accountId = keyfile.account_id;
+  if (accountId === undefined || accountId.length === 0) {
+    log.warn("Skipping request — keyfile is missing account_id; run 'allw-approver pair' first");
+    return null;
+  }
+  let origin;
+  try {
+    // The relay is zero-knowledge and does not parse account-state JWS payloads. Therefore its
+    // monotonic metadata is only useful if the device confirms it is backed by root-verified docs.
+    const verifiedHighestSequence =
+      relayMaxSequence !== undefined && relayMaxSequence > 0
+        ? highestVerifiedAccountStateSequence(
+            wasm,
+            accountStates,
+            accountId,
+            keyfile.account_root_pubkey,
+          )
+        : null;
+    if (
+      relayMaxSequence !== undefined &&
+      relayMaxSequence > 0 &&
+      (verifiedHighestSequence === null || verifiedHighestSequence < relayMaxSequence)
+    ) {
+      origin = {
+        verified: false as const,
+        reason:
+          `relay account-state max_sequence ${String(relayMaxSequence)} exceeds highest ` +
+          `root-verified sequence ${String(verifiedHighestSequence ?? "none")}`,
+      };
+    } else {
+      origin = verifyActorOrigin(
+        wasm,
+        prepared,
+        accountId,
+        keyfile.account_root_pubkey,
+        accountStates,
+      );
+    }
+  } catch (err) {
+    origin = {
+      verified: false as const,
+      reason: `account-state sequence check failed: ${(err as Error).message}`,
+    };
+  }
   const preparedWithOrigin: RenderableRequest = { ...prepared, origin };
 
   const rendered = renderRequest(preparedWithOrigin);
@@ -265,7 +340,7 @@ export async function runWatch(
   // verified origin is driven only by account state the configured account root signed. Relay fetch
   // failures are caught by `handleRequest` and downgrade the render to ⚠ UNVERIFIED.
   const resolveAccountStates: AccountStateResolver = () =>
-    fetchAccountStates(relayUrl, accountId, deviceAuthToken);
+    fetchAccountStatesWithMetadata(relayUrl, accountId, deviceAuthToken);
 
   // Serialize request handling: prompts are interactive, so process one at a time.
   let chain: Promise<unknown> = Promise.resolve();

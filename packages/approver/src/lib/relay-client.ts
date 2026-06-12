@@ -157,12 +157,17 @@ export async function pairingComplete(
  * JWS strings signed by the account root; the relay only caches and serves them, while the approver
  * core decides whether any document actually verifies and enrolls the actor key.
  */
-export async function fetchAccountStates(
+export interface AccountStateFetchResult {
+  readonly accountStates: readonly string[];
+  readonly maxSequence: number;
+}
+
+export async function fetchAccountStatesWithMetadata(
   relayUrl: string,
   accountId: string,
   deviceAuthToken: string,
   timeoutMs: number = PAIRING_TIMEOUT_MS,
-): Promise<readonly string[]> {
+): Promise<AccountStateFetchResult> {
   const url = `${normalizeBase(relayUrl)}/${encodeURIComponent(accountId)}/account-states`;
   const result = await getJson(url, timeoutMs, { Authorization: `Bearer ${deviceAuthToken}` });
   if (
@@ -175,7 +180,27 @@ export async function fetchAccountStates(
   ) {
     throw new Error(`relay account-states returned an unexpected shape: ${JSON.stringify(result)}`);
   }
-  return (result as { account_states: string[] }).account_states;
+  const maxSequence = (result as { max_sequence?: unknown }).max_sequence;
+  if (
+    maxSequence !== undefined &&
+    (typeof maxSequence !== "number" || !Number.isSafeInteger(maxSequence) || maxSequence < 0)
+  ) {
+    throw new Error(`relay account-states returned an unexpected shape: ${JSON.stringify(result)}`);
+  }
+  return {
+    accountStates: (result as { account_states: string[] }).account_states,
+    maxSequence: maxSequence ?? 0,
+  };
+}
+
+export async function fetchAccountStates(
+  relayUrl: string,
+  accountId: string,
+  deviceAuthToken: string,
+  timeoutMs: number = PAIRING_TIMEOUT_MS,
+): Promise<readonly string[]> {
+  return (await fetchAccountStatesWithMetadata(relayUrl, accountId, deviceAuthToken, timeoutMs))
+    .accountStates;
 }
 
 /**

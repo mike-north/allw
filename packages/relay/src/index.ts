@@ -113,6 +113,10 @@ interface AccountStateRow extends Record<string, string | number | null | ArrayB
   created_at: number;
 }
 
+interface AccountStateMetaRow extends Record<string, string | number | null | ArrayBuffer> {
+  max_sequence: number;
+}
+
 // Public shape returned to callers — only public key material + metadata.
 interface DeviceRecord {
   device_id: string;
@@ -333,6 +337,11 @@ function requiredAccountStates(body: Record<string, unknown>): string[] | null {
   return states;
 }
 
+function requiredAccountStateMaxSequence(body: Record<string, unknown>): number | null {
+  const raw = body.max_sequence;
+  return typeof raw === "number" && Number.isSafeInteger(raw) && raw >= 0 ? raw : null;
+}
+
 /** True when the request is a WebSocket upgrade (`Upgrade: websocket`, case-insensitive). */
 function isWebSocketUpgrade(request: Request): boolean {
   return (request.headers.get("Upgrade") ?? "").toLowerCase() === "websocket";
@@ -486,6 +495,15 @@ export class AccountRelay implements DurableObject {
         ordinal    INTEGER PRIMARY KEY,
         state_jws  TEXT    NOT NULL,
         created_at INTEGER NOT NULL
+      );
+
+      -- Zero-knowledge monotonicity metadata for the opaque account-state cache. The relay never
+      -- parses signed state JWS payloads, but it can reject a publish whose caller asserts a lower
+      -- max_sequence than the highest one previously accepted for this account.
+      CREATE TABLE IF NOT EXISTS account_state_meta (
+        id           INTEGER PRIMARY KEY CHECK (id = 1),
+        max_sequence INTEGER NOT NULL,
+        updated_at   INTEGER NOT NULL
       );
     `);
     try {
@@ -869,11 +887,12 @@ export class AccountRelay implements DurableObject {
 
   /**
    * POST /account-states
-   * Body: { account_states: string[] }
+   * Body: { account_states: string[], max_sequence: number }
    * Response: { account_states: string[] }
    *
-   * Replaces the account's current root-signed account-state document set. The relay treats the
-   * docs as opaque compact JWS strings: it is a distribution cache, never the trust anchor.
+   * Replaces the account's current root-signed account-state document set when the asserted
+   * max_sequence is monotonic. The relay treats the docs as opaque compact JWS strings: it is a
+   * distribution cache, never the trust anchor.
    */
   private async handleAccountStatePublish(request: Request): Promise<Response> {
     const authorizedDevice = await this.authorizedDeviceId(request);
@@ -892,6 +911,26 @@ export class AccountRelay implements DurableObject {
       );
     }
 
+    const maxSequence = requiredAccountStateMaxSequence(body);
+    if (maxSequence === null) {
+      return json({ error: "'max_sequence' must be a non-negative safe integer" }, 400);
+    }
+
+    const currentMeta = [
+      ...this.sql.exec<AccountStateMetaRow>(
+        `SELECT max_sequence FROM account_state_meta WHERE id = 1`,
+      ),
+    ][0];
+    const currentMaxSequence = currentMeta?.max_sequence;
+    if (currentMaxSequence !== undefined && maxSequence < currentMaxSequence) {
+      return json(
+        {
+          error: `max_sequence regression: ${String(maxSequence)} is below current ${String(currentMaxSequence)}`,
+        },
+        409,
+      );
+    }
+
     const now = Date.now();
     this.sql.exec(`DELETE FROM account_state`);
     for (const [ordinal, stateJws] of accountStates.entries()) {
@@ -902,8 +941,13 @@ export class AccountRelay implements DurableObject {
         now,
       );
     }
+    this.sql.exec(
+      `INSERT OR REPLACE INTO account_state_meta (id, max_sequence, updated_at) VALUES (1, ?, ?)`,
+      maxSequence,
+      now,
+    );
 
-    return json({ account_states: accountStates });
+    return json({ account_states: accountStates, max_sequence: maxSequence });
   }
 
   /**
@@ -911,8 +955,8 @@ export class AccountRelay implements DurableObject {
    * Response: { account_states: string[] }
    *
    * Returns relay-distributed account-state docs for local root-signature verification. A malicious
-   * relay can omit or tamper with these strings, but that only downgrades approver rendering to
-   * unverified; it cannot produce a verified actor origin.
+   * relay can omit or tamper with these strings, but the monotonic publish guard prevents enrolled
+   * devices from rolling the relay cache back to a lower asserted sequence.
    */
   private async handleAccountStateList(request: Request): Promise<Response> {
     const authorizedDevice = await this.authorizedDeviceId(request);
@@ -923,7 +967,15 @@ export class AccountRelay implements DurableObject {
         `SELECT ordinal, state_jws, created_at FROM account_state ORDER BY ordinal ASC`,
       ),
     ];
-    return json({ account_states: rows.map((row) => row.state_jws) });
+    const currentMeta = [
+      ...this.sql.exec<AccountStateMetaRow>(
+        `SELECT max_sequence FROM account_state_meta WHERE id = 1`,
+      ),
+    ][0];
+    return json({
+      account_states: rows.map((row) => row.state_jws),
+      max_sequence: currentMeta?.max_sequence ?? 0,
+    });
   }
 
   /**

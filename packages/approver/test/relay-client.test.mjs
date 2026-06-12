@@ -26,6 +26,7 @@ import { readKeyfile } from "../dist/lib/keyfile.js";
 import {
   deviceConnectWsUrl,
   fetchAccountStates,
+  fetchAccountStatesWithMetadata,
   pairingStart,
   pairingComplete,
   PAIRING_TIMEOUT_MS,
@@ -94,6 +95,7 @@ function startFakeRelay() {
         res.end(
           JSON.stringify({
             account_states: ["account-state-jws-1", "account-state-jws-2"],
+            max_sequence: 7,
           }),
         );
         return;
@@ -206,6 +208,18 @@ test("fetchAccountStates uses the paired device bearer token and returns compact
     const fetchReq = relay.requests.find((r) => r.url.endsWith("/account-states"));
     assert.equal(fetchReq.method, "GET");
     assert.equal(fetchReq.authorization, `Bearer ${DEVICE_AUTH_TOKEN}`);
+  } finally {
+    await relay.close();
+  }
+});
+
+test("fetchAccountStatesWithMetadata returns relay max_sequence metadata", async () => {
+  const relay = await startFakeRelay();
+  try {
+    const result = await fetchAccountStatesWithMetadata(relay.url, "acct-2", DEVICE_AUTH_TOKEN);
+
+    assert.deepEqual(result.accountStates, ["account-state-jws-1", "account-state-jws-2"]);
+    assert.equal(result.maxSequence, 7);
   } finally {
     await relay.close();
   }
