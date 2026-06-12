@@ -21,7 +21,8 @@ import { dirname } from "node:path";
 import type { AllwWasm } from "./wasm.js";
 
 /** Current on-disk keyfile schema version. Bumped only on a breaking change to the shape. */
-export const KEYFILE_VERSION = 1 as const;
+export const KEYFILE_VERSION = 2 as const;
+const LEGACY_KEYFILE_VERSION = 1 as const;
 
 /**
  * The persisted approver identity. **Contains secret seeds** — never log, transmit, or commit it.
@@ -58,6 +59,11 @@ export interface Keyfile {
   label?: string;
   /** Device→account-root certificate (compact JWS) minted at pairing (set by `pair`). */
   device_cert?: string;
+  /**
+   * Highest root-verified account-state sequence this device has accepted. This local floor keeps a
+   * compromised relay from rolling verified actor origins back to older-but-still-valid state.
+   */
+  account_state_highest_sequence?: number;
 }
 
 /** A freshly generated, not-yet-paired identity (seeds + derived pubkeys only). */
@@ -124,6 +130,9 @@ const OPTIONAL_STRING_FIELDS = [
   "device_cert",
 ] as const;
 
+/** Optional monotonic counters populated as the approver observes root-signed account state. */
+const OPTIONAL_SEQUENCE_FIELDS = ["account_state_highest_sequence"] as const;
+
 /**
  * Validate that `value` is a base64url-unpadded string decoding to **exactly 32 bytes** — the shape
  * of every seed and derived public key (Ed25519 / X25519 are 32-byte). A corrupt keyfile must fail
@@ -152,7 +161,7 @@ export function validateKeyfile(value: unknown): Keyfile {
   if (!isRecord(value)) {
     throw new Error("keyfile is not a JSON object");
   }
-  if (value.version !== KEYFILE_VERSION) {
+  if (value.version !== KEYFILE_VERSION && value.version !== LEGACY_KEYFILE_VERSION) {
     throw new Error(
       `unsupported keyfile version ${String(value.version)} (expected ${String(KEYFILE_VERSION)})`,
     );
@@ -175,8 +184,19 @@ export function validateKeyfile(value: unknown): Keyfile {
       throw new Error(`keyfile field '${key}' must be a string when present (corrupt keyfile)`);
     }
   }
-  // Every required field is a validated 32-byte key and every present optional field is a string.
-  return value as unknown as Keyfile;
+  for (const key of OPTIONAL_SEQUENCE_FIELDS) {
+    if (
+      key in value &&
+      value[key] !== undefined &&
+      (typeof value[key] !== "number" || !Number.isSafeInteger(value[key]) || value[key] < 0)
+    ) {
+      throw new Error(
+        `keyfile field '${key}' must be a non-negative safe integer when present (corrupt keyfile)`,
+      );
+    }
+  }
+  // Every required field is a validated 32-byte key and optional fields have been shape-checked.
+  return { ...value, version: KEYFILE_VERSION } as unknown as Keyfile;
 }
 
 /** Node augments I/O errors with a string `code` (e.g. `"ENOENT"`); narrow to read it safely. */

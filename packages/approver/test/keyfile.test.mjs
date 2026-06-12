@@ -174,6 +174,36 @@ test("validateKeyfile rejects a non-string optional pairing field (review item #
   );
 });
 
+test("validateKeyfile accepts only a non-negative safe account-state sequence floor", async () => {
+  const wasm = await loadWasm();
+  const kf = generateKeyfile(wasm);
+
+  assert.equal(
+    validateKeyfile({ ...kf, account_state_highest_sequence: 3 }).account_state_highest_sequence,
+    3,
+    "a valid persisted account-state sequence floor round-trips through validation",
+  );
+  for (const bad of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, "3"]) {
+    assert.throws(
+      () => validateKeyfile({ ...kf, account_state_highest_sequence: bad }),
+      /'account_state_highest_sequence' must be a non-negative safe integer/,
+      `invalid sequence floor ${String(bad)} must be rejected`,
+    );
+  }
+});
+
+test("validateKeyfile migrates v1 keyfiles to the current sequence-floor schema", async () => {
+  const wasm = await loadWasm();
+  const legacy = { ...generateKeyfile(wasm), version: 1 };
+
+  assert.equal(KEYFILE_VERSION, 2, "the sequence-floor keyfile schema must bump the version");
+  assert.equal(
+    validateKeyfile(legacy).version,
+    KEYFILE_VERSION,
+    "existing v1 keyfiles are accepted and upgraded in memory",
+  );
+});
+
 // ── loadKeyfile distinguishes absent / corrupt / unreadable (review items #2 + #4) ────────────
 
 test("loadKeyfile returns { kind: 'absent' } only for a genuinely missing file (ENOENT)", async () => {

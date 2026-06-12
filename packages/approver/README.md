@@ -152,6 +152,9 @@ its id and WYSIWYS hash — not a reusable identity token).
 - **Verified** → the attestation verified against the actor key that is `active` in the
   highest-sequence account-state document the configured account root signed. The actor line shows
   `✓ VERIFIED origin — {kind} · {id}`.
+- **Stale account state** → `watch` persists the highest root-verified account-state sequence it
+  has accepted in the keyfile and downgrades any later lower-sequence relay response to
+  `⚠ UNVERIFIED`, even if the older document is still correctly root-signed.
 - **Absent / not-root-anchored / revoked / wrong-key / spoofed / wrong-request / lifted** → the line
   is explicitly downgraded to `⚠ UNVERIFIED — <reason> (#16)`. A failed or absent attestation is
   **never** shown as verified (fail-closed display). When no root-signed account state is available

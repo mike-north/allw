@@ -253,24 +253,27 @@ Authoring and distribution flow:
 4. Approver devices fetch `GET /{account_id}/account-states` with their `device_auth_token` before rendering a
    request origin. The relay returns opaque compact JWS strings plus the stored `max_sequence` metadata and does
    not inspect or author the docs.
-5. The device verifies the account-root signature and highest valid sequence locally, and downgrades the origin
-   to `⚠ UNVERIFIED` if the relay's `max_sequence` is not backed by a root-verified document at least that new.
-   Missing, tampered, or relay-substituted state renders `⚠ UNVERIFIED`; relay-side monotonic publish metadata
-   prevents enrolled devices from rolling the cache back to a lower asserted sequence.
+5. The device verifies the account-root signature and highest valid sequence locally, persists the highest
+   root-verified sequence it has accepted, and downgrades the origin to `⚠ UNVERIFIED` if the relay's
+   `max_sequence` is not backed by a root-verified document at least that new or if fetched state is below the
+   persisted floor. Missing, tampered, relay-substituted, or relay-rolled-back state renders `⚠ UNVERIFIED`;
+   relay-side monotonic publish metadata prevents enrolled devices from rolling the cache back to a lower
+   asserted sequence, while the device-side floor covers a compromised relay that lies about metadata.
 
 Validation:
 
 - `sequence` must be monotonic per `account_id`; a lower sequence is stale.
 - `current_root` must match the configured trust anchor or be learned through a valid root-rotation chain.
 - Revoked devices and actors are not active even if older relay lists still contain them.
-- The relay cannot make a revoked key active by omitting the revocation from an older state document; verifiers
-  keep the highest valid sequence they have seen.
+- The relay cannot make a revoked key active by omitting the revocation from an older state document; approver
+  devices keep the highest valid sequence they have seen and reject lower-sequence rollbacks.
 
 SDK callers that use the revocation-aware `*_with_account_states` verification APIs must supply all known
 account-state JWS documents, or must first enforce a durably stored highest sequence for the account. The SDK and
 WASM core reject stale lower-sequence rollback within one supplied set, but monotonic persistence across calls is
-integrator-owned in v1. The plain `requestApproval` / `Verdict.verify` SDK path enforces account-state revocation
-only when `ClientConfig.accountStates` or `Verdict.verify(..., { accountStates })` is supplied.
+integrator-owned when using the SDK directly. The `allw-approver watch` CLI persists that floor in its keyfile.
+The plain `requestApproval` / `Verdict.verify` SDK path enforces account-state revocation only when
+`ClientConfig.accountStates` or `Verdict.verify(..., { accountStates })` is supplied.
 
 ## Key Rotation
 
