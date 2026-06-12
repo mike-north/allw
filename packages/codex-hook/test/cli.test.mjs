@@ -7,6 +7,8 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { mkdtemp, rm, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -20,9 +22,9 @@ function decisionOf(output) {
   return output.hookSpecificOutput.permissionDecision;
 }
 
-function runCli(stdin) {
+function runCli(stdin, cliPath = CLI) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [CLI], {
+    const child = spawn(process.execPath, [cliPath], {
       env: { PATH: process.env.PATH },
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -96,6 +98,28 @@ test("subprocess: non-gated Codex tool emits allow and exits 0 without config", 
 
   assert.equal(code, 0, "the hook exits 0 with an explicit Codex decision JSON");
   assert.equal(subprocessDecisionOf(stdout), "allow");
+});
+
+test("subprocess: installed symlinked bin emits allow and exits 0", async () => {
+  const binDir = await mkdtemp(join(tmpdir(), "allw-codex-hook-bin-"));
+  const binPath = join(binDir, "allw-codex-hook");
+  try {
+    // Package managers expose bins through symlinks; the CLI guard must still recognize itself.
+    await symlink(CLI, binPath);
+    const { code, stdout } = await runCli(
+      JSON.stringify({
+        hook_event_name: "PreToolUse",
+        tool_name: "Read",
+        tool_input: { file_path: "/tmp/a" },
+      }),
+      binPath,
+    );
+
+    assert.equal(code, 0, "the installed bin exits 0 with an explicit Codex decision JSON");
+    assert.equal(subprocessDecisionOf(stdout), "allow");
+  } finally {
+    await rm(binDir, { recursive: true, force: true });
+  }
 });
 
 test("subprocess: gated Codex Bash with missing config emits deny and exits 0", async () => {

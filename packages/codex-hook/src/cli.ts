@@ -8,7 +8,8 @@
  */
 
 import { hostname as osHostname } from "node:os";
-import { pathToFileURL } from "node:url";
+import { realpathSync } from "node:fs";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { createClient, type ClientConfig } from "@allw/sdk";
 import { isGatedTool, loadWasm, readConfig } from "@allw/hook";
@@ -105,6 +106,14 @@ async function main(): Promise<void> {
 }
 
 const entrypoint = process.argv[1];
-if (entrypoint !== undefined && import.meta.url === pathToFileURL(entrypoint).href) {
+if (entrypoint !== undefined && isEntrypoint(entrypoint)) {
   void main();
+}
+
+/** Package-manager bins are symlinks; resolve both sides before deciding whether to run. */
+function isEntrypoint(entrypoint: string): boolean {
+  return (
+    pathToFileURL(realpathSync(fileURLToPath(import.meta.url))).href ===
+    pathToFileURL(realpathSync(entrypoint)).href
+  );
 }
