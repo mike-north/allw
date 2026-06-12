@@ -14,7 +14,7 @@ This document covers:
 - revocation propagation through the relay and offline verifiers;
 - lost/replaced-device recovery.
 
-It informs relay pairing/authn work (#10) and actor-key attestation work (#16).
+It informs relay pairing/authn work (#89) and actor-key attestation work (#16).
 
 Out of scope:
 
@@ -82,11 +82,13 @@ Device enrollment binds an approver device to an account in two places:
 The v1 pairing flow is:
 
 1. Account owner starts a short-lived pairing: `POST /{account_id}/pairing/start`.
-2. Relay returns `{ code, expires_at }`; the code is shown out-of-band to the device.
+2. Relay returns `{ code, expires_at, pairing_auth_token }`; the code and bearer token are shown
+   out-of-band to the device or delivered through the account-owner pairing ceremony.
 3. Device completes pairing with `{ code, encryption_pubkey, signing_pubkey, label? }`, where
    `encryption_pubkey` is its X25519 encryption public key and `signing_pubkey` is the Ed25519 public key to
    certify for verdict and policy-rule signatures.
-4. Relay consumes the code exactly once, creates `device_id`, and stores only public key material.
+4. Relay validates the pairing bearer token, consumes the code exactly once, creates `device_id`,
+   returns `device_auth_token`, and stores only public key material plus relay-token hashes.
 5. Account root signs a `device_cert` for the device signing key:
 
    ```jsonc
@@ -342,23 +344,25 @@ If the account root is suspected compromised:
 
 ## Relay API Implications
 
-Current relay mechanics (#10) already cover the registry subset:
+Current relay mechanics cover the registry subset and #89 adds relay-scoped endpoint tokens:
 
-| Endpoint                           | Enrollment meaning                                              |
-| ---------------------------------- | --------------------------------------------------------------- |
-| `POST /pairing/start`              | Create a short-lived single-use device enrollment code.         |
-| `POST /pairing/complete`           | Redeem the code and store a device encryption public key.       |
-| `GET /devices`                     | Return active device encryption public keys for JWE recipients. |
-| `POST /devices/{device_id}/revoke` | Remove an active device and close its live socket.              |
-| `POST /actors`                     | Enroll an actor public key.                                     |
-| `GET /actors`                      | List enrolled actor public keys.                                |
+| Endpoint                           | Enrollment meaning                                                                      |
+| ---------------------------------- | --------------------------------------------------------------------------------------- |
+| `POST /pairing/start`              | Create a short-lived single-use device enrollment code.                                 |
+| `POST /pairing/complete`           | Redeem the code with its pairing bearer token and store a device encryption public key. |
+| `GET /devices`                     | Return active device encryption public keys for JWE recipients.                         |
+| `POST /devices/{device_id}/revoke` | Remove an active device and close its live socket.                                      |
+| `POST /actors`                     | Enroll an actor public key.                                                             |
+| `GET /actors`                      | List enrolled actor public keys.                                                        |
 
-Endpoint authentication and authorization must be added before production use:
+Endpoint authentication and authorization rules:
 
-- starting pairing requires account-owner authorization;
-- completing pairing requires the code and account-owner approval;
-- actor enrollment requires an account-authorized device or owner flow;
-- device/actor revocation requires account-owner authorization;
+- starting pairing remains an account-owner ceremony boundary;
+- completing pairing requires the code plus the `pairing_auth_token`;
+- actor enrollment requires an enrolled device token;
+- device revocation requires the target device token;
+- device presence requires the target device token, passed as a bearer header or `auth` query on WebSocket upgrade;
+- request polling and wait sockets require the `request_auth_token` returned by `POST /requests`;
 - serving account state requires integrity but not confidentiality, because it contains public keys and metadata.
 
 ## Test Implications

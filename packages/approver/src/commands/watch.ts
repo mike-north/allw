@@ -182,14 +182,20 @@ export async function runWatch(
   const relayUrl = options.relayUrl ?? keyfile.relay_url;
   const accountId = keyfile.account_id;
   const deviceId = keyfile.device_id;
-  if (relayUrl === undefined || accountId === undefined || deviceId === undefined) {
+  const deviceAuthToken = keyfile.device_auth_token;
+  if (
+    relayUrl === undefined ||
+    accountId === undefined ||
+    deviceId === undefined ||
+    deviceAuthToken === undefined
+  ) {
     throw new Error("keyfile is not paired — run 'allw-approver pair' first");
   }
   if (keyfile.device_cert === undefined || keyfile.device_cert.length === 0) {
     throw new Error("keyfile has no device_cert — re-pair to mint one before watching");
   }
 
-  const url = deviceConnectWsUrl(relayUrl, accountId, deviceId);
+  const url = deviceConnectWsUrl(relayUrl, accountId, deviceId, deviceAuthToken);
   log.info(`Connecting to ${url} …`);
   // TODO(#41 v0): no reconnect/backoff — on close the loop simply exits (re-run `watch` to
   // reconnect). A resilient reconnect-with-backoff loop is out of scope for the v0 skeleton.

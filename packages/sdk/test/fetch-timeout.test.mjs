@@ -132,7 +132,10 @@ function makeRelayDouble({ devices, hang, reject }) {
       if (hang === "submit") return neverResolves();
       if (reject === "submit") return Promise.reject(new TypeError("fetch failed"));
       return Promise.resolve(
-        jsonResponse({ request_id: "x", status: "pending", delivered_to: 1 }, 202),
+        jsonResponse(
+          { request_id: "x", status: "pending", delivered_to: 1, request_auth_token: "token-x" },
+          202,
+        ),
       );
     }
     if (method === "GET" && path.includes("/requests/")) {

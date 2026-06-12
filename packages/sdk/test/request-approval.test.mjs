@@ -163,7 +163,7 @@ function signVerdict(wasm, approver, req, capturedEnvelope, { decision = "approv
  * submitted envelope so a test can mint a matching verdict afterwards.
  */
 function makeRelayDouble({ devices, behavior }) {
-  const state = { captured: null, submitted: false };
+  const state = { captured: null, submitted: false, requestAuthToken: null };
 
   const fetchImpl = async (url, init = {}) => {
     const u = new URL(url);
@@ -177,12 +177,24 @@ function makeRelayDouble({ devices, behavior }) {
       const envelope = JSON.parse(init.body);
       state.captured = envelope;
       state.submitted = true;
+      state.requestAuthToken = `token-${envelope.id}`;
       if (behavior.submitStatus && behavior.submitStatus !== 202) {
         return jsonResponse({ error: "rejected" }, behavior.submitStatus);
       }
-      return jsonResponse({ request_id: envelope.id, status: "pending", delivered_to: 1 }, 202);
+      return jsonResponse(
+        {
+          request_id: envelope.id,
+          status: "pending",
+          delivered_to: 1,
+          request_auth_token: state.requestAuthToken,
+        },
+        202,
+      );
     }
     if (method === "GET" && path.includes("/requests/")) {
+      if (init.headers?.Authorization !== `Bearer ${state.requestAuthToken}`) {
+        return jsonResponse({ error: "authorization denied" }, 403);
+      }
       const outcome = behavior.poll(state.captured);
       if (outcome === null) return jsonResponse({ request_id: "x", status: "pending" });
       if (outcome === "expired") return jsonResponse({ request_id: "x", status: "expired" });
@@ -204,7 +216,13 @@ function jsonResponse(data, status = 200) {
  * built from the already-captured envelope.
  */
 function makeWebSocketFactory(frameFor) {
-  return (url) => new FakeWebSocket(url, frameFor);
+  const urls = [];
+  const factory = (url) => {
+    urls.push(url);
+    return new FakeWebSocket(url, frameFor);
+  };
+  factory.urls = urls;
+  return factory;
 }
 
 class FakeWebSocket {
@@ -310,6 +328,13 @@ test("(a) happy WS round-trip → approved, verify() re-passes", async () => {
   });
 
   const verdict = await client.requestApproval(req);
+  assert.match(
+    wsFactory.urls[0],
+    new RegExp(
+      `/requests/${relay.state.captured.id}/wait\\?auth=token-${relay.state.captured.id}$`,
+    ),
+    "the wait WebSocket URL carries the request auth token returned by submit",
+  );
   assert.equal(
     verdict.decision,
     "approved",

@@ -84,40 +84,132 @@ async function post<T>(
   accountId: string,
   subPath: string,
   body: unknown,
+  headers: Record<string, string> = {},
 ): Promise<{ status: number; data: T }> {
+  const finalHeaders = { ...headers };
+  const revokeMatch = /^\/devices\/([^/]+)\/revoke$/.exec(subPath);
+  if (revokeMatch && finalHeaders.Authorization === undefined) {
+    const token = deviceAuthTokens.get(
+      tokenKey(accountId, decodeURIComponent(revokeMatch[1] ?? "")),
+    );
+    if (token !== undefined) finalHeaders.Authorization = `Bearer ${token}`;
+  }
   const resp = await SELF.fetch(relayUrl(accountId, subPath), {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...finalHeaders },
     body: JSON.stringify(body),
   });
   const data = (await resp.json()) as T;
+  if (subPath === "/requests" && resp.status === 202) {
+    rememberRequest(accountId, data as SubmitResult);
+  }
   return { status: resp.status, data };
 }
 
-async function get<T>(accountId: string, subPath: string): Promise<{ status: number; data: T }> {
-  const resp = await SELF.fetch(relayUrl(accountId, subPath), { method: "GET" });
+async function get<T>(
+  accountId: string,
+  subPath: string,
+  headers: Record<string, string> = {},
+): Promise<{ status: number; data: T }> {
+  const finalHeaders = { ...headers };
+  const requestMatch = /^\/requests\/([^/]+)$/.exec(subPath);
+  if (requestMatch && finalHeaders.Authorization === undefined) {
+    const token = requestAuthTokens.get(
+      tokenKey(accountId, decodeURIComponent(requestMatch[1] ?? "")),
+    );
+    if (token !== undefined) finalHeaders.Authorization = `Bearer ${token}`;
+  }
+  const resp = await SELF.fetch(relayUrl(accountId, subPath), {
+    method: "GET",
+    headers: finalHeaders,
+  });
   const data = (await resp.json()) as T;
   return { status: resp.status, data };
 }
 
-/** Enroll a device via the pairing flow and return its device_id. */
-async function enrollDevice(accountId: string, pubkey = DEVICE_PUBKEY): Promise<string> {
-  const start = await post<{ code: string }>(accountId, "/pairing/start", {});
-  const complete = await post<{ device_id: string }>(accountId, "/pairing/complete", {
-    code: start.data.code,
-    pubkey,
-  });
-  return complete.data.device_id;
+function bearer(token: string): Record<string, string> {
+  return { Authorization: `Bearer ${token}` };
 }
 
-async function enrollDeviceWithPushToken(accountId: string, token = "ios-token"): Promise<string> {
-  const start = await post<{ code: string }>(accountId, "/pairing/start", {});
-  const complete = await post<{ device_id: string }>(accountId, "/pairing/complete", {
-    code: start.data.code,
-    pubkey: DEVICE_PUBKEY,
-    push_tokens: [{ transport: "apns", token }],
-  });
-  return complete.data.device_id;
+function appendAuthQuery(subPath: string, token: string): string {
+  const separator = subPath.includes("?") ? "&" : "?";
+  return `${subPath}${separator}auth=${encodeURIComponent(token)}`;
+}
+
+interface PairingStartResult {
+  code: string;
+  pairing_auth_token: string;
+}
+
+interface DeviceEnrollment {
+  device_id: string;
+  device_auth_token: string;
+}
+
+interface SubmitResult {
+  request_id: string;
+  status: string;
+  delivered_to: number;
+  push_wakeups?: number;
+  request_auth_token: string;
+}
+
+const deviceAuthTokens = new Map<string, string>();
+const requestAuthTokens = new Map<string, string>();
+
+function tokenKey(accountId: string, id: string): string {
+  return `${accountId}\0${id}`;
+}
+
+function rememberDevice(accountId: string, device: DeviceEnrollment): void {
+  deviceAuthTokens.set(tokenKey(accountId, device.device_id), device.device_auth_token);
+}
+
+function rememberRequest(accountId: string, submit: SubmitResult): void {
+  requestAuthTokens.set(tokenKey(accountId, submit.request_id), submit.request_auth_token);
+}
+
+/** Enroll a device via the pairing flow and retain its token for helper-built auth headers. */
+async function pairDevice(accountId: string, pubkey = DEVICE_PUBKEY): Promise<DeviceEnrollment> {
+  const start = await post<PairingStartResult>(accountId, "/pairing/start", {});
+  const complete = await post<DeviceEnrollment>(
+    accountId,
+    "/pairing/complete",
+    { code: start.data.code, pubkey },
+    bearer(start.data.pairing_auth_token),
+  );
+  rememberDevice(accountId, complete.data);
+  return complete.data;
+}
+
+async function enrollDevice(accountId: string, pubkey = DEVICE_PUBKEY): Promise<string> {
+  return (await pairDevice(accountId, pubkey)).device_id;
+}
+
+async function pairDeviceWithPushToken(
+  accountId: string,
+  token = "a".repeat(64),
+): Promise<DeviceEnrollment> {
+  const start = await post<PairingStartResult>(accountId, "/pairing/start", {});
+  const complete = await post<DeviceEnrollment>(
+    accountId,
+    "/pairing/complete",
+    {
+      code: start.data.code,
+      pubkey: DEVICE_PUBKEY,
+      push_tokens: [{ transport: "apns", token }],
+    },
+    bearer(start.data.pairing_auth_token),
+  );
+  rememberDevice(accountId, complete.data);
+  return complete.data;
+}
+
+async function enrollDeviceWithPushToken(
+  accountId: string,
+  token = "a".repeat(64),
+): Promise<string> {
+  return (await pairDeviceWithPushToken(accountId, token)).device_id;
 }
 
 async function installPushTransports(
@@ -157,7 +249,21 @@ interface WsClient {
  * Returns the 101 client wrapped in a queue-backed reader, or throws on a non-101 response.
  */
 async function connectWs(accountId: string, subPath: string): Promise<WsClient> {
-  const resp = await SELF.fetch(relayUrl(accountId, subPath), {
+  let authedSubPath = subPath;
+  const deviceMatch = /^\/devices\/([^/?]+)\/connect(?:\?(.+))?$/.exec(subPath);
+  const waitMatch = /^\/requests\/([^/?]+)\/wait(?:\?(.+))?$/.exec(subPath);
+  if (deviceMatch && !new URLSearchParams(deviceMatch[2] ?? "").has("auth")) {
+    const token = deviceAuthTokens.get(
+      tokenKey(accountId, decodeURIComponent(deviceMatch[1] ?? "")),
+    );
+    if (token !== undefined) authedSubPath = appendAuthQuery(subPath, token);
+  } else if (waitMatch && !new URLSearchParams(waitMatch[2] ?? "").has("auth")) {
+    const token = requestAuthTokens.get(
+      tokenKey(accountId, decodeURIComponent(waitMatch[1] ?? "")),
+    );
+    if (token !== undefined) authedSubPath = appendAuthQuery(subPath, token);
+  }
+  const resp = await SELF.fetch(relayUrl(accountId, authedSubPath), {
     headers: { Upgrade: "websocket" },
   });
   if (resp.status !== 101 || !resp.webSocket) {
@@ -290,12 +396,17 @@ describe("AccountRelay — routing (device online)", () => {
 describe("AccountRelay — routing (device offline)", () => {
   it("submitting a request schedules request-id-only push wakeups for registered tokens", async () => {
     const acct = "acct-push-wakeup";
-    const start = await post<{ code: string }>(acct, "/pairing/start", {});
-    await post(acct, "/pairing/complete", {
-      code: start.data.code,
-      pubkey: DEVICE_PUBKEY,
-      push_tokens: [{ transport: "apns", token: "ios-token" }],
-    });
+    const start = await post<PairingStartResult>(acct, "/pairing/start", {});
+    await post(
+      acct,
+      "/pairing/complete",
+      {
+        code: start.data.code,
+        pubkey: DEVICE_PUBKEY,
+        push_tokens: [{ transport: "apns", token: "a".repeat(64) }],
+      },
+      bearer(start.data.pairing_auth_token),
+    );
 
     const submit = await post<{
       delivered_to: number;
@@ -589,7 +700,7 @@ describe("AccountRelay — cross-device coordination", () => {
       },
     } as unknown as Pick<SqlStorage, "exec">;
 
-    const response = relay.handleDeviceConnect(
+    const response = await relay.handleDeviceConnect(
       "dev-stale-flush",
       new Request(
         "https://relay.allw.test/acct/devices/dev-stale-flush/connect?surface_id=mac-screen",
@@ -705,6 +816,80 @@ describe("AccountRelay — verdict authenticity", () => {
     // The request must remain pending — the forged verdict did NOT resolve it.
     const polled = await get<{ status: string }>(acct, "/requests/req-sec-1");
     expect(polled.data.status).toBe("pending");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Endpoint authentication (issue #89)
+// ---------------------------------------------------------------------------
+
+describe("AccountRelay — endpoint authentication", () => {
+  it("requires the enrolled device token for device presence sockets", async () => {
+    const acct = "acct-auth-device-connect";
+    const device = await pairDevice(acct);
+
+    const noAuth = await SELF.fetch(relayUrl(acct, `/devices/${device.device_id}/connect`), {
+      headers: { Upgrade: "websocket" },
+    });
+    expect(noAuth.status).toBe(401);
+
+    const wrongAuth = await SELF.fetch(
+      relayUrl(acct, appendAuthQuery(`/devices/${device.device_id}/connect`, "wrong-token")),
+      { headers: { Upgrade: "websocket" } },
+    );
+    expect(wrongAuth.status).toBe(403);
+
+    const ok = await SELF.fetch(
+      relayUrl(
+        acct,
+        appendAuthQuery(`/devices/${device.device_id}/connect`, device.device_auth_token),
+      ),
+      { headers: { Upgrade: "websocket" } },
+    );
+    expect(ok.status).toBe(101);
+    ok.webSocket?.accept();
+    ok.webSocket?.close();
+  });
+
+  it("requires the per-request token for polling and wait sockets", async () => {
+    const acct = "acct-auth-request-token";
+    const submit = await post<SubmitResult>(acct, "/requests", makeEnvelope("req-auth-token"));
+    expect(submit.status).toBe(202);
+
+    const noAuthPoll = await SELF.fetch(relayUrl(acct, "/requests/req-auth-token"));
+    expect(noAuthPoll.status).toBe(401);
+
+    const wrongAuthPoll = await SELF.fetch(relayUrl(acct, "/requests/req-auth-token"), {
+      headers: bearer("wrong-request-token"),
+    });
+    expect(wrongAuthPoll.status).toBe(403);
+
+    const okPoll = await SELF.fetch(relayUrl(acct, "/requests/req-auth-token"), {
+      headers: bearer(submit.data.request_auth_token),
+    });
+    expect(okPoll.status).toBe(200);
+
+    const noAuthWait = await SELF.fetch(relayUrl(acct, "/requests/req-auth-token/wait"), {
+      headers: { Upgrade: "websocket" },
+    });
+    expect(noAuthWait.status).toBe(401);
+
+    const wrongAuthWait = await SELF.fetch(
+      relayUrl(acct, appendAuthQuery("/requests/req-auth-token/wait", "wrong-request-token")),
+      { headers: { Upgrade: "websocket" } },
+    );
+    expect(wrongAuthWait.status).toBe(403);
+
+    const okWait = await SELF.fetch(
+      relayUrl(
+        acct,
+        appendAuthQuery("/requests/req-auth-token/wait", submit.data.request_auth_token),
+      ),
+      { headers: { Upgrade: "websocket" } },
+    );
+    expect(okWait.status).toBe(101);
+    okWait.webSocket?.accept();
+    okWait.webSocket?.close();
   });
 });
 

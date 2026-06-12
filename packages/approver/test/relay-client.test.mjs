@@ -33,6 +33,8 @@ import { runPair } from "../dist/commands/pair.js";
 
 const PAIRING_CODE = "ABC23456";
 const ASSIGNED_DEVICE_ID = "dev-from-relay-xyz";
+const PAIRING_AUTH_TOKEN = "pairing-token-from-relay";
+const DEVICE_AUTH_TOKEN = "device-token-from-relay";
 
 /**
  * Start a fake relay mimicking the pairing endpoints. Captures every request body so tests can
@@ -45,18 +47,39 @@ function startFakeRelay() {
     req.on("data", (chunk) => (body += chunk));
     req.on("end", () => {
       const parsed = body ? JSON.parse(body) : {};
-      requests.push({ method: req.method, url: req.url, body: parsed });
+      requests.push({
+        method: req.method,
+        url: req.url,
+        body: parsed,
+        authorization: req.headers.authorization,
+      });
 
       // POST /:acct/pairing/start → { code, expires_at }
       if (req.method === "POST" && req.url.endsWith("/pairing/start")) {
         res.writeHead(201, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ code: PAIRING_CODE, expires_at: 1700003600000 }));
+        res.end(
+          JSON.stringify({
+            code: PAIRING_CODE,
+            expires_at: 1700003600000,
+            pairing_auth_token: PAIRING_AUTH_TOKEN,
+          }),
+        );
         return;
       }
-      // POST /:acct/pairing/complete → { device_id }
+      // POST /:acct/pairing/complete → { device_id, device_auth_token }
       if (req.method === "POST" && req.url.endsWith("/pairing/complete")) {
+        if (req.headers.authorization !== `Bearer ${PAIRING_AUTH_TOKEN}`) {
+          res.writeHead(403, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "authorization denied" }));
+          return;
+        }
         res.writeHead(201, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ device_id: ASSIGNED_DEVICE_ID }));
+        res.end(
+          JSON.stringify({
+            device_id: ASSIGNED_DEVICE_ID,
+            device_auth_token: DEVICE_AUTH_TOKEN,
+          }),
+        );
         return;
       }
       res.writeHead(404, { "Content-Type": "application/json" });
@@ -120,6 +143,7 @@ test("pairingStart returns the relay's code", async () => {
   try {
     const result = await pairingStart(relay.url, "acct-1");
     assert.equal(result.code, PAIRING_CODE);
+    assert.equal(result.pairing_auth_token, PAIRING_AUTH_TOKEN);
     assert.equal(relay.requests[0].url, "/acct-1/pairing/start");
   } finally {
     await relay.close();
@@ -131,10 +155,19 @@ test("pairingComplete sends ONLY the X25519 pubkey and returns the relay device_
   const relay = await startFakeRelay();
   try {
     const x25519Pub = wasm.x25519_public_key(Buffer.alloc(32, 11).toString("base64url"));
-    const deviceId = await pairingComplete(relay.url, "acct-2", PAIRING_CODE, x25519Pub, "laptop");
-    assert.equal(deviceId, ASSIGNED_DEVICE_ID);
+    const paired = await pairingComplete(
+      relay.url,
+      "acct-2",
+      PAIRING_CODE,
+      PAIRING_AUTH_TOKEN,
+      x25519Pub,
+      "laptop",
+    );
+    assert.equal(paired.device_id, ASSIGNED_DEVICE_ID);
+    assert.equal(paired.device_auth_token, DEVICE_AUTH_TOKEN);
 
     const completeReq = relay.requests.find((r) => r.url.endsWith("/pairing/complete"));
+    assert.equal(completeReq.authorization, `Bearer ${PAIRING_AUTH_TOKEN}`);
     assert.equal(completeReq.body.pubkey, x25519Pub, "the registered pubkey is the X25519 key");
     assert.equal(completeReq.body.code, PAIRING_CODE);
     // SECURITY: no seed/secret may ever be sent to the relay (zero-knowledge).
@@ -167,6 +200,7 @@ test("runPair self-drives start+complete, mints a device_cert, and persists pair
 
       // The persisted keyfile carries the relay-issued device id + a minted cert.
       assert.equal(updated.device_id, ASSIGNED_DEVICE_ID);
+      assert.equal(updated.device_auth_token, DEVICE_AUTH_TOKEN);
       assert.equal(updated.account_id, "acct-3");
       assert.equal(updated.relay_url, relay.url);
       assert.ok(
@@ -283,12 +317,12 @@ test("pairingStart ABORTS against a hung relay (fail-closed AbortSignal.timeout 
 test("deviceConnectWsUrl upgrades http(s)→ws(s) and builds the presence path", async () => {
   await loadWasm();
   assert.equal(
-    deviceConnectWsUrl("https://relay.example.com", "acct-9", "dev-9"),
-    "wss://relay.example.com/acct-9/devices/dev-9/connect",
+    deviceConnectWsUrl("https://relay.example.com", "acct-9", "dev-9", "device-token"),
+    "wss://relay.example.com/acct-9/devices/dev-9/connect?auth=device-token",
   );
   assert.equal(
-    deviceConnectWsUrl("http://127.0.0.1:8787/", "acct-9", "dev 9"),
-    "ws://127.0.0.1:8787/acct-9/devices/dev%209/connect",
+    deviceConnectWsUrl("http://127.0.0.1:8787/", "acct-9", "dev 9", "token value"),
+    "ws://127.0.0.1:8787/acct-9/devices/dev%209/connect?auth=token%20value",
   );
 });
 
