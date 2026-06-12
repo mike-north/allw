@@ -175,13 +175,18 @@ and the signed verdict — never plaintext, never a key it could sign with.
 | `GET  /requests/{id}`                          | integrator | Poll status → `pending` / terminal `expired` / `resolved` + verdict.                                                                                                      |
 | `GET  /requests/{id}/wait` (WS)                | integrator | Block for the verdict; it is pushed the instant a device decides.                                                                                                         |
 | `GET  /devices/{id}/connect?surface_id=…` (WS) | device     | Presence socket (hibernatable); flushes the offline queue on open. `surface_id` is optional visible-screen topology for deduping mirrored/native notification transports. |
+| `POST /account-states`                         | device     | Replace the relay-distributed set of root-signed account-state JWS documents for the account.                                                                             |
+| `GET  /account-states`                         | device     | Fetch root-signed account-state JWS documents before local actor-origin verification.                                                                                     |
 
 `POST /pairing/start` returns `{ code, expires_at, pairing_auth_token }`; `POST /pairing/complete`
 must present that token as `Authorization: Bearer …` and returns `{ device_id, device_auth_token }`.
 Device-scoped endpoints such as `GET /devices/{id}/connect` and
 `POST /devices/{id}/revoke` require that device token (header or `auth` query for WebSocket
 upgrades). `POST /requests` returns `request_auth_token`; `GET /requests/{id}` and
-`GET /requests/{id}/wait` require it. The relay stores only SHA-256 hashes of these bearer tokens.
+`GET /requests/{id}/wait` require it. `POST /account-states` and `GET /account-states`
+also require an enrolled device token: the relay distributes only opaque compact JWS account-state
+documents and cannot make a substituted actor key trusted. The relay stores only SHA-256 hashes of
+these bearer tokens.
 
 **Device socket messages** (JSON): relay → device `{ type: "request", request_id, envelope }` and
 `{ type: "retract", request_id }` (another surface resolved it); device → relay

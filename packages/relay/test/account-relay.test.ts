@@ -70,6 +70,19 @@ async function get<T>(accountId: string, subPath: string): Promise<{ status: num
   return { status: resp.status, data };
 }
 
+async function getWithHeaders<T>(
+  accountId: string,
+  subPath: string,
+  headers: Record<string, string> = {},
+): Promise<{ status: number; data: T }> {
+  const resp = await SELF.fetch(relayUrl(accountId, subPath), {
+    method: "GET",
+    headers,
+  });
+  const data = (await resp.json()) as T;
+  return { status: resp.status, data };
+}
+
 function bearer(token: string): Record<string, string> {
   return { Authorization: `Bearer ${token}` };
 }
@@ -545,6 +558,188 @@ describe("AccountRelay — actor enrollment", () => {
       bearer("wrong-device-token"),
     );
     expect(wrongAuth.status).toBe(403);
+  });
+});
+
+describe("AccountRelay — account-state distribution", () => {
+  const ACCOUNT_STATE_1 = "eyJhbGciOiJFZERTQSJ9.eyJzZXF1ZW5jZSI6MX0.sig";
+  const ACCOUNT_STATE_2 = "eyJhbGciOiJFZERTQSJ9.eyJzZXF1ZW5jZSI6Mn0.sig";
+
+  it("lets an enrolled device publish and fetch root-signed account-state documents", async () => {
+    const acct = "acct-account-state";
+    const device = await enrollDevice(acct);
+
+    const publish = await post<{ account_states: string[] }>(
+      acct,
+      "/account-states",
+      { account_states: [ACCOUNT_STATE_1, ACCOUNT_STATE_2], max_sequence: 2 },
+      bearer(device.device_auth_token),
+    );
+    expect(publish.status).toBe(200);
+    expect(publish.data.account_states).toEqual([ACCOUNT_STATE_1, ACCOUNT_STATE_2]);
+
+    const fetched = await getWithHeaders<{ account_states: string[] }>(
+      acct,
+      "/account-states",
+      bearer(device.device_auth_token),
+    );
+    expect(fetched.status).toBe(200);
+    expect(fetched.data.account_states).toEqual([ACCOUNT_STATE_1, ACCOUNT_STATE_2]);
+  });
+
+  it("replaces the current account-state document set atomically for the account", async () => {
+    const acct = "acct-account-state-replace";
+    const device = await enrollDevice(acct);
+
+    await post(
+      acct,
+      "/account-states",
+      { account_states: [ACCOUNT_STATE_1], max_sequence: 1 },
+      bearer(device.device_auth_token),
+    );
+    const replace = await post<{ account_states: string[] }>(
+      acct,
+      "/account-states",
+      { account_states: [ACCOUNT_STATE_2], max_sequence: 2 },
+      bearer(device.device_auth_token),
+    );
+    expect(replace.status).toBe(200);
+
+    const fetched = await getWithHeaders<{ account_states: string[] }>(
+      acct,
+      "/account-states",
+      bearer(device.device_auth_token),
+    );
+    expect(fetched.data.account_states).toEqual([ACCOUNT_STATE_2]);
+  });
+
+  it("requires an enrolled device token to publish or fetch account state", async () => {
+    const acct = "acct-account-state-auth";
+    const device = await enrollDevice(acct);
+
+    const noPublishAuth = await post<{ error: string }>(acct, "/account-states", {
+      account_states: [ACCOUNT_STATE_1],
+      max_sequence: 1,
+    });
+    expect(noPublishAuth.status).toBe(401);
+
+    const wrongFetchAuth = await getWithHeaders<{ error: string }>(
+      acct,
+      "/account-states",
+      bearer("wrong-device-token"),
+    );
+    expect(wrongFetchAuth.status).toBe(403);
+
+    const goodPublish = await post(
+      acct,
+      "/account-states",
+      { account_states: [ACCOUNT_STATE_1], max_sequence: 1 },
+      bearer(device.device_auth_token),
+    );
+    expect(goodPublish.status).toBe(200);
+  });
+
+  it("rejects malformed account-state payloads before replacing stored state", async () => {
+    const acct = "acct-account-state-bad-shape";
+    const device = await enrollDevice(acct);
+    await post(
+      acct,
+      "/account-states",
+      { account_states: [ACCOUNT_STATE_1], max_sequence: 1 },
+      bearer(device.device_auth_token),
+    );
+
+    const malformed = await post<{ error: string }>(
+      acct,
+      "/account-states",
+      { account_states: ["not a compact jws"], max_sequence: 2 },
+      bearer(device.device_auth_token),
+    );
+    expect(malformed.status).toBe(400);
+
+    const fetched = await getWithHeaders<{ account_states: string[] }>(
+      acct,
+      "/account-states",
+      bearer(device.device_auth_token),
+    );
+    expect(fetched.data.account_states).toEqual([ACCOUNT_STATE_1]);
+  });
+
+  it("rejects malformed account-state max_sequence before replacing stored state", async () => {
+    const acct = "acct-account-state-bad-sequence";
+    const device = await enrollDevice(acct);
+    await post(
+      acct,
+      "/account-states",
+      { account_states: [ACCOUNT_STATE_1], max_sequence: 1 },
+      bearer(device.device_auth_token),
+    );
+
+    const malformed = await post<{ error: string }>(
+      acct,
+      "/account-states",
+      { account_states: [ACCOUNT_STATE_2], max_sequence: "2" },
+      bearer(device.device_auth_token),
+    );
+    expect(malformed.status).toBe(400);
+    expect(malformed.data.error).toMatch(/max_sequence/);
+
+    const fetched = await getWithHeaders<{ account_states: string[] }>(
+      acct,
+      "/account-states",
+      bearer(device.device_auth_token),
+    );
+    expect(fetched.data.account_states).toEqual([ACCOUNT_STATE_1]);
+  });
+
+  it("rejects regressive account-state publishes and preserves the newer cached set", async () => {
+    const acct = "acct-account-state-regression";
+    const firstDevice = await enrollDevice(acct);
+    const secondDevice = await enrollDevice(acct);
+
+    const publishNewer = await post<{ account_states: string[] }>(
+      acct,
+      "/account-states",
+      { account_states: [ACCOUNT_STATE_2], max_sequence: 2 },
+      bearer(firstDevice.device_auth_token),
+    );
+    expect(publishNewer.status).toBe(200);
+
+    const staleRepublish = await post<{ error: string }>(
+      acct,
+      "/account-states",
+      { account_states: [ACCOUNT_STATE_1], max_sequence: 1 },
+      bearer(secondDevice.device_auth_token),
+    );
+    expect(staleRepublish.status).toBe(409);
+    expect(staleRepublish.data.error).toMatch(/max_sequence regression/);
+
+    const fetched = await getWithHeaders<{ account_states: string[] }>(
+      acct,
+      "/account-states",
+      bearer(secondDevice.device_auth_token),
+    );
+    expect(fetched.data.account_states).toEqual([ACCOUNT_STATE_2]);
+  });
+
+  it("allows equal-sequence account-state republishes without parsing opaque JWS docs", async () => {
+    const acct = "acct-account-state-equal-sequence";
+    const device = await enrollDevice(acct);
+
+    await post(
+      acct,
+      "/account-states",
+      { account_states: [ACCOUNT_STATE_1], max_sequence: 2 },
+      bearer(device.device_auth_token),
+    );
+    const equalSequence = await post<{ account_states: string[] }>(
+      acct,
+      "/account-states",
+      { account_states: [ACCOUNT_STATE_2], max_sequence: 2 },
+      bearer(device.device_auth_token),
+    );
+    expect(equalSequence.status).toBe(200);
+    expect(equalSequence.data.account_states).toEqual([ACCOUNT_STATE_2]);
   });
 });
 

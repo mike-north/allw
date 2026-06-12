@@ -47,6 +47,35 @@ async function postJson(
   return parsed;
 }
 
+/**
+ * GET JSON with the same bounded relay failure behavior as pairing POSTs. Device-facing reads use
+ * bearer authorization; callers decide whether an error aborts or downgrades their UI.
+ */
+async function getJson(
+  url: string,
+  timeoutMs: number = PAIRING_TIMEOUT_MS,
+  headers: Record<string, string> = {},
+): Promise<unknown> {
+  const resp = await fetch(url, {
+    method: "GET",
+    headers,
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  const text = await resp.text();
+  let parsed: unknown;
+  try {
+    parsed = text ? JSON.parse(text) : null;
+  } catch {
+    parsed = text;
+  }
+  if (!resp.ok) {
+    const detail =
+      parsed && typeof parsed === "object" && "error" in parsed ? String(parsed.error) : text;
+    throw new Error(`relay ${url} → HTTP ${String(resp.status)}: ${detail}`);
+  }
+  return parsed;
+}
+
 /** Result of `POST /:acct/pairing/start`. */
 export interface PairingStartResult {
   readonly code: string;
@@ -121,6 +150,57 @@ export async function pairingComplete(
     );
   }
   return result as unknown as PairingCompleteResult;
+}
+
+/**
+ * Fetch the latest root-signed account-state documents distributed by the relay. These are compact
+ * JWS strings signed by the account root; the relay only caches and serves them, while the approver
+ * core decides whether any document actually verifies and enrolls the actor key.
+ */
+export interface AccountStateFetchResult {
+  readonly accountStates: readonly string[];
+  readonly maxSequence: number;
+}
+
+export async function fetchAccountStatesWithMetadata(
+  relayUrl: string,
+  accountId: string,
+  deviceAuthToken: string,
+  timeoutMs: number = PAIRING_TIMEOUT_MS,
+): Promise<AccountStateFetchResult> {
+  const url = `${normalizeBase(relayUrl)}/${encodeURIComponent(accountId)}/account-states`;
+  const result = await getJson(url, timeoutMs, { Authorization: `Bearer ${deviceAuthToken}` });
+  if (
+    typeof result !== "object" ||
+    result === null ||
+    !Array.isArray((result as { account_states?: unknown }).account_states) ||
+    !(result as { account_states: unknown[] }).account_states.every(
+      (value) => typeof value === "string",
+    )
+  ) {
+    throw new Error(`relay account-states returned an unexpected shape: ${JSON.stringify(result)}`);
+  }
+  const maxSequence = (result as { max_sequence?: unknown }).max_sequence;
+  if (
+    maxSequence !== undefined &&
+    (typeof maxSequence !== "number" || !Number.isSafeInteger(maxSequence) || maxSequence < 0)
+  ) {
+    throw new Error(`relay account-states returned an unexpected shape: ${JSON.stringify(result)}`);
+  }
+  return {
+    accountStates: (result as { account_states: string[] }).account_states,
+    maxSequence: maxSequence ?? 0,
+  };
+}
+
+export async function fetchAccountStates(
+  relayUrl: string,
+  accountId: string,
+  deviceAuthToken: string,
+  timeoutMs: number = PAIRING_TIMEOUT_MS,
+): Promise<readonly string[]> {
+  return (await fetchAccountStatesWithMetadata(relayUrl, accountId, deviceAuthToken, timeoutMs))
+    .accountStates;
 }
 
 /**

@@ -64,6 +64,12 @@ export interface AllwWasm {
     approver_root_pubkey_b64: string,
     now_ms: number,
   ): string;
+  /** Verify a compact account-state JWS and return the authenticated AccountState JSON. */
+  verify_account_state(
+    account_state_jws: string,
+    expected_account_id: string,
+    account_root_pubkey_b64: string,
+  ): string;
   /**
    * Verify an actor attestation (verified request origin, #16), resolving the actor's verifying
    * key from **root-signed account state** — never from a relay-supplied registry. Given the

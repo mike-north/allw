@@ -126,6 +126,34 @@ function selfClosingSocket() {
   };
 }
 
+/** A socket that delivers one request, then closes after the approver sends the verdict. */
+function requestThenCloseSocket(envelope) {
+  const listeners = { open: [], message: [], error: [], close: [] };
+  const sent = [];
+  const emit = (type, ev = {}) => {
+    for (const listener of listeners[type]) listener(ev);
+  };
+  queueMicrotask(() => {
+    emit("open");
+    emit("message", {
+      data: JSON.stringify({ type: "request", request_id: REQUEST_ID, envelope }),
+    });
+  });
+  return {
+    sent,
+    addEventListener(type, listener) {
+      listeners[type].push(listener);
+    },
+    send(data) {
+      sent.push(JSON.parse(data));
+      emit("close");
+    },
+    close() {
+      emit("close");
+    },
+  };
+}
+
 test("runWatch logs a redacted device presence URL while connecting with the auth token", async () => {
   const wasm = await loadWasm();
   const { keyfile } = pairedApprover(wasm);
@@ -161,6 +189,61 @@ test("runWatch logs a redacted device presence URL while connecting with the aut
       "logs must not expose the device bearer token or auth query string",
     );
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("runWatch fetches relay account state and renders a verified actor origin (#104)", async () => {
+  const wasm = await loadWasm();
+  const actorSeed = Buffer.alloc(32, 0x44).toString("base64url");
+  const actorPub = wasm.ed25519_public_key(actorSeed);
+  const { keyfile, jwe } = pairedApproverWithAttestation(wasm, { actorSeed });
+  const accountState = signedAccountState(wasm, keyfile, actorPub);
+  const prompter = capturingPrompter("approved");
+  const log = recordingLogger();
+  const socket = requestThenCloseSocket(makeEnvelope(jwe));
+  const dir = mkdtempSync(join(tmpdir(), "allw-watch-"));
+  const originalFetch = globalThis.fetch;
+  const fetches = [];
+  try {
+    globalThis.fetch = async (url, init = {}) => {
+      fetches.push({ url: String(url), authorization: init.headers?.Authorization });
+      return new Response(JSON.stringify({ account_states: [accountState] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+
+    const keyfilePath = join(dir, "keyfile.json");
+    writeKeyfile(keyfilePath, { ...keyfile, device_auth_token: "device-secret-token" });
+
+    await runWatch(
+      wasm,
+      { keyfilePath },
+      {
+        connect() {
+          return socket;
+        },
+        prompter,
+        log,
+        now: () => DECIDED_AT,
+      },
+    );
+
+    assert.deepEqual(fetches, [
+      {
+        url: `https://relay.allw.test/${ACCOUNT_ID}/account-states`,
+        authorization: "Bearer device-secret-token",
+      },
+    ]);
+    assert.match(
+      prompter.renders[0],
+      /✓ VERIFIED origin — claude-code · machine:ci/,
+      "the relay-distributed root-signed state drives verified origin rendering",
+    );
+    assert.equal(socket.sent.length, 1, "the request still reaches a signed verdict");
+  } finally {
+    globalThis.fetch = originalFetch;
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -431,11 +514,11 @@ function pairedApproverWithAttestation(wasm, { actorSeed }) {
  * keyfile's account root. This is the device's root-anchored trust input (#16); a relay-supplied
  * key is never trusted. `docs/enrollment.md` §Account State.
  */
-function signedAccountState(wasm, keyfile, actorPubkey) {
+function signedAccountState(wasm, keyfile, actorPubkey, { sequence = 1 } = {}) {
   const state = {
     v: 1,
     account_id: ACCOUNT_ID,
-    sequence: 1,
+    sequence,
     current_root: keyfile.account_root_pubkey,
     previous_roots: [],
     devices: [],
@@ -482,6 +565,37 @@ test("verified origin: a root-anchored key renders ✓ VERIFIED in the watch loo
     /✓ VERIFIED origin — claude-code · machine:ci/,
     "the rendered block shows the cryptographically-verified, root-anchored origin",
   );
+});
+
+test("origin fail-closed: relay max_sequence above verified docs renders ⚠ UNVERIFIED", async () => {
+  const wasm = await loadWasm();
+  const actorSeed = Buffer.alloc(32, 0x44).toString("base64url");
+  const actorPub = wasm.ed25519_public_key(actorSeed);
+  const { keyfile, jwe } = pairedApproverWithAttestation(wasm, { actorSeed });
+  const ws = stubSocket();
+  const prompter = capturingPrompter("approved");
+
+  const accountStates = [signedAccountState(wasm, keyfile, actorPub, { sequence: 1 })];
+  const resolveAccountStates = () => Promise.resolve({ accountStates, maxSequence: 2 });
+
+  await handleRequest(
+    wasm,
+    keyfile,
+    ws,
+    prompter,
+    makeEnvelope(jwe),
+    recordingLogger(),
+    () => DECIDED_AT,
+    resolveAccountStates,
+  );
+
+  assert.equal(prompter.renders.length, 1, "the human was prompted with a rendered block");
+  assert.match(
+    prompter.renders[0],
+    /⚠ UNVERIFIED/,
+    "a relay max_sequence not backed by root-verified docs must downgrade the origin",
+  );
+  assert.match(prompter.renders[0], /max_sequence 2 exceeds highest root-verified sequence 1/);
 });
 
 test("origin fail-closed: a resolver error still renders the request as ⚠ UNVERIFIED (#16)", async () => {

@@ -25,6 +25,8 @@ import { loadWasm } from "../dist/index.js";
 import { readKeyfile } from "../dist/lib/keyfile.js";
 import {
   deviceConnectWsUrl,
+  fetchAccountStates,
+  fetchAccountStatesWithMetadata,
   pairingStart,
   pairingComplete,
   PAIRING_TIMEOUT_MS,
@@ -78,6 +80,22 @@ function startFakeRelay() {
           JSON.stringify({
             device_id: ASSIGNED_DEVICE_ID,
             device_auth_token: DEVICE_AUTH_TOKEN,
+          }),
+        );
+        return;
+      }
+      // GET /:acct/account-states → { account_states }
+      if (req.method === "GET" && req.url.endsWith("/account-states")) {
+        if (req.headers.authorization !== `Bearer ${DEVICE_AUTH_TOKEN}`) {
+          res.writeHead(403, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "authorization denied" }));
+          return;
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            account_states: ["account-state-jws-1", "account-state-jws-2"],
+            max_sequence: 7,
           }),
         );
         return;
@@ -176,6 +194,32 @@ test("pairingComplete sends ONLY the X25519 pubkey and returns the relay device_
       !bodyKeys.some((k) => k.includes("seed") || k.includes("secret") || k.includes("private")),
       "no secret material is sent to the relay",
     );
+  } finally {
+    await relay.close();
+  }
+});
+
+test("fetchAccountStates uses the paired device bearer token and returns compact state docs", async () => {
+  const relay = await startFakeRelay();
+  try {
+    const states = await fetchAccountStates(relay.url, "acct-2", DEVICE_AUTH_TOKEN);
+
+    assert.deepEqual(states, ["account-state-jws-1", "account-state-jws-2"]);
+    const fetchReq = relay.requests.find((r) => r.url.endsWith("/account-states"));
+    assert.equal(fetchReq.method, "GET");
+    assert.equal(fetchReq.authorization, `Bearer ${DEVICE_AUTH_TOKEN}`);
+  } finally {
+    await relay.close();
+  }
+});
+
+test("fetchAccountStatesWithMetadata returns relay max_sequence metadata", async () => {
+  const relay = await startFakeRelay();
+  try {
+    const result = await fetchAccountStatesWithMetadata(relay.url, "acct-2", DEVICE_AUTH_TOKEN);
+
+    assert.deepEqual(result.accountStates, ["account-state-jws-1", "account-state-jws-2"]);
+    assert.equal(result.maxSequence, 7);
   } finally {
     await relay.close();
   }
