@@ -79,7 +79,7 @@ async function main(): Promise<void> {
   // `--version`/`-v` is a top-level flag (no subcommand): `allw-approver --version`. Handle it
   // before command dispatch so it never requires a command or loads the WASM core. The version is
   // read from this package's own package.json (never a hardcoded literal — see ./version.ts).
-  if (command === "--version" || command === "-v" || command === "version") {
+  if (command === "--version" || command === "-v") {
     console.log(getVersion());
     process.exit(0);
   }

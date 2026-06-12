@@ -44,7 +44,7 @@ const PACKAGES = [
   { name: "@allw/approver", dir: join(repoRoot, "packages", "approver") },
 ];
 
-/** Run a command, inheriting stderr, and fail loudly (non-zero exit) on error. */
+/** Run a command (stderr is piped and embedded in the thrown error on failure), fail loudly (non-zero exit) on error. */
 function run(cmd, args, opts = {}) {
   const res = spawnSync(cmd, args, { encoding: "utf8", ...opts });
   if (res.status !== 0) {
@@ -74,22 +74,29 @@ try {
 
   // 1. Pack each package into packDir. `pnpm pack --pack-destination` writes the tarball there.
   console.log("\n[1/3] packing tarballs");
-  const tarballs = [];
+  /** @type {Array<{name: string, file: string}>} */
+  const packedPkgs = [];
   for (const pkg of PACKAGES) {
+    const seenBefore = new Set(readdirSync(packDir).filter((f) => f.endsWith(".tgz")));
     run("pnpm", ["pack", "--pack-destination", packDir], { cwd: pkg.dir });
-    // pnpm names the file from the package name + version; find the one it just wrote.
+    // Identify the tarball pnpm just wrote by diffing the directory listing — keyed to this
+    // package by name so adding more packages later can't misroute the identity check.
     const file = readdirSync(packDir)
-      .filter((f) => f.endsWith(".tgz"))
-      .map((f) => join(packDir, f))
-      .find((p) => !tarballs.includes(p));
+      .filter((f) => f.endsWith(".tgz") && !seenBefore.has(f))
+      .map((f) => join(packDir, f))[0];
     assert.ok(file, `no tarball produced for ${pkg.name}`);
-    tarballs.push(file);
+    packedPkgs.push({ name: pkg.name, file });
     ok(`packed ${pkg.name}`);
   }
 
+  // Collect just the paths for the bulk npm install later.
+  const tarballs = packedPkgs.map((p) => p.file);
+
   // Assert the SDK tarball actually contains the bundled wasm (the whole point). If this regresses,
   // an install would silently need a Rust toolchain.
-  const sdkTarball = tarballs[0];
+  const sdkEntry = packedPkgs.find((p) => p.name === "@allw/sdk");
+  assert.ok(sdkEntry, "could not identify the @allw/sdk tarball by package name");
+  const sdkTarball = sdkEntry.file;
   const listing = run("tar", ["-tzf", sdkTarball]).stdout;
   assert.match(
     listing,
