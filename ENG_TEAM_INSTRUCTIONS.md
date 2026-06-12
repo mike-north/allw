@@ -42,20 +42,20 @@ runs the review/merge gate; these rules exist so work flows through it without f
 13. **Fail-closed is a contract invariant** (`docs/contract.md`). Any failure, over-budget input,
     missing field, or unverifiable artifact must resolve to deny/escalate — never to silent
     no-match or default-accept. Watch especially for retrofits where "doesn't match" differs from
-    "must not be allowed" (a cap that un-matches a *deny* rule is a bypass, not a guard).
+    "must not be allowed" (a cap that un-matches a _deny_ rule is a bypass, not a guard).
 14. **Every rejection path at a security boundary needs a direct negative test** — wrong account,
     wrong root/signer, cross-typ JWS confusion, tampered payload, expired cert, malformed input,
     replay, double-submit. If a verification function has N error branches, expect to write ~N
     tests. PRs have been blocked on exactly this five times; write them proactively.
 15. Thin-shell discipline: surfaces (WASM/SDK/UniFFI/UI) never reimplement core logic — hashing,
     verification, signing, policy evaluation live in `crates/allw-core` only. UI surfaces must make
-    unsafe states *unreachable* (e.g. approve disabled structurally), not merely styled as warnings.
+    unsafe states _unreachable_ (e.g. approve disabled structurally), not merely styled as warnings.
 16. Repo testing rules: no `Date.now()`/`new Date()` in test data (inject fixed clocks);
     assertions derive from the spec, not from captured program output; `@see` links to the spec
     sections a test enforces.
 17. Validation gate before opening/pushing: `cargo fmt --check`, `cargo check`, `cargo clippy
-    --all-targets -- -D warnings`, `cargo test`, `pnpm -r build/typecheck/lint/test`, `prettier
-    --check`. List what you ran in the PR body (the team already does this well — keep it up).
+--all-targets -- -D warnings`, `cargo test`, `pnpm -r build/typecheck/lint/test`, `prettier
+--check`. List what you ran in the PR body (the team already does this well — keep it up).
 
 ## Docs
 
