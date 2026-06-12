@@ -59,7 +59,8 @@ policy evaluation receives `actor` plus `ActionRecord` as separate inputs (`Poli
 ActionRecord {
   record_schema_version: int
 
-  surface: "command" | "mcp_tool_call"        // interception paradigm (more added as needed:
+  surface: "command" | "mcp_tool_call" | "file_edit"
+                                              // interception paradigm (more added as needed:
                                               //   agent_tool_call, delegated_fetch …)
 
   // --- syntactic substrate (v1, always present) ---
@@ -68,6 +69,9 @@ ActionRecord {
     bin?, argv?, flags?, positionals?, cwd?, host?, env_refs?
     // surface=mcp_tool_call:
     server?, tool?, params?                    // params as raw/structured values
+    // surface=file_edit:
+    operation?, paths?, diff_summary?, diff_hash?
+                                                // target paths + compact WYSIWYS summary/hash
     raw?                                        // original form, for fallback + display
   }
 

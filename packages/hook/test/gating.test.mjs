@@ -34,10 +34,13 @@ test("parseMcpToolName returns null for non-MCP names and malformed forms", () =
 
 // ── which tools are gated ─────────────────────────────────────────────────────────────────────
 
-test("Bash and MCP tools are gated; everything else is not", () => {
+test("Bash, MCP, and file-edit tools are gated; read-only tools are not", () => {
   assert.equal(isGatedTool("Bash"), true);
   assert.equal(isGatedTool("mcp__gh__create_pr"), true);
-  for (const t of ["Read", "Edit", "Write", "Glob", "Grep", "WebFetch", "Task"]) {
+  for (const t of ["Edit", "MultiEdit", "Write", "apply_patch"]) {
+    assert.equal(isGatedTool(t), true, `${t} must be gated as a file-edit surface`);
+  }
+  for (const t of ["Read", "Glob", "Grep", "WebFetch", "Task"]) {
     assert.equal(isGatedTool(t), false, `${t} must not be gated in v0`);
   }
 });
@@ -130,6 +133,57 @@ test("gateToolCall(MCP) with no params defaults to an empty object", async () =>
   assert.equal(out.kind, "gated");
   const record = JSON.parse(out.actionRecord);
   assert.deepEqual(record.syntactic.params, {});
+});
+
+test("gateToolCall(apply_patch) → gated with a file_edit ActionRecord", async () => {
+  const wasm = await loadWasm();
+  const patch = [
+    "*** Begin Patch",
+    "*** Update File: src/app.ts",
+    "@@",
+    "-old",
+    "+new",
+    "*** End Patch",
+    "",
+  ].join("\n");
+  const out = gateToolCall(wasm, "apply_patch", { patch }, "/repo");
+  assert.equal(out.kind, "gated");
+  const record = JSON.parse(out.actionRecord);
+  assert.equal(record.surface, "file_edit");
+  assert.equal(record.syntactic.operation, "patch");
+  assert.deepEqual(record.syntactic.paths, ["src/app.ts"]);
+  assert.match(record.syntactic.diff_summary, /src\/app\.ts/);
+  assert.equal(typeof record.syntactic.diff_hash, "string");
+  assert.match(out.summary, /file edit/i);
+});
+
+test("gateToolCall(Claude Edit/Write/MultiEdit) → gated file_edit records", async () => {
+  const wasm = await loadWasm();
+  const cases = [
+    ["Edit", { file_path: "/repo/src/a.ts", old_string: "old", new_string: "new" }, "edit"],
+    ["Write", { file_path: "/repo/src/b.ts", content: "hello" }, "write"],
+    [
+      "MultiEdit",
+      { file_path: "/repo/src/c.ts", edits: [{ old_string: "a", new_string: "b" }] },
+      "multi_edit",
+    ],
+  ];
+
+  for (const [toolName, toolInput, operation] of cases) {
+    const out = gateToolCall(wasm, toolName, toolInput, "/repo");
+    assert.equal(out.kind, "gated", `${toolName} must gate`);
+    const record = JSON.parse(out.actionRecord);
+    assert.equal(record.surface, "file_edit");
+    assert.equal(record.syntactic.operation, operation);
+    assert.equal(record.syntactic.paths.length, 1);
+    assert.equal(typeof record.syntactic.diff_hash, "string");
+  }
+});
+
+test("gateToolCall(file edit with missing path/patch) → build-error", async () => {
+  const wasm = await loadWasm();
+  assert.equal(gateToolCall(wasm, "Edit", { old_string: "old", new_string: "new" }, "/repo").kind, "build-error");
+  assert.equal(gateToolCall(wasm, "apply_patch", { patch: "not a valid patch" }, "/repo").kind, "build-error");
 });
 
 test("gateToolCall(non-gated) → pass-through", async () => {

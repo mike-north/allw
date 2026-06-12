@@ -1444,3 +1444,38 @@ test("action_from_mcp_tool_call throws on malformed params JSON (fail-closed)", 
     "unparseable params must surface as a thrown JS error (fail-closed)",
   );
 });
+
+test("action_from_file_edit builds a file_edit ActionRecord with paths and diff hash", async () => {
+  const wasm = await loadWasm();
+  const patch = [
+    "*** Begin Patch",
+    "*** Update File: src/app.ts",
+    "@@",
+    "-old",
+    "+new",
+    "*** End Patch",
+    "",
+  ].join("\n");
+  const record = JSON.parse(
+    wasm.action_from_file_edit("patch", JSON.stringify(["src/app.ts"]), "patch src/app.ts", patch),
+  );
+
+  assert.equal(record.surface, "file_edit", "surface must be 'file_edit'");
+  assert.equal(record.record_schema_version, 1, "v1 record schema version");
+  assert.equal(record.syntactic.operation, "patch", "operation is preserved");
+  assert.deepEqual(record.syntactic.paths, ["src/app.ts"], "target paths are preserved");
+  assert.equal(record.syntactic.diff_summary, "patch src/app.ts", "summary is preserved");
+  assert.equal(typeof record.syntactic.diff_hash, "string", "diff hash is present");
+  assert.equal(record.syntactic.diff_hash.length, 43, "SHA-256 base64url hash length");
+  assert.equal(record.risk, "high", "file edits are high risk in v1");
+});
+
+test("action_from_file_edit throws on empty paths (fail-closed)", async () => {
+  const wasm = await loadWasm();
+
+  assert.throws(
+    () => wasm.action_from_file_edit("patch", "[]", "pathless patch", "patch bytes"),
+    /file edit paths must not be empty/,
+    "pathless edits must be denied before they reach approval",
+  );
+});

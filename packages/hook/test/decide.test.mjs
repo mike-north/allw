@@ -208,6 +208,36 @@ test("MCP tool call is gated; approved → allow, with the request built from th
   assert.equal(req.actor.kind, "claude-code");
 });
 
+test("Claude file edit tools are gated; approved → allow with file_edit ActionRecord", async () => {
+  const wasm = await loadWasm();
+  const approver = recording("approved");
+  const output = await decide(
+    {
+      hookEventName: "PreToolUse",
+      toolName: "Edit",
+      toolInput: {
+        file_path: "/workspace/src/app.ts",
+        old_string: "const mode = 'old';",
+        new_string: "const mode = 'new';",
+      },
+      cwd: "/workspace",
+    },
+    { wasm, config: CONFIG, requestApproval: approver.fn },
+    HOSTNAME,
+  );
+
+  assert.equal(decisionOf(output), "allow");
+  assert.equal(approver.calls.length, 1, "file edits must request approval");
+  const req = approver.calls[0];
+  assert.equal(req.action.surface, "file_edit");
+  assert.equal(req.action.syntactic.operation, "edit");
+  assert.deepEqual(req.action.syntactic.paths, ["/workspace/src/app.ts"]);
+  assert.equal(typeof req.action.syntactic.diff_hash, "string");
+  assert.match(req.action.syntactic.diff_summary, /src\/app\.ts/);
+  assert.equal(req.action.risk, "high");
+  assert.equal(req.reversible, false);
+});
+
 test("the ApprovalRequest carries the command ActionRecord + actor + risk-derived reversible", async () => {
   const wasm = await loadWasm();
   const approver = recording("approved");

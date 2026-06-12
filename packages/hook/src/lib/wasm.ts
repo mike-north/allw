@@ -5,7 +5,7 @@
  * # Why WASM-under-node (a hard constraint, not a preference)
  * On-machine `allw` code runs as **WASM under node**, never a standalone native binary, so
  * enterprise binary-allowlisting (Santa) and MDM cannot block it (`docs/architecture.md`). The
- * hook therefore never reimplements `ActionRecord` construction — both builders are the audited
+ * hook therefore never reimplements `ActionRecord` construction — the builders are the audited
  * core's, reached through this surface. (Crypto is reached through `@allw/sdk`, which loads the
  * same vendored artifact.)
  *
@@ -26,7 +26,7 @@ import { dirname, join, parse as parsePath } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 /**
- * The exact subset of the `allw-wasm` FFI the hook depends on: the two `ActionRecord` builders.
+ * The exact subset of the `allw-wasm` FFI the hook depends on: the `ActionRecord` builders.
  * Both take strings (the language-agnostic wire contract) and return an `ActionRecord` as JSON;
  * a malformed input **throws** (fail-closed at the boundary). Mirrors `crates/allw-wasm/src/lib.rs`.
  */
@@ -43,6 +43,17 @@ export interface HookWasm {
    * than submitting a record built from unparseable parameters.
    */
   action_from_mcp_tool_call(server: string, tool: string, paramsJson: string): string;
+  /**
+   * Build an `ActionRecord` JSON for a file edit (the `file_edit` surface). `pathsJson` is a JSON
+   * string array. **Throws** when paths are malformed/empty, so the hook denies rather than
+   * presenting a pathless edit to the human.
+   */
+  action_from_file_edit(
+    operation: string,
+    pathsJson: string,
+    diffSummary: string,
+    diffBytes: string,
+  ): string;
 }
 
 /** The `--target web` glue module shape we depend on (subset of the generated bindings). */

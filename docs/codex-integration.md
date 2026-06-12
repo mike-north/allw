@@ -18,7 +18,7 @@ Recommended hook configuration:
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|mcp__.*",
+        "matcher": "Bash|apply_patch|mcp__.*",
         "hooks": [
           {
             "type": "command",
@@ -60,9 +60,9 @@ This is the Codex-parallel install path for developers who already have a paired
 4. Start Codex, run `/hooks`, review the hook, and trust it. Codex skips untrusted non-managed
    hooks by design.
 
-5. Trigger a gated action such as a Bash command or `mcp__<server>__<tool>` call. The hook submits
-   a Codex-scoped approval request (`actor.id = "codex:<hostname>"`), and Codex proceeds only after
-   a verified allw approval.
+5. Trigger a gated action such as a Bash command, `apply_patch`, or an `mcp__<server>__<tool>`
+   call. The hook submits a Codex-scoped approval request (`actor.id = "codex:<hostname>"`), and
+   Codex proceeds only after a verified allw approval.
 
 ## UAT Checklist
 
@@ -77,23 +77,18 @@ and record the result on the PR:
    Codex denies before its 480 second hook timeout.
 4. **Actor identity**: confirm the approval inbox shows the request as `codex:<hostname>` rather
    than the Claude Code actor.
+5. **File-edit path**: ask Codex for a simple file edit through `apply_patch` and confirm the hook
+   gates the resulting `file_edit` action with the target path, summary, and diff hash visible.
 
 The automated tests cover the same SDK/WASM verification path with a relay double; this checklist
 is the remaining product acceptance proof that Codex itself invokes the hook and honors the result.
 
-The matcher intentionally matches the Claude Code hook's v1 surface:
+The matcher intentionally matches the hook's v1 surfaces:
 
 - `Bash` commands are converted to command `ActionRecord`s through the WASM core.
+- `apply_patch` calls are converted to file-edit `ActionRecord`s through the WASM core.
 - `mcp__<server>__<tool>` calls are converted to MCP `ActionRecord`s through the WASM core.
-- Other Codex tools, including `apply_patch`, pass through for now.
-
-That `apply_patch` pass-through is a bypass, not just missing coverage: an agent denied on a
-mutating `Bash` command can often route the same file edit through `apply_patch`, because the
-recommended `Bash|mcp__.*` matcher leaves file edits ungated. allw does not yet have a core
-`ActionRecord` surface for file edits, and gating them in this slice would either duplicate policy
-in TypeScript or build an ambiguous record. Issue
-[#106](https://github.com/mike-north/allw/issues/106) tracks the edit-surface `ActionRecord`
-follow-up needed to close this bypass.
+- Other Codex tools pass through when they do not map to a supported allw approval surface.
 
 ## Decision Mapping
 

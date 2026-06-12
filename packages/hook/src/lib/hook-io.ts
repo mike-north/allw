@@ -14,7 +14,7 @@
  *   "cwd": "/abs/path",
  *   "permission_mode": "default",
  *   "hook_event_name": "PreToolUse",
- *   "tool_name": "Bash",            // or "mcp__<server>__<tool>"
+ *   "tool_name": "Bash",            // or "Edit" / "Write" / "mcp__<server>__<tool>"
  *   "tool_input": { "command": "rm -rf build" }   // tool-specific
  * }
  * ```

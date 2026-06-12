@@ -32,15 +32,15 @@ Pair an approver device first (e.g. with [`@allw/approver`](../approver)) to obt
 the account-root public key.
 
 Wire the hook into your project's (or user's) `.claude/settings.json` as a `PreToolUse` hook. The
-matcher selects which tools `allw` gates — `Bash` for shell commands and `mcp__.*` for any MCP tool
-call:
+matcher selects which tools `allw` gates — `Bash` for shell commands, `Edit`/`Write`/`MultiEdit`
+for direct file edits, and `mcp__.*` for any MCP tool call:
 
 ```json
 {
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|mcp__.*",
+        "matcher": "Bash|Edit|MultiEdit|Write|mcp__.*",
         "hooks": [
           {
             "type": "command",
@@ -112,7 +112,7 @@ The hook implements the Claude Code PreToolUse wire contract verbatim.
 {
   "hook_event_name": "PreToolUse",
   "cwd": "/abs/path",
-  "tool_name": "Bash", // or "mcp__<server>__<tool>"
+  "tool_name": "Bash", // or "Edit" / "Write" / "mcp__<server>__<tool>"
   "tool_input": { "command": "rm -rf build" }, // tool-specific
 }
 ```
@@ -139,9 +139,11 @@ Deliberately conservative, so the human is only interrupted for actions that act
 effects:
 
 - **`Bash`** — a shell command (`tool_input.command`).
+- **`Edit` / `Write` / `MultiEdit`** — direct file edits (`tool_input.file_path` plus edit
+  payload).
 - **`mcp__<server>__<tool>`** — any MCP tool call (`tool_input` is the raw params object).
-- **everything else** (`Read`, `Edit`, `Write`, `Glob`, `Grep`, `WebFetch`, …) — **not gated**; it
-  passes through as `allow` without bothering the human (and without needing any `allw` config).
+- **everything else** (`Read`, `Glob`, `Grep`, `WebFetch`, …) — **not gated**; it passes through as
+  `allow` without bothering the human (and without needing any `allw` config).
 
 Widening the matcher later is an additive change.
 

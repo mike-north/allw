@@ -476,6 +476,10 @@ fn args_any_glob_matches_structured_tokens_not_raw_or_substrings() {
         tool: None,
         params: None,
         raw: Some("rm -rf build".to_string()),
+        operation: None,
+        paths: None,
+        diff_summary: None,
+        diff_hash: None,
     });
     assert_eq!(
         evaluate(&raw_only, &[rule]).decision,
@@ -711,6 +715,10 @@ fn from_approval_exact_call_uses_raw_command_when_argv_is_unavailable() {
         tool: None,
         params: None,
         raw: Some("git push --force origin main".to_string()),
+        operation: None,
+        paths: None,
+        diff_summary: None,
+        diff_hash: None,
     });
     let verified = signed(
         UnsignedPolicyRule::from_approval(
@@ -756,6 +764,10 @@ fn from_approval_exact_call_rejects_unrepresentable_command_shape() {
         tool: None,
         params: None,
         raw: None,
+        operation: None,
+        paths: None,
+        diff_summary: None,
+        diff_hash: None,
     });
 
     assert!(

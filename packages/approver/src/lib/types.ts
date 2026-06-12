@@ -14,7 +14,7 @@ export type Decision = "approved" | "denied" | "expired" | "aborted";
 export type Risk = "low" | "medium" | "high" | "critical";
 
 /** The interception paradigm an action arrived through. */
-export type Surface = "command" | "mcp_tool_call";
+export type Surface = "command" | "mcp_tool_call" | "file_edit";
 
 /**
  * Tokenized syntactic substrate — opaque, untrusted structure the approver renders but never

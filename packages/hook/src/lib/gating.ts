@@ -8,8 +8,11 @@
  * - **`Bash`** — a shell command. Gated; the substrate is built from `tool_input.command` (+ `cwd`).
  * - **`mcp__<server>__<tool>`** — any MCP tool call. Gated; the substrate is built from the parsed
  *   server/tool name and `tool_input` (the raw params object).
- * - **everything else** (`Read`, `Edit`, `Write`, `Glob`, `Grep`, `WebFetch`, …) — **not gated**.
- *   These either don't run shell/MCP side effects or are out of v0 scope; they pass through as
+ * - **`apply_patch` / `Edit` / `Write` / `MultiEdit`** — file edits. Gated; the substrate is
+ *   built from the operation kind, target paths, a compact summary, and a hash of the full edit
+ *   bytes.
+ * - **everything else** (`Read`, `Glob`, `Grep`, `WebFetch`, …) — **not gated**. These either
+ *   don't run shell/MCP/file-edit side effects or are out of v0 scope; they pass through as
  *   `allow` without prompting. Widening the matcher is a future, additive change.
  *
  * Gating is intentionally separate from risk: *whether* to ask the human is a matcher decision
@@ -33,6 +36,12 @@ const MCP_TOOL_PREFIX = "mcp__";
 /** The Bash tool name (the v0 command surface). */
 const BASH_TOOL_NAME = "Bash";
 
+/** Codex's patch application tool name. */
+const APPLY_PATCH_TOOL_NAME = "apply_patch";
+
+/** Claude Code file-editing tool names that can mutate files without going through Bash. */
+const CLAUDE_FILE_EDIT_TOOLS = new Set(["Edit", "MultiEdit", "Write"]);
+
 /**
  * The outcome of classifying + reducing a tool call:
  * - `gated`: build succeeded; `actionRecord` (JSON) + a one-line `summary` are ready to submit.
@@ -53,6 +62,13 @@ function readBashCommand(toolInput: unknown): string | null {
   if (typeof toolInput !== "object" || toolInput === null) return null;
   const command = (toolInput as { command?: unknown }).command;
   return typeof command === "string" ? command : null;
+}
+
+/** Read a string field from an untrusted tool_input record. */
+function readStringField(toolInput: unknown, key: string): string | null {
+  if (typeof toolInput !== "object" || toolInput === null || Array.isArray(toolInput)) return null;
+  const value = (toolInput as Record<string, unknown>)[key];
+  return typeof value === "string" ? value : null;
 }
 
 /**
@@ -78,8 +94,14 @@ function hasMcpPrefix(toolName: string): boolean {
   return toolName.startsWith(MCP_TOOL_PREFIX);
 }
 
+/** True if a tool name represents a direct file-edit operation this hook must gate. */
+function isFileEditTool(toolName: string): boolean {
+  return toolName === APPLY_PATCH_TOOL_NAME || CLAUDE_FILE_EDIT_TOOLS.has(toolName);
+}
+
 /**
- * True if a tool name is one this hook gates: `Bash`, or **any** `mcp__`-prefixed name.
+ * True if a tool name is one this hook gates: `Bash`, file edit tools, or **any**
+ * `mcp__`-prefixed name.
  *
  * Crucially, gating an MCP name does NOT require it to fully parse as `mcp__<server>__<tool>`. The
  * recommended `.claude/settings.json` matcher is `mcp__.*`, so Claude Code routes every
@@ -89,13 +111,142 @@ function hasMcpPrefix(toolName: string): boolean {
  * cannot be reduced to an `ActionRecord`.
  */
 export function isGatedTool(toolName: string): boolean {
-  return toolName === BASH_TOOL_NAME || hasMcpPrefix(toolName);
+  return toolName === BASH_TOOL_NAME || isFileEditTool(toolName) || hasMcpPrefix(toolName);
 }
 
 /** Truncate a summary so a long command/params blob stays a one-liner in the notification. */
 function oneLine(s: string, max = 160): string {
   const collapsed = s.replace(/\s+/g, " ").trim();
   return collapsed.length > max ? `${collapsed.slice(0, max - 1)}…` : collapsed;
+}
+
+/** Add a path once, preserving first-seen order so the human sees a stable target list. */
+function addUniquePath(paths: string[], path: string): void {
+  const trimmed = path.trim();
+  if (trimmed.length === 0 || paths.includes(trimmed)) return;
+  paths.push(trimmed);
+}
+
+/** Extract target paths from Codex's apply_patch grammar. */
+function extractApplyPatchPaths(patch: string): string[] | null {
+  if (!patch.includes("*** Begin Patch") || !patch.includes("*** End Patch")) return null;
+
+  const paths: string[] = [];
+  for (const line of patch.split(/\r?\n/)) {
+    for (const prefix of [
+      "*** Add File: ",
+      "*** Update File: ",
+      "*** Delete File: ",
+      "*** Move to: ",
+    ]) {
+      if (line.startsWith(prefix)) addUniquePath(paths, line.slice(prefix.length));
+    }
+  }
+  return paths.length > 0 ? paths : null;
+}
+
+/** Read Codex apply_patch input, which may arrive as a raw string or a small object wrapper. */
+function readApplyPatch(toolInput: unknown): { patch: string; paths: string[] } | null {
+  const patch =
+    typeof toolInput === "string"
+      ? toolInput
+      : readStringField(toolInput, "patch") ??
+        readStringField(toolInput, "input") ??
+        readStringField(toolInput, "diff");
+  if (patch === null) return null;
+
+  const paths = extractApplyPatchPaths(patch);
+  return paths === null ? null : { patch, paths };
+}
+
+/** Compact path list for notification and ActionRecord raw summary lines. */
+function formatPathList(paths: readonly string[]): string {
+  if (paths.length === 1) return paths[0] ?? "";
+  const shown = paths.slice(0, 3).join(", ");
+  return paths.length > 3 ? `${shown}, +${paths.length - 3} more` : shown;
+}
+
+/** Build the one-line summary stored in the hash-bound file-edit substrate. */
+function summarizeFileEdit(operation: string, paths: readonly string[], detail?: string): string {
+  const suffix = detail === undefined ? "" : ` ${detail}`;
+  return oneLine(`${operation} ${formatPathList(paths)}${suffix}`);
+}
+
+type FileEditReduction =
+  | {
+      readonly operation: string;
+      readonly paths: readonly string[];
+      readonly diffSummary: string;
+      readonly diffBytes: string;
+    }
+  | { readonly error: string };
+
+/** Reduce a direct file-edit tool call into the core's file_edit builder inputs. */
+function reduceFileEdit(toolName: string, toolInput: unknown): FileEditReduction {
+  if (toolName === APPLY_PATCH_TOOL_NAME) {
+    const patch = readApplyPatch(toolInput);
+    if (patch === null) {
+      return { error: "apply_patch tool_input must contain a valid patch with target paths" };
+    }
+    return {
+      operation: "patch",
+      paths: patch.paths,
+      diffSummary: summarizeFileEdit("patch", patch.paths),
+      diffBytes: patch.patch,
+    };
+  }
+
+  const filePath = readStringField(toolInput, "file_path");
+  if (filePath === null || filePath.trim().length === 0) {
+    return { error: `${toolName} tool_input missing a string 'file_path'` };
+  }
+  const paths = [filePath];
+
+  if (toolName === "Edit") {
+    const oldString = readStringField(toolInput, "old_string");
+    const newString = readStringField(toolInput, "new_string");
+    if (oldString === null || newString === null) {
+      return { error: "Edit tool_input missing string 'old_string' or 'new_string'" };
+    }
+    return {
+      operation: "edit",
+      paths,
+      diffSummary: summarizeFileEdit("edit", paths),
+      diffBytes: JSON.stringify({
+        file_path: filePath,
+        old_string: oldString,
+        new_string: newString,
+        replace_all: (toolInput as Record<string, unknown>).replace_all,
+      }),
+    };
+  }
+
+  if (toolName === "Write") {
+    const content = readStringField(toolInput, "content");
+    if (content === null) return { error: "Write tool_input missing string 'content'" };
+    return {
+      operation: "write",
+      paths,
+      diffSummary: summarizeFileEdit("write", paths, `(${content.length} bytes)`),
+      diffBytes: JSON.stringify({ file_path: filePath, content }),
+    };
+  }
+
+  if (toolName === "MultiEdit") {
+    const edits =
+      typeof toolInput === "object" && toolInput !== null && !Array.isArray(toolInput)
+        ? (toolInput as Record<string, unknown>).edits
+        : undefined;
+    if (!Array.isArray(edits)) return { error: "MultiEdit tool_input missing array 'edits'" };
+    return {
+      operation: "multi_edit",
+      paths,
+      diffSummary: summarizeFileEdit("multi_edit", paths, `(${edits.length} edits)`),
+      diffBytes: JSON.stringify({ file_path: filePath, edits }),
+    };
+  }
+
+  return { error: `unsupported file edit tool '${toolName}'` };
 }
 
 /**
@@ -136,6 +287,37 @@ export function gateToolCall(
     }
   }
 
+  if (isFileEditTool(toolName)) {
+    const fileEdit = reduceFileEdit(toolName, toolInput);
+    if ("error" in fileEdit) {
+      return {
+        kind: "build-error",
+        reason: `allw: ${fileEdit.error} (fail-closed deny)`,
+      };
+    }
+
+    try {
+      const actionRecord = wasm.action_from_file_edit(
+        fileEdit.operation,
+        JSON.stringify(fileEdit.paths),
+        fileEdit.diffSummary,
+        fileEdit.diffBytes,
+      );
+      return {
+        kind: "gated",
+        actionRecord,
+        summary: oneLine(`File edit: ${fileEdit.diffSummary}`),
+      };
+    } catch (err) {
+      return {
+        kind: "build-error",
+        reason: `allw: could not build an ActionRecord for the file edit (fail-closed deny): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      };
+    }
+  }
+
   if (hasMcpPrefix(toolName)) {
     const mcp = parseMcpToolName(toolName);
     if (mcp === null) {
@@ -166,7 +348,7 @@ export function gateToolCall(
     }
   }
 
-  // A genuinely non-Bash, non-MCP tool (Read/Edit/Grep/…) is not gated — pass through as before.
+  // A genuinely non-Bash, non-MCP, non-file-edit tool (Read/Grep/…) is not gated.
   return {
     kind: "pass-through",
     reason: `allw: tool '${toolName}' is not gated by allw; passing through`,
