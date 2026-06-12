@@ -176,6 +176,8 @@ on its next `connect` (the queue), so delivery survives reconnect. If a device c
 the relay fans out and flushes queued requests to at most one live socket per `surface_id`, preventing a single
 visible screen from showing both a native prompt and a mirrored prompt. Retractions still go to all live device
 sockets so stale surfaces clear.
+`surface_id` is caller-asserted, account-global topology metadata; it is trusted only under the user-owned-device
+assumption and will be hardened when endpoint authentication lands (#10).
 
 **Fail-closed expiry** (§Invariants #6): once a request is past `expires_at` it can never become approvable. A
 verdict for an expired request is refused (acked `expired`, not stored); the offline-queue flush skips expired
