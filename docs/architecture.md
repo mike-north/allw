@@ -59,6 +59,27 @@ just data it loads, so there's nothing new to allowlist. A hard constraint, not 
   allowlisted by publisher cert; the risk is ad-hoc CLI binaries, which we don't ship.
 - **The same WASM build is browser/worker-compatible** — which also unlocks the web fallback (below).
 
+### Cross-surface FFI naming
+
+Both thin surfaces — `allw-wasm` (TS, `--target web`) and `crates/allw-uniffi` (Swift/Kotlin) — expose the
+same core operations as flat free functions over a JSON/base64url string boundary. The two surfaces are generated
+into **different idioms** (snake_case JS identifiers vs UniFFI's camelCase), and they were authored against
+different naming instincts, so the **function name for one core op can differ across surfaces** (e.g. the WASM
+`ed25519_public_key` and the UniFFI `derive_signing_pubkey_b64` derive the same Ed25519 public key). That is
+accepted; the binding contract is held together by a **return-type suffix convention**, not by verb parity:
+
+- **`_b64`** — returns a single **base64url-unpadded string** (a key, hash, or nonce), e.g.
+  `compute_request_hash_b64`, `derive_signing_pubkey_b64`.
+- **`_json`** — returns a **JSON string** of a canonical core wire type, e.g. `derive_device_keys_json`,
+  `sign_verdict_json`, `action_from_command_json`.
+- **No suffix** — the WASM surface omits suffixes (its `.d.ts` documents each return type inline); when a name is
+  shared verbatim across surfaces it keeps the same suffix on both.
+
+When adding an op to either surface: **match the suffix to the return type**, name the input params `<thing>_b64`
+/ `<thing>_json` for their wire encoding, and prefer reusing the sibling surface's verb unless the surface's
+generated idiom argues otherwise. A rename to force verb parity across the just-merged surfaces is **not** worth
+the smoke-test churn while there are no external consumers; this convention is the forward-compat contract.
+
 ## Why native: deep OS integration is the product
 
 For an approval primitive the notification interaction is not chrome — it's the product. Time-to-decision and
