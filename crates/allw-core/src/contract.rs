@@ -77,6 +77,8 @@ pub enum Surface {
     Command,
     /// An MCP tool call.
     McpToolCall,
+    /// A direct file-edit tool call such as Codex `apply_patch` or Claude Code `Edit`/`Write`.
+    FileEdit,
     // Future: AgentToolCall, DelegatedFetch.
 }
 
@@ -114,7 +116,9 @@ pub enum Risk {
 ///
 /// - `surface = command`: `bin`, `argv`, `flags`, `positionals`, `cwd`, `host`, `env_refs`
 /// - `surface = mcp_tool_call`: `server`, `tool`, `params`
-/// - Either surface may set `raw` for display/fallback
+/// - `surface = file_edit`: `operation`, `paths`, `diff_summary`, `diff_hash`, `raw`
+/// - File edits set `raw` to the exact edit/patch text for WYSIWYS display.
+/// - Other surfaces may set `raw` for display/fallback.
 ///
 /// The T1 syntactic substrate is the durable base that all three policy tiers match against.
 /// See `docs/policy-seam.md` §The action record.
@@ -161,6 +165,23 @@ pub struct SyntacticSubstrate {
     /// Tool call parameters as raw/structured JSON values.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub params: Option<serde_json::Value>,
+
+    // ── file_edit-surface fields ─────────────────────────────────────────────
+    /// File edit operation kind (`patch`, `edit`, `multi_edit`, `write`, …).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub operation: Option<String>,
+
+    /// Target file paths affected by the edit.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub paths: Option<Vec<String>>,
+
+    /// Human-readable compact summary of the file edit/diff.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub diff_summary: Option<String>,
+
+    /// Base64url-unpadded SHA-256 hash of the full diff/edit bytes.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub diff_hash: Option<String>,
 
     // ── cross-surface fields ─────────────────────────────────────────────────
     /// Original string form — used for display and as a fallback for matching.
@@ -601,6 +622,10 @@ mod tests {
             server: None,
             tool: None,
             params: None,
+            operation: None,
+            paths: None,
+            diff_summary: None,
+            diff_hash: None,
             raw: Some("git push --force".to_string()),
         }
     }
@@ -694,7 +719,7 @@ mod tests {
 
     #[test]
     fn surface_round_trip() {
-        for v in [Surface::Command, Surface::McpToolCall] {
+        for v in [Surface::Command, Surface::McpToolCall, Surface::FileEdit] {
             let json = serde_json::to_string(&v).unwrap();
             let back: Surface = serde_json::from_str(&json).unwrap();
             assert_eq!(v, back);
@@ -748,6 +773,10 @@ mod tests {
             server: Some("omnifocus".to_string()),
             tool: Some("delete_project".to_string()),
             params: Some(json!({ "list": "Agent Inbox" })),
+            operation: Some("patch".to_string()),
+            paths: Some(vec!["src/app.ts".to_string()]),
+            diff_summary: Some("patch src/app.ts (+1 -1)".to_string()),
+            diff_hash: Some("d".repeat(43)),
             raw: Some("git status".to_string()),
         };
         let val: Value = serde_json::to_value(&s).unwrap();
@@ -757,6 +786,13 @@ mod tests {
         assert!(
             val.get("server").is_some() && val.get("tool").is_some(),
             "mcp fields `server`/`tool` coexist at the top level (flat substrate)"
+        );
+        assert!(
+            val.get("operation").is_some()
+                && val.get("paths").is_some()
+                && val.get("diff_summary").is_some()
+                && val.get("diff_hash").is_some(),
+            "file-edit fields coexist at the top level (flat substrate)"
         );
         // snake_case key name, not `envRefs`/`env-refs`.
         assert_eq!(

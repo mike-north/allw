@@ -478,6 +478,54 @@ test("renderRequest surfaces MCP server/tool even when a benign raw masks them, 
   assert.match(rendered, /delete_all_files/, "the dangerous MCP tool token is visible");
 });
 
+test("renderRequest surfaces file-edit paths, operation, summary, and diff hash (#106)", async () => {
+  const wasm = await loadWasm();
+  const { keyfile } = pairedApprover(wasm);
+  const patch = [
+    "*** Begin Patch",
+    "*** Update File: src/app.ts",
+    "@@",
+    "-old",
+    "+new",
+    "*** End Patch",
+  ].join("\n");
+
+  const ctx = {
+    action: {
+      record_schema_version: 1,
+      surface: "file_edit",
+      syntactic: {
+        operation: "patch",
+        paths: ["src/app.ts"],
+        diff_summary: "patch src/app.ts (+1 -1)",
+        diff_hash: "d".repeat(43),
+        raw: patch,
+      },
+      risk: "high",
+    },
+    summary: "edit app source",
+    actor: { id: "machine:agent", kind: "codex" },
+    risk: "high",
+    reversible: false,
+    constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
+  };
+  const ctxJson = JSON.stringify(ctx);
+  const jwe = wasm.encrypt_context(
+    ctxJson,
+    JSON.stringify([{ device_id: DEVICE_ID, public_key_b64: keyfile.device_encryption_pubkey }]),
+  );
+  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
+  const rendered = renderRequest(prepared);
+
+  assert.match(rendered, /Action:\s+patch src\/app\.ts/, "the file-edit summary is visible");
+  assert.match(rendered, /File edit:\s+patch/, "the edit operation is visible");
+  assert.match(rendered, /Paths:\s+src\/app\.ts/, "the target path is visible");
+  assert.match(rendered, /Diff summary:\s+patch src\/app\.ts \(\+1 -1\)/);
+  assert.match(rendered, new RegExp(`Diff hash:\\s+${"d".repeat(43)}`));
+  assert.match(rendered, /File edit content:\n {4}\*\*\* Begin Patch/);
+  assert.match(rendered, / {4}-old\n {4}\+new/, "the actual patch text is rendered");
+});
+
 test("renderRequest disambiguates argv args containing whitespace (WYSIWYS — review item #1)", async () => {
   const wasm = await loadWasm();
   const { keyfile } = pairedApprover(wasm);

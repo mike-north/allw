@@ -25,6 +25,7 @@ pub mod audit;
 pub mod command;
 pub mod contract;
 pub mod crypto;
+pub mod file_edit;
 pub mod hash;
 pub mod jwe;
 pub mod mcp;
@@ -50,6 +51,7 @@ pub use crypto::{
     NonceStore, PublicKey, SigningKeyPair, UnsignedVerdict, VerdictClaims, VerifiedVerdict,
     VerifyError,
 };
+pub use file_edit::action_from_file_edit;
 pub use hash::{canonical_request_bytes, compute_request_hash};
 pub use jwe::{
     decrypt_context, encrypt_context, ContextRecipient, JweError, X25519KeyPair, X25519PublicKey,

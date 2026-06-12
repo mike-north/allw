@@ -1,11 +1,11 @@
 use allw_core::{
-    action_from_argv, action_from_mcp_tool_call, evaluate, evaluate_for_actor, issue_device_cert,
-    sign_account_state, sign_policy_rule, sign_verdict, verify_policy_rule,
-    verify_policy_rule_with_account_states, AccountState, AccountStateRevocation,
-    AccountStateRevocationKind, Actor, Approver, CommandContext, Decision, McpMatcher,
-    ParamMatcher, PolicyDecision, PolicyEffect, PolicyPredicate, PolicyProvenance, PolicyRuleError,
-    PolicyRuleScope, PolicyTier, Risk, SigningKeyPair, Surface, SyntacticSubstrate,
-    UnsignedPolicyRule, UnsignedVerdict, Verdict,
+    action_from_argv, action_from_file_edit, action_from_mcp_tool_call, evaluate,
+    evaluate_for_actor, issue_device_cert, sign_account_state, sign_policy_rule, sign_verdict,
+    verify_policy_rule, verify_policy_rule_with_account_states, AccountState,
+    AccountStateRevocation, AccountStateRevocationKind, Actor, Approver, CommandContext, Decision,
+    McpMatcher, ParamMatcher, PolicyDecision, PolicyEffect, PolicyPredicate, PolicyProvenance,
+    PolicyRuleBuildError, PolicyRuleError, PolicyRuleScope, PolicyTier, Risk, SigningKeyPair,
+    Surface, SyntacticSubstrate, UnsignedPolicyRule, UnsignedVerdict, Verdict,
 };
 use serde_json::json;
 
@@ -95,6 +95,10 @@ fn git_force_action() -> allw_core::ActionRecord {
     action_from_argv(&argv, &CommandContext::default())
 }
 
+fn file_edit_action(path: &str, diff: &str) -> allw_core::ActionRecord {
+    action_from_file_edit("patch", &[path.to_string()], &format!("patch {path}"), diff)
+}
+
 fn command_action_with_syntactic(syntactic: SyntacticSubstrate) -> allw_core::ActionRecord {
     allw_core::ActionRecord {
         record_schema_version: 1,
@@ -162,6 +166,114 @@ fn precedence_is_deny_then_ask_then_allow_and_no_match_escalates() {
 
     let unrelated = action_from_mcp_tool_call("github", "list_issues", json!({}));
     assert_eq!(evaluate(&unrelated, &[]).decision, PolicyDecision::Escalate);
+}
+
+#[test]
+fn command_and_mcp_rules_do_not_match_file_edit_actions() {
+    let action = file_edit_action("src/app.ts", "patch app");
+    let command_deny = signed(UnsignedPolicyRule {
+        id: "deny-command".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate::command_bin("apply_patch"),
+        effect: PolicyEffect::Deny,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    });
+    let mcp_deny = signed(UnsignedPolicyRule {
+        id: "deny-mcp".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate {
+            surface: Some(Surface::McpToolCall),
+            command: None,
+            mcp: Some(McpMatcher {
+                server: Some("filesystem".to_string()),
+                tool: Some("write_file".to_string()),
+                ..McpMatcher::default()
+            }),
+        },
+        effect: PolicyEffect::Deny,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    });
+
+    assert_eq!(
+        evaluate(&action, &[command_deny, mcp_deny]).decision,
+        PolicyDecision::Escalate,
+        "command/MCP policy rules must not match the file_edit surface"
+    );
+}
+
+#[test]
+fn file_edit_deny_precedes_file_edit_allow() {
+    let action = file_edit_action("src/app.ts", "patch app");
+    let file_edit_predicate = PolicyPredicate {
+        surface: Some(Surface::FileEdit),
+        command: None,
+        mcp: None,
+    };
+    let allow = signed(UnsignedPolicyRule {
+        id: "allow-file-edit".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: file_edit_predicate.clone(),
+        effect: PolicyEffect::Allow,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    });
+    let deny = signed(UnsignedPolicyRule {
+        id: "deny-file-edit".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: file_edit_predicate,
+        effect: PolicyEffect::Deny,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    });
+
+    let decision = evaluate(&action, &[allow, deny]);
+    assert_eq!(decision.decision, PolicyDecision::Deny);
+    assert_eq!(decision.rule_id.as_deref(), Some("deny-file-edit"));
+}
+
+#[test]
+fn over_budget_file_edit_match_input_escalates_before_policy_match() {
+    let action = file_edit_action(&"a".repeat(4097), "patch app");
+    let allow = signed(UnsignedPolicyRule {
+        id: "allow-file-edit".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate {
+            surface: Some(Surface::FileEdit),
+            command: None,
+            mcp: None,
+        },
+        effect: PolicyEffect::Allow,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    });
+
+    assert_eq!(
+        evaluate(&action, &[allow]).decision,
+        PolicyDecision::Escalate,
+        "oversized file-edit path/summary input must not match even a broad file_edit rule"
+    );
 }
 
 #[test]
@@ -476,6 +588,10 @@ fn args_any_glob_matches_structured_tokens_not_raw_or_substrings() {
         tool: None,
         params: None,
         raw: Some("rm -rf build".to_string()),
+        operation: None,
+        paths: None,
+        diff_summary: None,
+        diff_hash: None,
     });
     assert_eq!(
         evaluate(&raw_only, &[rule]).decision,
@@ -711,6 +827,10 @@ fn from_approval_exact_call_uses_raw_command_when_argv_is_unavailable() {
         tool: None,
         params: None,
         raw: Some("git push --force origin main".to_string()),
+        operation: None,
+        paths: None,
+        diff_summary: None,
+        diff_hash: None,
     });
     let verified = signed(
         UnsignedPolicyRule::from_approval(
@@ -756,6 +876,10 @@ fn from_approval_exact_call_rejects_unrepresentable_command_shape() {
         tool: None,
         params: None,
         raw: None,
+        operation: None,
+        paths: None,
+        diff_summary: None,
+        diff_hash: None,
     });
 
     assert!(
@@ -770,6 +894,36 @@ fn from_approval_exact_call_rejects_unrepresentable_command_shape() {
         .is_err(),
         "a bin-only command cannot safely become an exact-call allow rule"
     );
+}
+
+#[test]
+fn from_approval_rejects_file_edit_policy_scopes_until_file_matchers_exist() {
+    let actor = actor();
+    let action = file_edit_action("src/app.ts", "write app");
+
+    for scope in [
+        PolicyRuleScope::ExactCall,
+        PolicyRuleScope::CommandOrToolAnyArgs,
+        PolicyRuleScope::McpParamEquals {
+            path: "operation".to_string(),
+        },
+        PolicyRuleScope::ArgsAnyGlob {
+            pattern: "src/*".to_string(),
+        },
+    ] {
+        assert_eq!(
+            UnsignedPolicyRule::from_approval(
+                "approval-file-edit",
+                ACCOUNT_ID,
+                &actor,
+                &action,
+                scope,
+                1_700_000_000_000,
+            ),
+            Err(PolicyRuleBuildError::UnsupportedFileEditPolicyScope),
+            "file-edit approvals must not derive surface-only allow rules"
+        );
+    }
 }
 
 #[test]

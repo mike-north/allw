@@ -486,6 +486,7 @@ impl std::error::Error for PolicyRuleError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyRuleBuildError {
     UnrepresentableExactCommand,
+    UnsupportedFileEditPolicyScope,
 }
 
 impl std::fmt::Display for PolicyRuleBuildError {
@@ -494,6 +495,10 @@ impl std::fmt::Display for PolicyRuleBuildError {
             Self::UnrepresentableExactCommand => write!(
                 f,
                 "exact command policy requires either argv or raw command text"
+            ),
+            Self::UnsupportedFileEditPolicyScope => write!(
+                f,
+                "file_edit approval-derived policy scopes require file path/diff matchers"
             ),
         }
     }
@@ -677,6 +682,9 @@ fn predicate_from_approval(
     action: &ActionRecord,
     scope: PolicyRuleScope,
 ) -> Result<PolicyPredicate, PolicyRuleBuildError> {
+    if action.surface == Surface::FileEdit {
+        return Err(PolicyRuleBuildError::UnsupportedFileEditPolicyScope);
+    }
     match scope {
         PolicyRuleScope::ExactCall => exact_call_predicate(action),
         PolicyRuleScope::CommandOrToolAnyArgs => Ok(command_or_tool_predicate(action)),
@@ -719,6 +727,13 @@ fn exact_call_predicate(action: &ActionRecord) -> Result<PolicyPredicate, Policy
                 params: Vec::new(),
             }),
         }),
+        // File-edit policy matchers are reserved for the next policy-schema expansion. A scoped
+        // approval still narrows to the file-edit surface instead of widening to commands/MCP.
+        Surface::FileEdit => Ok(PolicyPredicate {
+            surface: Some(Surface::FileEdit),
+            command: None,
+            mcp: None,
+        }),
     }
 }
 
@@ -740,6 +755,11 @@ fn command_or_tool_predicate(action: &ActionRecord) -> PolicyPredicate {
                 tool: action.syntactic.tool.clone(),
                 ..McpMatcher::default()
             }),
+        },
+        Surface::FileEdit => PolicyPredicate {
+            surface: Some(Surface::FileEdit),
+            command: None,
+            mcp: None,
         },
     }
 }
@@ -806,6 +826,25 @@ fn action_has_over_budget_match_input(action: &ActionRecord) -> bool {
             .params
             .as_ref()
             .is_some_and(json_has_over_budget_string),
+        Surface::FileEdit => {
+            let syntactic = &action.syntactic;
+            syntactic.paths.as_ref().is_some_and(|paths| {
+                paths
+                    .iter()
+                    .any(|path| path.len() > MAX_PATTERN_MATCH_BYTES)
+            }) || syntactic
+                .diff_summary
+                .as_ref()
+                .is_some_and(|summary| summary.len() > MAX_PATTERN_MATCH_BYTES)
+                || syntactic
+                    .diff_hash
+                    .as_ref()
+                    .is_some_and(|hash| hash.len() > MAX_PATTERN_MATCH_BYTES)
+                || syntactic
+                    .raw
+                    .as_ref()
+                    .is_some_and(|raw| raw.len() > MAX_PATTERN_MATCH_BYTES)
+        }
     }
 }
 

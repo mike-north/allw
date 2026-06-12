@@ -2,11 +2,12 @@
 /**
  * `allw-hook` — the Claude Code **PreToolUse** permission hook (the v1 beachhead integrator).
  *
- * Reads the pending tool call as JSON on stdin, and — for a gated action (a `Bash` command or an
- * `mcp__server__tool` call) — turns it into a phone approval: it builds the `ActionRecord` via the
- * WASM core, requests a human decision over the zero-knowledge relay (`@allw/sdk`), and emits an
- * `allow` only for a **verified** approval. Everything else (non-approval, timeout, missing config,
- * any error) emits `deny`. Non-gated tools pass through as `allow` without bothering the human.
+ * Reads the pending tool call as JSON on stdin, and — for a gated action (`Bash`, a direct
+ * file-edit tool, or an `mcp__server__tool` call) — turns it into a phone approval: it builds the
+ * `ActionRecord` via the WASM core, requests a human decision over the zero-knowledge relay
+ * (`@allw/sdk`), and emits an `allow` only for a **verified** approval. Everything else
+ * (non-approval, timeout, missing config, any error) emits `deny`. Non-gated tools pass through as
+ * `allow` without bothering the human.
  *
  * # Runs as Node + WASM (a hard constraint)
  * This is a `node` entrypoint over the same vendored `.wasm` the SDK uses — never a standalone

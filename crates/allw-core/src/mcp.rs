@@ -115,6 +115,10 @@ pub fn action_from_mcp_tool_call(
             server: Some(server.to_string()),
             tool: Some(tool.to_string()),
             params: Some(params),
+            operation: None,
+            paths: None,
+            diff_summary: None,
+            diff_hash: None,
             // cross-surface display/fallback field
             raw: Some(raw),
         },

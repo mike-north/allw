@@ -38,6 +38,7 @@
 
 use allw_core::{
     action_from_command as core_action_from_command,
+    action_from_file_edit as core_action_from_file_edit,
     action_from_mcp_tool_call as core_action_from_mcp_tool_call,
     compute_request_hash as core_compute_request_hash, decrypt_context as core_decrypt_context,
     encrypt_context as core_encrypt_context, evaluate as core_evaluate,
@@ -988,5 +989,35 @@ pub fn action_from_mcp_tool_call(
 ) -> Result<String, JsError> {
     let params: serde_json::Value = parse_json(params_json, "MCP tool params")?;
     let record = core_action_from_mcp_tool_call(server, tool, params);
+    to_json(&record, "ActionRecord")
+}
+
+/// Builds an [`ActionRecord`](allw_core::ActionRecord) for a file edit, returning it as JSON.
+/// This is the **file_edit** surface (`docs/policy-seam.md` §The three tiers, T1): the core
+/// preserves the operation kind, target paths, compact diff summary, and a hash of the full edit
+/// bytes. The hook calls this for Codex `apply_patch` and Claude Code `Edit`/`Write`/`MultiEdit`
+/// tool calls so file writes cannot bypass human approval by avoiding the command surface.
+///
+/// - `operation` — the edit operation kind, e.g. `"patch"`, `"edit"`, `"write"`, `"multi_edit"`.
+/// - `paths_json` — JSON array of target path strings.
+/// - `diff_summary` — one-line human-facing summary of the change.
+/// - `diff_bytes` — full edit payload whose SHA-256 hash is bound into the record.
+///
+/// # Errors
+///
+/// Throws if `paths_json` is not a JSON array of strings or if it is empty — fail-closed: a file
+/// edit with unknown targets is denied rather than summarized generically.
+#[wasm_bindgen]
+pub fn action_from_file_edit(
+    operation: &str,
+    paths_json: &str,
+    diff_summary: &str,
+    diff_bytes: &str,
+) -> Result<String, JsError> {
+    let paths: Vec<String> = parse_json(paths_json, "file edit paths")?;
+    if paths.is_empty() {
+        return Err(JsError::new("file edit paths must not be empty"));
+    }
+    let record = core_action_from_file_edit(operation, &paths, diff_summary, diff_bytes);
     to_json(&record, "ActionRecord")
 }

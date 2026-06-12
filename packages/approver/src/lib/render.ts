@@ -127,6 +127,16 @@ function reconstructCommand(syntactic: Record<string, unknown>): string | undefi
 function renderActionHeadline(action: ActionRecord): string {
   const syntactic = action.syntactic;
   if (isRecord(syntactic)) {
+    if (action.surface === "file_edit") {
+      const diffSummary = readString(syntactic, "diff_summary");
+      if (diffSummary !== undefined) return diffSummary;
+      const operation = readString(syntactic, "operation");
+      const paths = readStringArray(syntactic, "paths");
+      if (operation !== undefined && paths !== undefined && paths.length > 0) {
+        return `${operation} ${paths.join(", ")}`;
+      }
+    }
+
     const raw = readString(syntactic, "raw");
     if (raw !== undefined) return raw;
 
@@ -139,6 +149,13 @@ function renderActionHeadline(action: ActionRecord): string {
     if (tool !== undefined) {
       const server = readString(syntactic, "server");
       return server !== undefined ? `${server} :: ${tool}` : tool;
+    }
+
+    // File-edit headline when no raw summary is present: "patch src/app.ts".
+    const operation = readString(syntactic, "operation");
+    const paths = readStringArray(syntactic, "paths");
+    if (operation !== undefined && paths !== undefined && paths.length > 0) {
+      return `${operation} ${paths.join(", ")}`;
     }
   }
   return JSON.stringify(syntactic);
@@ -209,6 +226,36 @@ function substrateDetailLines(action: ActionRecord): string[] {
   // MCP params are the entire call payload — show them in full (compact JSON), never elided.
   if ("params" in syntactic && syntactic.params !== undefined && syntactic.params !== null) {
     lines.push(`  Params:     ${JSON.stringify(syntactic.params)}`);
+  }
+
+  // File-edit fields are hash-bound and must be visible: a path or operation hidden behind a
+  // generic summary would let the human sign over a different file mutation than they reviewed.
+  const operation = readString(syntactic, "operation");
+  if (operation !== undefined) {
+    lines.push(`  File edit:  ${operation}`);
+  }
+
+  const paths = readStringArray(syntactic, "paths");
+  if (paths !== undefined && paths.length > 0) {
+    lines.push(`  Paths:      ${paths.join(", ")}`);
+  }
+
+  const diffSummary = readString(syntactic, "diff_summary");
+  if (diffSummary !== undefined) {
+    lines.push(`  Diff summary: ${diffSummary}`);
+  }
+
+  const diffHash = readString(syntactic, "diff_hash");
+  if (diffHash !== undefined) {
+    lines.push(`  Diff hash:  ${diffHash}`);
+  }
+
+  const rawEdit = action.surface === "file_edit" ? readString(syntactic, "raw") : undefined;
+  if (rawEdit !== undefined) {
+    lines.push("  File edit content:");
+    for (const line of rawEdit.split(/\r?\n/)) {
+      lines.push(`    ${line}`);
+    }
   }
 
   return lines;

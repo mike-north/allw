@@ -33,7 +33,7 @@ Add the hook to `~/.codex/hooks.json` or a trusted project `.codex/hooks.json`:
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|mcp__.*",
+        "matcher": "Bash|apply_patch|mcp__.*",
         "hooks": [
           {
             "type": "command",

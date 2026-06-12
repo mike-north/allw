@@ -130,6 +130,39 @@ test("MCP tools are gated through the shared ActionRecord builder", async () => 
   });
 });
 
+test("Codex apply_patch is gated through the file_edit ActionRecord builder", async () => {
+  const wasm = await loadWasm();
+  const approver = recording("approved");
+  const patch = [
+    "*** Begin Patch",
+    "*** Update File: src/app.ts",
+    "@@",
+    "-old",
+    "+new",
+    "*** End Patch",
+    "",
+  ].join("\n");
+
+  const output = await decide(
+    {
+      hookEventName: "PreToolUse",
+      toolName: "apply_patch",
+      toolInput: { patch },
+      toolUseId: "patch-call-1",
+    },
+    { wasm, config: CONFIG, requestApproval: approver.fn },
+    HOSTNAME,
+  );
+
+  assert.equal(decisionOf(output), "allow");
+  assert.equal(approver.calls.length, 1, "apply_patch must request approval");
+  assert.equal(approver.calls[0].action.surface, "file_edit");
+  assert.equal(approver.calls[0].action.syntactic.operation, "patch");
+  assert.deepEqual(approver.calls[0].action.syntactic.paths, ["src/app.ts"]);
+  assert.equal(typeof approver.calls[0].action.syntactic.diff_hash, "string");
+  assert.deepEqual(approver.calls[0].chain, ["codex:tool_use_id:patch-call-1"]);
+});
+
 test("non-gated Codex tools pass through without config-time approval", async () => {
   const wasm = await loadWasm();
   const approver = recording("denied");
