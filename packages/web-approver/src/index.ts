@@ -145,9 +145,7 @@ export class WebApproverController {
   }
 
   inbox(): readonly ApprovalListItem[] {
-    return this.#list(["pending", "deciding", "expired", "unverified"]).filter(
-      (item) => item.status === "pending" || item.status === "deciding",
-    );
+    return this.#list(["pending", "deciding", "expired", "unverified"]);
   }
 
   history(): readonly ApprovalListItem[] {

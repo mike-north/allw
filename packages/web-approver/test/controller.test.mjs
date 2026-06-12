@@ -133,6 +133,11 @@ test("tampered or undecryptable context fails closed as unverified and cannot ap
   const detail = controller.detail("req-tampered");
   assert.equal(detail?.status, "unverified");
   assert.equal(detail?.denyOnly, true);
+  assert.deepEqual(
+    controller.inbox().map((item) => item.id),
+    ["req-tampered"],
+    "unverified requests stay visible as blocked inbox work",
+  );
   assert.match(detail?.verificationError ?? "", /hash mismatch/);
   assert.equal(controller.canApprove("req-tampered"), false);
   await assert.rejects(() => controller.decide("req-tampered", "approved"), /not approvable/);
@@ -151,6 +156,11 @@ test("expired requests are visible but cannot be approved or signed", async () =
   await controller.sync([expired]);
 
   assert.equal(controller.detail("req-expired")?.status, "expired");
+  assert.deepEqual(
+    controller.inbox().map((item) => item.id),
+    ["req-expired"],
+    "expired requests stay visible as blocked inbox work",
+  );
   assert.equal(controller.canApprove("req-expired"), false);
   await assert.rejects(() => controller.decide("req-expired", "approved"), /expired/);
   assert.equal(fakeRuntime.signCalls.length, 0, "expired requests are never signed");
