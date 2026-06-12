@@ -6,12 +6,21 @@ import uniffi.allw_uniffi.issueDeviceCertJson
 import uniffi.allw_uniffi.signVerdictJson
 import uniffi.allw_uniffi.verifyVerdictJson
 import uniffi.allw_uniffi.AllwFfiException
-import org.json.JSONObject
 import java.util.Base64
 
 // Minimal base64url helper (no padding, url-safe alphabet).
 private fun base64urlEncode(bytes: ByteArray): String =
     Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
+
+// Smoke-grade extraction of a top-level JSON string value. CI's `kotlinc` classpath has no
+// `org.json`, so we avoid an external JSON dependency (mirroring smoke.swift, which uses only
+// Foundation). These UniFFI outputs are simple objects whose string values are base64url/ascii
+// with no embedded quotes, so a non-greedy quoted capture is sufficient.
+private fun jsonStringField(json: String, key: String): String {
+    val match = Regex("\"" + Regex.escape(key) + "\"\\s*:\\s*\"([^\"]*)\"").find(json)
+        ?: error("key $key not found in JSON")
+    return match.groupValues[1]
+}
 
 fun main() {
     // ── Existing: action + hash checks ──────────────────────────────────────
@@ -28,8 +37,7 @@ fun main() {
     val accountSeed = base64urlEncode(ByteArray(32) { 11 })
 
     val deviceKeysJson = deriveDeviceKeysJson(deviceSeed, deviceSeed)
-    val deviceKeys = JSONObject(deviceKeysJson)
-    val deviceSigningPubkey = deviceKeys.getString("device_signing_pubkey_b64")
+    val deviceSigningPubkey = jsonStringField(deviceKeysJson, "device_signing_pubkey_b64")
 
     val accountRootPubkey = deriveSigningPubkeyB64(accountSeed)
 
@@ -48,17 +56,16 @@ fun main() {
 
     val verdict = signVerdictJson(unsignedVerdict, deviceSeed, nonce)
     val verified = verifyVerdictJson(verdict, request, context, accountRootPubkey, 1_700_000_002_000L)
-    val verifiedObj = JSONObject(verified)
-    check(verifiedObj.getString("device_id") == "dev-1") {
+    check(verified.contains("\"device_id\":\"dev-1\"")) {
         "sign→verify round-trip failed: device_id mismatch"
     }
 
     // ── New (PM blocker 1b): tampered verdict must throw ─────────────────────
     // Mutate request_hash to all-zero bytes (32 bytes base64url-encoded).
     val zeroHash = base64urlEncode(ByteArray(32) { 0 })
-    val verdictObj = JSONObject(verdict)
-    verdictObj.put("request_hash", zeroHash)
-    val tamperedVerdict = verdictObj.toString()
+    val tamperedVerdict =
+        Regex("\"request_hash\"\\s*:\\s*\"[^\"]*\"").replaceFirst(verdict, "\"request_hash\":\"$zeroHash\"")
+    check(tamperedVerdict != verdict) { "tamper precondition failed: request_hash not present in signed verdict" }
 
     var caughtExpectedError = false
     try {
