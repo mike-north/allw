@@ -107,6 +107,15 @@ The `crates/allw-uniffi` shell exposes the same JSON-string wire contract as the
 generated Swift/Kotlin smoke tests via `scripts/uniffi-smoke.sh`, so native bindings prove they can call the
 shared core rather than reimplementing crypto.
 
+Native binding names prefer app-readable verbs and explicit wire suffixes: JSON-returning helpers end in `_json`,
+base64url-returning helpers end in `_b64`, and the UniFFI `derive_signing_pubkey_b64` helper is the native
+counterpart to the WASM `ed25519_public_key(seed_b64)` helper. The different names are API-surface convention,
+not different crypto.
+
+Any native seed derivation helper that accepts both signing and encryption seeds requires two independently-random
+32-byte seeds. Tests may use fixed deterministic seeds, but production apps must keep those seeds in platform
+custody and must not reuse one seed for both Ed25519 signing and X25519 encryption.
+
 | Platform | UI stack                                 | Native surfaces we exploit                                                                                                                                                                                                                       | Keystore                   |
 | -------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------- |
 | iOS      | Swift / SwiftUI                          | Interactive notifications (Approve/Deny on lock screen) · **Live Activity + Dynamic Island** (pending + expiry) · **widgets** (WidgetKit) · **App Intents / Siri** (voice, Action Button, Spotlight) · Time-Sensitive/Critical · **Apple Watch** | Secure Enclave + Keychain  |

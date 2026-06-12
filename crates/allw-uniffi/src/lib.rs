@@ -12,6 +12,7 @@ use allw_core::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 uniffi::setup_scaffolding!();
 
@@ -67,19 +68,27 @@ fn to_json<T: Serialize>(value: &T, what: &str) -> Result<String, AllwFfiError> 
         .map_err(|e| AllwFfiError::failure(format!("failed to serialize {what}: {e}")))
 }
 
-fn decode_b64_32(value: &str, what: &str) -> Result<[u8; 32], AllwFfiError> {
-    let bytes = URL_SAFE_NO_PAD
-        .decode(value)
-        .map_err(|e| AllwFfiError::failure(format!("{what} is not valid base64url: {e}")))?;
-    bytes
-        .try_into()
-        .map_err(|_| AllwFfiError::failure(format!("{what} must decode to exactly 32 bytes")))
+fn decode_b64_32(value: &str, what: &str) -> Result<Zeroizing<[u8; 32]>, AllwFfiError> {
+    let bytes = Zeroizing::new(
+        URL_SAFE_NO_PAD
+            .decode(value)
+            .map_err(|e| AllwFfiError::failure(format!("{what} is not valid base64url: {e}")))?,
+    );
+    if bytes.len() != 32 {
+        return Err(AllwFfiError::failure(format!(
+            "{what} must decode to exactly 32 bytes"
+        )));
+    }
+
+    let mut out = [0_u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(Zeroizing::new(out))
 }
 
-fn decode_b64_vec(value: &str, what: &str) -> Result<Vec<u8>, AllwFfiError> {
-    URL_SAFE_NO_PAD
-        .decode(value)
-        .map_err(|e| AllwFfiError::failure(format!("{what} is not valid base64url: {e}")))
+fn decode_b64_vec(value: &str, what: &str) -> Result<Zeroizing<Vec<u8>>, AllwFfiError> {
+    Ok(Zeroizing::new(URL_SAFE_NO_PAD.decode(value).map_err(
+        |e| AllwFfiError::failure(format!("{what} is not valid base64url: {e}")),
+    )?))
 }
 
 #[uniffi::export]
@@ -101,6 +110,11 @@ pub fn compute_request_hash_b64(
     Ok(URL_SAFE_NO_PAD.encode(core_compute_request_hash(&context, expires_at)))
 }
 
+/// Derive native app public keys from two independently-random 32-byte seeds.
+///
+/// The signing seed and encryption seed are deliberately separate custody inputs. Test fixtures may
+/// use fixed bytes for reproducibility, but production callers must generate them independently
+/// and keep the private seed material in platform custody (#23).
 #[uniffi::export]
 pub fn derive_device_keys_json(
     device_signing_seed_b64: String,
@@ -120,6 +134,10 @@ pub fn derive_device_keys_json(
     )
 }
 
+/// Derive the Ed25519 signing public key for a 32-byte seed.
+///
+/// This is named for native binding readability; it is the UniFFI counterpart to the WASM
+/// `ed25519_public_key(seed_b64)` helper documented in `docs/architecture.md`.
 #[uniffi::export]
 pub fn derive_signing_pubkey_b64(signing_seed_b64: String) -> Result<String, AllwFfiError> {
     let seed = decode_b64_32(&signing_seed_b64, "signing_seed_b64")?;
@@ -163,7 +181,7 @@ pub fn sign_verdict_json(
     let unsigned = UnsignedVerdict {
         v: unsigned_json.v,
         request_id: unsigned_json.request_id,
-        request_hash,
+        request_hash: *request_hash,
         decision: unsigned_json.decision,
         decided_at: unsigned_json.decided_at,
         approver: unsigned_json.approver,

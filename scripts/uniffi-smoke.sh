@@ -44,10 +44,12 @@ swiftc \
 DYLD_LIBRARY_PATH="$LIB_DIR" LD_LIBRARY_PATH="$LIB_DIR" "$TARGET_DIR/swift-smoke"
 
 if command -v kotlinc >/dev/null 2>&1 && command -v java >/dev/null 2>&1; then
-  JNA_JAR="${JNA_JAR:-$TARGET_DIR/jna.jar}"
+  JNA_VERSION="${JNA_VERSION:-5.17.0}"
+  JNA_JAR="${JNA_JAR:-$TARGET_DIR/jna-$JNA_VERSION.jar}"
+  mkdir -p "$(dirname "$JNA_JAR")"
   if [[ ! -f "$JNA_JAR" ]]; then
     curl --fail --location --silent --show-error \
-      "https://repo1.maven.org/maven2/net/java/dev/jna/jna/5.17.0/jna-5.17.0.jar" \
+      "https://repo1.maven.org/maven2/net/java/dev/jna/jna/$JNA_VERSION/jna-$JNA_VERSION.jar" \
       --output "$JNA_JAR"
   fi
   kotlinc $(find "$TARGET_DIR/kotlin" -name '*.kt' -print) "$ROOT/crates/allw-uniffi/tests/Smoke.kt" \

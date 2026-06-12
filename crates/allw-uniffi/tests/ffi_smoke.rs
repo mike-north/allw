@@ -14,16 +14,18 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde_json::json;
 
 const DEVICE_SEED: [u8; 32] = [7; 32];
+const DEVICE_ENCRYPTION_SEED: [u8; 32] = [8; 32];
 const ACCOUNT_SEED: [u8; 32] = [11; 32];
 
 /// Build a complete sign→verify fixture and return (verdict_json, request_json, context_json,
 /// account_root_pubkey_b64, now_ms).
 fn build_signed_verdict() -> (String, String, String, String, i64) {
     let device_seed = URL_SAFE_NO_PAD.encode(DEVICE_SEED);
+    let device_encryption_seed = URL_SAFE_NO_PAD.encode(DEVICE_ENCRYPTION_SEED);
     let account_seed = URL_SAFE_NO_PAD.encode(ACCOUNT_SEED);
 
     let device_keys: serde_json::Value = serde_json::from_str(
-        &derive_device_keys_json(device_seed.clone(), device_seed.clone()).unwrap(),
+        &derive_device_keys_json(device_seed.clone(), device_encryption_seed).unwrap(),
     )
     .unwrap();
     let device_signing_pubkey = device_keys["device_signing_pubkey_b64"].as_str().unwrap();
@@ -102,9 +104,10 @@ fn command_action_and_request_hash_round_trip_over_json_strings() {
 #[test]
 fn sign_and_verify_verdict_through_uniffi_json_surface() {
     let device_seed = URL_SAFE_NO_PAD.encode(DEVICE_SEED);
+    let device_encryption_seed = URL_SAFE_NO_PAD.encode(DEVICE_ENCRYPTION_SEED);
     let account_seed = URL_SAFE_NO_PAD.encode(ACCOUNT_SEED);
     let device_keys = serde_json::from_str::<serde_json::Value>(
-        &derive_device_keys_json(device_seed.clone(), device_seed.clone()).unwrap(),
+        &derive_device_keys_json(device_seed.clone(), device_encryption_seed).unwrap(),
     )
     .unwrap();
     let device_signing_pubkey = device_keys["device_signing_pubkey_b64"].as_str().unwrap();
@@ -163,6 +166,22 @@ fn sign_and_verify_verdict_through_uniffi_json_surface() {
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&verified).unwrap()["device_id"],
         "dev-1"
+    );
+}
+
+#[test]
+fn device_key_derivation_uses_independent_signing_and_encryption_seeds() {
+    let device_seed = URL_SAFE_NO_PAD.encode(DEVICE_SEED);
+    let device_encryption_seed = URL_SAFE_NO_PAD.encode(DEVICE_ENCRYPTION_SEED);
+
+    let device_keys = serde_json::from_str::<serde_json::Value>(
+        &derive_device_keys_json(device_seed, device_encryption_seed).unwrap(),
+    )
+    .unwrap();
+
+    assert_ne!(
+        device_keys["device_signing_pubkey_b64"], device_keys["device_encryption_pubkey_b64"],
+        "native callers must supply independently-random signing and encryption seeds"
     );
 }
 
