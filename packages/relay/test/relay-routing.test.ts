@@ -21,7 +21,7 @@
  */
 
 import { SELF, env, runInDurableObject } from "cloudflare:test";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { AccountRelay } from "../src/index.js";
 
 // ---------------------------------------------------------------------------
@@ -371,6 +371,152 @@ describe("AccountRelay — cross-device coordination", () => {
 
     const polled = await get<{ verdict: Record<string, unknown> }>(acct, "/requests/req-dedupe-1");
     expect(polled.data.verdict).toEqual(winning); // the first decision stands
+  });
+
+  it("fans out to only one connection per visible surface", async () => {
+    const acct = "acct-surface-dedupe";
+    await enrollDevice(acct);
+    const deviceId = await firstDeviceId(acct);
+
+    // These two sockets represent distinct enrolled devices/transports that would notify the same
+    // physical screen, e.g. native macOS plus iPhone notification mirroring on that Mac.
+    const nativeMac = await connectWs(acct, `/devices/${deviceId}/connect?surface_id=mac-screen`);
+    const mirroredPhone = await connectWs(
+      acct,
+      `/devices/${deviceId}/connect?surface_id=mac-screen`,
+    );
+    const phone = await connectWs(acct, `/devices/${deviceId}/connect?surface_id=phone-screen`);
+
+    const submit = await post<{ delivered_to: number }>(
+      acct,
+      "/requests",
+      makeEnvelope("req-surface-1"),
+    );
+    expect(submit.data.delivered_to).toBe(2);
+
+    expect((await nativeMac.next()).request_id).toBe("req-surface-1");
+    expect((await phone.next()).request_id).toBe("req-surface-1");
+    await expect(mirroredPhone.next(500)).rejects.toThrow(/timeout/);
+  });
+
+  it("continues same-surface fan-out when the first tagged socket cannot be sent to", async () => {
+    const staleMac = { send: () => void 0 } as unknown as WebSocket;
+    const liveMacMessages: string[] = [];
+    const liveMac = {
+      send: (message: string) => liveMacMessages.push(message),
+    } as unknown as WebSocket;
+    const phoneMessages: string[] = [];
+    const phone = {
+      send: (message: string) => phoneMessages.push(message),
+    } as unknown as WebSocket;
+
+    const tags = new Map<WebSocket, string[]>([
+      [staleMac, ["device", "surface:mac-screen"]],
+      [liveMac, ["device", "surface:mac-screen"]],
+      [phone, ["device", "surface:phone-screen"]],
+    ]);
+
+    const relay = Object.create(AccountRelay.prototype) as {
+      ctx: Pick<DurableObjectState, "getTags" | "getWebSockets">;
+      sendRequestToOneSocketPerSurface(requestId: string, envelope: unknown): number;
+    };
+    relay.ctx = {
+      getTags: (ws: WebSocket) => tags.get(ws) ?? [],
+      getWebSockets: (tag: string) => (tag === "device" ? [staleMac, liveMac, phone] : []),
+    } as Pick<DurableObjectState, "getTags" | "getWebSockets">;
+
+    // A closing hibernation socket can still be returned by the tag index but reject `send()`. It
+    // must not claim the visible surface unless the relay actually sends the request to it.
+    vi.spyOn(staleMac, "send").mockImplementation(() => {
+      throw new Error("socket already closing");
+    });
+
+    const delivered = relay.sendRequestToOneSocketPerSurface(
+      "req-surface-stale-1",
+      makeEnvelope("req-surface-stale-1"),
+    );
+
+    expect(delivered).toBe(2);
+    expect(JSON.parse(liveMacMessages[0] ?? "{}")).toMatchObject({
+      type: "request",
+      request_id: "req-surface-stale-1",
+    });
+    expect(JSON.parse(phoneMessages[0] ?? "{}")).toMatchObject({
+      type: "request",
+      request_id: "req-surface-stale-1",
+    });
+  });
+
+  it("flushes queued requests to only one reconnecting connection per visible surface", async () => {
+    const acct = "acct-surface-flush";
+    await enrollDevice(acct);
+    const deviceId = await firstDeviceId(acct);
+
+    await post(acct, "/requests", makeEnvelope("req-surface-queued"));
+
+    const nativeMac = await connectWs(acct, `/devices/${deviceId}/connect?surface_id=mac-screen`);
+    const mirroredPhone = await connectWs(
+      acct,
+      `/devices/${deviceId}/connect?surface_id=mac-screen`,
+    );
+    const phone = await connectWs(acct, `/devices/${deviceId}/connect?surface_id=phone-screen`);
+
+    expect((await nativeMac.next()).request_id).toBe("req-surface-queued");
+    expect((await phone.next()).request_id).toBe("req-surface-queued");
+    await expect(mirroredPhone.next(500)).rejects.toThrow(/timeout/);
+  });
+
+  it("flushes queued requests when only stale sockets exist for the reconnecting surface", async () => {
+    const staleMac = {
+      readyState: WebSocket.CLOSING,
+      send: () => {
+        throw new Error("socket already closing");
+      },
+    } as unknown as WebSocket;
+    const envelope = makeEnvelope("req-surface-stale-queued");
+
+    const relay = Object.create(AccountRelay.prototype) as {
+      ctx: Pick<DurableObjectState, "acceptWebSocket" | "getWebSockets">;
+      sql: Pick<SqlStorage, "exec">;
+      handleDeviceConnect(deviceId: string, request: Request): Response;
+    };
+    relay.ctx = {
+      acceptWebSocket: (ws: WebSocket) => ws.accept(),
+      getWebSockets: (tag: string) => (tag === "surface:mac-screen" ? [staleMac] : []),
+    } as Pick<DurableObjectState, "acceptWebSocket" | "getWebSockets">;
+    relay.sql = {
+      exec: (query: string) => {
+        if (query.includes("FROM device")) return [{ device_id: "dev-stale-flush" }];
+        if (query.includes("FROM request")) {
+          return [{ request_id: "req-surface-stale-queued", envelope: JSON.stringify(envelope) }];
+        }
+        return [];
+      },
+    } as unknown as Pick<SqlStorage, "exec">;
+
+    const response = relay.handleDeviceConnect(
+      "dev-stale-flush",
+      new Request(
+        "https://relay.allw.test/acct/devices/dev-stale-flush/connect?surface_id=mac-screen",
+      ),
+    );
+    expect(response.status).toBe(101);
+    expect(response.webSocket).toBeDefined();
+
+    const client = response.webSocket as WebSocket;
+    const queued = new Promise<WsMessage>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("WebSocket message timeout")), 500);
+      client.addEventListener("message", (event: MessageEvent) => {
+        clearTimeout(timeout);
+        resolve(JSON.parse(event.data as string) as WsMessage);
+      });
+    });
+    client.accept();
+
+    await expect(queued).resolves.toMatchObject({
+      type: "request",
+      request_id: "req-surface-stale-queued",
+    });
   });
 });
 

@@ -224,6 +224,7 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 // An integrator waiter carries `integrator:<request_id>` (targeted verdict push).
 const DEVICE_TAG = "device";
 const deviceTag = (deviceId: string): string => `device:${deviceId}`;
+const surfaceTag = (surfaceId: string): string => `surface:${surfaceId}`;
 const integratorTag = (requestId: string): string => `integrator:${requestId}`;
 
 // The exact, exhaustive set of ApprovalRequest envelope keys the relay accepts (contract.md
@@ -235,6 +236,14 @@ function json(data: unknown, status = 200): Response {
     status,
     headers: { "Content-Type": "application/json" },
   });
+}
+
+/** Validate a caller-declared visible surface id for cross-transport notification dedupe. */
+function parseSurfaceId(request: Request): string | null | undefined {
+  const value = new URL(request.url).searchParams.get("surface_id");
+  if (value === null) return undefined;
+  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(value)) return null;
+  return value;
 }
 
 // ---------------------------------------------------------------------------
@@ -388,7 +397,7 @@ export class AccountRelay implements DurableObject {
       if (!isWebSocketUpgrade(request)) {
         return json({ error: "WebSocket upgrade required" }, 426);
       }
-      return this.handleDeviceConnect(path1);
+      return this.handleDeviceConnect(path1, request);
     }
 
     // POST /requests — integrator submits an ApprovalRequest envelope (ciphertext + routing).
@@ -655,45 +664,58 @@ export class AccountRelay implements DurableObject {
    *
    * Opens a hibernatable presence socket for an enrolled device and immediately flushes every
    * still-pending request (the offline queue): a device that was offline when a request arrived
-   * receives it on reconnect. Returns 404 if the device is not enrolled (a request without a
-   * WebSocket upgrade header is rejected earlier, at the router, with 426).
+   * receives it on reconnect. `surface_id` is an optional visible-screen/topology id used to avoid
+   * double-prompting one screen via multiple transports (for example native macOS plus iPhone
+   * Mirroring). Returns 404 if the device is not enrolled, 400 for a malformed `surface_id` (a
+   * request without a WebSocket upgrade header is rejected earlier, at the router, with 426).
    *
    * Protocol (relay → device): `{ type: "request", request_id, envelope }` (ciphertext to fetch),
    * `{ type: "retract", request_id }` (another surface resolved it).
    * Protocol (device → relay): `{ type: "verdict", request_id, verdict }` (signed decision).
    */
-  private handleDeviceConnect(deviceId: string): Response {
+  private handleDeviceConnect(deviceId: string, request: Request): Response {
     const enrolled = [
       ...this.sql.exec<DeviceRow>(`SELECT device_id FROM device WHERE device_id = ?`, deviceId),
     ];
     if (enrolled.length === 0) {
       return json({ error: "device not enrolled" }, 404);
     }
+    const surfaceId = parseSurfaceId(request);
+    if (surfaceId === null) {
+      return json({ error: "surface_id must be 1-128 URL-safe identifier chars" }, 400);
+    }
+    const shouldFlushOfflineQueue =
+      surfaceId === undefined || !this.hasOpenSocketOnSurface(surfaceId);
 
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
     // Hibernation: the DO may be evicted while the socket stays open; handlers below re-attach it.
-    this.ctx.acceptWebSocket(server, [DEVICE_TAG, deviceTag(deviceId)]);
+    const tags = [DEVICE_TAG, deviceTag(deviceId)];
+    if (surfaceId !== undefined) tags.push(surfaceTag(surfaceId));
+    this.ctx.acceptWebSocket(server, tags);
 
-    // Flush the offline queue: every still-live pending request, oldest first. Fail-closed: a
-    // request that expired while queued is excluded (`expires_at > now`), so a dead request is
-    // never re-pushed to a reconnecting device. (Submit fan-out needs no such guard — `handleSubmit`
-    // rejects an already-expired `expires_at`, so a freshly stored request is always future-dated.)
-    const now = Date.now();
-    const pending = [
-      ...this.sql.exec<RequestRow>(
-        `SELECT request_id, envelope FROM request
-         WHERE status = 'pending' AND expires_at > ? ORDER BY created_at ASC`,
-        now,
-      ),
-    ];
-    for (const p of pending) {
-      trySendJson(server, {
-        type: "request",
-        request_id: p.request_id,
-        envelope: JSON.parse(p.envelope) as unknown,
-      });
+    if (shouldFlushOfflineQueue) {
+      // Flush the offline queue: every still-live pending request, oldest first. Fail-closed: a
+      // request that expired while queued is excluded (`expires_at > now`), so a dead request is
+      // never re-pushed to a reconnecting device. (Submit fan-out needs no such guard —
+      // `handleSubmit` rejects an already-expired `expires_at`, so a freshly stored request is
+      // always future-dated.)
+      const now = Date.now();
+      const pending = [
+        ...this.sql.exec<RequestRow>(
+          `SELECT request_id, envelope FROM request
+           WHERE status = 'pending' AND expires_at > ? ORDER BY created_at ASC`,
+          now,
+        ),
+      ];
+      for (const p of pending) {
+        trySendJson(server, {
+          type: "request",
+          request_id: p.request_id,
+          envelope: JSON.parse(p.envelope) as unknown,
+        });
+      }
     }
 
     return new Response(null, { status: 101, webSocket: client });
@@ -768,11 +790,7 @@ export class AccountRelay implements DurableObject {
     }
     await this.armExpiryAlarm();
 
-    // Fan out to every online device.
-    let delivered = 0;
-    for (const ws of this.ctx.getWebSockets(DEVICE_TAG)) {
-      if (trySendJson(ws, { type: "request", request_id: id, envelope })) delivered++;
-    }
+    const delivered = this.sendRequestToOneSocketPerSurface(id, envelope);
 
     return json({ request_id: id, status: "pending", delivered_to: delivered }, 202);
   }
@@ -900,6 +918,41 @@ export class AccountRelay implements DurableObject {
       if (tag.startsWith("device:")) return tag.slice("device:".length);
     }
     return null;
+  }
+
+  /** Resolve the visible surface tag for a hibernation socket. */
+  private surfaceIdForSocket(ws: WebSocket): string | null {
+    for (const tag of this.ctx.getTags(ws)) {
+      if (tag.startsWith("surface:")) return tag.slice("surface:".length);
+    }
+    return null;
+  }
+
+  /** True when a same-surface peer is still open enough to own queued reconnect delivery. */
+  private hasOpenSocketOnSurface(surfaceId: string): boolean {
+    for (const ws of this.ctx.getWebSockets(surfaceTag(surfaceId))) {
+      // Hibernation tag indexes can briefly retain closing sockets; those must not suppress the
+      // reconnecting live socket's offline-queue flush.
+      if (ws.readyState === WebSocket.OPEN) return true;
+    }
+    return false;
+  }
+
+  /** Send a request to at most one live socket per visible surface. */
+  private sendRequestToOneSocketPerSurface(requestId: string, envelope: unknown): number {
+    const deliveredSurfaces = new Set<string>();
+    let delivered = 0;
+    for (const ws of this.ctx.getWebSockets(DEVICE_TAG)) {
+      const surfaceId = this.surfaceIdForSocket(ws);
+      if (surfaceId !== null && deliveredSurfaces.has(surfaceId)) continue;
+      if (trySendJson(ws, { type: "request", request_id: requestId, envelope })) {
+        delivered++;
+        // Only a successful send claims the visible surface; stale closing sockets must not block
+        // a later live socket for the same screen/transport group.
+        if (surfaceId !== null) deliveredSurfaces.add(surfaceId);
+      }
+    }
+    return delivered;
   }
 
   // ---------------------------------------------------------------------------
