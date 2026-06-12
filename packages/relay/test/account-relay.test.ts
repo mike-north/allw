@@ -226,6 +226,22 @@ describe("AccountRelay — pairing", () => {
     expect(goodAuth.status).toBe(201);
   });
 
+  it("fails closed when a legacy pairing row has no stored auth-token hash", async () => {
+    const acct = "acct-pairing-null-auth-hash";
+    const start = await startPairing(acct);
+
+    await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(acct)), (instance) => {
+      const relay = instance as unknown as { sql: SqlStorage };
+      relay.sql.exec(`UPDATE pairing SET auth_token_hash = NULL WHERE code = ?`, start.code);
+    });
+
+    const noAuth = await post<{ error: string }>(acct, "/pairing/complete", {
+      code: start.code,
+      pubkey: VALID_PUBKEY_1,
+    });
+    expect(noAuth.status).toBe(401);
+  });
+
   it("stores push tokens supplied while completing pairing without exposing them in /devices", async () => {
     const acct = "acct-pairing-push-token";
     const startResp = await startPairing(acct, "Phone");
@@ -582,6 +598,22 @@ describe("AccountRelay — device revocation", () => {
       bearer("wrong-device-token"),
     );
     expect(wrongAuth.status).toBe(403);
+  });
+
+  it("rejects another enrolled device's real token when revoking the target device", async () => {
+    const acct = "acct-revoke-token-scoped-to-device";
+    const deviceA = await enrollDevice(acct);
+    const startB = await startPairing(acct);
+    const completeB = await completePairing(acct, startB, { pubkey: VALID_PUBKEY_2 });
+    expect(completeB.status).toBe(201);
+
+    const crossDevice = await post<{ error: string }>(
+      acct,
+      `/devices/${deviceA.device_id}/revoke`,
+      {},
+      bearer(completeB.data.device_auth_token),
+    );
+    expect(crossDevice.status).toBe(403);
   });
 
   it("deletes registered push tokens when revoking a device", async () => {

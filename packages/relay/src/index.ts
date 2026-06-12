@@ -211,7 +211,7 @@ function authError(status: 401 | 403): Response {
 }
 
 async function tokenMatches(storedHash: string | null, token: string | null): Promise<boolean> {
-  if (storedHash === null) return true;
+  if (storedHash === null) return false;
   if (token === null) return false;
   return timingSafeEqual(storedHash, await hashAuthToken(token));
 }
@@ -579,7 +579,9 @@ export class AccountRelay implements DurableObject {
     request: Request,
     storedHash: string | null | undefined,
   ): Promise<Response | null> {
-    if (storedHash === null || storedHash === undefined) return null;
+    // A missing hash is a legacy/migration row, not proof of authorization. Fail closed and require
+    // re-pairing or re-submission so no endpoint silently falls back to unauthenticated access.
+    if (storedHash === null || storedHash === undefined) return authError(401);
     const token = bearerToken(request);
     if (token === null) return authError(401);
     return (await tokenMatches(storedHash, token)) ? null : authError(403);

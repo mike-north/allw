@@ -64,6 +64,17 @@ const defaultLogger: WatchLogger = {
   },
 };
 
+/** Remove relay bearer capabilities from URLs before printing them to terminals or captured logs. */
+function redactAuthQuery(url: string): string {
+  try {
+    const parsed = new URL(url);
+    parsed.searchParams.delete("auth");
+    return parsed.toString();
+  } catch {
+    return url.split("?")[0] ?? url;
+  }
+}
+
 /** Parse a raw WS message payload into our typed inbound union; returns null if unrecognized. */
 function parseInbound(data: unknown): DeviceInboundMessage | null {
   const text = typeof data === "string" ? data : new TextDecoder().decode(data as ArrayBuffer);
@@ -196,7 +207,7 @@ export async function runWatch(
   }
 
   const url = deviceConnectWsUrl(relayUrl, accountId, deviceId, deviceAuthToken);
-  log.info(`Connecting to ${url} …`);
+  log.info(`Connecting to ${redactAuthQuery(url)} …`);
   // TODO(#41 v0): no reconnect/backoff — on close the loop simply exits (re-run `watch` to
   // reconnect). A resilient reconnect-with-backoff loop is out of scope for the v0 skeleton.
   const ws = deps.connect(url);

@@ -357,12 +357,16 @@ Current relay mechanics cover the registry subset and #89 adds relay-scoped endp
 
 Endpoint authentication and authorization rules:
 
-- starting pairing remains an account-owner ceremony boundary;
+- `POST /pairing/start` and `POST /requests` are deliberately unauthenticated token issuers:
+  pairing start is an account-owner ceremony boundary, while request submit returns a per-request read
+  capability that can only tighten the caller's authority;
 - completing pairing requires the code plus the `pairing_auth_token`;
 - actor enrollment requires an enrolled device token;
 - device revocation requires the target device token;
 - device presence requires the target device token, passed as a bearer header or `auth` query on WebSocket upgrade;
 - request polling and wait sockets require the `request_auth_token` returned by `POST /requests`;
+- legacy rows without a stored relay auth-token hash fail closed with `401`; devices must re-pair and pending
+  requests must be re-submitted rather than becoming unauthenticated;
 - serving account state requires integrity but not confidentiality, because it contains public keys and metadata.
 
 ## Test Implications

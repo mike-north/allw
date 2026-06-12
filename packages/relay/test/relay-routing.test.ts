@@ -24,6 +24,7 @@ import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, it, expect, vi } from "vitest";
 import { AccountRelay } from "../src/index.js";
 import type { PushTransportRegistry } from "../src/push.js";
+import type { SqlStorage } from "@cloudflare/workers-types";
 
 // ---------------------------------------------------------------------------
 // Fixtures (deterministic; never `Date.now()` in data — see fixed-dates rule)
@@ -156,6 +157,14 @@ interface SubmitResult {
 
 const deviceAuthTokens = new Map<string, string>();
 const requestAuthTokens = new Map<string, string>();
+
+async function testAuthTokenHash(token: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
+  return btoa(String.fromCharCode(...new Uint8Array(digest)))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
 
 function tokenKey(accountId: string, id: string): string {
   return `${accountId}\0${id}`;
@@ -680,6 +689,7 @@ describe("AccountRelay — cross-device coordination", () => {
       },
     } as unknown as WebSocket;
     const envelope = makeEnvelope("req-surface-stale-queued");
+    const authTokenHash = await testAuthTokenHash("stale-device-token");
 
     const relay = Object.create(AccountRelay.prototype) as {
       ctx: Pick<DurableObjectState, "acceptWebSocket" | "getWebSockets">;
@@ -692,7 +702,9 @@ describe("AccountRelay — cross-device coordination", () => {
     } as Pick<DurableObjectState, "acceptWebSocket" | "getWebSockets">;
     relay.sql = {
       exec: (query: string) => {
-        if (query.includes("FROM device")) return [{ device_id: "dev-stale-flush" }];
+        if (query.includes("FROM device")) {
+          return [{ device_id: "dev-stale-flush", auth_token_hash: authTokenHash }];
+        }
         if (query.includes("FROM request")) {
           return [{ request_id: "req-surface-stale-queued", envelope: JSON.stringify(envelope) }];
         }
@@ -703,7 +715,7 @@ describe("AccountRelay — cross-device coordination", () => {
     const response = await relay.handleDeviceConnect(
       "dev-stale-flush",
       new Request(
-        "https://relay.allw.test/acct/devices/dev-stale-flush/connect?surface_id=mac-screen",
+        "https://relay.allw.test/acct/devices/dev-stale-flush/connect?surface_id=mac-screen&auth=stale-device-token",
       ),
     );
     expect(response.status).toBe(101);
@@ -849,6 +861,53 @@ describe("AccountRelay — endpoint authentication", () => {
     expect(ok.status).toBe(101);
     ok.webSocket?.accept();
     ok.webSocket?.close();
+  });
+
+  it("rejects another enrolled device's real token for a target device presence socket", async () => {
+    const acct = "acct-auth-device-connect-scoped";
+    const deviceA = await pairDevice(acct);
+    const deviceB = await pairDevice(acct, "__________________________________________8");
+
+    const crossDevice = await SELF.fetch(
+      relayUrl(
+        acct,
+        appendAuthQuery(`/devices/${deviceA.device_id}/connect`, deviceB.device_auth_token),
+      ),
+      { headers: { Upgrade: "websocket" } },
+    );
+    expect(crossDevice.status).toBe(403);
+  });
+
+  it("fails closed when legacy device or request rows have no stored auth-token hash", async () => {
+    const acct = "acct-auth-null-hash";
+    const device = await pairDevice(acct);
+    const submit = await post<SubmitResult>(acct, "/requests", makeEnvelope("req-auth-null-hash"));
+    expect(submit.status).toBe(202);
+
+    await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(acct)), (instance) => {
+      const relay = instance as unknown as { sql: SqlStorage };
+      relay.sql.exec(
+        `UPDATE device SET auth_token_hash = NULL WHERE device_id = ?`,
+        device.device_id,
+      );
+      relay.sql.exec(
+        `UPDATE request SET auth_token_hash = NULL WHERE request_id = ?`,
+        submit.data.request_id,
+      );
+    });
+
+    const connect = await SELF.fetch(relayUrl(acct, `/devices/${device.device_id}/connect`), {
+      headers: { Upgrade: "websocket" },
+    });
+    expect(connect.status).toBe(401);
+
+    const poll = await SELF.fetch(relayUrl(acct, `/requests/${submit.data.request_id}`));
+    expect(poll.status).toBe(401);
+
+    const wait = await SELF.fetch(relayUrl(acct, `/requests/${submit.data.request_id}/wait`), {
+      headers: { Upgrade: "websocket" },
+    });
+    expect(wait.status).toBe(401);
   });
 
   it("requires the per-request token for polling and wait sockets", async () => {
@@ -1192,17 +1251,21 @@ async function seedExpiredRequest(
   requestId: string,
 ): Promise<Record<string, unknown>> {
   const envelope = makeEnvelope(requestId, { expires_at: PAST_EXPIRES_AT });
+  const requestAuthToken = `expired-request-token-${requestId}`;
+  const requestAuthTokenHash = await testAuthTokenHash(requestAuthToken);
+  requestAuthTokens.set(tokenKey(accountId, requestId), requestAuthToken);
   const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
   await runInDurableObject(stub, (instance: AccountRelay) => {
     const relay = instance as unknown as { sql: SqlStorage };
     relay.sql.exec(
       `INSERT OR REPLACE INTO request
-       (request_id, envelope, created_at, expires_at, status, terminal_at)
-       VALUES (?, ?, ?, ?, 'pending', NULL)`,
+       (request_id, envelope, created_at, expires_at, status, terminal_at, auth_token_hash)
+       VALUES (?, ?, ?, ?, 'pending', NULL, ?)`,
       requestId,
       JSON.stringify(envelope),
       CREATED_AT,
       PAST_EXPIRES_AT,
+      requestAuthTokenHash,
     );
   });
   return envelope;
