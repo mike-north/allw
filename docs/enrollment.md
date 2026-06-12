@@ -229,7 +229,8 @@ Validation:
 SDK callers that use the revocation-aware `*_with_account_states` verification APIs must supply all known
 account-state JWS documents, or must first enforce a durably stored highest sequence for the account. The SDK and
 WASM core reject stale lower-sequence rollback within one supplied set, but monotonic persistence across calls is
-integrator-owned in v1.
+integrator-owned in v1. The plain `requestApproval` / `Verdict.verify` SDK path enforces account-state revocation
+only when `ClientConfig.accountStates` or `Verdict.verify(..., { accountStates })` is supplied.
 
 ## Key Rotation
 

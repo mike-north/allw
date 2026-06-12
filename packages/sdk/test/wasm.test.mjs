@@ -703,6 +703,34 @@ test("verify_verdict_with_account_states rejects revoked devices and stale rollb
   );
 });
 
+test("verify_verdict_with_account_states rejects substituted wrong-root account state", async () => {
+  const wasm = await loadWasm();
+  const f = approverFixture(wasm);
+  const verdictJson = wasm.sign_verdict(JSON.stringify(f.unsigned), f.deviceSeed, f.nonce, f.cert);
+  const wrongRootSeed = Buffer.alloc(32, 0x77).toString("base64url");
+  const wrongRootState = signedAccountState(wasm, {
+    accountSeed: wrongRootSeed,
+    accountId: "acct_rt",
+    currentRoot: wasm.ed25519_public_key(wrongRootSeed),
+    sequence: 6,
+    revokedDeviceIds: ["dev_rt"],
+  });
+
+  assert.throws(
+    () =>
+      wasm.verify_verdict_with_account_states(
+        verdictJson,
+        f.v.request_json,
+        f.v.context_json,
+        f.accountRootPub,
+        f.v.now_ms,
+        JSON.stringify([wrongRootState]),
+      ),
+    /account state is invalid/,
+    "substituted wrong-root account state must fail closed, not be ignored",
+  );
+});
+
 test("verify_policy_rule_with_account_states rejects revoked signing devices", async () => {
   const wasm = await loadWasm();
   const f = policyFixture(wasm);
@@ -754,6 +782,47 @@ test("verify_policy_rule_with_account_states rejects revoked signing devices", a
       ),
     /policy-rule signing device is revoked/,
     "policy evaluation must fail closed when a signed rule's device is revoked",
+  );
+});
+
+test("verify_policy_rule_with_account_states rejects substituted wrong-root account state", async () => {
+  const wasm = await loadWasm();
+  const f = policyFixture(wasm);
+  const unsigned = {
+    id: "allow-status-wrong-root-state",
+    account_id: f.accountId,
+    subject: { kind: "any" },
+    match: { surface: "command", command: { bin: "git", args_any_globs: ["status"] } },
+    effect: "allow",
+    provenance: "manual",
+    tier: "syntactic",
+    created_at: f.createdAt,
+  };
+  const signedRule = wasm.sign_policy_rule(
+    JSON.stringify(unsigned),
+    f.deviceId,
+    f.deviceSeed,
+    f.cert,
+  );
+  const wrongRootSeed = Buffer.alloc(32, 0x78).toString("base64url");
+  const wrongRootState = signedAccountState(wasm, {
+    accountSeed: wrongRootSeed,
+    accountId: f.accountId,
+    currentRoot: wasm.ed25519_public_key(wrongRootSeed),
+    sequence: 3,
+    revokedDeviceIds: [f.deviceId],
+  });
+
+  assert.throws(
+    () =>
+      wasm.verify_policy_rule_with_account_states(
+        signedRule,
+        f.accountRootPub,
+        f.nowMs,
+        JSON.stringify([wrongRootState]),
+      ),
+    /account state is invalid/,
+    "substituted wrong-root account state must fail closed, not be ignored",
   );
 });
 
