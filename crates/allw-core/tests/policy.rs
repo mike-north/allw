@@ -1,9 +1,9 @@
 use allw_core::{
     action_from_argv, action_from_mcp_tool_call, evaluate, evaluate_for_actor, issue_device_cert,
-    sign_policy_rule, verify_policy_rule, Actor, Approver, CommandContext, Decision,
+    sign_policy_rule, sign_verdict, verify_policy_rule, Actor, Approver, CommandContext, Decision,
     PolicyDecision, PolicyEffect, PolicyPredicate, PolicyProvenance, PolicyRuleError,
     PolicyRuleScope, PolicyTier, Risk, SigningKeyPair, Surface, SyntacticSubstrate,
-    UnsignedPolicyRule, Verdict,
+    UnsignedPolicyRule, UnsignedVerdict, Verdict,
 };
 use serde_json::json;
 
@@ -46,6 +46,17 @@ fn device_cert() -> String {
         &device_key().public_key(),
         CREATED_AT,
         None,
+    )
+}
+
+fn expired_device_cert() -> String {
+    issue_device_cert(
+        &root_key(),
+        ACCOUNT_ID,
+        DEVICE_ID,
+        &device_key().public_key(),
+        CREATED_AT,
+        Some(CREATED_AT + 500),
     )
 }
 
@@ -218,6 +229,61 @@ fn signed_policy_rule_requires_account_root_cert_chain_and_matching_kid() {
         verify_policy_rule(&missing_cert, &root_key().public_key(), NOW_OK),
         Err(PolicyRuleError::MissingDeviceCert),
         "policy rules must carry a device cert so verification chains to the account root"
+    );
+
+    let expired_cert_rule = sign_policy_rule(
+        &unsigned,
+        DEVICE_ID,
+        &device_key(),
+        Some(expired_device_cert()),
+    );
+    assert_eq!(
+        verify_policy_rule(&expired_cert_rule, &root_key().public_key(), NOW_OK),
+        Err(PolicyRuleError::CertExpired),
+        "policy rules must reject expired device certs on the policy verification path"
+    );
+}
+
+#[test]
+fn signed_policy_rule_rejects_cross_typ_jws_confusion() {
+    let unsigned = UnsignedPolicyRule {
+        id: "allow-ls".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate::command_bin("ls"),
+        effect: PolicyEffect::Allow,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: CREATED_AT,
+        expires_at: None,
+    };
+
+    let verdict = sign_verdict(
+        &UnsignedVerdict {
+            v: 1,
+            request_id: "req-policy-confusion".to_string(),
+            request_hash: [0x11; 32],
+            decision: Decision::Approved,
+            decided_at: CREATED_AT,
+            approver: Approver {
+                account_id: ACCOUNT_ID.to_string(),
+                device_id: DEVICE_ID.to_string(),
+            },
+            note: None,
+            challenge_response: None,
+        },
+        &device_key(),
+        &[0x01, 0x02, 0x03, 0x04],
+        Some(device_cert()),
+    );
+    let mut rule = sign_policy_rule(&unsigned, DEVICE_ID, &device_key(), Some(device_cert()));
+    rule.sig = verdict.sig;
+
+    assert_eq!(
+        verify_policy_rule(&rule, &root_key().public_key(), NOW_OK),
+        Err(PolicyRuleError::UnexpectedTyp),
+        "a verdict JWS must not be accepted as a policy-rule JWS"
     );
 }
 
