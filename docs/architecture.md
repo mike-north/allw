@@ -103,6 +103,9 @@ independent delivery, and retractions still broadcast to every live socket so st
 ## Platform mapping (native)
 
 Core access: **UniFFI** (Swift/Kotlin); **direct crate** (Linux `gtk4-rs`); **C ABI / P-Invoke** (Windows, C#/.NET).
+The `crates/allw-uniffi` shell exposes the same JSON-string wire contract as the WASM shell and CI runs
+generated Swift/Kotlin smoke tests via `scripts/uniffi-smoke.sh`, so native bindings prove they can call the
+shared core rather than reimplementing crypto.
 
 | Platform | UI stack                                 | Native surfaces we exploit                                                                                                                                                                                                                       | Keystore                   |
 | -------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------- |
