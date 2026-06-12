@@ -22,5 +22,9 @@
     "lint": "eslint src",
     "test": "tsc -p tsconfig.json && node --test \"test/**/*.test.mjs\""
   },
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "@types/jsdom": "^28.0.3",
+    "jsdom": "^29.1.1"
+  }
 }

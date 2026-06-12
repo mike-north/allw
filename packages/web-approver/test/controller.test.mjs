@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { JSDOM } from "jsdom";
+
+import { mountWebApprover } from "../dist/browser.js";
 import { WebApproverController } from "../dist/index.js";
 
 const NOW = Date.parse("2026-06-12T16:00:00.000Z");
@@ -66,6 +69,14 @@ function runtime(fixtures) {
       };
     },
   };
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }
 
 test("sync builds a pending inbox first and keeps resolved history below the fold", async () => {
@@ -187,4 +198,146 @@ test("number-match challenge gates approval and is included in the signed verdic
   assert.equal(verdict.decision, "approved");
   assert.equal(fakeRuntime.signCalls[0]?.challengeResponse, "4821");
   assert.equal(controller.detail("req-challenge")?.status, "approved");
+});
+
+test("double-submit races are rejected before a second verdict can be signed", async () => {
+  const request = envelope("req-double-submit");
+  const signing = deferred();
+  const signCalls = [];
+  const fakeRuntime = {
+    signCalls,
+    async prepare() {
+      return { requestHash: "hash-double-submit", context: context() };
+    },
+    async signDecision(input) {
+      signCalls.push(input);
+      return signing.promise;
+    },
+  };
+  const controller = new WebApproverController({
+    runtime: fakeRuntime,
+    nowMs: () => NOW,
+  });
+
+  await controller.sync([request]);
+
+  const firstDecision = controller.decide("req-double-submit", "approved");
+  const secondDecision = controller.decide("req-double-submit", "approved");
+  try {
+    assert.equal(signCalls.length, 1, "only the first submit reaches the signing runtime");
+    await assert.rejects(() => secondDecision, /already being decided/);
+  } finally {
+    signing.resolve({
+      requestId: request.id,
+      decision: "approved",
+      signedVerdictJson: "{}",
+    });
+    await Promise.allSettled([firstDecision, secondDecision]);
+  }
+  assert.equal(controller.detail("req-double-submit")?.status, "approved");
+});
+
+test("disallowed decisions are rejected before signing", async () => {
+  const deniedOnly = envelope("req-denied-only");
+  const fakeRuntime = runtime(
+    new Map([
+      [
+        deniedOnly.id,
+        {
+          requestHash: "hash-denied-only",
+          context: context({ allowed_decisions: ["denied"] }),
+        },
+      ],
+    ]),
+  );
+  const controller = new WebApproverController({
+    runtime: fakeRuntime,
+    nowMs: () => NOW,
+  });
+
+  await controller.sync([deniedOnly]);
+
+  assert.equal(controller.canApprove("req-denied-only"), false);
+  await assert.rejects(() => controller.decide("req-denied-only", "approved"), /not allowed/);
+  assert.equal(fakeRuntime.signCalls.length, 0, "disallowed decisions are never signed");
+});
+
+test("malformed action contexts render as unknown actions without throwing", async () => {
+  const missingCommand = envelope("req-missing-command");
+  const missingMcp = envelope("req-missing-mcp");
+  const controller = new WebApproverController({
+    runtime: runtime(
+      new Map([
+        [
+          missingCommand.id,
+          {
+            requestHash: "hash-missing-command",
+            context: context({ kind: "command", command: undefined }),
+          },
+        ],
+        [
+          missingMcp.id,
+          {
+            requestHash: "hash-missing-mcp",
+            context: context({ kind: "mcp", command: undefined, mcp: undefined }),
+          },
+        ],
+      ]),
+    ),
+    nowMs: () => NOW,
+  });
+
+  await controller.sync([missingCommand, missingMcp]);
+
+  assert.equal(controller.detail("req-missing-command")?.summary, "Unknown action");
+  assert.equal(controller.detail("req-missing-command")?.exactPlaintext, "Unknown action");
+  assert.equal(controller.detail("req-missing-mcp")?.summary, "Unknown action");
+  assert.equal(controller.detail("req-missing-mcp")?.exactPlaintext, "Unknown action");
+});
+
+test("browser rendering treats attacker argv as inert text", async () => {
+  const dom = new JSDOM('<div id="app"></div>', { url: "https://approver.local/" });
+  const root = dom.window.document.getElementById("app");
+  const attackArg = "<script>globalThis.__allwXss = true</script>";
+  const globals = {
+    document: globalThis.document,
+    window: globalThis.window,
+    HTMLButtonElement: globalThis.HTMLButtonElement,
+  };
+
+  globalThis.document = dom.window.document;
+  globalThis.window = dom.window;
+  globalThis.HTMLButtonElement = dom.window.HTMLButtonElement;
+
+  try {
+    await mountWebApprover({
+      root,
+      nowMs: () => NOW,
+      fetchInbox: async () => [envelope("req-xss")],
+      runtime: runtime(
+        new Map([
+          [
+            "req-xss",
+            {
+              requestHash: "hash-xss",
+              context: context({
+                command: {
+                  cwd: "/repo",
+                  argv: ["echo", attackArg],
+                },
+              }),
+            },
+          ],
+        ]),
+      ),
+    });
+
+    assert.equal(root.querySelector("script"), null);
+    assert.match(root.textContent ?? "", /<script>globalThis\.__allwXss = true<\/script>/);
+    assert.equal(dom.window.__allwXss, undefined);
+  } finally {
+    globalThis.document = globals.document;
+    globalThis.window = globals.window;
+    globalThis.HTMLButtonElement = globals.HTMLButtonElement;
+  }
 });

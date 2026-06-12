@@ -1,6 +1,6 @@
 export type ApprovalDecision = "approved" | "denied";
 
-export type ApprovalStatus = "pending" | "expired" | "unverified" | ApprovalDecision;
+export type ApprovalStatus = "pending" | "deciding" | "expired" | "unverified" | ApprovalDecision;
 
 export interface ApprovalEnvelope {
   readonly v: number;
@@ -55,6 +55,7 @@ export interface ApprovalContext {
 export interface PreparedApproval {
   readonly requestHash: string;
   readonly context: ApprovalContext;
+  /** MUST be set only from a core-verified terminal Verdict. */
   readonly resolvedDecision?: ApprovalDecision;
 }
 
@@ -144,8 +145,8 @@ export class WebApproverController {
   }
 
   inbox(): readonly ApprovalListItem[] {
-    return this.#list(["pending", "expired", "unverified"]).filter(
-      (item) => item.status === "pending",
+    return this.#list(["pending", "deciding", "expired", "unverified"]).filter(
+      (item) => item.status === "pending" || item.status === "deciding",
     );
   }
 
@@ -184,6 +185,9 @@ export class WebApproverController {
     if (record.status === "expired") {
       throw new Error(`request '${id}' is expired`);
     }
+    if (record.status === "deciding") {
+      throw new Error(`request '${id}' is already being decided`);
+    }
     if (!record.prepared || record.status === "unverified") {
       throw new Error(`request '${id}' is not approvable`);
     }
@@ -198,10 +202,17 @@ export class WebApproverController {
     }
 
     const signInput = this.#signInput(record, decision, options.challengeResponse);
-    const verdict = await this.#runtime.signDecision(signInput);
-    record.status = decision;
-    record.decidedAt = this.#nowMs();
-    return verdict;
+    // Claim the request before signing so duplicate submits cannot produce two verdicts.
+    record.status = "deciding";
+    try {
+      const verdict = await this.#runtime.signDecision(signInput);
+      record.status = decision;
+      record.decidedAt = this.#nowMs();
+      return verdict;
+    } catch (error) {
+      record.status = "pending";
+      throw error;
+    }
   }
 
   async #prepare(envelope: ApprovalEnvelope): Promise<ApprovalRecord> {

@@ -60,8 +60,8 @@ function render(
   header.append(refreshButton);
   shell.append(header);
 
-  const inbox = section("Pending", controller.inbox(), controller, true);
-  const history = section("History", controller.history(), controller, false);
+  const inbox = section("Pending", controller.inbox(), controller, true, refresh);
+  const history = section("History", controller.history(), controller, false, refresh);
   shell.append(inbox, history);
   root.append(shell);
 }
@@ -71,6 +71,7 @@ function section(
   items: readonly ReturnType<WebApproverController["inbox"]>[number][],
   controller: WebApproverController,
   interactive: boolean,
+  refresh: () => Promise<void>,
 ): HTMLElement {
   const sectionEl = document.createElement("section");
   sectionEl.className = "approver-section";
@@ -89,13 +90,18 @@ function section(
   const list = document.createElement("div");
   list.className = "approval-list";
   for (const item of items) {
-    list.append(card(item.id, controller, interactive));
+    list.append(card(item.id, controller, interactive, refresh));
   }
   sectionEl.append(list);
   return sectionEl;
 }
 
-function card(id: string, controller: WebApproverController, interactive: boolean): HTMLElement {
+function card(
+  id: string,
+  controller: WebApproverController,
+  interactive: boolean,
+  refresh: () => Promise<void>,
+): HTMLElement {
   const detail = controller.detail(id);
   if (!detail) {
     return document.createElement("article");
@@ -123,12 +129,16 @@ function card(id: string, controller: WebApproverController, interactive: boolea
   }
 
   if (interactive) {
-    article.append(decisionControls(id, controller));
+    article.append(decisionControls(id, controller, refresh));
   }
   return article;
 }
 
-function decisionControls(id: string, controller: WebApproverController): HTMLElement {
+function decisionControls(
+  id: string,
+  controller: WebApproverController,
+  refresh: () => Promise<void>,
+): HTMLElement {
   const form = document.createElement("form");
   form.className = "decision-controls";
   const detail = controller.detail(id);
@@ -158,9 +168,14 @@ function decisionControls(id: string, controller: WebApproverController): HTMLEl
         ? submitter.value
         : "denied";
     const challengeResponse = challengeInput.value || undefined;
-    void controller.decide(id, decision, {
-      ...(challengeResponse ? { challengeResponse } : {}),
-    });
+    deny.disabled = true;
+    approve.disabled = true;
+    challengeInput.disabled = true;
+    void controller
+      .decide(id, decision, {
+        ...(challengeResponse ? { challengeResponse } : {}),
+      })
+      .then(refresh, refresh);
   });
   return form;
 }
