@@ -486,6 +486,7 @@ impl std::error::Error for PolicyRuleError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyRuleBuildError {
     UnrepresentableExactCommand,
+    UnsupportedFileEditPolicyScope,
 }
 
 impl std::fmt::Display for PolicyRuleBuildError {
@@ -494,6 +495,10 @@ impl std::fmt::Display for PolicyRuleBuildError {
             Self::UnrepresentableExactCommand => write!(
                 f,
                 "exact command policy requires either argv or raw command text"
+            ),
+            Self::UnsupportedFileEditPolicyScope => write!(
+                f,
+                "file_edit approval-derived policy scopes require file path/diff matchers"
             ),
         }
     }
@@ -677,6 +682,9 @@ fn predicate_from_approval(
     action: &ActionRecord,
     scope: PolicyRuleScope,
 ) -> Result<PolicyPredicate, PolicyRuleBuildError> {
+    if action.surface == Surface::FileEdit {
+        return Err(PolicyRuleBuildError::UnsupportedFileEditPolicyScope);
+    }
     match scope {
         PolicyRuleScope::ExactCall => exact_call_predicate(action),
         PolicyRuleScope::CommandOrToolAnyArgs => Ok(command_or_tool_predicate(action)),

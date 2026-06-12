@@ -1,11 +1,11 @@
 use allw_core::{
-    action_from_argv, action_from_mcp_tool_call, evaluate, evaluate_for_actor, issue_device_cert,
-    sign_account_state, sign_policy_rule, sign_verdict, verify_policy_rule,
-    verify_policy_rule_with_account_states, AccountState, AccountStateRevocation,
-    AccountStateRevocationKind, Actor, Approver, CommandContext, Decision, McpMatcher,
-    ParamMatcher, PolicyDecision, PolicyEffect, PolicyPredicate, PolicyProvenance, PolicyRuleError,
-    PolicyRuleScope, PolicyTier, Risk, SigningKeyPair, Surface, SyntacticSubstrate,
-    UnsignedPolicyRule, UnsignedVerdict, Verdict,
+    action_from_argv, action_from_file_edit, action_from_mcp_tool_call, evaluate,
+    evaluate_for_actor, issue_device_cert, sign_account_state, sign_policy_rule, sign_verdict,
+    verify_policy_rule, verify_policy_rule_with_account_states, AccountState,
+    AccountStateRevocation, AccountStateRevocationKind, Actor, Approver, CommandContext, Decision,
+    McpMatcher, ParamMatcher, PolicyDecision, PolicyEffect, PolicyPredicate, PolicyProvenance,
+    PolicyRuleBuildError, PolicyRuleError, PolicyRuleScope, PolicyTier, Risk, SigningKeyPair,
+    Surface, SyntacticSubstrate, UnsignedPolicyRule, UnsignedVerdict, Verdict,
 };
 use serde_json::json;
 
@@ -93,6 +93,10 @@ fn signed(rule: UnsignedPolicyRule) -> allw_core::VerifiedPolicyRule {
 fn git_force_action() -> allw_core::ActionRecord {
     let argv = ["git", "push", "--force", "origin", "main"].map(String::from);
     action_from_argv(&argv, &CommandContext::default())
+}
+
+fn file_edit_action(path: &str, diff: &str) -> allw_core::ActionRecord {
+    action_from_file_edit("patch", &[path.to_string()], &format!("patch {path}"), diff)
 }
 
 fn command_action_with_syntactic(syntactic: SyntacticSubstrate) -> allw_core::ActionRecord {
@@ -782,6 +786,36 @@ fn from_approval_exact_call_rejects_unrepresentable_command_shape() {
         .is_err(),
         "a bin-only command cannot safely become an exact-call allow rule"
     );
+}
+
+#[test]
+fn from_approval_rejects_file_edit_policy_scopes_until_file_matchers_exist() {
+    let actor = actor();
+    let action = file_edit_action("src/app.ts", "write app");
+
+    for scope in [
+        PolicyRuleScope::ExactCall,
+        PolicyRuleScope::CommandOrToolAnyArgs,
+        PolicyRuleScope::McpParamEquals {
+            path: "operation".to_string(),
+        },
+        PolicyRuleScope::ArgsAnyGlob {
+            pattern: "src/*".to_string(),
+        },
+    ] {
+        assert_eq!(
+            UnsignedPolicyRule::from_approval(
+                "approval-file-edit",
+                ACCOUNT_ID,
+                &actor,
+                &action,
+                scope,
+                1_700_000_000_000,
+            ),
+            Err(PolicyRuleBuildError::UnsupportedFileEditPolicyScope),
+            "file-edit approvals must not derive surface-only allow rules"
+        );
+    }
 }
 
 #[test]
