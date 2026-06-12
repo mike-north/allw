@@ -182,8 +182,14 @@ test("gateToolCall(Claude Edit/Write/MultiEdit) → gated file_edit records", as
 
 test("gateToolCall(file edit with missing path/patch) → build-error", async () => {
   const wasm = await loadWasm();
-  assert.equal(gateToolCall(wasm, "Edit", { old_string: "old", new_string: "new" }, "/repo").kind, "build-error");
-  assert.equal(gateToolCall(wasm, "apply_patch", { patch: "not a valid patch" }, "/repo").kind, "build-error");
+  assert.equal(
+    gateToolCall(wasm, "Edit", { old_string: "old", new_string: "new" }, "/repo").kind,
+    "build-error",
+  );
+  assert.equal(
+    gateToolCall(wasm, "apply_patch", { patch: "not a valid patch" }, "/repo").kind,
+    "build-error",
+  );
 });
 
 test("gateToolCall(non-gated) → pass-through", async () => {

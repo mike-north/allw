@@ -150,9 +150,9 @@ function readApplyPatch(toolInput: unknown): { patch: string; paths: string[] } 
   const patch =
     typeof toolInput === "string"
       ? toolInput
-      : readStringField(toolInput, "patch") ??
+      : (readStringField(toolInput, "patch") ??
         readStringField(toolInput, "input") ??
-        readStringField(toolInput, "diff");
+        readStringField(toolInput, "diff"));
   if (patch === null) return null;
 
   const paths = extractApplyPatchPaths(patch);
@@ -163,7 +163,7 @@ function readApplyPatch(toolInput: unknown): { patch: string; paths: string[] } 
 function formatPathList(paths: readonly string[]): string {
   if (paths.length === 1) return paths[0] ?? "";
   const shown = paths.slice(0, 3).join(", ");
-  return paths.length > 3 ? `${shown}, +${paths.length - 3} more` : shown;
+  return paths.length > 3 ? `${shown}, +${String(paths.length - 3)} more` : shown;
 }
 
 /** Build the one-line summary stored in the hash-bound file-edit substrate. */
@@ -227,7 +227,7 @@ function reduceFileEdit(toolName: string, toolInput: unknown): FileEditReduction
     return {
       operation: "write",
       paths,
-      diffSummary: summarizeFileEdit("write", paths, `(${content.length} bytes)`),
+      diffSummary: summarizeFileEdit("write", paths, `(${String(content.length)} bytes)`),
       diffBytes: JSON.stringify({ file_path: filePath, content }),
     };
   }
@@ -241,7 +241,7 @@ function reduceFileEdit(toolName: string, toolInput: unknown): FileEditReduction
     return {
       operation: "multi_edit",
       paths,
-      diffSummary: summarizeFileEdit("multi_edit", paths, `(${edits.length} edits)`),
+      diffSummary: summarizeFileEdit("multi_edit", paths, `(${String(edits.length)} edits)`),
       diffBytes: JSON.stringify({ file_path: filePath, edits }),
     };
   }
