@@ -127,6 +127,16 @@ function reconstructCommand(syntactic: Record<string, unknown>): string | undefi
 function renderActionHeadline(action: ActionRecord): string {
   const syntactic = action.syntactic;
   if (isRecord(syntactic)) {
+    if (action.surface === "file_edit") {
+      const diffSummary = readString(syntactic, "diff_summary");
+      if (diffSummary !== undefined) return diffSummary;
+      const operation = readString(syntactic, "operation");
+      const paths = readStringArray(syntactic, "paths");
+      if (operation !== undefined && paths !== undefined && paths.length > 0) {
+        return `${operation} ${paths.join(", ")}`;
+      }
+    }
+
     const raw = readString(syntactic, "raw");
     if (raw !== undefined) return raw;
 
@@ -238,6 +248,14 @@ function substrateDetailLines(action: ActionRecord): string[] {
   const diffHash = readString(syntactic, "diff_hash");
   if (diffHash !== undefined) {
     lines.push(`  Diff hash:  ${diffHash}`);
+  }
+
+  const rawEdit = action.surface === "file_edit" ? readString(syntactic, "raw") : undefined;
+  if (rawEdit !== undefined) {
+    lines.push("  File edit content:");
+    for (const line of rawEdit.split(/\r?\n/)) {
+      lines.push(`    ${line}`);
+    }
   }
 
   return lines;

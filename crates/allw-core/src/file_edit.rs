@@ -2,8 +2,8 @@
 //!
 //! The relay and approver must treat file edits as first-class actions, not as an MCP/command
 //! approximation. This surface captures the paths being changed, the edit operation kind, and a
-//! compact diff summary plus hash so the human can see what is changing while the full edit bytes
-//! remain bound into the WYSIWYS record.
+//! compact diff summary plus hash. The full edit bytes are also stored in `syntactic.raw` so the
+//! approver can show the exact content the human is signing over.
 
 use crate::contract::{ActionRecord, Risk, Surface, SyntacticSubstrate};
 use base64::Engine;
@@ -34,7 +34,7 @@ pub fn action_from_file_edit(
             server: None,
             tool: None,
             params: None,
-            raw: Some(diff_summary.to_string()),
+            raw: Some(diff_bytes.to_string()),
             operation: Some(operation.to_string()),
             paths: Some(paths.to_vec()),
             diff_summary: Some(diff_summary.to_string()),
@@ -70,6 +70,11 @@ mod tests {
         assert_eq!(
             record.syntactic.diff_hash.as_deref().map(str::len),
             Some(43)
+        );
+        assert_eq!(
+            record.syntactic.raw.as_deref(),
+            Some(diff),
+            "raw must carry the exact patch/edit text for WYSIWYS rendering"
         );
         assert_eq!(record.risk, Risk::High);
         assert!(record.capabilities.is_none());

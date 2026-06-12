@@ -116,8 +116,9 @@ pub enum Risk {
 ///
 /// - `surface = command`: `bin`, `argv`, `flags`, `positionals`, `cwd`, `host`, `env_refs`
 /// - `surface = mcp_tool_call`: `server`, `tool`, `params`
-/// - `surface = file_edit`: `operation`, `paths`, `diff_summary`, `diff_hash`
-/// - Either surface may set `raw` for display/fallback
+/// - `surface = file_edit`: `operation`, `paths`, `diff_summary`, `diff_hash`, `raw`
+/// - File edits set `raw` to the exact edit/patch text for WYSIWYS display.
+/// - Other surfaces may set `raw` for display/fallback.
 ///
 /// The T1 syntactic substrate is the durable base that all three policy tiers match against.
 /// See `docs/policy-seam.md` §The action record.

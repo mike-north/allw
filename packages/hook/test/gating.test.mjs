@@ -157,6 +157,25 @@ test("gateToolCall(apply_patch) → gated with a file_edit ActionRecord", async 
   assert.match(out.summary, /file edit/i);
 });
 
+test("gateToolCall(apply_patch rename) captures both source and destination paths", async () => {
+  const wasm = await loadWasm();
+  const patch = [
+    "*** Begin Patch",
+    "*** Update File: src/old.ts",
+    "*** Move to: src/new.ts",
+    "@@",
+    "-old",
+    "+new",
+    "*** End Patch",
+    "",
+  ].join("\n");
+  const out = gateToolCall(wasm, "apply_patch", { patch }, "/repo");
+  assert.equal(out.kind, "gated");
+  const record = JSON.parse(out.actionRecord);
+  assert.equal(record.surface, "file_edit");
+  assert.deepEqual(record.syntactic.paths, ["src/old.ts", "src/new.ts"]);
+});
+
 test("gateToolCall(Claude Edit/Write/MultiEdit) → gated file_edit records", async () => {
   const wasm = await loadWasm();
   const cases = [

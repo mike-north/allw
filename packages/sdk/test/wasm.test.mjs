@@ -1465,6 +1465,7 @@ test("action_from_file_edit builds a file_edit ActionRecord with paths and diff 
   assert.equal(record.syntactic.operation, "patch", "operation is preserved");
   assert.deepEqual(record.syntactic.paths, ["src/app.ts"], "target paths are preserved");
   assert.equal(record.syntactic.diff_summary, "patch src/app.ts", "summary is preserved");
+  assert.equal(record.syntactic.raw, patch, "raw carries the exact patch text for display");
   assert.equal(typeof record.syntactic.diff_hash, "string", "diff hash is present");
   assert.equal(record.syntactic.diff_hash.length, 43, "SHA-256 base64url hash length");
   assert.equal(record.risk, "high", "file edits are high risk in v1");

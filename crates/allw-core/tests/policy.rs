@@ -169,6 +169,114 @@ fn precedence_is_deny_then_ask_then_allow_and_no_match_escalates() {
 }
 
 #[test]
+fn command_and_mcp_rules_do_not_match_file_edit_actions() {
+    let action = file_edit_action("src/app.ts", "patch app");
+    let command_deny = signed(UnsignedPolicyRule {
+        id: "deny-command".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate::command_bin("apply_patch"),
+        effect: PolicyEffect::Deny,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    });
+    let mcp_deny = signed(UnsignedPolicyRule {
+        id: "deny-mcp".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate {
+            surface: Some(Surface::McpToolCall),
+            command: None,
+            mcp: Some(McpMatcher {
+                server: Some("filesystem".to_string()),
+                tool: Some("write_file".to_string()),
+                ..McpMatcher::default()
+            }),
+        },
+        effect: PolicyEffect::Deny,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    });
+
+    assert_eq!(
+        evaluate(&action, &[command_deny, mcp_deny]).decision,
+        PolicyDecision::Escalate,
+        "command/MCP policy rules must not match the file_edit surface"
+    );
+}
+
+#[test]
+fn file_edit_deny_precedes_file_edit_allow() {
+    let action = file_edit_action("src/app.ts", "patch app");
+    let file_edit_predicate = PolicyPredicate {
+        surface: Some(Surface::FileEdit),
+        command: None,
+        mcp: None,
+    };
+    let allow = signed(UnsignedPolicyRule {
+        id: "allow-file-edit".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: file_edit_predicate.clone(),
+        effect: PolicyEffect::Allow,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    });
+    let deny = signed(UnsignedPolicyRule {
+        id: "deny-file-edit".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: file_edit_predicate,
+        effect: PolicyEffect::Deny,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    });
+
+    let decision = evaluate(&action, &[allow, deny]);
+    assert_eq!(decision.decision, PolicyDecision::Deny);
+    assert_eq!(decision.rule_id.as_deref(), Some("deny-file-edit"));
+}
+
+#[test]
+fn over_budget_file_edit_match_input_escalates_before_policy_match() {
+    let action = file_edit_action(&"a".repeat(4097), "patch app");
+    let allow = signed(UnsignedPolicyRule {
+        id: "allow-file-edit".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate {
+            surface: Some(Surface::FileEdit),
+            command: None,
+            mcp: None,
+        },
+        effect: PolicyEffect::Allow,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    });
+
+    assert_eq!(
+        evaluate(&action, &[allow]).decision,
+        PolicyDecision::Escalate,
+        "oversized file-edit path/summary input must not match even a broad file_edit rule"
+    );
+}
+
+#[test]
 fn signed_policy_rule_rejects_tampering_and_wrong_device_key() {
     let key = device_key();
     let other_key = SigningKeyPair::from_seed(&OTHER_DEVICE_SEED);
