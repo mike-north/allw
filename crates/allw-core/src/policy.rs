@@ -473,7 +473,7 @@ impl std::fmt::Display for PolicyRuleError {
             Self::PayloadMismatch => write!(f, "policy-rule JWS payload does not match outer rule"),
             Self::UnsupportedBounds => write!(
                 f,
-                "policy-rule expires_at/bounds are unsupported until enforcement is implemented"
+                "policy-rule expires_at/bounds are unsupported or matcher limits are exceeded"
             ),
             Self::EmptyPredicate => write!(f, "policy-rule predicate must constrain the action"),
         }
@@ -590,6 +590,9 @@ pub fn verify_policy_rule_with_account_states(
     if rule.expires_at.is_some() || rule.bounds.is_some() {
         return Err(PolicyRuleError::UnsupportedBounds);
     }
+    if predicate_has_over_budget_pattern(&rule.predicate) {
+        return Err(PolicyRuleError::UnsupportedBounds);
+    }
     if rule.predicate.is_empty() {
         return Err(PolicyRuleError::EmptyPredicate);
     }
@@ -620,6 +623,15 @@ fn evaluate_inner(
     action: &ActionRecord,
     rules: &[VerifiedPolicyRule],
 ) -> PolicyEvaluation {
+    if action_has_over_budget_match_input(action) {
+        return PolicyEvaluation {
+            decision: PolicyDecision::Escalate,
+            rule_id: None,
+            tier: PolicyTier::Syntactic,
+            schema_version: POLICY_SCHEMA_VERSION,
+        };
+    }
+
     let mut best: Option<(u8, &VerifiedPolicyRule)> = None;
     for verified in rules {
         let rule = &verified.rule;
@@ -768,6 +780,46 @@ fn command_candidates(action: &ActionRecord) -> Vec<&str> {
     candidates
 }
 
+fn predicate_has_over_budget_pattern(predicate: &PolicyPredicate) -> bool {
+    predicate.command.as_ref().is_some_and(|command| {
+        command
+            .args_any_globs
+            .iter()
+            .any(|pattern| pattern.len() > MAX_PATTERN_MATCH_BYTES)
+    }) || predicate.mcp.as_ref().is_some_and(|mcp| {
+        mcp.params.iter().any(|matcher| {
+            matcher
+                .string_glob
+                .as_ref()
+                .is_some_and(|pattern| pattern.len() > MAX_PATTERN_MATCH_BYTES)
+        })
+    })
+}
+
+fn action_has_over_budget_match_input(action: &ActionRecord) -> bool {
+    match action.surface {
+        Surface::Command => command_candidates(action)
+            .iter()
+            .any(|candidate| candidate.len() > MAX_PATTERN_MATCH_BYTES),
+        Surface::McpToolCall => action
+            .syntactic
+            .params
+            .as_ref()
+            .is_some_and(json_has_over_budget_string),
+    }
+}
+
+fn json_has_over_budget_string(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(value) => value.len() > MAX_PATTERN_MATCH_BYTES,
+        serde_json::Value::Array(values) => values.iter().any(json_has_over_budget_string),
+        serde_json::Value::Object(entries) => entries.values().any(json_has_over_budget_string),
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            false
+        }
+    }
+}
+
 fn json_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
     if path.is_empty() {
         return Some(value);
@@ -779,7 +831,16 @@ fn json_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_j
     Some(current)
 }
 
+// Bound signed policy matcher work: the glob engine is O(pattern * value). Oversized signed
+// patterns are rejected at verification time, and oversized action values escalate before rule
+// matching so a deny rule cannot be bypassed by padding the offending token.
+const MAX_PATTERN_MATCH_BYTES: usize = 4096;
+
 fn string_matches_pattern(value: &str, pattern: &str) -> bool {
+    if value.len() > MAX_PATTERN_MATCH_BYTES || pattern.len() > MAX_PATTERN_MATCH_BYTES {
+        return false;
+    }
+
     if pattern.contains('*') || pattern.contains('?') {
         glob_matches(value, pattern)
     } else {
@@ -835,13 +896,52 @@ fn policy_jws_error(err: JwsError) -> PolicyRuleError {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::glob_matches;
+    use super::{glob_matches, string_matches_pattern};
 
     #[test]
     fn glob_matches_preserves_star_and_question_mark_semantics() {
         assert!(glob_matches("--force", "*force*"));
         assert!(glob_matches("build-prod", "build-????"));
         assert!(!glob_matches("build-prod", "build-???"));
+    }
+
+    #[test]
+    fn glob_matches_pins_edge_case_semantics() {
+        assert!(
+            glob_matches("abc", "abc*"),
+            "trailing star matches an empty suffix"
+        );
+        assert!(
+            glob_matches("abc", "*bc"),
+            "leading star can consume a prefix"
+        );
+        assert!(
+            !glob_matches("", "*?"),
+            "star-question still requires one code point"
+        );
+        assert!(
+            glob_matches("abc", "***"),
+            "consecutive stars collapse to match any value"
+        );
+        assert!(glob_matches("", ""), "empty pattern matches empty value");
+        assert!(
+            !glob_matches("abc", ""),
+            "empty pattern does not match a non-empty value"
+        );
+        assert!(
+            glob_matches("café", "caf?"),
+            "question mark matches one Unicode code point"
+        );
+    }
+
+    #[test]
+    fn string_matches_pattern_rejects_inputs_over_the_matcher_ceiling() {
+        let oversized = "a".repeat(4097);
+
+        assert!(
+            !string_matches_pattern(&oversized, &oversized),
+            "over-cap exact patterns fail closed instead of spending verifier budget"
+        );
     }
 
     #[test]
