@@ -705,19 +705,35 @@ fn string_matches_pattern(value: &str, pattern: &str) -> bool {
 }
 
 fn glob_matches(value: &str, pattern: &str) -> bool {
-    fn inner(value: &[char], pattern: &[char]) -> bool {
-        match pattern {
-            [] => value.is_empty(),
-            ['*', rest @ ..] => {
-                inner(value, rest) || (!value.is_empty() && inner(&value[1..], pattern))
-            }
-            ['?', rest @ ..] => !value.is_empty() && inner(&value[1..], rest),
-            [head, rest @ ..] => value.first() == Some(head) && inner(&value[1..], rest),
-        }
-    }
     let value = value.chars().collect::<Vec<_>>();
     let pattern = pattern.chars().collect::<Vec<_>>();
-    inner(&value, &pattern)
+    let mut value_idx = 0;
+    let mut pattern_idx = 0;
+    let mut last_star_idx = None;
+    let mut value_idx_after_star = 0;
+
+    while value_idx < value.len() {
+        if pattern_idx < pattern.len()
+            && (pattern[pattern_idx] == '?' || pattern[pattern_idx] == value[value_idx])
+        {
+            value_idx += 1;
+            pattern_idx += 1;
+        } else if pattern_idx < pattern.len() && pattern[pattern_idx] == '*' {
+            // Record the star and first let it match zero chars; if the suffix later fails, the
+            // fallback branch below extends this same star one char at a time.
+            last_star_idx = Some(pattern_idx);
+            pattern_idx += 1;
+            value_idx_after_star = value_idx;
+        } else if let Some(star_idx) = last_star_idx {
+            pattern_idx = star_idx + 1;
+            value_idx_after_star += 1;
+            value_idx = value_idx_after_star;
+        } else {
+            return false;
+        }
+    }
+
+    pattern[pattern_idx..].iter().all(|ch| *ch == '*')
 }
 
 fn encode_compact_jws<T: Serialize>(
@@ -779,4 +795,34 @@ fn decode_and_verify_policy_jws(
         .map_err(|_| PolicyRuleError::MalformedJws)?;
     let claims = serde_json::from_slice(&claims_json).map_err(|_| PolicyRuleError::MalformedJws)?;
     Ok(DecodedPolicyJws { header, claims })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::glob_matches;
+
+    #[test]
+    fn glob_matches_preserves_star_and_question_mark_semantics() {
+        assert!(glob_matches("--force", "*force*"));
+        assert!(glob_matches("build-prod", "build-????"));
+        assert!(!glob_matches("build-prod", "build-???"));
+    }
+
+    #[test]
+    fn glob_matches_pathological_non_match_is_bounded() {
+        // A naive recursive wildcard matcher explores exponentially many partitions here before
+        // it can prove that the trailing `b` is impossible. Policy rules are signed, but verifier
+        // work must still remain bounded for a self-foot-gun or compromised device.
+        let value = "a".repeat(24);
+        let pattern = format!("{}b", "*a".repeat(24));
+
+        let started = Instant::now();
+        assert!(!glob_matches(&value, &pattern));
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "pathological policy globs must complete within a bounded verifier budget"
+        );
+    }
 }
