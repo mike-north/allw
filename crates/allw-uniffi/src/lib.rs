@@ -12,6 +12,7 @@ use allw_core::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 uniffi::setup_scaffolding!();
 
@@ -76,6 +77,32 @@ fn decode_b64_32(value: &str, what: &str) -> Result<[u8; 32], AllwFfiError> {
         .map_err(|_| AllwFfiError::failure(format!("{what} must decode to exactly 32 bytes")))
 }
 
+/// Decode a 32-byte **secret seed** from base64url, scrubbing every intermediate copy.
+///
+/// Seed material (signing/encryption device seeds, the account root seed) crosses the FFI as a
+/// base64 string and is decoded here into bytes that key derivation reads. Unlike [`decode_b64_32`]
+/// (used for *public* values — pubkeys, request hashes), this wraps the decoded `Vec<u8>` and the
+/// returned `[u8; 32]` in [`Zeroizing`] so both the heap buffer and the stack array are wiped on
+/// drop (issue #90). The caller must keep the result in a `Zeroizing` binding (not copy the inner
+/// `[u8; 32]` out) for the guarantee to hold.
+fn decode_seed_b64_32(value: &str, what: &str) -> Result<Zeroizing<[u8; 32]>, AllwFfiError> {
+    // `Zeroizing<Vec<u8>>` wipes the heap-decoded bytes when this function returns, regardless of
+    // which branch (Ok/Err) is taken.
+    let bytes = Zeroizing::new(
+        URL_SAFE_NO_PAD
+            .decode(value)
+            .map_err(|e| AllwFfiError::failure(format!("{what} is not valid base64url: {e}")))?,
+    );
+    if bytes.len() != 32 {
+        return Err(AllwFfiError::failure(format!(
+            "{what} must decode to exactly 32 bytes"
+        )));
+    }
+    let mut seed = Zeroizing::new([0_u8; 32]);
+    seed.copy_from_slice(&bytes);
+    Ok(seed)
+}
+
 fn decode_b64_vec(value: &str, what: &str) -> Result<Vec<u8>, AllwFfiError> {
     URL_SAFE_NO_PAD
         .decode(value)
@@ -101,13 +128,24 @@ pub fn compute_request_hash_b64(
     Ok(URL_SAFE_NO_PAD.encode(core_compute_request_hash(&context, expires_at)))
 }
 
+/// Derive a device's public signing (Ed25519) and encryption (X25519) keys from two seeds.
+///
+/// **The two seeds MUST be independently random.** `device_signing_seed_b64` and
+/// `device_encryption_seed_b64` key separate cryptosystems; deriving both from the same seed
+/// couples the signing and encryption keypairs and is a real-enrollment defect. The smoke tests
+/// (`tests/smoke.swift`, `tests/Smoke.kt`, `tests/ffi_smoke.rs`) pass one seed for both **purely for
+/// brevity** — that shortcut must never be copied into device enrollment, which must draw two
+/// independent 32-byte random seeds (see `docs/enrollment.md`).
+///
+/// Both decoded seeds are scrubbed from memory on drop ([`Zeroizing`], issue #90).
 #[uniffi::export]
 pub fn derive_device_keys_json(
     device_signing_seed_b64: String,
     device_encryption_seed_b64: String,
 ) -> Result<String, AllwFfiError> {
-    let signing_seed = decode_b64_32(&device_signing_seed_b64, "device_signing_seed_b64")?;
-    let encryption_seed = decode_b64_32(&device_encryption_seed_b64, "device_encryption_seed_b64")?;
+    let signing_seed = decode_seed_b64_32(&device_signing_seed_b64, "device_signing_seed_b64")?;
+    let encryption_seed =
+        decode_seed_b64_32(&device_encryption_seed_b64, "device_encryption_seed_b64")?;
     let signing_key = SigningKeyPair::from_seed(&signing_seed);
     let encryption_key = X25519KeyPair::from_seed(&encryption_seed);
     to_json(
@@ -122,7 +160,7 @@ pub fn derive_device_keys_json(
 
 #[uniffi::export]
 pub fn derive_signing_pubkey_b64(signing_seed_b64: String) -> Result<String, AllwFfiError> {
-    let seed = decode_b64_32(&signing_seed_b64, "signing_seed_b64")?;
+    let seed = decode_seed_b64_32(&signing_seed_b64, "signing_seed_b64")?;
     Ok(URL_SAFE_NO_PAD.encode(SigningKeyPair::from_seed(&seed).public_key().to_bytes()))
 }
 
@@ -135,7 +173,7 @@ pub fn issue_device_cert_json(
     issued_at: i64,
     expires_at: i64,
 ) -> Result<String, AllwFfiError> {
-    let account_seed = decode_b64_32(&account_root_seed_b64, "account_root_seed_b64")?;
+    let account_seed = decode_seed_b64_32(&account_root_seed_b64, "account_root_seed_b64")?;
     let device_pubkey_bytes = decode_b64_32(&device_pubkey_b64, "device_pubkey_b64")?;
     let account_root = SigningKeyPair::from_seed(&account_seed);
     let device_pubkey = PublicKey::from_bytes(&device_pubkey_bytes)
@@ -157,7 +195,7 @@ pub fn sign_verdict_json(
     nonce_b64: String,
 ) -> Result<String, AllwFfiError> {
     let unsigned_json: UnsignedVerdictJson = parse_json(&unsigned_verdict_json, "UnsignedVerdict")?;
-    let device_seed = decode_b64_32(&device_seed_b64, "device_seed_b64")?;
+    let device_seed = decode_seed_b64_32(&device_seed_b64, "device_seed_b64")?;
     let nonce = decode_b64_vec(&nonce_b64, "nonce_b64")?;
     let request_hash = decode_b64_32(&unsigned_json.request_hash, "request_hash")?;
     let unsigned = UnsignedVerdict {
@@ -209,4 +247,49 @@ pub fn verify_verdict_json(
         },
         "VerifiedVerdict",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A valid 32-byte seed decodes into a `Zeroizing<[u8; 32]>` whose bytes match the input.
+    /// The return type itself is the proof the scrubbing wrapper is wired (issue #90): if the
+    /// signature regressed to a bare `[u8; 32]`, the binding below would fail to type-check.
+    #[test]
+    fn decode_seed_b64_32_accepts_32_bytes_and_wraps_in_zeroizing() {
+        let raw = [3_u8; 32];
+        let encoded = URL_SAFE_NO_PAD.encode(raw);
+
+        let seed: Zeroizing<[u8; 32]> = decode_seed_b64_32(&encoded, "seed").unwrap();
+
+        assert_eq!(*seed, raw, "decoded seed bytes must round-trip the input");
+    }
+
+    /// A seed that decodes to the wrong number of bytes is rejected — apps must see an explicit
+    /// error, never silent key derivation from truncated/padded material. Mirrors the FFI-level
+    /// negative test in `tests/ffi_smoke.rs`, but pins the helper's own boundary directly.
+    #[test]
+    fn decode_seed_b64_32_rejects_wrong_length() {
+        let too_short = URL_SAFE_NO_PAD.encode([0_u8; 16]);
+        let too_long = URL_SAFE_NO_PAD.encode([0_u8; 33]);
+
+        assert!(
+            decode_seed_b64_32(&too_short, "seed").is_err(),
+            "16-byte seed must be rejected"
+        );
+        assert!(
+            decode_seed_b64_32(&too_long, "seed").is_err(),
+            "33-byte seed must be rejected"
+        );
+    }
+
+    /// Non-base64url input is rejected with an error, not a panic.
+    #[test]
+    fn decode_seed_b64_32_rejects_invalid_base64() {
+        assert!(
+            decode_seed_b64_32("not valid base64 !!!", "seed").is_err(),
+            "invalid base64url seed must be rejected"
+        );
+    }
 }
