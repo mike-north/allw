@@ -54,7 +54,7 @@ function runtime(fixtures) {
         throw value;
       }
       assert.ok(value, `missing fixture for ${envelopeInput.id}`);
-      return value;
+      return { expiresAt: envelopeInput.expires_at, ...value };
     },
     async signDecision(input) {
       signCalls.push(input);
@@ -166,6 +166,36 @@ test("expired requests are visible but cannot be approved or signed", async () =
   assert.equal(fakeRuntime.signCalls.length, 0, "expired requests are never signed");
 });
 
+test("verified expiry from prepare controls lifecycle instead of relay-visible expiry", async () => {
+  const relayLooksFresh = envelope("req-verified-expired", { expires_at: NOW + 60_000 });
+  const fakeRuntime = runtime(
+    new Map([
+      [
+        relayLooksFresh.id,
+        {
+          requestHash: "hash-verified-expired",
+          context: context(),
+          expiresAt: NOW - 1,
+        },
+      ],
+    ]),
+  );
+  const controller = new WebApproverController({
+    runtime: fakeRuntime,
+    nowMs: () => NOW,
+  });
+
+  await controller.sync([relayLooksFresh]);
+
+  const detail = controller.detail("req-verified-expired");
+  assert.equal(detail?.status, "expired");
+  assert.equal(detail?.expiresAt, NOW - 1);
+  assert.equal(detail?.countdownMs, 0);
+  assert.equal(controller.canApprove("req-verified-expired"), false);
+  await assert.rejects(() => controller.decide("req-verified-expired", "approved"), /expired/);
+  assert.equal(fakeRuntime.signCalls.length, 0, "core-expired requests are never signed");
+});
+
 test("number-match challenge gates approval and is included in the signed verdict", async () => {
   const challenged = envelope("req-challenge");
   const fakeRuntime = runtime(
@@ -217,7 +247,11 @@ test("double-submit races are rejected before a second verdict can be signed", a
   const fakeRuntime = {
     signCalls,
     async prepare() {
-      return { requestHash: "hash-double-submit", context: context() };
+      return {
+        requestHash: "hash-double-submit",
+        expiresAt: request.expires_at,
+        context: context(),
+      };
     },
     async signDecision(input) {
       signCalls.push(input);
