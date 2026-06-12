@@ -266,6 +266,27 @@ describe("AccountRelay — routing (device online)", () => {
 // ---------------------------------------------------------------------------
 
 describe("AccountRelay — routing (device offline)", () => {
+  it("submitting a request schedules request-id-only push wakeups for registered tokens", async () => {
+    const acct = "acct-push-wakeup";
+    const start = await post<{ code: string }>(acct, "/pairing/start", {});
+    await post(acct, "/pairing/complete", {
+      code: start.data.code,
+      pubkey: DEVICE_PUBKEY,
+      push_tokens: [{ transport: "apns", token: "ios-token" }],
+    });
+
+    const submit = await post<{
+      delivered_to: number;
+      push_wakeups: number;
+      status: string;
+    }>(acct, "/requests", makeEnvelope("req-push-wakeup"));
+
+    expect(submit.status).toBe(202);
+    expect(submit.data.status).toBe("pending");
+    expect(submit.data.delivered_to).toBe(0);
+    expect(submit.data.push_wakeups).toBe(1);
+  });
+
   it("queues a request submitted while offline and flushes it on reconnect", async () => {
     const acct = "acct-offline-queue";
     await enrollDevice(acct);

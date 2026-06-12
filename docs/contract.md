@@ -156,6 +156,12 @@ Relay routes only — it sees the **ApprovalRequest envelope** (routing + lifecy
 Push (APNs / FCM; **Web Push later**) carries a wakeup + request id — **never context** (push isn't E2EE / is
 size-limited). The envelope's ciphertext is fetched as JWE and decrypted on-device.
 
+Push tokens are registered during pairing by including `push_tokens` on `POST /pairing/complete`. Each token has
+`transport` (`apns`, `fcm`, or future `webpush`) plus the opaque vendor token. Tokens are relay routing metadata:
+they are stored only to wake an enrolled device and are not exposed by `GET /devices`. `POST /requests` fans a
+request-id-only wakeup through the configured transport registry and still queues the ciphertext envelope for
+polling / WebSocket delivery.
+
 ### Relay routing API (v1)
 
 The per-account Durable Object exposes routing under `/{account_id}/…`. It persists **only** the opaque envelope
