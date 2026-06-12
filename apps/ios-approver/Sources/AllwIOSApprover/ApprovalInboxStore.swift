@@ -53,6 +53,12 @@ public final class ApprovalInboxStore {
         for envelope in envelopes {
             next[envelope.id] = await prepareRecord(envelope)
         }
+        // Relay sync returns the active inbox, not the local audit/history surface. Retain
+        // terminal rows that disappeared from the active feed so resolved decisions remain
+        // visible until a dedicated history store replaces this in-memory model.
+        for (id, record) in records where [.approved, .denied].contains(record.status) && next[id] == nil {
+            next[id] = record
+        }
         records = next
         expirePendingRecords()
     }

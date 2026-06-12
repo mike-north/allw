@@ -12,6 +12,7 @@ struct ApprovalInboxStoreTests {
         try await testDecisionRechecksCoreVerifiedExpiryBeforeSigning()
         try await testDoubleSubmitProducesOnlyOneSignature()
         try await testDeniedOnlyRequestRejectsApproval()
+        try await testTerminalDecisionSurvivesLaterEmptySync()
     }
 
     static func testSyncUsesPreparedExpiryInsteadOfRelayEnvelopeExpiry() async throws {
@@ -204,6 +205,28 @@ struct ApprovalInboxStoreTests {
             try await store.decide("req-deny-only", decision: .approved)
         }
         try expect(runtime.signInputs.isEmpty)
+    }
+
+    static func testTerminalDecisionSurvivesLaterEmptySync() async throws {
+        let runtime = RecordingRuntime()
+        runtime.prepared["req-history"] = .command(
+            requestHash: "hash-history",
+            expiresAt: 50_000,
+            summary: "restart production relay",
+            challenge: nil
+        )
+        let store = ApprovalInboxStore(runtime: runtime, nowMs: { 1_000 })
+        await store.sync([
+            .fixture(id: "req-history", expiresAt: 50_000)
+        ])
+
+        _ = try await store.decide("req-history", decision: .approved)
+        try expectEqual(store.history.map(\.id), ["req-history"])
+
+        await store.sync([])
+
+        try expect(store.inbox.isEmpty)
+        try expectEqual(store.history.map(\.id), ["req-history"])
     }
 }
 
