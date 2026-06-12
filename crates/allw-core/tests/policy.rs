@@ -327,6 +327,7 @@ fn signed_policy_rule_rejects_empty_predicate() {
     let key = device_key();
     let empty_match = UnsignedPolicyRule {
         id: "empty-predicate".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate {
             surface: None,
@@ -340,10 +341,10 @@ fn signed_policy_rule_rejects_empty_predicate() {
         created_at: 1_700_000_000_000,
         expires_at: None,
     };
-    let signed_empty = sign_policy_rule(&empty_match, "device:phone", &key);
+    let signed_empty = sign_policy_rule(&empty_match, DEVICE_ID, &key, Some(device_cert()));
 
     assert_eq!(
-        verify_policy_rule(&signed_empty, &key.public_key()),
+        verify_policy_rule(&signed_empty, &root_key().public_key(), NOW_OK),
         Err(PolicyRuleError::EmptyPredicate),
         "a signed manual policy with an empty predicate must not become a match-everything allow"
     );
@@ -353,6 +354,7 @@ fn signed_policy_rule_rejects_empty_predicate() {
 fn args_any_glob_matches_structured_tokens_not_raw_or_substrings() {
     let rule = signed(UnsignedPolicyRule {
         id: "allow-build-dir".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::command_bin("rm").with_args_any_glob("build"),
         effect: PolicyEffect::Allow,

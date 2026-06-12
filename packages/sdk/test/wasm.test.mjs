@@ -457,12 +457,12 @@ test("evaluate_policy rejects policy rules with unenforced expiry or bounds", as
 
 test("evaluate_policy rejects empty predicates and token-anchors args_any_globs", async () => {
   const wasm = await loadWasm();
-  const deviceSeed = Buffer.alloc(32, 0x42).toString("base64url");
-  const devicePubkey = wasm.ed25519_public_key(deviceSeed);
+  const f = policyFixture(wasm);
   const actor = { id: "machine:macbook", kind: "claude-code" };
 
   const emptyPredicate = {
     id: "empty-predicate",
+    account_id: f.accountId,
     subject: { kind: "any" },
     match: {},
     effect: "allow",
@@ -471,7 +471,7 @@ test("evaluate_policy rejects empty predicates and token-anchors args_any_globs"
     created_at: 1700000000000,
   };
   const signedEmpty = JSON.parse(
-    wasm.sign_policy_rule(JSON.stringify(emptyPredicate), "device:phone", deviceSeed),
+    wasm.sign_policy_rule(JSON.stringify(emptyPredicate), f.deviceId, f.deviceSeed, f.cert),
   );
   assert.throws(
     () =>
@@ -479,7 +479,8 @@ test("evaluate_policy rejects empty predicates and token-anchors args_any_globs"
         wasm.action_from_command("git status", null),
         JSON.stringify(actor),
         JSON.stringify([signedEmpty]),
-        devicePubkey,
+        f.accountRootPub,
+        f.nowMs,
       ),
     /predicate must constrain the action/,
     "manual {} predicates must not become match-everything allow rules",
@@ -487,6 +488,7 @@ test("evaluate_policy rejects empty predicates and token-anchors args_any_globs"
 
   const tokenRule = {
     id: "allow-build-token",
+    account_id: f.accountId,
     subject: { kind: "any" },
     match: { surface: "command", command: { bin: "rm", args_any_globs: ["build"] } },
     effect: "allow",
@@ -495,14 +497,15 @@ test("evaluate_policy rejects empty predicates and token-anchors args_any_globs"
     created_at: 1700000000000,
   };
   const signedTokenRule = JSON.parse(
-    wasm.sign_policy_rule(JSON.stringify(tokenRule), "device:phone", deviceSeed),
+    wasm.sign_policy_rule(JSON.stringify(tokenRule), f.deviceId, f.deviceSeed, f.cert),
   );
   const exactToken = JSON.parse(
     wasm.evaluate_policy(
       wasm.action_from_command("rm -rf build", null),
       JSON.stringify(actor),
       JSON.stringify([signedTokenRule]),
-      devicePubkey,
+      f.accountRootPub,
+      f.nowMs,
     ),
   );
   assert.equal(exactToken.decision, "allow");
@@ -512,7 +515,8 @@ test("evaluate_policy rejects empty predicates and token-anchors args_any_globs"
       wasm.action_from_command("rm -rf build-prod", null),
       JSON.stringify(actor),
       JSON.stringify([signedTokenRule]),
-      devicePubkey,
+      f.accountRootPub,
+      f.nowMs,
     ),
   );
   assert.equal(
@@ -532,7 +536,8 @@ test("evaluate_policy rejects empty predicates and token-anchors args_any_globs"
       JSON.stringify(rawOnly),
       JSON.stringify(actor),
       JSON.stringify([signedTokenRule]),
-      devicePubkey,
+      f.accountRootPub,
+      f.nowMs,
     ),
   );
   assert.equal(
