@@ -228,12 +228,18 @@ function optionalPushTokens(body: Record<string, unknown>): IncomingPushToken[] 
   if (raw === undefined) return [];
   if (!Array.isArray(raw)) return null;
   const tokens: IncomingPushToken[] = [];
+  const seenTokens = new Set<string>();
   for (const item of raw) {
     if (!isPlainObject(item)) return null;
     const transport = item.transport;
     const token = item.token;
     if (typeof transport !== "string" || !isPushTransportKind(transport)) return null;
     if (typeof token !== "string" || token.length < 1 || token.length > 4096) return null;
+    // Duplicate registrations are idempotent for one device; collapse them before DB mutation so
+    // a repeated token cannot half-complete pairing by tripping the push-token primary key.
+    const tokenKey = `${transport}\0${token}`;
+    if (seenTokens.has(tokenKey)) continue;
+    seenTokens.add(tokenKey);
     tokens.push({ transport, token });
   }
   return tokens;

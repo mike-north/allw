@@ -209,6 +209,26 @@ describe("AccountRelay — pairing", () => {
     expect(listResp.data.devices[0]).not.toHaveProperty("push_tokens");
   });
 
+  it("deduplicates repeated push tokens before consuming the pairing code", async () => {
+    const acct = "acct-pairing-duplicate-push-token";
+    const startResp = await post<{ code: string }>(acct, "/pairing/start", {
+      label: "Phone",
+    });
+
+    const completeResp = await post<{ device_id: string }>(acct, "/pairing/complete", {
+      code: startResp.data.code,
+      pubkey: VALID_PUBKEY_1,
+      push_tokens: [
+        { transport: "apns", token: "ios-token" },
+        { transport: "apns", token: "ios-token" },
+      ],
+    });
+    expect(completeResp.status).toBe(201);
+
+    const stored = await readPushTokens(acct, completeResp.data.device_id);
+    expect(stored).toEqual([{ transport: "apns", token: "ios-token" }]);
+  });
+
   it("rejects malformed push tokens before consuming the pairing code", async () => {
     const acct = "acct-pairing-bad-push-token";
     const startResp = await post<{ code: string }>(acct, "/pairing/start", {});
@@ -421,6 +441,28 @@ describe("AccountRelay — device revocation", () => {
       {},
     );
     expect(status).toBe(404);
+  });
+
+  it("deletes registered push tokens when revoking a device", async () => {
+    const acct = "acct-revoke-clears-push-tokens";
+    const { data: startData } = await post<{ code: string }>(acct, "/pairing/start", {});
+    const { data: completeData } = await post<{ device_id: string }>(acct, "/pairing/complete", {
+      code: startData.code,
+      pubkey: VALID_PUBKEY_1,
+      push_tokens: [{ transport: "apns", token: "ios-token" }],
+    });
+
+    expect(await readPushTokens(acct, completeData.device_id)).toEqual([
+      { transport: "apns", token: "ios-token" },
+    ]);
+
+    const revoke = await post<{ revoked: boolean }>(
+      acct,
+      `/devices/${completeData.device_id}/revoke`,
+      {},
+    );
+    expect(revoke.status).toBe(200);
+    expect(await readPushTokens(acct, completeData.device_id)).toEqual([]);
   });
 });
 
