@@ -685,7 +685,7 @@ export class AccountRelay implements DurableObject {
       return json({ error: "surface_id must be 1-128 URL-safe identifier chars" }, 400);
     }
     const shouldFlushOfflineQueue =
-      surfaceId === undefined || this.ctx.getWebSockets(surfaceTag(surfaceId)).length === 0;
+      surfaceId === undefined || !this.hasOpenSocketOnSurface(surfaceId);
 
     const pair = new WebSocketPair();
     const client = pair[0];
@@ -926,6 +926,16 @@ export class AccountRelay implements DurableObject {
       if (tag.startsWith("surface:")) return tag.slice("surface:".length);
     }
     return null;
+  }
+
+  /** True when a same-surface peer is still open enough to own queued reconnect delivery. */
+  private hasOpenSocketOnSurface(surfaceId: string): boolean {
+    for (const ws of this.ctx.getWebSockets(surfaceTag(surfaceId))) {
+      // Hibernation tag indexes can briefly retain closing sockets; those must not suppress the
+      // reconnecting live socket's offline-queue flush.
+      if (ws.readyState === WebSocket.OPEN) return true;
+    }
+    return false;
   }
 
   /** Send a request to at most one live socket per visible surface. */
