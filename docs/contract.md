@@ -160,19 +160,22 @@ size-limited). The envelope's ciphertext is fetched as JWE and decrypted on-devi
 The per-account Durable Object exposes routing under `/{account_id}/…`. It persists **only** the opaque envelope
 and the signed verdict — never plaintext, never a key it could sign with.
 
-| Method / path                     | Who        | Purpose                                                              |
-| --------------------------------- | ---------- | -------------------------------------------------------------------- |
-| `POST /requests`                  | integrator | Submit an ApprovalRequest envelope; fans out to online devices.      |
-| `GET  /requests/{id}`             | integrator | Poll status → `pending` / terminal `expired` / `resolved` + verdict. |
-| `GET  /requests/{id}/wait` (WS)   | integrator | Block for the verdict; it is pushed the instant a device decides.    |
-| `GET  /devices/{id}/connect` (WS) | device     | Presence socket (hibernatable); flushes the offline queue on open.   |
+| Method / path                                  | Who        | Purpose                                                                                                                                                                   |
+| ---------------------------------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /requests`                               | integrator | Submit an ApprovalRequest envelope; fans out to online devices.                                                                                                           |
+| `GET  /requests/{id}`                          | integrator | Poll status → `pending` / terminal `expired` / `resolved` + verdict.                                                                                                      |
+| `GET  /requests/{id}/wait` (WS)                | integrator | Block for the verdict; it is pushed the instant a device decides.                                                                                                         |
+| `GET  /devices/{id}/connect?surface_id=…` (WS) | device     | Presence socket (hibernatable); flushes the offline queue on open. `surface_id` is optional visible-screen topology for deduping mirrored/native notification transports. |
 
 **Device socket messages** (JSON): relay → device `{ type: "request", request_id, envelope }` and
 `{ type: "retract", request_id }` (another surface resolved it); device → relay
 `{ type: "verdict", request_id, verdict }` (the signed [`Verdict`](#verdict--one-shot-and-scope-free)), answered
 with `{ type: "ack", request_id, status }`. **First verdict wins** — a later verdict for a resolved request is
 acked as `already_resolved` and does not overwrite. A device that was offline when a request arrived receives it
-on its next `connect` (the queue), so delivery survives reconnect.
+on its next `connect` (the queue), so delivery survives reconnect. If a device connection supplies `surface_id`,
+the relay fans out and flushes queued requests to at most one live socket per `surface_id`, preventing a single
+visible screen from showing both a native prompt and a mirrored prompt. Retractions still go to all live device
+sockets so stale surfaces clear.
 
 **Fail-closed expiry** (§Invariants #6): once a request is past `expires_at` it can never become approvable. A
 verdict for an expired request is refused (acked `expired`, not stored); the offline-queue flush skips expired

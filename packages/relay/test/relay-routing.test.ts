@@ -372,6 +372,51 @@ describe("AccountRelay — cross-device coordination", () => {
     const polled = await get<{ verdict: Record<string, unknown> }>(acct, "/requests/req-dedupe-1");
     expect(polled.data.verdict).toEqual(winning); // the first decision stands
   });
+
+  it("fans out to only one connection per visible surface", async () => {
+    const acct = "acct-surface-dedupe";
+    await enrollDevice(acct);
+    const deviceId = await firstDeviceId(acct);
+
+    // These two sockets represent distinct enrolled devices/transports that would notify the same
+    // physical screen, e.g. native macOS plus iPhone notification mirroring on that Mac.
+    const nativeMac = await connectWs(acct, `/devices/${deviceId}/connect?surface_id=mac-screen`);
+    const mirroredPhone = await connectWs(
+      acct,
+      `/devices/${deviceId}/connect?surface_id=mac-screen`,
+    );
+    const phone = await connectWs(acct, `/devices/${deviceId}/connect?surface_id=phone-screen`);
+
+    const submit = await post<{ delivered_to: number }>(
+      acct,
+      "/requests",
+      makeEnvelope("req-surface-1"),
+    );
+    expect(submit.data.delivered_to).toBe(2);
+
+    expect((await nativeMac.next()).request_id).toBe("req-surface-1");
+    expect((await phone.next()).request_id).toBe("req-surface-1");
+    await expect(mirroredPhone.next(500)).rejects.toThrow(/timeout/);
+  });
+
+  it("flushes queued requests to only one reconnecting connection per visible surface", async () => {
+    const acct = "acct-surface-flush";
+    await enrollDevice(acct);
+    const deviceId = await firstDeviceId(acct);
+
+    await post(acct, "/requests", makeEnvelope("req-surface-queued"));
+
+    const nativeMac = await connectWs(acct, `/devices/${deviceId}/connect?surface_id=mac-screen`);
+    const mirroredPhone = await connectWs(
+      acct,
+      `/devices/${deviceId}/connect?surface_id=mac-screen`,
+    );
+    const phone = await connectWs(acct, `/devices/${deviceId}/connect?surface_id=phone-screen`);
+
+    expect((await nativeMac.next()).request_id).toBe("req-surface-queued");
+    expect((await phone.next()).request_id).toBe("req-surface-queued");
+    await expect(mirroredPhone.next(500)).rejects.toThrow(/timeout/);
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -94,6 +94,11 @@ Mirroring). Getting this right is a coordination problem, and another reason nat
 - **Owner: the relay.** The per-account **Durable Object** knows the device topology and live presence, so it
   drives targeted fan-out, retraction, and dedupe. First-class requirement on the relay + apps, not an afterthought.
 
+Relay device presence sockets expose the topology hook with an optional `surface_id` on
+`GET /devices/{id}/connect`: transports visible on the same physical screen use the same `surface_id`, and the
+Durable Object fans out/flushes a request to only one live socket per surface. Clients that omit `surface_id` keep
+independent delivery, and retractions still broadcast to every live socket so stale notifications clear.
+
 ## Platform mapping (native)
 
 Core access: **UniFFI** (Swift/Kotlin); **direct crate** (Linux `gtk4-rs`); **C ABI / P-Invoke** (Windows, C#/.NET).
