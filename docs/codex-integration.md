@@ -85,12 +85,15 @@ The matcher intentionally matches the Claude Code hook's v1 surface:
 
 - `Bash` commands are converted to command `ActionRecord`s through the WASM core.
 - `mcp__<server>__<tool>` calls are converted to MCP `ActionRecord`s through the WASM core.
-- Other Codex tools pass through for now.
+- Other Codex tools, including `apply_patch`, pass through for now.
 
-Codex can also expose `apply_patch` through `PreToolUse`, but allw does not yet have a core
-`ActionRecord` surface for file edits. Gating it in this slice would either duplicate policy in
-TypeScript or build an ambiguous record, so this package documents the limitation instead of
-pretending file edits are covered.
+That `apply_patch` pass-through is a bypass, not just missing coverage: an agent denied on a
+mutating `Bash` command can often route the same file edit through `apply_patch`, because the
+recommended `Bash|mcp__.*` matcher leaves file edits ungated. allw does not yet have a core
+`ActionRecord` surface for file edits, and gating them in this slice would either duplicate policy
+in TypeScript or build an ambiguous record. Issue
+[#106](https://github.com/mike-north/allw/issues/106) tracks the edit-surface `ActionRecord`
+follow-up needed to close this bypass.
 
 ## Decision Mapping
 
@@ -116,6 +119,16 @@ For gated calls, the hook builds the syntactic `ActionRecord`, requests approval
 | relay/network/approval error             | `deny`         |
 | non-gated tool                           | `allow`        |
 
+Codex itself fails open if a command hook fails to emit a well-formed, exit-0
+`permissionDecision`: startup failure, malformed stdout, process crash, SIGKILL, or Codex's hook
+timeout are reported as hook errors and the tool call continues. allw's fail-closed behavior
+therefore depends on the hook process starting and returning an explicit `deny` before Codex's
+pinned 480 second timeout. The CLI catch-all covers internal throws by emitting `deny`; startup
+failures, external kills, and process death before stdout remain unavoidable residual fail-open
+cases. This is the same timeout-ordering invariant documented for
+[#52](https://github.com/mike-north/allw/issues/52): `ALLW_TIMEOUT_MS` must stay below the pinned
+hook timeout so the SDK reaches a verified approval or explicit denial first.
+
 The actor is distinct from the Claude Code hook: Codex requests use `actor.kind = "codex"` and
 `actor.id = "codex:<hostname>"`, so a single allw inbox can distinguish "Claude Code on devbox-1"
 from "Codex on devbox-1".
@@ -127,6 +140,8 @@ This design depends on the current OpenAI Codex hooks contract, checked on 2026-
 - Hook commands receive one JSON object on stdin and may return JSON on stdout.
 - `PreToolUse` can intercept Bash, `apply_patch`, and MCP tool calls, but the docs describe it as a
   guardrail rather than a complete enforcement boundary.
+- A failed, malformed, or timed-out hook invocation is a non-blocking error; Codex reports the hook
+  problem and continues the tool call.
 - Matching command hooks can run concurrently, and multiple hook sources all load.
 - Non-managed hooks must be reviewed and trusted with `/hooks` before Codex runs them.
 - Hook `timeout` is in seconds and defaults to 600; allw pins 480 seconds so the SDK deadline wins

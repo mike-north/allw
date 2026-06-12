@@ -28,6 +28,8 @@ export interface CodexApprovalRequest {
   readonly actor: { readonly id: string; readonly kind: "codex" };
   readonly risk: "low" | "medium" | "high" | "critical";
   readonly reversible: boolean;
+  /** Optional Codex call id carried for audit-chain correlation and dedupe. */
+  readonly chain?: readonly string[];
   readonly timeoutMs?: number;
 }
 
@@ -73,6 +75,7 @@ function buildApprovalRequest(
   summary: string,
   config: HookConfig,
   hostname: string,
+  toolUseId?: string,
 ): CodexApprovalRequest | null {
   let parsed: unknown;
   try {
@@ -93,6 +96,9 @@ function buildApprovalRequest(
     actor: { id: `codex:${hostname}`, kind: "codex" },
     risk: parsed.risk,
     reversible: reversibleForRisk(parsed.risk),
+    ...(toolUseId !== undefined && toolUseId.length > 0
+      ? { chain: [`codex:tool_use_id:${toolUseId}`] }
+      : {}),
     ...(config.timeoutMs !== undefined ? { timeoutMs: config.timeoutMs } : {}),
   };
 }
@@ -117,7 +123,13 @@ export async function decide(
     return denyOutput(gate.reason);
   }
 
-  const req = buildApprovalRequest(gate.actionRecord, gate.summary, deps.config, hostname);
+  const req = buildApprovalRequest(
+    gate.actionRecord,
+    gate.summary,
+    deps.config,
+    hostname,
+    input.toolUseId,
+  );
   if (req === null) {
     return denyOutput("allw: built ActionRecord was not in the expected shape (fail-closed deny)");
   }

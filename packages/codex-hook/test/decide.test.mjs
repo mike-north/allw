@@ -19,12 +19,13 @@ const CONFIG = {
   approverRootKey: "x".repeat(43),
 };
 
-function bashInput(command, cwd) {
+function bashInput(command, cwd, toolUseId) {
   return {
     hookEventName: "PreToolUse",
     toolName: "Bash",
     toolInput: { command },
     ...(cwd ? { cwd } : {}),
+    ...(toolUseId ? { toolUseId } : {}),
   };
 }
 
@@ -48,7 +49,7 @@ test("approved Bash verdict allows Codex and carries a distinct Codex actor", as
   const approver = recording("approved");
 
   const output = await decide(
-    bashInput("git push origin main", "/repo"),
+    bashInput("git push origin main", "/repo", "call-1"),
     { wasm, config: CONFIG, requestApproval: approver.fn },
     HOSTNAME,
   );
@@ -59,6 +60,7 @@ test("approved Bash verdict allows Codex and carries a distinct Codex actor", as
   assert.equal(approver.calls[0].actor.kind, "codex");
   assert.equal(approver.calls[0].action.surface, "command");
   assert.equal(approver.calls[0].action.syntactic.cwd, "/repo");
+  assert.deepEqual(approver.calls[0].chain, ["codex:tool_use_id:call-1"]);
 });
 
 test("non-approved verdicts deny Codex fail-closed", async () => {
