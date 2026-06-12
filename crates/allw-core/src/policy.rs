@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::contract::{ActionRecord, Actor, PolicyDecision, Surface};
 use crate::crypto::{
-    decode_and_verify_jws, encode_compact_jws, verify_certified_device, DeviceCertError, JwsError,
-    JwsHeader, PublicKey, SigningKeyPair, ALG_EDDSA,
+    account_state_revokes_device, decode_and_verify_jws, encode_compact_jws,
+    verify_certified_device, DeviceCertError, JwsError, JwsHeader, PublicKey, SigningKeyPair,
+    ALG_EDDSA,
 };
 
 const POLICY_SCHEMA_VERSION: u32 = 1;
@@ -430,6 +431,8 @@ pub enum PolicyRuleError {
     CertAccountMismatch,
     CertDeviceMismatch,
     CertExpired,
+    AccountStateInvalid,
+    DeviceRevoked,
     MalformedJws,
     UnexpectedAlg,
     UnexpectedTyp,
@@ -459,6 +462,10 @@ impl std::fmt::Display for PolicyRuleError {
                 write!(f, "policy-rule JWS kid does not match the certified device")
             }
             Self::CertExpired => write!(f, "policy-rule device cert has expired"),
+            Self::AccountStateInvalid => write!(f, "account state is invalid"),
+            Self::DeviceRevoked => {
+                write!(f, "policy-rule signing device is revoked by account state")
+            }
             Self::MalformedJws => write!(f, "malformed policy-rule JWS"),
             Self::UnexpectedAlg => write!(f, "unexpected policy-rule JWS alg"),
             Self::UnexpectedTyp => write!(f, "unexpected policy-rule JWS typ"),
@@ -530,6 +537,18 @@ pub fn verify_policy_rule(
     account_root: &PublicKey,
     now_ms: i64,
 ) -> Result<VerifiedPolicyRule, PolicyRuleError> {
+    verify_policy_rule_with_account_states(rule, account_root, now_ms, &[])
+}
+
+/// Verify a signed policy rule and reject rules signed by devices revoked in account state.
+///
+/// When multiple valid account-state documents are supplied, the highest `sequence` wins.
+pub fn verify_policy_rule_with_account_states(
+    rule: &PolicyRule,
+    account_root: &PublicKey,
+    now_ms: i64,
+    account_states: &[&str],
+) -> Result<VerifiedPolicyRule, PolicyRuleError> {
     let cert = rule
         .device_cert
         .as_deref()
@@ -541,6 +560,16 @@ pub fn verify_policy_rule(
             DeviceCertError::CertExpired => PolicyRuleError::CertExpired,
         },
     )?;
+    if account_state_revokes_device(
+        account_states,
+        &rule.account_id,
+        account_root,
+        &certified.device_id,
+    )
+    .map_err(|_| PolicyRuleError::AccountStateInvalid)?
+    {
+        return Err(PolicyRuleError::DeviceRevoked);
+    }
 
     let decoded = decode_and_verify_jws::<UnsignedPolicyRule>(
         &rule.sig,

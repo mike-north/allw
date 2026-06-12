@@ -1,9 +1,11 @@
 use allw_core::{
     action_from_argv, action_from_mcp_tool_call, evaluate, evaluate_for_actor, issue_device_cert,
-    sign_policy_rule, sign_verdict, verify_policy_rule, Actor, Approver, CommandContext, Decision,
-    PolicyDecision, PolicyEffect, PolicyPredicate, PolicyProvenance, PolicyRuleError,
-    PolicyRuleScope, PolicyTier, Risk, SigningKeyPair, Surface, SyntacticSubstrate,
-    UnsignedPolicyRule, UnsignedVerdict, Verdict,
+    sign_account_state, sign_policy_rule, sign_verdict, verify_policy_rule,
+    verify_policy_rule_with_account_states, AccountState, AccountStateRevocation,
+    AccountStateRevocationKind, Actor, Approver, CommandContext, Decision, PolicyDecision,
+    PolicyEffect, PolicyPredicate, PolicyProvenance, PolicyRuleError, PolicyRuleScope, PolicyTier,
+    Risk, SigningKeyPair, Surface, SyntacticSubstrate, UnsignedPolicyRule, UnsignedVerdict,
+    Verdict,
 };
 use serde_json::json;
 
@@ -58,6 +60,28 @@ fn expired_device_cert() -> String {
         CREATED_AT,
         Some(CREATED_AT + 500),
     )
+}
+
+fn account_state(sequence: u64, revoked_device_ids: &[&str]) -> String {
+    let state = AccountState {
+        v: 1,
+        account_id: ACCOUNT_ID.to_string(),
+        sequence,
+        current_root: root_key().public_key().to_bytes(),
+        previous_roots: Vec::new(),
+        devices: Vec::new(),
+        actors: Vec::new(),
+        revocations: revoked_device_ids
+            .iter()
+            .map(|device_id| AccountStateRevocation {
+                kind: AccountStateRevocationKind::Device,
+                id: (*device_id).to_string(),
+                revoked_at: NOW_OK - 1,
+                reason: Some("test revocation".to_string()),
+            })
+            .collect(),
+    };
+    sign_account_state(&state, &root_key())
 }
 
 fn signed(rule: UnsignedPolicyRule) -> allw_core::VerifiedPolicyRule {
@@ -241,6 +265,35 @@ fn signed_policy_rule_requires_account_root_cert_chain_and_matching_kid() {
         verify_policy_rule(&expired_cert_rule, &root_key().public_key(), NOW_OK),
         Err(PolicyRuleError::CertExpired),
         "policy rules must reject expired device certs on the policy verification path"
+    );
+}
+
+#[test]
+fn signed_policy_rule_rejects_revoked_device_from_account_state() {
+    let unsigned = UnsignedPolicyRule {
+        id: "allow-ls".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate::command_bin("ls"),
+        effect: PolicyEffect::Allow,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: CREATED_AT,
+        expires_at: None,
+    };
+    let rule = sign_policy_rule(&unsigned, DEVICE_ID, &device_key(), Some(device_cert()));
+    let revoked = account_state(7, &[DEVICE_ID]);
+
+    assert_eq!(
+        verify_policy_rule_with_account_states(
+            &rule,
+            &root_key().public_key(),
+            NOW_OK,
+            &[revoked.as_str()]
+        ),
+        Err(PolicyRuleError::DeviceRevoked),
+        "policy verification must reject a rule signed by a revoked certified device"
     );
 }
 
