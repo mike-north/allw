@@ -1,0 +1,26 @@
+{
+  "name": "@allw/web-approver",
+  "version": "0.0.0",
+  "description": "Browser approver surface: inbox, WYSIWYS detail, and number-match decision flow.",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "public"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src",
+    "test": "tsc -p tsconfig.json && node --test \"test/**/*.test.mjs\""
+  },
+  "license": "MIT"
+}

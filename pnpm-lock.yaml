@@ -84,6 +84,8 @@ importers:
         specifier: ^22.0.0
         version: 22.19.20
 
+  packages/web-approver: {}
+
 packages:
 
   '@cloudflare/kv-asset-handler@0.5.0':
