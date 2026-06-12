@@ -36,7 +36,7 @@ pnpm -r build                     # topological dist build for packages that imp
 pnpm -r typecheck                 # tsc --noEmit across packages
 pnpm -r lint                      # ESLint (type-checked)
 pnpm -r test                      # package tests: node:test plus relay Vitest workers-pool tests
-pnpm exec prettier --check "**/*.{ts,js,json,md}"   # --write to fix
+pnpm exec prettier --check "**/*.{ts,js,mjs,json,md}"   # --write to fix (incl. .mjs — the test files)
 pnpm --filter @allw/relay typecheck                 # a single package
 ```
 
