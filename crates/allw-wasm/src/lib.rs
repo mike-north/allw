@@ -42,8 +42,12 @@ use allw_core::{
     compute_request_hash as core_compute_request_hash, decrypt_context as core_decrypt_context,
     encrypt_context as core_encrypt_context, evaluate as core_evaluate,
     evaluate_for_actor as core_evaluate_for_actor, issue_device_cert as core_issue_device_cert,
-    sign_policy_rule as core_sign_policy_rule, sign_verdict as core_sign_verdict,
-    verify_policy_rule as core_verify_policy_rule, verify_verdict as core_verify_verdict,
+    sign_account_state as core_sign_account_state, sign_policy_rule as core_sign_policy_rule,
+    sign_verdict as core_sign_verdict, verify_account_state as core_verify_account_state,
+    verify_policy_rule as core_verify_policy_rule,
+    verify_policy_rule_with_account_states as core_verify_policy_rule_with_account_states,
+    verify_verdict as core_verify_verdict,
+    verify_verdict_with_account_states as core_verify_verdict_with_account_states, AccountState,
     ActionRecord, Actor, ApprovalContext, ApprovalRequest, Approver, CommandContext,
     ContextRecipient, Decision, PolicyRule, PolicyRuleScope, PublicKey, SigningKeyPair,
     UnsignedPolicyRule, UnsignedVerdict, Verdict, X25519KeyPair, X25519PublicKey,
@@ -84,6 +88,13 @@ fn decode_b64_vec(s: &str, what: &str) -> Result<Vec<u8>, JsError> {
     URL_SAFE_NO_PAD
         .decode(s)
         .map_err(|e| JsError::new(&format!("{what} is not valid base64url: {e}")))
+}
+
+/// Parses the JSON array of compact account-state JWS strings that the SDK passes through. The
+/// core owns all signature/sequence semantics; this helper only turns JS strings into borrowed
+/// `&str`s for the thin-shell call.
+fn parse_account_states_json(account_states_json: &str) -> Result<Vec<String>, JsError> {
+    parse_json(account_states_json, "account state JWS array")
 }
 
 /// JS `Number.MAX_SAFE_INTEGER` = 2^53 − 1. Integer `f64`s within `±MAX_SAFE_INTEGER` are the
@@ -311,6 +322,64 @@ pub fn verify_verdict(
     )
 }
 
+/// Verifies a [`Verdict`](allw_core::Verdict) exactly like [`verify_verdict`], but additionally
+/// rejects verdicts signed by a device revoked in the highest-sequence valid root-signed account
+/// state supplied by the caller.
+///
+/// `account_states_json` is a JSON array of compact `allw-account-state+jws` strings. The core
+/// validates every supplied state against `approver_root_pubkey_b64`; malformed, wrong-account, or
+/// wrong-root state fails closed instead of being ignored. Callers must persist monotonic account
+/// state themselves: passing only stale state can make stale trust look current.
+///
+/// # Errors
+///
+/// Throws on any ordinary verdict verification failure, any invalid account-state JWS, or a
+/// highest-sequence account state that revokes the verdict-signing device.
+#[wasm_bindgen]
+pub fn verify_verdict_with_account_states(
+    verdict_json: &str,
+    request_json: &str,
+    context_json: &str,
+    approver_root_pubkey_b64: &str,
+    now_ms: f64,
+    account_states_json: &str,
+) -> Result<String, JsError> {
+    let verdict: Verdict = parse_json(verdict_json, "Verdict")?;
+    let request: ApprovalRequest = parse_json(request_json, "ApprovalRequest")?;
+    let context: ApprovalContext = parse_json(context_json, "ApprovalContext")?;
+    let root_bytes = decode_b64_32(approver_root_pubkey_b64, "approver_root_pubkey_b64")?;
+    let root = PublicKey::from_bytes(&root_bytes).map_err(|e| {
+        JsError::new(&format!(
+            "approver_root_pubkey_b64 is not a valid Ed25519 key: {e}"
+        ))
+    })?;
+    let now_ms = ms_to_i64(now_ms, "now_ms")?;
+    let account_states = parse_account_states_json(account_states_json)?;
+    let account_state_refs: Vec<&str> = account_states.iter().map(String::as_str).collect();
+
+    let mut nonce_store = allw_core::InMemoryNonceStore::new();
+    let verified = core_verify_verdict_with_account_states(
+        &verdict,
+        &request,
+        &context,
+        &root,
+        &mut nonce_store,
+        now_ms,
+        &account_state_refs,
+    )
+    .map_err(|e| JsError::new(&format!("verify_verdict_with_account_states failed: {e}")))?;
+
+    to_json(
+        &VerifyResult {
+            approved: true,
+            device_id: verified.device_id,
+            decided_at: verified.decided_at,
+            nonce_b64: URL_SAFE_NO_PAD.encode(verified.nonce),
+        },
+        "VerifyResult",
+    )
+}
+
 // ── sign_verdict ──────────────────────────────────────────────────────────────────────
 
 /// The signing input for [`sign_verdict`]: every [`Verdict`](allw_core::Verdict) field except the
@@ -434,6 +503,52 @@ pub fn issue_device_cert(
     ))
 }
 
+// ── account state ───────────────────────────────────────────────────────────────────
+
+/// Signs a root-authored [`AccountState`](allw_core::AccountState), returning an
+/// `allw-account-state+jws` compact JWS string. This is a test/development helper for the SDK
+/// surface; production account-state issuance belongs to account-owner enrollment flows.
+///
+/// # Errors
+///
+/// Throws if `state_json` is not a valid `AccountState` JSON document or
+/// `account_root_seed_b64` is not a 32-byte base64url seed.
+#[wasm_bindgen]
+pub fn sign_account_state(
+    state_json: &str,
+    account_root_seed_b64: &str,
+) -> Result<String, JsError> {
+    let state: AccountState = parse_json(state_json, "AccountState")?;
+    let seed = decode_b64_32(account_root_seed_b64, "account_root_seed_b64")?;
+    let account_root = SigningKeyPair::from_seed(&seed);
+    Ok(core_sign_account_state(&state, &account_root))
+}
+
+/// Verifies a root-signed account-state JWS for `expected_account_id`, returning the verified
+/// [`AccountState`](allw_core::AccountState) JSON. Wrong account ids, wrong roots, invalid
+/// signatures, and unsupported versions all fail closed.
+///
+/// # Errors
+///
+/// Throws if `account_root_pubkey_b64` is not a valid Ed25519 public key or the account-state JWS
+/// does not verify against that root for `expected_account_id`.
+#[wasm_bindgen]
+pub fn verify_account_state(
+    account_state_jws: &str,
+    expected_account_id: &str,
+    account_root_pubkey_b64: &str,
+) -> Result<String, JsError> {
+    let root_bytes = decode_b64_32(account_root_pubkey_b64, "account_root_pubkey_b64")?;
+    let root = PublicKey::from_bytes(&root_bytes).map_err(|e| {
+        JsError::new(&format!(
+            "account_root_pubkey_b64 is not a valid Ed25519 key: {e}"
+        ))
+    })?;
+    let state = core_verify_account_state(account_state_jws, expected_account_id, &root)
+        .map_err(|e| JsError::new(&format!("verify_account_state failed: {e}")))?;
+    to_json(&state, "AccountState")
+}
+
 // ── policy rules ──────────────────────────────────────────────────────────────────────
 
 /// Signs an unsigned [`PolicyRule`](allw_core::PolicyRule) payload with a device Ed25519 key,
@@ -511,6 +626,46 @@ pub fn policy_rule_from_approval(
     to_json(&rule, "PolicyRule")
 }
 
+/// Verifies one signed [`PolicyRule`](allw_core::PolicyRule) against an account root and the
+/// caller-supplied account-state JWS set. A highest-sequence revocation for the rule-signing
+/// device rejects the rule even when its embedded device certificate still chains to the root.
+///
+/// # Errors
+///
+/// Throws if the rule JSON is malformed, the root key is invalid, any account-state JWS is invalid
+/// for the rule account/root, or the rule fails certificate/signature/revocation verification.
+#[wasm_bindgen]
+pub fn verify_policy_rule_with_account_states(
+    rule_json: &str,
+    account_root_pubkey_b64: &str,
+    now_ms: f64,
+    account_states_json: &str,
+) -> Result<String, JsError> {
+    let rule: PolicyRule = parse_json(rule_json, "PolicyRule")?;
+    let root_pubkey_bytes = decode_b64_32(account_root_pubkey_b64, "account_root_pubkey_b64")?;
+    let root_pubkey = PublicKey::from_bytes(&root_pubkey_bytes).map_err(|e| {
+        JsError::new(&format!(
+            "account_root_pubkey_b64 is not a valid Ed25519 key: {e}"
+        ))
+    })?;
+    let now_ms = ms_to_i64(now_ms, "now_ms")?;
+    let account_states = parse_account_states_json(account_states_json)?;
+    let account_state_refs: Vec<&str> = account_states.iter().map(String::as_str).collect();
+
+    let verified = core_verify_policy_rule_with_account_states(
+        &rule,
+        &root_pubkey,
+        now_ms,
+        &account_state_refs,
+    )
+    .map_err(|e| {
+        JsError::new(&format!(
+            "verify_policy_rule_with_account_states failed: {e}"
+        ))
+    })?;
+    to_json(&verified, "VerifiedPolicyRule")
+}
+
 /// Verifies signed policy rules and evaluates them against one action. Returns a
 /// [`PolicyEvaluation`](allw_core::PolicyEvaluation) JSON object.
 ///
@@ -550,6 +705,62 @@ pub fn evaluate_policy(
         .map(|rule| {
             core_verify_policy_rule(rule, &root_pubkey, now_ms)
                 .map_err(|e| JsError::new(&format!("verify_policy_rule failed: {e}")))
+        })
+        .collect::<Result<Vec<_>, JsError>>()?;
+
+    let evaluation = match actor.as_ref() {
+        Some(actor) => core_evaluate_for_actor(actor, &action, &verified),
+        None => core_evaluate(&action, &verified),
+    };
+    to_json(&evaluation, "PolicyEvaluation")
+}
+
+/// Verifies signed policy rules with account-state revocation enforcement and evaluates them
+/// against one action. This is the account-state-aware twin of [`evaluate_policy`]: every supplied
+/// rule must verify under the account root and must not have been signed by a revoked device.
+///
+/// # Errors
+///
+/// Throws if action/actor/rules/account-state JSON is malformed, the root key is invalid,
+/// `now_ms` is unsafe, or any signed rule fails verification.
+#[wasm_bindgen]
+pub fn evaluate_policy_with_account_states(
+    action_json: &str,
+    actor_json: Option<String>,
+    signed_rules_json: &str,
+    account_root_pubkey_b64: &str,
+    now_ms: f64,
+    account_states_json: &str,
+) -> Result<String, JsError> {
+    let action: ActionRecord = parse_json(action_json, "ActionRecord")?;
+    let actor: Option<Actor> = actor_json
+        .as_deref()
+        .map(|json| parse_json(json, "Actor"))
+        .transpose()?;
+    let rules: Vec<PolicyRule> = parse_json(signed_rules_json, "PolicyRule[]")?;
+    let root_pubkey_bytes = decode_b64_32(account_root_pubkey_b64, "account_root_pubkey_b64")?;
+    let root_pubkey = PublicKey::from_bytes(&root_pubkey_bytes).map_err(|e| {
+        JsError::new(&format!(
+            "account_root_pubkey_b64 is not a valid Ed25519 key: {e}"
+        ))
+    })?;
+    let now_ms = ms_to_i64(now_ms, "now_ms")?;
+    let account_states = parse_account_states_json(account_states_json)?;
+    let account_state_refs: Vec<&str> = account_states.iter().map(String::as_str).collect();
+    let verified = rules
+        .iter()
+        .map(|rule| {
+            core_verify_policy_rule_with_account_states(
+                rule,
+                &root_pubkey,
+                now_ms,
+                &account_state_refs,
+            )
+            .map_err(|e| {
+                JsError::new(&format!(
+                    "verify_policy_rule_with_account_states failed: {e}"
+                ))
+            })
         })
         .collect::<Result<Vec<_>, JsError>>()?;
 

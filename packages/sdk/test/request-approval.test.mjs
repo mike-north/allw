@@ -155,6 +155,28 @@ function signVerdict(wasm, approver, req, capturedEnvelope, { decision = "approv
   return JSON.parse(verdictJson);
 }
 
+/** Root-sign a minimal account-state document for account-state-aware SDK verification tests. */
+function signAccountState(wasm, approver, { sequence, revokedDeviceIds = [] }) {
+  return wasm.sign_account_state(
+    JSON.stringify({
+      v: 1,
+      account_id: ACCOUNT_ID,
+      sequence,
+      current_root: approver.accountRootPub,
+      previous_roots: [],
+      devices: [],
+      actors: [],
+      revocations: revokedDeviceIds.map((id) => ({
+        kind: "device",
+        id,
+        revoked_at: NOW_MS,
+        reason: "test revocation",
+      })),
+    }),
+    approver.accountSeed,
+  );
+}
+
 // ── Relay test double ─────────────────────────────────────────────────────────────────
 
 /**
@@ -364,6 +386,45 @@ test("(a') happy poll round-trip (no WebSocket) → approved", async () => {
 
   const verdict = await pollClient(approver, relay).requestApproval(req);
   assert.equal(verdict.decision, "approved", "poll fallback verifies an approved verdict");
+});
+
+test("(a-revoked) accountStates reject an otherwise valid verdict from a revoked device", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const req = sampleRequest();
+  const revokedState = signAccountState(wasm, approver, {
+    sequence: 1,
+    revokedDeviceIds: [approver.deviceId],
+  });
+
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: {
+      poll: (env) => (env ? signVerdict(wasm, approver, req, env, { decision: "approved" }) : null),
+    },
+  });
+  const client = createClient({
+    relayUrl: RELAY_URL,
+    accountId: ACCOUNT_ID,
+    approverRootKey: approver.accountRootPub,
+    fetchImpl: relay.fetchImpl,
+    nowImpl: () => NOW_MS,
+    webSocketFactory: undefined,
+    pollIntervalMs: 5,
+    accountStates: [revokedState],
+  });
+
+  const verdict = await client.requestApproval(req);
+  assert.equal(
+    verdict.decision,
+    "denied",
+    "a revoked device's otherwise valid approval fails closed to denied",
+  );
+  assert.equal(
+    await verdict.verify(approver.accountRootPub),
+    false,
+    "verify() uses the client account-state set by default",
+  );
 });
 
 test("(b) timeout (no verdict ever) → expired, never approved, verify() false", async () => {

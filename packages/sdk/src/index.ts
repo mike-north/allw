@@ -115,7 +115,7 @@ export interface Verdict {
    * object is idempotent: the nonce accepted by `requestApproval` does not self-trip this method.
    * Never throws.
    */
-  verify(approverRootKey: string): Promise<boolean>;
+  verify(approverRootKey: string, options?: VerdictVerifyOptions): Promise<boolean>;
 }
 
 /**
@@ -132,6 +132,98 @@ export interface NonceStore {
    * separate read-then-write operations, so concurrent replay attempts cannot both be accepted.
    */
   checkAndInsert(nonceB64: string): boolean | Promise<boolean>;
+}
+
+/**
+ * Account-state documents known to the verifier. Integrators must provide every state they know
+ * about, or at least enforce a durably persisted highest sequence before calling; the SDK cannot
+ * infer omitted newer revocations from a stale list.
+ */
+export interface AccountStateOptions {
+  readonly accountStates?: readonly string[];
+}
+
+/** Options for re-verifying a returned {@link Verdict}. */
+export type VerdictVerifyOptions = AccountStateOptions;
+
+/** Root-signed account trust state used by offline verdict/policy verifiers for revocation. */
+export interface AccountState {
+  readonly v: number;
+  readonly account_id: string;
+  readonly sequence: number;
+  readonly current_root: string;
+  readonly previous_roots: readonly {
+    readonly root: string;
+    readonly valid_until: number;
+  }[];
+  readonly devices: readonly {
+    readonly device_id: string;
+    readonly encryption_pubkey: string;
+    readonly signing_pubkey: string;
+    readonly status: string;
+    readonly cert_expires_at?: number;
+  }[];
+  readonly actors: readonly {
+    readonly actor_id: string;
+    readonly kind: string;
+    readonly pubkey: string;
+    readonly status: string;
+  }[];
+  readonly revocations: readonly {
+    readonly kind: "device" | "actor";
+    readonly id: string;
+    readonly revoked_at: number;
+    readonly reason?: string;
+  }[];
+}
+
+/** Normalized successful verdict verification result from the WASM core. */
+export interface VerifiedVerdictResult {
+  readonly approved: true;
+  readonly deviceId: string;
+  readonly decidedAt: number;
+  readonly nonceB64: string;
+}
+
+/** Result of verifying a signed policy rule, normalized from the core's snake_case JSON. */
+export interface VerifiedPolicyRule {
+  readonly rule: unknown;
+  readonly deviceId: string;
+}
+
+export type PolicyDecision = "allow" | "deny" | "escalate";
+export type PolicyTier = "syntactic" | "semantic";
+
+/** Result of policy evaluation for one action. */
+export interface PolicyEvaluation {
+  readonly decision: PolicyDecision;
+  readonly ruleId?: string;
+  readonly tier: PolicyTier;
+  readonly schemaVersion: number;
+}
+
+export interface VerifyVerdictWithAccountStatesInput extends AccountStateOptions {
+  readonly verdict: unknown;
+  readonly request: unknown;
+  readonly context: unknown;
+  readonly approverRootKey: string;
+  readonly nowMs: number;
+  /** Optional cross-call replay store. When omitted, the WASM core still enforces one-shot local replay. */
+  readonly nonceStore?: NonceStore;
+}
+
+export interface VerifyPolicyRuleWithAccountStatesInput extends AccountStateOptions {
+  readonly rule: unknown;
+  readonly accountRootKey: string;
+  readonly nowMs: number;
+}
+
+export interface EvaluatePolicyWithAccountStatesInput extends AccountStateOptions {
+  readonly action: unknown;
+  readonly actor?: unknown;
+  readonly signedRules: readonly unknown[];
+  readonly accountRootKey: string;
+  readonly nowMs: number;
 }
 
 /** Configuration for {@link createClient}. */
@@ -167,6 +259,12 @@ export interface ClientConfig {
    * persists across `requestApproval` and `Verdict.verify()` calls for this client instance.
    */
   readonly nonceStore?: NonceStore;
+  /**
+   * Root-signed account-state JWS documents used to reject verdicts from revoked devices.
+   * The caller owns monotonic persistence: supply all known states, or only call with a state set
+   * already checked against a durably stored highest sequence.
+   */
+  readonly accountStates?: readonly string[];
   /**
    * Override the timer used to schedule the poll cadence and the fail-closed deadline (tests).
    * Defaults to `setTimeout`. Exposed so the fail-closed timing can be driven deterministically by
@@ -298,16 +396,38 @@ interface VerifiedDecision {
 }
 
 interface VerifiedWasmResult {
+  readonly approved: true;
+  readonly deviceId: string;
+  readonly decidedAt: number;
   readonly nonceB64: string;
 }
 
 /** Parse the WASM verification JSON and normalize its snake_case nonce field for SDK use. */
 function readVerifiedWasmResult(json: string): VerifiedWasmResult {
-  const value = JSON.parse(json) as { nonce_b64?: unknown };
+  const value = JSON.parse(json) as {
+    approved?: unknown;
+    device_id?: unknown;
+    decided_at?: unknown;
+    nonce_b64?: unknown;
+  };
+  if (value.approved !== true) {
+    throw new Error("allw: verify_verdict result was not approved");
+  }
+  if (typeof value.device_id !== "string" || value.device_id.length === 0) {
+    throw new Error("allw: verify_verdict result did not include a device_id");
+  }
+  if (typeof value.decided_at !== "number" || !Number.isSafeInteger(value.decided_at)) {
+    throw new Error("allw: verify_verdict result did not include a safe decided_at");
+  }
   if (typeof value.nonce_b64 !== "string" || value.nonce_b64.length === 0) {
     throw new Error("allw: verify_verdict result did not include a nonce_b64");
   }
-  return { nonceB64: value.nonce_b64 };
+  return {
+    approved: true,
+    deviceId: value.device_id,
+    decidedAt: value.decided_at,
+    nonceB64: value.nonce_b64,
+  };
 }
 
 /**
@@ -322,6 +442,11 @@ async function acceptVerifiedNonce(
 ): Promise<boolean> {
   if (acceptedNonceB64 !== undefined && nonceB64 === acceptedNonceB64) return true;
   return nonceStore.checkAndInsert(nonceB64);
+}
+
+/** Stringify the caller-provided account-state JWS list in the exact form the WASM bridge expects. */
+function accountStatesJson(accountStates: readonly string[] | undefined): string {
+  return JSON.stringify(accountStates ?? []);
 }
 
 /**
@@ -341,13 +466,24 @@ async function verifyToDecision(
   approverRootKey: string,
   nowMs: number,
   nonceStore: NonceStore,
+  accountStates?: readonly string[],
   acceptedNonceB64?: string,
 ): Promise<VerifiedDecision | null> {
   if (verdictValue === null || verdictValue === undefined) return null;
   const verdictJson = JSON.stringify(verdictValue);
   let verifyJson: string;
   try {
-    verifyJson = wasm.verify_verdict(verdictJson, requestJson, contextJson, approverRootKey, nowMs);
+    verifyJson =
+      accountStates === undefined
+        ? wasm.verify_verdict(verdictJson, requestJson, contextJson, approverRootKey, nowMs)
+        : wasm.verify_verdict_with_account_states(
+            verdictJson,
+            requestJson,
+            contextJson,
+            approverRootKey,
+            nowMs,
+            accountStatesJson(accountStates),
+          );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (isAuthenticatedNonApproval(message)) {
@@ -366,6 +502,107 @@ async function verifyToDecision(
     // A malformed binding result or nonce-store failure cannot be treated as approved.
     return null;
   }
+}
+
+/**
+ * Sign an account-state document through the WASM core. This is intentionally thin: production
+ * account-state authoring belongs to enrollment/recovery flows, while this helper keeps tests and
+ * local tools on the same signed wire format as verifiers.
+ */
+export async function signAccountState(
+  state: AccountState,
+  accountRootSeedB64: string,
+): Promise<string> {
+  const wasm = await loadWasm();
+  return wasm.sign_account_state(JSON.stringify(state), accountRootSeedB64);
+}
+
+/** Verify a root-signed account-state JWS and return the authenticated account-state document. */
+export async function verifyAccountState(
+  accountStateJws: string,
+  expectedAccountId: string,
+  accountRootKey: string,
+): Promise<AccountState> {
+  const wasm = await loadWasm();
+  return JSON.parse(
+    wasm.verify_account_state(accountStateJws, expectedAccountId, accountRootKey),
+  ) as AccountState;
+}
+
+/**
+ * Verify a verdict while enforcing account-state device revocations. The optional nonce store is
+ * checked after the core authenticates the signed nonce, so replay protection composes with the
+ * revocation-aware verification path.
+ */
+export async function verifyVerdictWithAccountStates(
+  input: VerifyVerdictWithAccountStatesInput,
+): Promise<VerifiedVerdictResult> {
+  const wasm = await loadWasm();
+  const result = readVerifiedWasmResult(
+    wasm.verify_verdict_with_account_states(
+      JSON.stringify(input.verdict),
+      JSON.stringify(input.request),
+      JSON.stringify(input.context),
+      input.approverRootKey,
+      input.nowMs,
+      accountStatesJson(input.accountStates),
+    ),
+  );
+  if (input.nonceStore && !(await input.nonceStore.checkAndInsert(result.nonceB64))) {
+    throw new Error("allw: verdict nonce replayed");
+  }
+  return result;
+}
+
+/** Verify one signed policy rule while enforcing account-state device revocations. */
+export async function verifyPolicyRuleWithAccountStates(
+  input: VerifyPolicyRuleWithAccountStatesInput,
+): Promise<VerifiedPolicyRule> {
+  const wasm = await loadWasm();
+  const value = JSON.parse(
+    wasm.verify_policy_rule_with_account_states(
+      JSON.stringify(input.rule),
+      input.accountRootKey,
+      input.nowMs,
+      accountStatesJson(input.accountStates),
+    ),
+  ) as { rule?: unknown; device_id?: unknown };
+  if (typeof value.device_id !== "string" || value.device_id.length === 0) {
+    throw new Error("allw: verified policy rule did not include a device_id");
+  }
+  return { rule: value.rule, deviceId: value.device_id };
+}
+
+/** Evaluate signed policy rules after revocation-aware verification of every rule. */
+export async function evaluatePolicyWithAccountStates(
+  input: EvaluatePolicyWithAccountStatesInput,
+): Promise<PolicyEvaluation> {
+  const wasm = await loadWasm();
+  const value = JSON.parse(
+    wasm.evaluate_policy_with_account_states(
+      JSON.stringify(input.action),
+      input.actor === undefined ? null : JSON.stringify(input.actor),
+      JSON.stringify(input.signedRules),
+      input.accountRootKey,
+      input.nowMs,
+      accountStatesJson(input.accountStates),
+    ),
+  ) as { decision?: unknown; rule_id?: unknown; tier?: unknown; schema_version?: unknown };
+  if (value.decision !== "allow" && value.decision !== "deny" && value.decision !== "escalate") {
+    throw new Error("allw: policy evaluation returned an invalid decision");
+  }
+  if (value.tier !== "syntactic" && value.tier !== "semantic") {
+    throw new Error("allw: policy evaluation returned an invalid tier");
+  }
+  if (typeof value.schema_version !== "number" || !Number.isSafeInteger(value.schema_version)) {
+    throw new Error("allw: policy evaluation returned an invalid schema_version");
+  }
+  return {
+    decision: value.decision,
+    ...(typeof value.rule_id === "string" ? { ruleId: value.rule_id } : {}),
+    tier: value.tier,
+    schemaVersion: value.schema_version,
+  };
 }
 
 /**
@@ -509,6 +746,7 @@ export function createClient(config: ClientConfig): Client {
         config.approverRootKey,
         now(),
         nonceStore,
+        config.accountStates,
       );
       // Unverifiable verdict ⇒ synthesized `denied` (never surface a forged decision as truth).
       decision = verified?.decision ?? "denied";
@@ -529,6 +767,7 @@ export function createClient(config: ClientConfig): Client {
       contextJson,
       now,
       nonceStore,
+      config.accountStates,
       acceptedNonceB64,
     );
   }
@@ -549,16 +788,20 @@ function makeVerdict(
   contextJson: string,
   now: NowImpl,
   nonceStore: NonceStore,
+  accountStates?: readonly string[],
   acceptedNonceB64?: string,
 ): Verdict {
   const verdictValue = outcome.kind === "verdict" ? outcome.value : null;
   return {
     requestId,
     decision,
-    async verify(approverRootKey: string): Promise<boolean> {
+    async verify(approverRootKey: string, options?: VerdictVerifyOptions): Promise<boolean> {
       // A synthesized (non-delivered) outcome has no verifiable artifact — it can never be approved.
       if (verdictValue === null || verdictValue === undefined) return false;
       const wasm = await loadWasm();
+      // An explicit option overrides the client-level account-state set, including `[]` for tests
+      // that intentionally verify without revocation context.
+      const states = options && "accountStates" in options ? options.accountStates : accountStates;
       const result = await verifyToDecision(
         wasm,
         verdictValue,
@@ -567,6 +810,7 @@ function makeVerdict(
         approverRootKey,
         now(),
         nonceStore,
+        states,
         acceptedNonceB64,
       );
       return result?.decision === "approved";
