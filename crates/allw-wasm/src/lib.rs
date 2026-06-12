@@ -443,17 +443,25 @@ pub fn issue_device_cert(
 /// # Errors
 ///
 /// Throws if `unsigned_rule_json` is not a valid [`UnsignedPolicyRule`](allw_core::UnsignedPolicyRule)
-/// or the device seed is not a 32-byte base64url value.
+/// or the device seed is not a 32-byte base64url value. `device_cert` is the
+/// account-root-signed certificate for this device; pass an empty string only to construct an
+/// intentionally unverifiable rule for negative tests.
 #[wasm_bindgen]
 pub fn sign_policy_rule(
     unsigned_rule_json: &str,
     device_id: &str,
     device_seed_b64: &str,
+    device_cert: &str,
 ) -> Result<String, JsError> {
     let unsigned: UnsignedPolicyRule = parse_json(unsigned_rule_json, "UnsignedPolicyRule")?;
     let seed = decode_b64_32(device_seed_b64, "device_seed_b64")?;
     let device_key = SigningKeyPair::from_seed(&seed);
-    let rule = core_sign_policy_rule(&unsigned, device_id, &device_key);
+    let cert = if device_cert.is_empty() {
+        None
+    } else {
+        Some(device_cert.to_string())
+    };
+    let rule = core_sign_policy_rule(&unsigned, device_id, &device_key, cert);
     to_json(&rule, "PolicyRule")
 }
 
@@ -469,14 +477,20 @@ pub fn sign_policy_rule(
 /// Throws if actor/action/scope JSON is malformed, `created_at` is not a safe integer millisecond
 /// timestamp, or the device seed is not a 32-byte base64url value.
 #[wasm_bindgen]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "wasm-bindgen exports a positional JS FFI"
+)]
 pub fn policy_rule_from_approval(
     id: &str,
+    account_id: &str,
     actor_json: &str,
     action_json: &str,
     scope_json: &str,
     created_at: f64,
     device_id: &str,
     device_seed_b64: &str,
+    device_cert: &str,
 ) -> Result<String, JsError> {
     let actor: Actor = parse_json(actor_json, "Actor")?;
     let action: ActionRecord = parse_json(action_json, "ActionRecord")?;
@@ -485,9 +499,15 @@ pub fn policy_rule_from_approval(
     let seed = decode_b64_32(device_seed_b64, "device_seed_b64")?;
     let device_key = SigningKeyPair::from_seed(&seed);
 
-    let unsigned = UnsignedPolicyRule::from_approval(id, &actor, &action, scope, created_at)
-        .map_err(|e| JsError::new(&format!("policy_rule_from_approval failed: {e}")))?;
-    let rule = core_sign_policy_rule(&unsigned, device_id, &device_key);
+    let unsigned =
+        UnsignedPolicyRule::from_approval(id, account_id, &actor, &action, scope, created_at)
+            .map_err(|e| JsError::new(&format!("policy_rule_from_approval failed: {e}")))?;
+    let cert = if device_cert.is_empty() {
+        None
+    } else {
+        Some(device_cert.to_string())
+    };
+    let rule = core_sign_policy_rule(&unsigned, device_id, &device_key, cert);
     to_json(&rule, "PolicyRule")
 }
 
@@ -495,19 +515,22 @@ pub fn policy_rule_from_approval(
 /// [`PolicyEvaluation`](allw_core::PolicyEvaluation) JSON object.
 ///
 /// `signed_rules_json` is a JSON array of signed [`PolicyRule`](allw_core::PolicyRule) objects.
-/// All supplied rules are verified against `device_pubkey_b64`; any invalid rule throws rather
-/// than being ignored, so callers fail closed on policy tampering.
+/// All supplied rules are verified by chaining their embedded device certs to
+/// `account_root_pubkey_b64`; any invalid rule throws rather than being ignored, so callers fail
+/// closed on policy tampering.
 ///
 /// # Errors
 ///
-/// Throws if the action/actor/rules JSON is malformed, the public key is not a valid Ed25519 key,
-/// or any signed policy rule fails verification.
+/// Throws if the action/actor/rules JSON is malformed, the account-root public key is not a valid
+/// Ed25519 key, `now_ms` is not a safe integer millisecond timestamp, or any signed policy rule
+/// fails verification.
 #[wasm_bindgen]
 pub fn evaluate_policy(
     action_json: &str,
     actor_json: Option<String>,
     signed_rules_json: &str,
-    device_pubkey_b64: &str,
+    account_root_pubkey_b64: &str,
+    now_ms: f64,
 ) -> Result<String, JsError> {
     let action: ActionRecord = parse_json(action_json, "ActionRecord")?;
     let actor: Option<Actor> = actor_json
@@ -515,16 +538,17 @@ pub fn evaluate_policy(
         .map(|json| parse_json(json, "Actor"))
         .transpose()?;
     let rules: Vec<PolicyRule> = parse_json(signed_rules_json, "PolicyRule[]")?;
-    let device_pubkey_bytes = decode_b64_32(device_pubkey_b64, "device_pubkey_b64")?;
-    let device_pubkey = PublicKey::from_bytes(&device_pubkey_bytes).map_err(|e| {
+    let root_pubkey_bytes = decode_b64_32(account_root_pubkey_b64, "account_root_pubkey_b64")?;
+    let root_pubkey = PublicKey::from_bytes(&root_pubkey_bytes).map_err(|e| {
         JsError::new(&format!(
-            "device_pubkey_b64 is not a valid Ed25519 key: {e}"
+            "account_root_pubkey_b64 is not a valid Ed25519 key: {e}"
         ))
     })?;
+    let now_ms = ms_to_i64(now_ms, "now_ms")?;
     let verified = rules
         .iter()
         .map(|rule| {
-            core_verify_policy_rule(rule, &device_pubkey)
+            core_verify_policy_rule(rule, &root_pubkey, now_ms)
                 .map_err(|e| JsError::new(&format!("verify_policy_rule failed: {e}")))
         })
         .collect::<Result<Vec<_>, JsError>>()?;

@@ -136,7 +136,8 @@ verdict `sig` (+ optional integrator counter-sign). Periodically anchor the head
   A `device_cert` chains each device key to an account root so verifiers need only the root; see
   [enrollment.md](./enrollment.md) for pairing, rotation, revocation, and recovery.
 - **Crypto:** **JOSE** — JWE (X25519 ECDH) for context, JWS (Ed25519) for verdicts/rules — reusing vaultkeeper's
-  substrate. Static ECDH for v1; forward secrecy later.
+  substrate. Verdict and policy-rule JWS verification both chain the signing device key through `device_cert` to the
+  account root and reject account / `kid` confusion. Static ECDH for v1; forward secrecy later.
 
 ---
 

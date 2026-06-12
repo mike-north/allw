@@ -101,6 +101,7 @@ A `PolicyRule` is **as trusted as a verdict** — signed by a device key. v1 rul
 ```
 PolicyRule {
   id
+  account_id: string                           // account root that must certify the signing device
   subject:    ActorMatcher                    // actor.id == "machine:macbook" | any
   match:      Predicate                       // T1/T2: surface + bin/tool + glob/args/flag/param matchers
                                               // T3 (later): capability + named-field/scope matchers
@@ -109,7 +110,8 @@ PolicyRule {
   provenance: "manual" | "from_approval"
   tier:       "syntactic" | "semantic"
   created_at, expires_at?
-  sig:        device-key signature
+  sig:        device-key compact JWS over every unsigned field above
+  device_cert?: account-root compact JWS       // chains device key -> account root
 }
 ```
 
@@ -121,6 +123,11 @@ For command argument matching, `args_any_globs` runs only against structured `ar
 tokens, never raw shell text. Patterns without `*` or `?` are exact token matches; explicit glob
 patterns are still anchored to one structured token and cannot span whitespace or shell
 metacharacter boundaries.
+
+Policy rule verification mirrors verdict verification for key trust: the verifier takes an account-root public key,
+verifies `device_cert`, requires the signed cert `account_id` to match the rule `account_id`, verifies the policy JWS
+with the certified device key, and requires the policy JWS `kid` to match the certified `device_id`. A rule missing a
+cert, signed by an uncertified key, bound to a different account, or carrying a confused `kid` fails closed.
 
 ---
 

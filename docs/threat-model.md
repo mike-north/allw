@@ -149,6 +149,8 @@ Validation:
 
 - Policy tests must pin precedence: `deny > ask > allow`; no match means ask.
 - A `from_approval` rule test must prove future matching actions use a signed rule, not a reused verdict.
+- Policy-rule verification tests must reject cross-account certs, signing keys that do not chain to the account root,
+  missing certs, and `kid` values that do not name the certified device.
 
 ### R6. Auditability
 
