@@ -75,6 +75,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "uniffi",
+ "zeroize",
 ]
 
 [[package]]

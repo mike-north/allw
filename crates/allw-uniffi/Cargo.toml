@@ -25,3 +25,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 uniffi = { version = "0.31.1", features = ["cli"] }
+# Scrub decoded seed/secret material from memory on drop. Seeds cross the FFI as base64 strings,
+# get decoded into heap `Vec<u8>` / stack `[u8; 32]`, and must not linger after use — wrap every
+# decoded seed in `Zeroizing<>` so Drop zeroes the bytes (issue #90). 1.8.x is already in the
+# lockfile via x25519-dalek's `zeroize` feature, so this adds no new transitive tree.
+zeroize = "1"

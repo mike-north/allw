@@ -51,6 +51,11 @@ The approval primitive has two independent device keys:
 | Device encryption key | X25519    | JWE recipient for `ApprovalContext` ciphertext | public key only, in `GET /devices`    |
 | Device signing key    | Ed25519   | Signs verdicts and policy rules                | public key only through `device_cert` |
 
+These two keys are derived from **two independently-drawn 32-byte random seeds** — enrollment MUST NOT derive both
+from one seed. The cross-platform smoke tests (`crates/allw-uniffi/tests/*`, and the WASM vectors) reuse a single
+seed for both purely for fixture brevity; that shortcut is a test convenience only and must never be carried into
+real enrollment. (See the `derive_device_keys_json` doc comment in `crates/allw-uniffi/src/lib.rs`.)
+
 The account root signs `device_cert` objects for device signing keys. Integrators verify verdicts with only the
 configured account-root public key plus the `device_cert` carried in the verdict.
 
