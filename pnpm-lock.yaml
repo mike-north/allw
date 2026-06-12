@@ -50,6 +50,19 @@ importers:
         specifier: ^22.0.0
         version: 22.19.20
 
+  packages/codex-hook:
+    dependencies:
+      '@allw/hook':
+        specifier: workspace:*
+        version: link:../hook
+      '@allw/sdk':
+        specifier: workspace:*
+        version: link:../sdk
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.19.20
+
   packages/hook:
     dependencies:
       '@allw/sdk':

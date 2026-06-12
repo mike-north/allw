@@ -22,6 +22,11 @@ test("recursive workspace scripts build local dependencies before validation", a
       guardedScripts: ["typecheck", "lint", "test"],
     },
     {
+      path: "packages/codex-hook/package.json",
+      requiredBuilds: ["pnpm --filter @allw/sdk build", "pnpm --filter @allw/hook build"],
+      guardedScripts: ["typecheck", "lint", "test"],
+    },
+    {
       path: "examples/walking-skeleton/package.json",
       requiredBuilds: [
         "pnpm --filter @allw/sdk build",

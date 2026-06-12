@@ -1,0 +1,36 @@
+{
+  "name": "@allw/codex-hook",
+  "version": "0.0.0",
+  "description": "Codex PreToolUse approval hook (Node + WASM): gates sensitive Codex actions through allw, fail-closed.",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "allw-codex-hook": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:deps": "pnpm --filter @allw/sdk build && pnpm --filter @allw/hook build",
+    "typecheck": "pnpm run build:deps && tsc -p tsconfig.json --noEmit",
+    "lint": "pnpm run build:deps && eslint src",
+    "test": "pnpm run build:deps && tsc -p tsconfig.json && node --test \"test/**/*.test.mjs\""
+  },
+  "dependencies": {
+    "@allw/hook": "workspace:*",
+    "@allw/sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  },
+  "license": "MIT"
+}
