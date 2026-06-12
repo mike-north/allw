@@ -165,7 +165,11 @@ export class WebApproverController {
 
   canApprove(id: string, options: { readonly challengeResponse?: string } = {}): boolean {
     const record = this.#records.get(id);
-    if (!record?.prepared || record.status !== "pending") {
+    if (
+      !record?.prepared ||
+      this.#markExpiredIfPastDeadline(record) ||
+      record.status !== "pending"
+    ) {
       return false;
     }
     if (!record.prepared.context.allowed_decisions.includes("approved")) {
@@ -183,7 +187,7 @@ export class WebApproverController {
     if (!record) {
       throw new Error(`unknown request '${id}'`);
     }
-    if (record.status === "expired") {
+    if (this.#markExpiredIfPastDeadline(record)) {
       throw new Error(`request '${id}' is expired`);
     }
     if (record.status === "deciding") {
@@ -214,6 +218,13 @@ export class WebApproverController {
       record.status = "pending";
       throw error;
     }
+  }
+
+  #markExpiredIfPastDeadline(record: ApprovalRecord): boolean {
+    if (record.status === "pending" && record.prepared && record.expiresAt <= this.#nowMs()) {
+      record.status = "expired";
+    }
+    return record.status === "expired";
   }
 
   async #prepare(envelope: ApprovalEnvelope): Promise<ApprovalRecord> {
