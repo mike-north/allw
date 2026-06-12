@@ -23,6 +23,26 @@ const VERDICT_VERSION = 1 as const;
 /** Anti-replay nonce length in bytes. The core is length-agnostic; the contract requires ≥16. */
 const NONCE_BYTES = 16;
 
+/**
+ * The outcome of verifying a request's actor attestation (the *verified origin*, #16). Either the
+ * origin is cryptographically verified (and carries a display string), or it is unverified — with a
+ * concrete `reason` the renderer surfaces so an unverifiable origin is never shown as trusted.
+ *
+ * Fail-closed: a missing attestation, an unenrolled actor, a relay outage, or a failed verification
+ * all yield `verified: false`. There is no "unknown → trusted" path.
+ */
+export type OriginVerification =
+  | {
+      readonly verified: true;
+      /** Human-readable verified origin (`"{kind} · {id}"`) from the core. */
+      readonly origin: string;
+    }
+  | {
+      readonly verified: false;
+      /** Why the origin could not be verified (shown alongside the ⚠ marker). */
+      readonly reason: string;
+    };
+
 /** A decrypted, hash-verified request ready to render to the human (WYSIWYS). */
 export interface RenderableRequest {
   /** The envelope's request id (also the verdict's `request_id`). */
@@ -33,6 +53,12 @@ export interface RenderableRequest {
   readonly expiresAt: number;
   /** The WYSIWYS `request_hash` (base64url) the core computed from `context` + `expiresAt`. */
   readonly requestHash: string;
+  /**
+   * The actor-attestation outcome (#16). `undefined` only when origin verification was not
+   * attempted (e.g. no relay configured); the renderer treats absent/unverified identically — it
+   * never shows an unverified origin as trusted.
+   */
+  readonly origin?: OriginVerification;
 }
 
 /** A high-entropy anti-replay nonce as a base64url string (≥16 random bytes). */
@@ -135,6 +161,74 @@ export function prepareRequest(
     expiresAt: envelope.expires_at,
     requestHash,
   };
+}
+
+/**
+ * Verify a prepared request's **actor attestation** and return the verified-origin outcome (#16,
+ * `docs/contract.md` §Invariants #4 — requester attestation). Resolves to a discriminated
+ * {@link OriginVerification} the renderer consumes; it never throws for an *unverifiable* origin —
+ * a failure is a `verified: false` result with a reason, so a bad origin downgrades the display
+ * rather than aborting the request (the human still sees the action, just with an explicit ⚠).
+ *
+ * # Trust anchor: root-signed account state, never the relay (#16 blocker fix)
+ * The attestation binds the actor identity to the request's `request_id` + recomputed
+ * `request_hash` (so it is request-specific, not a reusable token), and is verified against the
+ * actor key **resolved from root-signed account state** (`docs/enrollment.md` §Account State) — NOT
+ * a relay-supplied `/actors` key. The WASM core verifies each account-state document against
+ * `accountRootPubkey` and only trusts an actor key that appears, active and un-revoked, in the
+ * highest-sequence document. A malicious or compromised relay can list its own key in `/actors`,
+ * but it cannot author account state, so it can never drive a `verified: true` (✓ VERIFIED) result.
+ *
+ * @param accountId the account the device trusts (the attestation's `account_id` must match).
+ * @param accountRootPubkey the configured account-root verifying key (base64url) — the device's
+ *   trust anchor (from its keyfile), against which every account-state document is checked.
+ * @param accountStates root-signed `allw-account-state+jws` documents that enroll the trusted actor
+ *   keys. An empty list (no root-anchored trust available) yields an unverified origin, never an
+ *   abort — the human still reviews the action with an explicit ⚠.
+ */
+export function verifyActorOrigin(
+  wasm: AllwWasm,
+  prepared: RenderableRequest,
+  accountId: string,
+  accountRootPubkey: string,
+  accountStates: readonly string[],
+): OriginVerification {
+  const actor = prepared.context.actor;
+  // No attestation present → unverifiable plaintext (mirrors the core's fail-closed `Missing`).
+  if (actor.attestation === undefined || actor.attestation.length === 0) {
+    return { verified: false, reason: "no attestation present (origin is unauthenticated)" };
+  }
+  // No root-anchored trust material → we cannot establish trust; show unverified, do not abort.
+  // (Crucially: a relay-supplied `/actors` key is NEVER accepted here — only root-signed account
+  // state can root-anchor an actor key.)
+  if (accountStates.length === 0) {
+    return {
+      verified: false,
+      reason: `no root-signed account state to anchor actor '${actor.id}' (origin not root-anchored)`,
+    };
+  }
+  try {
+    const resultJson = wasm.verify_actor_attestation(
+      JSON.stringify(actor),
+      accountId,
+      prepared.requestId,
+      prepared.requestHash,
+      JSON.stringify(accountStates),
+      accountRootPubkey,
+    );
+    const result = JSON.parse(resultJson) as { origin?: unknown };
+    const origin =
+      typeof result.origin === "string" ? result.origin : `${actor.kind} · ${actor.id}`;
+    return { verified: true, origin };
+  } catch (err) {
+    // A failed verification (spoofed/altered origin, non-root-anchored key, revoked actor, wrong
+    // request id/hash) is reported as unverified — the request is still rendered, but the origin is
+    // explicitly NOT trusted (fail-closed display).
+    return {
+      verified: false,
+      reason: `attestation failed verification: ${(err as Error).message}`,
+    };
+  }
 }
 
 /**

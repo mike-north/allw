@@ -340,11 +340,17 @@ test("renderRequest shows the exact action, actor, risk, expiry, and request_has
     rendered.includes(prepared.requestHash),
     "the request_hash is shown verbatim for out-of-band verification",
   );
-  // Review fix #3: the actor origin must be marked UNVERIFIED (v0 cannot verify — #16).
+  // With no origin verification supplied (prepared.origin undefined), the actor origin must be
+  // marked ⚠ UNVERIFIED — a failed/absent attestation is never shown as trusted (#16).
   assert.match(
     rendered,
-    /UNVERIFIED in v0/,
-    "the actor origin is shown as unverified, not trusted (#16 still open)",
+    /⚠ UNVERIFIED/,
+    "the actor origin is shown as unverified when no attestation verified (#16)",
+  );
+  assert.doesNotMatch(
+    rendered,
+    /✓ VERIFIED/,
+    "an unverified origin must NOT render the verified marker",
   );
 });
 

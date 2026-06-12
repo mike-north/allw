@@ -15,7 +15,12 @@
 
 import { createInterface, type Interface } from "node:readline/promises";
 
-import { prepareRequest, signDecision, type RenderableRequest } from "../lib/approver-core.js";
+import {
+  prepareRequest,
+  signDecision,
+  verifyActorOrigin,
+  type RenderableRequest,
+} from "../lib/approver-core.js";
 import { readKeyfile, type Keyfile } from "../lib/keyfile.js";
 import { deviceConnectWsUrl } from "../lib/relay-client.js";
 import { renderRequest } from "../lib/render.js";
@@ -91,9 +96,29 @@ function parseInbound(data: unknown): DeviceInboundMessage | null {
 }
 
 /**
+ * Resolve the **root-signed account-state documents** (compact `allw-account-state+jws` strings)
+ * the device uses to root-anchor an actor's verifying key (#16, `docs/enrollment.md` §Account
+ * State). The actor key is trusted only because it appears, active, inside one of these documents
+ * signed by the configured account root — a relay-supplied `/actors` key is NEVER trusted.
+ *
+ * Returns an empty list when no root-anchored trust material is available (→ unverified display,
+ * not an abort). The relay may *distribute* these documents (it cannot forge them), so a future
+ * resolver can fetch them from a relay account-state endpoint; the trust is the root signature, not
+ * the relay.
+ */
+export type AccountStateResolver = (actorId: string) => Promise<readonly string[]>;
+
+/**
  * Handle a single decrypted request: render, prompt, sign, and send the verdict. Isolated and
  * exported so tests can drive it directly with a stub socket/prompter. Returns the decision made
  * (or null when none was — fail-closed: no verdict sent).
+ *
+ * `resolveAccountStates` resolves the root-signed account-state documents (#16,
+ * `docs/enrollment.md` §Account State) that root-anchor the actor key so the rendered origin can be
+ * shown VERIFIED; it defaults to "no resolution" → the origin renders ⚠ UNVERIFIED (fail-closed
+ * display). A resolver error is caught and likewise downgrades to unverified — origin verification
+ * never blocks rendering the action the human must review. A relay-supplied `/actors` key is NEVER
+ * trusted here; only a root-signed account-state document can drive ✓ VERIFIED.
  *
  * @throws never for a per-request decrypt/sign failure — those are caught, logged, and skipped so
  *   one bad request cannot take down the watch loop. (Programmer errors still surface.)
@@ -106,6 +131,7 @@ export async function handleRequest(
   rawEnvelope: unknown,
   log: WatchLogger,
   now: () => number = Date.now,
+  resolveAccountStates: AccountStateResolver = () => Promise.resolve([]),
 ): Promise<Decision | null> {
   let prepared: RenderableRequest;
   try {
@@ -119,8 +145,30 @@ export async function handleRequest(
     return null;
   }
 
-  const rendered = renderRequest(prepared);
-  const decision = await prompter.decide(rendered, prepared);
+  // Verify the actor origin (#16): resolve the root-signed account-state docs that anchor the actor
+  // key, then verify the attestation against the account root. A resolution failure (relay outage)
+  // downgrades to an unverified origin rather than aborting — the human must still see the action;
+  // the origin is just explicitly marked ⚠.
+  let accountStates: readonly string[] = [];
+  try {
+    accountStates = await resolveAccountStates(prepared.context.actor.id);
+  } catch (err) {
+    log.warn(
+      `Could not resolve account state for '${prepared.context.actor.id}' — rendering origin as unverified: ${(err as Error).message}`,
+    );
+    accountStates = [];
+  }
+  const origin = verifyActorOrigin(
+    wasm,
+    prepared,
+    keyfile.account_id ?? "",
+    keyfile.account_root_pubkey,
+    accountStates,
+  );
+  const preparedWithOrigin: RenderableRequest = { ...prepared, origin };
+
+  const rendered = renderRequest(preparedWithOrigin);
+  const decision = await prompter.decide(rendered, preparedWithOrigin);
   if (decision === null) {
     log.info(`No decision recorded for ${prepared.requestId} — leaving it pending.`);
     return null;
@@ -212,6 +260,17 @@ export async function runWatch(
   // reconnect). A resilient reconnect-with-backoff loop is out of scope for the v0 skeleton.
   const ws = deps.connect(url);
 
+  // Resolve the root-signed account-state documents that root-anchor an actor key (#16). A
+  // relay-supplied `/actors` key is NOT a trust anchor (a malicious relay could forge it), so the
+  // verified origin is driven only by account state the configured account root signed.
+  //
+  // TODO(#104): wire a relay account-state distribution endpoint (the relay may serve
+  // root-signed account state it cannot author). Until that lands, no root-anchored account state is
+  // available at runtime, so origins render ⚠ UNVERIFIED (fail-closed) — never falsely ✓ VERIFIED
+  // off a relay key. The verification path itself is complete and exercised end-to-end in tests that
+  // supply a root-signed account-state document.
+  const resolveAccountStates: AccountStateResolver = () => Promise.resolve([]);
+
   // Serialize request handling: prompts are interactive, so process one at a time.
   let chain: Promise<unknown> = Promise.resolve();
 
@@ -227,11 +286,18 @@ export async function runWatch(
       }
       if (msg.type === "request") {
         chain = chain.then(() =>
-          handleRequest(wasm, keyfile, ws, deps.prompter, msg.envelope, log, deps.now).catch(
-            (err: unknown) => {
-              log.warn(`Unexpected error handling a request: ${(err as Error).message}`);
-            },
-          ),
+          handleRequest(
+            wasm,
+            keyfile,
+            ws,
+            deps.prompter,
+            msg.envelope,
+            log,
+            deps.now,
+            resolveAccountStates,
+          ).catch((err: unknown) => {
+            log.warn(`Unexpected error handling a request: ${(err as Error).message}`);
+          }),
         );
       } else if (msg.type === "retract") {
         // TODO(#41 v0): a retract that arrives mid-prompt only logs — the human can still answer the
