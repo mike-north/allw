@@ -1105,6 +1105,254 @@ test("verify rejects a device-cert presented as the verdict signature (typ domai
   );
 });
 
+// ── actor attestation (issue #16: verified request origin via the WASM core) ──────────────────
+
+/**
+ * Build an actor + its enrolled key, a root-signed account-state document anchoring that key, and a
+ * correctly-signed attestation — all through the WASM surface. Reuses the shared vector's
+ * request/context so `request_hash`/`request_id`/`account_id` line up with a known set.
+ *
+ * The actor key is root-anchored in account state (NOT a relay-supplied key): a malicious relay
+ * cannot mint a verified origin. `docs/enrollment.md` §Account State.
+ */
+function actorAttestationFixture(wasm) {
+  const v = loadVector();
+  const request = JSON.parse(v.request_json);
+  const requestHash = wasm.compute_request_hash(v.context_json, request.expires_at);
+  const accountId = request.approver; // the vector's account id
+  const requestId = request.id;
+
+  // The account root that signs account state, and the actor key it enrolls.
+  const rootSeed = Buffer.alloc(32, 0x66).toString("base64url");
+  const rootPub = wasm.ed25519_public_key(rootSeed);
+  const actorSeed = Buffer.alloc(32, 0x44).toString("base64url");
+  const actorPub = wasm.ed25519_public_key(actorSeed);
+  const actorId = "machine:macbook-pro";
+  const actorKind = "claude-code";
+
+  const accountState = (actorPubkey, status = "active", revoke = false) => {
+    const state = {
+      v: 1,
+      account_id: accountId,
+      sequence: 1,
+      current_root: rootPub,
+      previous_roots: [],
+      devices: [],
+      actors: [{ actor_id: actorId, kind: actorKind, pubkey: actorPubkey, status }],
+      revocations: revoke ? [{ kind: "actor", id: actorId, revoked_at: 1700000000000 }] : [],
+    };
+    return wasm.sign_account_state(JSON.stringify(state), rootSeed);
+  };
+  const enrolledStates = JSON.stringify([accountState(actorPub)]);
+
+  const attestation = wasm.sign_actor_attestation(
+    accountId,
+    actorId,
+    actorKind,
+    requestId,
+    requestHash,
+    actorSeed,
+  );
+  const actor = { id: actorId, kind: actorKind, attestation };
+  const verify = (actorJson, states = enrolledStates) =>
+    wasm.verify_actor_attestation(actorJson, accountId, requestId, requestHash, states, rootPub);
+  return {
+    v,
+    requestHash,
+    requestId,
+    accountId,
+    rootSeed,
+    rootPub,
+    actorSeed,
+    actorPub,
+    actorId,
+    actorKind,
+    actor,
+    accountState,
+    enrolledStates,
+    verify,
+  };
+}
+
+test("sign_actor_attestation → verify_actor_attestation round-trip (root-anchored verified origin)", async () => {
+  const wasm = await loadWasm();
+  const f = actorAttestationFixture(wasm);
+
+  const result = JSON.parse(f.verify(JSON.stringify(f.actor)));
+  assert.equal(result.verified, true, "a correctly-signed, root-anchored attestation verifies");
+  assert.equal(result.actor_id, f.actorId, "actor_id echoes the verified attestation");
+  assert.equal(result.actor_kind, f.actorKind, "actor_kind echoes the verified attestation");
+  // docs/contract.md §Identity & keys: the verified origin renders "{kind} · {id}".
+  assert.equal(
+    result.origin,
+    "claude-code · machine:macbook-pro",
+    "the human-readable verified origin is '{kind} · {id}'",
+  );
+});
+
+test("verify_actor_attestation throws when the attestation is absent (fail-closed)", async () => {
+  const wasm = await loadWasm();
+  const f = actorAttestationFixture(wasm);
+
+  // An actor with NO attestation must be rejected — origin is unverifiable plaintext (never shown
+  // as verified).
+  const noAttestation = { id: f.actorId, kind: f.actorKind };
+  assert.throws(
+    () => f.verify(JSON.stringify(noAttestation)),
+    /verify_actor_attestation failed/,
+    "an absent attestation must throw, not return a verified origin",
+  );
+});
+
+test("verify_actor_attestation throws when the actor key is NOT root-anchored (forged/relay key)", async () => {
+  const wasm = await loadWasm();
+  const f = actorAttestationFixture(wasm);
+
+  // THE blocker: an attestation signed by a key the account root never enrolled cannot verify, even
+  // though it is self-consistent. Account state enrolls only the real key → the forged key fails.
+  const attackerSeed = Buffer.alloc(32, 0x55).toString("base64url");
+  const forged = wasm.sign_actor_attestation(
+    f.accountId,
+    f.actorId,
+    f.actorKind,
+    f.requestId,
+    f.requestHash,
+    attackerSeed,
+  );
+  const actor = { id: f.actorId, kind: f.actorKind, attestation: forged };
+  assert.throws(
+    () => f.verify(JSON.stringify(actor)),
+    /verify_actor_attestation failed/,
+    "a non-root-anchored (forged/relay) key must not drive a verified origin",
+  );
+});
+
+test("verify_actor_attestation throws when account state enrolls a DIFFERENT key (relay substitution)", async () => {
+  const wasm = await loadWasm();
+  const f = actorAttestationFixture(wasm);
+
+  // The real key signed the attestation, but account state enrolls the OTHER key for this actor —
+  // modeling a substituted enrollment. The signature cannot verify under the enrolled key.
+  const otherSeed = Buffer.alloc(32, 0x55).toString("base64url");
+  const otherPub = wasm.ed25519_public_key(otherSeed);
+  const substituted = JSON.stringify([f.accountState(otherPub)]);
+  assert.throws(
+    () => f.verify(JSON.stringify(f.actor), substituted),
+    /verify_actor_attestation failed/,
+    "an enrolled key that did not sign the attestation must be rejected",
+  );
+});
+
+test("verify_actor_attestation throws with no account state (no root anchor, fail-closed)", async () => {
+  const wasm = await loadWasm();
+  const f = actorAttestationFixture(wasm);
+
+  assert.throws(
+    () => f.verify(JSON.stringify(f.actor), JSON.stringify([])),
+    /verify_actor_attestation failed/,
+    "with no root-signed account state there is no trust anchor → reject",
+  );
+});
+
+test("verify_actor_attestation throws for a revoked actor (fail-closed)", async () => {
+  const wasm = await loadWasm();
+  const f = actorAttestationFixture(wasm);
+
+  const revoked = JSON.stringify([f.accountState(f.actorPub, "active", /* revoke */ true)]);
+  assert.throws(
+    () => f.verify(JSON.stringify(f.actor), revoked),
+    /verify_actor_attestation failed/,
+    "a revoked actor must not be shown as verified",
+  );
+});
+
+test("verify_actor_attestation throws on a spoofed actor id (origin spoofing)", async () => {
+  const wasm = await loadWasm();
+  const f = actorAttestationFixture(wasm);
+
+  // Sign for a DIFFERENT (attacker) actor id, but present an outer actor claiming the trusted id.
+  // The signed actor_id ≠ the rendered actor.id → rejected. This is the core "verified origin"
+  // guarantee: a benign-looking plaintext id cannot ride a signature for a different actor.
+  const attackerAttestation = wasm.sign_actor_attestation(
+    f.accountId,
+    "machine:attacker",
+    f.actorKind,
+    f.requestId,
+    f.requestHash,
+    f.actorSeed,
+  );
+  const spoofed = { id: f.actorId, kind: f.actorKind, attestation: attackerAttestation };
+  assert.throws(
+    () => f.verify(JSON.stringify(spoofed)),
+    /verify_actor_attestation failed/,
+    "a spoofed outer actor.id must be rejected",
+  );
+});
+
+test("verify_actor_attestation throws when the request_id binding is wrong (no swap)", async () => {
+  const wasm = await loadWasm();
+  const f = actorAttestationFixture(wasm);
+
+  // Signed over a DIFFERENT request_id (same hash) — a lift onto a content-identical sibling. The
+  // request_id binding (not just request_hash) catches it.
+  const lifted = wasm.sign_actor_attestation(
+    f.accountId,
+    f.actorId,
+    f.actorKind,
+    "req-other-0002",
+    f.requestHash,
+    f.actorSeed,
+  );
+  const actor = { id: f.actorId, kind: f.actorKind, attestation: lifted };
+  assert.throws(
+    () => f.verify(JSON.stringify(actor)),
+    /verify_actor_attestation failed/,
+    "an attestation bound to a different request_id must be rejected",
+  );
+});
+
+test("verify_actor_attestation throws when the request_hash binding is altered (lift/replay)", async () => {
+  const wasm = await loadWasm();
+  const f = actorAttestationFixture(wasm);
+
+  // Signed over a DIFFERENT request_hash (a different request the device is rendering) → reject.
+  const otherHash = Buffer.alloc(32, 0xcd).toString("base64url");
+  const lifted = wasm.sign_actor_attestation(
+    f.accountId,
+    f.actorId,
+    f.actorKind,
+    f.requestId,
+    otherHash,
+    f.actorSeed,
+  );
+  const actor = { id: f.actorId, kind: f.actorKind, attestation: lifted };
+  assert.throws(
+    () => f.verify(JSON.stringify(actor)),
+    /verify_actor_attestation failed/,
+    "an attestation bound to a different request_hash must be rejected",
+  );
+});
+
+test("verify_actor_attestation throws when a verdict/cert JWS is presented as an attestation (typ separation)", async () => {
+  const wasm = await loadWasm();
+  const f = actorAttestationFixture(wasm);
+
+  // Domain separation: a device-cert / verdict JWS used in the attestation slot has the wrong `typ`
+  // and must be rejected before any identity check. Reuse a cert as a stand-in foreign JWS
+  // (b64url-encode its UTF-8 bytes to match the attestation wire encoding).
+  const deviceSeed = Buffer.alloc(32, 9).toString("base64url");
+  const devicePub = wasm.ed25519_public_key(deviceSeed);
+  const cert = wasm.issue_device_cert(f.rootSeed, f.accountId, "dev_rt", devicePub, 1700000000000);
+  const certAsAttestation = Buffer.from(cert, "utf8").toString("base64url");
+  const actor = { id: f.actorId, kind: f.actorKind, attestation: certAsAttestation };
+
+  assert.throws(
+    () => f.verify(JSON.stringify(actor)),
+    /verify_actor_attestation failed/,
+    "a device-cert JWS in the attestation slot must be rejected (wrong typ)",
+  );
+});
+
 // ── ActionRecord builders (issue #13: the hook's syntactic substrate via the WASM core) ───────
 
 test("action_from_command builds a command ActionRecord (surface=command, tokenized + cwd)", async () => {

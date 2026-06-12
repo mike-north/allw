@@ -374,3 +374,152 @@ test("fail-closed: a request that expires WHILE the human deliberates emits no v
     "the post-decision expiry is reported (fail-closed)",
   );
 });
+
+// ── Verified request origin in the watch loop (#16) ───────────────────────────────────────────
+
+/** A capturing prompter that records the rendered block and returns a fixed decision. */
+function capturingPrompter(decision) {
+  const renders = [];
+  return {
+    renders,
+    decide(rendered) {
+      renders.push(rendered);
+      return Promise.resolve(decision);
+    },
+  };
+}
+
+/** Build a paired approver whose decrypted context carries a correctly-signed actor attestation. */
+function pairedApproverWithAttestation(wasm, { actorSeed }) {
+  const fresh = generateKeyfile(wasm);
+  const cert = wasm.issue_device_cert(
+    fresh.account_root_seed,
+    ACCOUNT_ID,
+    DEVICE_ID,
+    fresh.device_signing_pubkey,
+    ISSUED_AT,
+  );
+  const keyfile = {
+    ...fresh,
+    relay_url: "https://relay.allw.test",
+    account_id: ACCOUNT_ID,
+    device_id: DEVICE_ID,
+    device_cert: cert,
+  };
+  // The attestation binds to the request_id + request_hash of the attestation-free context
+  // (attestation is excluded from request_hash), so the device's recomputed hash matches what was
+  // signed.
+  const requestHash = wasm.compute_request_hash(CONTEXT_JSON, EXPIRES_AT);
+  const attestation = wasm.sign_actor_attestation(
+    ACCOUNT_ID,
+    CONTEXT.actor.id,
+    CONTEXT.actor.kind,
+    REQUEST_ID,
+    requestHash,
+    actorSeed,
+  );
+  const attestedContext = { ...CONTEXT, actor: { ...CONTEXT.actor, attestation } };
+  const jwe = wasm.encrypt_context(
+    JSON.stringify(attestedContext),
+    JSON.stringify([{ device_id: DEVICE_ID, public_key_b64: fresh.device_encryption_pubkey }]),
+  );
+  return { keyfile, jwe };
+}
+
+/**
+ * A root-signed account-state document enrolling `actorId` with `actorPubkey`, signed by the
+ * keyfile's account root. This is the device's root-anchored trust input (#16); a relay-supplied
+ * key is never trusted. `docs/enrollment.md` §Account State.
+ */
+function signedAccountState(wasm, keyfile, actorPubkey) {
+  const state = {
+    v: 1,
+    account_id: ACCOUNT_ID,
+    sequence: 1,
+    current_root: keyfile.account_root_pubkey,
+    previous_roots: [],
+    devices: [],
+    actors: [
+      {
+        actor_id: CONTEXT.actor.id,
+        kind: CONTEXT.actor.kind,
+        pubkey: actorPubkey,
+        status: "active",
+      },
+    ],
+    revocations: [],
+  };
+  return wasm.sign_account_state(JSON.stringify(state), keyfile.account_root_seed);
+}
+
+test("verified origin: a root-anchored key renders ✓ VERIFIED in the watch loop (#16)", async () => {
+  const wasm = await loadWasm();
+  const actorSeed = Buffer.alloc(32, 0x44).toString("base64url");
+  const actorPub = wasm.ed25519_public_key(actorSeed);
+  const { keyfile, jwe } = pairedApproverWithAttestation(wasm, { actorSeed });
+  const ws = stubSocket();
+  const prompter = capturingPrompter("approved");
+
+  // The resolver returns a root-signed account-state document enrolling the real actor key. A
+  // relay-supplied key would NOT be trusted here — only this root-signed material can drive VERIFIED.
+  const accountStates = [signedAccountState(wasm, keyfile, actorPub)];
+  const resolveAccountStates = () => Promise.resolve(accountStates);
+
+  await handleRequest(
+    wasm,
+    keyfile,
+    ws,
+    prompter,
+    makeEnvelope(jwe),
+    recordingLogger(),
+    () => DECIDED_AT,
+    resolveAccountStates,
+  );
+
+  assert.equal(prompter.renders.length, 1, "the human was prompted with a rendered block");
+  assert.match(
+    prompter.renders[0],
+    /✓ VERIFIED origin — claude-code · machine:ci/,
+    "the rendered block shows the cryptographically-verified, root-anchored origin",
+  );
+});
+
+test("origin fail-closed: a resolver error still renders the request as ⚠ UNVERIFIED (#16)", async () => {
+  const wasm = await loadWasm();
+  const actorSeed = Buffer.alloc(32, 0x44).toString("base64url");
+  const { keyfile, jwe } = pairedApproverWithAttestation(wasm, { actorSeed });
+  const ws = stubSocket();
+  const prompter = capturingPrompter("approved");
+  const log = recordingLogger();
+
+  // A relay outage while resolving the root-signed account state must NOT abort the request — the
+  // human still sees the action, with the origin explicitly marked unverified (fail-closed display).
+  const resolveAccountStates = () => Promise.reject(new Error("relay account-state → HTTP 503"));
+
+  const decision = await handleRequest(
+    wasm,
+    keyfile,
+    ws,
+    prompter,
+    makeEnvelope(jwe),
+    log,
+    () => DECIDED_AT,
+    resolveAccountStates,
+  );
+
+  assert.equal(
+    decision,
+    "approved",
+    "the request is still decided despite the origin-lookup error",
+  );
+  assert.equal(prompter.renders.length, 1, "the human was still prompted");
+  assert.match(
+    prompter.renders[0],
+    /⚠ UNVERIFIED/,
+    "the origin is shown unverified on lookup error",
+  );
+  assert.ok(
+    log._warn.some((l) => /could not resolve account state/i.test(l)),
+    "the resolver error is reported (origin downgraded, not aborted)",
+  );
+});

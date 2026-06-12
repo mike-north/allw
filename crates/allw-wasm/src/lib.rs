@@ -42,8 +42,12 @@ use allw_core::{
     compute_request_hash as core_compute_request_hash, decrypt_context as core_decrypt_context,
     encrypt_context as core_encrypt_context, evaluate as core_evaluate,
     evaluate_for_actor as core_evaluate_for_actor, issue_device_cert as core_issue_device_cert,
-    sign_account_state as core_sign_account_state, sign_policy_rule as core_sign_policy_rule,
-    sign_verdict as core_sign_verdict, verify_account_state as core_verify_account_state,
+    sign_account_state as core_sign_account_state,
+    sign_actor_attestation as core_sign_actor_attestation,
+    sign_policy_rule as core_sign_policy_rule, sign_verdict as core_sign_verdict,
+    verified_origin_string as core_verified_origin_string,
+    verify_account_state as core_verify_account_state,
+    verify_actor_attestation_with_account_states as core_verify_actor_attestation_with_account_states,
     verify_policy_rule as core_verify_policy_rule,
     verify_policy_rule_with_account_states as core_verify_policy_rule_with_account_states,
     verify_verdict as core_verify_verdict,
@@ -769,6 +773,139 @@ pub fn evaluate_policy_with_account_states(
         None => core_evaluate(&action, &verified),
     };
     to_json(&evaluation, "PolicyEvaluation")
+}
+
+// ── actor attestation (verified request origin, issue #16) ──────────────────────────────
+
+/// Signs an **actor attestation** binding the actor identity to a request's `request_id` +
+/// `request_hash`, and returns the attestation as a **base64url-unpadded** string — the value to
+/// place in the envelope's `ApprovalContext.actor.attestation` (the wire encoding of that
+/// `Option<Vec<u8>>` field). This is the *request side* of the trust model (`docs/contract.md`
+/// §Invariants #4), distinct from verdict signing.
+///
+/// The attestation is an EdDSA compact JWS over `(account_id, actor_id, actor_kind, request_id,
+/// request_hash)`, so it is **request-specific** — bound to both the request id and its WYSIWYS
+/// hash, not a reusable identity token.
+///
+/// - `account_id` — the account namespace the attestation binds to.
+/// - `actor_id` / `actor_kind` — the actor identity being attested (echoed in the signed claims).
+/// - `request_id` — the envelope id this attestation answers (binds id, not just hash).
+/// - `request_hash_b64` — the WYSIWYS `request_hash`, base64url-unpadded 32 bytes (from
+///   [`compute_request_hash`]).
+/// - `actor_seed_b64` — the actor signing-key seed, base64url-unpadded 32 bytes. **v0 stand-in:**
+///   a software-held seed; production actor keys are enrollment-/hardware-backed and never
+///   serialize.
+///
+/// # Errors
+///
+/// Throws if `request_hash_b64` is not 32 base64url bytes, or `actor_seed_b64` is not a 32-byte
+/// base64url value.
+#[wasm_bindgen]
+pub fn sign_actor_attestation(
+    account_id: &str,
+    actor_id: &str,
+    actor_kind: &str,
+    request_id: &str,
+    request_hash_b64: &str,
+    actor_seed_b64: &str,
+) -> Result<String, JsError> {
+    let request_hash = decode_b64_32(request_hash_b64, "request_hash_b64")?;
+    let seed = decode_b64_32(actor_seed_b64, "actor_seed_b64")?;
+    let actor_key = SigningKeyPair::from_seed(&seed);
+    let attestation = core_sign_actor_attestation(
+        account_id,
+        actor_id,
+        actor_kind,
+        request_id,
+        &request_hash,
+        &actor_key,
+    );
+    Ok(URL_SAFE_NO_PAD.encode(attestation))
+}
+
+/// The successful result of [`verify_actor_attestation`] — a cryptographically-**verified origin**.
+/// Serialized to JSON for the JS caller.
+///
+/// **Not authorization.** A verified origin only lets the inbox render a trusted "who" (instead of
+/// `⚠ UNVERIFIED`); the human still decides and the integrator still composes the final gate.
+#[derive(Serialize)]
+struct OriginResult {
+    /// Always `true` on success (a failed verification throws instead of returning `false`).
+    verified: bool,
+    /// The actor id, echoed from the verified attestation.
+    actor_id: String,
+    /// The actor kind, echoed from the verified attestation.
+    actor_kind: String,
+    /// A human-readable verified-origin string (`"{kind} · {id}"`) for inbox display.
+    origin: String,
+}
+
+/// Verifies the attestation carried by an [`Actor`](allw_core::Actor) against a request's
+/// `request_id` + `request_hash`, resolving the actor's verifying key from **root-signed account
+/// state** (`docs/enrollment.md` §Account State) — NOT from a relay-supplied registry. The actor
+/// key is trusted only because it appears, `active` and un-revoked, in an account-state document
+/// that the configured account root signed; a malicious relay cannot substitute its own key for an
+/// actor id and forge a verified origin.
+///
+/// On success returns a JSON
+/// `{ "verified": true, "actor_id": string, "actor_kind": string, "origin": string }`.
+///
+/// `actor_json` is the JSON `Actor` `{ id, kind, attestation? }` from the decrypted
+/// `ApprovalContext` (its `attestation` is a base64url-unpadded string when present).
+/// `account_states_json` is a JSON array of compact `allw-account-state+jws` strings — the core
+/// resolves the actor key from the highest valid sequence and rejects revoked/inactive actors.
+///
+/// # Errors
+///
+/// Throws on **any** verification failure (fail-closed, `docs/contract.md` §Invariants #6): a
+/// missing attestation, a malformed/wrong-`typ` JWS, a signature that does not verify under the
+/// root-anchored key, a spoofed actor id/kind, a wrong `request_id`/`request_hash`, an actor not
+/// present (or revoked/inactive) in account state, or any invalid account-state JWS. Also throws if
+/// `actor_json` is not a valid `Actor`, `request_hash_b64` is not 32 base64url bytes, or
+/// `account_root_pubkey_b64` is not a valid Ed25519 key. The thrown message is the core
+/// [`AttestationError`](allw_core::AttestationError) `Display`, so a caller can distinguish *why*
+/// the origin is unverified.
+#[wasm_bindgen]
+pub fn verify_actor_attestation(
+    actor_json: &str,
+    account_id: &str,
+    request_id: &str,
+    request_hash_b64: &str,
+    account_states_json: &str,
+    account_root_pubkey_b64: &str,
+) -> Result<String, JsError> {
+    let actor: Actor = parse_json(actor_json, "Actor")?;
+    let request_hash = decode_b64_32(request_hash_b64, "request_hash_b64")?;
+    let root_bytes = decode_b64_32(account_root_pubkey_b64, "account_root_pubkey_b64")?;
+    let account_root = PublicKey::from_bytes(&root_bytes).map_err(|e| {
+        JsError::new(&format!(
+            "account_root_pubkey_b64 is not a valid Ed25519 key: {e}"
+        ))
+    })?;
+    let account_states = parse_account_states_json(account_states_json)?;
+    let account_state_refs: Vec<&str> = account_states.iter().map(String::as_str).collect();
+
+    core_verify_actor_attestation_with_account_states(
+        &actor,
+        account_id,
+        request_id,
+        &request_hash,
+        &account_state_refs,
+        &account_root,
+    )
+    .map_err(|e| JsError::new(&format!("verify_actor_attestation failed: {e}")))?;
+
+    // Only after verification succeeds do we format the (now-trusted) origin string.
+    let origin = core_verified_origin_string(&actor);
+    to_json(
+        &OriginResult {
+            verified: true,
+            actor_id: actor.id,
+            actor_kind: actor.kind,
+            origin,
+        },
+        "OriginResult",
+    )
 }
 
 // ── key derivation (v0 software keys) ──────────────────────────────────────────────────

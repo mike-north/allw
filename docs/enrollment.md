@@ -61,7 +61,8 @@ configured account-root public key plus the `device_cert` carried in the verdict
 3. A device may resolve a request only while it is still enrolled.
 4. A verifier must accept a verdict only if its `device_cert` chains to an acceptable account root and the verdict
    itself verifies under the certified device signing key.
-5. A requester origin must eventually be accepted only if its actor attestation chains to an enrolled actor key.
+5. A requester origin is accepted as verified only if its actor attestation verifies under an actor key that is
+   `active` in root-signed account state (#16); a relay-supplied key never drives a verified origin.
 6. Rotation must have an explicit grace period; after the grace period, old keys fail closed.
 7. Revocation must propagate to online relay state immediately and to offline verifiers through signed
    account-state material.
@@ -151,25 +152,41 @@ attestation payload:
   "actor_kind": "claude-code",
   "request_id": "uuid-v4",
   "request_hash": "<base64url>",
-  "issued_at": 1760000000000,
 }
 ```
 
-The approver device verifies this signature against the enrolled actor key before presenting the origin as
-verified. Until actor-key verification lands (#16), UIs must visibly treat actor identity as asserted, not
-verified.
+The payload is a domain-separated EdDSA compact JWS (`typ = "allw-actor-attest+jws"`, `alg = EdDSA`,
+`kid = actor_id`) over these v1 claims. It binds the attestation to **both** the `request_id` and the WYSIWYS
+`request_hash`: because `request_hash` excludes `request_id`, two content-identical requests with different ids
+share one hash, so binding `request_id` too closes the cross-request "no swap" gap (mirroring the verdict path's
+id+hash binding). The `account_id` claim binds the attestation to a single account trust domain.
+
+**The trust anchor is root-signed account state, not the relay (#16, resolved).** Actor keys are anchored in the
+root-signed account-state document (§Account State below): each `actors` entry carries `actor_id → pubkey` and a
+`status`, and the document is signed by the account root. The approver device resolves the actor's verifying key
+from the **highest valid-sequence account-state document the configured account root signed**, then verifies the
+attestation against that key. A relay-distributed `GET /actors` registry key is **never** trusted to drive a
+verified origin — a malicious or compromised relay can list its own key for an actor id, but it cannot author
+account state, so it can never forge a `✓ VERIFIED` render. When no root-signed account state is available, or the
+actor is absent/revoked/inactive, or any binding check fails, the origin is shown `⚠ UNVERIFIED` (fail-closed); it
+is never shown as verified.
 
 Enrollment requirements:
 
 - Duplicate `actor_id` values are rejected unless the existing actor is explicitly rotated.
 - Actor enrollment stores only public key material and metadata.
-- Actor revocation prevents future requests from being shown as verified for that actor.
+- Actor revocation prevents future requests from being shown as verified for that actor. A `revocations` entry
+  (`kind: "actor"`) or a non-`active` `status` at the highest sequence fails closed — the actor is not verifiable
+  even if an older state document still lists it active.
 - The relay may help distribute actor public keys, but the device must treat actor trust as account-state data,
   not as a relay assertion.
 
-Whether actor enrollment is represented as a root-signed `actor_cert` artifact, only as entries in signed
-account-state, or both is deferred to #16. This document requires the actor public key to be account-root trusted
-before an origin is displayed as verified, but does not pin the final wire artifact.
+**Resolved (#16):** actor enrollment is represented as **entries in signed account-state** (`actors`), reusing the
+same root-signed document and highest-sequence revocation semantics as device trust — not a separate root-signed
+`actor_cert` artifact. This follows the established pattern: device keys, policy-rule signing keys, and verdict
+verification all resolve trust through the same account-state document. A standalone `actor_cert` remains an
+option for future flows that need the trust material to ride inside the request envelope, but v1 anchors through
+account state.
 
 ## Account State
 
@@ -393,4 +410,12 @@ Implementation PRs for this spec should add fixtures or tests for:
   hardware security key.
 - Account-state transport format: compact JWS payload versus JSON document plus detached signature.
 - Root-transition grace-period defaults.
-- Whether actor certs are root-signed like device certs or represented only in signed account state.
+- Relay distribution of root-signed account state to devices: the verification path anchors on account-state
+  documents the device holds; a relay endpoint that serves (but cannot author) the latest root-signed account state
+  is not yet wired (#104). Until then, devices with no root-anchored account state render origins
+  `⚠ UNVERIFIED` (fail-closed).
+
+Resolved (was deferred):
+
+- Whether actor keys are anchored via a root-signed `actor_cert` or via signed account-state: **#16 chose signed
+  account-state** (`actors` entries), reusing the device-trust/revocation machinery.

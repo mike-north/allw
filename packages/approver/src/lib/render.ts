@@ -220,7 +220,7 @@ function substrateDetailLines(action: ActionRecord): string[] {
  * possible. The block is framed so it stands out in a busy terminal.
  */
 export function renderRequest(prepared: RenderableRequest): string {
-  const { context, requestId, expiresAt, requestHash } = prepared;
+  const { context, requestId, expiresAt, requestHash, origin } = prepared;
   const lines: string[] = [];
   const rule = "─".repeat(72);
 
@@ -236,12 +236,19 @@ export function renderRequest(prepared: RenderableRequest): string {
   for (const detail of substrateDetailLines(context.action)) {
     lines.push(detail);
   }
-  // SECURITY (Invariant #4 — requester attestation): v0 cannot cryptographically verify the actor
-  // origin (actor-key verification is #16, still open). The deferral is acceptable ONLY if visible,
-  // so the origin is explicitly marked UNVERIFIED — it is spoofable plaintext, not an authenticated
-  // identity. Do NOT render it as if trusted.
+  // SECURITY (Invariant #4 — requester attestation): the actor origin is shown VERIFIED only when
+  // the actor attestation (#16) verified against the actor key **root-anchored in signed account
+  // state** (never a relay-supplied key), bound to THIS request_id + request_hash. Otherwise
+  // (absent / not-root-anchored / revoked / failed) it is explicitly marked ⚠ UNVERIFIED —
+  // spoofable plaintext, never rendered as if trusted. A failed/absent attestation MUST NOT look
+  // verified.
   lines.push(`  Actor:      ${context.actor.id} (${context.actor.kind})`);
-  lines.push(`              ⚠ UNVERIFIED in v0 — origin is unauthenticated plaintext (#16)`);
+  if (origin?.verified === true) {
+    lines.push(`              ✓ VERIFIED origin — ${origin.origin}`);
+  } else {
+    const reason = origin?.reason ?? "origin is unauthenticated plaintext";
+    lines.push(`              ⚠ UNVERIFIED — ${reason} (#16)`);
+  }
   lines.push(`  Risk:       ${context.risk}`);
   lines.push(`  Reversible: ${context.reversible ? "yes" : "no"}`);
   lines.push(`  Expires:    ${formatTimestamp(expiresAt)}`);

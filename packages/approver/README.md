@@ -101,7 +101,7 @@ from a `raw` headline — see below.)
   Cwd:        /home/me/project
   Env refs:   GIT_SSH_COMMAND
   Actor:      machine:laptop (claude-code)
-              ⚠ UNVERIFIED in v0 — origin is unauthenticated plaintext (#16)
+              ✓ VERIFIED origin — claude-code · machine:laptop
   Risk:       high
   Reversible: no
   Expires:    2023-11-14T23:13:20.000Z
@@ -137,13 +137,30 @@ their own unconditional labeled line whenever present:
 
 This is **display-only** — it never changes the bytes bound into `request_hash`.
 
-#### ⚠ Actor origin is UNVERIFIED in v0
+#### Verified request origin (Invariant #4)
 
 The contract promises a **cryptographically-verified** requester origin (Invariant #4, actor-key
-attestation). v0 **cannot** verify it — actor-key verification is
-[#16](https://github.com/mike-north/allw/issues/16), still open — so the rendered actor line is
-explicitly marked `UNVERIFIED`. Treat the shown `machine:… (…)` as **spoofable plaintext**, not an
-authenticated identity, until #16 lands.
+attestation — [#16](https://github.com/mike-north/allw/issues/16)). After decrypting and recomputing
+`request_hash`, the approver verifies the `actor.attestation` carried in the `ApprovalContext`
+against the actor's verifying key **resolved from root-signed account state**
+(`docs/enrollment.md` §Account State) — **never** a relay-supplied `GET /:acct/actors` key. A
+malicious or compromised relay can list its own key for an actor id, but it cannot author account
+state, so it can never forge a verified origin. The attestation is an EdDSA compact JWS over
+`(account_id, actor_id, actor_kind, request_id, request_hash)`, bound to **this exact request** (both
+its id and WYSIWYS hash — not a reusable identity token).
+
+- **Verified** → the attestation verified against the actor key that is `active` in the
+  highest-sequence account-state document the configured account root signed. The actor line shows
+  `✓ VERIFIED origin — {kind} · {id}`.
+- **Absent / not-root-anchored / revoked / wrong-key / spoofed / wrong-request / lifted** → the line
+  is explicitly downgraded to `⚠ UNVERIFIED — <reason> (#16)`. A failed or absent attestation is
+  **never** shown as verified (fail-closed display). When no root-signed account state is available
+  (e.g. it has not yet been distributed to the device), the origin downgrades to unverified rather
+  than aborting — the human still reviews the action, just without a trusted "who".
+
+The integrator/hook side (the actor **signing** its attestation) and account-owner enrollment (which
+authors the root-signed account state) are upstream of this package; this surface delivers the
+device-side **verification + render**.
 
 #### Device-side fail-closed expiry
 

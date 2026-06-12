@@ -70,6 +70,9 @@ pub(crate) const TYP_DEVICE_CERT: &str = "allw-device-cert+jws";
 pub(crate) const TYP_ACCOUNT_STATE: &str = "allw-account-state+jws";
 
 /// The only signature algorithm accepted: EdDSA over Ed25519 (RFC 8037).
+///
+/// `pub(crate)` so sibling modules reusing this compact-JWS substrate (e.g.
+/// [`crate::attestation`]) build their protected headers with the identical `alg`.
 pub(crate) const ALG_EDDSA: &str = "EdDSA";
 
 // ── Key abstractions ────────────────────────────────────────────────────────────
@@ -175,8 +178,11 @@ impl std::error::Error for KeyError {}
 
 /// A JWS protected header (the `{"alg","typ","kid"}` object).
 ///
-/// `alg` is always `"EdDSA"`; `typ` is one of [`TYP_VERDICT`] / [`TYP_DEVICE_CERT`]; `kid`
-/// identifies the signing key (device id or account id).
+/// `alg` is always `"EdDSA"`; `typ` is one of [`TYP_VERDICT`] / [`TYP_DEVICE_CERT`] / the
+/// actor-attestation typ; `kid` identifies the signing key (device id, account id, or actor id).
+///
+/// `pub(crate)` so sibling modules reusing this compact-JWS substrate (e.g.
+/// [`crate::attestation`]) can build and read the same header shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct JwsHeader {
     pub(crate) alg: String,
@@ -406,6 +412,9 @@ impl std::error::Error for JwsError {}
 ///
 /// Returns `b64url(header) || "." || b64url(payload) || "." || b64url(sig)`, where `sig` is the
 /// Ed25519 signature over the ASCII signing input `b64url(header) || "." || b64url(payload)`.
+///
+/// `pub(crate)` so [`crate::attestation`] reuses the identical, audited signing path rather than
+/// re-rolling its own.
 pub(crate) fn encode_compact_jws<T: Serialize>(
     header: &JwsHeader,
     payload: &T,
@@ -428,6 +437,8 @@ pub(crate) fn encode_compact_jws<T: Serialize>(
 }
 
 /// The decoded, signature-verified parts of a compact JWS.
+///
+/// `pub(crate)` so [`crate::attestation`] can read the verified `header`/`claims` it returns.
 pub(crate) struct DecodedJws<T> {
     pub(crate) header: JwsHeader,
     pub(crate) claims: T,
@@ -437,6 +448,9 @@ pub(crate) struct DecodedJws<T> {
 ///
 /// On success the returned [`DecodedJws`] is authenticated: the signature covered exactly the
 /// header+payload bytes present in `compact`.
+///
+/// `pub(crate)` so [`crate::attestation`] reuses the identical, audited verify path (it supplies
+/// the actor-attestation `typ`).
 pub(crate) fn decode_and_verify_jws<T: for<'de> Deserialize<'de>>(
     compact: &str,
     expected_typ: &str,

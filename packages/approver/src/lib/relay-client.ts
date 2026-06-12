@@ -136,3 +136,9 @@ export function deviceConnectWsUrl(
   const base = normalizeBase(relayUrl).replace(/^http/, "ws");
   return `${base}/${encodeURIComponent(accountId)}/devices/${encodeURIComponent(deviceId)}/connect?auth=${encodeURIComponent(deviceAuthToken)}`;
 }
+
+// The approver no longer resolves actor *keys* from the relay `/actors` registry: a relay-supplied
+// key is not a trust anchor (a malicious relay could substitute its own). Actor keys are now
+// root-anchored via root-signed account state (`docs/enrollment.md` §Account State), verified in
+// the WASM core (`verify_actor_attestation`). The relay's `/actors` endpoint (#10) still exists as
+// an enrollment/registry convenience, but it never drives a ✓ VERIFIED origin on the device.

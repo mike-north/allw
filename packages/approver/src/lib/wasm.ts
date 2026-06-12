@@ -64,6 +64,25 @@ export interface AllwWasm {
     approver_root_pubkey_b64: string,
     now_ms: number,
   ): string;
+  /**
+   * Verify an actor attestation (verified request origin, #16), resolving the actor's verifying
+   * key from **root-signed account state** — never from a relay-supplied registry. Given the
+   * `Actor` JSON (with its `attestation`), the trusted `account_id`, the envelope `request_id`, the
+   * request's `request_hash` (base64url), a JSON array of compact `allw-account-state+jws` strings,
+   * and the configured account-root public key (base64url), returns a JSON
+   * `{ verified: true, actor_id, actor_kind, origin }` on success and **throws** on any failure
+   * (missing/spoofed/altered origin, wrong `request_id`/hash, actor not root-anchored or revoked,
+   * invalid account state) — fail-closed. A malicious relay cannot mint a verified origin because
+   * the actor key is trusted only when it appears, active, in a root-signed account-state document.
+   */
+  verify_actor_attestation(
+    actor_json: string,
+    account_id: string,
+    request_id: string,
+    request_hash_b64: string,
+    account_states_json: string,
+    account_root_pubkey_b64: string,
+  ): string;
 }
 
 /** The `--target web` glue module shape we depend on (subset of the generated bindings). */
