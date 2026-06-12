@@ -21,7 +21,7 @@
  */
 
 import { SELF, env, runInDurableObject } from "cloudflare:test";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { AccountRelay } from "../src/index.js";
 
 // ---------------------------------------------------------------------------
@@ -397,6 +397,54 @@ describe("AccountRelay — cross-device coordination", () => {
     expect((await nativeMac.next()).request_id).toBe("req-surface-1");
     expect((await phone.next()).request_id).toBe("req-surface-1");
     await expect(mirroredPhone.next(500)).rejects.toThrow(/timeout/);
+  });
+
+  it("continues same-surface fan-out when the first tagged socket cannot be sent to", async () => {
+    const staleMac = { send: () => void 0 } as unknown as WebSocket;
+    const liveMacMessages: string[] = [];
+    const liveMac = {
+      send: (message: string) => liveMacMessages.push(message),
+    } as unknown as WebSocket;
+    const phoneMessages: string[] = [];
+    const phone = {
+      send: (message: string) => phoneMessages.push(message),
+    } as unknown as WebSocket;
+
+    const tags = new Map<WebSocket, string[]>([
+      [staleMac, ["device", "surface:mac-screen"]],
+      [liveMac, ["device", "surface:mac-screen"]],
+      [phone, ["device", "surface:phone-screen"]],
+    ]);
+
+    const relay = Object.create(AccountRelay.prototype) as {
+      ctx: Pick<DurableObjectState, "getTags" | "getWebSockets">;
+      sendRequestToOneSocketPerSurface(requestId: string, envelope: unknown): number;
+    };
+    relay.ctx = {
+      getTags: (ws: WebSocket) => tags.get(ws) ?? [],
+      getWebSockets: (tag: string) => (tag === "device" ? [staleMac, liveMac, phone] : []),
+    } as Pick<DurableObjectState, "getTags" | "getWebSockets">;
+
+    // A closing hibernation socket can still be returned by the tag index but reject `send()`. It
+    // must not claim the visible surface unless the relay actually sends the request to it.
+    vi.spyOn(staleMac, "send").mockImplementation(() => {
+      throw new Error("socket already closing");
+    });
+
+    const delivered = relay.sendRequestToOneSocketPerSurface(
+      "req-surface-stale-1",
+      makeEnvelope("req-surface-stale-1"),
+    );
+
+    expect(delivered).toBe(2);
+    expect(JSON.parse(liveMacMessages[0] ?? "{}")).toMatchObject({
+      type: "request",
+      request_id: "req-surface-stale-1",
+    });
+    expect(JSON.parse(phoneMessages[0] ?? "{}")).toMatchObject({
+      type: "request",
+      request_id: "req-surface-stale-1",
+    });
   });
 
   it("flushes queued requests to only one reconnecting connection per visible surface", async () => {

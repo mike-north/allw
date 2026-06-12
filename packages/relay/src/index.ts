@@ -934,11 +934,13 @@ export class AccountRelay implements DurableObject {
     let delivered = 0;
     for (const ws of this.ctx.getWebSockets(DEVICE_TAG)) {
       const surfaceId = this.surfaceIdForSocket(ws);
-      if (surfaceId !== null) {
-        if (deliveredSurfaces.has(surfaceId)) continue;
-        deliveredSurfaces.add(surfaceId);
+      if (surfaceId !== null && deliveredSurfaces.has(surfaceId)) continue;
+      if (trySendJson(ws, { type: "request", request_id: requestId, envelope })) {
+        delivered++;
+        // Only a successful send claims the visible surface; stale closing sockets must not block
+        // a later live socket for the same screen/transport group.
+        if (surfaceId !== null) deliveredSurfaces.add(surfaceId);
       }
-      if (trySendJson(ws, { type: "request", request_id: requestId, envelope })) delivered++;
     }
     return delivered;
   }
