@@ -9,8 +9,9 @@
   },
   "scripts": {
     "build": "pnpm -r build",
-    "build:wasm": "wasm-pack build crates/allw-wasm --target web --out-dir ../../packages/sdk/vendor/allw-wasm --release",
+    "build:wasm": "wasm-pack build crates/allw-wasm --target web --out-dir ../../packages/sdk/vendor/allw-wasm --release && node scripts/postbuild-wasm.mjs",
     "test:recursive-scripts": "node --test scripts/recursive-scripts.test.mjs",
+    "smoke:packaged-install": "node scripts/smoke-packaged-install.mjs",
     "typecheck": "pnpm -r typecheck",
     "lint": "pnpm -r lint",
     "test": "pnpm run test:recursive-scripts && pnpm -r test"

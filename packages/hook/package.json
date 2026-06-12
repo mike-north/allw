@@ -1,8 +1,7 @@
 {
   "name": "@allw/hook",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Claude Code PreToolUse permission hook (Node + WASM): turns a pending sensitive tool call into a phone approval, fail-closed.",
-  "private": true,
   "type": "module",
   "bin": {
     "allw-hook": "./dist/cli.js"
@@ -31,5 +30,16 @@
   "devDependencies": {
     "@types/node": "^22.0.0"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mike-north/allw.git",
+    "directory": "packages/hook"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=24"
+  }
 }
