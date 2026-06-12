@@ -23,6 +23,7 @@
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, it, expect, vi } from "vitest";
 import { AccountRelay } from "../src/index.js";
+import type { PushTransportRegistry } from "../src/push.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures (deterministic; never `Date.now()` in data — see fixed-dates rule)
@@ -107,6 +108,27 @@ async function enrollDevice(accountId: string, pubkey = DEVICE_PUBKEY): Promise<
     pubkey,
   });
   return complete.data.device_id;
+}
+
+async function enrollDeviceWithPushToken(accountId: string, token = "ios-token"): Promise<string> {
+  const start = await post<{ code: string }>(accountId, "/pairing/start", {});
+  const complete = await post<{ device_id: string }>(accountId, "/pairing/complete", {
+    code: start.data.code,
+    pubkey: DEVICE_PUBKEY,
+    push_tokens: [{ transport: "apns", token }],
+  });
+  return complete.data.device_id;
+}
+
+async function installPushTransports(
+  accountId: string,
+  pushTransports: PushTransportRegistry,
+): Promise<void> {
+  const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
+  await runInDurableObject(stub, (instance: AccountRelay) => {
+    (instance as unknown as { pushTransports: PushTransportRegistry }).pushTransports =
+      pushTransports;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -266,6 +288,79 @@ describe("AccountRelay — routing (device online)", () => {
 // ---------------------------------------------------------------------------
 
 describe("AccountRelay — routing (device offline)", () => {
+  it("submitting a request schedules request-id-only push wakeups for registered tokens", async () => {
+    const acct = "acct-push-wakeup";
+    const start = await post<{ code: string }>(acct, "/pairing/start", {});
+    await post(acct, "/pairing/complete", {
+      code: start.data.code,
+      pubkey: DEVICE_PUBKEY,
+      push_tokens: [{ transport: "apns", token: "ios-token" }],
+    });
+
+    const submit = await post<{
+      delivered_to: number;
+      push_wakeups: number;
+      status: string;
+    }>(acct, "/requests", makeEnvelope("req-push-wakeup"));
+
+    expect(submit.status).toBe(202);
+    expect(submit.data.status).toBe("pending");
+    expect(submit.data.delivered_to).toBe(0);
+    expect(submit.data.push_wakeups).toBe(1);
+  });
+
+  it("still delivers over WebSocket when a push transport throws", async () => {
+    const acct = "acct-push-throw-still-ws";
+    const deviceId = await enrollDeviceWithPushToken(acct);
+    const device = await connectWs(acct, `/devices/${deviceId}/connect`);
+    await installPushTransports(acct, {
+      apns: {
+        kind: "apns",
+        async sendWakeup() {
+          throw new Error("provider unavailable");
+        },
+      },
+    });
+
+    const submit = await post<{
+      delivered_to: number;
+      push_wakeups: number;
+      status: string;
+    }>(acct, "/requests", makeEnvelope("req-push-throw"));
+
+    expect(submit.status).toBe(202);
+    expect(submit.data.status).toBe("pending");
+    expect(submit.data.delivered_to).toBe(1);
+    expect(submit.data.push_wakeups).toBe(0);
+    const pushed = await device.next();
+    expect(pushed.type).toBe("request");
+    expect(pushed.request_id).toBe("req-push-throw");
+  });
+
+  it("stops scheduling push wakeups after the target device is revoked", async () => {
+    const acct = "acct-push-revoke-clears-wakeups";
+    const deviceId = await enrollDeviceWithPushToken(acct);
+
+    const beforeRevoke = await post<{ push_wakeups: number }>(
+      acct,
+      "/requests",
+      makeEnvelope("req-push-before-revoke"),
+    );
+    expect(beforeRevoke.status).toBe(202);
+    expect(beforeRevoke.data.push_wakeups).toBe(1);
+
+    const revoke = await post<{ revoked: boolean }>(acct, `/devices/${deviceId}/revoke`, {});
+    expect(revoke.status).toBe(200);
+
+    const afterRevoke = await post<{ push_wakeups: number }>(
+      acct,
+      "/requests",
+      makeEnvelope("req-push-after-revoke"),
+    );
+    expect(afterRevoke.status).toBe(202);
+    expect(afterRevoke.data.push_wakeups).toBe(0);
+  });
+
   it("queues a request submitted while offline and flushes it on reconnect", async () => {
     const acct = "acct-offline-queue";
     await enrollDevice(acct);

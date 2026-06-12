@@ -16,9 +16,24 @@
  */
 
 import { PAIRING_TTL_MS } from "./constants.js";
+import {
+  ApnsPushTransport,
+  FcmPushTransport,
+  NoopPushTransport,
+  WebPushStubTransport,
+  dispatchPushWakeups,
+  isPushTransportKind,
+  type PushTransportRegistry,
+  type PushTransportKind,
+} from "./push.js";
 
 export interface Env {
   readonly ACCOUNT: DurableObjectNamespace;
+  readonly APNS_ENDPOINT?: string;
+  readonly APNS_TOPIC?: string;
+  readonly APNS_BEARER_TOKEN?: string;
+  readonly FCM_ENDPOINT?: string;
+  readonly FCM_BEARER_TOKEN?: string;
 }
 
 export default {
@@ -44,6 +59,18 @@ interface DeviceRow extends Record<string, string | number | null | ArrayBuffer>
   pubkey: string;
   label: string | null;
   created_at: number;
+}
+
+interface DevicePushTokenRow extends Record<string, string | number | null | ArrayBuffer> {
+  device_id: string;
+  transport: PushTransportKind;
+  token: string;
+  created_at: number;
+}
+
+interface IncomingPushToken {
+  transport: PushTransportKind;
+  token: string;
 }
 
 interface ActorRow extends Record<string, string | number | null | ArrayBuffer> {
@@ -196,6 +223,28 @@ function requiredNumber(body: Record<string, unknown>, key: string): number | nu
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
+function optionalPushTokens(body: Record<string, unknown>): IncomingPushToken[] | null {
+  const raw = body.push_tokens;
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) return null;
+  const tokens: IncomingPushToken[] = [];
+  const seenTokens = new Set<string>();
+  for (const item of raw) {
+    if (!isPlainObject(item)) return null;
+    const transport = item.transport;
+    const token = item.token;
+    if (typeof transport !== "string" || !isPushTransportKind(transport)) return null;
+    if (typeof token !== "string" || token.length < 1 || token.length > 4096) return null;
+    // Duplicate registrations are idempotent for one device; collapse them before DB mutation so
+    // a repeated token cannot half-complete pairing by tripping the push-token primary key.
+    const tokenKey = `${transport}\0${token}`;
+    if (seenTokens.has(tokenKey)) continue;
+    seenTokens.add(tokenKey);
+    tokens.push({ transport, token });
+  }
+  return tokens;
+}
+
 /** True when the request is a WebSocket upgrade (`Upgrade: websocket`, case-insensitive). */
 function isWebSocketUpgrade(request: Request): boolean {
   return (request.headers.get("Upgrade") ?? "").toLowerCase() === "websocket";
@@ -264,10 +313,12 @@ function parseSurfaceId(request: Request): string | null | undefined {
 export class AccountRelay implements DurableObject {
   private readonly sql: SqlStorage;
   private readonly ctx: DurableObjectState;
+  private readonly pushTransports: PushTransportRegistry;
 
-  constructor(ctx: DurableObjectState, _env: Env) {
+  constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
     this.sql = ctx.storage.sql;
+    this.pushTransports = buildPushTransports(env);
     this.initSchema();
     // On reactivation, restore the alarm from persisted pending rows in case the previous
     // isolate exited after a write but before the scheduled alarm was durably restored.
@@ -287,6 +338,14 @@ export class AccountRelay implements DurableObject {
         pubkey     TEXT    NOT NULL,
         label      TEXT,
         created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS device_push_token (
+        device_id  TEXT    NOT NULL,
+        transport  TEXT    NOT NULL,
+        token      TEXT    NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (device_id, transport, token)
       );
 
       CREATE TABLE IF NOT EXISTS actor (
@@ -402,7 +461,7 @@ export class AccountRelay implements DurableObject {
 
     // POST /requests — integrator submits an ApprovalRequest envelope (ciphertext + routing).
     if (method === "POST" && path0 === "requests" && !path1) {
-      return this.handleSubmit(request);
+      return this.handleSubmit(request, segments[0] ?? "");
     }
 
     // GET /requests/{request_id}/wait (WebSocket) — integrator awaits the verdict (pushed).
@@ -476,7 +535,8 @@ export class AccountRelay implements DurableObject {
 
   /**
    * POST /pairing/complete
-   * Body: { code: string, pubkey: string (b64url 32 bytes), label?: string }
+   * Body: { code: string, pubkey: string (b64url 32 bytes), label?: string,
+   *         push_tokens?: Array<{ transport: "apns" | "fcm" | "webpush", token: string }> }
    * Response: { device_id: string }
    *
    * Validates the pairing code and enrolls the device's public key.
@@ -500,6 +560,10 @@ export class AccountRelay implements DurableObject {
     }
 
     const label = optionalString(body, "label");
+    const pushTokens = optionalPushTokens(body);
+    if (pushTokens === null) {
+      return json({ error: "'push_tokens' must contain supported transport/token pairs" }, 400);
+    }
 
     // Look up the pairing row
     const rows = [
@@ -530,6 +594,16 @@ export class AccountRelay implements DurableObject {
       label ?? pairing.label ?? null,
       now,
     );
+    for (const pushToken of pushTokens) {
+      this.sql.exec(
+        `INSERT INTO device_push_token (device_id, transport, token, created_at)
+         VALUES (?, ?, ?, ?)`,
+        deviceId,
+        pushToken.transport,
+        pushToken.token,
+        now,
+      );
+    }
 
     return json({ device_id: deviceId }, 201);
   }
@@ -644,6 +718,7 @@ export class AccountRelay implements DurableObject {
     }
 
     this.sql.exec(`DELETE FROM device WHERE device_id = ?`, deviceId);
+    this.sql.exec(`DELETE FROM device_push_token WHERE device_id = ?`, deviceId);
     // Drop any live presence socket for the revoked device — it must stop receiving ciphertext.
     for (const ws of this.ctx.getWebSockets(deviceTag(deviceId))) {
       try {
@@ -732,7 +807,7 @@ export class AccountRelay implements DurableObject {
    * - 400: not exactly the contract's envelope fields, or already expired.
    * - 409: a request with this `id` was already submitted.
    */
-  private async handleSubmit(request: Request): Promise<Response> {
+  private async handleSubmit(request: Request, accountId: string): Promise<Response> {
     const envelope = await parseJsonBody(request);
     if (!envelope) return json({ error: "invalid JSON body" }, 400);
 
@@ -791,8 +866,26 @@ export class AccountRelay implements DurableObject {
     await this.armExpiryAlarm();
 
     const delivered = this.sendRequestToOneSocketPerSurface(id, envelope);
+    const pushWakeups = await this.sendPushWakeups(accountId, id);
 
-    return json({ request_id: id, status: "pending", delivered_to: delivered }, 202);
+    return json(
+      { request_id: id, status: "pending", delivered_to: delivered, push_wakeups: pushWakeups },
+      202,
+    );
+  }
+
+  /** Send request-id-only push wakeups to every registered device push token. */
+  private async sendPushWakeups(accountId: string, requestId: string): Promise<number> {
+    const tokens = [
+      ...this.sql.exec<DevicePushTokenRow>(
+        `SELECT device_id, transport, token, created_at FROM device_push_token ORDER BY created_at ASC`,
+      ),
+    ];
+    return dispatchPushWakeups(tokens, {
+      accountId,
+      requestId,
+      transports: this.pushTransports,
+    });
   }
 
   /**
@@ -1191,4 +1284,26 @@ export class AccountRelay implements DurableObject {
     );
     this.sql.exec(`DELETE FROM verdict WHERE request_id NOT IN (SELECT request_id FROM request)`);
   }
+}
+
+function buildPushTransports(env: Env): PushTransportRegistry {
+  const transports: PushTransportRegistry = {
+    apns: new NoopPushTransport("apns"),
+    fcm: new NoopPushTransport("fcm"),
+    webpush: new WebPushStubTransport(),
+  };
+  if (env.APNS_ENDPOINT && env.APNS_TOPIC && env.APNS_BEARER_TOKEN) {
+    transports.apns = new ApnsPushTransport({
+      endpoint: env.APNS_ENDPOINT,
+      topic: env.APNS_TOPIC,
+      bearerToken: env.APNS_BEARER_TOKEN,
+    });
+  }
+  if (env.FCM_ENDPOINT && env.FCM_BEARER_TOKEN) {
+    transports.fcm = new FcmPushTransport({
+      endpoint: env.FCM_ENDPOINT,
+      bearerToken: env.FCM_BEARER_TOKEN,
+    });
+  }
+  return transports;
 }

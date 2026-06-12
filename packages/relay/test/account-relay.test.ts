@@ -96,6 +96,24 @@ async function seedExpiredPairing(accountId: string, code: string): Promise<void
   });
 }
 
+async function readPushTokens(
+  accountId: string,
+  deviceId: string,
+): Promise<Array<{ transport: string; token: string }>> {
+  const id = env.ACCOUNT.idFromName(accountId);
+  const stub = env.ACCOUNT.get(id);
+  return runInDurableObject(stub, (instance: AccountRelay) => {
+    const relay = instance as unknown as { sql: SqlStorage };
+    return [
+      ...relay.sql.exec<{ transport: string; token: string }>(
+        `SELECT transport, token FROM device_push_token
+         WHERE device_id = ? ORDER BY created_at ASC`,
+        deviceId,
+      ),
+    ];
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -163,6 +181,71 @@ describe("AccountRelay — pairing", () => {
     for (const key of actualKeys) {
       expect(allowedKeys.has(key)).toBe(true);
     }
+  });
+
+  it("stores push tokens supplied while completing pairing without exposing them in /devices", async () => {
+    const acct = "acct-pairing-push-token";
+    const startResp = await post<{ code: string }>(acct, "/pairing/start", {
+      label: "Phone",
+    });
+
+    const completeResp = await post<{ device_id: string }>(acct, "/pairing/complete", {
+      code: startResp.data.code,
+      pubkey: VALID_PUBKEY_1,
+      push_tokens: [
+        { transport: "apns", token: "ios-token" },
+        { transport: "fcm", token: "android-token" },
+      ],
+    });
+    expect(completeResp.status).toBe(201);
+
+    const stored = await readPushTokens(acct, completeResp.data.device_id);
+    expect(stored).toEqual([
+      { transport: "apns", token: "ios-token" },
+      { transport: "fcm", token: "android-token" },
+    ]);
+
+    const listResp = await get<{ devices: Array<Record<string, unknown>> }>(acct, "/devices");
+    expect(listResp.data.devices[0]).not.toHaveProperty("push_tokens");
+  });
+
+  it("deduplicates repeated push tokens before consuming the pairing code", async () => {
+    const acct = "acct-pairing-duplicate-push-token";
+    const startResp = await post<{ code: string }>(acct, "/pairing/start", {
+      label: "Phone",
+    });
+
+    const completeResp = await post<{ device_id: string }>(acct, "/pairing/complete", {
+      code: startResp.data.code,
+      pubkey: VALID_PUBKEY_1,
+      push_tokens: [
+        { transport: "apns", token: "ios-token" },
+        { transport: "apns", token: "ios-token" },
+      ],
+    });
+    expect(completeResp.status).toBe(201);
+
+    const stored = await readPushTokens(acct, completeResp.data.device_id);
+    expect(stored).toEqual([{ transport: "apns", token: "ios-token" }]);
+  });
+
+  it("rejects malformed push tokens before consuming the pairing code", async () => {
+    const acct = "acct-pairing-bad-push-token";
+    const startResp = await post<{ code: string }>(acct, "/pairing/start", {});
+
+    const badComplete = await post<{ error: string }>(acct, "/pairing/complete", {
+      code: startResp.data.code,
+      pubkey: VALID_PUBKEY_1,
+      push_tokens: [{ transport: "email", token: "not-a-push-transport" }],
+    });
+    expect(badComplete.status).toBe(400);
+    expect(badComplete.data.error).toMatch(/push_tokens/);
+
+    const goodComplete = await post<{ device_id: string }>(acct, "/pairing/complete", {
+      code: startResp.data.code,
+      pubkey: VALID_PUBKEY_1,
+    });
+    expect(goodComplete.status).toBe(201);
   });
 
   it("rejects completing a pairing with an unknown code (404)", async () => {
@@ -358,6 +441,28 @@ describe("AccountRelay — device revocation", () => {
       {},
     );
     expect(status).toBe(404);
+  });
+
+  it("deletes registered push tokens when revoking a device", async () => {
+    const acct = "acct-revoke-clears-push-tokens";
+    const { data: startData } = await post<{ code: string }>(acct, "/pairing/start", {});
+    const { data: completeData } = await post<{ device_id: string }>(acct, "/pairing/complete", {
+      code: startData.code,
+      pubkey: VALID_PUBKEY_1,
+      push_tokens: [{ transport: "apns", token: "ios-token" }],
+    });
+
+    expect(await readPushTokens(acct, completeData.device_id)).toEqual([
+      { transport: "apns", token: "ios-token" },
+    ]);
+
+    const revoke = await post<{ revoked: boolean }>(
+      acct,
+      `/devices/${completeData.device_id}/revoke`,
+      {},
+    );
+    expect(revoke.status).toBe(200);
+    expect(await readPushTokens(acct, completeData.device_id)).toEqual([]);
   });
 });
 
