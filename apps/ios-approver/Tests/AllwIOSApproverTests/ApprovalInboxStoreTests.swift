@@ -9,6 +9,9 @@ struct ApprovalInboxStoreTests {
         try await testNumberMatchMustBeCorrectBeforeApprovalSigns()
         try await testDenyCanSignWithoutSatisfyingNumberMatch()
         try await testSigningFailureRestoresPendingState()
+        try await testDecisionRechecksCoreVerifiedExpiryBeforeSigning()
+        try await testDoubleSubmitProducesOnlyOneSignature()
+        try await testDeniedOnlyRequestRejectsApproval()
     }
 
     static func testSyncUsesPreparedExpiryInsteadOfRelayEnvelopeExpiry() async throws {
@@ -119,6 +122,89 @@ struct ApprovalInboxStoreTests {
 
         try expectEqual(store.detail("req-sign-fail")?.status, .pending)
     }
+
+    static func testDecisionRechecksCoreVerifiedExpiryBeforeSigning() async throws {
+        var now: Int64 = 1_000
+        let runtime = RecordingRuntime()
+        runtime.prepared["req-toctou"] = .command(
+            requestHash: "hash-toctou",
+            expiresAt: 5_000,
+            summary: "rotate production signing key",
+            challenge: nil
+        )
+        let store = ApprovalInboxStore(runtime: runtime, nowMs: { now })
+        await store.sync([
+            .fixture(id: "req-toctou", expiresAt: 50_000)
+        ])
+
+        now = 5_001
+
+        try await expectThrows(
+            try await store.decide("req-toctou", decision: .approved)
+        )
+        try expect(runtime.signInputs.isEmpty)
+        try expectEqual(store.detail("req-toctou")?.status, .expired)
+    }
+
+    static func testDoubleSubmitProducesOnlyOneSignature() async throws {
+        let runtime = SuspendingRuntime()
+        runtime.prepared["req-double-submit"] = .command(
+            requestHash: "hash-double-submit",
+            expiresAt: 50_000,
+            summary: "deploy payment worker",
+            challenge: nil
+        )
+        let store = ApprovalInboxStore(runtime: runtime, nowMs: { 1_000 })
+        await store.sync([
+            .fixture(id: "req-double-submit", expiresAt: 50_000)
+        ])
+
+        let firstDecision = Task {
+            try await store.decide("req-double-submit", decision: .approved)
+        }
+        await runtime.waitUntilSignStarted()
+
+        try await expectInboxError(.alreadyDeciding) {
+            try await store.decide("req-double-submit", decision: .approved)
+        }
+        try expectEqual(runtime.signInputs.count, 1)
+
+        runtime.completeSigning(
+            SignedVerdict(
+                requestId: "req-double-submit",
+                decision: .approved,
+                signedVerdictJson: #"{"v":1}"#
+            )
+        )
+        let verdict = try await firstDecision.value
+
+        try expectEqual(verdict.decision, .approved)
+        try expectEqual(runtime.signInputs.count, 1)
+        try expectEqual(store.detail("req-double-submit")?.status, .approved)
+    }
+
+    static func testDeniedOnlyRequestRejectsApproval() async throws {
+        let runtime = RecordingRuntime()
+        runtime.prepared["req-deny-only"] = .command(
+            requestHash: "hash-deny-only",
+            expiresAt: 50_000,
+            summary: "drop staging database",
+            allowedDecisions: [.denied],
+            challenge: nil
+        )
+        let store = ApprovalInboxStore(runtime: runtime, nowMs: { 1_000 })
+        await store.sync([
+            .fixture(id: "req-deny-only", expiresAt: 50_000)
+        ])
+
+        let listItem = try unwrap(store.inbox.first)
+        try expect(listItem.denyOnly)
+
+        try await expectInboxError(.decisionNotAllowed) {
+            try await store.decide("req-deny-only", decision: .approved)
+        }
+        try expect(runtime.signInputs.isEmpty)
+    }
 }
 
 private final class RecordingRuntime: ApproverCoreRuntime {
@@ -150,6 +236,43 @@ private final class RecordingRuntime: ApproverCoreRuntime {
     }
 }
 
+private final class SuspendingRuntime: ApproverCoreRuntime {
+    var prepared: [String: PreparedApproval] = [:]
+    var signInputs: [SignDecisionInput] = []
+    private var signStartedContinuation: CheckedContinuation<Void, Never>?
+    private var signContinuation: CheckedContinuation<SignedVerdict, Error>?
+
+    func prepare(envelope: ApprovalEnvelope) async throws -> PreparedApproval {
+        guard let prepared = prepared[envelope.id] else {
+            throw TestFailure("missing prepared fixture for \(envelope.id)")
+        }
+        return prepared
+    }
+
+    func signDecision(_ input: SignDecisionInput) async throws -> SignedVerdict {
+        signInputs.append(input)
+        signStartedContinuation?.resume()
+        signStartedContinuation = nil
+        return try await withCheckedThrowingContinuation { continuation in
+            signContinuation = continuation
+        }
+    }
+
+    func waitUntilSignStarted() async {
+        if !signInputs.isEmpty {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            signStartedContinuation = continuation
+        }
+    }
+
+    func completeSigning(_ verdict: SignedVerdict) {
+        signContinuation?.resume(returning: verdict)
+        signContinuation = nil
+    }
+}
+
 private extension ApprovalEnvelope {
     static func fixture(id: String, expiresAt: Int64) -> ApprovalEnvelope {
         ApprovalEnvelope(
@@ -168,6 +291,7 @@ private extension PreparedApproval {
         requestHash: String,
         expiresAt: Int64,
         summary: String,
+        allowedDecisions: [ApprovalDecision] = [.approved, .denied],
         challenge: NumberMatchChallenge?
     ) -> PreparedApproval {
         PreparedApproval(
@@ -177,7 +301,7 @@ private extension PreparedApproval {
                 action: .command(CommandAction(cwd: "/repo", argv: ["git", "push", "--force"], raw: nil)),
                 actor: ApprovalActor(id: "agent-1", display: "Codex", attestation: .verified),
                 risk: ApprovalRisk(level: .critical, reversible: false, summary: summary),
-                allowedDecisions: [.approved, .denied],
+                allowedDecisions: allowedDecisions,
                 challenge: challenge
             )
         )
@@ -225,5 +349,43 @@ private func expectThrows(_ expression: @autoclosure () async throws -> some Sen
         throw TestFailure("expected expression to throw")
     } catch {
         // Expected.
+    }
+}
+
+private func expectInboxError(
+    _ expected: ApprovalInboxErrorKind,
+    _ expression: () async throws -> some Sendable
+) async throws {
+    do {
+        _ = try await expression()
+        throw TestFailure("expected expression to throw \(expected)")
+    } catch let error as ApprovalInboxError {
+        try expect(expected.matches(error), "expected \(expected), got \(error)")
+    } catch {
+        throw TestFailure("expected \(expected), got \(error)")
+    }
+}
+
+private enum ApprovalInboxErrorKind: CustomStringConvertible {
+    case alreadyDeciding
+    case decisionNotAllowed
+
+    var description: String {
+        switch self {
+        case .alreadyDeciding:
+            return "alreadyDeciding"
+        case .decisionNotAllowed:
+            return "decisionNotAllowed"
+        }
+    }
+
+    func matches(_ error: ApprovalInboxError) -> Bool {
+        switch (self, error) {
+        case (.alreadyDeciding, .alreadyDeciding),
+            (.decisionNotAllowed, .decisionNotAllowed):
+            return true
+        default:
+            return false
+        }
     }
 }

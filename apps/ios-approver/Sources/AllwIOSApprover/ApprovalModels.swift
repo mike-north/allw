@@ -152,6 +152,7 @@ public struct PreparedApproval: Equatable, Sendable {
     public let requestHash: String
     public let expiresAt: Int64
     public let context: ApprovalContext
+    /// MUST be set only from a core-verified terminal Verdict.
     public let resolvedDecision: ApprovalDecision?
 
     public init(
