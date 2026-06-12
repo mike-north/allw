@@ -12,6 +12,34 @@ governance layer that grows around it. See [`docs/`](./docs):
 - [policy-seam.md](./docs/policy-seam.md) — the seam to the (later) policy layer.
 - [threat-model.md](./docs/threat-model.md) — adversaries, residual risks, and the security review checklist.
 
+## Quickstart (zero → first approval)
+
+Get a real shell command **blocked until you approve it from a second device** — verified end to end.
+Full walkthrough with troubleshooting: **[docs/quickstart.md](./docs/quickstart.md)**.
+
+> Requires Node ≥ 24 and Claude Code. **No Rust toolchain needed** — the audited core ships pre-built
+> as WASM inside `@allw/sdk`. v0 stand-ins (CLI approver instead of a phone app; software-held keys;
+> self-hosted relay) are called out in the full doc.
+
+```sh
+# 0. Run a relay (local). In its own terminal, from a checkout of this repo:
+pnpm install && pnpm --filter @allw/relay dev        # → http://127.0.0.1:8787
+
+# 1. Install the CLIs in your project (the @allw/sdk + bundled WASM come along automatically):
+npm install @allw/hook @allw/approver
+
+# 2. Pair a second device (a second terminal). Prints your account-root public key:
+npx allw-approver pair --relay http://127.0.0.1:8787 --account my-account --label my-laptop
+
+# 3. Watch for requests on that device (leave running — this is your "phone" for now):
+npx allw-approver watch
+```
+
+Then point the Claude Code **PreToolUse** hook at `npx allw-hook` with the relay URL, account id, and
+account-root key as env vars, ask Claude Code to run `git status`, and approve it from the watch
+terminal. The exact hook config block and env vars are in
+**[docs/quickstart.md](./docs/quickstart.md)** (steps 4–5).
+
 ## Workspace
 
 Polyglot monorepo — one audited Rust core, thin surfaces around it.

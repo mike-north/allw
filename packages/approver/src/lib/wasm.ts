@@ -103,17 +103,42 @@ export const moduleDir = dirname(fileURLToPath(import.meta.url));
 const VENDOR_REL = join("packages", "sdk", "vendor", "allw-wasm");
 
 /**
+ * Resolve the vendored wasm via the **installed** `@allw/sdk` package — the path that matters for a
+ * published `npm install`, where there is no monorepo root to walk up to. `@allw/sdk` ships the
+ * `.wasm` + glue in its tarball and exposes them as `exports` subpaths, so `import.meta.resolve`
+ * locates the file inside the resolved `@allw/sdk` (typically `node_modules/@allw/sdk/...`).
+ *
+ * Returns `null` (rather than throwing) when the SDK or the subpath cannot be resolved, so the
+ * caller falls back to the monorepo walk-up below. `import.meta.resolve` is synchronous on Node ≥
+ * 20; the package targets Node ≥ 24.
+ */
+function resolveVendorDirFromSdk(): string | null {
+  try {
+    const wasmUrl = import.meta.resolve("@allw/sdk/vendor/allw-wasm/allw_wasm_bg.wasm");
+    const dir = dirname(fileURLToPath(wasmUrl));
+    return existsSync(join(dir, "allw_wasm_bg.wasm")) ? dir : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Resolve the directory holding the vendored wasm artifact. The wasm is vendored once under the
  * `@allw/sdk` package (`packages/sdk/vendor/allw-wasm`, built by `pnpm run build:wasm`) so there is
  * a single source of truth across surfaces.
  *
- * Resolution walks **up** from this module's directory looking for `packages/sdk/vendor/allw-wasm`.
- * This works identically whether the approver runs from `src/` (tests) or `dist/` (compiled), and —
- * unlike `require.resolve("@allw/sdk")` — needs no SDK build to have run first, only the wasm build.
+ * Resolution tries, in order:
+ * 1. the **installed `@allw/sdk`** (via `import.meta.resolve`) — the published-install path; and
+ * 2. a **walk up** from this module's directory to a monorepo `packages/sdk/vendor/allw-wasm` — the
+ *    in-repo dev/test path (works identically whether the approver runs from `src/` or `dist/`).
  *
- * @throws if the vendored wasm cannot be found (run `pnpm run build:wasm` from the repo root).
+ * @throws if the vendored wasm cannot be found by either strategy (run `pnpm run build:wasm` from
+ *   the repo root, or install `@allw/sdk`).
  */
 function resolveVendorDir(): string {
+  const fromSdk = resolveVendorDirFromSdk();
+  if (fromSdk !== null) return fromSdk;
+
   let dir = moduleDir;
   // Walk to the filesystem root, checking for the vendored wasm at each ancestor.
   for (;;) {
@@ -125,8 +150,8 @@ function resolveVendorDir(): string {
       const rootCandidate = join(parent, VENDOR_REL);
       if (existsSync(join(rootCandidate, "allw_wasm_bg.wasm"))) return rootCandidate;
       throw new Error(
-        `vendored wasm not found (looked for ${VENDOR_REL} above ${moduleDir}). ` +
-          "Run 'pnpm run build:wasm' from the repo root first.",
+        `vendored wasm not found (looked for the installed @allw/sdk, then ${VENDOR_REL} above ` +
+          `${moduleDir}). Run 'pnpm run build:wasm' from the repo root, or install @allw/sdk.`,
       );
     }
     dir = parent;

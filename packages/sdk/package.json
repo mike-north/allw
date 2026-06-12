@@ -1,18 +1,25 @@
 {
   "name": "@allw/sdk",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "TypeScript SDK for the allw approval primitive (wraps allw-core via WASM).",
   "type": "module",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
-    }
+    },
+    "./vendor/allw-wasm/allw_wasm_bg.wasm": "./vendor/allw-wasm/allw_wasm_bg.wasm",
+    "./vendor/allw-wasm/allw_wasm.js": "./vendor/allw-wasm/allw_wasm.js",
+    "./package.json": "./package.json"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "files": [
-    "dist"
+    "dist",
+    "vendor/allw-wasm/allw_wasm_bg.wasm",
+    "vendor/allw-wasm/allw_wasm.js",
+    "vendor/allw-wasm/allw_wasm.d.ts",
+    "vendor/allw-wasm/allw_wasm_bg.wasm.d.ts"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -23,5 +30,16 @@
   "devDependencies": {
     "@types/node": "^22.0.0"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mike-north/allw.git",
+    "directory": "packages/sdk"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=24"
+  }
 }

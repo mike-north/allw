@@ -18,6 +18,7 @@ import { runPair } from "./commands/pair.js";
 import { createReadlinePrompter, runWatch, type WebSocketLike } from "./commands/watch.js";
 import { defaultKeyfilePath } from "./lib/paths.js";
 import { loadWasm } from "./lib/wasm.js";
+import { getVersion } from "./version.js";
 
 const USAGE = `allw-approver — minimal stand-in approver (v0; software-held keys)
 
@@ -35,6 +36,7 @@ COMMANDS:
 COMMON OPTIONS:
   --keyfile <path>   Keyfile location (default: ~/.allw/approver-keyfile.json)
   -h, --help         Show help.
+  -v, --version      Print the version and exit.
 
 pair OPTIONS:
   --relay <url>      Relay base URL (required), e.g. https://relay.example.com
@@ -74,6 +76,14 @@ async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const command = argv[0];
 
+  // `--version`/`-v` is a top-level flag (no subcommand): `allw-approver --version`. Handle it
+  // before command dispatch so it never requires a command or loads the WASM core. The version is
+  // read from this package's own package.json (never a hardcoded literal — see ./version.ts).
+  if (command === "--version" || command === "-v") {
+    console.log(getVersion());
+    process.exit(0);
+  }
+
   if (command === undefined || command === "help" || command === "--help" || command === "-h") {
     printUsageAndExit(command === undefined ? 1 : 0);
   }
@@ -89,10 +99,15 @@ async function main(): Promise<void> {
       "pairing-token": { type: "string" },
       force: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
+      version: { type: "boolean", short: "v", default: false },
     },
     allowPositionals: false,
   });
 
+  if (values.version) {
+    console.log(getVersion());
+    process.exit(0);
+  }
   if (values.help) printUsageAndExit(0);
 
   const keyfilePath = values.keyfile ?? defaultKeyfilePath();

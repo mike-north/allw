@@ -1,8 +1,7 @@
 {
   "name": "@allw/approver",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Minimal stand-in approver (software-held key) — the v0 'second device' for the allw walking skeleton.",
-  "private": true,
   "type": "module",
   "bin": {
     "allw-approver": "./dist/cli.js"
@@ -31,5 +30,16 @@
   "devDependencies": {
     "@types/node": "^22.0.0"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mike-north/allw.git",
+    "directory": "packages/approver"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=24"
+  }
 }
