@@ -106,6 +106,13 @@ fn parse_account_states_json(account_states_json: &str) -> Result<Vec<String>, J
     parse_json(account_states_json, "account state JWS array")
 }
 
+/// Normalizes the optional verifier account constraint exposed to JavaScript. `undefined`/`null`
+/// already arrive as `None`; an empty string is treated the same way so blank config values do not
+/// turn the optional defense-in-depth guard into an accidental reject-everything mode.
+fn expected_account_id_constraint(expected_account_id: Option<&str>) -> Option<&str> {
+    expected_account_id.filter(|account_id| !account_id.is_empty())
+}
+
 /// Converts a required compact-JWS device certificate into the core's optional shape. The core
 /// supports `None` for negative tests; the public WASM signing boundary rejects the empty-string
 /// foot-gun so production JS callers cannot silently emit unverifiable artifacts.
@@ -324,7 +331,7 @@ pub fn verify_verdict(
     let now_ms = ms_to_i64(now_ms, "now_ms")?;
 
     let mut nonce_store = allw_core::InMemoryNonceStore::new();
-    let verified = match expected_account_id.as_deref() {
+    let verified = match expected_account_id_constraint(expected_account_id.as_deref()) {
         Some(expected) => core_verify_verdict_for_account(
             &verdict,
             &request,
@@ -393,7 +400,7 @@ pub fn verify_verdict_with_account_states(
     let account_state_refs: Vec<&str> = account_states.iter().map(String::as_str).collect();
 
     let mut nonce_store = allw_core::InMemoryNonceStore::new();
-    let verified = match expected_account_id.as_deref() {
+    let verified = match expected_account_id_constraint(expected_account_id.as_deref()) {
         Some(expected) => core_verify_verdict_with_account_states_for_account(
             &verdict,
             &request,
@@ -687,7 +694,7 @@ pub fn verify_policy_rule_with_account_states(
     let account_states = parse_account_states_json(account_states_json)?;
     let account_state_refs: Vec<&str> = account_states.iter().map(String::as_str).collect();
 
-    let verified = match expected_account_id.as_deref() {
+    let verified = match expected_account_id_constraint(expected_account_id.as_deref()) {
         Some(expected) => core_verify_policy_rule_with_account_states_for_account(
             &rule,
             &root_pubkey,
@@ -749,7 +756,7 @@ pub fn evaluate_policy(
     let verified = rules
         .iter()
         .map(|rule| {
-            match expected_account_id.as_deref() {
+            match expected_account_id_constraint(expected_account_id.as_deref()) {
                 Some(expected) => {
                     core_verify_policy_rule_for_account(rule, &root_pubkey, now_ms, expected)
                 }
@@ -803,7 +810,7 @@ pub fn evaluate_policy_with_account_states(
     let verified = rules
         .iter()
         .map(|rule| {
-            match expected_account_id.as_deref() {
+            match expected_account_id_constraint(expected_account_id.as_deref()) {
                 Some(expected) => core_verify_policy_rule_with_account_states_for_account(
                     rule,
                     &root_pubkey,

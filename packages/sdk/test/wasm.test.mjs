@@ -727,6 +727,39 @@ test("verify_verdict enforces optional expected account ids", async () => {
   );
   assert.equal(result.approved, true, "a matching expected account id must still verify");
 
+  const emptyExpectedResult = JSON.parse(
+    wasm.verify_verdict(
+      verdictJson,
+      f.v.request_json,
+      f.v.context_json,
+      f.accountRootPub,
+      f.v.now_ms,
+      "",
+    ),
+  );
+  assert.equal(
+    emptyExpectedResult.approved,
+    true,
+    "an empty expected account id is treated like no expected-account constraint",
+  );
+
+  const emptyExpectedWithStates = JSON.parse(
+    wasm.verify_verdict_with_account_states(
+      verdictJson,
+      f.v.request_json,
+      f.v.context_json,
+      f.accountRootPub,
+      f.v.now_ms,
+      JSON.stringify([]),
+      "",
+    ),
+  );
+  assert.equal(
+    emptyExpectedWithStates.approved,
+    true,
+    "account-state-aware verdict verification also treats empty expected account id as omitted",
+  );
+
   assert.throws(
     () =>
       wasm.verify_verdict(
@@ -945,6 +978,54 @@ test("policy verification enforces optional expected account ids", async () => {
   );
   assert.equal(verified.rule.account_id, f.accountId, "a matching expected account id must verify");
 
+  const verifiedEmptyExpected = JSON.parse(
+    wasm.verify_policy_rule_with_account_states(
+      signedRule,
+      f.accountRootPub,
+      f.nowMs,
+      JSON.stringify([]),
+      "",
+    ),
+  );
+  assert.equal(
+    verifiedEmptyExpected.rule.account_id,
+    f.accountId,
+    "an empty expected account id is treated like no policy-rule account constraint",
+  );
+
+  const emptyExpectedEvaluation = JSON.parse(
+    wasm.evaluate_policy(
+      actionJson,
+      actorJson,
+      JSON.stringify([JSON.parse(signedRule)]),
+      f.accountRootPub,
+      f.nowMs,
+      "",
+    ),
+  );
+  assert.equal(
+    emptyExpectedEvaluation.decision,
+    "allow",
+    "policy evaluation treats empty expected account id as omitted",
+  );
+
+  const emptyExpectedEvaluationWithStates = JSON.parse(
+    wasm.evaluate_policy_with_account_states(
+      actionJson,
+      actorJson,
+      JSON.stringify([JSON.parse(signedRule)]),
+      f.accountRootPub,
+      f.nowMs,
+      JSON.stringify([]),
+      "",
+    ),
+  );
+  assert.equal(
+    emptyExpectedEvaluationWithStates.decision,
+    "allow",
+    "account-state-aware policy evaluation treats empty expected account id as omitted",
+  );
+
   assert.throws(
     () =>
       wasm.verify_policy_rule_with_account_states(
@@ -1003,6 +1084,21 @@ test("@allw/sdk account-state helpers verify documents and reject revoked verdic
   });
   assert.equal(verifiedVerdict.approved, true);
   assert.equal(verifiedVerdict.deviceId, "dev_rt");
+
+  const emptyExpectedVerdict = await verifyVerdictWithAccountStates({
+    verdict,
+    request,
+    context,
+    approverRootKey: f.accountRootPub,
+    nowMs: f.v.now_ms,
+    accountStates: [stateJws],
+    expectedAccountId: "",
+  });
+  assert.equal(
+    emptyExpectedVerdict.approved,
+    true,
+    "SDK verdict helper treats empty expectedAccountId as omitted",
+  );
 
   await assert.rejects(
     () =>
@@ -1079,6 +1175,19 @@ test("@allw/sdk policy helpers reject rules from revoked devices", async () => {
   });
   assert.equal(verifiedRule.deviceId, f.deviceId);
 
+  const emptyExpectedRule = await verifyPolicyRuleWithAccountStates({
+    rule: signedRule,
+    accountRootKey: f.accountRootPub,
+    nowMs: f.nowMs,
+    accountStates: [activeState],
+    expectedAccountId: "",
+  });
+  assert.equal(
+    emptyExpectedRule.deviceId,
+    f.deviceId,
+    "SDK policy-rule helper treats empty expectedAccountId as omitted",
+  );
+
   const evaluation = await evaluatePolicyWithAccountStates({
     action,
     actor,
@@ -1090,6 +1199,21 @@ test("@allw/sdk policy helpers reject rules from revoked devices", async () => {
   });
   assert.equal(evaluation.decision, "allow");
   assert.equal(evaluation.ruleId, "allow-status-sdk");
+
+  const emptyExpectedSdkEvaluation = await evaluatePolicyWithAccountStates({
+    action,
+    actor,
+    signedRules: [signedRule],
+    accountRootKey: f.accountRootPub,
+    nowMs: f.nowMs,
+    accountStates: [activeState],
+    expectedAccountId: "",
+  });
+  assert.equal(
+    emptyExpectedSdkEvaluation.decision,
+    "allow",
+    "SDK policy evaluation treats empty expectedAccountId as omitted",
+  );
 
   await assert.rejects(
     () =>

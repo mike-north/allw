@@ -144,6 +144,7 @@ export interface AccountStateOptions {
   /**
    * Optional caller-asserted account namespace. Multi-account verifiers should set this so a
    * verdict or policy rule whose signed account id differs from the intended account fails closed.
+   * `""` is treated like omission at the SDK/WASM seam.
    */
   readonly expectedAccountId?: string;
 }
@@ -459,6 +460,11 @@ function accountStatesJson(accountStates: readonly string[] | undefined): string
   return JSON.stringify(accountStates ?? []);
 }
 
+/** Treat a blank optional account constraint like omission before crossing into WASM. */
+function expectedAccountIdConstraint(expectedAccountId: string | undefined): string | undefined {
+  return expectedAccountId === "" ? undefined : expectedAccountId;
+}
+
 /**
  * Verify a (possibly null) verdict value through the WASM core and reduce it to a {@link Decision}.
  *
@@ -482,6 +488,7 @@ async function verifyToDecision(
 ): Promise<VerifiedDecision | null> {
   if (verdictValue === null || verdictValue === undefined) return null;
   const verdictJson = JSON.stringify(verdictValue);
+  const accountConstraint = expectedAccountIdConstraint(expectedAccountId);
   let verifyJson: string;
   try {
     verifyJson =
@@ -492,7 +499,7 @@ async function verifyToDecision(
             contextJson,
             approverRootKey,
             nowMs,
-            expectedAccountId,
+            accountConstraint,
           )
         : wasm.verify_verdict_with_account_states(
             verdictJson,
@@ -501,7 +508,7 @@ async function verifyToDecision(
             approverRootKey,
             nowMs,
             accountStatesJson(accountStates),
-            expectedAccountId,
+            accountConstraint,
           );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -565,7 +572,7 @@ export async function verifyVerdictWithAccountStates(
       input.approverRootKey,
       input.nowMs,
       accountStatesJson(input.accountStates),
-      input.expectedAccountId,
+      expectedAccountIdConstraint(input.expectedAccountId),
     ),
   );
   if (input.nonceStore && !(await input.nonceStore.checkAndInsert(result.nonceB64))) {
@@ -585,7 +592,7 @@ export async function verifyPolicyRuleWithAccountStates(
       input.accountRootKey,
       input.nowMs,
       accountStatesJson(input.accountStates),
-      input.expectedAccountId,
+      expectedAccountIdConstraint(input.expectedAccountId),
     ),
   ) as { rule?: unknown; device_id?: unknown };
   if (typeof value.device_id !== "string" || value.device_id.length === 0) {
@@ -607,7 +614,7 @@ export async function evaluatePolicyWithAccountStates(
       input.accountRootKey,
       input.nowMs,
       accountStatesJson(input.accountStates),
-      input.expectedAccountId,
+      expectedAccountIdConstraint(input.expectedAccountId),
     ),
   ) as { decision?: unknown; rule_id?: unknown; tier?: unknown; schema_version?: unknown };
   if (value.decision !== "allow" && value.decision !== "deny" && value.decision !== "escalate") {
