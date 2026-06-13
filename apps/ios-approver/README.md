@@ -18,6 +18,8 @@ core through UniFFI.
 - Paired device credentials and the root-verified account-state sequence floor persist behind a
   Keychain-ready storage seam; rollback or relay-advertised-but-unverified account state fails
   closed before it can drive verified actor rendering.
+- `acceptVerifiedAccountState`'s `verifiedSequence` must come from core JWS verification, never from
+  relay `max_sequence` metadata.
 
 ## Local test
 
