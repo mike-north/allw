@@ -54,6 +54,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
 use crate::contract::{ApprovalContext, ApprovalRequest, Approver, Decision, Verdict};
@@ -74,6 +75,12 @@ pub(crate) const TYP_ACCOUNT_STATE: &str = "allw-account-state+jws";
 /// `pub(crate)` so sibling modules reusing this compact-JWS substrate (e.g.
 /// [`crate::attestation`]) build their protected headers with the identical `alg`.
 pub(crate) const ALG_EDDSA: &str = "EdDSA";
+
+/// Domain separation tag for deriving human-facing number-match challenges.
+const NUMBER_MATCH_DOMAIN_TAG: &[u8] = b"allw/number-match/v1";
+
+/// Null-byte separator between domain tag and request hash in number-match derivation.
+const NUMBER_MATCH_SEPARATOR: u8 = 0x00;
 
 // ── Key abstractions ────────────────────────────────────────────────────────────
 
@@ -809,6 +816,8 @@ pub enum VerifyError {
     Replay,
     /// Step 7 — a challenge was required but no (non-empty) challenge response was present.
     ChallengeMissing,
+    /// Step 7 — a challenge response was present but did not match the derived request code.
+    ChallengeMismatch,
     /// Step 8 — the verdict is authenticated and bound, but the human did **not** approve.
     ///
     /// This is distinct from any crypto error: it is a *verified* denial / expiry / abort, not
@@ -892,6 +901,12 @@ impl std::fmt::Display for VerifyError {
                     "a challenge was required but no challenge response was present"
                 )
             }
+            Self::ChallengeMismatch => {
+                write!(
+                    f,
+                    "challenge response did not match the derived request challenge"
+                )
+            }
             Self::NotApproved { decision } => {
                 write!(
                     f,
@@ -957,6 +972,26 @@ pub(crate) fn verify_certified_device(
     })
 }
 
+/// Derives the human-facing number-match challenge for a request hash.
+///
+/// The request hash already binds the exact WYSIWYS payload, including `challenge_required` and
+/// `expires_at`. This helper domain-separates that hash before reducing it to a four-digit decimal
+/// challenge that devices display and signed verdicts echo in `challenge_response`.
+#[must_use]
+pub fn derive_number_match_challenge(request_hash: &[u8; 32]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(NUMBER_MATCH_DOMAIN_TAG);
+    hasher.update([NUMBER_MATCH_SEPARATOR]);
+    hasher.update(request_hash);
+    let digest = hasher.finalize();
+    let value = u32::from_be_bytes(
+        digest[0..4]
+            .try_into()
+            .expect("SHA-256 digest has at least four bytes"),
+    ) % 10_000;
+    format!("{value:04}")
+}
+
 /// Verifies a [`Verdict`] against the request it answers and the approver's account root key,
 /// returning a [`VerifiedVerdict`] only when the verdict is authenticated, bound, fresh, and
 /// approved.
@@ -989,11 +1024,9 @@ pub(crate) fn verify_certified_device(
 ///    ([`VerifyError::Replay`]).
 /// 7. **Challenge** (checklist #5). If `context.constraints.challenge_required`, a non-empty
 ///    `challenge_response` must be present in both the claims and the outer verdict
-///    ([`VerifyError::ChallengeMissing`]).
-///
-///    **v1 limitation:** only the *presence* of a signed challenge response is checked. The
-///    number-match *value* is not validated against an expected challenge, because the
-///    expected-challenge derivation is not yet specified. See the inline `TODO`.
+///    ([`VerifyError::ChallengeMissing`]) and must exactly match
+///    [`derive_number_match_challenge`] for the recomputed request hash
+///    ([`VerifyError::ChallengeMismatch`]).
 /// 8. **Decision gate** (checklist #3 / #6). If `claims.decision != Approved`, returns
 ///    [`VerifyError::NotApproved`] — an authenticated denial/expiry, distinct from a forgery.
 ///    Otherwise returns `Ok`.
@@ -1232,11 +1265,8 @@ fn verify_verdict_with_account_states_impl(
         return Err(VerifyError::Replay);
     }
 
-    // ── Step 7: challenge presence (value validation deferred) ───────────────────
+    // ── Step 7: challenge correctness ───────────────────────────────────────────
     if context.constraints.challenge_required {
-        // TODO(#follow-up): validate challenge value — match the signed challenge_response
-        // against the expected number-match challenge once that derivation is specced. v1
-        // only proves a challenge response was signed, not that it is the *correct* one.
         let claim_present = claims
             .challenge_response
             .as_deref()
@@ -1247,6 +1277,10 @@ fn verify_verdict_with_account_states_impl(
             .is_some_and(|s| !s.is_empty());
         if !(claim_present && outer_present) {
             return Err(VerifyError::ChallengeMissing);
+        }
+        let expected_challenge = derive_number_match_challenge(&expected);
+        if claims.challenge_response.as_deref() != Some(expected_challenge.as_str()) {
+            return Err(VerifyError::ChallengeMismatch);
         }
     }
 
@@ -2128,16 +2162,22 @@ mod tests {
         assert_eq!(err, VerifyError::ChallengeMissing);
     }
 
-    /// checklist #5: challenge required AND a present signed challenge_response → passes.
+    /// Number-match derivation is stable and domain-separated from the request hash itself.
     #[test]
-    fn challenge_required_and_present_passes() {
+    fn number_match_challenge_derivation_is_pinned() {
+        let zero_hash = [0u8; 32];
+
+        assert_eq!(derive_number_match_challenge(&zero_hash), "8729");
+    }
+
+    /// checklist #5: challenge required AND the derived signed challenge_response → passes.
+    #[test]
+    fn challenge_required_and_correct_response_passes() {
         let cert = make_cert(&root_key());
+        let request_hash = canonical_hash(true);
+        let expected_challenge = derive_number_match_challenge(&request_hash);
         let verdict = sign_verdict(
-            &make_unsigned(
-                Decision::Approved,
-                canonical_hash(true),
-                Some("42".to_string()),
-            ),
+            &make_unsigned(Decision::Approved, request_hash, Some(expected_challenge)),
             &device_key(),
             NONCE,
             Some(cert),
@@ -2154,8 +2194,45 @@ mod tests {
             &mut store,
             NOW_OK,
         )
-        .expect("present challenge response must pass");
+        .expect("correct challenge response must pass");
         assert_eq!(verified.decision, Decision::Approved);
+    }
+
+    /// checklist #5: a signed but incorrect number-match response fails closed.
+    #[test]
+    fn challenge_required_wrong_response_detected() {
+        let cert = make_cert(&root_key());
+        let request_hash = canonical_hash(true);
+        let expected_challenge = derive_number_match_challenge(&request_hash);
+        let wrong_challenge = if expected_challenge == "0000" {
+            "0001"
+        } else {
+            "0000"
+        };
+        let verdict = sign_verdict(
+            &make_unsigned(
+                Decision::Approved,
+                request_hash,
+                Some(wrong_challenge.to_string()),
+            ),
+            &device_key(),
+            NONCE,
+            Some(cert),
+        );
+        let request = make_request();
+        let context = make_context(true);
+        let mut store = InMemoryNonceStore::new();
+
+        let err = verify_verdict(
+            &verdict,
+            &request,
+            &context,
+            &root_key().public_key(),
+            &mut store,
+            NOW_OK,
+        )
+        .expect_err("incorrect challenge response must fail");
+        assert_eq!(err, VerifyError::ChallengeMismatch);
     }
 
     fn signed_account_state(sequence: u64, revoked_device_ids: &[&str]) -> String {

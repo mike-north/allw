@@ -38,9 +38,16 @@ export interface WatchOptions {
  * A minimal prompt abstraction so the decision loop is testable without a TTY. `decide` returns the
  * human's choice for a rendered request; `null` means "no decision" (e.g. retracted/aborted).
  */
+export interface PromptDecision {
+  readonly decision: Decision;
+  readonly challengeResponse?: string;
+}
+
+type PromptResult = Decision | PromptDecision | null;
+
 export interface Prompter {
   /** Show the rendered block and return the decision (or null if none was made). */
-  decide(rendered: string, prepared: RenderableRequest): Promise<Decision | null>;
+  decide(rendered: string, prepared: RenderableRequest): Promise<PromptResult>;
   /** Optional cleanup (close the readline interface). */
   close?(): void;
 }
@@ -93,6 +100,12 @@ function parseInbound(data: unknown): DeviceInboundMessage | null {
   const obj = parsed as Record<string, unknown>;
   if (typeof obj.type !== "string") return null;
   return obj as unknown as DeviceInboundMessage;
+}
+
+function normalizePromptResult(result: PromptResult): PromptDecision | null {
+  if (result === null) return null;
+  if (typeof result === "string") return { decision: result };
+  return result;
 }
 
 /**
@@ -258,8 +271,8 @@ export async function handleRequest(
   const preparedWithOrigin: RenderableRequest = { ...prepared, origin };
 
   const rendered = renderRequest(preparedWithOrigin);
-  const decision = await prompter.decide(rendered, preparedWithOrigin);
-  if (decision === null) {
+  const promptDecision = normalizePromptResult(await prompter.decide(rendered, preparedWithOrigin));
+  if (promptDecision === null) {
     log.info(`No decision recorded for ${prepared.requestId} — leaving it pending.`);
     return null;
   }
@@ -276,7 +289,16 @@ export async function handleRequest(
 
   let verdict: unknown;
   try {
-    verdict = signDecision(wasm, keyfile, prepared, decision, now());
+    verdict = signDecision(
+      wasm,
+      keyfile,
+      prepared,
+      promptDecision.decision,
+      now(),
+      promptDecision.challengeResponse === undefined
+        ? {}
+        : { challengeResponse: promptDecision.challengeResponse },
+    );
   } catch (err) {
     // A signing failure must NOT emit a partial/forged verdict — abort this request.
     log.warn(`Failed to sign verdict for ${prepared.requestId}: ${(err as Error).message}`);
@@ -284,17 +306,28 @@ export async function handleRequest(
   }
 
   ws.send(JSON.stringify({ type: "verdict", request_id: prepared.requestId, verdict }));
-  log.info(`Sent ${decision} verdict for ${prepared.requestId}.`);
-  return decision;
+  log.info(`Sent ${promptDecision.decision} verdict for ${prepared.requestId}.`);
+  return promptDecision.decision;
 }
 
 /** A readline-backed prompter for the interactive CLI. */
 export function createReadlinePrompter(): Prompter {
   const rl: Interface = createInterface({ input: process.stdin, output: process.stdout });
   return {
-    async decide(rendered: string): Promise<Decision | null> {
+    async decide(rendered: string, prepared: RenderableRequest): Promise<PromptResult> {
       console.log(rendered);
-      const answer = (await rl.question("Approve / Deny / Skip? [a/d/s] ")).trim().toLowerCase();
+      const prompt =
+        prepared.numberMatchChallenge === undefined
+          ? "Approve / Deny / Skip? [a/d/s] "
+          : `Type ${prepared.numberMatchChallenge} to approve / Deny / Skip? [code/d/s] `;
+      const answer = (await rl.question(prompt)).trim().toLowerCase();
+      if (prepared.numberMatchChallenge !== undefined) {
+        if (answer === prepared.numberMatchChallenge) {
+          return { decision: "approved", challengeResponse: answer };
+        }
+        if (answer === "d" || answer === "deny") return "denied";
+        return null; // skip / anything else → no decision (fail-closed)
+      }
       if (answer === "a" || answer === "approve") return "approved";
       if (answer === "d" || answer === "deny") return "denied";
       return null; // skip / anything else → no decision (fail-closed)

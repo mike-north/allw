@@ -3,7 +3,9 @@
  *
  * The human must be shown the **exact** action they are signing over, and the rendered fields are
  * precisely the ones bound into `request_hash` (the full `ActionRecord` syntactic substrate,
- * `summary`, `actor`, `risk`, `reversible`, `expires_at`, plus the `request_hash` itself).
+ * `summary`, `actor`, `risk`, `reversible`, `expires_at`, plus the `request_hash` itself). When a
+ * number-match challenge is required, the code derived from that `request_hash` is shown too; the
+ * human must type it back before an approval can be signed.
  * Rendering is pure (returns a string) so it is trivially testable and the CLI just prints it.
  *
  * # Completeness is a security property, not a nicety
@@ -298,6 +300,9 @@ export function renderRequest(prepared: RenderableRequest): string {
   }
   lines.push(`  Risk:       ${context.risk}`);
   lines.push(`  Reversible: ${context.reversible ? "yes" : "no"}`);
+  if (prepared.numberMatchChallenge !== undefined) {
+    lines.push(`  Number match: ${prepared.numberMatchChallenge}`);
+  }
   lines.push(`  Expires:    ${formatTimestamp(expiresAt)}`);
   if (context.chain && context.chain.length > 0) {
     lines.push(`  Chain:      ${context.chain.join(", ")}`);

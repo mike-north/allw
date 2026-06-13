@@ -283,8 +283,9 @@ mod option_wire_b64_vec {
 
 /// Request constraints on which decisions are valid and whether a challenge is required.
 ///
-/// `challenge_required` governs the number-match challenge for destructive/critical ops;
-/// the challenge-response mechanism itself is a later issue.
+/// `challenge_required` governs the number-match challenge for destructive/critical ops. When
+/// true, the approver signs the four-digit code derived from `request_hash`; verification
+/// fail-closes unless `challenge_response` matches that derived value.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Constraints {
     /// Which [`Decision`] variants the approver is permitted to select.

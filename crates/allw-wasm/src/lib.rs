@@ -41,6 +41,7 @@ use allw_core::{
     action_from_file_edit as core_action_from_file_edit,
     action_from_mcp_tool_call as core_action_from_mcp_tool_call,
     compute_request_hash as core_compute_request_hash, decrypt_context as core_decrypt_context,
+    derive_number_match_challenge as core_derive_number_match_challenge,
     encrypt_context as core_encrypt_context, evaluate as core_evaluate,
     evaluate_for_actor as core_evaluate_for_actor, issue_device_cert as core_issue_device_cert,
     sign_account_state as core_sign_account_state,
@@ -167,6 +168,21 @@ pub fn compute_request_hash(context_json: &str, expires_at: f64) -> Result<Strin
     let expires_at = ms_to_i64(expires_at, "expires_at")?;
     let hash = core_compute_request_hash(&ctx, expires_at);
     Ok(URL_SAFE_NO_PAD.encode(hash))
+}
+
+/// Derives the four-digit number-match challenge for a request hash.
+///
+/// `request_hash_b64` must be the base64url-unpadded 32-byte WYSIWYS request hash returned by
+/// [`compute_request_hash`]. The returned string is zero-padded decimal and is what a challenged
+/// approval must sign as `challenge_response`.
+///
+/// # Errors
+///
+/// Throws if `request_hash_b64` is not 32 base64url bytes.
+#[wasm_bindgen]
+pub fn derive_number_match_challenge(request_hash_b64: &str) -> Result<String, JsError> {
+    let request_hash = decode_b64_32(request_hash_b64, "request_hash_b64")?;
+    Ok(core_derive_number_match_challenge(&request_hash))
 }
 
 /// Returns the RFC 8785 JCS canonical bytes for the request-hash input (the

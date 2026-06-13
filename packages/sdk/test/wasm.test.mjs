@@ -72,6 +72,22 @@ test("compute_request_hash reproduces the Rust request-hash/v2 vector", async ()
   assert.equal(hex, v.expected_request_hash_hex, "decoded hash must equal the frozen hex vector");
 });
 
+test("derive_number_match_challenge reproduces the Rust number-match vector", async () => {
+  const wasm = await loadWasm();
+  const zeroHash = Buffer.alloc(32, 0).toString("base64url");
+
+  assert.equal(
+    wasm.derive_number_match_challenge(zeroHash),
+    "8729",
+    "WASM number-match derivation must match the core's pinned vector",
+  );
+  assert.throws(
+    () => wasm.derive_number_match_challenge("not-a-32-byte-hash"),
+    /request_hash_b64/,
+    "malformed request hash input must throw at the WASM boundary",
+  );
+});
+
 test("verify_verdict accepts the known-good signed verdict", async () => {
   const wasm = await loadWasm();
   const v = loadVector();

@@ -92,7 +92,7 @@ function makeRequestJson() {
  * signing key, with relay/account/device populated. Returns { keyfile, jwe } where `jwe` encrypts
  * CONTEXT to the device's X25519 key (the integrator's encrypt step).
  */
-function pairedApprover(wasm) {
+function pairedApprover(wasm, contextJson = CONTEXT_JSON) {
   const fresh = generateKeyfile(wasm);
   const cert = wasm.issue_device_cert(
     fresh.account_root_seed,
@@ -111,7 +111,7 @@ function pairedApprover(wasm) {
   const recipients = JSON.stringify([
     { device_id: DEVICE_ID, public_key_b64: fresh.device_encryption_pubkey },
   ]);
-  const jwe = wasm.encrypt_context(CONTEXT_JSON, recipients);
+  const jwe = wasm.encrypt_context(contextJson, recipients);
   return { keyfile, jwe };
 }
 
@@ -175,6 +175,63 @@ test("denied round-trip: a signed denial verifies as a verified 'no' (verify_ver
     /verify_verdict failed/,
     "a verified denial surfaces as a thrown error (deny-by-default), not a falsy result",
   );
+});
+
+test("number-match request renders derived code and signs only the matching response", async () => {
+  const wasm = await loadWasm();
+  const challengedContext = {
+    ...CONTEXT,
+    constraints: { ...CONTEXT.constraints, challenge_required: true },
+  };
+  const challengedContextJson = JSON.stringify(challengedContext);
+  const { keyfile, jwe } = pairedApprover(wasm, challengedContextJson);
+
+  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
+  const expectedChallenge = wasm.derive_number_match_challenge(prepared.requestHash);
+
+  assert.equal(
+    prepared.numberMatchChallenge,
+    expectedChallenge,
+    "prepareRequest must derive the display challenge through the WASM core",
+  );
+  assert.match(
+    renderRequest(prepared),
+    new RegExp(`Number match:\\s+${expectedChallenge}`),
+    "renderRequest must show the derived number-match code before signing",
+  );
+  assert.throws(
+    () => signDecision(wasm, keyfile, prepared, "approved", DECIDED_AT),
+    /requires number-match challenge response/,
+    "approvals for challenged requests must not silently sign without the typed code",
+  );
+  assert.throws(
+    () =>
+      signDecision(wasm, keyfile, prepared, "approved", DECIDED_AT, {
+        challengeResponse: expectedChallenge === "0000" ? "0001" : "0000",
+      }),
+    /does not match derived number-match challenge/,
+    "an incorrect typed code must fail before signing",
+  );
+
+  const verdict = signDecision(wasm, keyfile, prepared, "approved", DECIDED_AT, {
+    challengeResponse: expectedChallenge,
+  });
+  assert.equal(
+    verdict.challenge_response,
+    expectedChallenge,
+    "the signed verdict must carry the derived challenge response",
+  );
+
+  const result = JSON.parse(
+    wasm.verify_verdict(
+      JSON.stringify(verdict),
+      makeRequestJson(),
+      challengedContextJson,
+      keyfile.account_root_pubkey,
+      NOW_MS,
+    ),
+  );
+  assert.equal(result.approved, true, "the challenged approval must verify under the core");
 });
 
 // ── Fail-closed: malformed / wrong-key ciphertext ────────────────────────────────────────────
