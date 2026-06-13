@@ -102,6 +102,18 @@ fn parse_account_states_json(account_states_json: &str) -> Result<Vec<String>, J
     parse_json(account_states_json, "account state JWS array")
 }
 
+/// Converts a required compact-JWS device certificate into the core's optional shape. The core
+/// supports `None` for negative tests; the public WASM signing boundary rejects the empty-string
+/// foot-gun so production JS callers cannot silently emit unverifiable artifacts.
+fn required_device_cert(device_cert: &str) -> Result<String, JsError> {
+    if device_cert.is_empty() {
+        return Err(JsError::new(
+            "device_cert must not be empty; mint one with issue_device_cert before signing",
+        ));
+    }
+    Ok(device_cert.to_string())
+}
+
 /// JS `Number.MAX_SAFE_INTEGER` = 2^53 − 1. Integer `f64`s within `±MAX_SAFE_INTEGER` are the
 /// exact integer the caller intended; beyond it, distinct integers collapse onto the same `f64`,
 /// so an `ms.fract() == 0.0` value there is NOT necessarily the millisecond count JS meant.
@@ -418,13 +430,13 @@ struct WasmUnsignedVerdict {
 ///   length-agnostic, but anti-replay security depends on a **high-entropy** nonce: callers (the
 ///   SDK, #12) MUST generate **≥16 cryptographically-random bytes** per verdict. It is signed into
 ///   the claims and checked against a [`NonceStore`](allw_core::NonceStore) on verify.
-/// - `device_cert` — the device→account-root certificate JWS (from [`issue_device_cert`]); pass an
-///   empty string for none, though [`verify_verdict`] requires one to chain the device key to root.
+/// - `device_cert` — the device→account-root certificate JWS (from [`issue_device_cert`]); required
+///   so the signed verdict can chain the device key to the account root.
 ///
 /// # Errors
 ///
 /// Throws if any JSON/seed/nonce input is malformed (invalid JSON, a non-32-byte seed, a
-/// non-base64url nonce, or a `request_hash` that is not 32 base64url bytes).
+/// non-base64url nonce, a `request_hash` that is not 32 base64url bytes, or `device_cert` is empty).
 #[wasm_bindgen]
 pub fn sign_verdict(
     unsigned_json: &str,
@@ -449,14 +461,9 @@ pub fn sign_verdict(
         challenge_response: u.challenge_response,
     };
 
-    // An empty `device_cert` means "no cert" — though a verifiable verdict needs one.
-    let cert = if device_cert.is_empty() {
-        None
-    } else {
-        Some(device_cert.to_string())
-    };
+    let cert = required_device_cert(device_cert)?;
 
-    let verdict: Verdict = core_sign_verdict(&unsigned, &device_key, &nonce, cert);
+    let verdict: Verdict = core_sign_verdict(&unsigned, &device_key, &nonce, Some(cert));
     to_json(&verdict, "Verdict")
 }
 
@@ -564,8 +571,7 @@ pub fn verify_account_state(
 ///
 /// Throws if `unsigned_rule_json` is not a valid [`UnsignedPolicyRule`](allw_core::UnsignedPolicyRule)
 /// or the device seed is not a 32-byte base64url value. `device_cert` is the
-/// account-root-signed certificate for this device; pass an empty string only to construct an
-/// intentionally unverifiable rule for negative tests.
+/// account-root-signed certificate for this device and must not be empty.
 #[wasm_bindgen]
 pub fn sign_policy_rule(
     unsigned_rule_json: &str,
@@ -576,12 +582,8 @@ pub fn sign_policy_rule(
     let unsigned: UnsignedPolicyRule = parse_json(unsigned_rule_json, "UnsignedPolicyRule")?;
     let seed = decode_b64_32(device_seed_b64, "device_seed_b64")?;
     let device_key = SigningKeyPair::from_seed(&seed);
-    let cert = if device_cert.is_empty() {
-        None
-    } else {
-        Some(device_cert.to_string())
-    };
-    let rule = core_sign_policy_rule(&unsigned, device_id, &device_key, cert);
+    let cert = required_device_cert(device_cert)?;
+    let rule = core_sign_policy_rule(&unsigned, device_id, &device_key, Some(cert));
     to_json(&rule, "PolicyRule")
 }
 
@@ -595,7 +597,7 @@ pub fn sign_policy_rule(
 /// # Errors
 ///
 /// Throws if actor/action/scope JSON is malformed, `created_at` is not a safe integer millisecond
-/// timestamp, or the device seed is not a 32-byte base64url value.
+/// timestamp, the device seed is not a 32-byte base64url value, or `device_cert` is empty.
 #[wasm_bindgen]
 #[allow(
     clippy::too_many_arguments,
@@ -622,12 +624,8 @@ pub fn policy_rule_from_approval(
     let unsigned =
         UnsignedPolicyRule::from_approval(id, account_id, &actor, &action, scope, created_at)
             .map_err(|e| JsError::new(&format!("policy_rule_from_approval failed: {e}")))?;
-    let cert = if device_cert.is_empty() {
-        None
-    } else {
-        Some(device_cert.to_string())
-    };
-    let rule = core_sign_policy_rule(&unsigned, device_id, &device_key, cert);
+    let cert = required_device_cert(device_cert)?;
+    let rule = core_sign_policy_rule(&unsigned, device_id, &device_key, Some(cert));
     to_json(&rule, "PolicyRule")
 }
 
