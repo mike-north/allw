@@ -57,7 +57,9 @@ reserved and null. The contract is **action-agnostic**: it transports and binds 
 3. Submits to relay → push **wakeup (request id only)** → device fetches the envelope's ciphertext.
 4. Device decrypts the `ApprovalContext`, verifies the actor `attestation`, **renders** (WYSIWYS), recomputes
    `request_hash`, human decides; destructive ops may require a **number-match** challenge.
-5. Device emits a **Verdict** signed (JWS/COSE) over `(request_id, request_hash, decision, decided_at, nonce)`.
+5. Device emits a **Verdict** signed (JWS/COSE) over `(request_id, request_hash, decision, decided_at, nonce)`;
+   if an approval requires number-match, the signed `challenge_response` must be the derived challenge for that
+   `request_hash`. Denials do not need to satisfy the approval challenge.
 6. Integrator **verifies** (checklist below), composes with its own + upstream policy, appends an **AuditRecord**.
 
 ---
@@ -124,7 +126,8 @@ verdict `sig` (+ optional integrator counter-sign). Periodically anchor the head
    distinguishes them.
 3. `decision == approved`.
 4. Not expired; `decided_at` within window; nonce unseen (anti-replay).
-5. If destructive & challenge required: `challenge_response` correct.
+5. If the verdict is approved and destructive challenge is required: `challenge_response` equals the derived
+   number-match challenge. Authenticated denials stay denials without a challenge response.
 6. **Then** `effective_allow = approved ∧ verified ∧ local_policy ∧ (other gates)`. The primitive contributes a
    verified human decision; it never authorizes by itself.
 
@@ -304,6 +307,21 @@ Two JWS types, domain-separated by the `typ` header:
 
 The `Verdict.sig` and `AuditRecord.sig` wire fields are therefore the **compact JWS string** (not raw bytes); the
 audit record carries the verdict's JWS verbatim for non-repudiation.
+
+### number-match challenge derivation
+
+When `constraints.challenge_required` is true, the challenge displayed by the approver device and echoed in the
+signed `Verdict.challenge_response` is derived from the WYSIWYS `request_hash`:
+
+```
+challenge = zero_pad_4_decimal(
+  uint32_be(SHA-256( b"allw/number-match/v1" || 0x00 || request_hash )[0..4]) mod 10000
+)
+```
+
+The result is exactly four decimal digits (`0000` through `9999`). Domain-separating the derivation from
+`request_hash` keeps the human-facing code from being a raw prefix of any protocol hash while preserving a single
+source of authority: the same `request_hash` the device signs and the verifier recomputes.
 
 ### context_ciphertext (JWE)
 

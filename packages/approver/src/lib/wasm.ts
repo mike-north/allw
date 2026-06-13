@@ -38,6 +38,8 @@ export interface AllwWasm {
   decrypt_context(jwe: string, device_id: string, device_secret_b64: string): string;
   /** Compute the WYSIWYS `request_hash` (base64url) over an ApprovalContext + `expires_at`. */
   compute_request_hash(context_json: string, expires_at: number): string;
+  /** Derive the four-digit number-match challenge for a base64url request hash. */
+  derive_number_match_challenge(request_hash_b64: string): string;
   /** Sign a verdict with the device key; returns the full Verdict JSON (its `sig` is a JWS). */
   sign_verdict(
     unsigned_json: string,

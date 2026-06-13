@@ -5,10 +5,12 @@
 
 use allw_core::{
     action_from_command as core_action_from_command,
-    compute_request_hash as core_compute_request_hash, issue_device_cert as core_issue_device_cert,
-    sign_verdict as core_sign_verdict, verify_verdict as core_verify_verdict, ApprovalContext,
-    ApprovalRequest, Approver, CommandContext, Decision, InMemoryNonceStore, PublicKey,
-    SigningKeyPair, UnsignedVerdict, Verdict, X25519KeyPair,
+    compute_request_hash as core_compute_request_hash,
+    derive_number_match_challenge as core_derive_number_match_challenge,
+    issue_device_cert as core_issue_device_cert, sign_verdict as core_sign_verdict,
+    verify_verdict as core_verify_verdict, ApprovalContext, ApprovalRequest, Approver,
+    CommandContext, Decision, InMemoryNonceStore, PublicKey, SigningKeyPair, UnsignedVerdict,
+    Verdict, X25519KeyPair,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
@@ -132,6 +134,12 @@ pub fn compute_request_hash_b64(
 ) -> Result<String, AllwFfiError> {
     let context: ApprovalContext = parse_json(&context_json, "ApprovalContext")?;
     Ok(URL_SAFE_NO_PAD.encode(core_compute_request_hash(&context, expires_at)))
+}
+
+#[uniffi::export]
+pub fn derive_number_match_challenge_b64(request_hash_b64: String) -> Result<String, AllwFfiError> {
+    let request_hash = decode_b64_32(&request_hash_b64, "request_hash_b64")?;
+    Ok(core_derive_number_match_challenge(&request_hash))
 }
 
 /// Derive a device's public signing (Ed25519) and encryption (X25519) keys from two seeds.

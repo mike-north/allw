@@ -53,12 +53,19 @@ export interface RenderableRequest {
   readonly expiresAt: number;
   /** The WYSIWYS `request_hash` (base64url) the core computed from `context` + `expiresAt`. */
   readonly requestHash: string;
+  /** The core-derived four-digit number-match code, present only when the context requires it. */
+  readonly numberMatchChallenge?: string;
   /**
    * The actor-attestation outcome (#16). `undefined` only when origin verification was not
    * attempted (e.g. no relay configured); the renderer treats absent/unverified identically — it
    * never shows an unverified origin as trusted.
    */
   readonly origin?: OriginVerification;
+}
+
+export interface SignDecisionOptions {
+  readonly note?: string;
+  readonly challengeResponse?: string;
 }
 
 /** A high-entropy anti-replay nonce as a base64url string (≥16 random bytes). */
@@ -154,12 +161,17 @@ export function prepareRequest(
   // Recompute the WYSIWYS request_hash from the decrypted plaintext + the envelope's expires_at.
   // The core canonicalizes (RFC 8785 JCS) and hashes; we never derive these bytes ourselves.
   const requestHash = wasm.compute_request_hash(contextJson, envelope.expires_at);
+  const parsedContext = context as unknown as ApprovalContext;
+  const numberMatchChallenge = parsedContext.constraints.challenge_required
+    ? wasm.derive_number_match_challenge(requestHash)
+    : undefined;
 
   return {
     requestId: envelope.id,
-    context: context as unknown as ApprovalContext,
+    context: parsedContext,
     expiresAt: envelope.expires_at,
     requestHash,
+    ...(numberMatchChallenge !== undefined ? { numberMatchChallenge } : {}),
   };
 }
 
@@ -248,7 +260,7 @@ export function signDecision(
   prepared: RenderableRequest,
   decision: Decision,
   decidedAt: number,
-  note?: string,
+  options: SignDecisionOptions = {},
 ): unknown {
   const accountId = keyfile.account_id;
   const deviceId = keyfile.device_id;
@@ -260,6 +272,18 @@ export function signDecision(
     // A verdict without a cert cannot chain to the account root → verify_verdict would reject it.
     throw new Error("keyfile has no device_cert — re-pair to mint one before deciding");
   }
+  if (decision === "approved" && prepared.context.constraints.challenge_required) {
+    const expected = prepared.numberMatchChallenge;
+    if (expected === undefined) {
+      throw new Error("approval requires number-match challenge but no derived code is prepared");
+    }
+    if (options.challengeResponse === undefined || options.challengeResponse.length === 0) {
+      throw new Error("approval requires number-match challenge response");
+    }
+    if (options.challengeResponse !== expected) {
+      throw new Error("challenge response does not match derived number-match challenge");
+    }
+  }
 
   const unsigned: UnsignedVerdict = {
     v: VERDICT_VERSION,
@@ -268,7 +292,10 @@ export function signDecision(
     decision,
     decided_at: decidedAt,
     approver: { account_id: accountId, device_id: deviceId },
-    ...(note !== undefined && note.length > 0 ? { note } : {}),
+    ...(options.note !== undefined && options.note.length > 0 ? { note: options.note } : {}),
+    ...(options.challengeResponse !== undefined && options.challengeResponse.length > 0
+      ? { challenge_response: options.challengeResponse }
+      : {}),
   };
 
   const nonce = generateNonce();
