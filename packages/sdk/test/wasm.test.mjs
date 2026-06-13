@@ -225,6 +225,60 @@ function signedAccountState(
   );
 }
 
+test("WASM signing boundaries reject empty device_cert strings", async () => {
+  const wasm = await loadWasm();
+  const verdictFixture = approverFixture(wasm);
+  const policy = policyFixture(wasm);
+  const actor = { id: "machine:macbook", kind: "claude-code" };
+  const actionJson = wasm.action_from_command("git status", null);
+  const unsignedRule = {
+    id: "allow-status",
+    account_id: policy.accountId,
+    subject: { kind: "any" },
+    match: { surface: "command", command: { bin: "git", args_any_globs: ["status"] } },
+    effect: "allow",
+    provenance: "manual",
+    tier: "syntactic",
+    created_at: policy.createdAt,
+  };
+
+  assert.throws(
+    () =>
+      wasm.sign_verdict(
+        JSON.stringify(verdictFixture.unsigned),
+        verdictFixture.deviceSeed,
+        verdictFixture.nonce,
+        "",
+      ),
+    /device_cert must not be empty/,
+    "verdict signing must reject an empty certificate instead of silently producing an unverifiable verdict",
+  );
+
+  assert.throws(
+    () =>
+      wasm.sign_policy_rule(JSON.stringify(unsignedRule), policy.deviceId, policy.deviceSeed, ""),
+    /device_cert must not be empty/,
+    "manual policy signing must reject an empty certificate instead of silently producing an unverifiable rule",
+  );
+
+  assert.throws(
+    () =>
+      wasm.policy_rule_from_approval(
+        "approval-empty-cert",
+        policy.accountId,
+        JSON.stringify(actor),
+        actionJson,
+        JSON.stringify({ kind: "exact_call" }),
+        policy.createdAt,
+        policy.deviceId,
+        policy.deviceSeed,
+        "",
+      ),
+    /device_cert must not be empty/,
+    "approval-derived policy signing must reject an empty certificate at the signing boundary",
+  );
+});
+
 function unsignedAccountState({
   accountId,
   currentRoot,
