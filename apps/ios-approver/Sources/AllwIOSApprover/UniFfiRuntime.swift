@@ -1,20 +1,23 @@
 import Foundation
 
 /// Configuration the eventual Xcode target will load from Keychain after pairing.
-public struct NativeDeviceCredentials: Equatable, Sendable {
+public struct NativeDeviceCredentials: Codable, Equatable, Sendable {
     public let accountId: String
     public let deviceId: String
+    public let deviceAuthToken: String
     public let deviceSigningSeedB64: String
     public let deviceCert: String
 
     public init(
         accountId: String,
         deviceId: String,
+        deviceAuthToken: String,
         deviceSigningSeedB64: String,
         deviceCert: String
     ) {
         self.accountId = accountId
         self.deviceId = deviceId
+        self.deviceAuthToken = deviceAuthToken
         self.deviceSigningSeedB64 = deviceSigningSeedB64
         self.deviceCert = deviceCert
     }

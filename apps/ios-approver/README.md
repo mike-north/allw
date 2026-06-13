@@ -15,6 +15,11 @@ core through UniFFI.
 - Deny remains available for prepared requests without satisfying number-match.
 - A signing failure restores `.pending` so a transient Keychain/Secure Enclave problem does not lose
   the request.
+- Paired device credentials and the root-verified account-state sequence floor persist behind a
+  Keychain-ready storage seam; rollback or relay-advertised-but-unverified account state fails
+  closed before it can drive verified actor rendering.
+- `acceptVerifiedAccountState`'s `verifiedSequence` must come from core JWS verification, never from
+  relay `max_sequence` metadata.
 
 ## Local test
 
@@ -31,4 +36,4 @@ The current UniFFI crate exposes request hashing and verdict signing/verificatio
 does not yet expose native context decryption, pairing helpers, or a wired native signing path.
 `UniFfiApproverRuntime` therefore fails closed until those calls exist. The next slice should add
 the missing UniFFI decrypt/pairing operations, then back `prepare(envelope:)` and
-`signDecision(_:)` with real core calls and Keychain device credentials.
+`signDecision(_:)` with real core calls and the persisted Keychain device credentials.
