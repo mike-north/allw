@@ -7,5 +7,71 @@
   "durable_objects": {
     "bindings": [{ "name": "ACCOUNT", "class_name": "AccountRelay" }]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccountRelay"] }]
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccountRelay"] }],
+
+  // ---------------------------------------------------------------------------
+  // Production environment
+  //
+  // Deploy with:  wrangler deploy --env production
+  //
+  // Replace every REPLACE_ME value before deploying. Secrets (APNS_BEARER_TOKEN,
+  // FCM_BEARER_TOKEN) must be set via `wrangler secret put` — never committed here.
+  // See docs/relay-deploy.md for the complete runbook.
+  // ---------------------------------------------------------------------------
+  "env": {
+    "production": {
+      // Worker name in the Cloudflare dashboard (must be unique within your account).
+      "name": "allw-relay",
+
+      // Your Cloudflare account id — found in the dashboard right sidebar or via `wrangler whoami`.
+      "account_id": "REPLACE_ME",
+
+      // Route the production worker to your custom domain.
+      // Remove this block to use the default workers.dev subdomain instead.
+      "routes": [
+        {
+          // Replace with the hostname you want to serve the relay from.
+          // E.g. "relay.example.com/*" (requires the zone to be on your Cloudflare account).
+          "pattern": "REPLACE_ME/*",
+          "zone_name": "REPLACE_ME"
+        }
+      ],
+
+      // Same main entrypoint as dev.
+      "main": "src/index.ts",
+      "compatibility_date": "2026-01-01",
+      "compatibility_flags": ["nodejs_compat"],
+
+      // Durable Object binding — must reference the same class as the dev environment.
+      "durable_objects": {
+        "bindings": [{ "name": "ACCOUNT", "class_name": "AccountRelay" }]
+      },
+
+      // Pin the migration tag so Cloudflare applies the DO schema exactly once on first deploy.
+      // Do NOT change the tag after the production DO is live — it is a one-way migration marker.
+      // To add future schema changes, append a new migration entry with a new tag, e.g. "v2".
+      "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccountRelay"] }],
+
+      // Production resource limits — tighten these relative to the Workers free-tier defaults.
+      "limits": {
+        // Maximum CPU time per request (milliseconds). The relay is I/O-bound; 30 ms is generous.
+        "cpu_ms": 30
+      }
+
+      // Optional plaintext env vars (non-secret):
+      //
+      //   APNS_ENDPOINT  — e.g. "https://api.push.apple.com" (production) or
+      //                         "https://api.development.push.apple.com" (sandbox).
+      //                    Set here as a var because it changes per environment, not per secret.
+      //   APNS_TOPIC     — your app's bundle id, e.g. "com.example.myapp".
+      //                    Safe to commit; it is public in your provisioning profile.
+      //
+      // Secrets (set via `wrangler secret put --env production`; never committed):
+      //   APNS_BEARER_TOKEN  — APNs token-auth JWT signed with your .p8 key.
+      //   FCM_BEARER_TOKEN   — FCM HTTP v1 OAuth 2.0 access token (or a long-lived service-account key).
+      //   FCM_ENDPOINT       — FCM HTTP v1 send endpoint (includes your project id).
+      //
+      // See docs/relay-deploy.md §Secrets for the full inventory and setup commands.
+    }
+  }
 }
