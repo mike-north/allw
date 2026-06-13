@@ -2,7 +2,8 @@
 
 Design package for the web approver happy path (#93), delivered by the design agent and imported
 2026-06-12. This is the **visual source of truth** for the inbox, request detail (WYSIWYS), and
-number-match confirm flows; implementation slices in `packages/web-approver` should match it.
+number-match confirm flows; implementation slices in `packages/web-approver` should match it. The
+onboarding (#94) and audit history (#95) designs extend the same token system for adjacent flows.
 
 ## Contents (`inbox/`)
 
@@ -19,9 +20,15 @@ number-match confirm flows; implementation slices in `packages/web-approver` sho
 
 ## Status
 
-Covers the **happy-path** surfaces. Login/onboarding (#94) and audit history (#95) designs are
-being produced separately. The `PairingScreen` here covers the pairing-code entry moment; #94
-covers the full first-run journey around it.
+Covers the **happy-path** surfaces. The `PairingScreen` here covers the pairing-code entry moment;
+#94 covers the full first-run journey around it.
 
 These JSX files are design artifacts (React-flavored mockups), not production components — they are
 not part of the pnpm workspace and are excluded from lint/typecheck.
+
+## Adjacent flows
+
+- `onboarding/` — first-run account creation, pairing ceremony, returning-device unlock, and paired
+  empty state.
+- `audit-history/` — read-only decision timeline, WYSIWYS decision detail, chain-integrity cue,
+  verified/unverifiable states, and export-slice affordance.
