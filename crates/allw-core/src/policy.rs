@@ -429,6 +429,7 @@ pub enum PolicyRuleError {
     MissingDeviceCert,
     CertSignatureInvalid,
     CertAccountMismatch,
+    ExpectedAccountMismatch,
     CertDeviceMismatch,
     CertExpired,
     AccountStateInvalid,
@@ -457,6 +458,12 @@ impl std::fmt::Display for PolicyRuleError {
             }
             Self::CertAccountMismatch => {
                 write!(f, "policy-rule device cert account_id does not match rule")
+            }
+            Self::ExpectedAccountMismatch => {
+                write!(
+                    f,
+                    "policy-rule account_id does not match expected account_id"
+                )
             }
             Self::CertDeviceMismatch => {
                 write!(f, "policy-rule JWS kid does not match the certified device")
@@ -545,6 +552,26 @@ pub fn verify_policy_rule(
     verify_policy_rule_with_account_states(rule, account_root, now_ms, &[])
 }
 
+/// Verify a signed policy rule against an account root, additionally requiring the rule's account
+/// namespace to match `expected_account_id`.
+///
+/// This is defense-in-depth for multi-account verifiers that know the account they intended to
+/// verify independently of the root key they were handed.
+pub fn verify_policy_rule_for_account(
+    rule: &PolicyRule,
+    account_root: &PublicKey,
+    now_ms: i64,
+    expected_account_id: &str,
+) -> Result<VerifiedPolicyRule, PolicyRuleError> {
+    verify_policy_rule_with_account_states_for_account(
+        rule,
+        account_root,
+        now_ms,
+        &[],
+        expected_account_id,
+    )
+}
+
 /// Verify a signed policy rule and reject rules signed by devices revoked in account state.
 ///
 /// When multiple valid account-state documents are supplied, the highest `sequence` wins.
@@ -558,6 +585,38 @@ pub fn verify_policy_rule_with_account_states(
     now_ms: i64,
     account_states: &[&str],
 ) -> Result<VerifiedPolicyRule, PolicyRuleError> {
+    verify_policy_rule_with_account_states_impl(rule, account_root, now_ms, account_states, None)
+}
+
+/// Verify a signed policy rule like [`verify_policy_rule_with_account_states`], additionally
+/// requiring the rule's account namespace to match `expected_account_id`.
+pub fn verify_policy_rule_with_account_states_for_account(
+    rule: &PolicyRule,
+    account_root: &PublicKey,
+    now_ms: i64,
+    account_states: &[&str],
+    expected_account_id: &str,
+) -> Result<VerifiedPolicyRule, PolicyRuleError> {
+    verify_policy_rule_with_account_states_impl(
+        rule,
+        account_root,
+        now_ms,
+        account_states,
+        Some(expected_account_id),
+    )
+}
+
+fn verify_policy_rule_with_account_states_impl(
+    rule: &PolicyRule,
+    account_root: &PublicKey,
+    now_ms: i64,
+    account_states: &[&str],
+    expected_account_id: Option<&str>,
+) -> Result<VerifiedPolicyRule, PolicyRuleError> {
+    if expected_account_id.is_some_and(|expected| expected != rule.account_id) {
+        return Err(PolicyRuleError::ExpectedAccountMismatch);
+    }
+
     let cert = rule
         .device_cert
         .as_deref()

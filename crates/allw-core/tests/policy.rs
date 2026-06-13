@@ -1,11 +1,12 @@
 use allw_core::{
     action_from_argv, action_from_file_edit, action_from_mcp_tool_call, evaluate,
     evaluate_for_actor, issue_device_cert, sign_account_state, sign_policy_rule, sign_verdict,
-    verify_policy_rule, verify_policy_rule_with_account_states, AccountState,
-    AccountStateRevocation, AccountStateRevocationKind, Actor, Approver, CommandContext, Decision,
-    McpMatcher, ParamMatcher, PolicyDecision, PolicyEffect, PolicyPredicate, PolicyProvenance,
-    PolicyRuleBuildError, PolicyRuleError, PolicyRuleScope, PolicyTier, Risk, SigningKeyPair,
-    Surface, SyntacticSubstrate, UnsignedPolicyRule, UnsignedVerdict, Verdict,
+    verify_policy_rule, verify_policy_rule_for_account, verify_policy_rule_with_account_states,
+    AccountState, AccountStateRevocation, AccountStateRevocationKind, Actor, Approver,
+    CommandContext, Decision, McpMatcher, ParamMatcher, PolicyDecision, PolicyEffect,
+    PolicyPredicate, PolicyProvenance, PolicyRuleBuildError, PolicyRuleError, PolicyRuleScope,
+    PolicyTier, Risk, SigningKeyPair, Surface, SyntacticSubstrate, UnsignedPolicyRule,
+    UnsignedVerdict, Verdict,
 };
 use serde_json::json;
 
@@ -377,6 +378,37 @@ fn signed_policy_rule_requires_account_root_cert_chain_and_matching_kid() {
         verify_policy_rule(&expired_cert_rule, &root_key().public_key(), NOW_OK),
         Err(PolicyRuleError::CertExpired),
         "policy rules must reject expired device certs on the policy verification path"
+    );
+}
+
+#[test]
+fn signed_policy_rule_enforces_expected_account_id_when_supplied() {
+    let unsigned = UnsignedPolicyRule {
+        id: "allow-ls".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate::command_bin("ls"),
+        effect: PolicyEffect::Allow,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: CREATED_AT,
+        expires_at: None,
+    };
+    let signed_rule = sign_policy_rule(&unsigned, DEVICE_ID, &device_key(), Some(device_cert()));
+
+    verify_policy_rule_for_account(&signed_rule, &root_key().public_key(), NOW_OK, ACCOUNT_ID)
+        .expect("matching expected account id must preserve the happy path");
+
+    assert_eq!(
+        verify_policy_rule_for_account(
+            &signed_rule,
+            &root_key().public_key(),
+            NOW_OK,
+            OTHER_ACCOUNT_ID,
+        ),
+        Err(PolicyRuleError::ExpectedAccountMismatch),
+        "a caller-asserted wrong account id must fail closed"
     );
 }
 

@@ -45,7 +45,8 @@ pub use contract::{
 };
 pub use crypto::{
     effective_allow, issue_device_cert, sign_account_state, sign_verdict, verify_account_state,
-    verify_verdict, verify_verdict_with_account_states, AccountState, AccountStateActor,
+    verify_verdict, verify_verdict_for_account, verify_verdict_with_account_states,
+    verify_verdict_with_account_states_for_account, AccountState, AccountStateActor,
     AccountStateDevice, AccountStateError, AccountStatePreviousRoot, AccountStateRevocation,
     AccountStateRevocationKind, DeviceCertClaims, InMemoryNonceStore, JwsError, KeyError,
     NonceStore, PublicKey, SigningKeyPair, UnsignedVerdict, VerdictClaims, VerifiedVerdict,
@@ -59,8 +60,9 @@ pub use jwe::{
 pub use mcp::action_from_mcp_tool_call;
 pub use policy::{
     evaluate, evaluate_for_actor, sign_policy_rule, verify_policy_rule,
-    verify_policy_rule_with_account_states, ActorMatcher, CommandMatcher, McpMatcher, ParamMatcher,
-    PolicyEffect, PolicyEvaluation, PolicyPredicate, PolicyProvenance, PolicyRule,
+    verify_policy_rule_for_account, verify_policy_rule_with_account_states,
+    verify_policy_rule_with_account_states_for_account, ActorMatcher, CommandMatcher, McpMatcher,
+    ParamMatcher, PolicyEffect, PolicyEvaluation, PolicyPredicate, PolicyProvenance, PolicyRule,
     PolicyRuleBuildError, PolicyRuleError, PolicyRuleScope, PolicyTier, UnsignedPolicyRule,
     VerifiedPolicyRule,
 };

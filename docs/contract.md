@@ -115,6 +115,9 @@ verdict `sig` (+ optional integrator counter-sign). Periodically anchor the head
 ## Verification checklist (integrator MUST)
 
 1. Signature valid against the approver's device/account root key.
+   Multi-account verifiers that already know the account namespace they intended to verify SHOULD also pass that
+   `expected_account_id`; verification fails closed if the verdict's certified account does not match it, which
+   prevents accidentally accepting a verdict under the wrong trusted root.
 2. Bound to the **exact request** (no swap): the verdict's `request_id` equals the request's `id`, **and** its
    `request_hash` equals the integrator's locally-computed hash of the canonical `ApprovalContext`. Both are
    required — `request_hash` excludes `id`, so two content-identical requests share a hash; the `id` check

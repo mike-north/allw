@@ -656,6 +656,38 @@ test("sign_verdict + issue_device_cert produce a verdict verify_verdict accepts"
   assert.equal(result.device_id, "dev_rt", "device_id comes from the verified verdict");
 });
 
+test("verify_verdict enforces optional expected account ids", async () => {
+  const wasm = await loadWasm();
+  const f = approverFixture(wasm);
+  const verdictJson = wasm.sign_verdict(JSON.stringify(f.unsigned), f.deviceSeed, f.nonce, f.cert);
+
+  const result = JSON.parse(
+    wasm.verify_verdict(
+      verdictJson,
+      f.v.request_json,
+      f.v.context_json,
+      f.accountRootPub,
+      f.v.now_ms,
+      f.accountId,
+    ),
+  );
+  assert.equal(result.approved, true, "a matching expected account id must still verify");
+
+  assert.throws(
+    () =>
+      wasm.verify_verdict(
+        verdictJson,
+        f.v.request_json,
+        f.v.context_json,
+        f.accountRootPub,
+        f.v.now_ms,
+        "acct_wrong_namespace",
+      ),
+    /expected account_id/,
+    "a wrong caller-supplied expected account id must fail closed",
+  );
+});
+
 test("verify_verdict_with_account_states rejects revoked devices and stale rollback", async () => {
   const wasm = await loadWasm();
   const f = approverFixture(wasm);
@@ -826,6 +858,67 @@ test("verify_policy_rule_with_account_states rejects substituted wrong-root acco
   );
 });
 
+test("policy verification enforces optional expected account ids", async () => {
+  const wasm = await loadWasm();
+  const f = policyFixture(wasm);
+  const unsigned = {
+    id: "allow-status-expected-account",
+    account_id: f.accountId,
+    subject: { kind: "any" },
+    match: { surface: "command", command: { bin: "git", args_any_globs: ["status"] } },
+    effect: "allow",
+    provenance: "manual",
+    tier: "syntactic",
+    created_at: f.createdAt,
+  };
+  const signedRule = wasm.sign_policy_rule(
+    JSON.stringify(unsigned),
+    f.deviceId,
+    f.deviceSeed,
+    f.cert,
+  );
+  const actionJson = wasm.action_from_command("git status", null);
+  const actorJson = JSON.stringify({ id: "machine:macbook", kind: "claude-code" });
+
+  const verified = JSON.parse(
+    wasm.verify_policy_rule_with_account_states(
+      signedRule,
+      f.accountRootPub,
+      f.nowMs,
+      JSON.stringify([]),
+      f.accountId,
+    ),
+  );
+  assert.equal(verified.rule.account_id, f.accountId, "a matching expected account id must verify");
+
+  assert.throws(
+    () =>
+      wasm.verify_policy_rule_with_account_states(
+        signedRule,
+        f.accountRootPub,
+        f.nowMs,
+        JSON.stringify([]),
+        "acct_wrong_namespace",
+      ),
+    /expected account_id/,
+    "a wrong expected account id must reject the policy rule",
+  );
+
+  assert.throws(
+    () =>
+      wasm.evaluate_policy(
+        actionJson,
+        actorJson,
+        JSON.stringify([JSON.parse(signedRule)]),
+        f.accountRootPub,
+        f.nowMs,
+        "acct_wrong_namespace",
+      ),
+    /expected account_id/,
+    "policy evaluation must fail closed when a rule does not match the expected account id",
+  );
+});
+
 test("@allw/sdk account-state helpers verify documents and reject revoked verdicts", async () => {
   const wasm = await loadWasm();
   const f = approverFixture(wasm);
@@ -852,9 +945,25 @@ test("@allw/sdk account-state helpers verify documents and reject revoked verdic
     approverRootKey: f.accountRootPub,
     nowMs: f.v.now_ms,
     accountStates: [stateJws],
+    expectedAccountId: "acct_rt",
   });
   assert.equal(verifiedVerdict.approved, true);
   assert.equal(verifiedVerdict.deviceId, "dev_rt");
+
+  await assert.rejects(
+    () =>
+      verifyVerdictWithAccountStates({
+        verdict,
+        request,
+        context,
+        approverRootKey: f.accountRootPub,
+        nowMs: f.v.now_ms,
+        accountStates: [stateJws],
+        expectedAccountId: "acct_wrong_namespace",
+      }),
+    /expected account_id/,
+    "SDK verdict verification must reject a wrong expected account id",
+  );
 
   const revokedStateJws = await signAccountState(
     unsignedAccountState({
@@ -912,6 +1021,7 @@ test("@allw/sdk policy helpers reject rules from revoked devices", async () => {
     accountRootKey: f.accountRootPub,
     nowMs: f.nowMs,
     accountStates: [activeState],
+    expectedAccountId: f.accountId,
   });
   assert.equal(verifiedRule.deviceId, f.deviceId);
 
@@ -922,9 +1032,37 @@ test("@allw/sdk policy helpers reject rules from revoked devices", async () => {
     accountRootKey: f.accountRootPub,
     nowMs: f.nowMs,
     accountStates: [activeState],
+    expectedAccountId: f.accountId,
   });
   assert.equal(evaluation.decision, "allow");
   assert.equal(evaluation.ruleId, "allow-status-sdk");
+
+  await assert.rejects(
+    () =>
+      verifyPolicyRuleWithAccountStates({
+        rule: signedRule,
+        accountRootKey: f.accountRootPub,
+        nowMs: f.nowMs,
+        accountStates: [activeState],
+        expectedAccountId: "acct_wrong_namespace",
+      }),
+    /expected account_id/,
+    "SDK policy-rule verification must reject a wrong expected account id",
+  );
+  await assert.rejects(
+    () =>
+      evaluatePolicyWithAccountStates({
+        action,
+        actor,
+        signedRules: [signedRule],
+        accountRootKey: f.accountRootPub,
+        nowMs: f.nowMs,
+        accountStates: [activeState],
+        expectedAccountId: "acct_wrong_namespace",
+      }),
+    /expected account_id/,
+    "SDK policy evaluation must reject a wrong expected account id",
+  );
 
   const revokedState = await signAccountState(
     unsignedAccountState({
