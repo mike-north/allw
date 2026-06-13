@@ -4,7 +4,7 @@ version = "0.0.0"
 description = "WASM (wasm-bindgen) bindings exposing allw-core to the TypeScript SDK / hook. Thin shell; all security-critical logic lives in allw-core."
 edition.workspace = true
 rust-version.workspace = true # MSRV 1.85 (inherited via allw-core / serde_jcs 0.2)
-license.workspace = true
+license = "MIT"  # explicit string: wasm-pack parses this manifest directly and rejects workspace-inherited license maps
 repository.workspace = true
 authors.workspace = true
 
