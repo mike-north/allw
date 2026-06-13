@@ -20,9 +20,11 @@ struct ApprovalInboxStoreTests {
         try await testCredentialStorePersistsPairedDeviceCredentials()
         try await testAccountStateFloorRejectsRollbackBelowStoredSequence()
         try await testAccountStateFloorRequiresRelayMaxSequenceToBeVerified()
+        try await testAccountStateFloorRejectsNegativeSequenceInputs()
         #if canImport(Security)
         try await testKeychainAccountStateFloorRejectsMalformedPersistedData()
         try await testKeychainAccountStateFloorRejectsNegativePersistedSequence()
+        try await testKeychainPairedDeviceCredentialsAreThisDeviceOnly()
         #endif
     }
 
@@ -283,6 +285,27 @@ struct ApprovalInboxStoreTests {
         try expectEqual(storage.accountStateFloors["acct-1"], nil)
     }
 
+    static func testAccountStateFloorRejectsNegativeSequenceInputs() async throws {
+        let storage = MemoryNativeCredentialStorage()
+        let store = NativeCredentialStore(storage: storage)
+
+        try await expectCredentialStoreError(.invalidAccountStateSequence) {
+            try await store.acceptVerifiedAccountState(
+                accountId: "acct-1",
+                relayMaxSequence: nil,
+                verifiedSequence: -1
+            )
+        }
+
+        try await expectCredentialStoreError(.invalidAccountStateSequence) {
+            try await store.acceptVerifiedAccountState(
+                accountId: "acct-1",
+                relayMaxSequence: -1,
+                verifiedSequence: 0
+            )
+        }
+    }
+
     #if canImport(Security)
     static func testKeychainAccountStateFloorRejectsMalformedPersistedData() async throws {
         let service = "dev.allw.ios-approver.tests.\(UUID().uuidString)"
@@ -320,6 +343,24 @@ struct ApprovalInboxStoreTests {
                 verifiedSequence: 1
             )
         }
+    }
+
+    static func testKeychainPairedDeviceCredentialsAreThisDeviceOnly() async throws {
+        let service = "dev.allw.ios-approver.tests.\(UUID().uuidString)"
+        let store = NativeCredentialStore(storage: KeychainNativeCredentialStorage(service: service))
+
+        defer {
+            deleteKeychainAccount(service: service, account: "paired-device")
+        }
+
+        try await store.savePairedDevice(.fixture())
+
+        let attributes = try loadKeychainAttributes(service: service, account: "paired-device")
+        try expectEqual(
+            attributes[kSecAttrAccessible as String] as? String,
+            kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as String
+        )
+        try expectKeychainSynchronizableFalse(attributes[kSecAttrSynchronizable as String])
     }
     #endif
 }
@@ -544,6 +585,37 @@ private func saveRawKeychainAccountStateFloor(service: String, accountId: String
     guard status == errSecSuccess else {
         throw TestFailure("Keychain test fixture add failed with status \(status)")
     }
+}
+
+private func loadKeychainAttributes(service: String, account: String) throws -> [String: Any] {
+    let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: service,
+        kSecAttrAccount as String: account,
+        kSecReturnAttributes as String: true,
+        kSecMatchLimit as String: kSecMatchLimitOne,
+    ]
+    var result: CFTypeRef?
+    let status = SecItemCopyMatching(query as CFDictionary, &result)
+    guard status == errSecSuccess, let attributes = result as? [String: Any] else {
+        throw TestFailure("Keychain attribute load failed with status \(status)")
+    }
+    return attributes
+}
+
+private func expectKeychainSynchronizableFalse(_ value: Any?) throws {
+    guard let value else {
+        throw TestFailure("expected Keychain synchronizable attribute to be false")
+    }
+    if let bool = value as? Bool {
+        try expect(!bool, "expected Keychain synchronizable attribute to be false")
+        return
+    }
+    if let number = value as? NSNumber {
+        try expect(!number.boolValue, "expected Keychain synchronizable attribute to be false")
+        return
+    }
+    throw TestFailure("unexpected Keychain synchronizable attribute: \(value)")
 }
 
 private func deleteKeychainAccount(service: String, account: String) {
