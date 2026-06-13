@@ -1,0 +1,393 @@
+/* app.jsx - allw web approver audit history prototype for issue #95.
+   This is a design artifact: local sample data drives filters, detail, chain state, and export
+   preview so implementation slices can copy the information architecture without inheriting logic. */
+
+const { useMemo, useState } = React;
+
+const FILTERS = {
+  actor: ["all", "claude", "codex", "buildkite"],
+  surface: ["all", "command", "mcp_tool_call", "file_edit"],
+  decision: ["all", "approved", "denied", "expired", "aborted"],
+  date: ["all", "today", "7d", "30d"],
+};
+
+const RECORDS = [
+  {
+    id: "aud_1042",
+    sequence: 1042,
+    actor: "claude",
+    actorLabel: "Claude Code",
+    machine: "mike-mbp",
+    surface: "command",
+    decision: "approved",
+    risk: "high",
+    date: "today",
+    time: "14:23",
+    decidedAt: "Jun 12, 2026 14:23:18",
+    summary: "Install package dependencies before running the release smoke test.",
+    plaintext: "pnpm install --frozen-lockfile",
+    cwd: "~/src/allw",
+    origin: "verified",
+    signature: "verified",
+    chainStatus: "verified",
+    chainCopy: "Audit chain verified through Jun 12, 2026 14:23",
+    chainDetail: "Record 1042 links to 1041 and matches its signed verdict payload.",
+    requestHash: "req_8F7B...3A91",
+    recordHash: "rec_4D12...C0A7",
+    prevHash: "rec_913A...88E1",
+    policy: "escalate",
+  },
+  {
+    id: "aud_1041",
+    sequence: 1041,
+    actor: "codex",
+    actorLabel: "Codex",
+    machine: "tmux-devbox-2",
+    surface: "file_edit",
+    decision: "denied",
+    risk: "critical",
+    date: "today",
+    time: "13:58",
+    decidedAt: "Jun 12, 2026 13:58:04",
+    summary: "Attempt to modify SSH configuration outside the repository.",
+    plaintext: "file_edit: replace ~/.ssh/config\npaths: ~/.ssh/config",
+    cwd: "~",
+    origin: "verified",
+    signature: "verified",
+    chainStatus: "verified",
+    chainCopy: "Audit chain verified through Jun 12, 2026 14:23",
+    chainDetail: "Denied verdict is signed and chained; no authorization was granted.",
+    requestHash: "req_BA51...72E9",
+    recordHash: "rec_913A...88E1",
+    prevHash: "rec_7B1C...A419",
+    policy: "escalate",
+  },
+  {
+    id: "aud_1039",
+    sequence: 1039,
+    actor: "claude",
+    actorLabel: "Claude Code",
+    machine: "mike-mbp",
+    surface: "mcp_tool_call",
+    decision: "approved",
+    risk: "medium",
+    date: "7d",
+    time: "Wed",
+    decidedAt: "Jun 10, 2026 09:44:51",
+    summary: "Move a triaged OmniFocus task into the project queue.",
+    plaintext: 'mcp_tool_call: ofocus.update_task\nparams: {"id":"task_9Q2","project":"allw v1"}',
+    cwd: "ofocus://tasks",
+    origin: "verified",
+    signature: "verified",
+    chainStatus: "verified",
+    chainCopy: "Audit chain verified through Jun 12, 2026 14:23",
+    chainDetail: "MCP parameters match the WYSIWYS render and request hash.",
+    requestHash: "req_2AC0...191B",
+    recordHash: "rec_D812...A77B",
+    prevHash: "rec_6E71...12FC",
+    policy: "escalate",
+  },
+  {
+    id: "aud_1032",
+    sequence: 1032,
+    actor: "buildkite",
+    actorLabel: "Buildkite Agent",
+    machine: "ci-macos-15",
+    surface: "command",
+    decision: "expired",
+    risk: "high",
+    date: "30d",
+    time: "Jun 04",
+    decidedAt: "Jun 04, 2026 18:02:00",
+    summary: "Deploy a TestFlight build from an unverified runner.",
+    plaintext: "xcrun altool --upload-app --file allw.ipa",
+    cwd: "~/ci/allw",
+    origin: "unverifiable",
+    signature: "unverifiable",
+    chainStatus: "broken",
+    chainCopy: "Broken chain at record 1032",
+    chainDetail:
+      "Previous hash does not match the locally verified head. Treat this entry as fail-closed and unapprovable evidence until repaired.",
+    requestHash: "req_901E...6CC0",
+    recordHash: "rec_0000...BEEF",
+    prevHash: "rec_missing",
+    policy: "escalate",
+  },
+];
+
+function Icon({ name }) {
+  const paths = {
+    shield: <path d="M12 3l7 3v5c0 5-3 8.5-7 10-4-1.5-7-5-7-10V6l7-3z" />,
+    check: <path d="M20 6 9 17l-5-5" />,
+    alert: (
+      <path d="M12 9v4m0 4h.01M10.3 4.2 2.8 17a2 2 0 0 0 1.7 3h15a2 2 0 0 0 1.7-3L13.7 4.2a2 2 0 0 0-3.4 0z" />
+    ),
+    filter: <path d="M4 5h16M7 12h10M10 19h4" />,
+    download: <path d="M12 3v12m0 0 4-4m-4 4-4-4M5 21h14" />,
+    command: <path d="M7 8h10M7 12h6M7 16h10M5 4h14v16H5z" />,
+    link: (
+      <path d="M10 13a5 5 0 0 0 7 0l2-2a5 5 0 0 0-7-7l-1 1M14 11a5 5 0 0 0-7 0l-2 2a5 5 0 0 0 7 7l1-1" />
+    ),
+    x: <path d="M18 6 6 18M6 6l12 12" />,
+  };
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      {paths[name] || paths.shield}
+    </svg>
+  );
+}
+
+function App() {
+  const [filters, setFilters] = useState({
+    actor: "all",
+    surface: "all",
+    decision: "all",
+    date: "today",
+  });
+  const [selectedId, setSelectedId] = useState(RECORDS[0].id);
+  const [exportOpen, setExportOpen] = useState(false);
+
+  const filteredRecords = useMemo(
+    () =>
+      RECORDS.filter((record) =>
+        Object.entries(filters).every(([key, value]) => value === "all" || record[key] === value),
+      ),
+    [filters],
+  );
+  const selected =
+    filteredRecords.find((record) => record.id === selectedId) || filteredRecords[0] || RECORDS[0];
+  const brokenCount = filteredRecords.filter((record) => record.chainStatus === "broken").length;
+  const chainHealthy = brokenCount === 0;
+
+  function updateFilter(name, value) {
+    setFilters((current) => ({ ...current, [name]: value }));
+    const next = RECORDS.find((record) =>
+      Object.entries({ ...filters, [name]: value }).every(
+        ([key, filterValue]) => filterValue === "all" || record[key] === filterValue,
+      ),
+    );
+    if (next) setSelectedId(next.id);
+  }
+
+  return (
+    <div className="stage theme-light">
+      <div className="workspace">
+        <header className="topbar">
+          <div className="brand">
+            <span className="brand-mark">
+              <Icon name="shield" />
+            </span>
+            <div>
+              <div className="wordmark">allw</div>
+              <div className="section-label">Audit history</div>
+            </div>
+          </div>
+          <div className={chainHealthy ? "chain-cue ok" : "chain-cue broken"}>
+            <Icon name={chainHealthy ? "check" : "alert"} />
+            <span>
+              {chainHealthy
+                ? "Audit chain verified through Jun 12, 2026 14:23"
+                : "Broken chain in current slice"}
+            </span>
+          </div>
+          <button className="icon-button labeled" type="button" onClick={() => setExportOpen(true)}>
+            <Icon name="download" />
+            <span>Export slice</span>
+          </button>
+        </header>
+
+        <aside className="filters" aria-label="Audit filters">
+          <div className="panel-title">
+            <Icon name="filter" /> Timeline of decisions
+          </div>
+          {Object.entries(FILTERS).map(([name, values]) => (
+            <label className="filter-control" key={name}>
+              <span>{name}</span>
+              <select
+                data-filter={name}
+                value={filters[name]}
+                onChange={(event) => updateFilter(name, event.target.value)}
+              >
+                {values.map((value) => (
+                  <option value={value} key={value}>
+                    {value === "all" ? `All ${name}` : value}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ))}
+          <div className="slice-summary">
+            <b>{filteredRecords.length}</b>
+            <span>records in slice</span>
+            <b>{brokenCount}</b>
+            <span>chain warnings</span>
+          </div>
+        </aside>
+
+        <main className="timeline" aria-label="Decision timeline">
+          {filteredRecords.map((record) => (
+            <button
+              type="button"
+              key={record.id}
+              className="record-row"
+              data-selected={record.id === selected.id}
+              data-decision={record.decision}
+              onClick={() => setSelectedId(record.id)}
+            >
+              <span className="rail-dot" data-status={record.chainStatus} />
+              <span className="row-time">{record.time}</span>
+              <span className="row-main">
+                <span className="row-title">{record.summary}</span>
+                <span className="row-meta">
+                  {record.actorLabel} · {record.machine} · {record.surface}
+                </span>
+              </span>
+              <span className="decision-chip">{record.decision}</span>
+            </button>
+          ))}
+        </main>
+
+        <Detail record={selected} />
+      </div>
+
+      {exportOpen && (
+        <ExportDialog
+          records={filteredRecords}
+          brokenCount={brokenCount}
+          onClose={() => setExportOpen(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+function Detail({ record }) {
+  const broken = record.chainStatus === "broken";
+  return (
+    <section className="detail" aria-labelledby="detail-title">
+      <div className="detail-head">
+        <span className="kicker">Decision detail</span>
+        <h1 id="detail-title">
+          {record.actorLabel} · {record.decision}
+        </h1>
+        <p>{record.summary}</p>
+      </div>
+
+      <div className="status-grid">
+        <Evidence
+          label="Verdict signature"
+          value={record.signature}
+          bad={record.signature !== "verified"}
+        />
+        <Evidence label="Actor origin" value={record.origin} bad={record.origin !== "verified"} />
+        <Evidence label="Chain position" value={`#${record.sequence}`} bad={broken} />
+      </div>
+
+      <div className="wysiwys">
+        <div className="code-label">WYSIWYS render</div>
+        <pre>{record.plaintext}</pre>
+        <div className="cwd">cwd {record.cwd}</div>
+      </div>
+
+      <div className={broken ? "chain-card broken" : "chain-card ok"}>
+        <div className="chain-title">
+          <Icon name={broken ? "alert" : "check"} />
+          <span>{broken ? "Broken chain" : "Audit chain verified"}</span>
+        </div>
+        <p>{record.chainDetail}</p>
+      </div>
+
+      <dl className="hash-list">
+        <div>
+          <dt>request hash</dt>
+          <dd>{record.requestHash}</dd>
+        </div>
+        <div>
+          <dt>record hash</dt>
+          <dd>{record.recordHash}</dd>
+        </div>
+        <div>
+          <dt>previous hash</dt>
+          <dd>{record.prevHash}</dd>
+        </div>
+        <div>
+          <dt>policy</dt>
+          <dd>{record.policy}</dd>
+        </div>
+      </dl>
+
+      {broken && (
+        <div className="fail-closed">
+          <Icon name="alert" />
+          <span>
+            This record is fail-closed and unapprovable until local chain continuity is restored.
+          </span>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function Evidence({ label, value, bad = false }) {
+  return (
+    <div className={bad ? "evidence bad" : "evidence"}>
+      <span className="evidence-icon">
+        <Icon name={bad ? "alert" : "check"} />
+      </span>
+      <span>
+        <span className="evidence-label">{label}</span>
+        <span className="evidence-value">{value}</span>
+      </span>
+    </div>
+  );
+}
+
+function ExportDialog({ records, brokenCount, onClose }) {
+  return (
+    <div className="scrim" role="presentation">
+      <section
+        className="export-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="export-title"
+      >
+        <button className="close" type="button" aria-label="Close export preview" onClick={onClose}>
+          <Icon name="x" />
+        </button>
+        <span className="kicker">Export slice</span>
+        <h2 id="export-title">Audit evidence package</h2>
+        <p>
+          The local device will package {records.length} records with plaintext WYSIWYS renders,
+          verdict JWS, request hash, record hash, previous hash, actor, approver, and filter
+          metadata.
+        </p>
+        <div className={brokenCount > 0 ? "export-warning" : "export-ok"}>
+          <Icon name={brokenCount > 0 ? "alert" : "check"} />
+          <span>
+            {brokenCount > 0
+              ? `${brokenCount} unverifiable record will be marked in the export.`
+              : "Every record in this slice is locally chain-verified."}
+          </span>
+        </div>
+        <div className="dialog-actions">
+          <button className="btn secondary" type="button" onClick={onClose}>
+            Cancel
+          </button>
+          <button className="btn primary" type="button" onClick={onClose}>
+            Prepare export
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
