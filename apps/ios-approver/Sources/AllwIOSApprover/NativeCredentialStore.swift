@@ -195,6 +195,9 @@ public final class KeychainNativeCredentialStorage: NativeCredentialStorage {
 
         var addQuery = query
         addQuery[kSecValueData as String] = data
+        // Device trust material must not migrate through iCloud sync or encrypted backups.
+        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        addQuery[kSecAttrSynchronizable as String] = false
         let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
         guard addStatus == errSecSuccess else {
             throw NativeCredentialStoreError.keychainFailure("Keychain add failed with status \(addStatus)")
