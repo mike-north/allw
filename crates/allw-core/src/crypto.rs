@@ -777,6 +777,8 @@ pub enum VerifyError {
     CertSignatureInvalid,
     /// Step 1 — the cert's `account_id` does not match the verdict's `approver.account_id`.
     CertAccountMismatch,
+    /// Step 1 — the verdict's `approver.account_id` does not match the caller-asserted account.
+    ExpectedAccountMismatch,
     /// Step 1 — the cert's `device_id` does not match the verdict's `approver.device_id`.
     CertDeviceMismatch,
     /// Step 1 — the cert has expired (`now_ms > expires_at`).
@@ -834,6 +836,9 @@ impl std::fmt::Display for VerifyError {
                     f,
                     "device cert account_id does not match the verdict approver"
                 )
+            }
+            Self::ExpectedAccountMismatch => {
+                write!(f, "verdict account_id does not match expected account_id")
             }
             Self::CertDeviceMismatch => {
                 write!(
@@ -1022,6 +1027,32 @@ pub fn verify_verdict(
     )
 }
 
+/// Verifies a [`Verdict`] like [`verify_verdict`], and additionally requires the signed verdict's
+/// account namespace to match `expected_account_id`.
+///
+/// This is defense-in-depth for multi-account verifiers: callers that already know which account
+/// they intended to verify can reject a verdict even if they accidentally pass the wrong root key.
+pub fn verify_verdict_for_account(
+    verdict: &Verdict,
+    request: &ApprovalRequest,
+    context: &ApprovalContext,
+    approver_root: &PublicKey,
+    nonce_store: &mut dyn NonceStore,
+    now_ms: i64,
+    expected_account_id: &str,
+) -> Result<VerifiedVerdict, VerifyError> {
+    verify_verdict_with_account_states_for_account(
+        verdict,
+        request,
+        context,
+        approver_root,
+        nonce_store,
+        now_ms,
+        &[],
+        expected_account_id,
+    )
+}
+
 /// Like [`verify_verdict`], but also enforces root-signed account-state revocations.
 ///
 /// When multiple valid account-state documents are supplied, the highest `sequence` wins. A
@@ -1039,7 +1070,65 @@ pub fn verify_verdict_with_account_states(
     now_ms: i64,
     account_states: &[&str],
 ) -> Result<VerifiedVerdict, VerifyError> {
+    verify_verdict_with_account_states_impl(
+        verdict,
+        request,
+        context,
+        approver_root,
+        nonce_store,
+        now_ms,
+        account_states,
+        None,
+    )
+}
+
+/// Verifies a [`Verdict`] like [`verify_verdict_with_account_states`], and additionally requires
+/// the signed verdict's account namespace to match `expected_account_id`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "verdict verification already carries request/context/root/nonce/time inputs; this variant only adds the optional account namespace guard"
+)]
+pub fn verify_verdict_with_account_states_for_account(
+    verdict: &Verdict,
+    request: &ApprovalRequest,
+    context: &ApprovalContext,
+    approver_root: &PublicKey,
+    nonce_store: &mut dyn NonceStore,
+    now_ms: i64,
+    account_states: &[&str],
+    expected_account_id: &str,
+) -> Result<VerifiedVerdict, VerifyError> {
+    verify_verdict_with_account_states_impl(
+        verdict,
+        request,
+        context,
+        approver_root,
+        nonce_store,
+        now_ms,
+        account_states,
+        Some(expected_account_id),
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shared implementation keeps the legacy and expected-account verifier paths behaviorally identical"
+)]
+fn verify_verdict_with_account_states_impl(
+    verdict: &Verdict,
+    request: &ApprovalRequest,
+    context: &ApprovalContext,
+    approver_root: &PublicKey,
+    nonce_store: &mut dyn NonceStore,
+    now_ms: i64,
+    account_states: &[&str],
+    expected_account_id: Option<&str>,
+) -> Result<VerifiedVerdict, VerifyError> {
     // ── Step 1: device cert chains to the account root ───────────────────────────
+    if expected_account_id.is_some_and(|expected| expected != verdict.approver.account_id) {
+        return Err(VerifyError::ExpectedAccountMismatch);
+    }
+
     let cert_compact = verdict
         .device_cert
         .as_deref()
@@ -1456,6 +1545,42 @@ mod tests {
         )
         .expect_err("account mismatch must fail");
         assert_eq!(err, VerifyError::CertAccountMismatch);
+    }
+
+    /// Multi-account verifiers may know the trusted account namespace independently of the root
+    /// key they were handed. A caller-supplied expected account id must therefore be enforced in
+    /// addition to the existing cert↔verdict self-consistency checks.
+    #[test]
+    fn expected_account_id_is_enforced_for_verdicts() {
+        let verdict = make_signed_approved();
+        let request = make_request();
+        let context = make_context(false);
+        let root_pub = root_key().public_key();
+        let mut ok_store = InMemoryNonceStore::new();
+
+        verify_verdict_for_account(
+            &verdict,
+            &request,
+            &context,
+            &root_pub,
+            &mut ok_store,
+            NOW_OK,
+            ACCOUNT_ID,
+        )
+        .expect("matching expected account id must preserve the happy path");
+
+        let mut wrong_account_store = InMemoryNonceStore::new();
+        let err = verify_verdict_for_account(
+            &verdict,
+            &request,
+            &context,
+            &root_pub,
+            &mut wrong_account_store,
+            NOW_OK,
+            "acc_wrong_namespace",
+        )
+        .expect_err("a caller-asserted wrong account id must fail closed");
+        assert_eq!(err, VerifyError::ExpectedAccountMismatch);
     }
 
     /// An expired device cert → CertExpired (checklist #1).

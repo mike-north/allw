@@ -141,6 +141,11 @@ export interface NonceStore {
  */
 export interface AccountStateOptions {
   readonly accountStates?: readonly string[];
+  /**
+   * Optional caller-asserted account namespace. Multi-account verifiers should set this so a
+   * verdict or policy rule whose signed account id differs from the intended account fails closed.
+   */
+  readonly expectedAccountId?: string;
 }
 
 /** Options for re-verifying a returned {@link Verdict}. */
@@ -265,6 +270,11 @@ export interface ClientConfig {
    * already checked against a durably stored highest sequence.
    */
   readonly accountStates?: readonly string[];
+  /**
+   * Optional account namespace the client intended to verify. When set, verdict verification fails
+   * closed if the signed verdict's certified account id differs from this value.
+   */
+  readonly expectedAccountId?: string;
   /**
    * Override the timer used to schedule the poll cadence and the fail-closed deadline (tests).
    * Defaults to `setTimeout`. Exposed so the fail-closed timing can be driven deterministically by
@@ -467,6 +477,7 @@ async function verifyToDecision(
   nowMs: number,
   nonceStore: NonceStore,
   accountStates?: readonly string[],
+  expectedAccountId?: string,
   acceptedNonceB64?: string,
 ): Promise<VerifiedDecision | null> {
   if (verdictValue === null || verdictValue === undefined) return null;
@@ -475,7 +486,14 @@ async function verifyToDecision(
   try {
     verifyJson =
       accountStates === undefined
-        ? wasm.verify_verdict(verdictJson, requestJson, contextJson, approverRootKey, nowMs)
+        ? wasm.verify_verdict(
+            verdictJson,
+            requestJson,
+            contextJson,
+            approverRootKey,
+            nowMs,
+            expectedAccountId,
+          )
         : wasm.verify_verdict_with_account_states(
             verdictJson,
             requestJson,
@@ -483,6 +501,7 @@ async function verifyToDecision(
             approverRootKey,
             nowMs,
             accountStatesJson(accountStates),
+            expectedAccountId,
           );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -546,6 +565,7 @@ export async function verifyVerdictWithAccountStates(
       input.approverRootKey,
       input.nowMs,
       accountStatesJson(input.accountStates),
+      input.expectedAccountId,
     ),
   );
   if (input.nonceStore && !(await input.nonceStore.checkAndInsert(result.nonceB64))) {
@@ -565,6 +585,7 @@ export async function verifyPolicyRuleWithAccountStates(
       input.accountRootKey,
       input.nowMs,
       accountStatesJson(input.accountStates),
+      input.expectedAccountId,
     ),
   ) as { rule?: unknown; device_id?: unknown };
   if (typeof value.device_id !== "string" || value.device_id.length === 0) {
@@ -586,6 +607,7 @@ export async function evaluatePolicyWithAccountStates(
       input.accountRootKey,
       input.nowMs,
       accountStatesJson(input.accountStates),
+      input.expectedAccountId,
     ),
   ) as { decision?: unknown; rule_id?: unknown; tier?: unknown; schema_version?: unknown };
   if (value.decision !== "allow" && value.decision !== "deny" && value.decision !== "escalate") {
@@ -747,6 +769,7 @@ export function createClient(config: ClientConfig): Client {
         now(),
         nonceStore,
         config.accountStates,
+        config.expectedAccountId,
       );
       // Unverifiable verdict ⇒ synthesized `denied` (never surface a forged decision as truth).
       decision = verified?.decision ?? "denied";
@@ -768,6 +791,7 @@ export function createClient(config: ClientConfig): Client {
       now,
       nonceStore,
       config.accountStates,
+      config.expectedAccountId,
       acceptedNonceB64,
     );
   }
@@ -789,6 +813,7 @@ function makeVerdict(
   now: NowImpl,
   nonceStore: NonceStore,
   accountStates?: readonly string[],
+  clientExpectedAccountId?: string,
   acceptedNonceB64?: string,
 ): Verdict {
   const verdictValue = outcome.kind === "verdict" ? outcome.value : null;
@@ -802,6 +827,10 @@ function makeVerdict(
       // An explicit option overrides the client-level account-state set, including `[]` for tests
       // that intentionally verify without revocation context.
       const states = options && "accountStates" in options ? options.accountStates : accountStates;
+      const expectedAccountId =
+        options && "expectedAccountId" in options
+          ? options.expectedAccountId
+          : clientExpectedAccountId;
       const result = await verifyToDecision(
         wasm,
         verdictValue,
@@ -811,6 +840,7 @@ function makeVerdict(
         now(),
         nonceStore,
         states,
+        expectedAccountId,
         acceptedNonceB64,
       );
       return result?.decision === "approved";

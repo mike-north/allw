@@ -56,6 +56,7 @@ export interface AllwWasm {
     contextJson: string,
     approverRootPubkeyB64: string,
     nowMs: number,
+    expectedAccountId?: string | null,
   ): string;
   /**
    * Verifies a verdict and rejects it when the signing device appears revoked in the
@@ -69,6 +70,7 @@ export interface AllwWasm {
     approverRootPubkeyB64: string,
     nowMs: number,
     accountStatesJson: string,
+    expectedAccountId?: string | null,
   ): string;
   /** Sign a root-authored account-state JSON document, returning a compact account-state JWS. */
   sign_account_state(stateJson: string, accountRootSeedB64: string): string;
@@ -111,6 +113,7 @@ export interface AllwWasm {
     signedRulesJson: string,
     accountRootPubkeyB64: string,
     nowMs: number,
+    expectedAccountId?: string | null,
   ): string;
   /** Verify one signed PolicyRule JSON object with account-state revocation enforcement. */
   verify_policy_rule_with_account_states(
@@ -118,6 +121,7 @@ export interface AllwWasm {
     accountRootPubkeyB64: string,
     nowMs: number,
     accountStatesJson: string,
+    expectedAccountId?: string | null,
   ): string;
   /** Verify signed PolicyRule JSON objects with account-state revocation and evaluate one action. */
   evaluate_policy_with_account_states(
@@ -127,6 +131,7 @@ export interface AllwWasm {
     accountRootPubkeyB64: string,
     nowMs: number,
     accountStatesJson: string,
+    expectedAccountId?: string | null,
   ): string;
 }
 

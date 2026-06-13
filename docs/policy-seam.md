@@ -132,6 +132,8 @@ Policy rule verification mirrors verdict verification for key trust: the verifie
 verifies `device_cert`, requires the signed cert `account_id` to match the rule `account_id`, verifies the policy JWS
 with the certified device key, and requires the policy JWS `kid` to match the certified `device_id`. A rule missing a
 cert, signed by an uncertified key, bound to a different account, or carrying a confused `kid` fails closed.
+Multi-account verifiers that already know the account namespace they intended to verify SHOULD also pass that
+`expected_account_id`; a rule whose signed `account_id` does not match it fails closed before policy evaluation.
 
 ---
 

@@ -63,6 +63,7 @@ export interface AllwWasm {
     context_json: string,
     approver_root_pubkey_b64: string,
     now_ms: number,
+    expected_account_id?: string | null,
   ): string;
   /** Verify a compact account-state JWS and return the authenticated AccountState JSON. */
   verify_account_state(

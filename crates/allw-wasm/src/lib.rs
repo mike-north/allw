@@ -50,10 +50,14 @@ use allw_core::{
     verify_account_state as core_verify_account_state,
     verify_actor_attestation_with_account_states as core_verify_actor_attestation_with_account_states,
     verify_policy_rule as core_verify_policy_rule,
+    verify_policy_rule_for_account as core_verify_policy_rule_for_account,
     verify_policy_rule_with_account_states as core_verify_policy_rule_with_account_states,
+    verify_policy_rule_with_account_states_for_account as core_verify_policy_rule_with_account_states_for_account,
     verify_verdict as core_verify_verdict,
-    verify_verdict_with_account_states as core_verify_verdict_with_account_states, AccountState,
-    ActionRecord, Actor, ApprovalContext, ApprovalRequest, Approver, CommandContext,
+    verify_verdict_for_account as core_verify_verdict_for_account,
+    verify_verdict_with_account_states as core_verify_verdict_with_account_states,
+    verify_verdict_with_account_states_for_account as core_verify_verdict_with_account_states_for_account,
+    AccountState, ActionRecord, Actor, ApprovalContext, ApprovalRequest, Approver, CommandContext,
     ContextRecipient, Decision, PolicyRule, PolicyRuleScope, PublicKey, SigningKeyPair,
     UnsignedPolicyRule, UnsignedVerdict, Verdict, X25519KeyPair, X25519PublicKey,
 };
@@ -294,10 +298,11 @@ struct VerifyResult {
 /// # Errors
 ///
 /// Throws on **any** verification failure (fail-closed): a verified denial/expiry/abort, a bad
-/// signature, a broken WYSIWYS binding, an expired/out-of-window decision, etc. The thrown
-/// message is the core [`VerifyError`](allw_core::VerifyError) `Display`, so callers can
-/// distinguish a verified "no" from a forgery by inspecting the message. Also throws if any input
-/// JSON is invalid, the root key is not a 32-byte base64url value, or `now_ms` is out of range.
+/// signature, a broken WYSIWYS binding, an expired/out-of-window decision, an optional
+/// `expected_account_id` mismatch, etc. The thrown message is the core
+/// [`VerifyError`](allw_core::VerifyError) `Display`, so callers can distinguish a verified "no"
+/// from a forgery by inspecting the message. Also throws if any input JSON is invalid, the root key
+/// is not a 32-byte base64url value, or `now_ms` is out of range.
 #[wasm_bindgen]
 pub fn verify_verdict(
     verdict_json: &str,
@@ -305,6 +310,7 @@ pub fn verify_verdict(
     context_json: &str,
     approver_root_pubkey_b64: &str,
     now_ms: f64,
+    expected_account_id: Option<String>,
 ) -> Result<String, JsError> {
     let verdict: Verdict = parse_json(verdict_json, "Verdict")?;
     let request: ApprovalRequest = parse_json(request_json, "ApprovalRequest")?;
@@ -318,14 +324,25 @@ pub fn verify_verdict(
     let now_ms = ms_to_i64(now_ms, "now_ms")?;
 
     let mut nonce_store = allw_core::InMemoryNonceStore::new();
-    let verified = core_verify_verdict(
-        &verdict,
-        &request,
-        &context,
-        &root,
-        &mut nonce_store,
-        now_ms,
-    )
+    let verified = match expected_account_id.as_deref() {
+        Some(expected) => core_verify_verdict_for_account(
+            &verdict,
+            &request,
+            &context,
+            &root,
+            &mut nonce_store,
+            now_ms,
+            expected,
+        ),
+        None => core_verify_verdict(
+            &verdict,
+            &request,
+            &context,
+            &root,
+            &mut nonce_store,
+            now_ms,
+        ),
+    }
     .map_err(|e| JsError::new(&format!("verify_verdict failed: {e}")))?;
 
     to_json(
@@ -360,6 +377,7 @@ pub fn verify_verdict_with_account_states(
     approver_root_pubkey_b64: &str,
     now_ms: f64,
     account_states_json: &str,
+    expected_account_id: Option<String>,
 ) -> Result<String, JsError> {
     let verdict: Verdict = parse_json(verdict_json, "Verdict")?;
     let request: ApprovalRequest = parse_json(request_json, "ApprovalRequest")?;
@@ -375,15 +393,27 @@ pub fn verify_verdict_with_account_states(
     let account_state_refs: Vec<&str> = account_states.iter().map(String::as_str).collect();
 
     let mut nonce_store = allw_core::InMemoryNonceStore::new();
-    let verified = core_verify_verdict_with_account_states(
-        &verdict,
-        &request,
-        &context,
-        &root,
-        &mut nonce_store,
-        now_ms,
-        &account_state_refs,
-    )
+    let verified = match expected_account_id.as_deref() {
+        Some(expected) => core_verify_verdict_with_account_states_for_account(
+            &verdict,
+            &request,
+            &context,
+            &root,
+            &mut nonce_store,
+            now_ms,
+            &account_state_refs,
+            expected,
+        ),
+        None => core_verify_verdict_with_account_states(
+            &verdict,
+            &request,
+            &context,
+            &root,
+            &mut nonce_store,
+            now_ms,
+            &account_state_refs,
+        ),
+    }
     .map_err(|e| JsError::new(&format!("verify_verdict_with_account_states failed: {e}")))?;
 
     to_json(
@@ -636,13 +666,15 @@ pub fn policy_rule_from_approval(
 /// # Errors
 ///
 /// Throws if the rule JSON is malformed, the root key is invalid, any account-state JWS is invalid
-/// for the rule account/root, or the rule fails certificate/signature/revocation verification.
+/// for the rule account/root, `expected_account_id` does not match the rule account, or the rule
+/// fails certificate/signature/revocation verification.
 #[wasm_bindgen]
 pub fn verify_policy_rule_with_account_states(
     rule_json: &str,
     account_root_pubkey_b64: &str,
     now_ms: f64,
     account_states_json: &str,
+    expected_account_id: Option<String>,
 ) -> Result<String, JsError> {
     let rule: PolicyRule = parse_json(rule_json, "PolicyRule")?;
     let root_pubkey_bytes = decode_b64_32(account_root_pubkey_b64, "account_root_pubkey_b64")?;
@@ -655,12 +687,21 @@ pub fn verify_policy_rule_with_account_states(
     let account_states = parse_account_states_json(account_states_json)?;
     let account_state_refs: Vec<&str> = account_states.iter().map(String::as_str).collect();
 
-    let verified = core_verify_policy_rule_with_account_states(
-        &rule,
-        &root_pubkey,
-        now_ms,
-        &account_state_refs,
-    )
+    let verified = match expected_account_id.as_deref() {
+        Some(expected) => core_verify_policy_rule_with_account_states_for_account(
+            &rule,
+            &root_pubkey,
+            now_ms,
+            &account_state_refs,
+            expected,
+        ),
+        None => core_verify_policy_rule_with_account_states(
+            &rule,
+            &root_pubkey,
+            now_ms,
+            &account_state_refs,
+        ),
+    }
     .map_err(|e| {
         JsError::new(&format!(
             "verify_policy_rule_with_account_states failed: {e}"
@@ -680,8 +721,9 @@ pub fn verify_policy_rule_with_account_states(
 /// # Errors
 ///
 /// Throws if the action/actor/rules JSON is malformed, the account-root public key is not a valid
-/// Ed25519 key, `now_ms` is not a safe integer millisecond timestamp, or any signed policy rule
-/// fails verification.
+/// Ed25519 key, `now_ms` is not a safe integer millisecond timestamp, an optional
+/// `expected_account_id` does not match a rule account, or any signed policy rule fails
+/// verification.
 #[wasm_bindgen]
 pub fn evaluate_policy(
     action_json: &str,
@@ -689,6 +731,7 @@ pub fn evaluate_policy(
     signed_rules_json: &str,
     account_root_pubkey_b64: &str,
     now_ms: f64,
+    expected_account_id: Option<String>,
 ) -> Result<String, JsError> {
     let action: ActionRecord = parse_json(action_json, "ActionRecord")?;
     let actor: Option<Actor> = actor_json
@@ -706,8 +749,13 @@ pub fn evaluate_policy(
     let verified = rules
         .iter()
         .map(|rule| {
-            core_verify_policy_rule(rule, &root_pubkey, now_ms)
-                .map_err(|e| JsError::new(&format!("verify_policy_rule failed: {e}")))
+            match expected_account_id.as_deref() {
+                Some(expected) => {
+                    core_verify_policy_rule_for_account(rule, &root_pubkey, now_ms, expected)
+                }
+                None => core_verify_policy_rule(rule, &root_pubkey, now_ms),
+            }
+            .map_err(|e| JsError::new(&format!("verify_policy_rule failed: {e}")))
         })
         .collect::<Result<Vec<_>, JsError>>()?;
 
@@ -725,7 +773,8 @@ pub fn evaluate_policy(
 /// # Errors
 ///
 /// Throws if action/actor/rules/account-state JSON is malformed, the root key is invalid,
-/// `now_ms` is unsafe, or any signed rule fails verification.
+/// `now_ms` is unsafe, an optional `expected_account_id` does not match a rule account, or any
+/// signed rule fails verification.
 #[wasm_bindgen]
 pub fn evaluate_policy_with_account_states(
     action_json: &str,
@@ -734,6 +783,7 @@ pub fn evaluate_policy_with_account_states(
     account_root_pubkey_b64: &str,
     now_ms: f64,
     account_states_json: &str,
+    expected_account_id: Option<String>,
 ) -> Result<String, JsError> {
     let action: ActionRecord = parse_json(action_json, "ActionRecord")?;
     let actor: Option<Actor> = actor_json
@@ -753,12 +803,21 @@ pub fn evaluate_policy_with_account_states(
     let verified = rules
         .iter()
         .map(|rule| {
-            core_verify_policy_rule_with_account_states(
-                rule,
-                &root_pubkey,
-                now_ms,
-                &account_state_refs,
-            )
+            match expected_account_id.as_deref() {
+                Some(expected) => core_verify_policy_rule_with_account_states_for_account(
+                    rule,
+                    &root_pubkey,
+                    now_ms,
+                    &account_state_refs,
+                    expected,
+                ),
+                None => core_verify_policy_rule_with_account_states(
+                    rule,
+                    &root_pubkey,
+                    now_ms,
+                    &account_state_refs,
+                ),
+            }
             .map_err(|e| {
                 JsError::new(&format!(
                     "verify_policy_rule_with_account_states failed: {e}"
