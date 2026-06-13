@@ -64,10 +64,31 @@ This is the Codex-parallel install path for developers who already have a paired
    call. The hook submits a Codex-scoped approval request (`actor.id = "codex:<hostname>"`), and
    Codex proceeds only after a verified allw approval.
 
+## Human-Run UAT Setup
+
+The real-Codex UAT is intentionally operator-run. The automated/headless attempt triggered macOS
+malware detection on the local Codex binary, so repository automation must prepare the environment
+but must not spawn Codex.
+
+Use the helper from the repo root:
+
+```sh
+scripts/uat-codex.sh
+```
+
+The script builds the WASM and TypeScript packages, starts a local relay, pairs a temporary
+`allw-approver` keyfile, writes a temporary project-scoped `.codex/hooks.json`, prints the exact
+`codex exec` commands for the operator to run in a second terminal, and then runs
+`allw-approver watch` in the foreground. It never touches `~/.codex` global config and never invokes
+`codex`; the human runs Codex directly.
+
+When UAT is complete, press `Ctrl-C` in the script terminal. Its exit trap stops the relay and
+removes the temporary keyfile/project.
+
 ## UAT Checklist
 
-Before making the Codex hook PR ready, run a live Codex session against an enrolled second device
-and record the result on the PR:
+Run a live Codex session against the temporary project prepared by `scripts/uat-codex.sh` and
+record the result on issue #97:
 
 1. **Approve path**: ask Codex to run a harmless gated Bash command, approve it on the second
    device, and confirm Codex proceeds.
@@ -79,6 +100,17 @@ and record the result on the PR:
    than the Claude Code actor.
 5. **File-edit path**: ask Codex for a simple file edit through `apply_patch` and confirm the hook
    gates the resulting `file_edit` action with the target path, summary, and diff hash visible.
+
+Use this comment template on #97:
+
+```md
+Approve: PASS/FAIL - command ran only after approval
+Deny: PASS/FAIL - command was blocked after denial
+Timeout: PASS/FAIL - command failed closed after ALLW_TIMEOUT_MS
+Actor identity: PASS/FAIL - inbox showed codex:<hostname>
+File edit: PASS/FAIL - apply_patch was gated with path, summary, and diff hash
+Notes:
+```
 
 The automated tests cover the same SDK/WASM verification path with a relay double; this checklist
 is the remaining product acceptance proof that Codex itself invokes the hook and honors the result.
