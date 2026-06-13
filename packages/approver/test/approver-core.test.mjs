@@ -204,6 +204,26 @@ test("number-match request renders derived code and signs only the matching resp
     /requires number-match challenge response/,
     "approvals for challenged requests must not silently sign without the typed code",
   );
+
+  const deniedVerdict = signDecision(wasm, keyfile, prepared, "denied", DECIDED_AT);
+  assert.equal(
+    deniedVerdict.challenge_response,
+    undefined,
+    "challenged denials do not need the approval-only challenge response",
+  );
+  assert.throws(
+    () =>
+      wasm.verify_verdict(
+        JSON.stringify(deniedVerdict),
+        makeRequestJson(),
+        challengedContextJson,
+        keyfile.account_root_pubkey,
+        NOW_MS,
+      ),
+    /verified human decision was not 'approved': Denied/,
+    "challenged denials must verify as authenticated non-approvals, not malformed challenges",
+  );
+
   assert.throws(
     () =>
       signDecision(wasm, keyfile, prepared, "approved", DECIDED_AT, {

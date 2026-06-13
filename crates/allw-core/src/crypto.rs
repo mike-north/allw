@@ -1022,14 +1022,14 @@ pub fn derive_number_match_challenge(request_hash: &[u8; 32]) -> String {
 ///    ([`VerifyError::DecidedAtOutOfWindow`]).
 /// 6. **Anti-replay** (checklist #4). The nonce must be unseen in `nonce_store`
 ///    ([`VerifyError::Replay`]).
-/// 7. **Challenge** (checklist #5). If `context.constraints.challenge_required`, a non-empty
-///    `challenge_response` must be present in both the claims and the outer verdict
-///    ([`VerifyError::ChallengeMissing`]) and must exactly match
-///    [`derive_number_match_challenge`] for the recomputed request hash
-///    ([`VerifyError::ChallengeMismatch`]).
-/// 8. **Decision gate** (checklist #3 / #6). If `claims.decision != Approved`, returns
+/// 7. **Decision gate** (checklist #3 / #6). If `claims.decision != Approved`, returns
 ///    [`VerifyError::NotApproved`] — an authenticated denial/expiry, distinct from a forgery.
-///    Otherwise returns `Ok`.
+/// 8. **Challenge** (checklist #5). If `context.constraints.challenge_required` and the verified
+///    decision is approved, a non-empty `challenge_response` must be present in both the claims and
+///    the outer verdict ([`VerifyError::ChallengeMissing`]) and must exactly match
+///    [`derive_number_match_challenge`] for the recomputed request hash
+///    ([`VerifyError::ChallengeMismatch`]). Authenticated denials remain denials without requiring
+///    the approval-only number-match response.
 ///
 /// # Not authorization
 ///
@@ -1265,7 +1265,14 @@ fn verify_verdict_with_account_states_impl(
         return Err(VerifyError::Replay);
     }
 
-    // ── Step 7: challenge correctness ───────────────────────────────────────────
+    // ── Step 7: decision gate ────────────────────────────────────────────────────
+    if claims.decision != Decision::Approved {
+        return Err(VerifyError::NotApproved {
+            decision: claims.decision,
+        });
+    }
+
+    // ── Step 8: approval challenge correctness ──────────────────────────────────
     if context.constraints.challenge_required {
         let claim_present = claims
             .challenge_response
@@ -1282,13 +1289,6 @@ fn verify_verdict_with_account_states_impl(
         if claims.challenge_response.as_deref() != Some(expected_challenge.as_str()) {
             return Err(VerifyError::ChallengeMismatch);
         }
-    }
-
-    // ── Step 8: decision gate ────────────────────────────────────────────────────
-    if claims.decision != Decision::Approved {
-        return Err(VerifyError::NotApproved {
-            decision: claims.decision,
-        });
     }
 
     Ok(VerifiedVerdict {
@@ -2160,6 +2160,37 @@ mod tests {
         )
         .expect_err("missing required challenge response must fail");
         assert_eq!(err, VerifyError::ChallengeMissing);
+    }
+
+    /// checklist #3/#5: challenged denials do not need the approval-only number-match response.
+    #[test]
+    fn challenge_required_denial_without_response_is_authenticated_denial() {
+        let cert = make_cert(&root_key());
+        let verdict = sign_verdict(
+            &make_unsigned(Decision::Denied, canonical_hash(true), None),
+            &device_key(),
+            NONCE,
+            Some(cert),
+        );
+        let request = make_request();
+        let context = make_context(true);
+        let mut store = InMemoryNonceStore::new();
+
+        let err = verify_verdict(
+            &verdict,
+            &request,
+            &context,
+            &root_key().public_key(),
+            &mut store,
+            NOW_OK,
+        )
+        .expect_err("challenged denial without challenge response must remain authenticated");
+        assert_eq!(
+            err,
+            VerifyError::NotApproved {
+                decision: Decision::Denied,
+            }
+        );
     }
 
     /// Number-match derivation is stable and domain-separated from the request hash itself.

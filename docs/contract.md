@@ -58,8 +58,8 @@ reserved and null. The contract is **action-agnostic**: it transports and binds 
 4. Device decrypts the `ApprovalContext`, verifies the actor `attestation`, **renders** (WYSIWYS), recomputes
    `request_hash`, human decides; destructive ops may require a **number-match** challenge.
 5. Device emits a **Verdict** signed (JWS/COSE) over `(request_id, request_hash, decision, decided_at, nonce)`;
-   if a number-match challenge was required, the signed `challenge_response` must be the derived challenge for
-   that `request_hash`.
+   if an approval requires number-match, the signed `challenge_response` must be the derived challenge for that
+   `request_hash`. Denials do not need to satisfy the approval challenge.
 6. Integrator **verifies** (checklist below), composes with its own + upstream policy, appends an **AuditRecord**.
 
 ---
@@ -126,7 +126,8 @@ verdict `sig` (+ optional integrator counter-sign). Periodically anchor the head
    distinguishes them.
 3. `decision == approved`.
 4. Not expired; `decided_at` within window; nonce unseen (anti-replay).
-5. If destructive & challenge required: `challenge_response` equals the derived number-match challenge.
+5. If the verdict is approved and destructive challenge is required: `challenge_response` equals the derived
+   number-match challenge. Authenticated denials stay denials without a challenge response.
 6. **Then** `effective_allow = approved ∧ verified ∧ local_policy ∧ (other gates)`. The primitive contributes a
    verified human decision; it never authorizes by itself.
 
