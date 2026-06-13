@@ -15,8 +15,18 @@ test("audit history prototype wires shared tokens and React canvas", async () =>
 
   assert.match(html, /..\/inbox\/tokens\.css/, "prototype must reuse the inbox token source");
   assert.match(html, /app\.css/, "prototype must load local audit styling");
-  assert.match(html, /app\.jsx/, "prototype must load the interactive audit canvas");
   assert.match(html, /id="root"/, "prototype must expose a React mount point");
+});
+
+test("audit history prototype can open directly from the filesystem", async () => {
+  const html = await read("Allw Approver Audit History.html");
+
+  assert.doesNotMatch(
+    html,
+    /<script[^>]+type="text\/babel"[^>]+src=/,
+    "file:// prototypes must not depend on Babel XHR-loading a local JSX file",
+  );
+  assert.match(html, /function App\(\)/, "prototype must inline the interactive audit canvas");
 });
 
 test("audit history prototype covers required issue #95 surfaces", async () => {
