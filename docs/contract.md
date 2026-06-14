@@ -17,12 +17,14 @@ and [enrollment.md](./enrollment.md) (account/device enrollment, rotation, revoc
 1. **E2EE** — the relay never sees plaintext context or rationale. Context is encrypted to the approver's device
    key(s); the verdict is signed by a device key.
 2. **Structure-not-data** — the relay (and anything off-device) may see action **structure** — the surface kind,
-   program / tool name, and session label — but **never** action **data**: arguments, parameter values, environment
-   variable names or values, or any content the agent is operating on. Shorthand: "know the function, not the
-   arguments." This is enforced on-device (in the WASM/native client) before any bytes reach the relay, and it
-   tightens the E2EE invariant — it does not loosen it. Full `ActionRecord` data travels only inside the JWE
-   (`context_ciphertext`), visible exclusively to enrolled approver devices. A RESERVED `privacy_preference` wire
-   field (null = default in v1) controls how much structure the relay sees; see §Messages for the three tiers.
+   program name (commands) / server + tool name (MCP calls), and session label — but **never** action **data**:
+   arguments, parameter values, environment variable names or values, or any content the agent is operating on.
+   Shorthand: "know the function, not the arguments." For MCP calls the function identity is the (server, tool)
+   pair, parallel to a command's program name; both are structure. This is enforced on-device (in the WASM/native
+   client) before any bytes reach the relay, and it tightens the E2EE invariant — it does not loosen it. Full
+   `ActionRecord` data travels only inside the JWE (`context_ciphertext`), visible exclusively to enrolled
+   approver devices. A RESERVED `privacy_preference` wire field (null = default in v1) controls how much
+   structure the relay sees; see §Messages for the three tiers.
 3. **Verifiable verdict** — a signed artifact any party can verify _without trusting the relay_, cryptographically
    **bound to the exact request** (no replay, no swap).
 4. **WYSIWYS (what you see is what you sign)** — the verdict binds to a single `request_hash` over the _entire_
@@ -43,10 +45,10 @@ and [enrollment.md](./enrollment.md) (account/device enrollment, rotation, revoc
 - **Actor / Subject** — the automation needing approval (a coding agent on a machine, a web agent via a gateway). Attested.
 - **Integrator / Relying Party** — the code calling `requestApproval` (a hook, the proxy, a gateway). Verifies and enforces.
 - **Approver** — the human; owns an account with one or more enrolled **devices** (the "inbox").
-- **Relay** — zero-knowledge router (Cloudflare Workers + Durable Objects). At the default (structure-visible) tier
-  it sees: routing metadata, opaque `context_ciphertext`, and action structure (surface / program / session-label).
-  It never sees action data (arguments, values, env). At the paranoid/enterprise tier (reserved; not built in v1)
-  it sees routing metadata only.
+- **Relay** — zero-knowledge router (Cloudflare Workers + Durable Objects). At the default (structure-visible)
+  tier it sees: routing metadata, opaque `context_ciphertext`, and action structure (surface / program name or
+  server+tool name / session-label). It never sees action data (arguments, values, env). At the
+  paranoid/enterprise tier (reserved; not built in v1) it sees routing metadata only.
 
 ---
 
@@ -88,9 +90,11 @@ ciphertext. **The relay never sees the `ActionRecord` or any rendered content.**
 `action_structure`? · `privacy_preference`? (RESERVED).
 
 `action_structure` is the **structure-not-data** surface (Invariant 2): when present, it carries only structure
-fields — `surface` kind, `program` / tool name, `session_label` — never data (arguments, values, env). In the
-default (structure-visible) tier the integrator SHOULD populate this field so the relay can use structure for
-routing intelligence. In the paranoid/enterprise tier (reserved; not built in v1) this field is omitted.
+fields — `surface` kind, function identity (`program` name for commands; `server` + `tool` name for MCP calls),
+`session_label` — never data (arguments, parameter values, env). For MCP calls the (server, tool) pair is the
+function identity, parallel to a command's program name; both are structure. In the default (structure-visible)
+tier the integrator SHOULD populate this field so the relay can use structure for routing intelligence. In the
+paranoid/enterprise tier (reserved; not built in v1) this field is omitted.
 
 `privacy_preference` is a **RESERVED** field: `null` (or absent) in v1 is equivalent to `"default"`.
 The three tiers — and what each allows the relay to observe — are:

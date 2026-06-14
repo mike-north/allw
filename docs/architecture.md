@@ -48,10 +48,11 @@ deliberate moat over web / Electron / push-only competitors.
 
 ## Structure-not-data boundary
 
-The relay (and anything off-device) may observe action **structure** — surface kind, program / tool name,
-session label — but **never** action **data**: arguments, parameter values, environment variable names or
-values, or any content the agent is operating on. "Know the function, not the arguments." This tightens the
-existing E2EE / zero-knowledge property; it does not loosen it.
+The relay (and anything off-device) may observe action **structure** — surface kind, program / server+tool
+name, session label — but **never** action **data**: arguments, parameter values, environment variable names or
+values, or any content the agent is operating on. "Know the function, not the arguments." For MCP calls the
+function identity is the (server, tool) pair, parallel to a command's program name; both are structure. This
+tightens the existing E2EE / zero-knowledge property; it does not loosen it.
 
 **Where the boundary is enforced:** on-device, in the WASM/native client, before any bytes reach the relay.
 The integrator constructs the `ApprovalRequest` envelope with at most an `action_structure` field (structure
@@ -61,8 +62,8 @@ only) in the plaintext portion; all `ActionRecord` data travels exclusively insi
 **How the preference is carried:** a RESERVED `privacy_preference` wire field on `ApprovalRequest` (null =
 `"default"` in v1) controls how much structure the relay sees:
 
-- **default** (structure-visible) — relay receives `action_structure` (surface / program / session-label); v1
-  implementation.
+- **default** (structure-visible) — relay receives `action_structure` (surface / program / server+tool /
+  session-label); v1 implementation.
 - **paranoid / enterprise** (structure-hidden) — relay receives routing metadata only; `action_structure`
   omitted; reserved, not built.
 - **ai-summary** — future tier; reserved, not built.

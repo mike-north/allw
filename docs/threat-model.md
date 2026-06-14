@@ -33,7 +33,8 @@ Out of scope:
 6. Every ambiguous, expired, missing, unverifiable, or transport-failed path must block the gated action.
 7. Auditors must be able to reconstruct the decision artifact and the policy state without trusting the relay.
 8. The relay must never observe action **data** (arguments, values, env) — only action **structure** (program /
-   session-label / surface). "Know the function, not the arguments." This holds at every privacy tier.
+   server+tool / session-label / surface). "Know the function, not the arguments." This holds at every privacy
+   tier.
 
 ## Assets
 
@@ -59,11 +60,11 @@ actor/integrator process
   (default tier: relay sees structure only; paranoid/enterprise tier: relay sees routing metadata only)
   |
   | opaque ApprovalRequest envelope + ciphertext
-  | envelope plaintext carries at most: structure (surface / program / session-label), never data
+  | envelope plaintext carries at most: structure (surface / program / server+tool / session-label), never data
   v
 zero-knowledge relay
   routes by account/request/device ids, stores opaque envelopes and signed verdicts
-  sees structure at most (default tier); routing metadata only (paranoid/enterprise tier)
+  sees structure at most (surface / program / server+tool / session-label) at default tier; routing metadata only (paranoid/enterprise tier)
   |
   | ciphertext only
   v
@@ -76,19 +77,20 @@ The relay is intentionally outside the plaintext and signing trust boundary. It 
 or mutate relay-visible fields, but it must not be trusted to preserve confidentiality or authorize decisions.
 
 **Structure vs. data boundary:** the relay (and anything off-device) may observe action **structure** — the
-program name, session label, and surface kind — but never action **data**: arguments, parameter values,
-environment variables, or any content the agent is operating on. Structure is what routing metadata
-legitimately needs; data belongs exclusively inside the JWE ciphertext, visible only to the approver's
-enrolled devices. This boundary is enforced on-device (in the WASM/native client) before anything reaches
-the relay.
+program name (commands) / server + tool name (MCP calls), session label, and surface kind — but never action
+**data**: arguments, parameter values, environment variables, or any content the agent is operating on. For
+MCP calls the (server, tool) pair is the function identity, parallel to a command's program name; both are
+structure. Structure is what routing metadata legitimately needs; data belongs exclusively inside the JWE
+ciphertext, visible only to the approver's enrolled devices. This boundary is enforced on-device (in the
+WASM/native client) before anything reaches the relay.
 
 **Privacy preference tiers (v1: default only):**
 
-| Tier                                         | Relay sees                                                 | v1 status           |
-| -------------------------------------------- | ---------------------------------------------------------- | ------------------- |
-| **default** (structure-visible)              | program / session-label / surface kind — never data        | **shipped**         |
-| **paranoid / enterprise** (structure-hidden) | routing metadata only (account id, request id, device ids) | reserved; not built |
-| **ai-summary**                               | future tier — reserved; do not build                       | reserved; not built |
+| Tier                                         | Relay sees                                                        | v1 status           |
+| -------------------------------------------- | ----------------------------------------------------------------- | ------------------- |
+| **default** (structure-visible)              | program / server+tool / session-label / surface kind — never data | **shipped**         |
+| **paranoid / enterprise** (structure-hidden) | routing metadata only (account id, request id, device ids)        | reserved; not built |
+| **ai-summary**                               | future tier — reserved; do not build                              | reserved; not built |
 
 The preference is a RESERVED field on the wire contract (null = default in v1); see `docs/contract.md`.
 Paranoid/enterprise tier — how an org enforces structure-hidden mode on its members — is an open question
@@ -113,7 +115,7 @@ tracked in the roadmap epic.
 | Contract invariant             | Defends against                                                                | Required checks / evidence                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | ------------------------------ | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | E2EE                           | Compromised relay, network MITM, plaintext leakage through push/relay state    | Relay stores only routing metadata, opaque `context_ciphertext`, public keys, and signed verdicts; tests reject unexpected envelope keys and secret material.                                                                                                                                                                                                                                                                                                      |
-| Structure-not-data             | Compromised relay or network MITM inferring argument values / env / content    | On-device enforcement (WASM/native client) strips data fields from the relay-visible `ApprovalRequest` envelope before transmission; envelope plaintext carries only structure (surface / program / session-label), never data; relay-field acceptance tests assert no argument/value/env keys appear in the envelope.                                                                                                                                             |
+| Structure-not-data             | Compromised relay or network MITM inferring argument values / env / content    | On-device enforcement (WASM/native client) strips data fields from the relay-visible `ApprovalRequest` envelope before transmission; envelope plaintext carries only structure (surface / program / server+tool / session-label), never data; relay-field acceptance tests assert no argument/value/env keys appear in the envelope.                                                                                                                               |
 | Verifiable verdict             | Compromised relay, forged verdicts, malicious network, malicious device ids    | Verify verdict JWS against enrolled device cert and account root; reject revoked device ids from the highest-sequence root-signed account state; reject claim/outer mismatches; do not trust relay status alone.                                                                                                                                                                                                                                                   |
 | WYSIWYS                        | Context/action TOCTOU, summary-only deception, swapped ciphertext or deadline  | Device recomputes `request_hash` over the canonical request-hash input (`ActionRecord`, summary, actor id/kind, risk, reversible, constraints, chain, and shown `expires_at`; `actor.attestation` is verified separately); renderer must show the bound syntactic substrate needed for the decision. The structure-not-data boundary does not affect WYSIWYS — full `ActionRecord` data remains inside the JWE; `request_hash` is computed post-decrypt on-device. |
 | Requester attestation          | Requester impersonation, misleading origin text                                | Device verifies the actor-key attestation before approval, resolving the actor key from root-signed account state (#16) and binding it to `request_id` + `request_hash`; a relay-supplied key never drives a verified origin, and any non-root-anchored / revoked / unbound origin is visibly downgraded to ⚠ UNVERIFIED.                                                                                                                                          |
@@ -193,9 +195,10 @@ Validation:
 ### R7. Structure-not-data (relay data boundary)
 
 The plaintext `ApprovalRequest` envelope submitted to the relay must carry **at most** action structure — the
-surface kind, program / tool name, and session label — and **never** action data: arguments, parameter values,
-environment variable names or values, or any content the agent is operating on. Full `ActionRecord` data travels
-exclusively inside the JWE ciphertext (`context_ciphertext`), visible only to enrolled approver devices.
+surface kind, program name (commands) / server + tool name (MCP calls), and session label — and **never**
+action data: arguments, parameter values, environment variable names or values, or any content the agent is
+operating on. Full `ActionRecord` data travels exclusively inside the JWE ciphertext (`context_ciphertext`),
+visible only to enrolled approver devices.
 
 This is enforced on-device (in the WASM/native client) before any bytes reach the relay. The preferred privacy
 tier is carried as a RESERVED wire field (null = default / structure-visible in v1). The three tiers are defined
@@ -207,21 +210,22 @@ Validation:
   key appears in the plaintext `ApprovalRequest` fields accepted by the relay.
 - SDK/hook integration tests assert that the constructed envelope contains only structure fields in plaintext.
 - Manual review checks every new `ActionRecord` syntactic field addition: data fields must land only inside the
-  JWE; structure fields (surface, tool/program name, session-label) may appear in the plaintext envelope.
+  JWE; structure fields (surface, program name / server+tool name, session-label) may appear in the plaintext
+  envelope.
 - Any code path that serializes an `ActionRecord` toward the relay is audited for argument/value/env leakage.
 
 ## Residual Risks
 
-| Residual                                                    | Why it remains                                                                                                                                                                                                                                | Owner / next step                                                                                                                                                    |
-| ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Agent-readable non-secret sensitive data can be exfiltrated | If the agent must read data to work, approval cannot prevent it from copying that data elsewhere.                                                                                                                                             | Sandbox/egress controls and data minimization; keep secrets in vaultkeeper.                                                                                          |
-| Relay denial of service                                     | Zero-knowledge routing does not make the relay available or honest about delivery timing.                                                                                                                                                     | Availability engineering, retries, alternate transports, and audit visibility.                                                                                       |
-| Endpoint authentication is incomplete                       | Current routing relies on high-entropy ids and enrollment work still in progress.                                                                                                                                                             | Enrollment spec (#19) and endpoint authn implementation.                                                                                                             |
-| Actor identity unverified without distributed account state | Actor-key attestation now anchors on root-signed account state (#16); until the relay distributes that state to devices, a device without it cannot root-anchor an actor key.                                                                 | Wire relay distribution of root-signed account state (#104); meanwhile origins render ⚠ UNVERIFIED (fail-closed).                                                    |
-| Device loss and recovery UX is underspecified               | Root-signed account state gives offline verifier semantics, but publication latency and recovery flows still need product design.                                                                                                             | Enrollment/revocation UX (#19).                                                                                                                                      |
-| Persistent nonce retention is integrator-owned              | In-memory nonce stores only protect one process lifetime.                                                                                                                                                                                     | SDK/integrator persistent `NonceStore` configuration and retention tests.                                                                                            |
-| Semantic capability mistakes are deferred                   | v1 is syntactic; it does not infer generalized capabilities or data meaning.                                                                                                                                                                  | T3 policy engine; until then, use conservative syntactic rules and human escalation.                                                                                 |
-| Action structure visible to relay at default tier           | The default (structure-visible) tier lets the relay observe the program name, session label, and surface kind. This is by design — routing benefits from it — but it means the relay knows _what tool_ the agent is using, not _what it did_. | Paranoid/enterprise (structure-hidden) tier is reserved and not yet built. Org enforcement of structure-hidden mode is an open question tracked in the roadmap epic. |
+| Residual                                                    | Why it remains                                                                                                                                                                                                                                                                                                 | Owner / next step                                                                                                                                                    |
+| ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Agent-readable non-secret sensitive data can be exfiltrated | If the agent must read data to work, approval cannot prevent it from copying that data elsewhere.                                                                                                                                                                                                              | Sandbox/egress controls and data minimization; keep secrets in vaultkeeper.                                                                                          |
+| Relay denial of service                                     | Zero-knowledge routing does not make the relay available or honest about delivery timing.                                                                                                                                                                                                                      | Availability engineering, retries, alternate transports, and audit visibility.                                                                                       |
+| Endpoint authentication is incomplete                       | Current routing relies on high-entropy ids and enrollment work still in progress.                                                                                                                                                                                                                              | Enrollment spec (#19) and endpoint authn implementation.                                                                                                             |
+| Actor identity unverified without distributed account state | Actor-key attestation now anchors on root-signed account state (#16); until the relay distributes that state to devices, a device without it cannot root-anchor an actor key.                                                                                                                                  | Wire relay distribution of root-signed account state (#104); meanwhile origins render ⚠ UNVERIFIED (fail-closed).                                                    |
+| Device loss and recovery UX is underspecified               | Root-signed account state gives offline verifier semantics, but publication latency and recovery flows still need product design.                                                                                                                                                                              | Enrollment/revocation UX (#19).                                                                                                                                      |
+| Persistent nonce retention is integrator-owned              | In-memory nonce stores only protect one process lifetime.                                                                                                                                                                                                                                                      | SDK/integrator persistent `NonceStore` configuration and retention tests.                                                                                            |
+| Semantic capability mistakes are deferred                   | v1 is syntactic; it does not infer generalized capabilities or data meaning.                                                                                                                                                                                                                                   | T3 policy engine; until then, use conservative syntactic rules and human escalation.                                                                                 |
+| Action structure visible to relay at default tier           | The default (structure-visible) tier lets the relay observe the program name (commands) / server + tool name (MCP calls), session label, and surface kind. This is by design — routing benefits from it — but it means the relay knows _what function_ the agent is invoking, not _what arguments_ were given. | Paranoid/enterprise (structure-hidden) tier is reserved and not yet built. Org enforcement of structure-hidden mode is an open question tracked in the roadmap epic. |
 
 ## Security Review Checklist
 

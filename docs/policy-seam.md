@@ -52,23 +52,28 @@ invariant (see [contract.md](./contract.md) Invariant 2 and [threat-model.md](./
 
 - **Structure** — the parts the relay may observe at the default privacy tier:
   - `surface` kind (`"command"` / `"mcp_tool_call"` / `"file_edit"` / …)
-  - program or tool name — `syntactic.bin` for commands, `syntactic.tool` for MCP calls
+  - function identity: program name (`syntactic.bin`) for commands; **`syntactic.server` + `syntactic.tool`**
+    for MCP calls — the (server, tool) pair is the MCP function identity, parallel to a command's program name
   - `session_label` (carried at the `ApprovalRequest` envelope level, not inside `ActionRecord`)
 
   These are what the `action_structure` plaintext envelope field may expose; they tell the relay _what function_
-  is being invoked, never _what arguments_ were given.
+  is being invoked, never _what arguments_ were given. Orgs that consider server identity itself sensitive
+  (parallel to a sensitive internal program name) should use the **paranoid/enterprise tier**, which hides all
+  structure — reclassifying server as data is not the right escape hatch for that concern.
 
 - **Data** — the parts that must never leave the JWE; relay never sees these even at the default tier:
   - `syntactic.argv`, `syntactic.flags`, `syntactic.positionals`, `syntactic.cwd`, `syntactic.env_refs`
   - `syntactic.params` (MCP parameter values)
   - `syntactic.paths`, `syntactic.diff_summary`, `syntactic.diff_hash` (file-edit content)
   - `syntactic.raw` (original form)
-  - `syntactic.server` — this is the MCP server name; treat as **data** (can reveal what system is targeted)
+  - any future server connection details / URL / endpoint field (only the server **name** is structure,
+    parallel to program name vs. path/cwd)
 
-The syntactic **substrate** in the `ActionRecord` is therefore split: the surface and tool/bin name are
-structure; everything else is data. The `capabilities`/`scope` semantic enrichment fields (T3, reserved) are
-data. This split is enforced on-device (in the WASM/native client) when constructing the `ApprovalRequest`
-envelope — not by the relay, and not post-hoc.
+The syntactic **substrate** in the `ActionRecord` is therefore split: surface, function identity (bin for
+commands; server + tool for MCP), and session label are structure; arguments, parameter values, env, paths,
+and content are data. The `capabilities`/`scope` semantic enrichment fields (T3, reserved) are data. This
+split is enforced on-device (in the WASM/native client) when constructing the `ApprovalRequest` envelope —
+not by the relay, and not post-hoc.
 
 ## The action record (what `allw-core` captures)
 
