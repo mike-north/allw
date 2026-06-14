@@ -77,10 +77,19 @@ scripts/uat-codex.sh
 ```
 
 The script builds the WASM and TypeScript packages, starts a local relay, pairs a temporary
-`allw-approver` keyfile, writes a temporary project-scoped `.codex/hooks.json`, prints the exact
-`codex exec` commands for the operator to run in a second terminal, and then runs
-`allw-approver watch` in the foreground. It never touches `~/.codex` global config and never invokes
-`codex`; the human runs Codex directly.
+`allw-approver` keyfile, and then writes a self-contained temporary project to a system temp
+directory. The project contains:
+
+- `.codex/allw-hook.sh` — a small wrapper script that `export`s the three `ALLW_*` env vars
+  (relay URL, account ID, approver root key) baked in at generation time, then `exec`s the hook
+  CLI. The Codex command-hook schema has no per-handler `env` field, so the variables are baked
+  into the wrapper rather than placed in `hooks.json`.
+- `.codex/hooks.json` — the project-scoped Codex hook config; its `"command"` field invokes the
+  wrapper via `bash <abs-path>/allw-hook.sh`. No manual `export` step is needed.
+
+The helper prints the exact `codex exec` commands for the operator to run in a second terminal,
+then runs `allw-approver watch` in the foreground. It never touches `~/.codex` global config
+and never invokes `codex`; the human runs Codex directly.
 
 When UAT is complete, press `Ctrl-C` in the script terminal. Its exit trap stops the relay and
 removes the temporary keyfile/project.

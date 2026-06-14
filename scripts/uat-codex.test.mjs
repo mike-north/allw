@@ -27,6 +27,15 @@ function stripHereDocs(source) {
   return kept.join("\n");
 }
 
+/**
+ * Extract the body of the heredoc that writes hooks.json (the JSON here-doc
+ * between <<JSON and the closing JSON terminator).
+ */
+function extractJsonHeredoc(source) {
+  const match = /<<JSON\n([\s\S]*?)\nJSON\b/m.exec(source);
+  return match ? match[1] : "";
+}
+
 test("Codex UAT helper prepares the gate without invoking Codex", async () => {
   const script = await readScript();
   const activeShell = stripHereDocs(script);
@@ -52,4 +61,38 @@ test("Codex UAT helper prepares the gate without invoking Codex", async () => {
   );
   assert.doesNotMatch(activeShell, /\$\(\s*codex(?:\s|\))/);
   assert.doesNotMatch(activeShell, /`\s*codex(?:\s|`)/);
+});
+
+test("Generated hooks.json uses self-contained wrapper approach, not unsupported env map", async () => {
+  const script = await readScript();
+  const jsonHeredoc = extractJsonHeredoc(script);
+
+  // The hooks.json template must not contain an "env" key — Codex's command hook
+  // schema has no per-handler env field; adding one would silently be ignored and
+  // the hook would launch without ALLW_RELAY_URL / ALLW_ACCOUNT_ID / ALLW_APPROVER_ROOT_KEY.
+  assert.doesNotMatch(
+    jsonHeredoc,
+    /"env"\s*:/,
+    'hooks.json template must not emit an unsupported "env" key',
+  );
+
+  // The three ALLW_* values must appear in the active shell (the wrapper script
+  // section), not be omitted — they must be baked into the generated wrapper.
+  assert.match(script, /export ALLW_RELAY_URL/, "wrapper must export ALLW_RELAY_URL");
+  assert.match(script, /export ALLW_ACCOUNT_ID/, "wrapper must export ALLW_ACCOUNT_ID");
+  assert.match(
+    script,
+    /export ALLW_APPROVER_ROOT_KEY/,
+    "wrapper must export ALLW_APPROVER_ROOT_KEY",
+  );
+
+  // The wrapper script file must be referenced so Codex invokes it.
+  assert.match(script, /allw-hook\.sh/, "script must write a named wrapper (allw-hook.sh)");
+
+  // The hooks.json "command" entry must reference the wrapper, not bare node cli.
+  assert.match(
+    jsonHeredoc,
+    /bash.*HOOK_WRAPPER|HOOK_WRAPPER.*bash/,
+    'hooks.json "command" must invoke the wrapper via bash',
+  );
 });

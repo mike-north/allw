@@ -94,7 +94,19 @@ ACCOUNT_ROOT_KEY="$(
   node -e 'const fs = require("node:fs"); const keyfile = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(keyfile.account_root_pubkey);' "$KEYFILE"
 )"
 HOOK_CLI="$ROOT_DIR/packages/codex-hook/dist/cli.js"
-HOOK_COMMAND="node $HOOK_CLI"
+HOOK_WRAPPER="$PROJECT_DIR/.codex/allw-hook.sh"
+
+# Write a self-contained wrapper script that exports the three allw env vars then
+# exec's the hook CLI. Codex's hook schema has no per-handler "env" field, so the
+# variables must be baked into the wrapper rather than set in hooks.json.
+cat >"$HOOK_WRAPPER" <<WRAPPER
+#!/usr/bin/env bash
+export ALLW_RELAY_URL=$(printf '%q' "$RELAY_URL")
+export ALLW_ACCOUNT_ID=$(printf '%q' "$ACCOUNT_ID")
+export ALLW_APPROVER_ROOT_KEY=$(printf '%q' "$ACCOUNT_ROOT_KEY")
+exec node $(printf '%q' "$HOOK_CLI") "\$@"
+WRAPPER
+chmod +x "$HOOK_WRAPPER"
 
 cat >"$PROJECT_DIR/.codex/hooks.json" <<JSON
 {
@@ -105,14 +117,9 @@ cat >"$PROJECT_DIR/.codex/hooks.json" <<JSON
         "hooks": [
           {
             "type": "command",
-            "command": $(json_string "$HOOK_COMMAND"),
+            "command": $(json_string "bash $HOOK_WRAPPER"),
             "timeout": 480,
-            "statusMessage": "Requesting allw approval",
-            "env": {
-              "ALLW_RELAY_URL": $(json_string "$RELAY_URL"),
-              "ALLW_ACCOUNT_ID": $(json_string "$ACCOUNT_ID"),
-              "ALLW_APPROVER_ROOT_KEY": $(json_string "$ACCOUNT_ROOT_KEY")
-            }
+            "statusMessage": "Requesting allw approval"
           }
         ]
       }
@@ -160,7 +167,7 @@ Deny case:
   codex exec "run: echo allw-uat-deny"
 
 Timeout case:
-  node -e 'const fs = require("node:fs"); const p = process.argv[1]; const c = JSON.parse(fs.readFileSync(p, "utf8")); c.hooks.PreToolUse[0].hooks[0].env.ALLW_TIMEOUT_MS = "5000"; fs.writeFileSync(p, JSON.stringify(c, null, 2) + "\n");' "$PROJECT_DIR/.codex/hooks.json"
+  printf '\\nexport ALLW_TIMEOUT_MS=5000\\n' >> $(printf '%q' "$HOOK_WRAPPER")
   Then run:
     cd $(printf '%q' "$PROJECT_DIR")
     codex exec "run: echo allw-uat-timeout"
