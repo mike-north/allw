@@ -45,6 +45,36 @@ rules are a strict subset of semantic, so nothing written at T1/T2 breaks when T
 
 ---
 
+## Structure vs. data in the ActionRecord
+
+The `ActionRecord` has a **structure/data** boundary that maps directly onto the relay's zero-knowledge
+invariant (see [contract.md](./contract.md) Invariant 2 and [threat-model.md](./threat-model.md) §R7):
+
+- **Structure** — the parts the relay may observe at the default privacy tier:
+  - `surface` kind (`"command"` / `"mcp_tool_call"` / `"file_edit"` / …)
+  - function identity: program name (`syntactic.bin`) for commands; **`syntactic.server` + `syntactic.tool`**
+    for MCP calls — the (server, tool) pair is the MCP function identity, parallel to a command's program name
+  - `session_label` (carried at the `ApprovalRequest` envelope level, not inside `ActionRecord`)
+
+  These are what the `action_structure` plaintext envelope field may expose; they tell the relay _what function_
+  is being invoked, never _what arguments_ were given. Orgs that consider server identity itself sensitive
+  (parallel to a sensitive internal program name) should use the **paranoid/enterprise tier**, which hides all
+  structure — reclassifying server as data is not the right escape hatch for that concern.
+
+- **Data** — the parts that must never leave the JWE; relay never sees these even at the default tier:
+  - `syntactic.argv`, `syntactic.flags`, `syntactic.positionals`, `syntactic.cwd`, `syntactic.env_refs`
+  - `syntactic.params` (MCP parameter values)
+  - `syntactic.paths`, `syntactic.diff_summary`, `syntactic.diff_hash` (file-edit content)
+  - `syntactic.raw` (original form)
+  - any future server connection details / URL / endpoint field (only the server **name** is structure,
+    parallel to program name vs. path/cwd)
+
+The syntactic **substrate** in the `ActionRecord` is therefore split: surface, function identity (bin for
+commands; server + tool for MCP), and session label are structure; arguments, parameter values, env, paths,
+and content are data. The `capabilities`/`scope` semantic enrichment fields (T3, reserved) are data. This
+split is enforced on-device (in the WASM/native client) when constructing the `ApprovalRequest` envelope —
+not by the relay, and not post-hoc.
+
 ## The action record (what `allw-core` captures)
 
 `allw-core` reduces every approvable action to an `ActionRecord` and embeds it in both the `ApprovalRequest`
@@ -92,6 +122,10 @@ ActionRecord {
 3. **Reserve the optional `capabilities` / `scope` fields** so the semantic tier layers on with no wire break.
 4. **Reserve a `policy` block in `AuditRecord`:** `{ decision: allow|deny|escalate, rule_id?, tier, schema_version }`.
    v1 always writes `escalate`; the field exists so history is policy-analyzable later.
+5. **Enforce the structure/data split** when constructing `ApprovalRequest` envelopes: surface + tool/bin name
+   may appear in the plaintext `action_structure` envelope field; everything else (argv, params, env, paths,
+   diff, raw) must stay inside the JWE. New syntactic fields must be classified (structure or data) at the time
+   they are added — see §Structure vs. data above.
 
 Do **not** build capability inference or a schema DB in v1. Just don't foreclose them.
 

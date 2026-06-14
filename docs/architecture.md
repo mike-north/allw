@@ -46,6 +46,33 @@ deliberate moat over web / Electron / push-only competitors.
    DPAPI / libsecret (desktop — reuse vaultkeeper's backend abstraction). Signing keys never leave hardware.
 ```
 
+## Structure-not-data boundary
+
+The relay (and anything off-device) may observe action **structure** — surface kind, program / server+tool
+name, session label — but **never** action **data**: arguments, parameter values, environment variable names or
+values, or any content the agent is operating on. "Know the function, not the arguments." For MCP calls the
+function identity is the (server, tool) pair, parallel to a command's program name; both are structure. This
+tightens the existing E2EE / zero-knowledge property; it does not loosen it.
+
+**Where the boundary is enforced:** on-device, in the WASM/native client, before any bytes reach the relay.
+The integrator constructs the `ApprovalRequest` envelope with at most an `action_structure` field (structure
+only) in the plaintext portion; all `ActionRecord` data travels exclusively inside the JWE
+`context_ciphertext`. The relay can never access data fields regardless of transport.
+
+**How the preference is carried:** a RESERVED `privacy_preference` wire field on `ApprovalRequest` (null =
+`"default"` in v1) controls how much structure the relay sees:
+
+- **default** (structure-visible) — relay receives `action_structure` (surface / program / server+tool /
+  session-label); v1 implementation.
+- **paranoid / enterprise** (structure-hidden) — relay receives routing metadata only; `action_structure`
+  omitted; reserved, not built.
+- **ai-summary** — future tier; reserved, not built.
+
+The enforcement point (WASM/native client) matters: it means structure-data stripping happens in the same
+audited Rust core that handles JOSE crypto and verdict verification — no separate enforcement layer, no
+opportunity for a surface to accidentally forward data. See [contract.md](./contract.md) §Messages and
+[threat-model.md](./threat-model.md) §R7 for the full invariant.
+
 ## Local execution: WASM, not native binaries
 
 On-machine code (the Claude Code hook, the integrator SDK, anything running the core _locally_) ships as **WASM
