@@ -45,6 +45,31 @@ rules are a strict subset of semantic, so nothing written at T1/T2 breaks when T
 
 ---
 
+## Structure vs. data in the ActionRecord
+
+The `ActionRecord` has a **structure/data** boundary that maps directly onto the relay's zero-knowledge
+invariant (see [contract.md](./contract.md) Invariant 2 and [threat-model.md](./threat-model.md) §R7):
+
+- **Structure** — the parts the relay may observe at the default privacy tier:
+  - `surface` kind (`"command"` / `"mcp_tool_call"` / `"file_edit"` / …)
+  - program or tool name — `syntactic.bin` for commands, `syntactic.tool` for MCP calls
+  - `session_label` (carried at the `ApprovalRequest` envelope level, not inside `ActionRecord`)
+
+  These are what the `action_structure` plaintext envelope field may expose; they tell the relay _what function_
+  is being invoked, never _what arguments_ were given.
+
+- **Data** — the parts that must never leave the JWE; relay never sees these even at the default tier:
+  - `syntactic.argv`, `syntactic.flags`, `syntactic.positionals`, `syntactic.cwd`, `syntactic.env_refs`
+  - `syntactic.params` (MCP parameter values)
+  - `syntactic.paths`, `syntactic.diff_summary`, `syntactic.diff_hash` (file-edit content)
+  - `syntactic.raw` (original form)
+  - `syntactic.server` — this is the MCP server name; treat as **data** (can reveal what system is targeted)
+
+The syntactic **substrate** in the `ActionRecord` is therefore split: the surface and tool/bin name are
+structure; everything else is data. The `capabilities`/`scope` semantic enrichment fields (T3, reserved) are
+data. This split is enforced on-device (in the WASM/native client) when constructing the `ApprovalRequest`
+envelope — not by the relay, and not post-hoc.
+
 ## The action record (what `allw-core` captures)
 
 `allw-core` reduces every approvable action to an `ActionRecord` and embeds it in both the `ApprovalRequest`
@@ -92,6 +117,10 @@ ActionRecord {
 3. **Reserve the optional `capabilities` / `scope` fields** so the semantic tier layers on with no wire break.
 4. **Reserve a `policy` block in `AuditRecord`:** `{ decision: allow|deny|escalate, rule_id?, tier, schema_version }`.
    v1 always writes `escalate`; the field exists so history is policy-analyzable later.
+5. **Enforce the structure/data split** when constructing `ApprovalRequest` envelopes: surface + tool/bin name
+   may appear in the plaintext `action_structure` envelope field; everything else (argv, params, env, paths,
+   diff, raw) must stay inside the JWE. New syntactic fields must be classified (structure or data) at the time
+   they are added — see §Structure vs. data above.
 
 Do **not** build capability inference or a schema DB in v1. Just don't foreclose them.
 
