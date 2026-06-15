@@ -6,8 +6,8 @@ runs the review/merge gate; these rules exist so work flows through it without f
 
 ## Claiming work
 
-1. The work queue is **open GitHub issues that are _ready_** — see "Issue labels" below for what
-   "ready" means and how to order your pick. Epics group related work; claim their child issues,
+1. The work queue is **open GitHub issues labelled `greenlit`** — see "Issue labels" below for the
+   full scheme and how to order your pick. Epics group related work; claim their child issues,
    never the epic itself.
 2. **Claim before working**: add the `in progress` label AND post a one-line claim comment on the
    issue. An issue labeled `in progress` belongs to someone else — pick a different one.
@@ -21,8 +21,12 @@ runs the review/merge gate; these rules exist so work flows through it without f
 The queue is **label-driven**, not a hand-maintained list — so the same scheme works across every
 issue. The PM triages; you read the labels.
 
-**An issue is _ready_ (claimable) when it is open, carries a priority label, and is _not_ labelled
-`in progress` or `blocked`.** Pick the highest priority first:
+**An issue is claimable when it is open, labelled `greenlit`, and _not_ labelled `in progress` or
+`blocked`.** `greenlit` is the readiness signal: the PM applies it once a ticket is fully scoped,
+has acceptance criteria, and is unblocked. **No `greenlit` ⇒ not ready** — don't pick it up (it may
+still be under design or awaiting a decision); ping the PM if you think it should be greenlit.
+
+Among greenlit issues, pick the **highest priority first**:
 
 | Priority | Meaning                                            |
 | -------- | -------------------------------------------------- |
@@ -30,9 +34,9 @@ issue. The PM triages; you read the labels.
 | `P1`     | Important for the current release (v1).            |
 | `P2`     | Later / post-v1. Claim when no P0/P1 is available. |
 
-An open issue **with no priority label is not yet triaged** — don't pick it up; ping the PM if you
-think it should be ready. The milestone (`v1`, …) is the _target release_; the priority label is the
-_urgency_ — both can be set, but priority is what orders the queue.
+Priority **orders** the greenlit queue; it does not by itself mean "ready" (a ticket can be
+prioritised but not yet greenlit). The milestone (`v1`, …) is the _target release_; the priority
+label is the _urgency_.
 
 **Lifecycle labels** (these remove an issue from the ready set):
 
