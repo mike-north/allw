@@ -168,6 +168,11 @@ verdict `sig` (+ optional integrator counter-sign). Periodically anchor the head
 
 - **Actor (v1: actor-key pairing):** each machine/agent enrolls a keypair; requests are signed, so the inbox shows
   a verified origin ("Claude Code · macbook-pro"). No IdP dependency. (OAuth 2.1 / MCP-token interop deferred.)
+  The post-v1 **work-stream attestation** model (Decisions 4 + 5, #133) sharpens this: the actor key is the
+  **machine** Secure-Enclave key (the cryptographic trust root for _which machine_), and the inbox anchors trust
+  to a human-meaningful **work-stream label** whose _stream_ component is **asserted, not verified** (a keyless
+  harness hook). See [enrollment.md](./enrollment.md) §Work-Stream Attestation — it extends, and does not change,
+  the actor-key wire format or account-state anchoring.
 - **Approver:** an account with enrolled **devices**; each device holds a keypair in **Secure Enclave / StrongBox**,
   with **biometric-gated signing** (the verdict key is released by Face ID / Touch ID and never leaves hardware).
   A `device_cert` chains each device key to an account root so verifiers need only the root; see
