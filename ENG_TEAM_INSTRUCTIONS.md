@@ -6,13 +6,52 @@ runs the review/merge gate; these rules exist so work flows through it without f
 
 ## Claiming work
 
-1. The work queue is **open GitHub issues**. Current priorities: the v1 epic (#14) checklist.
+1. The work queue is **open GitHub issues labelled `greenlit`** — see "Issue labels" below for the
+   full scheme and how to order your pick. Epics group related work; claim their child issues,
+   never the epic itself.
 2. **Claim before working**: add the `in progress` label AND post a one-line claim comment on the
    issue. An issue labeled `in progress` belongs to someone else — pick a different one.
 3. One issue per PR (`Closes #N`). If a PR closes several issues, claim and label all of them.
 4. If you stop work without finishing: remove the label and comment what state you left it in.
 5. Before opening a PR, check open PRs — if one already exists for the issue, **do not open a
    duplicate**; comment on the existing PR instead.
+
+## Issue labels
+
+The queue is **label-driven**, not a hand-maintained list — so the same scheme works across every
+issue. The PM triages; you read the labels.
+
+**An issue is claimable when it is open, labelled `greenlit`, and _not_ labelled `in progress` or
+`blocked`.** `greenlit` is the readiness signal: the PM applies it once a ticket is fully scoped,
+has acceptance criteria, and is unblocked. **No `greenlit` ⇒ not ready** — don't pick it up (it may
+still be under design or awaiting a decision); ping the PM if you think it should be greenlit.
+
+Among greenlit issues, pick the **highest priority first**:
+
+| Priority | Meaning                                            |
+| -------- | -------------------------------------------------- |
+| `P0`     | Foundational / unblocks others — do these first.   |
+| `P1`     | Important for the current release (v1).            |
+| `P2`     | Later / post-v1. Claim when no P0/P1 is available. |
+
+Priority **orders** the greenlit queue; it does not by itself mean "ready" (a ticket can be
+prioritised but not yet greenlit). The milestone (`v1`, …) is the _target release_; the priority
+label is the _urgency_.
+
+**Lifecycle labels** (these remove an issue from the ready set):
+
+- `in progress` — claimed by someone (rule 2).
+- `blocked` — has an unmet dependency or an open design question; not claimable until the PM clears
+  it. If you discover a blocker mid-flight, add `blocked`, remove `in progress`, and comment why.
+
+**Type labels** tell you what the deliverable is: `epic` (tracker — never claimed directly),
+`type:spec` (a design/spec doc under `docs/`, not implementation), `enhancement` (feature),
+`bug`, `documentation`.
+
+**Area labels** (`area:core`, `area:sdk`, `area:hook`, `area:relay`, `area:apps`, `area:policy`,
+`area:infra`) scope the work — use them to filter for issues in your wheelhouse.
+
+The PM keeps this scheme current; if a label is missing or ambiguous, ask rather than inventing one.
 
 ## Branching & rebase discipline
 
