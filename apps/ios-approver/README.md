@@ -30,10 +30,30 @@ uses `swiftc` directly so it can run in Command Line Tools environments without 
 bash apps/ios-approver/scripts/test-ios-approver.sh
 ```
 
+## `prepare(envelope:)` is backed by the core
+
+`UniFfiApproverRuntime.prepare(envelope:)` now composes the shared Rust core via the UniFFI
+`prepare_approval_json` call: it decrypts the envelope JWE with the device X25519 encryption seed,
+recomputes the WYSIWYS `request_hash` device-side, and verifies the actor attestation against
+root-signed account state. The runtime never hashes, decrypts, or interprets crypto itself — it only
+marshals inputs, decodes the canonical core `ApprovalContext` JSON into the render model, and maps
+the core-reported `attestation_verified` onto the inbox's verified/unverified display state.
+
+Fail-closed split:
+
+- A **decrypt/hash failure** (forged/tampered JWE, wrong key, malformed input) throws → the store
+  renders the request `.unverified` with no plaintext.
+- An **unverifiable origin** (attestation not root-anchored) is not an error: the context still
+  decrypts and renders, but the row is `.unverified` and deny-only.
+
+The `apps/ios-approver` package compiles standalone (its local `swiftc` validation does not link the
+generated bindings), so the runtime depends on the narrow `UniFfiCoreBinding` seam. The Xcode target
+wires that seam to the generated `prepareApprovalJson`; tests inject a fake.
+
 ## Deferred production wiring
 
-The current UniFFI crate exposes request hashing and verdict signing/verification smoke tests, but
-does not yet expose native context decryption, pairing helpers, or a wired native signing path.
-`UniFfiApproverRuntime` therefore fails closed until those calls exist. The next slice should add
-the missing UniFFI decrypt/pairing operations, then back `prepare(envelope:)` and
-`signDecision(_:)` with real core calls and the persisted Keychain device credentials.
+`signDecision(_:)` still fails closed: native Secure-Enclave verdict signing is the next #23 child
+(#141). It will call UniFFI `sign_verdict_json` with the device signing seed and a random nonce after
+`prepare` has produced core-decrypted context. Pairing helpers (populating
+`NativeDeviceCredentials`, including the device encryption seed) and the wiring of the generated
+binding into the Xcode target also remain.
