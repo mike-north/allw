@@ -1,3 +1,14 @@
+export type { AllwWasm, WasmModuleSource } from "./wasm.js";
+export { initWasm, initWasmSync, resetWasmForTests } from "./wasm.js";
+
+export type {
+  ApproverIdentity,
+  AccountStateResolver,
+  WasmRuntimeOptions,
+  BrowserRuntimeOptions,
+} from "./runtime.js";
+export { createWasmRuntime, createBrowserRuntime } from "./runtime.js";
+
 export type ApprovalDecision = "approved" | "denied";
 
 export type ApprovalStatus = "pending" | "deciding" | "expired" | "unverified" | ApprovalDecision;

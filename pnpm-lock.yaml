@@ -98,6 +98,10 @@ importers:
         version: 22.19.20
 
   packages/web-approver:
+    dependencies:
+      '@allw/sdk':
+        specifier: workspace:*
+        version: link:../sdk
     devDependencies:
       '@types/jsdom':
         specifier: ^28.0.3
