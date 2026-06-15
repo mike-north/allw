@@ -10,11 +10,14 @@ This document covers:
 - account identity and the account-root trust anchor;
 - approver device enrollment and `device_cert` validation;
 - actor-key enrollment for requester attestation;
+- work-stream attestation: the work-stream label, the machine Secure-Enclave keypair (the cryptographic trust
+  root), and the asserted-not-verified harness session-ID (Decisions 4 + 5, #133);
 - device-key and account-root rotation;
 - revocation propagation through the relay and offline verifiers;
 - lost/replaced-device recovery.
 
-It informs relay pairing/authn work (#89) and actor-key attestation work (#16).
+It informs relay pairing/authn work (#89), actor-key attestation work (#16), and work-stream attestation
+(#133, which extends the actor-key model into a machine key + work-stream label — see §Work-Stream Attestation).
 
 Out of scope:
 
@@ -192,6 +195,181 @@ same root-signed document and highest-sequence revocation semantics as device tr
 verification all resolve trust through the same account-state document. A standalone `actor_cert` remains an
 option for future flows that need the trust material to ride inside the request envelope, but v1 anchors through
 account state.
+
+## Work-Stream Attestation
+
+> **Status:** design spec (CEO roadmap Decisions 4 + 5, 2026-06-13; tracked in #133, post-v1). This section
+> _extends_ the actor-key model above; it does not replace it. Where it refines a term, it says so explicitly.
+
+The actor-key model above answers **"which machine signed this request?"** Work-stream attestation answers the
+question the human actually reads in the inbox: **"which _stream of work_ is asking?"** — e.g. _"Codex on
+devbox-1 / refactor-auth"_. The two compose: the machine key is the cryptographic trust root, and the
+work-stream label is the human-meaningful unit that trust is anchored _to_. The design's whole job is to keep the
+boundary between **cryptographically verified** and **merely asserted** honest, so the inbox never overstates what
+it knows.
+
+### Decision 4 — the attested unit is the work-stream LABEL
+
+The unit of attested identity shown in the inbox is the **work-stream label**, not the agent binary. A human
+reasoning about "should I approve this?" reasons about a _stream of work_ ("the refactor-auth run Codex is doing
+on devbox-1"), not about which executable emitted the call. The label is therefore a first-class, structured
+field — not free-form display text.
+
+A work-stream label has three components:
+
+```jsonc
+{
+  "machine": "devbox-1", // human name of the machine (mirrors the machine actor's label)
+  "harness": "codex", // the tool harness / agent kind running the stream (e.g. "codex", "claude-code")
+  "stream": "refactor-auth", // the human-meaningful stream/session name (free text the harness emits)
+}
+```
+
+The inbox renders these as **"{harness} on {machine} / {stream}"** (e.g. _"Codex on devbox-1 / refactor-auth"_).
+Each component carries a **different trust weight** (see Decision 5), and the renderer MUST reflect that — the
+label is not uniformly trusted just because it is one string on screen.
+
+**Relationship to `session_label`.** The contract already carries a `session_label` at the `ApprovalRequest`
+envelope level as a **structure** field (`docs/contract.md` §Messages; `docs/policy-seam.md` §Structure vs.
+data). The work-stream label is the **structured, trust-tiered refinement** of that field: `session_label`
+remains the relay-visible structure string (the `"{harness} on {machine} / {stream}"` rendering, or a compatible
+opaque token), while the components above and their per-component trust live inside the JWE `ApprovalContext` and
+the machine attestation (below), never widening what the relay sees. The structure-not-data boundary is
+unchanged: the relay may see the label string as structure; it never sees action data, and it is never the trust
+anchor for the label.
+
+### Decision 5 — the two-part origin signal
+
+A request's origin is asserted by **two independent signals with different trust weights**:
+
+| Signal                               | What it proves                                          | Trust weight                   |
+| ------------------------------------ | ------------------------------------------------------- | ------------------------------ |
+| **Machine Secure-Enclave keypair**   | _which machine_ produced the request                    | **cryptographically verified** |
+| **Deterministic harness session-ID** | _which stream/session_ on that machine (asserted by it) | **asserted, NOT verified**     |
+
+#### Part 1 — the machine Secure-Enclave keypair (cryptographic trust root)
+
+The cryptographic trust root for "which machine" is a **machine-level keypair held in the Secure Enclave /
+StrongBox** of the requesting machine. **This is the actor key of #16, sharpened:** what the existing model calls
+the _actor_ is, in the work-stream model, precisely the **machine**. The composition with #16 is explicit and
+reuses the existing machinery rather than forking it:
+
+- The machine keypair is enrolled **exactly as an actor key is** — as an `actors` entry in **root-signed
+  account state** (§Account State, §Actor-Key Enrollment). It is **not** a new, separate key class and **not** a
+  separately-rooted trust anchor. The `actor_id` is the machine identity (e.g. `machine:devbox-1`); the
+  `kind`/`label` metadata names the machine. Anchoring, rotation, and revocation are the actor-key rules already
+  specified above — nothing new is invented for the machine key.
+- Each request carries a **machine attestation** — the actor-key attestation of #16
+  (`crates/allw-core/src/attestation.rs`, `typ = "allw-actor-attest+jws"`), signed by the machine's
+  Secure-Enclave key, bound to `(account_id, actor_id, actor_kind, request_id, request_hash)`. Verification is
+  unchanged: the approver device resolves the machine key from the highest valid-sequence root-signed
+  account-state document and verifies the attestation against it. A relay-supplied key never drives a verified
+  machine identity.
+- "Secure Enclave" is the **custody** of that key on the requesting machine (hardware-backed, non-exportable),
+  matching how approver _device_ signing keys are custodied (`docs/architecture.md`). It does not change the wire
+  format or the account-state anchoring — it strengthens the residual risk (a stolen machine key cannot be
+  exfiltrated as bytes), which the threat model notes.
+
+> **No design fork with #16/#71.** The machine key is the account-state-anchored actor key; the only change is
+> conceptual sharpening (actor → machine) plus naming the custody. The contract's `Actor` type, the
+> account-state `actors` schema, and the attestation verification path are all unchanged.
+
+#### Part 2 — the deterministic harness session-ID (asserted, NOT verified)
+
+The stream component of the label is anchored to a **deterministic session-ID emitted by the tool harness's
+hook** (e.g. a Claude Code or Codex hook that emits a stable id for the duration of one agent session). This id
+lets the inbox group, de-duplicate, and name a stream of work coherently.
+
+**This signal is asserted, not cryptographically verified — and the spec is deliberately precise about that:**
+
+- **The hook is a dumb emitter and holds no key** (`docs/architecture.md` §"Local execution: WASM, not native
+  binaries"; the hard constraint below). It emits a session-ID string; it does **not** sign anything.
+- The session-ID therefore reaches the allw client as **plaintext the harness asserted**. The client may include
+  it inside the machine attestation's signed payload (so the _machine_ vouches "I emitted a request carrying
+  session-ID X for stream Y"), but a machine-key signature over an asserted string only proves **the machine
+  forwarded that string** — it does **not** prove the harness authenticated the session, that the session-ID is
+  unforgeable, or that the stream name is truthful. There is no harness key, so there is no harness-level
+  cryptographic guarantee to be had.
+- Concretely: a compromised or misbehaving harness on an _enrolled, verified machine_ can assert any
+  `harness`/`stream`/session-ID it likes. The machine attestation will still verify (the machine is real); the
+  **stream identity is only as trustworthy as the machine's own software stack.** That is the honest ceiling, and
+  the inbox must present it as such.
+
+### The cryptographically-guaranteed vs. merely-asserted boundary
+
+This is the most important part of the spec. The inbox MUST present each component of a work-stream label at its
+true trust weight and **fail closed** on the asserted parts — never rendering an asserted-only signal as if it
+were cryptographically verified.
+
+| Label component              | Backed by                                       | Inbox trust marker                                                                             |
+| ---------------------------- | ----------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `machine` (which machine)    | machine Secure-Enclave key, root-anchored (#16) | **`✓ VERIFIED`** when, and only when, the machine attestation verifies (§Actor-Key Enrollment) |
+| `harness` (which agent kind) | asserted by the machine; no harness key         | **asserted** — shown as machine-asserted, never `✓ VERIFIED`                                   |
+| `stream` / session-ID        | asserted by the harness via a keyless hook      | **asserted** — shown as machine-asserted, never `✓ VERIFIED`                                   |
+
+Presentation rules (extend the existing `✓ VERIFIED` / `⚠ UNVERIFIED` discipline in
+`packages/approver/src/lib/render.ts` and `crates/allw-core/src/attestation.rs`):
+
+1. **Machine identity** uses the existing two-state origin discipline unchanged: `✓ VERIFIED` only when the
+   machine attestation verifies against the root-anchored machine key bound to this `request_id` + `request_hash`;
+   otherwise `⚠ UNVERIFIED` (fail-closed — absent / not-root-anchored / revoked / mismatched all render
+   unverified, never verified).
+2. **The stream/harness components are NEVER shown with the `✓ VERIFIED` marker.** They are rendered as
+   **asserted** — visibly distinct from a cryptographically verified origin (e.g. an `≈ ASSERTED` / "machine
+   asserts" treatment), so a human cannot mistake "the machine says this is the refactor-auth stream" for "this
+   stream is cryptographically proven."
+3. **Fail-closed composition.** A `✓ VERIFIED` machine with an asserted stream renders as _verified machine,
+   asserted stream_ — the verified marker does **not** bleed onto the stream. If the machine itself is
+   `⚠ UNVERIFIED`, the entire label (including the stream) is unverified; an asserted stream on an unverified
+   machine carries no independent trust and MUST NOT be elevated.
+4. **Never silently upgrade.** Absence of a session-ID, an unrecognized harness, or any parse failure degrades to
+   the asserted/unverified presentation — never to a more-trusted state.
+
+The one-line mental model: **the inbox can cryptographically trust _which machine_; it can only repeat what the
+machine _asserts_ about _which stream_.**
+
+### Hard constraint — crypto lives in the client, never in the hook
+
+All signing and verification for work-stream attestation happens in the **allw client downstream of the hook**
+(the WASM-under-`node` SDK/integrator, or a native client), **never in the hook itself.** The hook stays a **dumb
+emitter**: it produces a session-ID (and the raw action), and forwards them; it holds no key and performs no
+crypto. This is the same WASM-local + thin-surface constraint that governs the rest of the system
+(`docs/architecture.md` §"Local execution: WASM, not native binaries"): the machine Secure-Enclave key is used by
+the client, which is the audited core, so the keyless hook adds nothing to allowlist and cannot hold or leak a
+key. It is _because_ the hook is keyless that Part 2's session-ID is asserted-not-verified — the two facts are the
+same fact.
+
+### Reconciliation with #16 / #71 (actor-key attestation)
+
+Work-stream attestation **composes with, and does not duplicate or contradict,** the actor-key model:
+
+- **Machine key = actor key.** The "machine Secure-Enclave keypair" is the #16 actor key, anchored as an
+  `actors` entry in root-signed account state (#16 resolved; #104 wired relay distribution). Enrollment,
+  rotation, revocation, and the highest-sequence/fail-closed semantics are unchanged.
+- **Per-request binding is unchanged.** The machine attestation is the existing
+  `allw-actor-attest+jws`, bound to `(account_id, actor_id, actor_kind, request_id, request_hash)`, with the same
+  no-swap / no-lift protections.
+- **The label is additive.** The work-stream label (machine + harness + stream) is a refinement of the
+  envelope-level `session_label` structure field plus the machine-asserted components inside the
+  `ApprovalContext`. It introduces **no new root**, no new key class, and no new trust anchor — only a structured
+  label and an explicit per-component trust tiering on top of the verified machine identity.
+- **The verified-origin render extends, it doesn't override.** `verified_origin_string` /
+  `verify_actor_attestation_with_account_states` continue to govern the **machine** marker; the stream/harness
+  markers are new, weaker presentations that ride alongside and are never allowed to reach `✓ VERIFIED`.
+
+> **Open contract/type follow-ups (NOT implemented here — noted for arbitration/scheduling).** Realizing this
+> spec in code would imply: (a) a structured work-stream-label type (machine/harness/stream) layered over the
+> existing `session_label` string; and (b) a renderer change distinguishing `✓ VERIFIED` (machine) from an
+> `≈ ASSERTED` stream treatment. Both are forward-compatible (the machine attestation and account-state schemas
+> are untouched) and are deferred to implementation issues under #133 — this is a docs-only spec.
+
+### Open question (carried)
+
+**Session-ID harness coverage.** Which agent harnesses (Claude Code via #13, Codex via #97, …) can emit a
+_deterministic_ session-ID, and what the fallback is when a harness cannot. When no deterministic session-ID is
+available, the stream component degrades to the asserted/unknown presentation (fail-closed — never fabricated,
+never elevated); the machine identity is unaffected and still verifies. Tracked in the roadmap epic (#136) and
+this issue (#133). See also `docs/threat-model.md` §"Work-stream origin: machine verified, stream asserted".
 
 ## Account State
 
