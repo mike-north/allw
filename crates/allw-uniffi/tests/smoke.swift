@@ -116,5 +116,52 @@ struct Smoke {
         if !caughtExpectedError {
             fatalError("tampered verdict was accepted — Result→exception marshaling broken")
         }
+
+        // ── New (#140): prepare_approval_json fail-closed marshaling ─────────
+        // A valid JWE cannot be built in Swift (the FFI deliberately exposes no encryption), so the
+        // happy path is covered by Rust `ffi_smoke.rs`. Here we prove the `prepare` Result→throws
+        // marshaling works for the two input-only rejection paths the app depends on for
+        // fail-closed behavior: a malformed JWE and a wrong-length device encryption seed.
+        let prepareAccountRoot = accountRootPubkey
+        let validDeviceSeed = deviceSeed
+
+        var caughtMalformedJwe = false
+        do {
+            _ = try prepareApprovalJson(
+                contextCiphertext: "NOT A JWE {{{",
+                deviceId: "dev-1",
+                deviceEncryptionSeedB64: validDeviceSeed,
+                requestId: "req-1",
+                accountId: "acct-1",
+                expiresAt: 4_102_444_800_000,
+                accountStates: [],
+                accountRootPubkeyB64: prepareAccountRoot
+            )
+        } catch {
+            caughtMalformedJwe = true
+        }
+        if !caughtMalformedJwe {
+            fatalError("prepare accepted a malformed JWE — fail-closed marshaling broken")
+        }
+
+        let shortSeed = base64urlEncode([UInt8](repeating: 0, count: 16))
+        var caughtShortSeed = false
+        do {
+            _ = try prepareApprovalJson(
+                contextCiphertext: "{}",
+                deviceId: "dev-1",
+                deviceEncryptionSeedB64: shortSeed,
+                requestId: "req-1",
+                accountId: "acct-1",
+                expiresAt: 4_102_444_800_000,
+                accountStates: [],
+                accountRootPubkeyB64: prepareAccountRoot
+            )
+        } catch {
+            caughtShortSeed = true
+        }
+        if !caughtShortSeed {
+            fatalError("prepare accepted a 16-byte device seed — fail-closed marshaling broken")
+        }
     }
 }

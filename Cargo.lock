@@ -71,6 +71,7 @@ version = "0.0.0"
 dependencies = [
  "allw-core",
  "base64",
+ "rand_chacha",
  "serde",
  "serde_json",
  "thiserror",
