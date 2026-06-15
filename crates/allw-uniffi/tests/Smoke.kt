@@ -3,6 +3,7 @@ import uniffi.allw_uniffi.computeRequestHashB64
 import uniffi.allw_uniffi.deriveDeviceKeysJson
 import uniffi.allw_uniffi.deriveSigningPubkeyB64
 import uniffi.allw_uniffi.issueDeviceCertJson
+import uniffi.allw_uniffi.prepareApprovalJson
 import uniffi.allw_uniffi.signVerdictJson
 import uniffi.allw_uniffi.verifyVerdictJson
 import uniffi.allw_uniffi.AllwFfiException
@@ -75,4 +76,31 @@ fun main() {
         caughtExpectedError = true
     }
     check(caughtExpectedError) { "tampered verdict was accepted — Result→exception marshaling broken" }
+
+    // ── New (#140): prepare_approval_json fail-closed marshaling ─────────────
+    // A valid JWE cannot be built in Kotlin (the FFI exposes no encryption); the happy path is
+    // covered by Rust `ffi_smoke.rs`. Here we prove the `prepare` Result→exception marshaling works
+    // for the two input-only rejection paths: a malformed JWE and a wrong-length device seed.
+    var caughtMalformedJwe = false
+    try {
+        prepareApprovalJson(
+            "NOT A JWE {{{", "dev-1", deviceSeed, "req-1", "acct-1",
+            4_102_444_800_000L, emptyList(), accountRootPubkey
+        )
+    } catch (_: AllwFfiException) {
+        caughtMalformedJwe = true
+    }
+    check(caughtMalformedJwe) { "prepare accepted a malformed JWE — fail-closed marshaling broken" }
+
+    val shortSeed = base64urlEncode(ByteArray(16) { 0 })
+    var caughtShortSeed = false
+    try {
+        prepareApprovalJson(
+            "{}", "dev-1", shortSeed, "req-1", "acct-1",
+            4_102_444_800_000L, emptyList(), accountRootPubkey
+        )
+    } catch (_: AllwFfiException) {
+        caughtShortSeed = true
+    }
+    check(caughtShortSeed) { "prepare accepted a 16-byte device seed — fail-closed marshaling broken" }
 }

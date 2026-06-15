@@ -17,6 +17,9 @@ struct ApprovalInboxStoreTests {
         try await testDoubleSubmitProducesOnlyOneSignature()
         try await testDeniedOnlyRequestRejectsApproval()
         try await testTerminalDecisionSurvivesLaterEmptySync()
+        try await testUniFfiRuntimePreparesVerifiedContextFromCoreJson()
+        try await testUniFfiRuntimePreparesUnverifiedOriginAsDenyOnly()
+        try await testUniFfiRuntimeMapsCoreDecryptFailureToUnverified()
         try await testCredentialStorePersistsPairedDeviceCredentials()
         try await testAccountStateFloorRejectsRollbackBelowStoredSequence()
         try await testAccountStateFloorRequiresRelayMaxSequenceToBeVerified()
@@ -65,6 +68,84 @@ struct ApprovalInboxStoreTests {
             try await store.decide("req-bad", decision: .approved)
         )
         try expect(runtime.signInputs.isEmpty)
+    }
+
+    // MARK: UniFfiApproverRuntime.prepare() — core-JSON decode + verified/asserted mapping
+
+    /// A core prepare result with a verified attestation maps to a `.pending`, approvable row whose
+    /// render model carries the decrypted command, the core-computed hash/expiry, and the verified
+    /// origin. Proves the thin-shell runtime decodes the canonical core context JSON correctly.
+    static func testUniFfiRuntimePreparesVerifiedContextFromCoreJson() async throws {
+        let core = FakeCoreBinding()
+        core.result = CorePreparedApproval(
+            contextJson: Self.coreContextJson(
+                summary: "force push to main",
+                challengeRequired: true
+            ),
+            requestHashB64: "hash-verified",
+            expiresAt: 50_000,
+            attestationVerified: true,
+            challengeCode: "482"
+        )
+        let runtime = Self.runtime(core: core)
+        let store = ApprovalInboxStore(runtime: runtime, nowMs: { 1_000 })
+
+        await store.sync([.fixture(id: "req-verified", expiresAt: 9_999)])
+
+        let detail = try unwrap(store.detail("req-verified"))
+        try expectEqual(detail.status, .pending)
+        try expectEqual(detail.attestation, .verified)
+        try expectEqual(detail.requestHash, "hash-verified")
+        // Core-verified expiry overrides the relay envelope's value.
+        try expectEqual(detail.expiresAt, 50_000)
+        try expect(detail.exactPlaintext.contains("git push --force"))
+        // Challenge derived by the core gates approval.
+        try expect(!store.canApprove("req-verified"))
+        try expect(store.canApprove("req-verified", challengeResponse: "482"))
+    }
+
+    /// An unverified origin (core reports `attestationVerified == false`) is NOT an error: the
+    /// context still renders, but the row is `.unverified` and cannot be approved (deny-only).
+    static func testUniFfiRuntimePreparesUnverifiedOriginAsDenyOnly() async throws {
+        let core = FakeCoreBinding()
+        core.result = CorePreparedApproval(
+            contextJson: Self.coreContextJson(summary: "delete prod db", challengeRequired: false),
+            requestHashB64: "hash-unverified",
+            expiresAt: 50_000,
+            attestationVerified: false,
+            challengeCode: nil
+        )
+        let runtime = Self.runtime(core: core)
+        let store = ApprovalInboxStore(runtime: runtime, nowMs: { 1_000 })
+
+        await store.sync([.fixture(id: "req-unverified", expiresAt: 9_999)])
+
+        let detail = try unwrap(store.detail("req-unverified"))
+        try expectEqual(detail.status, .unverified)
+        try expectEqual(detail.attestation, .unverified)
+        try expect(detail.denyOnly)
+        try expect(!store.canApprove("req-unverified"))
+        try await expectThrows(
+            try await store.decide("req-unverified", decision: .approved)
+        )
+    }
+
+    /// A core decrypt/hash failure surfaces as a thrown error → the store renders `.unverified`
+    /// (fail-closed). No prepared context, no plaintext, never approvable.
+    static func testUniFfiRuntimeMapsCoreDecryptFailureToUnverified() async throws {
+        let core = FakeCoreBinding()
+        core.error = FakeCoreError.decryptFailed
+        let runtime = Self.runtime(core: core)
+        let store = ApprovalInboxStore(runtime: runtime, nowMs: { 1_000 })
+
+        await store.sync([.fixture(id: "req-bad-jwe", expiresAt: 9_999)])
+
+        let detail = try unwrap(store.detail("req-bad-jwe"))
+        try expectEqual(detail.status, .unverified)
+        try expect(!store.canApprove("req-bad-jwe"))
+        try await expectThrows(
+            try await store.decide("req-bad-jwe", decision: .approved)
+        )
     }
 
     static func testNumberMatchMustBeCorrectBeforeApprovalSigns() async throws {
@@ -360,6 +441,61 @@ struct ApprovalInboxStoreTests {
     #endif
 }
 
+// MARK: - UniFfiApproverRuntime test helpers
+
+private extension ApprovalInboxStoreTests {
+    static func runtime(core: FakeCoreBinding) -> UniFfiApproverRuntime {
+        UniFfiApproverRuntime(
+            credentials: .fixture(),
+            trust: AccountTrustMaterial(
+                accountStateJws: ["state-jws"],
+                accountRootPubkeyB64: "root-pubkey"
+            ),
+            core: core
+        )
+    }
+
+    /// Canonical core `ApprovalContext` wire JSON (snake_case) for a command surface — the exact
+    /// shape `prepare_approval_json`'s `context_json` produces.
+    static func coreContextJson(summary: String, challengeRequired: Bool) -> String {
+        """
+        {"action":{"record_schema_version":1,"surface":"command","syntactic":{"bin":"git","argv":["git","push","--force"],"cwd":"/repo","raw":"git push --force origin main"},"risk":"critical"},"summary":"\(summary)","actor":{"id":"machine:macbook-pro","kind":"claude-code"},"risk":"critical","reversible":false,"constraints":{"allowed_decisions":["approved","denied"],"challenge_required":\(challengeRequired ? "true" : "false")}}
+        """
+    }
+}
+
+private enum FakeCoreError: Error {
+    case decryptFailed
+}
+
+private final class FakeCoreBinding: UniFfiCoreBinding, @unchecked Sendable {
+    var result: CorePreparedApproval?
+    var error: Error?
+    private(set) var lastDeviceEncryptionSeedB64: String?
+    private(set) var lastRequestId: String?
+
+    func prepare(
+        contextCiphertext: String,
+        deviceId: String,
+        deviceEncryptionSeedB64: String,
+        requestId: String,
+        accountId: String,
+        expiresAt: Int64,
+        accountStateJws: [String],
+        accountRootPubkeyB64: String
+    ) throws -> CorePreparedApproval {
+        lastDeviceEncryptionSeedB64 = deviceEncryptionSeedB64
+        lastRequestId = requestId
+        if let error {
+            throw error
+        }
+        guard let result else {
+            throw FakeCoreError.decryptFailed
+        }
+        return result
+    }
+}
+
 private final class RecordingRuntime: ApproverCoreRuntime {
     var prepared: [String: PreparedApproval] = [:]
     var prepareErrors: [String: Error] = [:]
@@ -454,6 +590,7 @@ private extension NativeDeviceCredentials {
             deviceId: "dev-1",
             deviceAuthToken: "device-token",
             deviceSigningSeedB64: "signing-seed",
+            deviceEncryptionSeedB64: "encryption-seed",
             deviceCert: "device-cert"
         )
     }

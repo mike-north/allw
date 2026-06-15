@@ -5,9 +5,10 @@
 
 use allw_core::{
     action_from_command as core_action_from_command,
-    compute_request_hash as core_compute_request_hash,
+    compute_request_hash as core_compute_request_hash, decrypt_context as core_decrypt_context,
     derive_number_match_challenge as core_derive_number_match_challenge,
     issue_device_cert as core_issue_device_cert, sign_verdict as core_sign_verdict,
+    verify_actor_attestation_with_account_states as core_verify_actor_attestation,
     verify_verdict as core_verify_verdict, ApprovalContext, ApprovalRequest, Approver,
     CommandContext, Decision, InMemoryNonceStore, PublicKey, SigningKeyPair, UnsignedVerdict,
     Verdict, X25519KeyPair,
@@ -58,6 +59,26 @@ struct VerifiedVerdictJson {
     approver: Approver,
     decided_at: i64,
     nonce_b64: String,
+}
+
+/// The device-prepared WYSIWYS payload returned by [`prepare_approval_json`].
+///
+/// `context_json` is the decrypted [`ApprovalContext`] re-serialized as the canonical core wire
+/// JSON (the surface decodes it into its render model). `request_hash_b64` and `expires_at` are the
+/// **device-computed** WYSIWYS binding — never trusted from the relay envelope. `attestation_verified`
+/// reports whether the actor origin is cryptographically root-anchored (the verified-vs-asserted
+/// distinction); a `false` here is *not* a `prepare` failure — the context still decrypted and the
+/// human may see a deny-only render — only a decrypt/hash failure returns `Err`.
+#[derive(Serialize)]
+struct PreparedApprovalJson {
+    context_json: String,
+    request_hash_b64: String,
+    expires_at: i64,
+    attestation_verified: bool,
+    /// The number-match challenge code derived from `request_hash` when the context requires one
+    /// (`constraints.challenge_required`), else `None`. Derived here (core op) so the surface gets
+    /// the full WYSIWYS render payload from one composed call and never recomputes it.
+    challenge_code: Option<String>,
 }
 
 fn parse_json<T: for<'de> Deserialize<'de>>(json: &str, what: &str) -> Result<T, AllwFfiError> {
@@ -134,6 +155,98 @@ pub fn compute_request_hash_b64(
 ) -> Result<String, AllwFfiError> {
     let context: ApprovalContext = parse_json(&context_json, "ApprovalContext")?;
     Ok(URL_SAFE_NO_PAD.encode(core_compute_request_hash(&context, expires_at)))
+}
+
+/// Prepare a relay approval envelope for WYSIWYS rendering on this device — the composed
+/// decrypt + recompute-hash + verify-attestation step the native approver calls after an APNs
+/// wakeup (issue #140, parent #23).
+///
+/// This is a **thin shell**: it reuses [`allw_core`] for every security-critical operation and
+/// reimplements none of it. In order:
+///
+/// 1. **Decrypt** `context_ciphertext` (the envelope JWE) to the [`ApprovalContext`] with the
+///    device's long-term X25519 **encryption** key ([`decrypt_context`](core_decrypt_context)).
+///    The device key is derived from `device_encryption_seed_b64`, which is **distinct** from the
+///    Ed25519 signing seed used for verdicts.
+/// 2. **Recompute** the WYSIWYS `request_hash` device-side over the decrypted context bound to the
+///    envelope's `expires_at` ([`compute_request_hash`](core_compute_request_hash)) — the relay's
+///    copy is never trusted.
+/// 3. **Verify** the actor attestation against **root-signed account state**
+///    ([`verify_actor_attestation_with_account_states`](core_verify_actor_attestation)), anchoring
+///    the actor key to `account_root_pubkey_b64` for `account_id` and binding it to `request_id` +
+///    the recomputed `request_hash`. The result is reported as `attestation_verified` so the surface
+///    can render `✓ VERIFIED` vs `⚠ UNVERIFIED` (the verified-vs-asserted distinction).
+///
+/// # Fail-closed
+///
+/// Any **decrypt** failure (malformed/forged JWE, wrong key, tampered ciphertext) or malformed
+/// input returns `Err` — never a partial "looks-approved" state (`docs/contract.md` §Invariants #1,
+/// #6). An **attestation** failure is *not* an `Err`: the context decrypted authentically, so the
+/// device returns the prepared payload with `attestation_verified = false`, letting the surface show
+/// a deny-only, unverified-origin render. Approval gating on that state is the store's job.
+///
+/// `account_states` are the root-signed `allw-account-state+jws` documents the device fetched;
+/// `account_root_pubkey_b64` is the configured account root (base64url Ed25519 public key). Both
+/// must come from device-trusted material, never from un-anchored relay metadata.
+#[uniffi::export]
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_approval_json(
+    context_ciphertext: String,
+    device_id: String,
+    device_encryption_seed_b64: String,
+    request_id: String,
+    account_id: String,
+    expires_at: i64,
+    account_states: Vec<String>,
+    account_root_pubkey_b64: String,
+) -> Result<String, AllwFfiError> {
+    // ── Step 1: decrypt the JWE to the ApprovalContext (fail-closed on any decrypt error) ──
+    let device_seed =
+        decode_seed_b64_32(&device_encryption_seed_b64, "device_encryption_seed_b64")?;
+    let device_key = X25519KeyPair::from_seed(&device_seed);
+    let context: ApprovalContext =
+        core_decrypt_context(&context_ciphertext, &device_id, &device_key)
+            .map_err(|e| AllwFfiError::failure(format!("context decryption failed: {e}")))?;
+
+    // ── Step 2: recompute the WYSIWYS request_hash device-side (never trust the relay's copy) ──
+    let request_hash = core_compute_request_hash(&context, expires_at);
+
+    // ── Step 3: verify the actor attestation against root-signed account state ──
+    // A verification failure is reported (verified-vs-asserted), not raised: the context already
+    // decrypted authentically, so the surface may still render a deny-only unverified row.
+    let account_root_bytes = decode_b64_32(&account_root_pubkey_b64, "account_root_pubkey_b64")?;
+    let account_root = PublicKey::from_bytes(&account_root_bytes)
+        .map_err(|e| AllwFfiError::failure(format!("invalid account_root_pubkey_b64: {e}")))?;
+    let account_state_refs: Vec<&str> = account_states.iter().map(String::as_str).collect();
+    // Any AttestationError is a fail-closed "unverified origin", not a prepare failure.
+    let attestation_verified = core_verify_actor_attestation(
+        &context.actor,
+        &account_id,
+        &request_id,
+        &request_hash,
+        &account_state_refs,
+        &account_root,
+    )
+    .is_ok();
+
+    // Derive the number-match challenge code from the recomputed hash when the context requires one
+    // (the same core derivation the verdict path uses), so the surface renders WYSIWYS in one call.
+    let challenge_code = if context.constraints.challenge_required {
+        Some(core_derive_number_match_challenge(&request_hash))
+    } else {
+        None
+    };
+
+    to_json(
+        &PreparedApprovalJson {
+            context_json: to_json(&context, "ApprovalContext")?,
+            request_hash_b64: URL_SAFE_NO_PAD.encode(request_hash),
+            expires_at,
+            attestation_verified,
+            challenge_code,
+        },
+        "PreparedApproval",
+    )
 }
 
 #[uniffi::export]

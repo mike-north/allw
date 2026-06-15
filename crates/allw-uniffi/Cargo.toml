@@ -30,3 +30,10 @@ uniffi = { version = "0.31.1", features = ["cli"] }
 # decoded seed in `Zeroizing<>` so Drop zeroes the bytes (issue #90). 1.8.x is already in the
 # lockfile via x25519-dalek's `zeroize` feature, so this adds no new transitive tree.
 zeroize = "1"
+
+[dev-dependencies]
+# Deterministic CSPRNG for building real JWE fixtures in the prepare() smoke tests. `encrypt_context`
+# takes an injected `CryptoRng + RngCore` (the core never links an OS RNG), so the test supplies a
+# fixed-seed ChaCha20 stream — matching the core's own jwe.rs test convention. Already in the
+# lockfile via allw-core's dev-deps, so this adds no new transitive tree.
+rand_chacha = "0.3"
