@@ -18,11 +18,15 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "build:deps": "pnpm --filter @allw/sdk build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint src",
-    "test": "tsc -p tsconfig.json && node --test \"test/**/*.test.mjs\""
+    "test": "pnpm run build:deps && tsc -p tsconfig.json && node --test \"test/**/*.test.mjs\""
   },
   "license": "MIT",
+  "dependencies": {
+    "@allw/sdk": "workspace:*"
+  },
   "devDependencies": {
     "@types/jsdom": "^28.0.3",
     "jsdom": "^29.1.1"
