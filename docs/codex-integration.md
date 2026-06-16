@@ -146,14 +146,21 @@ The hook reads the same allw environment as the Claude Code hook:
 For gated calls, the hook builds the syntactic `ActionRecord`, requests approval through
 `@allw/sdk`, and returns Codex's `hookSpecificOutput.permissionDecision`:
 
-| allw result                              | Codex decision |
-| ---------------------------------------- | -------------- |
-| verified verdict `decision === approved` | `allow`        |
-| verified `denied`, `expired`, `aborted`  | `deny`         |
-| malformed gated input                    | `deny`         |
-| missing or invalid allw config           | `deny`         |
-| relay/network/approval error             | `deny`         |
-| non-gated tool                           | `allow`        |
+| allw result                              | Codex decision | `hookSpecificOutput.denyReason` |
+| ---------------------------------------- | -------------- | ------------------------------- |
+| verified verdict `decision === approved` | `allow`        | _(absent)_                      |
+| verified verdict `decision === denied`   | `deny`         | `no-approval`                   |
+| verified verdict `decision === expired`  | `deny`         | `timeout`                       |
+| verified verdict `decision === aborted`  | `deny`         | `aborted`                       |
+| malformed gated input / ActionRecord     | `deny`         | `build-error`                   |
+| missing or invalid allw config           | `deny`         | `config-error`                  |
+| relay/network/approval error             | `deny`         | `transport-error`               |
+| malformed hook stdin                     | `deny`         | `input-parse-error`             |
+| non-gated tool                           | `allow`        | _(absent)_                      |
+
+On deny decisions, `denyReason` carries a machine-readable category so operators can distinguish
+why the hook blocked an action without parsing the human-readable `permissionDecisionReason` string.
+The deny decision itself is unaffected — fail-closed semantics are unchanged.
 
 Codex itself fails open if a command hook fails to emit a well-formed, exit-0
 `permissionDecision`: startup failure, malformed stdout, process crash, SIGKILL, or Codex's hook

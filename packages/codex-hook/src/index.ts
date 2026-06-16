@@ -24,6 +24,7 @@ export {
   type CodexHookSpecificOutput,
   type CodexPreToolUseInput,
   type CodexPreToolUseOutput,
+  type DenyReason,
   type ParseResult,
   type PermissionDecision,
 } from "./lib/codex-io.js";

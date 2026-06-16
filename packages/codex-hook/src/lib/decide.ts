@@ -14,6 +14,7 @@ import {
   denyOutput,
   type CodexPreToolUseInput,
   type CodexPreToolUseOutput,
+  type DenyReason,
 } from "./codex-io.js";
 
 /** The minimal verdict shape read from `@allw/sdk`. */
@@ -120,7 +121,7 @@ export async function decide(
     return allowOutput(gate.reason);
   }
   if (gate.kind === "build-error") {
-    return denyOutput(gate.reason);
+    return denyOutput(gate.reason, "build-error");
   }
 
   const req = buildApprovalRequest(
@@ -131,7 +132,10 @@ export async function decide(
     input.toolUseId,
   );
   if (req === null) {
-    return denyOutput("allw: built ActionRecord was not in the expected shape (fail-closed deny)");
+    return denyOutput(
+      "allw: built ActionRecord was not in the expected shape (fail-closed deny)",
+      "build-error",
+    );
   }
 
   let verdict: ApprovalVerdict;
@@ -142,11 +146,22 @@ export async function decide(
       `allw: approval request failed (fail-closed deny): ${
         err instanceof Error ? err.message : String(err)
       }`,
+      "transport-error",
     );
   }
 
   if (verdict.decision === "approved") {
     return allowOutput(`allw: ${gate.summary} — approved by the human`);
   }
-  return denyOutput(`allw: ${gate.summary} — not approved (verdict: ${verdict.decision})`);
+
+  const verdictDenyReason: DenyReason =
+    verdict.decision === "denied"
+      ? "no-approval"
+      : verdict.decision === "expired"
+        ? "timeout"
+        : "aborted";
+  return denyOutput(
+    `allw: ${gate.summary} — not approved (verdict: ${verdict.decision})`,
+    verdictDenyReason,
+  );
 }
