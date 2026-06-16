@@ -9,6 +9,8 @@ export type {
 } from "./runtime.js";
 export { createWasmRuntime, createBrowserRuntime } from "./runtime.js";
 
+export { mountAuditHistory } from "./audit-history.js";
+
 export type ApprovalDecision = "approved" | "denied";
 
 export type ApprovalStatus = "pending" | "deciding" | "expired" | "unverified" | ApprovalDecision;
@@ -126,6 +128,28 @@ export interface ApprovalDetail extends ApprovalListItem {
   readonly challenge?: NumberMatchChallenge;
 }
 
+/**
+ * A resolved audit-history record: an `ApprovalDetail` extended with `decidedAt` and a
+ * chain-integrity status derived from what the runtime could verify. This is the type consumed by
+ * the audit-history view; it is read-only and never carries an approvable action.
+ *
+ * `chainStatus` is fail-closed: any record that could not be fully verified by the WASM core during
+ * `prepare` renders as `"broken"`, never as `"verified"`. Records the core successfully prepared
+ * render as `"verified"` (the chain link was intact at prepare time). The history view must make
+ * broken/unverifiable records visually prominent and must never display them as approved-looking.
+ *
+ * @see docs/contract.md §Audit chain
+ */
+export interface AuditHistoryItem extends ApprovalDetail {
+  /** Unix-ms at which the controller recorded the terminal decision (or `undefined` when resolved
+   *  by the relay before this device processed it — the envelope's `resolved_at` covers that). */
+  readonly decidedAt?: number;
+  /** Chain integrity from the runtime's `prepare` pass.
+   *  - `"verified"` — the core processed this record without error.
+   *  - `"broken"` — `prepare` threw (tampered/undecryptable/unverifiable); fail-closed. */
+  readonly chainStatus: "verified" | "broken";
+}
+
 interface ApprovalRecord {
   readonly envelope: ApprovalEnvelope;
   readonly expiresAt: number;
@@ -164,6 +188,25 @@ export class WebApproverController {
 
   history(): readonly ApprovalListItem[] {
     return this.#list(["approved", "denied"]);
+  }
+
+  /**
+   * Returns resolved decisions for the audit-history view, sorted most-recent first.
+   * Each item carries the full {@link AuditHistoryItem} including `chainStatus` and `decidedAt`.
+   * Read-only: the audit history view must never expose approve/deny controls for these items.
+   * Fail-closed: records the core could not prepare render with `chainStatus: "broken"` and
+   * `denyOnly: true`, so the UI cannot display them as approved-looking evidence.
+   */
+  auditHistory(): readonly AuditHistoryItem[] {
+    return Array.from(this.#records.values())
+      .filter((record) => record.status === "approved" || record.status === "denied")
+      .map((record) => this.#toAuditHistoryItem(record))
+      .sort((left, right) => {
+        // Most-recent decision first; fall back to expiresAt for relay-resolved records.
+        const leftAt = left.decidedAt ?? left.expiresAt;
+        const rightAt = right.decidedAt ?? right.expiresAt;
+        return rightAt - leftAt;
+      });
   }
 
   detail(id: string): ApprovalDetail | undefined {
@@ -344,6 +387,22 @@ export class WebApproverController {
       return { ...input, challengeResponse };
     }
     return input;
+  }
+
+  /**
+   * Map a resolved `ApprovalRecord` to an `AuditHistoryItem`. `chainStatus` is derived from
+   * whether `prepare` succeeded: records without a `prepared` value had a prepare error ⇒ broken.
+   * The audit history view must render broken records with fail-closed language and visual
+   * prominence — never as approved-looking evidence (see `docs/contract.md` §Invariants #6).
+   */
+  #toAuditHistoryItem(record: ApprovalRecord): AuditHistoryItem {
+    const detail = this.#toDetail(record);
+    const chainStatus: AuditHistoryItem["chainStatus"] = record.prepared ? "verified" : "broken";
+    const base: AuditHistoryItem = { ...detail, chainStatus };
+    if (record.decidedAt !== undefined) {
+      return { ...base, decidedAt: record.decidedAt };
+    }
+    return base;
   }
 }
 
