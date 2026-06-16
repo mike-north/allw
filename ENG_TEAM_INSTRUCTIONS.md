@@ -7,11 +7,17 @@ runs the review/merge gate; these rules exist so work flows through it without f
 ## Claiming work
 
 1. The work queue is **open GitHub issues labelled `greenlit`** — see "Issue labels" below for the
-   full scheme and how to order your pick. Epics group related work; claim their child issues,
-   never the epic itself.
-2. **Claim before working**: add the `in progress` label AND post a one-line claim comment on the
-   issue. An issue labeled `in progress` belongs to someone else — pick a different one.
-3. One issue per PR (`Closes #N`). If a PR closes several issues, claim and label all of them.
+   full scheme. Read the ranked ready queue **deterministically** with `gh-queue.mjs list`
+   (the `github-fleet-tools` plugin) — don't hand-rank or eyeball the issue list. Epics group
+   related work; claim their child issues, never the epic itself.
+2. **Claim before working**: run `gh-queue.mjs ground-truth <N>` first; if safe, add the
+   `in progress` label AND post a one-line claim comment (`issue-label.sh` / `issue-comment.sh`).
+   An issue labeled `in progress` belongs to someone else — pick a different one.
+3. One issue per PR. Reference it with **`Refs #N`, never `Closes #N`/`Fixes #N`** — GitHub parses
+   closing keywords anywhere in the body and will close the `epic` tracking parents out from under
+   the queue. The PM/orchestrator closes the issue on merge once its acceptance criteria are
+   demonstrably met. (Use `Closes #N` only when the PR genuinely completes the issue's _full_
+   criteria — e.g. a standalone non-tracker issue.)
 4. If you stop work without finishing: remove the label and comment what state you left it in.
 5. Before opening a PR, check open PRs — if one already exists for the issue, **do not open a
    duplicate**; comment on the existing PR instead.
@@ -21,10 +27,21 @@ runs the review/merge gate; these rules exist so work flows through it without f
 The queue is **label-driven**, not a hand-maintained list — so the same scheme works across every
 issue. The PM triages; you read the labels.
 
-**An issue is claimable when it is open, labelled `greenlit`, and _not_ labelled `in progress` or
-`blocked`.** `greenlit` is the readiness signal: the PM applies it once a ticket is fully scoped,
+**An issue is claimable when it is open, labelled `greenlit`, and carries none of the exclude
+labels below.** `greenlit` is the readiness signal: the PM applies it once a ticket is fully scoped,
 has acceptance criteria, and is unblocked. **No `greenlit` ⇒ not ready** — don't pick it up (it may
 still be under design or awaiting a decision); ping the PM if you think it should be greenlit.
+
+The detection engine (`gh-queue.mjs`) is exclude-based; for this repo it's configured so its ready
+set equals the greenlit set:
+
+```
+PLEF_PRIORITY_LABELS="P0,P1,P2"
+PLEF_EXCLUDE_LABELS="in progress,blocked,epic,backlog,needs-decision"
+```
+
+The PM keeps these in sync — every not-ready open issue carries an exclude label, and every ready
+one carries `greenlit`.
 
 Among greenlit issues, pick the **highest priority first**:
 
@@ -38,11 +55,16 @@ Priority **orders** the greenlit queue; it does not by itself mean "ready" (a ti
 prioritised but not yet greenlit). The milestone (`v1`, …) is the _target release_; the priority
 label is the _urgency_.
 
-**Lifecycle labels** (these remove an issue from the ready set):
+**Lifecycle / exclude labels** (these remove an issue from the ready set):
 
 - `in progress` — claimed by someone (rule 2).
-- `blocked` — has an unmet dependency or an open design question; not claimable until the PM clears
-  it. If you discover a blocker mid-flight, add `blocked`, remove `in progress`, and comment why.
+- `blocked` — has an unmet dependency, an open design question, or is waiting on a human step; not
+  claimable until the PM clears it. If you discover a blocker mid-flight, add `blocked`, remove
+  `in progress`, and comment why.
+- `needs-decision` — ranked but design-unresolved. This is how a ticket can be **high-priority yet
+  not ready**: the product/PM may file a `P0`/`P1` with `needs-decision` ahead of engineering; it
+  sorts high but is never picked up until the PM resolves it and adds `greenlit`.
+- `backlog` — deferred to a later cycle; not for pickup.
 
 **Type labels** tell you what the deliverable is: `epic` (tracker — never claimed directly),
 `type:spec` (a design/spec doc under `docs/`, not implementation), `enhancement` (feature),
@@ -117,3 +139,20 @@ The PM keeps this scheme current; if a label is missing or ambiguous, ask rather
     within minutes. Status updates on pushes are appreciated and speed up re-review.
 24. These instructions evolve; the PM updates this file as conventions emerge. When a PR comment
     from the PM conflicts with this file, the PR comment wins (it's newer and case-specific).
+
+## Fleet loop (detection-with-code, response-through-bounded-tools)
+
+25. **Implementers stop at PR-open.** Pick up exactly one issue, build to its acceptance criteria in
+    an isolated worktree off `origin/main`, open the PR, comment its link on the issue, and **stop**.
+    Do **not** self-address review comments — the PM/orchestrator runs the review cycle. Continuing
+    tends to push an un-formatted "fix" that bypasses review and fails CI.
+26. **Every review comment gets a reply before merge** (what changed, or why you respectfully
+    didn't), and addressed threads get resolved (`pr-reply-resolve.sh` / `pr-resolve-threads.sh`).
+    Disagreement is fine; silence is debt.
+27. **Detection is deterministic; writes are bounded.** Read state with `gh-queue.mjs`
+    (`list` / `ground-truth <N>` / `status`) — never hand-diff the issue list in an agent's head.
+    Mutate only through the bounded `github-fleet-tools` verbs (`issue-label.sh`, `issue-comment.sh`,
+    `pr-create.sh`, `pr-merge.sh`, `issue-close.sh`, …). Arbitrary `gh api` stays human-gated.
+28. **Never touch release/Version PRs** (e.g. an automated "Release packages" PR) — their blocked
+    state is a deliberate human release gate. Never flip repo visibility, publish packages locally,
+    or add/modify repo secrets; releases happen only through CI.
