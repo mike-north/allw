@@ -8,7 +8,7 @@
  */
 
 import { hostname as osHostname } from "node:os";
-import { realpathSync } from "node:fs";
+import { appendFileSync, realpathSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { createClient, type ClientConfig } from "@allw/sdk";
@@ -20,6 +20,7 @@ import {
   denyOutput,
   parseCodexHookInput,
   type CodexPreToolUseOutput,
+  type DenyReason,
 } from "./lib/codex-io.js";
 
 /** Test-only SDK transport seams; production uses SDK defaults. */
@@ -50,6 +51,27 @@ function emit(output: CodexPreToolUseOutput): void {
 }
 
 /**
+ * Append a single deny-reason log line to `.codex/allw-hook.log` in the given directory.
+ *
+ * The file is created if it does not exist. Errors are swallowed: log appending must never
+ * convert a deny into a process crash. The log is intentionally non-leaky — only the
+ * `denyReason` category and the `permissionDecisionReason` string are written, not raw input.
+ */
+function appendDenyLog(
+  cwd: string,
+  isoTimestamp: string,
+  denyReason: DenyReason,
+  detail: string,
+): void {
+  try {
+    const logPath = `${cwd}/.codex/allw-hook.log`;
+    appendFileSync(logPath, `${isoTimestamp} [allw] deny reason=${denyReason} detail=${detail}\n`);
+  } catch {
+    // Intentionally swallowed — log failure must never affect the deny decision.
+  }
+}
+
+/**
  * Run the Codex hook against raw stdin and an env map. Pure with respect to stdout for tests.
  *
  * Non-gated tools pass through before config is read, matching the Claude Code hook behavior.
@@ -61,7 +83,7 @@ export async function runCodexHook(
 ): Promise<CodexPreToolUseOutput> {
   const parsed = parseCodexHookInput(raw);
   if (!parsed.ok) {
-    return denyOutput(parsed.reason);
+    return denyOutput(parsed.reason, parsed.denyReason);
   }
 
   if (!isGatedTool(parsed.input.toolName)) {
@@ -72,7 +94,7 @@ export async function runCodexHook(
 
   const configResult = readConfig(env);
   if (!configResult.ok) {
-    return denyOutput(configResult.reason);
+    return denyOutput(configResult.reason, "config-error");
   }
   const config = configResult.config;
   const wasm = await loadWasm();
@@ -99,8 +121,24 @@ async function main(): Promise<void> {
       `allw: Codex hook failed unexpectedly (fail-closed deny): ${
         err instanceof Error ? err.message : String(err)
       }`,
+      "transport-error",
     );
   }
+
+  // Append a deny-reason line to the project log so operators can audit without parsing stdout.
+  const { hookSpecificOutput } = output;
+  if (
+    hookSpecificOutput.permissionDecision === "deny" &&
+    hookSpecificOutput.denyReason !== undefined
+  ) {
+    appendDenyLog(
+      process.cwd(),
+      new Date().toISOString(),
+      hookSpecificOutput.denyReason,
+      hookSpecificOutput.permissionDecisionReason,
+    );
+  }
+
   emit(output);
   process.exit(0);
 }

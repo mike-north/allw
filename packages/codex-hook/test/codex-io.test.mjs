@@ -4,6 +4,11 @@
  * These pin the current Codex hook schema documented at developers.openai.com/codex/hooks:
  * Codex sends one JSON object on stdin with `hook_event_name`, `tool_name`, `tool_input`, and
  * optional `cwd`; a PreToolUse denial/allow decision is returned under `hookSpecificOutput`.
+ *
+ * Deny outputs carry a `denyReason` category in `hookSpecificOutput` so operators can
+ * distinguish failure kinds without parsing the human-readable `permissionDecisionReason`.
+ *
+ * @see https://developers.openai.com/codex/hooks
  */
 
 import assert from "node:assert/strict";
@@ -47,20 +52,25 @@ test("parses MCP tool input verbatim", () => {
   assert.deepEqual(result.input.toolInput, { path: "/tmp/a", content: "hello" });
 });
 
-test("malformed stdin fails closed during parse", () => {
-  assert.equal(parseCodexHookInput("not json").ok, false);
-  assert.equal(parseCodexHookInput("[]").ok, false);
-  assert.equal(
-    parseCodexHookInput(JSON.stringify({ hook_event_name: "PostToolUse", tool_name: "Bash" })).ok,
-    false,
-  );
-  assert.equal(
-    parseCodexHookInput(JSON.stringify({ hook_event_name: "PreToolUse", tool_name: "" })).ok,
-    false,
-  );
+test("malformed stdin fails closed during parse with denyReason=input-parse-error", () => {
+  const cases = [
+    "not json",
+    "[]",
+    JSON.stringify({ hook_event_name: "PostToolUse", tool_name: "Bash" }),
+    JSON.stringify({ hook_event_name: "PreToolUse", tool_name: "" }),
+  ];
+  for (const raw of cases) {
+    const result = parseCodexHookInput(raw);
+    assert.equal(result.ok, false, `expected failure for: ${raw}`);
+    assert.equal(
+      result.denyReason,
+      "input-parse-error",
+      `expected denyReason=input-parse-error for: ${raw}`,
+    );
+  }
 });
 
-test("allowOutput and denyOutput emit the Codex PreToolUse hookSpecificOutput shape", () => {
+test("allowOutput emits the Codex PreToolUse hookSpecificOutput shape without denyReason", () => {
   assert.deepEqual(allowOutput("approved by allw"), {
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
@@ -68,12 +78,33 @@ test("allowOutput and denyOutput emit the Codex PreToolUse hookSpecificOutput sh
       permissionDecisionReason: "approved by allw",
     },
   });
+});
 
-  assert.deepEqual(denyOutput("blocked by allw"), {
+test("denyOutput emits the Codex PreToolUse hookSpecificOutput shape with denyReason", () => {
+  assert.deepEqual(denyOutput("blocked by allw", "no-approval"), {
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
       permissionDecision: "deny",
       permissionDecisionReason: "blocked by allw",
+      denyReason: "no-approval",
     },
   });
+});
+
+test("denyOutput carries all DenyReason categories correctly", () => {
+  /** @type {Array<import('../dist/lib/codex-io.js').DenyReason>} */
+  const reasons = [
+    "input-parse-error",
+    "config-error",
+    "build-error",
+    "transport-error",
+    "no-approval",
+    "timeout",
+    "aborted",
+  ];
+  for (const reason of reasons) {
+    const output = denyOutput("test", reason);
+    assert.equal(output.hookSpecificOutput.denyReason, reason);
+    assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  }
 });

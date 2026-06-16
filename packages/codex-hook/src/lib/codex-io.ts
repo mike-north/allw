@@ -16,6 +16,26 @@ export const HOOK_EVENT_NAME = "PreToolUse" as const;
 export type PermissionDecision = "allow" | "deny";
 
 /**
+ * Machine-readable category for the deny reason, surfaced in `hookSpecificOutput.denyReason`.
+ *
+ * - `input-parse-error` — stdin was malformed or missing required fields.
+ * - `config-error` — required allw env vars were absent or invalid.
+ * - `build-error` — the WASM core could not construct a valid `ActionRecord`.
+ * - `transport-error` — the approval relay request failed (network/SDK error).
+ * - `no-approval` — the human explicitly denied the request (`decision === "denied"`).
+ * - `timeout` — the approval request expired before the human responded (`decision === "expired"`).
+ * - `aborted` — the approval request was aborted (`decision === "aborted"`).
+ */
+export type DenyReason =
+  | "input-parse-error"
+  | "config-error"
+  | "build-error"
+  | "transport-error"
+  | "no-approval"
+  | "timeout"
+  | "aborted";
+
+/**
  * The validated subset of Codex PreToolUse input. Unknown fields are ignored; `toolInput` stays
  * `unknown` because Bash, MCP, and future tools each have their own shape.
  */
@@ -27,11 +47,18 @@ export interface CodexPreToolUseInput {
   readonly toolUseId?: string;
 }
 
-/** The `hookSpecificOutput` object Codex reads as a PreToolUse decision. */
+/**
+ * The `hookSpecificOutput` object Codex reads as a PreToolUse decision.
+ *
+ * On deny decisions, `denyReason` carries a machine-readable category so operators can
+ * distinguish no-approval from timeout from config errors without parsing the reason string.
+ */
 export interface CodexHookSpecificOutput {
   readonly hookEventName: typeof HOOK_EVENT_NAME;
   readonly permissionDecision: PermissionDecision;
   readonly permissionDecisionReason: string;
+  /** Present only on `deny` decisions; absent on `allow`. */
+  readonly denyReason?: DenyReason;
 }
 
 /** The full JSON stdout payload emitted by the hook. */
@@ -42,7 +69,7 @@ export interface CodexPreToolUseOutput {
 /** Parse result: either a validated input or the fail-closed reason to deny with. */
 export type ParseResult =
   | { readonly ok: true; readonly input: CodexPreToolUseInput }
-  | { readonly ok: false; readonly reason: string };
+  | { readonly ok: false; readonly reason: string; readonly denyReason: DenyReason };
 
 /** True for JSON objects whose fields can be inspected safely. */
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -50,12 +77,17 @@ function isObject(value: unknown): value is Record<string, unknown> {
 }
 
 /** Build a Codex PreToolUse output payload. */
-export function makeOutput(decision: PermissionDecision, reason: string): CodexPreToolUseOutput {
+export function makeOutput(
+  decision: PermissionDecision,
+  reason: string,
+  denyReason?: DenyReason,
+): CodexPreToolUseOutput {
   return {
     hookSpecificOutput: {
       hookEventName: HOOK_EVENT_NAME,
       permissionDecision: decision,
       permissionDecisionReason: reason,
+      ...(denyReason !== undefined ? { denyReason } : {}),
     },
   };
 }
@@ -65,9 +97,14 @@ export function allowOutput(reason: string): CodexPreToolUseOutput {
   return makeOutput("allow", reason);
 }
 
-/** Build a `deny` output. This is the default for every error or ambiguous gated path. */
-export function denyOutput(reason: string): CodexPreToolUseOutput {
-  return makeOutput("deny", reason);
+/**
+ * Build a `deny` output. This is the default for every error or ambiguous gated path.
+ *
+ * The `denyReason` parameter is required to ensure every deny path carries a machine-readable
+ * category that operators can use to distinguish the cause without parsing the reason string.
+ */
+export function denyOutput(reason: string, denyReason: DenyReason): CodexPreToolUseOutput {
+  return makeOutput("deny", reason, denyReason);
 }
 
 /**
@@ -81,10 +118,18 @@ export function parseCodexHookInput(raw: string): ParseResult {
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return { ok: false, reason: "allw: Codex hook input was not valid JSON (fail-closed deny)" };
+    return {
+      ok: false,
+      reason: "allw: Codex hook input was not valid JSON (fail-closed deny)",
+      denyReason: "input-parse-error",
+    };
   }
   if (!isObject(parsed)) {
-    return { ok: false, reason: "allw: Codex hook input was not a JSON object (fail-closed deny)" };
+    return {
+      ok: false,
+      reason: "allw: Codex hook input was not a JSON object (fail-closed deny)",
+      denyReason: "input-parse-error",
+    };
   }
 
   const eventName = parsed.hook_event_name;
@@ -94,6 +139,7 @@ export function parseCodexHookInput(raw: string): ParseResult {
       reason: `allw: unexpected Codex hook_event_name '${String(
         eventName,
       )}' (expected '${HOOK_EVENT_NAME}'; fail-closed deny)`,
+      denyReason: "input-parse-error",
     };
   }
 
@@ -102,6 +148,7 @@ export function parseCodexHookInput(raw: string): ParseResult {
     return {
       ok: false,
       reason: "allw: Codex hook input missing a string 'tool_name' (fail-closed deny)",
+      denyReason: "input-parse-error",
     };
   }
 

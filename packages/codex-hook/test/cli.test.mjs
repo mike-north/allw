@@ -2,7 +2,8 @@
  * End-to-end tests for `runCodexHook`, stopping at an injected SDK transport seam.
  *
  * These prove the process boundary remains fail-closed: malformed stdin and missing config produce
- * parseable `deny` decisions, while non-gated tools pass through without requiring allw env vars.
+ * parseable `deny` decisions with the correct machine-readable `denyReason`, while non-gated tools
+ * pass through without requiring allw env vars.
  */
 
 import assert from "node:assert/strict";
@@ -20,6 +21,10 @@ const CLI = join(here, "..", "dist", "cli.js");
 
 function decisionOf(output) {
   return output.hookSpecificOutput.permissionDecision;
+}
+
+function denyReasonOf(output) {
+  return output.hookSpecificOutput.denyReason;
 }
 
 function runCli(stdin, cliPath = CLI) {
@@ -53,14 +58,19 @@ function subprocessDecisionOf(stdout) {
   return JSON.parse(stdout).hookSpecificOutput.permissionDecision;
 }
 
-test("malformed stdin produces a Codex deny decision", async () => {
+function subprocessDenyReasonOf(stdout) {
+  return JSON.parse(stdout).hookSpecificOutput.denyReason;
+}
+
+test("malformed stdin produces a Codex deny with denyReason=input-parse-error", async () => {
   const output = await runCodexHook("not json", {});
 
   assert.equal(decisionOf(output), "deny");
   assert.match(output.hookSpecificOutput.permissionDecisionReason, /not valid JSON/);
+  assert.equal(denyReasonOf(output), "input-parse-error");
 });
 
-test("gated actions with missing config deny before relay access", async () => {
+test("gated actions with missing config deny with denyReason=config-error", async () => {
   const output = await runCodexHook(
     JSON.stringify({
       hook_event_name: "PreToolUse",
@@ -72,6 +82,7 @@ test("gated actions with missing config deny before relay access", async () => {
 
   assert.equal(decisionOf(output), "deny");
   assert.match(output.hookSpecificOutput.permissionDecisionReason, /ALLW_RELAY_URL/);
+  assert.equal(denyReasonOf(output), "config-error");
 });
 
 test("non-gated tools pass through without config", async () => {
@@ -85,6 +96,7 @@ test("non-gated tools pass through without config", async () => {
   );
 
   assert.equal(decisionOf(output), "allow");
+  assert.equal(denyReasonOf(output), undefined, "allow must not carry denyReason");
 });
 
 test("subprocess: non-gated Codex tool emits allow and exits 0 without config", async () => {
@@ -122,7 +134,7 @@ test("subprocess: installed symlinked bin emits allow and exits 0", async () => 
   }
 });
 
-test("subprocess: gated Codex Bash with missing config emits deny and exits 0", async () => {
+test("subprocess: gated Codex Bash with missing config emits deny with denyReason=config-error and exits 0", async () => {
   const { code, stdout } = await runCli(
     JSON.stringify({
       hook_event_name: "PreToolUse",
@@ -134,11 +146,13 @@ test("subprocess: gated Codex Bash with missing config emits deny and exits 0", 
   assert.equal(code, 0);
   assert.equal(subprocessDecisionOf(stdout), "deny");
   assert.match(JSON.parse(stdout).hookSpecificOutput.permissionDecisionReason, /ALLW_RELAY_URL/);
+  assert.equal(subprocessDenyReasonOf(stdout), "config-error");
 });
 
-test("subprocess: malformed Codex stdin emits deny and exits 0", async () => {
+test("subprocess: malformed Codex stdin emits deny with denyReason=input-parse-error and exits 0", async () => {
   const { code, stdout } = await runCli("not json");
 
   assert.equal(code, 0);
   assert.equal(subprocessDecisionOf(stdout), "deny");
+  assert.equal(subprocessDenyReasonOf(stdout), "input-parse-error");
 });
