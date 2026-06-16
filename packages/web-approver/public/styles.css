@@ -412,3 +412,226 @@ input {
   font-size: 13px;
   font-weight: 600;
 }
+
+/* ── Login / pairing-ceremony gate (issue #148) ────────────────────────────────────────────────
+   Color constants mirror tokens.css theme-light values (see design/web-approver/inbox/tokens.css).
+   Full CSS custom property migration is tracked in #162. ─────────────────────────────────────── */
+
+.pairing-shell {
+  max-width: 680px;
+  margin: 0 auto;
+  padding: 40px 24px;
+}
+
+.pairing-header {
+  margin-bottom: 32px;
+}
+
+.pairing-wordmark {
+  margin: 0;
+  font-size: 1.4rem;
+  font-weight: 700;
+  color: #1c1a15; /* --ink */
+}
+
+.pairing-screen {
+  border: 1px solid #e6e0d3; /* --border */
+  border-radius: 18px; /* --r-xl */
+  background: #ffffff; /* --surface */
+  padding: 32px;
+  display: grid;
+  gap: 20px;
+}
+
+.pairing-kicker {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #3b5bff; /* --accent */
+  background: rgba(59, 91, 255, 0.1); /* --accent-soft */
+  width: fit-content;
+  padding: 6px 10px;
+  border-radius: 999px; /* --r-pill */
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.pairing-headline {
+  margin: 0;
+  font-size: 2rem;
+  font-weight: 700;
+  color: #1c1a15; /* --ink */
+  line-height: 1.1;
+}
+
+.pairing-subcopy {
+  margin: 0;
+  color: #5c574c; /* --ink-2 */
+  font-size: 15px;
+  line-height: 1.55;
+}
+
+/* Device ticket (returning screen) */
+.pairing-device-ticket {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 14px;
+  border: 1px solid #e6e0d3; /* --border */
+  border-radius: 8px; /* --r-sm */
+  background: #faf7f0; /* --surface-2 */
+  padding: 14px 16px;
+}
+
+.pairing-device-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: #1c1a15; /* --ink */
+}
+
+.pairing-device-meta {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #908a7c; /* --ink-3 */
+  font-family: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+.pairing-status-pill {
+  color: #128a4e; /* --ok */
+  background: rgba(18, 138, 78, 0.1); /* --ok-soft */
+  border: 1px solid rgba(18, 138, 78, 0.3); /* --ok-edge */
+  border-radius: 999px; /* --r-pill */
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+/* Evidence / trust checklists */
+.pairing-evidence,
+.pairing-trust-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 8px;
+}
+
+.pairing-evidence-item,
+.pairing-trust-item {
+  display: flex;
+  gap: 10px;
+  color: #5c574c; /* --ink-2 */
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+.pairing-check {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  color: #128a4e; /* --ok */
+  background: rgba(18, 138, 78, 0.1); /* --ok-soft */
+  display: grid;
+  place-items: center;
+  font-size: 12px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+/* Pairing form */
+.pairing-form {
+  display: grid;
+  gap: 14px;
+}
+
+.pairing-field {
+  display: grid;
+  gap: 5px;
+}
+
+.pairing-label {
+  font-size: 13px;
+  font-weight: 700;
+  color: #5c574c; /* --ink-2 */
+}
+
+.pairing-input {
+  width: 100%;
+  padding: 9px 11px;
+  border: 1px solid #d6cfbe; /* --border-strong */
+  border-radius: 8px; /* --r-sm */
+  background: #faf7f0; /* --surface-2 */
+  color: #1c1a15; /* --ink */
+  font-size: 14px;
+  font-family: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+.pairing-input:focus {
+  outline: 2px solid #3b5bff; /* --accent */
+  outline-offset: 2px;
+}
+
+.pairing-submit-row {
+  margin-top: 4px;
+}
+
+/* Action buttons */
+.pairing-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.pairing-btn {
+  min-height: 42px;
+  border: 0;
+  border-radius: 8px; /* --r-sm */
+  padding: 0 16px;
+  font-size: 15px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.pairing-btn--primary {
+  color: #ffffff; /* --accent-ink */
+  background: #3b5bff; /* --accent */
+}
+
+.pairing-btn--secondary {
+  color: #1c1a15; /* --ink */
+  background: #faf7f0; /* --surface-2 */
+  border: 1px solid #e6e0d3; /* --border */
+}
+
+/* Error banner — fail-closed: always visible on validation failure */
+.pairing-error-banner {
+  border-radius: 8px; /* --r-sm */
+  padding: 10px 14px;
+  color: #cf3b2a; /* --no */
+  background: rgba(207, 59, 42, 0.1); /* --no-soft */
+  border: 1px solid rgba(207, 59, 42, 0.32); /* --no-edge */
+  font-size: 13px;
+  font-weight: 600;
+}
+
+@media (max-width: 480px) {
+  .pairing-shell {
+    padding: 24px 16px;
+  }
+
+  .pairing-screen {
+    padding: 20px;
+  }
+
+  .pairing-actions {
+    flex-direction: column;
+  }
+
+  .pairing-btn {
+    width: 100%;
+    text-align: center;
+  }
+}

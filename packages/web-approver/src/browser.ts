@@ -5,6 +5,7 @@ import {
   type ApprovalStatus,
   type WebApproverRuntime,
 } from "./index.js";
+import { mountPairingGate, type PairingStore } from "./pairing.js";
 import { createRelayPoller, type RelayPollerOptions } from "./relay-poll.js";
 
 /** Configuration for automatic relay polling. When supplied, `fetchInbox` is ignored. */
@@ -29,6 +30,15 @@ interface BrowserConfig {
    */
   readonly relay?: RelayPollConfig;
   readonly nowMs?: () => number;
+  /**
+   * When set, {@link mountWebApprover} first renders the login/pairing-ceremony gate (issue #148).
+   * The inbox is only rendered after the human has confirmed a valid stored identity or completed
+   * the pairing ceremony. The gate renders into the same `root` element and replaces itself with
+   * the inbox once pairing is confirmed.
+   *
+   * Omit to skip the gate (e.g. in tests that supply a pre-authenticated runtime directly).
+   */
+  readonly pairingStore?: PairingStore;
 }
 
 declare global {
@@ -55,6 +65,11 @@ export interface WebApproverMount {
 /**
  * Mount the web approver into `config.root`.
  *
+ * When `config.pairingStore` is provided (issue #148), the login/pairing-ceremony gate renders
+ * first. The inbox is only mounted after the human confirms a valid stored identity or completes
+ * the pairing ceremony. An unpaired or failed-pairing state **never** reaches the approve-capable
+ * inbox — fail-closed is structural.
+ *
  * When `config.relay` is provided the inbox is kept live via a relay poll loop (issue #147):
  * the poller fires an initial tick immediately, then polls every `pollIntervalMs` (default 2s).
  * On outage the last-known inbox is preserved with an error banner — never fail-open. The refresh
@@ -63,10 +78,38 @@ export interface WebApproverMount {
  * When only `config.fetchInbox` is provided (test harness / manual mode) a single fetch is done
  * on mount and the returned controller can be re-synced manually.
  *
- * Returns `{ controller, stop }`. `stop()` cancels the poll interval in the relay path so callers
- * can dispose the loop on unmount; in the manual path it is a no-op.
+ * Returns a Promise that resolves to `{ controller, stop }`. `stop()` cancels the poll interval
+ * in the relay path so callers can dispose the loop on unmount; in the manual path it is a no-op.
+ *
+ * When `pairingStore` is set the Promise resolves only after the gate hands off to the inbox —
+ * i.e. after the human completes the pairing ceremony or confirms the returning-device screen.
  */
 export async function mountWebApprover(config: BrowserConfig): Promise<WebApproverMount> {
+  // Pairing gate (issue #148): render login/pairing before the inbox when a store is provided.
+  // The Promise is resolved inside the `onPaired` callback, guaranteeing that the inbox is
+  // mounted only after a valid identity is confirmed — fail-closed is structural.
+  if (config.pairingStore) {
+    const pairingStore = config.pairingStore;
+    return new Promise<WebApproverMount>((resolve) => {
+      mountPairingGate({
+        root: config.root,
+        pairingStore,
+        onPaired: (_identity) => {
+          // Identity confirmed — now mount the inbox (without the gate).
+          void mountWebApproverInbox(config).then(resolve);
+        },
+      });
+    });
+  }
+
+  return mountWebApproverInbox(config);
+}
+
+/**
+ * The inner inbox-mount logic, separated so the pairing gate can call it after confirming an
+ * identity without triggering the gate again.
+ */
+async function mountWebApproverInbox(config: BrowserConfig): Promise<WebApproverMount> {
   const controllerOptions = {
     runtime: config.runtime,
     ...(config.nowMs ? { nowMs: config.nowMs } : {}),
