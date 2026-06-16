@@ -8,8 +8,9 @@
 
 use allw_core::{
     compute_request_hash, encrypt_context, sign_account_state, sign_actor_attestation,
-    AccountState, AccountStateActor, ActionRecord, Actor, ApprovalContext, Constraints,
-    ContextRecipient, Decision, Risk, SigningKeyPair, Surface, SyntacticSubstrate, X25519KeyPair,
+    AccountState, AccountStateActor, AccountStateRevocation, AccountStateRevocationKind,
+    ActionRecord, Actor, ApprovalContext, Constraints, ContextRecipient, Decision, Risk,
+    SigningKeyPair, Surface, SyntacticSubstrate, X25519KeyPair,
 };
 use allw_uniffi::{
     action_from_command_json, compute_request_hash_b64, derive_device_keys_json,
@@ -582,5 +583,69 @@ fn prepare_attestation_bound_to_other_request_is_unverified() {
     assert_eq!(
         out["attestation_verified"], false,
         "an attestation bound to a different request_id must not verify (cross-request no-swap)"
+    );
+}
+
+/// Defense-in-depth (ENG_TEAM_INSTRUCTIONS §14): a revoked actor in the highest-sequence
+/// account state ⇒ `attestation_verified = false`, not an `Err`.
+///
+/// The context decrypts authentically — revocation is an origin-verification failure, not a
+/// decrypt failure — so `prepare_approval_json` returns `Ok` with `attestation_verified = false`,
+/// letting the surface render a deny-only, unverified-origin row. This pins the FFI binding
+/// boundary for revocation handling that `allw-core` unit-tests internally
+/// (`AttestationError::ActorRevoked`), adding a second fail-closed guard at the binding layer.
+///
+/// Spec ref: `docs/contract.md` §Invariants #4 (Requester attestation), #6 (Fail-closed).
+/// @see docs/enrollment.md §Account State
+#[test]
+fn prepare_revoked_actor_yields_attestation_unverified_not_err() {
+    // Build the standard attested context (actor key is ACTOR_SEED, account root is ROOT_SEED).
+    let context = make_attested_context();
+    let jwe = encrypt_to_prep_device(&context);
+
+    // Build a root-signed account-state document at sequence 1 that explicitly revokes the actor.
+    // The revocation entry overrides any active key entry at the same sequence (highest-sequence
+    // revocation wins per `resolve_root_anchored_actor_key` in attestation.rs).
+    let revoked_state = AccountState {
+        v: 1,
+        account_id: PREP_ACCOUNT_ID.to_string(),
+        sequence: 1,
+        current_root: root_key().public_key().to_bytes(),
+        previous_roots: Vec::new(),
+        devices: Vec::new(),
+        // The actor key is still listed (as the resolver reaches the revocations check first),
+        // but the explicit revocation entry wins, marking the actor as inactive/revoked.
+        actors: vec![AccountStateActor {
+            actor_id: PREP_ACTOR_ID.to_string(),
+            kind: PREP_ACTOR_KIND.to_string(),
+            pubkey: actor_key().public_key().to_bytes(),
+            status: "active".to_string(),
+        }],
+        revocations: vec![AccountStateRevocation {
+            kind: AccountStateRevocationKind::Actor,
+            id: PREP_ACTOR_ID.to_string(),
+            revoked_at: 1_700_000_000_000,
+            reason: Some("compromised".to_string()),
+        }],
+    };
+    let revoked_account_states = vec![sign_account_state(&revoked_state, &root_key())];
+
+    // prepare_approval_json must succeed (decryption is independent of attestation) …
+    let out = call_prepare(jwe, DEVICE_ENC_SEED, revoked_account_states)
+        .expect("a decryptable envelope must prepare even when the actor is revoked");
+
+    // … but the revoked actor must not be shown as verified (fail-closed per §Invariants #4/#6).
+    assert_eq!(
+        out["attestation_verified"], false,
+        "a revoked actor in account state must yield attestation_verified=false (deny-only render)"
+    );
+
+    // The decrypted plaintext is still returned so the human can see and deny the request.
+    let context_json = out["context_json"]
+        .as_str()
+        .expect("context_json is a string");
+    assert!(
+        context_json.contains("force push to main"),
+        "the decrypted context must still be returned so the human can issue an explicit deny"
     );
 }
