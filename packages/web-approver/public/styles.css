@@ -134,3 +134,296 @@ input {
 .empty-state {
   color: #5f5f57;
 }
+
+/* ── Audit-history view ────────────────────────────────────────────────────────────────────────
+   CSS variables mirror design/web-approver/inbox/tokens.css (used verbatim per ENG rule 19).
+   The audit-history section is rendered below the inbox fold; it shares the same document root
+   so the tokens defined in styles.css are already available. Color constants below are taken
+   directly from tokens.css theme-light values. ─────────────────────────────────────────────── */
+
+.audit-history {
+  padding: 24px 0;
+}
+
+.audit-history__heading {
+  margin: 0 0 12px;
+  font-size: 1rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.audit-history__empty {
+  color: #5f5f57;
+}
+
+/* Chain cue — persistent header badge showing overall chain health */
+.audit-chain-cue {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.audit-chain-cue[data-chain-status="verified"] {
+  color: #128a4e; /* --ok */
+  background: rgba(18, 138, 78, 0.1); /* --ok-soft */
+  border: 1px solid rgba(18, 138, 78, 0.3); /* --ok-edge */
+}
+
+.audit-chain-cue[data-chain-status="broken"] {
+  color: #cf3b2a; /* --no */
+  background: rgba(207, 59, 42, 0.1); /* --no-soft */
+  border: 1px solid rgba(207, 59, 42, 0.32); /* --no-edge */
+}
+
+.audit-chain-cue__icon {
+  font-size: 14px;
+}
+
+/* Timeline list */
+.audit-history__list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 12px;
+}
+
+/* Each resolved-decision row */
+.audit-row {
+  display: grid;
+  grid-template-columns: 18px 140px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 10px;
+  border: 1px solid #d7d7cf; /* --border */
+  border-radius: 8px; /* --r-sm */
+  background: #ffffff; /* --surface */
+  padding: 12px;
+}
+
+.audit-row[data-chain-status="broken"] {
+  border-color: #cf3b2a; /* --no */
+}
+
+/* Rail dot */
+.audit-row__dot {
+  display: block;
+  margin-top: 4px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #128a4e; /* --ok */
+  box-shadow: 0 0 0 4px rgba(18, 138, 78, 0.1); /* --ok-soft ring */
+}
+
+.audit-row[data-chain-status="broken"] .audit-row__dot {
+  background: #cf3b2a; /* --no */
+  box-shadow: 0 0 0 4px rgba(207, 59, 42, 0.1); /* --no-soft ring */
+}
+
+/* Time */
+.audit-row__time {
+  font-family:
+    "IBM Plex Mono",
+    ui-monospace,
+    "SF Mono",
+    Menlo,
+    monospace; /* --font-mono */
+  font-size: 12px;
+  color: #908a7c; /* --ink-3 */
+  padding-top: 2px;
+}
+
+/* Summary / meta */
+.audit-row__main {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.audit-row__summary {
+  overflow: hidden;
+  font-size: 14px;
+  font-weight: 700;
+  color: #1c1a15; /* --ink */
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.audit-row__meta {
+  overflow: hidden;
+  font-size: 12px;
+  color: #908a7c; /* --ink-3 */
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Decision chip */
+.audit-decision-chip {
+  border: 1px solid #d7d7cf; /* --border */
+  border-radius: 999px; /* --r-pill */
+  padding: 4px 8px;
+  color: #5c574c; /* --ink-2 */
+  background: #ffffff; /* --surface */
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.audit-row[data-decision="approved"] .audit-decision-chip {
+  color: #128a4e; /* --ok */
+  background: rgba(18, 138, 78, 0.1); /* --ok-soft */
+  border-color: rgba(18, 138, 78, 0.3); /* --ok-edge */
+}
+
+.audit-row[data-decision="denied"] .audit-decision-chip {
+  color: #cf3b2a; /* --no */
+  background: rgba(207, 59, 42, 0.1); /* --no-soft */
+  border-color: rgba(207, 59, 42, 0.32); /* --no-edge */
+}
+
+/* Detail pane — spans full width below the row header */
+.audit-detail {
+  grid-column: 1 / -1;
+  margin-top: 8px;
+  padding-top: 12px;
+  border-top: 1px solid #eae5d9; /* --bg-tint */
+  display: grid;
+  gap: 10px;
+}
+
+/* Status grid: verdict signature, actor origin, request hash */
+.audit-status-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+@media (max-width: 600px) {
+  .audit-row {
+    grid-template-columns: 18px minmax(0, 1fr) auto;
+  }
+
+  .audit-row__time {
+    display: none;
+  }
+
+  .audit-status-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Evidence card */
+.audit-evidence {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  border: 1px solid #d7d7cf; /* --border */
+  border-radius: 8px; /* --r-sm */
+  background: #faf7f0; /* --surface-2 */
+  padding: 8px;
+}
+
+.audit-evidence__icon {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px; /* --r-sm */
+  color: #128a4e; /* --ok */
+  background: rgba(18, 138, 78, 0.1); /* --ok-soft */
+  font-size: 14px;
+}
+
+.audit-evidence--bad .audit-evidence__icon {
+  color: #cf3b2a; /* --no */
+  background: rgba(207, 59, 42, 0.1); /* --no-soft */
+}
+
+.audit-evidence__body {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.audit-evidence__label {
+  display: block;
+  color: #908a7c; /* --ink-3 */
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.audit-evidence__value {
+  display: block;
+  color: #1c1a15; /* --ink */
+  font-size: 12px;
+  font-weight: 700;
+  font-family:
+    "IBM Plex Mono",
+    ui-monospace,
+    "SF Mono",
+    Menlo,
+    monospace; /* --font-mono */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* WYSIWYS receipt */
+.audit-wysiwys {
+  border-radius: 8px; /* --r-sm */
+  background: #15140f; /* --code-bg */
+  color: #efede6; /* --code-ink */
+  padding: 12px;
+}
+
+.audit-wysiwys__label {
+  display: block;
+  color: #9a958a; /* --code-dim */
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.audit-wysiwys__pre {
+  margin: 8px 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family:
+    "IBM Plex Mono",
+    ui-monospace,
+    "SF Mono",
+    Menlo,
+    monospace; /* --font-mono */
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+/* Fail-closed banner — must be visually prominent for broken/unverifiable records */
+.audit-fail-closed {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-radius: 8px; /* --r-sm */
+  padding: 10px;
+  color: #cf3b2a; /* --no */
+  background: rgba(207, 59, 42, 0.1); /* --no-soft */
+  border: 1px solid rgba(207, 59, 42, 0.32); /* --no-edge */
+  font-size: 13px;
+  font-weight: 700;
+}
+
+/* Verification error text */
+.audit-verification-error {
+  margin: 0;
+  color: #8a1f1f;
+  font-size: 13px;
+  font-weight: 600;
+}
