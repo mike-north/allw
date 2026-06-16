@@ -1,6 +1,9 @@
 export type { AllwWasm, WasmModuleSource } from "./wasm.js";
 export { initWasm, initWasmSync, resetWasmForTests } from "./wasm.js";
 
+export type { PairingStore, PairingGateOptions } from "./pairing.js";
+export { createLocalPairingStore, mountPairingGate } from "./pairing.js";
+
 export type {
   FetchImpl as RelayFetchImpl,
   IntervalScheduler,
