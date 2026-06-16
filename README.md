@@ -10,6 +10,7 @@ governance layer that grows around it. See [`docs/`](./docs):
 - [contract.md](./docs/contract.md) — the approval-primitive contract (the keystone).
 - [enrollment.md](./docs/enrollment.md) — account/device enrollment, rotation, revocation, and recovery.
 - [policy-seam.md](./docs/policy-seam.md) — the seam to the (later) policy layer.
+- [decision-history.md](./docs/decision-history.md) — on-device, encrypted, ephemeral decision history and the reflection pass (post-v1).
 - [threat-model.md](./docs/threat-model.md) — adversaries, residual risks, and the security review checklist.
 
 ## Quickstart (zero → first approval)
