@@ -38,6 +38,14 @@ public final class ApprovalInboxStore {
             .map(toListItem)
     }
 
+    /// Ambient pending-approvals summary for the Live Activity / Dynamic Island surface
+    /// (`docs/architecture.md`). Derived from the same actionable inbox, so it expires and clears in
+    /// lockstep with the rows the human sees. Read-only: it carries a count and the soonest expiry,
+    /// never request plaintext or a decision.
+    public var ambientState: PendingApprovalsActivityState {
+        PendingApprovalsActivityState.derive(from: inbox)
+    }
+
     /// Terminal decisions retained for the eventual audit/history surface.
     public var history: [ApprovalListItem] {
         records.values
