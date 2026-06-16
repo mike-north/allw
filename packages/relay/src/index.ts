@@ -591,6 +591,11 @@ export class AccountRelay implements DurableObject {
       return this.handleDeviceRevoke(path1, request);
     }
 
+    // GET /devices/{device_id}/inbox — authenticated device polls its pending envelopes.
+    if (method === "GET" && path0 === "devices" && path1 !== "" && path2 === "inbox") {
+      return this.handleDeviceInbox(path1, request);
+    }
+
     // GET /devices/{device_id}/connect (WebSocket) — device presence + offline-queue flush.
     if (method === "GET" && path0 === "devices" && path1 !== "" && path2 === "connect") {
       if (!isWebSocketUpgrade(request)) {
@@ -628,6 +633,7 @@ export class AccountRelay implements DurableObject {
         path1 !== "" &&
         path2 === "revoke" &&
         (subSegments[3] ?? "") === "") ||
+      (path0 === "devices" && path1 !== "" && path2 === "inbox" && (subSegments[3] ?? "") === "") ||
       (path0 === "devices" &&
         path1 !== "" &&
         path2 === "connect" &&
@@ -1013,6 +1019,49 @@ export class AccountRelay implements DurableObject {
   // ---------------------------------------------------------------------------
   // Ciphertext routing + verdict relay (issue #11)
   // ---------------------------------------------------------------------------
+
+  /**
+   * GET /devices/{device_id}/inbox
+   *
+   * HTTP polling counterpart to the WebSocket offline-queue flush. Returns the full relay-visible
+   * envelope (routing/lifecycle + opaque `context_ciphertext`) for every pending, non-expired
+   * request addressed to this account, so a web-surface approver can poll on a 1–5s interval
+   * without holding a WebSocket connection (issue #147).
+   *
+   * The relay never sees plaintext (zero-knowledge invariant). The response is the same ciphertext
+   * the device would receive via the WebSocket offline-queue flush; the web approver decrypts on
+   * device. Fail-closed: only `pending` requests whose `expires_at > now` are returned — an
+   * already-expired request is never included (it cannot be approved; contract §Invariants #6).
+   *
+   * Auth: device bearer token (same token as `…/connect`).
+   * Returns 404 if the device is not enrolled, 401/403 on auth failure.
+   */
+  private async handleDeviceInbox(deviceId: string, request: Request): Promise<Response> {
+    const enrolled = [
+      ...this.sql.exec<DeviceRow>(
+        `SELECT device_id, auth_token_hash FROM device WHERE device_id = ?`,
+        deviceId,
+      ),
+    ];
+    const device = enrolled[0];
+    if (!device) {
+      return json({ error: "device not enrolled" }, 404);
+    }
+    const authFailure = await this.authorizeStoredHash(request, device.auth_token_hash);
+    if (authFailure) return authFailure;
+
+    const now = Date.now();
+    const pending = [
+      ...this.sql.exec<RequestRow>(
+        `SELECT request_id, envelope FROM request
+         WHERE status = 'pending' AND expires_at > ? ORDER BY created_at ASC`,
+        now,
+      ),
+    ];
+
+    const envelopes = pending.map((p) => JSON.parse(p.envelope) as unknown);
+    return json({ envelopes });
+  }
 
   /**
    * GET /devices/{device_id}/connect  (WebSocket upgrade)

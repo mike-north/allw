@@ -2,6 +2,17 @@ export type { AllwWasm, WasmModuleSource } from "./wasm.js";
 export { initWasm, initWasmSync, resetWasmForTests } from "./wasm.js";
 
 export type {
+  FetchImpl as RelayFetchImpl,
+  IntervalScheduler,
+  IntervalCanceller,
+  OnPollResult,
+  PollResult,
+  RelayPollerOptions,
+  RelayPoller,
+} from "./relay-poll.js";
+export { createRelayPoller } from "./relay-poll.js";
+
+export type {
   ApproverIdentity,
   AccountStateResolver,
   WasmRuntimeOptions,
