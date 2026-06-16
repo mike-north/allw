@@ -4,6 +4,9 @@
  * The hook must mirror the Claude Code hook's fail-closed mapping while using a distinct Codex
  * actor identity. Only a verified `approved` verdict becomes a Codex `allow`; denied, expired,
  * aborted, build failures, and approval transport errors all produce `deny`.
+ *
+ * Each deny path also carries a machine-readable `denyReason` category in `hookSpecificOutput`
+ * so operators can distinguish no-approval from timeout from config/build errors.
  */
 
 import assert from "node:assert/strict";
@@ -44,6 +47,10 @@ function decisionOf(output) {
   return output.hookSpecificOutput.permissionDecision;
 }
 
+function denyReasonOf(output) {
+  return output.hookSpecificOutput.denyReason;
+}
+
 test("approved Bash verdict allows Codex and carries a distinct Codex actor", async () => {
   const wasm = await loadWasm();
   const approver = recording("approved");
@@ -55,6 +62,7 @@ test("approved Bash verdict allows Codex and carries a distinct Codex actor", as
   );
 
   assert.equal(decisionOf(output), "allow");
+  assert.equal(denyReasonOf(output), undefined, "allow decisions must not carry denyReason");
   assert.equal(approver.calls.length, 1);
   assert.equal(approver.calls[0].actor.id, `codex:${HOSTNAME}`);
   assert.equal(approver.calls[0].actor.kind, "codex");
@@ -63,9 +71,16 @@ test("approved Bash verdict allows Codex and carries a distinct Codex actor", as
   assert.deepEqual(approver.calls[0].chain, ["codex:tool_use_id:call-1"]);
 });
 
-test("non-approved verdicts deny Codex fail-closed", async () => {
+test("non-approved verdicts deny Codex fail-closed with the correct denyReason", async () => {
   const wasm = await loadWasm();
-  for (const verdict of ["denied", "expired", "aborted"]) {
+
+  /** @type {Array<[string, import('../dist/lib/codex-io.js').DenyReason]>} */
+  const cases = [
+    ["denied", "no-approval"],
+    ["expired", "timeout"],
+    ["aborted", "aborted"],
+  ];
+  for (const [verdict, expectedDenyReason] of cases) {
     const output = await decide(
       bashInput("rm -rf build"),
       { wasm, config: CONFIG, requestApproval: () => Promise.resolve({ decision: verdict }) },
@@ -73,10 +88,15 @@ test("non-approved verdicts deny Codex fail-closed", async () => {
     );
     assert.equal(decisionOf(output), "deny", `${verdict} must deny`);
     assert.match(output.hookSpecificOutput.permissionDecisionReason, new RegExp(verdict));
+    assert.equal(
+      denyReasonOf(output),
+      expectedDenyReason,
+      `verdict '${verdict}' must map to denyReason '${expectedDenyReason}'`,
+    );
   }
 });
 
-test("approval transport errors deny Codex fail-closed", async () => {
+test("approval transport errors deny Codex fail-closed with denyReason=transport-error", async () => {
   const wasm = await loadWasm();
   const output = await decide(
     bashInput("rm -rf build"),
@@ -90,9 +110,10 @@ test("approval transport errors deny Codex fail-closed", async () => {
 
   assert.equal(decisionOf(output), "deny");
   assert.match(output.hookSpecificOutput.permissionDecisionReason, /relay unavailable/);
+  assert.equal(denyReasonOf(output), "transport-error");
 });
 
-test("malformed gated inputs deny before asking the approver", async () => {
+test("malformed gated inputs deny before asking the approver with denyReason=build-error", async () => {
   const wasm = await loadWasm();
   const approver = recording("approved");
 
@@ -103,6 +124,7 @@ test("malformed gated inputs deny before asking the approver", async () => {
   );
 
   assert.equal(decisionOf(output), "deny");
+  assert.equal(denyReasonOf(output), "build-error");
   assert.equal(approver.calls.length, 0);
 });
 
@@ -121,6 +143,7 @@ test("MCP tools are gated through the shared ActionRecord builder", async () => 
   );
 
   assert.equal(decisionOf(output), "allow");
+  assert.equal(denyReasonOf(output), undefined, "allow decisions must not carry denyReason");
   assert.equal(approver.calls[0].action.surface, "mcp_tool_call");
   assert.equal(approver.calls[0].action.syntactic.server, "filesystem");
   assert.equal(approver.calls[0].action.syntactic.tool, "write_file");
@@ -174,5 +197,6 @@ test("non-gated Codex tools pass through without config-time approval", async ()
   );
 
   assert.equal(decisionOf(output), "allow");
+  assert.equal(denyReasonOf(output), undefined, "allow decisions must not carry denyReason");
   assert.equal(approver.calls.length, 0);
 });

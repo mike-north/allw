@@ -166,7 +166,7 @@ function overrides(fetchImpl) {
   };
 }
 
-test("end-to-end: a WASM-signed approved verdict makes Codex emit allow", async () => {
+test("end-to-end: a WASM-signed approved verdict makes Codex emit allow without denyReason", async () => {
   const wasm = await loadWasm();
   const approver = await pairedApprover(wasm);
   const { fetchImpl } = relayDouble(wasm, approver, "approved");
@@ -180,9 +180,10 @@ test("end-to-end: a WASM-signed approved verdict makes Codex emit allow", async 
   assert.equal(output.hookSpecificOutput.hookEventName, "PreToolUse");
   assert.equal(output.hookSpecificOutput.permissionDecision, "allow");
   assert.match(output.hookSpecificOutput.permissionDecisionReason, /approved by the human/);
+  assert.equal(output.hookSpecificOutput.denyReason, undefined, "allow must not carry denyReason");
 });
 
-test("end-to-end: a WASM-signed denied verdict makes Codex emit deny", async () => {
+test("end-to-end: a WASM-signed denied verdict makes Codex emit deny with denyReason=no-approval", async () => {
   const wasm = await loadWasm();
   const approver = await pairedApprover(wasm);
   const { fetchImpl } = relayDouble(wasm, approver, "denied");
@@ -195,9 +196,10 @@ test("end-to-end: a WASM-signed denied verdict makes Codex emit deny", async () 
 
   assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
   assert.match(output.hookSpecificOutput.permissionDecisionReason, /verdict: denied/);
+  assert.equal(output.hookSpecificOutput.denyReason, "no-approval");
 });
 
-test("end-to-end: no approver response makes Codex emit fail-closed deny", async () => {
+test("end-to-end: no approver response makes Codex emit fail-closed deny with denyReason=timeout", async () => {
   const wasm = await loadWasm();
   const approver = await pairedApprover(wasm);
   const { fetchImpl } = relayDouble(wasm, approver, "timeout");
@@ -210,4 +212,5 @@ test("end-to-end: no approver response makes Codex emit fail-closed deny", async
 
   assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
   assert.match(output.hookSpecificOutput.permissionDecisionReason, /verdict: expired/);
+  assert.equal(output.hookSpecificOutput.denyReason, "timeout");
 });
