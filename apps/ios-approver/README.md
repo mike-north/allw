@@ -20,6 +20,33 @@ core through UniFFI.
   closed before it can drive verified actor rendering.
 - `acceptVerifiedAccountState`'s `verifiedSequence` must come from core JWS verification, never from
   relay `max_sequence` metadata.
+- Ambient pending-approval presence (Live Activity / Dynamic Island): the store derives a read-only
+  `PendingApprovalsActivityState` (pending count + soonest-expiry deadline) from the same actionable
+  inbox, and a `LiveActivityCoordinator` starts/updates/clears the surface so a resolved or expired
+  queue clears it (issue #143; ties to the cross-device retract in `docs/architecture.md`).
+
+## Ambient Live Activity / Dynamic Island (#143)
+
+The ambient surface is split so the load-bearing logic stays testable on the macOS CI host:
+
+- **`LiveActivityState.swift`** — `PendingApprovalsActivityState`, a platform-agnostic, crypto-free
+  value type (count + next-expiry deadline) plus `derive(from:)` over the actionable inbox. Only
+  `.pending` rows count; the soonest pending expiry drives the countdown; an empty queue is
+  `.cleared`.
+- **`LiveActivityController.swift`** — `LiveActivityCoordinator`, which owns the
+  start → update → clear-on-resolve decisions behind a `PendingApprovalsActivityPresenter` seam. It
+  never decides an approval and holds no crypto; it reflects state the store already computed.
+- **`PendingApprovalsActivityAttributes.swift` / `PendingApprovalsLiveActivity.swift` /
+  `ActivityKitPresenter.swift`** — the ActivityKit attributes, the WidgetKit Dynamic Island +
+  lock-screen UI, and the real presenter. These are `#if os(iOS)`-gated: ActivityKit's
+  `ActivityAttributes` is **unavailable on macOS** (even though `canImport(ActivityKit)` is true
+  there), so this surface compiles and validates **only in the Xcode/iOS build, not** the macOS
+  `swiftc` CI job. The testable state + coordinator above DO run on the CI host.
+
+WYSIWYS discipline: the ambient surface shows a count and an expiry countdown only — never the
+command, diff, or any request plaintext. Tapping deep-links into the app, which renders the
+core-prepared WYSIWYS detail and gates Secure-Enclave signing. No inline lock-screen "Approve"
+affordance is presented over content the surface cannot WYSIWYS-render.
 
 ## Local test
 
