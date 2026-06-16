@@ -40,6 +40,9 @@ struct ApprovalInboxStoreTests {
 
         // APNs wakeup → fetch envelope → inbox refresh (issue #142).
         try await PushInboxCoordinatorTests.run()
+
+        // Ambient Live Activity / Dynamic Island surface (#143).
+        try await runLiveActivityTests()
     }
 
     static func testSyncUsesPreparedExpiryInsteadOfRelayEnvelopeExpiry() async throws {
