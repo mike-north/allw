@@ -50,6 +50,40 @@ The `apps/ios-approver` package compiles standalone (its local `swiftc` validati
 generated bindings), so the runtime depends on the narrow `UniFfiCoreBinding` seam. The Xcode target
 wires that seam to the generated `prepareApprovalJson`; tests inject a fake.
 
+## APNs wakeup → fetch envelope → inbox refresh
+
+`PushInboxCoordinator` drives the push-delivered inbox lifecycle (issue #142):
+
+1. An **APNs wakeup** carries a **request id only** — never human-shown context
+   (`docs/contract.md` §Push). The coordinator does not trust the payload for rendering; it is only a
+   signal to refresh.
+2. The coordinator **fetches the relay-visible envelopes** through the `RelayInboxFetching` seam
+   (`GET /{account}/devices/{device}/inbox`, the HTTP polling counterpart to the presence socket).
+   The relay is zero-knowledge: the response is opaque `context_ciphertext`.
+3. The envelopes go to `ApprovalInboxStore.sync`, which runs each through the core `prepare()`
+   (decrypt + WYSIWYS hash + attestation verification in `allw-core`).
+4. The coordinator **reconciles notifications**: it presents a notification for every still-pending
+   request and clears notifications for request ids that resolved, expired, or became unverifiable.
+
+Fail-closed behaviour proved by tests:
+
+- A relay **fetch error** throws and leaves the existing inbox and notifications untouched — a
+  network blip never wipes a real pending approval or renders an approved-looking row.
+- A **tampered/malformed** relay response (e.g. an envelope missing its ciphertext) fails the whole
+  batch closed in `RelayInboxDecoder` rather than smuggling a half-formed request in.
+- An **unverifiable origin** decrypts to a deny-only `.unverified` row and is never presented as a
+  fresh actionable approval.
+
+Device push-token registration: `HexApnsTokenRegistrar` hex-encodes the raw APNs token (the relay
+accepts 64-char hex APNs tokens) and forwards it to the relay's pairing-complete `push_tokens`
+registration; the concrete HTTP call lives in the pairing flow, so the registrar is parameterized
+over an async sender to keep the package's standalone `swiftc` validation free of networking.
+
+CI-only validation: the real `UNUserNotificationCenter` notification surface, the `URLSession`-backed
+`UrlSessionRelayInboxClient`, and APNs delivery validate only in CI's macOS `native-bindings` job.
+The local `swiftc` run exercises the coordinator, the decoder, and the reconciliation logic against
+injected fakes.
+
 ## Deferred production wiring
 
 `signDecision(_:)` still fails closed: native Secure-Enclave verdict signing is the next #23 child

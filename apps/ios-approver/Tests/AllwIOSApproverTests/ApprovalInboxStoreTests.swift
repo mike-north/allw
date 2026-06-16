@@ -37,6 +37,9 @@ struct ApprovalInboxStoreTests {
         try await testKeychainAccountStateFloorRejectsNegativePersistedSequence()
         try await testKeychainPairedDeviceCredentialsAreThisDeviceOnly()
         #endif
+
+        // APNs wakeup → fetch envelope → inbox refresh (issue #142).
+        try await PushInboxCoordinatorTests.run()
     }
 
     static func testSyncUsesPreparedExpiryInsteadOfRelayEnvelopeExpiry() async throws {
