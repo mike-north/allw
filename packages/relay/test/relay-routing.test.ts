@@ -1230,6 +1230,153 @@ describe("AccountRelay — fail-closed expiry", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Device inbox (HTTP polling — issue #147)
+// ---------------------------------------------------------------------------
+
+describe("AccountRelay — device inbox (HTTP poll)", () => {
+  it("returns pending envelopes for the authenticated device", async () => {
+    const acct = "acct-inbox-basic";
+    const device = await pairDevice(acct);
+    const token = device.device_auth_token;
+    const envA = makeEnvelope("req-inbox-a");
+    const envB = makeEnvelope("req-inbox-b");
+    await post(acct, "/requests", envA);
+    await post(acct, "/requests", envB);
+
+    const resp = await get<{ envelopes: unknown[] }>(
+      acct,
+      `/devices/${device.device_id}/inbox`,
+      bearer(token),
+    );
+    expect(resp.status).toBe(200);
+    const ids = resp.data.envelopes.map((e) => (e as Record<string, unknown>).id);
+    expect(ids).toContain("req-inbox-a");
+    expect(ids).toContain("req-inbox-b");
+    // Zero-knowledge: only relay-visible envelope fields, never plaintext context
+    for (const env of resp.data.envelopes) {
+      const keys = Object.keys(env as Record<string, unknown>);
+      expect(keys).not.toContain("action");
+      expect(keys).not.toContain("summary");
+      expect(keys).not.toContain("actor");
+      expect(keys).toContain("context_ciphertext");
+    }
+  });
+
+  it("excludes resolved and expired requests from the inbox", async () => {
+    const acct = "acct-inbox-exclude";
+    const device = await pairDevice(acct);
+    const token = device.device_auth_token;
+
+    // Submit two requests; resolve one via the WebSocket.
+    await post(acct, "/requests", makeEnvelope("req-exclude-pending"));
+    await post(acct, "/requests", makeEnvelope("req-exclude-resolved"));
+    const wsDevice = await connectWs(acct, `/devices/${device.device_id}/connect`);
+    // drain both offline-queue messages
+    await wsDevice.next();
+    await wsDevice.next();
+    wsDevice.send({
+      type: "verdict",
+      request_id: "req-exclude-resolved",
+      verdict: makeVerdict("req-exclude-resolved"),
+    });
+    await wsDevice.next(); // ack
+
+    const resp = await get<{ envelopes: unknown[] }>(
+      acct,
+      `/devices/${device.device_id}/inbox`,
+      bearer(token),
+    );
+    expect(resp.status).toBe(200);
+    const ids = resp.data.envelopes.map((e) => (e as Record<string, unknown>).id);
+    expect(ids).toContain("req-exclude-pending");
+    expect(ids).not.toContain("req-exclude-resolved");
+  });
+
+  it("excludes already-expired requests from the inbox (fail-closed)", async () => {
+    const acct = "acct-inbox-expired";
+    const device = await pairDevice(acct);
+    const token = device.device_auth_token;
+
+    // Seed an expired request directly (POST /requests rejects already-expired).
+    await seedExpiredRequest(acct, "req-inbox-already-expired");
+    // Submit a live request.
+    await post(acct, "/requests", makeEnvelope("req-inbox-live"));
+
+    const resp = await get<{ envelopes: unknown[] }>(
+      acct,
+      `/devices/${device.device_id}/inbox`,
+      bearer(token),
+    );
+    expect(resp.status).toBe(200);
+    const ids = resp.data.envelopes.map((e) => (e as Record<string, unknown>).id);
+    expect(ids).not.toContain("req-inbox-already-expired");
+    expect(ids).toContain("req-inbox-live");
+  });
+
+  it("returns 401 without a bearer token", async () => {
+    const acct = "acct-inbox-noauth";
+    const device = await pairDevice(acct);
+
+    const resp = await SELF.fetch(relayUrl(acct, `/devices/${device.device_id}/inbox`), {
+      method: "GET",
+    });
+    expect(resp.status).toBe(401);
+  });
+
+  it("returns 403 with a wrong bearer token", async () => {
+    const acct = "acct-inbox-wrongauth";
+    const device = await pairDevice(acct);
+
+    const resp = await SELF.fetch(relayUrl(acct, `/devices/${device.device_id}/inbox`), {
+      method: "GET",
+      headers: { Authorization: "Bearer wrong-token" },
+    });
+    expect(resp.status).toBe(403);
+  });
+
+  it("returns 404 for an unenrolled device id", async () => {
+    const acct = "acct-inbox-notfound";
+    await pairDevice(acct);
+
+    const resp = await SELF.fetch(relayUrl(acct, `/devices/not-a-real-device/inbox`), {
+      method: "GET",
+      headers: { Authorization: "Bearer any-token" },
+    });
+    expect(resp.status).toBe(404);
+  });
+
+  it("405 on POST to the inbox route", async () => {
+    const acct = "acct-inbox-405";
+    const device = await pairDevice(acct);
+    const token = device.device_auth_token;
+
+    const resp = await SELF.fetch(relayUrl(acct, `/devices/${device.device_id}/inbox`), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: "{}",
+    });
+    expect(resp.status).toBe(405);
+  });
+
+  it("returns an empty array when no pending requests exist", async () => {
+    const acct = "acct-inbox-empty";
+    const device = await pairDevice(acct);
+    const token = device.device_auth_token;
+
+    const resp = await get<{ envelopes: unknown[] }>(
+      acct,
+      `/devices/${device.device_id}/inbox`,
+      bearer(token),
+    );
+    expect(resp.status).toBe(200);
+    expect(resp.data.envelopes).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Helpers that need a live DO query
 // ---------------------------------------------------------------------------
 
