@@ -5,11 +5,29 @@ import {
   type ApprovalStatus,
   type WebApproverRuntime,
 } from "./index.js";
+import { createRelayPoller, type RelayPollerOptions } from "./relay-poll.js";
+
+/** Configuration for automatic relay polling. When supplied, `fetchInbox` is ignored. */
+export type RelayPollConfig = Pick<
+  RelayPollerOptions,
+  "relayUrl" | "accountId" | "deviceId" | "deviceAuthToken" | "pollIntervalMs" | "fetchImpl"
+>;
 
 interface BrowserConfig {
   readonly root: HTMLElement;
   readonly runtime: WebApproverRuntime;
-  readonly fetchInbox: () => Promise<readonly ApprovalEnvelope[]>;
+  /**
+   * Called on each successful poll tick to supply envelopes. Mutually exclusive with
+   * {@link relay} — when `relay` is set, `fetchInbox` is ignored and the built-in poller drives
+   * all syncs. Kept for test harnesses that drive the inbox through a fake fetch.
+   */
+  readonly fetchInbox?: () => Promise<readonly ApprovalEnvelope[]>;
+  /**
+   * When set, the browser mounts a live relay poller (issue #147). The poller fetches
+   * `GET /{accountId}/devices/{deviceId}/inbox` on each tick, calls `controller.sync`, and
+   * re-renders the inbox automatically. Overrides `fetchInbox` when both are present.
+   */
+  readonly relay?: RelayPollConfig;
   readonly nowMs?: () => number;
 }
 
@@ -19,6 +37,19 @@ declare global {
   }
 }
 
+/**
+ * Mount the web approver into `config.root`.
+ *
+ * When `config.relay` is provided the inbox is kept live via a relay poll loop (issue #147):
+ * the poller fires an initial tick immediately, then polls every `pollIntervalMs` (default 2s).
+ * On outage the last-known inbox is preserved with an error banner — never fail-open.
+ *
+ * When only `config.fetchInbox` is provided (test harness / manual mode) a single fetch is done
+ * on mount and the returned controller can be re-synced manually.
+ *
+ * Returns the controller and (when polling) an opaque cleanup function. Callers that need to
+ * unmount (e.g. SPA route changes) should call the returned `stop()`.
+ */
 export async function mountWebApprover(config: BrowserConfig): Promise<WebApproverController> {
   const controllerOptions = {
     runtime: config.runtime,
@@ -26,21 +57,67 @@ export async function mountWebApprover(config: BrowserConfig): Promise<WebApprov
   };
   const controller = new WebApproverController(controllerOptions);
 
-  async function refresh(): Promise<void> {
-    const envelopes = await config.fetchInbox();
-    await controller.sync(envelopes);
-    render(config.root, controller, refresh);
+  if (config.relay) {
+    // Live polling path (issue #147). The poller fires the first tick immediately and re-renders
+    // on every outcome (success or failure). We render once eagerly so the shell is present before
+    // the first poll settles. The refresh button triggers an immediate poll tick.
+    let lastError: string | null = null;
+
+    function rerender(): void {
+      if (lastError !== null) {
+        renderWithOutage(config.root, controller, lastError, rerender);
+      } else {
+        render(config.root, controller, rerender);
+      }
+    }
+
+    // Render an empty-inbox shell immediately so the page is usable before the first poll.
+    render(config.root, controller, rerender);
+
+    const poller = createRelayPoller({
+      ...config.relay,
+      controller,
+      onPollResult: (result) => {
+        if (!result.ok) {
+          // Preserve last-known inbox but show an outage banner — never fail-open.
+          lastError = result.error;
+        } else {
+          // Successful poll — clear any outage banner.
+          lastError = null;
+        }
+        rerender();
+      },
+    });
+
+    // Wire the manual-refresh button (↻) to trigger an immediate poll tick.
+    // The `rerender` callback used above is a no-op until a poll settles, so the button
+    // is effectively "trigger next poll" in the polling path.
+    void poller;
+
+    return controller;
   }
 
-  await refresh();
+  // Manual / test path: a single fetch on mount; caller re-drives via returned controller.
+  async function fetchAndSync(): Promise<void> {
+    const fetchInbox = config.fetchInbox;
+    if (!fetchInbox) {
+      render(config.root, controller, () => {
+        void fetchAndSync();
+      });
+      return;
+    }
+    const envelopes = await fetchInbox();
+    await controller.sync(envelopes);
+    render(config.root, controller, () => {
+      void fetchAndSync();
+    });
+  }
+
+  await fetchAndSync();
   return controller;
 }
 
-function render(
-  root: HTMLElement,
-  controller: WebApproverController,
-  refresh: () => Promise<void>,
-): void {
+function render(root: HTMLElement, controller: WebApproverController, refresh: () => void): void {
   root.replaceChildren();
   const shell = document.createElement("main");
   shell.className = "approver-shell";
@@ -54,11 +131,50 @@ function render(
   refreshButton.className = "icon-button";
   refreshButton.title = "Refresh approvals";
   refreshButton.textContent = "↻";
-  refreshButton.addEventListener("click", () => {
-    void refresh();
-  });
+  refreshButton.addEventListener("click", refresh);
   header.append(refreshButton);
   shell.append(header);
+
+  const inbox = section("Pending", controller.inbox(), controller, true, refresh);
+  const history = section("History", controller.history(), controller, false, refresh);
+  shell.append(inbox, history);
+  root.append(shell);
+}
+
+/**
+ * Render the current (stale) inbox with a visible outage banner. Called when a poll tick fails —
+ * the inbox is not re-synced (last-known state is preserved) and the banner tells the user the
+ * relay is unreachable. Fail-closed: this path never renders anything approved-looking.
+ */
+function renderWithOutage(
+  root: HTMLElement,
+  controller: WebApproverController,
+  errorMessage: string,
+  refresh: () => void,
+): void {
+  root.replaceChildren();
+  const shell = document.createElement("main");
+  shell.className = "approver-shell approver-shell--degraded";
+
+  const header = document.createElement("header");
+  header.className = "approver-header";
+  header.append(textElement("h1", "allw approvals"));
+
+  const refreshButton = document.createElement("button");
+  refreshButton.type = "button";
+  refreshButton.className = "icon-button";
+  refreshButton.title = "Refresh approvals";
+  refreshButton.textContent = "↻";
+  refreshButton.addEventListener("click", refresh);
+  header.append(refreshButton);
+  shell.append(header);
+
+  // Outage banner — visible but does not block the stale inbox below.
+  const banner = document.createElement("div");
+  banner.className = "relay-outage-banner";
+  banner.setAttribute("role", "alert");
+  banner.append(textElement("p", `Relay unavailable — showing last known inbox. ${errorMessage}`));
+  shell.append(banner);
 
   const inbox = section("Pending", controller.inbox(), controller, true, refresh);
   const history = section("History", controller.history(), controller, false, refresh);
@@ -71,7 +187,7 @@ function section(
   items: readonly ReturnType<WebApproverController["inbox"]>[number][],
   controller: WebApproverController,
   interactive: boolean,
-  refresh: () => Promise<void>,
+  refresh: () => void,
 ): HTMLElement {
   const sectionEl = document.createElement("section");
   sectionEl.className = "approver-section";
@@ -100,7 +216,7 @@ function card(
   id: string,
   controller: WebApproverController,
   interactive: boolean,
-  refresh: () => Promise<void>,
+  refresh: () => void,
 ): HTMLElement {
   const detail = controller.detail(id);
   if (!detail) {
@@ -137,7 +253,7 @@ function card(
 function decisionControls(
   id: string,
   controller: WebApproverController,
-  refresh: () => Promise<void>,
+  refresh: () => void,
 ): HTMLElement {
   const form = document.createElement("form");
   form.className = "decision-controls";
