@@ -20,6 +20,12 @@ export type {
 } from "./runtime.js";
 export { createWasmRuntime, createBrowserRuntime } from "./runtime.js";
 
+export type { RelayAccountStateResolverOptions } from "./account-state.js";
+export {
+  ACCOUNT_STATE_FETCH_TIMEOUT_MS,
+  createRelayAccountStateResolver,
+} from "./account-state.js";
+
 export { mountAuditHistory } from "./audit-history.js";
 
 export type ApprovalDecision = "approved" | "denied";
