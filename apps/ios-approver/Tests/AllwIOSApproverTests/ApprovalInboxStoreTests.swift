@@ -20,6 +20,14 @@ struct ApprovalInboxStoreTests {
         try await testUniFfiRuntimePreparesVerifiedContextFromCoreJson()
         try await testUniFfiRuntimePreparesUnverifiedOriginAsDenyOnly()
         try await testUniFfiRuntimeMapsCoreDecryptFailureToUnverified()
+        try await testSignDecisionGatesOnBiometricsThenSignsOverPreparedHash()
+        try await testSignDecisionBiometricCancelFailsClosedWithoutTouchingSeed()
+        try await testSignDecisionBiometricFailureFailsClosedWithoutTouchingSeed()
+        try await testSignDecisionSeedReleaseFailureFailsClosed()
+        try await testSignDecisionCoreSignFailureFailsClosed()
+        try await testSignDecisionDenialOmitsChallengeResponse()
+        try await testSignDecisionBindsToCoreComputedHashNotEnvelope()
+        try await testSignDecisionUnsignedVerdictOmitsNilNoteAndCarriesDeviceCert()
         try await testCredentialStorePersistsPairedDeviceCredentials()
         try await testAccountStateFloorRejectsRollbackBelowStoredSequence()
         try await testAccountStateFloorRequiresRelayMaxSequenceToBeVerified()
@@ -146,6 +154,201 @@ struct ApprovalInboxStoreTests {
         try await expectThrows(
             try await store.decide("req-bad-jwe", decision: .approved)
         )
+    }
+
+    // MARK: UniFfiApproverRuntime.signDecision() — Secure-Enclave custody + biometric gate (#141)
+
+    /// Happy path: biometric auth succeeds → the seed is released → the core signs over the
+    /// *core-computed* prepared hash. Proves the verdict binds to `prepared.requestHash` and the
+    /// runtime returns the core's signed verdict JSON verbatim. (End-to-end key custody + a real
+    /// `LAContext` validate only in CI's macOS `native-bindings` job.)
+    static func testSignDecisionGatesOnBiometricsThenSignsOverPreparedHash() async throws {
+        let gate = FakeBiometricGate()
+        let seed = FakeSeedProvider(seedB64: "device-seed-b64")
+        let signer = FakeSignBinding(verdictJson: #"{"v":1,"sig":"abc"}"#)
+        let runtime = Self.runtime(
+            core: Self.preparedCore(challengeRequired: true, challengeCode: "482"),
+            signer: signer,
+            biometricGate: gate,
+            seedProvider: seed
+        )
+        let store = ApprovalInboxStore(runtime: runtime, nowMs: { 1_000 })
+        await store.sync([.fixture(id: "req-sign", expiresAt: 9_999)])
+
+        let verdict = try await store.decide("req-sign", decision: .approved, challengeResponse: "482")
+
+        // Biometric gate ran exactly once, before the seed was released.
+        try expectEqual(gate.authorizeCount, 1)
+        try expectEqual(seed.releaseCount, 1)
+        try expectEqual(signer.calls.count, 1)
+        let call = try unwrap(signer.calls.first)
+        try expectEqual(call.seed, "device-seed-b64")
+        // Nonce is the fixed test nonce, base64url-encoded (16 bytes of 0x09).
+        try expectEqual(call.nonce, "CQkJCQkJCQkJCQkJCQkJCQ")
+        // The unsigned verdict binds to the core-computed hash, not anything UI-recomputed.
+        try expect(call.unsigned.contains("\"request_hash\":\"hash-verified\""))
+        try expect(call.unsigned.contains("\"decision\":\"approved\""))
+        try expect(call.unsigned.contains("\"challenge_response\":\"482\""))
+        try expect(call.unsigned.contains("\"device_id\":\"dev-1\""))
+        // The runtime returns the core's signed verdict verbatim.
+        try expectEqual(verdict.signedVerdictJson, #"{"v":1,"sig":"abc"}"#)
+        try expectEqual(store.detail("req-sign")?.status, .approved)
+    }
+
+    /// Fail-closed: a cancelled biometric prompt throws and NO seed is ever released and NO core
+    /// signature is produced. The store restores `pending` (covered by the store-level test); here
+    /// we prove the custody boundary is never crossed.
+    static func testSignDecisionBiometricCancelFailsClosedWithoutTouchingSeed() async throws {
+        let gate = FakeBiometricGate(error: .biometricCancelled("user cancelled"))
+        let seed = FakeSeedProvider()
+        let signer = FakeSignBinding()
+        let runtime = Self.runtime(
+            core: Self.preparedCore(),
+            signer: signer,
+            biometricGate: gate,
+            seedProvider: seed
+        )
+        let store = ApprovalInboxStore(runtime: runtime, nowMs: { 1_000 })
+        await store.sync([.fixture(id: "req-cancel", expiresAt: 9_999)])
+
+        try await expectThrows(
+            try await store.decide("req-cancel", decision: .approved)
+        )
+
+        try expectEqual(gate.authorizeCount, 1)
+        try expectEqual(seed.releaseCount, 0)
+        try expect(signer.calls.isEmpty)
+        // Fail-closed: the request is approvable again, never stuck or silently approved.
+        try expectEqual(store.detail("req-cancel")?.status, .pending)
+    }
+
+    /// Fail-closed: a hard biometric failure (no enrolled biometrics / lockout) behaves like cancel
+    /// — no seed release, no signature.
+    static func testSignDecisionBiometricFailureFailsClosedWithoutTouchingSeed() async throws {
+        let gate = FakeBiometricGate(error: .biometricFailed("no biometrics enrolled"))
+        let seed = FakeSeedProvider()
+        let signer = FakeSignBinding()
+        let runtime = Self.runtime(
+            core: Self.preparedCore(),
+            signer: signer,
+            biometricGate: gate,
+            seedProvider: seed
+        )
+        let store = ApprovalInboxStore(runtime: runtime, nowMs: { 1_000 })
+        await store.sync([.fixture(id: "req-biofail", expiresAt: 9_999)])
+
+        try await expectThrows(
+            try await store.decide("req-biofail", decision: .approved)
+        )
+
+        try expectEqual(seed.releaseCount, 0)
+        try expect(signer.calls.isEmpty)
+        try expectEqual(store.detail("req-biofail")?.status, .pending)
+    }
+
+    /// Fail-closed: biometric passes but the Keychain refuses to release the seed → no signature.
+    static func testSignDecisionSeedReleaseFailureFailsClosed() async throws {
+        let gate = FakeBiometricGate()
+        let seed = FakeSeedProvider(error: .seedUnavailable("keychain denied"))
+        let signer = FakeSignBinding()
+        let runtime = Self.runtime(
+            core: Self.preparedCore(),
+            signer: signer,
+            biometricGate: gate,
+            seedProvider: seed
+        )
+        let store = ApprovalInboxStore(runtime: runtime, nowMs: { 1_000 })
+        await store.sync([.fixture(id: "req-noseed", expiresAt: 9_999)])
+
+        try await expectThrows(
+            try await store.decide("req-noseed", decision: .approved)
+        )
+
+        try expectEqual(gate.authorizeCount, 1)
+        try expectEqual(seed.releaseCount, 1)
+        try expect(signer.calls.isEmpty)
+        try expectEqual(store.detail("req-noseed")?.status, .pending)
+    }
+
+    /// Fail-closed: the core signer rejecting the verdict surfaces as a signing failure → pending.
+    static func testSignDecisionCoreSignFailureFailsClosed() async throws {
+        let gate = FakeBiometricGate()
+        let seed = FakeSeedProvider()
+        let signer = FakeSignBinding(error: FakeSignError.coreRejected)
+        let runtime = Self.runtime(
+            core: Self.preparedCore(),
+            signer: signer,
+            biometricGate: gate,
+            seedProvider: seed
+        )
+        let store = ApprovalInboxStore(runtime: runtime, nowMs: { 1_000 })
+        await store.sync([.fixture(id: "req-corefail", expiresAt: 9_999)])
+
+        try await expectThrows(
+            try await store.decide("req-corefail", decision: .approved)
+        )
+
+        try expectEqual(signer.calls.count, 1)
+        try expectEqual(store.detail("req-corefail")?.status, .pending)
+    }
+
+    /// A denial never carries a `challenge_response` even if one was supplied, per `docs/contract.md`
+    /// (authenticated denials need no challenge). Denials still require biometric auth.
+    static func testSignDecisionDenialOmitsChallengeResponse() async throws {
+        let gate = FakeBiometricGate()
+        let signer = FakeSignBinding()
+        let runtime = Self.runtime(
+            core: Self.preparedCore(challengeRequired: true, challengeCode: "482"),
+            signer: signer,
+            biometricGate: gate
+        )
+        let store = ApprovalInboxStore(runtime: runtime, nowMs: { 1_000 })
+        await store.sync([.fixture(id: "req-deny-sign", expiresAt: 9_999)])
+
+        _ = try await store.decide("req-deny-sign", decision: .denied, challengeResponse: "482")
+
+        try expectEqual(gate.authorizeCount, 1)
+        let call = try unwrap(signer.calls.first)
+        try expect(call.unsigned.contains("\"decision\":\"denied\""))
+        try expect(!call.unsigned.contains("challenge_response"))
+    }
+
+    /// The signed verdict binds to the *core-computed* `prepared.requestHash`, never the relay
+    /// envelope. WYSIWYS: the device signs what the human saw, computed by the core in `prepare()`.
+    static func testSignDecisionBindsToCoreComputedHashNotEnvelope() async throws {
+        let signer = FakeSignBinding()
+        let runtime = Self.runtime(
+            core: Self.preparedCore(),
+            signer: signer
+        )
+        let store = ApprovalInboxStore(runtime: runtime, nowMs: { 1_000 })
+        await store.sync([.fixture(id: "req-bind", expiresAt: 9_999)])
+
+        _ = try await store.decide("req-bind", decision: .approved)
+
+        let call = try unwrap(signer.calls.first)
+        try expect(call.unsigned.contains("\"request_id\":\"req-bind\""))
+        try expect(call.unsigned.contains("\"request_hash\":\"hash-verified\""))
+        // The fixed verdict clock is used for decided_at, not Date.now().
+        try expect(call.unsigned.contains("\"decided_at\":1700000001000"))
+    }
+
+    /// The unsigned verdict omits a nil `note` and includes the device cert (which chains the
+    /// device key to the account root so the verdict verifies against the root). A missing optional
+    /// is what the core deserializer treats as `None`; emitting `"note":null` is avoided. (Checks
+    /// the `"note":` key precisely — the bare word "note" appears in unrelated ids.)
+    static func testSignDecisionUnsignedVerdictOmitsNilNoteAndCarriesDeviceCert() async throws {
+        let signer = FakeSignBinding()
+        let runtime = Self.runtime(core: Self.preparedCore(), signer: signer)
+        let store = ApprovalInboxStore(runtime: runtime, nowMs: { 1_000 })
+        await store.sync([.fixture(id: "req-misc", expiresAt: 9_999)])
+
+        _ = try await store.decide("req-misc", decision: .approved)
+
+        let call = try unwrap(signer.calls.first)
+        try expect(!call.unsigned.contains("\"note\":"))
+        try expect(!call.unsigned.contains("\"challenge_response\":"))
+        try expect(call.unsigned.contains("\"device_cert\":\"device-cert\""))
     }
 
     static func testNumberMatchMustBeCorrectBeforeApprovalSigns() async throws {
@@ -444,15 +647,47 @@ struct ApprovalInboxStoreTests {
 // MARK: - UniFfiApproverRuntime test helpers
 
 private extension ApprovalInboxStoreTests {
-    static func runtime(core: FakeCoreBinding) -> UniFfiApproverRuntime {
+    static func runtime(
+        core: FakeCoreBinding,
+        signer: FakeSignBinding = FakeSignBinding(),
+        biometricGate: FakeBiometricGate = FakeBiometricGate(),
+        seedProvider: FakeSeedProvider = FakeSeedProvider(),
+        nonceSource: FixedNonceSource = FixedNonceSource(),
+        nowMs: @escaping @Sendable () -> Int64 = { Self.fixedDecidedAt }
+    ) -> UniFfiApproverRuntime {
         UniFfiApproverRuntime(
             credentials: .fixture(),
             trust: AccountTrustMaterial(
                 accountStateJws: ["state-jws"],
                 accountRootPubkeyB64: "root-pubkey"
             ),
-            core: core
+            core: core,
+            signer: signer,
+            biometricGate: biometricGate,
+            seedProvider: seedProvider,
+            nonceSource: nonceSource,
+            nowMs: nowMs
         )
+    }
+
+    /// Fixed verdict-decision clock — never `Date.now()` in test data (repo testing rules).
+    static let fixedDecidedAt: Int64 = 1_700_000_001_000
+
+    /// A `FakeCoreBinding` returning a verified, approvable prepared context (request hash
+    /// `hash-verified`), used by the signDecision tests so the store reaches a `pending` row.
+    static func preparedCore(
+        challengeRequired: Bool = false,
+        challengeCode: String? = nil
+    ) -> FakeCoreBinding {
+        let core = FakeCoreBinding()
+        core.result = CorePreparedApproval(
+            contextJson: Self.coreContextJson(summary: "force push to main", challengeRequired: challengeRequired),
+            requestHashB64: "hash-verified",
+            expiresAt: 50_000,
+            attestationVerified: true,
+            challengeCode: challengeCode
+        )
+        return core
     }
 
     /// Canonical core `ApprovalContext` wire JSON (snake_case) for a command surface — the exact
@@ -494,6 +729,83 @@ private final class FakeCoreBinding: UniFfiCoreBinding, @unchecked Sendable {
         }
         return result
     }
+}
+
+/// Records the biometric authorize call and, when armed, fails closed (cancel/failure).
+private final class FakeBiometricGate: BiometricGate, @unchecked Sendable {
+    var error: SecureEnclaveSigningError?
+    private(set) var authorizeCount = 0
+    private(set) var lastReason: String?
+
+    init(error: SecureEnclaveSigningError? = nil) {
+        self.error = error
+    }
+
+    func authorize(reason: String) async throws {
+        authorizeCount += 1
+        lastReason = reason
+        if let error {
+            throw error
+        }
+    }
+}
+
+/// In-memory signing-seed custody. Throws before releasing the seed when armed, and records whether
+/// release happened so tests can prove no seed is touched after a biometric failure.
+private final class FakeSeedProvider: SigningSeedProvider, @unchecked Sendable {
+    var seedB64: String
+    var error: SecureEnclaveSigningError?
+    private(set) var releaseCount = 0
+
+    init(seedB64: String = "ZGV2aWNlLXNpZ25pbmctc2VlZA", error: SecureEnclaveSigningError? = nil) {
+        self.seedB64 = seedB64
+        self.error = error
+    }
+
+    func releaseSigningSeedB64() async throws -> String {
+        releaseCount += 1
+        if let error {
+            throw error
+        }
+        return seedB64
+    }
+}
+
+/// Records the FFI sign call. Returns a deterministic verdict JSON or throws a core error.
+private final class FakeSignBinding: UniFfiSignBinding, @unchecked Sendable {
+    var error: Error?
+    var verdictJson: String
+    private(set) var calls: [(unsigned: String, seed: String, nonce: String)] = []
+
+    init(verdictJson: String = #"{"v":1,"signed":true}"#, error: Error? = nil) {
+        self.verdictJson = verdictJson
+        self.error = error
+    }
+
+    func signVerdict(
+        unsignedVerdictJson: String,
+        deviceSeedB64: String,
+        nonceB64: String
+    ) throws -> String {
+        calls.append((unsignedVerdictJson, deviceSeedB64, nonceB64))
+        if let error {
+            throw error
+        }
+        return verdictJson
+    }
+}
+
+/// Deterministic nonce so signed-verdict assertions stay stable (no CSPRNG in tests).
+private struct FixedNonceSource: VerdictNonceSource {
+    var bytes: [UInt8] = Array(repeating: 9, count: 16)
+
+    func freshNonce() -> [UInt8] {
+        bytes
+    }
+}
+
+private enum FakeSignError: Error {
+    case coreRejected
 }
 
 private final class RecordingRuntime: ApproverCoreRuntime {
