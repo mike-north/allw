@@ -38,19 +38,35 @@ declare global {
 }
 
 /**
+ * The result of mounting the web approver.
+ *
+ * `controller` is always present. `stop` is a cleanup disposer: in the relay-polling path it
+ * cancels the poll interval; in the manual/test path it is a harmless no-op (there is no interval
+ * to cancel). Callers that unmount (e.g. SPA route changes) should always call `stop()` — it is
+ * safe to call regardless of which path mounted, and safe to call more than once.
+ */
+export interface WebApproverMount {
+  /** The mounted controller. */
+  readonly controller: WebApproverController;
+  /** Cancel the poll loop (relay path) or no-op (manual path). Idempotent. */
+  readonly stop: () => void;
+}
+
+/**
  * Mount the web approver into `config.root`.
  *
  * When `config.relay` is provided the inbox is kept live via a relay poll loop (issue #147):
  * the poller fires an initial tick immediately, then polls every `pollIntervalMs` (default 2s).
- * On outage the last-known inbox is preserved with an error banner — never fail-open.
+ * On outage the last-known inbox is preserved with an error banner — never fail-open. The refresh
+ * (↻) button forces an immediate poll tick.
  *
  * When only `config.fetchInbox` is provided (test harness / manual mode) a single fetch is done
  * on mount and the returned controller can be re-synced manually.
  *
- * Returns the controller and (when polling) an opaque cleanup function. Callers that need to
- * unmount (e.g. SPA route changes) should call the returned `stop()`.
+ * Returns `{ controller, stop }`. `stop()` cancels the poll interval in the relay path so callers
+ * can dispose the loop on unmount; in the manual path it is a no-op.
  */
-export async function mountWebApprover(config: BrowserConfig): Promise<WebApproverController> {
+export async function mountWebApprover(config: BrowserConfig): Promise<WebApproverMount> {
   const controllerOptions = {
     runtime: config.runtime,
     ...(config.nowMs ? { nowMs: config.nowMs } : {}),
@@ -60,19 +76,26 @@ export async function mountWebApprover(config: BrowserConfig): Promise<WebApprov
   if (config.relay) {
     // Live polling path (issue #147). The poller fires the first tick immediately and re-renders
     // on every outcome (success or failure). We render once eagerly so the shell is present before
-    // the first poll settles. The refresh button triggers an immediate poll tick.
+    // the first poll settles. The refresh (↻) button forces an immediate poll tick.
     let lastError: string | null = null;
 
     function rerender(): void {
       if (lastError !== null) {
-        renderWithOutage(config.root, controller, lastError, rerender);
+        renderWithOutage(config.root, controller, lastError, onRefresh);
       } else {
-        render(config.root, controller, rerender);
+        render(config.root, controller, onRefresh);
       }
     }
 
+    // The refresh (↻) button forces an immediate poll against the relay (not just a local repaint):
+    // it triggers a real fetch, the controller syncs on success, and `onPollResult` repaints. We
+    // also repaint defensively in case the poll rejects before `onPollResult` runs.
+    function onRefresh(): void {
+      void poller.poll().then(rerender, rerender);
+    }
+
     // Render an empty-inbox shell immediately so the page is usable before the first poll.
-    render(config.root, controller, rerender);
+    render(config.root, controller, onRefresh);
 
     const poller = createRelayPoller({
       ...config.relay,
@@ -89,12 +112,7 @@ export async function mountWebApprover(config: BrowserConfig): Promise<WebApprov
       },
     });
 
-    // Wire the manual-refresh button (↻) to trigger an immediate poll tick.
-    // The `rerender` callback used above is a no-op until a poll settles, so the button
-    // is effectively "trigger next poll" in the polling path.
-    void poller;
-
-    return controller;
+    return { controller, stop: poller.stop };
   }
 
   // Manual / test path: a single fetch on mount; caller re-drives via returned controller.
@@ -114,7 +132,8 @@ export async function mountWebApprover(config: BrowserConfig): Promise<WebApprov
   }
 
   await fetchAndSync();
-  return controller;
+  // No poll loop in the manual path — `stop` is a no-op so callers can dispose uniformly.
+  return { controller, stop: () => undefined };
 }
 
 function render(root: HTMLElement, controller: WebApproverController, refresh: () => void): void {
