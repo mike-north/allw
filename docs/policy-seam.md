@@ -234,7 +234,10 @@ crown jewels, not by a credential vault or an approval gate.
 
 - **The entire semantic / T3 engine:** capability inference, per-command schema DB, the doc-extraction &
   classification pipeline, capability-based rules, named-field/typed/scope matchers. (Reuse Arc Flow when we get
-  there — do not rebuild it.)
+  there — do not rebuild it.) **The recognized-tool registry** that defines which tools are "recognized" is part
+  of this deferred tier; the decision-history flywheel's tallies depend on it only through a narrow structure-only
+  `is_recognized` seam (stubbed `false` until T3 lands) — see
+  [decision-flywheel.md](./decision-flywheel.md) §"The recognized-tool registry boundary".
 - The **suggestion loop** ("approved 20× → propose a rule") — needs the accumulated decision history; the
   reflection pass over the on-device, ephemeral, structure-only history ([decision-history.md](./decision-history.md),
   #134) is what surfaces these candidate rules. Reflection only **proposes**; the rule itself is still a signed
