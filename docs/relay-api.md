@@ -219,8 +219,79 @@ then fetches the full envelope via the socket or `/inbox`. (WebPush reserved, no
 5. **Number-match challenge** is derived + verified on device (`docs/contract.md`); the relay never
    sees it.
 
+## 7. Integration clarifications (client FAQ)
+
+Answers to load-bearing client questions, confirmed against the relay source + the reference
+`packages/approver` client.
+
+1. **`verdict` is a JSON object, not a string.** The `{type:"verdict", request_id, verdict}` message
+   must embed the **parsed** Verdict object (the relay rejects a scalar/string:
+   `isPlainObject(msg.verdict)` ⇒ else `{type:"error"}`). The core's `sign_verdict_json` returns the
+   canonical Verdict **object** JSON (`{ v, request_id, request_hash, decision, decided_at,
+approver:{account_id,device_id}, sig:<compact JWS>, note?, challenge_response?, device_cert? }`) —
+   `JSON.parse` it and inline the object. The relay stores it opaquely and forwards the object to the
+   integrator; only `sig`/`device_cert` carry the cryptography (verified downstream, never by the relay).
+
+2. **`ack` reconciliation.** The relay replies `{type:"ack", status}`:
+   - `resolved` — your verdict won; row is terminal.
+   - `already_resolved` — another surface/device (or a retry) resolved it first; **your verdict was not
+     recorded.** Treat as resolved-elsewhere: clear the row (it will also arrive as a `retract`).
+   - `expired` — the request passed its deadline before your verdict landed; **refused, fail-closed.**
+     Surface this to the user ("expired before your approval reached the relay") — they must not believe
+     it took effect.
+
+   Keep the package's local terminal commit in `decide()` (sign-failure already restores `.pending`);
+   treat a **non-`resolved` ack as a correction** and reconcile (a `GET /inbox` is the simplest
+   authoritative re-sync). Don't gate the local commit on the round-trip.
+
+3. **WebSocket lifecycle.** Model: a persistent socket **while foregrounded**; in the background, the
+   APNs wake → `GET /inbox` (no socket needed). Verdict submission is WS-only, but approving requires
+   biometric (⇒ foreground), so the socket is naturally live at verdict time — **no background verdict
+   submission is expected.** The relay sends no server pings and requires none (it ignores unknown
+   message types). Use a protocol-level WS **ping ~30 s** to survive idle-connection drops by
+   intermediaries; on drop, **reconnect with exponential backoff + jitter** (e.g. 1→2→4→…→cap 30 s).
+   On every (re)connect the relay auto-flushes the offline queue; also `GET /inbox` to reconcile.
+
+4. **`surface_id` = a stable per-install UUID** (persist it), **not** the `device_id`. The socket is
+   already tagged `device:{device_id}`; `surface_id` is a finer "visible screen" key so the relay fans
+   out **one push per surface** (dedup across a Mac + a Mirrored iPhone on the same screen). For v1, one
+   UUID per app install is correct (each install = its own surface). Cross-device same-screen dedup is a
+   post-v1 refinement.
+
+5. **Inbound `request` vs `sync()`.** Endorsed approach: keep an authoritative in-memory envelope set;
+   on (re)connect treat `GET /inbox` as the **full truth**; apply WS `request` (union) / `retract`
+   (remove) as deltas; call `ApprovalInboxStore.sync(fullSet)` with the maintained set. WS-delivered
+   envelopes may be rendered **directly** — security comes from on-device `prepare()` (decrypt+verify,
+   fail-closed), not from the transport — so no per-message `/inbox` round-trip is needed; reconcile
+   with `/inbox` on connect and periodically.
+
+6. **Pairing & `device_cert` (read carefully — the relay is a single-key surface).**
+   - `POST /pairing/complete` registers **exactly one `pubkey` = the device X25519 _encryption_ key**
+     (used by integrators to JWE-encrypt to the device). The Ed25519 **signing** key is **not** sent to
+     the relay. (`enrollment.md` step 3 lists two keys; the implemented relay contract is single-key —
+     the signing key is handled via `device_cert` below.)
+   - The device also needs a **`device_cert`** — an account-root-signed JWS binding its Ed25519 signing
+     pubkey (`issue_device_cert`). **The relay does NOT issue or store it.** Verdicts without a valid
+     `device_cert` are denied by integrators (`enrollment.md` §Device Certificate Validation).
+   - Who calls `/pairing/start`: the **account owner** (the root-seed holder), or the reference
+     `allw-approver pair` CLI drives `start` itself when `--code` is omitted. The new device calls only
+     `/pairing/complete` with the `pairing_auth_token` shown out-of-band.
+   - **Cross-device gap (PM decision):** the walking-skeleton CLI holds the account-root seed and
+     self-mints the `device_cert` into one keyfile. The phone is **not** the root holder, so it must
+     obtain its `device_cert` out-of-band. **v1 direction (honors the Secure-Enclave invariant — the
+     signing key is generated on-device and never leaves it):** the phone generates its keys on-device,
+     completes relay pairing with its encryption pubkey, and the account-root holder issues the
+     `device_cert` over the phone's signing pubkey out-of-band (delivered back to the phone). A
+     dev-only provisioning bundle (relay coords + `account_id` + account-root pubkey + a pre-issued
+     `device_cert`) is acceptable as the v1 **dev stub** (mirrors the web approver's credential stub),
+     but **must not** ship the device _signing seed_ off-device. Tracked for a proper cross-device
+     cert-issuance ceremony (and an optional relay courier endpoint) in a follow-up.
+   - **Onboarding UX:** prioritize a **single QR / `allw://` deep-link** that bundles `relay_url`,
+     `account_id`, `account_root_pubkey`, the pairing `code`, and `pairing_auth_token` — do **not** make
+     the user hand-type the ~43-char token. Manual paste is an acceptable dev fallback only.
+
 ## References
 
 `docs/contract.md` (wire types: envelope, Verdict, ApprovalContext, WYSIWYS), `docs/enrollment.md`
 (pairing, account state, revocation), `docs/relay-deploy.md` (operator deploy), `docs/apple-approver-app.md`
-(the app spec). Relay source: `packages/relay/src/index.ts`.
+(the app spec). Relay source: `packages/relay/src/index.ts`; reference client: `packages/approver`.
