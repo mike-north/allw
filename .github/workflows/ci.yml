@@ -84,6 +84,11 @@ jobs:
       # script, not CI (see examples/walking-skeleton/README.md → Test layers).
       - run: pnpm --filter @allw/example-walking-skeleton build
       - run: pnpm --filter @allw/example-walking-skeleton test
+      # The web approver's production static-site bundle (issue #180) needs the vendored wasm to
+      # copy into dist-site/ (scripts/build-site.mjs), so it is re-built here rather than in the
+      # `typescript` job, which runs `pnpm -r build` before any wasm step; there the site bundle
+      # step is a no-op skip (see scripts/build-site.mjs's module doc).
+      - run: pnpm --filter @allw/web-approver build
       # Workspace-level TS test gate (#15). This intentionally runs after build:wasm + dist builds
       # above because several package tests load the generated WASM glue or compiled workspace deps.
       - run: pnpm -r test

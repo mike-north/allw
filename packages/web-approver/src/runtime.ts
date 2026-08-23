@@ -63,6 +63,15 @@ export interface ApproverIdentity {
   readonly deviceCert: string;
   /** Ed25519 account-root verifying key (base64url) — the device's attestation trust anchor. */
   readonly accountRootPubkey: string;
+  /**
+   * ⚠ secret — the relay-issued bearer token authorizing this device against
+   * `devices/{id}/inbox`, `devices/{id}/connect`, and `account-states` (`docs/relay-api.md`
+   * §Device (approver) endpoints). Distinct from {@link deviceCert}: the cert chains verdict
+   * signatures to the account root, while this token is an opaque relay-routing credential the
+   * relay itself minted and hashes for storage. Required to drive live relay polling (#147) or
+   * account-state resolution (#155) from a paired browser.
+   */
+  readonly deviceAuthToken: string;
 }
 
 /**

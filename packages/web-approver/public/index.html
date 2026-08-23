@@ -8,6 +8,13 @@
   </head>
   <body>
     <div id="app"></div>
-    <script type="module" src="../dist/browser.js"></script>
+    <!--
+      `scripts/build-site.mjs` copies this file into `dist-site/`, bundles `src/app.ts` (the
+      production boot sequence: relay-URL config → pairing gate → WASM-backed runtime → live
+      inbox) to `dist-site/app.js`, and copies the vendored WASM to `dist-site/vendor/allw-wasm/`
+      — all as flat siblings, so `./app.js` below resolves both here and once deployed to any
+      static host. See `docs/web-approver-deploy.md`.
+    -->
+    <script type="module" src="./app.js"></script>
   </body>
 </html>
