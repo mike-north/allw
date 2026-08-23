@@ -24,18 +24,11 @@
       "name": "allw-relay",
 
       // Your Cloudflare account id — found in the dashboard right sidebar or via `wrangler whoami`.
-      "account_id": "REPLACE_ME",
+      "account_id": "80e4f047ee415f2c8f6cb3f6672f37ba",
 
-      // Route the production worker to your custom domain.
-      // Remove this block to use the default workers.dev subdomain instead.
-      "routes": [
-        {
-          // Replace with the hostname you want to serve the relay from.
-          // E.g. "relay.example.com/*" (requires the zone to be on your Cloudflare account).
-          "pattern": "REPLACE_ME/*",
-          "zone_name": "REPLACE_ME"
-        }
-      ],
+      // No custom-domain route yet: the worker serves from the default workers.dev
+      // subdomain (https://allw-relay.<subdomain>.workers.dev). To move to a custom
+      // domain later, add a "routes" block per docs/relay-deploy.md §6.
 
       // Same main entrypoint as dev.
       "main": "src/index.ts",
@@ -52,11 +45,10 @@
       // To add future schema changes, append a new migration entry with a new tag, e.g. "v2".
       "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccountRelay"] }],
 
-      // Production resource limits — tighten these relative to the Workers free-tier defaults.
-      "limits": {
-        // Maximum CPU time per request (milliseconds). The relay is I/O-bound; 30 ms is generous.
-        "cpu_ms": 30
-      }
+      // Production resource limits: a per-request CPU cap ("limits": { "cpu_ms": 30 })
+      // requires the Workers Paid plan — Cloudflare rejects it on Free (error 100328).
+      // Re-add the cap when the account moves to a paid plan; the relay is I/O-bound
+      // and 30 ms is generous.
 
       // Optional plaintext env vars (non-secret):
       //
