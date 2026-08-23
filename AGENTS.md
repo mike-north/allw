@@ -15,6 +15,7 @@ implementing** — the architecture only makes sense across several docs togethe
 - `docs/architecture.md` — tech-stack and system-design decisions (and their rationale).
 - `docs/threat-model.md` — adversaries, residual risks, and the security review checklist.
 - `docs/positioning.md` — the product thesis (why decisions are shaped the way they are).
+- `docs/mvp-scope.md` — what v1 ships and in what order: integration goals, steel threads, milestones M1–M7.
 
 When you change a design decision, update the doc that owns it in the same change.
 
