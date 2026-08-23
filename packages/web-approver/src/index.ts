@@ -31,6 +31,14 @@ export {
 
 export { mountAuditHistory } from "./audit-history.js";
 
+export type { RelayUrlSource, RelayConfigGateOptions } from "./relay-config.js";
+export {
+  RELAY_URL_QUERY_PARAM,
+  RELAY_URL_STORAGE_KEY,
+  resolveRelayUrl,
+  mountRelayConfigGate,
+} from "./relay-config.js";
+
 export type ApprovalDecision = "approved" | "denied";
 
 export type ApprovalStatus = "pending" | "deciding" | "expired" | "unverified" | ApprovalDecision;

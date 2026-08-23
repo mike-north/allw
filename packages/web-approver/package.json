@@ -17,7 +17,7 @@
     "public"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/build-site.mjs",
     "build:deps": "pnpm --filter @allw/sdk build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint src",
@@ -29,6 +29,7 @@
   },
   "devDependencies": {
     "@types/jsdom": "^28.0.3",
+    "esbuild": "^0.27.3",
     "jsdom": "^29.1.1"
   }
 }

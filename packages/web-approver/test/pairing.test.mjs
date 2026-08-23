@@ -47,6 +47,7 @@ const VALID_IDENTITY = {
   deviceSigningSeed: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
   deviceCert: "eyJhbGciOiJFZERTQSJ9.test.sig",
   accountRootPubkey: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=",
+  deviceAuthToken: "relay-bearer-test-token",
 };
 
 /**

@@ -57,6 +57,7 @@ const REQUIRED_IDENTITY_FIELDS: readonly (keyof ApproverIdentity)[] = [
   "deviceSigningSeed",
   "deviceCert",
   "accountRootPubkey",
+  "deviceAuthToken",
 ];
 
 /** Narrow a parsed JSON value to an `ApproverIdentity`. Returns `null` on any structural failure. */
@@ -260,7 +261,7 @@ function renderReturningScreen(
  * from the CLI `allw pair` output). On successful validation the identity is persisted and
  * `onPaired` is called.
  *
- * The form collects all six fields required by `ApproverIdentity`; this mirrors the dev-mode
+ * The form collects all seven fields required by `ApproverIdentity`; this mirrors the dev-mode
  * credential-stub path described in the issue scope. In production the fields would be
  * pre-populated by a QR/deep-link containing the CLI pairing ceremony output.
  *
@@ -333,6 +334,10 @@ function renderPairingScreen(
     accountRootPubkey: {
       label: "Account root public key (base64url)",
       placeholder: "Ed25519 pubkey",
+    },
+    deviceAuthToken: {
+      label: "Device auth token (relay bearer)",
+      placeholder: "relay-issued bearer token",
     },
   };
 

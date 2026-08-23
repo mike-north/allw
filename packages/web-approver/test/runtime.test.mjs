@@ -110,6 +110,7 @@ function pairedIdentity(wasm) {
     deviceSigningSeed,
     deviceCert,
     accountRootPubkey,
+    deviceAuthToken: "relay-bearer-test-token",
   };
 
   const encryptTo = (contextJson) =>
