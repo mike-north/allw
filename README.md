@@ -6,6 +6,7 @@ A cheap, end-to-end-encrypted human-in-the-loop **approval primitive** for AI ag
 governance layer that grows around it. See [`docs/`](./docs):
 
 - [positioning.md](./docs/positioning.md) — what allw is and why it's different.
+- [mvp-scope.md](./docs/mvp-scope.md) — v1 scope: integration goals, steel threads, capability milestones.
 - [architecture.md](./docs/architecture.md) — tech stack and system design.
 - [contract.md](./docs/contract.md) — the approval-primitive contract (the keystone).
 - [enrollment.md](./docs/enrollment.md) — account/device enrollment, rotation, revocation, and recovery.
