@@ -262,6 +262,12 @@ still enrolled — a revoked device cannot drive a request to `resolved`. `GET /
 - **Defer:** reuse/standing autonomy & conditions (→ policy layer), semantic `ActionRecord` fields (→ T3),
   predicate rules, paranoid/enterprise and ai-summary privacy tiers.
 
+> **Caller set (MVP).** The set of integrators calling this contract has grown beyond the original Claude Code /
+> Codex hooks to include the **OpenClaw** approval client and the **macts** HITL-provider plugin (see
+> [mvp-scope.md](./mvp-scope.md)). This changes **nothing** in the Ship / Defer lists above: every caller
+> integrates against the same syntactic-only, one-shot, scope-free surface, and each still composes
+> `effective_allow` itself (§Verification checklist #6). More callers, same contract.
+
 ## Wire encoding
 
 - **Binary fields** (`request_hash`, `prev_hash`, `record_hash`, `attestation`) serialize as

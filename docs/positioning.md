@@ -92,6 +92,14 @@ it, ask at its edge, deny beyond it — widened over time by your own decisions.
 or browser on a machine you own — you decide per item what's autonomous, what needs a tap, and what's forbidden;
 enforced on your hardware, approved from your phone, with no all-powerful key ever issued.
 
+> **Where macts fits on this ladder.** The MVP ([mvp-scope.md](./mvp-scope.md)) pulls **macts** forward as an
+> approval **caller**: a macts host holds a confirm-first operation and asks a human through allw. That is a
+> v1/MVP integration of the **first** rung — the primitive, with one more caller in front of it — and **not** an
+> early arrival of the third rung. "Governing your local capabilities" means the **semantic policy tier**
+> (capability inference, per-command schemas, capability-scoped rules), and that stays deferred exactly as
+> described above and in [policy-seam.md](./policy-seam.md) §The three tiers. Host ∧ key policy composition in
+> the MVP lives in **macts**, not in an allw policy engine. More callers, same rung.
+
 ---
 
 ## Who it's for
