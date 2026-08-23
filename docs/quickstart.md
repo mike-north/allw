@@ -132,6 +132,9 @@ Leave this running. This is your "phone" for now.
 
 ## 4. Wire the Claude Code hook
 
+> For the full integration contract (matcher set, decision mapping, fail-closed analysis,
+> permission-mode interactions) see [`docs/claude-code-integration.md`](./claude-code-integration.md).
+
 The hook reads its config from the environment. Export these in the shell where Claude Code runs
 (using the values from step 2):
 

@@ -1,7 +1,8 @@
 # Codex Approval Gating
 
 Issue #97 adds a Codex-local approval hook that mirrors the Claude Code hook while preserving the
-project's Node + WASM local-surface constraint.
+project's Node + WASM local-surface constraint. For the Claude Code hook's own structural peer of
+this document, see [`docs/claude-code-integration.md`](./claude-code-integration.md).
 
 ## Integration Shape
 
