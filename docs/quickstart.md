@@ -12,6 +12,8 @@ stand-ins, called out inline. Where a step is **not yet wired**, it says so rath
 >   surface below runs it under `node`, with **no Rust toolchain at install time**.
 > - A fail-closed Claude Code **PreToolUse hook** (`@allw/hook`) that turns a gated tool call into an
 >   approval request and only emits `allow` for a verified human "yes".
+> - The same gate for **Codex** (`@allw/codex-hook`) — see [`docs/codex-integration.md`](./codex-integration.md)
+>   for the Codex-specific hook config; steps 0–3 below (relay, install, pairing, watch) are identical.
 > - A **second-device approver** (`@allw/approver`) that renders the exact action (WYSIWYS), prompts
 >   Approve / Deny, and returns a signed verdict.
 > - A **zero-knowledge relay** (`@allw/relay`) you run on Cloudflare (or locally via `wrangler dev`).
@@ -87,6 +89,11 @@ Confirm they're installed and which version you have (useful for bug reports):
 npx allw-hook --version
 npx allw-approver --version
 ```
+
+> Using **Codex** instead of Claude Code? Install `@allw/codex-hook` in place of `@allw/hook`
+> (`npm install @allw/codex-hook @allw/approver`) and skip to
+> [`docs/codex-integration.md`](./codex-integration.md) for step 4's Codex-equivalent hook wiring —
+> steps 0, 2, 3, and 5 below are unchanged.
 
 ---
 

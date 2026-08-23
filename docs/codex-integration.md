@@ -22,7 +22,7 @@ Recommended hook configuration:
         "hooks": [
           {
             "type": "command",
-            "command": "node /absolute/path/to/packages/codex-hook/dist/cli.js",
+            "command": "npx allw-codex-hook",
             "timeout": 480,
             "statusMessage": "Requesting allw approval"
           }
@@ -33,16 +33,27 @@ Recommended hook configuration:
 }
 ```
 
+> `npx allw-codex-hook` resolves the installed bin. If your Codex launch environment does not see
+> the project's `node_modules/.bin` on `PATH`, use the absolute path to the resolved bin instead
+> (find it with `node -e "console.log(require.resolve('@allw/codex-hook/package.json'))"` → the
+> `dist/cli.js` beside it), e.g. `"command": "node /abs/path/to/@allw/codex-hook/dist/cli.js"`.
+
 ## Quickstart
 
-This is the Codex-parallel install path for developers who already have a paired allw approver:
+This is the Codex-parallel install path for developers who already have a paired allw approver
+(see [`docs/quickstart.md`](./quickstart.md) for pairing a device from scratch):
 
-1. Build the Node + WASM surfaces:
+1. Install the CLI (no Rust toolchain needed — the audited core ships pre-built as WASM inside
+   `@allw/sdk`, pulled in automatically):
 
    ```sh
-   pnpm install
-   pnpm run build:wasm
-   pnpm --filter @allw/codex-hook build
+   npm install @allw/codex-hook
+   ```
+
+   Confirm it's installed and which version you have (useful for bug reports):
+
+   ```sh
+   npx allw-codex-hook --version
    ```
 
 2. Export the relay and account trust anchor:
@@ -54,8 +65,7 @@ This is the Codex-parallel install path for developers who already have a paired
    ```
 
 3. Add the `PreToolUse` block above to `~/.codex/hooks.json` or a trusted project
-   `.codex/hooks.json`, replacing the command path with the absolute path to
-   `packages/codex-hook/dist/cli.js`.
+   `.codex/hooks.json`.
 
 4. Start Codex, run `/hooks`, review the hook, and trust it. Codex skips untrusted non-managed
    hooks by design.
