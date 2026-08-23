@@ -51,7 +51,7 @@ The `ActionRecord` has a **structure/data** boundary that maps directly onto the
 invariant (see [contract.md](./contract.md) Invariant 2 and [threat-model.md](./threat-model.md) §R7):
 
 - **Structure** — the parts the relay may observe at the default privacy tier:
-  - `surface` kind (`"command"` / `"mcp_tool_call"` / `"file_edit"` / …)
+  - `surface` kind (`"command"` / `"mcp_tool_call"` / `"agent_tool_call"` / `"file_edit"` / …)
   - function identity: program name (`syntactic.bin`) for commands; **`syntactic.server` + `syntactic.tool`**
     for MCP calls — the (server, tool) pair is the MCP function identity, parallel to a command's program name
   - `session_label` (carried at the `ApprovalRequest` envelope level, not inside `ActionRecord`)
@@ -75,6 +75,14 @@ and content are data. The `capabilities`/`scope` semantic enrichment fields (T3,
 split is enforced on-device (in the WASM/native client) when constructing the `ApprovalRequest` envelope —
 not by the relay, and not post-hoc.
 
+**`agent_tool_call`** — an agent-runtime or plugin-owned tool call gated by the harness rather than by an
+MCP server (specified in [openclaw-integration.md](./openclaw-integration.md) §5.2). It **reuses the same
+`(server, tool)` function-identity pair** as `mcp_tool_call` — `server` holds the gating provider id, `tool`
+the tool name — so it adds no new syntactic field and inherits the classification above unchanged: the pair
+is structure, `params` / `raw` remain data. It is a distinct `surface` rather than an `mcp_tool_call` because
+`surface` is the relay-visible, policy-matchable namespace: a rule or registry scoped to "MCP calls" must not
+silently sweep in tool calls that no MCP server ever served.
+
 ## The action record (what `allw-core` captures)
 
 `allw-core` reduces every approvable action to an `ActionRecord` and embeds it in both the `ApprovalRequest`
@@ -89,15 +97,15 @@ policy evaluation receives `actor` plus `ActionRecord` as separate inputs (`Poli
 ActionRecord {
   record_schema_version: int
 
-  surface: "command" | "mcp_tool_call" | "file_edit"
+  surface: "command" | "mcp_tool_call" | "agent_tool_call" | "file_edit"
                                               // interception paradigm (more added as needed:
-                                              //   agent_tool_call, delegated_fetch …)
+                                              //   delegated_fetch …)
 
   // --- syntactic substrate (v1, always present) ---
   syntactic: {
     // surface=command:
     bin?, argv?, flags?, positionals?, cwd?, host?, env_refs?
-    // surface=mcp_tool_call:
+    // surface=mcp_tool_call / agent_tool_call:
     server?, tool?, params?                    // params as raw/structured values
     // surface=file_edit:
     operation?, paths?, diff_summary?, diff_hash?
