@@ -83,7 +83,10 @@ wait_for_relay
 printf '==> Pairing temporary approver account %s\n' "$ACCOUNT_ID"
 (
   cd "$ROOT_DIR"
-  pnpm --filter @allw/approver exec allw-approver pair \
+  # Invoke the built CLI directly: pnpm does not link a package's OWN bin into its
+  # own node_modules/.bin, so `pnpm --filter @allw/approver exec allw-approver`
+  # fails with ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL on a fresh checkout.
+  node "$ROOT_DIR/packages/approver/dist/cli.js" pair \
     --relay "$RELAY_URL" \
     --account "$ACCOUNT_ID" \
     --label "codex-uat-$(hostname -s 2>/dev/null || hostname)" \
@@ -196,4 +199,6 @@ relay and remove the temporary project/keyfile.
 EOF
 
 cd "$ROOT_DIR"
-pnpm --filter @allw/approver exec allw-approver watch --relay "$RELAY_URL" --keyfile "$KEYFILE"
+# Direct bin invocation for the same reason as the pair call above (own-package
+# bins are not linked by pnpm; the filtered exec form breaks on fresh checkouts).
+node "$ROOT_DIR/packages/approver/dist/cli.js" watch --relay "$RELAY_URL" --keyfile "$KEYFILE"
