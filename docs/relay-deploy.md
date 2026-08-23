@@ -288,6 +288,15 @@ the hosted URL without any Cloudflare account. Reference issue #96 for the full 
 
 ---
 
+## 10. Web approver static bundle (peer runbook)
+
+The browser approver surface (`packages/web-approver`) has its own deploy runbook —
+[`docs/web-approver-deploy.md`](./web-approver-deploy.md). It covers building the production
+static bundle, runtime relay-URL configuration (the same static bundle can point at any relay
+deployed via this runbook without a rebuild), and deploying to Cloudflare Pages or any static host.
+
+---
+
 ## Appendix: what this runbook has and has not verified
 
 | Item                                                             | Status                                                             |
