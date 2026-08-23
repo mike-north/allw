@@ -1,8 +1,7 @@
 {
   "name": "@allw/codex-hook",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Codex PreToolUse approval hook (Node + WASM): gates sensitive Codex actions through allw, fail-closed.",
-  "private": true,
   "type": "module",
   "bin": {
     "allw-codex-hook": "./dist/cli.js"
@@ -32,5 +31,16 @@
   "devDependencies": {
     "@types/node": "^22.0.0"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mike-north/allw.git",
+    "directory": "packages/codex-hook"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=24"
+  }
 }

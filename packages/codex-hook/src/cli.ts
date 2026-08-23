@@ -22,6 +22,7 @@ import {
   type CodexPreToolUseOutput,
   type DenyReason,
 } from "./lib/codex-io.js";
+import { getVersion } from "./version.js";
 
 /** Test-only SDK transport seams; production uses SDK defaults. */
 export type RunCodexHookOverrides = Partial<
@@ -111,8 +112,29 @@ export async function runCodexHook(
   return decide(parsed.input, { wasm, config, requestApproval }, osHostname());
 }
 
+/**
+ * Diagnostic, non-hook invocations the CLI answers **before** touching stdin: `--version`/`-v`
+ * prints the version (read from this package's own package.json — never a hardcoded literal, see
+ * ./version.ts) and exits 0. Returns `true` when it handled a flag (the caller must not proceed to
+ * the stdin hook path).
+ *
+ * This never runs on the hook hot path: Codex invokes the hook with no argv flags and pipes the
+ * tool call on stdin, so `argv` is empty there and this is a no-op.
+ */
+function handleDiagnosticFlags(argv: readonly string[]): boolean {
+  if (argv.includes("--version") || argv.includes("-v")) {
+    process.stdout.write(`${getVersion()}\n`);
+    return true;
+  }
+  return false;
+}
+
 /** Process entrypoint: always emit an explicit decision and exit 0. */
 async function main(): Promise<void> {
+  if (handleDiagnosticFlags(process.argv.slice(2))) {
+    process.exit(0);
+  }
+
   let output: CodexPreToolUseOutput;
   try {
     output = await runCodexHook(await readStdin(), process.env);
