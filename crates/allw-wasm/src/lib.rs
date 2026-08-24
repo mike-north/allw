@@ -44,7 +44,7 @@ use allw_core::{
     derive_number_match_challenge as core_derive_number_match_challenge,
     encrypt_context as core_encrypt_context, evaluate as core_evaluate,
     evaluate_for_actor as core_evaluate_for_actor, issue_device_cert as core_issue_device_cert,
-    sign_account_state as core_sign_account_state,
+    revoked_device_ids as core_revoked_device_ids, sign_account_state as core_sign_account_state,
     sign_actor_attestation as core_sign_actor_attestation,
     sign_policy_rule as core_sign_policy_rule, sign_verdict as core_sign_verdict,
     verified_origin_string as core_verified_origin_string,
@@ -612,6 +612,51 @@ pub fn verify_account_state(
     let state = core_verify_account_state(account_state_jws, expected_account_id, &root)
         .map_err(|e| JsError::new(&format!("verify_account_state failed: {e}")))?;
     to_json(&state, "AccountState")
+}
+
+/// Resolves the set of device ids revoked in the **highest-sequence** verified root-signed
+/// account-state document(s) among `account_states_json`, returned as a JSON array of strings.
+///
+/// This is the sender-side counterpart to [`verify_verdict_with_account_states`]'s revocation
+/// enforcement (issue #204 fix 1): the SDK calls this **before** encrypting a new request so a
+/// device the account owner already revoked never receives the plaintext `ApprovalContext` in
+/// the first place — closing the gap where a revoked device could still read every new request
+/// up until its next verdict submission was rejected. The set/parse/verify logic stays here
+/// (thin-shell); the caller only needs to drop matching `device_id`s from the recipient list it
+/// builds for [`encrypt_context`].
+///
+/// `account_states_json` is a JSON array of compact `allw-account-state+jws` strings, exactly
+/// like [`verify_verdict_with_account_states`]. An empty array resolves to an empty (no known
+/// revocations) result rather than an error, so the filter is a no-op when the caller has no
+/// account-state material yet.
+///
+/// # Errors
+///
+/// Throws if `account_states_json` is not valid JSON, `account_root_pubkey_b64` is not a valid
+/// Ed25519 key, or any supplied account-state JWS fails to verify for `expected_account_id`
+/// against that root (wrong account, wrong root, bad signature, unsupported version) — a bad
+/// document is never silently dropped, since that could mask a real revocation.
+#[wasm_bindgen]
+pub fn revoked_device_ids(
+    account_states_json: &str,
+    expected_account_id: &str,
+    account_root_pubkey_b64: &str,
+) -> Result<String, JsError> {
+    let root_bytes = decode_b64_32(account_root_pubkey_b64, "account_root_pubkey_b64")?;
+    let root = PublicKey::from_bytes(&root_bytes).map_err(|e| {
+        JsError::new(&format!(
+            "account_root_pubkey_b64 is not a valid Ed25519 key: {e}"
+        ))
+    })?;
+    let account_states = parse_account_states_json(account_states_json)?;
+    let account_state_refs: Vec<&str> = account_states.iter().map(String::as_str).collect();
+
+    let ids = core_revoked_device_ids(&account_state_refs, expected_account_id, &root)
+        .map_err(|e| JsError::new(&format!("revoked_device_ids failed: {e}")))?;
+    let mut ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    // Sort for a deterministic wire result (a `HashSet` has no defined iteration order).
+    ids.sort_unstable();
+    to_json(&ids, "revoked device ids")
 }
 
 // ── policy rules ──────────────────────────────────────────────────────────────────────

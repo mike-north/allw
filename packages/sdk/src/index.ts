@@ -460,6 +460,54 @@ function accountStatesJson(accountStates: readonly string[] | undefined): string
   return JSON.stringify(accountStates ?? []);
 }
 
+/** Parse the WASM `revoked_device_ids` JSON result into a `Set` for O(1) recipient filtering. */
+function parseRevokedDeviceIds(json: string): ReadonlySet<string> {
+  const ids = JSON.parse(json) as unknown;
+  if (!Array.isArray(ids) || !ids.every((id) => typeof id === "string")) {
+    throw new Error("allw: revoked_device_ids returned a non-string-array result");
+  }
+  return new Set(ids);
+}
+
+/**
+ * Drops any device revoked in the caller's verified account-state set from `devices`, **before**
+ * a new request is ever encrypted to it (issue #204 fix 1). Without this, a device revoked after
+ * enrollment keeps receiving every new request's plaintext `ApprovalContext` indefinitely — the
+ * relay-listed device set is untrusted input and account-state revocation was previously enforced
+ * only at verdict-verification time, long after the plaintext had already been sent.
+ *
+ * The revocation-set parse/verify/resolve logic runs entirely in the audited core via
+ * `wasm.revoked_device_ids` (thin-shell: this function only threads JSON through and filters the
+ * caller-supplied array by device id).
+ *
+ * When `config.accountStates` is omitted, this resolves to no known revocations (a no-op filter) —
+ * matching the same opt-in semantics as verdict-verification's account-state enforcement.
+ *
+ * @throws when filtering would leave zero recipients, so a fully-revoked account fails loudly
+ * (the hook maps the thrown error to a deny) instead of silently submitting a request nobody can
+ * decrypt, or worse, only to devices the account owner already revoked.
+ */
+function filterRevokedDevices(
+  wasm: AllwWasm,
+  devices: readonly DeviceRecord[],
+  accountId: string,
+  approverRootKey: string,
+  accountStates: readonly string[] | undefined,
+): readonly DeviceRecord[] {
+  const revokedIds = parseRevokedDeviceIds(
+    wasm.revoked_device_ids(accountStatesJson(accountStates), accountId, approverRootKey),
+  );
+  if (revokedIds.size === 0) return devices;
+  const nonRevoked = devices.filter((d) => !revokedIds.has(d.device_id));
+  if (nonRevoked.length === 0) {
+    throw new Error(
+      `allw: approver account '${accountId}' has no non-revoked devices to encrypt to ` +
+        `(${String(devices.length)} enrolled device(s), all revoked per account state)`,
+    );
+  }
+  return nonRevoked;
+}
+
 /** Treat a blank optional account constraint like omission before crossing into WASM. */
 function expectedAccountIdConstraint(expectedAccountId: string | undefined): string | undefined {
   return expectedAccountId === "" ? undefined : expectedAccountId;
@@ -642,9 +690,10 @@ export async function evaluatePolicyWithAccountStates(
  * - A bare `TypeError` from `fetch` — a connection-level failure (DNS, refused, reset) that never
  *   produced an HTTP response; WHATWG `fetch` rejects with a `TypeError` for these.
  *
- * A {@link RelayError} (a real HTTP status from the relay) and the explicit no-devices `Error` are
- * **not** transport failures — they signal integrator/protocol misconfiguration and keep throwing so
- * the caller (the hook) surfaces a precise deny reason.
+ * A {@link RelayError} (a real HTTP status from the relay), the explicit no-devices `Error`, and the
+ * explicit all-devices-revoked `Error` (from {@link filterRevokedDevices}) are **not** transport
+ * failures — they signal integrator/protocol misconfiguration or a fully-revoked account and keep
+ * throwing so the caller (the hook) surfaces a precise deny reason.
  */
 function isPreDeadlineTransportFailure(err: unknown): boolean {
   if (err instanceof RelayTimeoutError) return true;
@@ -691,13 +740,14 @@ export function createClient(config: ClientConfig): Client {
     // the pre-deadline relay round-trip never completes.
     const id = newRequestId();
 
-    // 3–4. Fetch devices, encrypt, and submit. These run BEFORE the await-verdict deadline timer is
-    // armed, so a hung relay (TCP-accepted but never responding) would otherwise wedge the call
-    // forever. The per-request fetch timeout (RelayClient) bounds each fetch; here we additionally
-    // ensure a *transport* failure on these calls fails closed to a `Verdict` (expired) instead of
-    // rejecting — the same fail-closed terminal a wait-stage timeout produces (issue #52,
-    // contract §Invariants #6). HTTP-level errors (a relay `RelayError` with a real status) and a
-    // no-devices account still throw, surfacing integrator/protocol misconfiguration loudly.
+    // 3–4. Fetch devices, filter out revoked ones, encrypt, and submit. These run BEFORE the
+    // await-verdict deadline timer is armed, so a hung relay (TCP-accepted but never responding)
+    // would otherwise wedge the call forever. The per-request fetch timeout (RelayClient) bounds
+    // each fetch; here we additionally ensure a *transport* failure on these calls fails closed to
+    // a `Verdict` (expired) instead of rejecting — the same fail-closed terminal a wait-stage
+    // timeout produces (issue #52, contract §Invariants #6). HTTP-level errors (a relay
+    // `RelayError` with a real status), a no-devices account, and an all-devices-revoked account
+    // still throw, surfacing integrator/protocol misconfiguration loudly.
     let contextCiphertext: string;
     try {
       const devices = await relay.fetchDevices();
@@ -706,7 +756,18 @@ export function createClient(config: ClientConfig): Client {
           `allw: approver account '${config.accountId}' has no enrolled devices to encrypt to`,
         );
       }
-      const recipients = devices.map((d: DeviceRecord) => ({
+      // Drop revoked devices from the relay-listed recipient set BEFORE encrypting — the relay is
+      // untrusted, so this must run against the caller's own verified account-state, not the
+      // relay's device registry (issue #204 fix 1). Throws (fail-closed) if every device is
+      // revoked; relay-side eviction (issue #204 fix 2) is a separate, still-open slice.
+      const nonRevokedDevices = filterRevokedDevices(
+        wasm,
+        devices,
+        config.accountId,
+        config.approverRootKey,
+        config.accountStates,
+      );
+      const recipients = nonRevokedDevices.map((d: DeviceRecord) => ({
         device_id: d.device_id,
         public_key_b64: d.pubkey,
       }));

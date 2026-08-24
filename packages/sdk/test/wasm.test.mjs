@@ -838,6 +838,68 @@ test("verify_verdict_with_account_states rejects revoked devices and stale rollb
   );
 });
 
+// ── revoked_device_ids (issue #204 fix 1: sender-side recipient filtering) ──────────────
+
+test("revoked_device_ids resolves highest-sequence revocations and ignores stale rollback", async () => {
+  const wasm = await loadWasm();
+  const f = approverFixture(wasm);
+  const staleWithoutRevocation = signedAccountState(wasm, {
+    accountSeed: f.accountSeed,
+    accountId: "acct_rt",
+    currentRoot: f.accountRootPub,
+    sequence: 4,
+  });
+  const newerRevocation = signedAccountState(wasm, {
+    accountSeed: f.accountSeed,
+    accountId: "acct_rt",
+    currentRoot: f.accountRootPub,
+    sequence: 5,
+    revokedDeviceIds: ["dev_rt"],
+  });
+
+  const revokedAtHighest = JSON.parse(
+    wasm.revoked_device_ids(JSON.stringify([newerRevocation]), "acct_rt", f.accountRootPub),
+  );
+  assert.deepEqual(revokedAtHighest, ["dev_rt"], "the highest-sequence revocation is resolved");
+
+  const revokedWithStaleMixedIn = JSON.parse(
+    wasm.revoked_device_ids(
+      JSON.stringify([newerRevocation, staleWithoutRevocation]),
+      "acct_rt",
+      f.accountRootPub,
+    ),
+  );
+  assert.deepEqual(
+    revokedWithStaleMixedIn,
+    ["dev_rt"],
+    "a lower-sequence document that omits a revocation must not roll it back",
+  );
+
+  const noneRevoked = JSON.parse(
+    wasm.revoked_device_ids(JSON.stringify([]), "acct_rt", f.accountRootPub),
+  );
+  assert.deepEqual(noneRevoked, [], "no account states supplied ⇒ no known revocations");
+});
+
+test("revoked_device_ids fails closed on a substituted wrong-root account state", async () => {
+  const wasm = await loadWasm();
+  const f = approverFixture(wasm);
+  const wrongRootSeed = Buffer.alloc(32, 0x79).toString("base64url");
+  const wrongRootState = signedAccountState(wasm, {
+    accountSeed: wrongRootSeed,
+    accountId: "acct_rt",
+    currentRoot: wasm.ed25519_public_key(wrongRootSeed),
+    sequence: 6,
+    revokedDeviceIds: ["dev_rt"],
+  });
+
+  assert.throws(
+    () => wasm.revoked_device_ids(JSON.stringify([wrongRootState]), "acct_rt", f.accountRootPub),
+    /revoked_device_ids failed/,
+    "a substituted wrong-root account state must fail closed, not be silently ignored",
+  );
+});
+
 test("verify_verdict_with_account_states rejects substituted wrong-root account state", async () => {
   const wasm = await loadWasm();
   const f = approverFixture(wasm);

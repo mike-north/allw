@@ -791,6 +791,21 @@ When a device is revoked:
 6. Offline verifiers reject verdicts whose device id appears in the highest-sequence revocation state they have
    seen, even if the verdict's `device_cert` cryptographically chains to an old root.
 
+Steps 1–4 depend on the relay honestly reflecting the revocation, which the relay itself is not trusted to do
+(`docs/threat-model.md`'s zero-knowledge relay is also assumed adversarial for routing/registry integrity, not
+only for plaintext confidentiality). **The sender independently enforces the exclusion**: before encrypting a new
+request's `ApprovalContext`, the SDK resolves the revoked device id set from the caller's own verified
+account-state documents (the highest-sequence root-signed state(s) — same semantics as offline verdict
+verification) and drops any relay-listed device that appears there, regardless of what `GET /devices` actually
+returns. If every enrolled device is revoked, `requestApproval` throws rather than submitting a request no
+trusted device can decrypt (fail-closed, never a silent send-to-nobody). This closes the gap where a revoked
+device would otherwise keep receiving every new request's plaintext context indefinitely, bounded only by how
+promptly the relay's registry converges — the relay is untrusted input, so sender-side filtering is the layer
+that actually holds. **A root-authorized relay-side eviction (the account root revoking another device's
+registry row, as opposed to today's self-revoke-only `POST /devices/{id}/revoke`) remains a separate, open
+piece of work** — defense in depth that stops push fan-out and registry staleness, but does not substitute for
+the sender-side check above.
+
 Pending requests:
 
 - If a revoked device already holds a ciphertext, it may still be able to decrypt that old context.
