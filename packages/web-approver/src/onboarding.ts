@@ -211,7 +211,10 @@ export function mountOnboardingWalkthrough(options: OnboardingWalkthroughOptions
     const list = el("ul", "onboarding-list");
     for (const item of step.bullets) {
       const li = el("li", "onboarding-list-item");
-      li.append(text("span", "✓", "onboarding-check"), text("span", item));
+      const check = text("span", "✓", "onboarding-check");
+      // Decorative only — hide from assistive tech so screen readers announce just the bullet text.
+      check.setAttribute("aria-hidden", "true");
+      li.append(check, text("span", item));
       list.append(li);
     }
     screen.append(list);
