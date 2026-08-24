@@ -105,8 +105,15 @@ npx allw-approver --version
 
 ## 2. Pair a second device (the approver)
 
-The approver is the surface where **you** see and decide the request. In a **second terminal**
-(leave it running), pair it with an account on your relay:
+The approver is the surface where **you** see and decide the request.
+
+> **Browser option.** A hosted web approver is live at
+> [https://allw-web-approver.pages.dev](https://allw-web-approver.pages.dev) — open it from any
+> browser (including your phone) and paste the pairing output from the CLI below into its pairing
+> form. See [`web-approver-deploy.md`](./web-approver-deploy.md) for details or self-hosting.
+
+For the CLI approver, in a **second terminal** (leave it running), pair it with an account on your
+relay:
 
 ```sh
 npx allw-approver pair \
