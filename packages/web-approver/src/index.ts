@@ -37,6 +37,23 @@ export {
   createInMemoryAccountStateFloorStore,
 } from "./sequence-floor.js";
 
+export type { SurfaceIdStore } from "./surface-id.js";
+export {
+  SURFACE_ID_STORAGE_KEY,
+  createLocalSurfaceIdStore,
+  resolveSurfaceId,
+} from "./surface-id.js";
+
+export type {
+  LiveSocket,
+  ConnectImpl,
+  ReconnectScheduler,
+  ReconnectCanceller,
+  RetractListenerOptions,
+  RetractListener,
+} from "./retract-listener.js";
+export { createRetractListener } from "./retract-listener.js";
+
 export { mountAuditHistory } from "./audit-history.js";
 
 export type { RelayUrlSource, RelayConfigGateOptions } from "./relay-config.js";
@@ -243,6 +260,35 @@ export class WebApproverController {
         const rightAt = right.decidedAt ?? right.expiresAt;
         return rightAt - leftAt;
       });
+  }
+
+  /**
+   * Remove a request resolved on ANOTHER device/surface (relay `{type:"retract"}`, #150;
+   * `docs/relay-api.md` §4). Deletes the record outright rather than merely marking it hidden, so
+   * the approve/deny path becomes structurally unreachable — `canApprove`/`decide` treat the id as
+   * unknown afterward, and it disappears from `inbox()`/`detail()` on the next render. This
+   * matches the fleet's UI-unreachable-states convention (`docs/apple-approver-app.md` §6.7,
+   * `docs/enrollment.md`): an unsafe state must be impossible to reach, not just unstyled.
+   *
+   * A record this device has already decided locally (`status` is `"approved"`/`"denied"`) is left
+   * untouched: the relay only retracts a request from devices OTHER than the one whose verdict won
+   * (`docs/relay-api.md` §4), so a retract should never arrive for our own winning decision — and
+   * even if one did (a lost race with another device, before verdict submission is wired up),
+   * preserving the locally-recorded decision here avoids silently erasing this device's own audit
+   * history entry.
+   *
+   * @returns `true` when a record was removed, `false` when `id` was unknown or already terminal.
+   */
+  retract(id: string): boolean {
+    const record = this.#records.get(id);
+    if (!record) {
+      return false;
+    }
+    if (record.status === "approved" || record.status === "denied") {
+      return false;
+    }
+    this.#records.delete(id);
+    return true;
   }
 
   detail(id: string): ApprovalDetail | undefined {

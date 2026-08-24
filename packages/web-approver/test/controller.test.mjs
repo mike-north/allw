@@ -418,3 +418,130 @@ test("browser rendering treats attacker argv as inert text", async () => {
     globalThis.HTMLButtonElement = globals.HTMLButtonElement;
   }
 });
+
+// ── controller.retract (cross-device retraction, #150) ─────────────────────
+//
+// `docs/relay-api.md` §4: the relay sends `{type:"retract", request_id}` to every device/surface
+// OTHER than the one whose verdict won. `controller.retract` is the sink for that signal — it must
+// make the approve/deny path structurally unreachable (not merely hidden), and it must never erase
+// a decision this device already recorded locally.
+
+test("retract removes a pending request — inbox/detail/canApprove/decide all treat it as gone", async () => {
+  const pending = envelope("req-retract-pending");
+  const controller = new WebApproverController({
+    runtime: runtime(
+      new Map([[pending.id, { requestHash: "hash-retract-pending", context: context() }]]),
+    ),
+    nowMs: () => NOW,
+  });
+
+  await controller.sync([pending]);
+  assert.equal(controller.canApprove(pending.id), true, "sanity: it was approvable before retract");
+
+  assert.equal(controller.retract(pending.id), true, "retract reports it removed a record");
+
+  assert.deepEqual(controller.inbox(), [], "retracted request no longer appears in the inbox");
+  assert.equal(controller.detail(pending.id), undefined, "detail() no longer resolves the id");
+  assert.equal(controller.canApprove(pending.id), false, "canApprove is false once retracted");
+  await assert.rejects(
+    () => controller.decide(pending.id, "approved"),
+    /unknown request/,
+    "decide() treats a retracted id as unknown — the approve path is unreachable, not just hidden",
+  );
+});
+
+test("retract on an already-approved request is a no-op — local decision history is preserved", async () => {
+  const request = envelope("req-retract-approved");
+  const controller = new WebApproverController({
+    runtime: runtime(
+      new Map([[request.id, { requestHash: "hash-retract-approved", context: context() }]]),
+    ),
+    nowMs: () => NOW,
+  });
+
+  await controller.sync([request]);
+  await controller.decide(request.id, "approved");
+  assert.equal(controller.detail(request.id)?.status, "approved");
+
+  assert.equal(
+    controller.retract(request.id),
+    false,
+    "retract does not remove a decision this device already recorded",
+  );
+  assert.deepEqual(
+    controller.history().map((item) => item.id),
+    [request.id],
+    "the approved decision remains in history after a (spurious) retract",
+  );
+});
+
+test("retract on an unknown id is a no-op and reports false", async () => {
+  const controller = new WebApproverController({
+    runtime: runtime(new Map()),
+    nowMs: () => NOW,
+  });
+
+  assert.equal(controller.retract("req-never-existed"), false);
+});
+
+test("retract mid-decide removes the record so the in-flight decision cannot resurrect it", async () => {
+  const request = envelope("req-retract-mid-decide");
+  const signing = deferred();
+  const fakeRuntime = {
+    signCalls: [],
+    async prepare() {
+      return {
+        requestHash: "hash-retract-mid-decide",
+        expiresAt: request.expires_at,
+        context: context(),
+      };
+    },
+    async signDecision(input) {
+      fakeRuntime.signCalls.push(input);
+      return signing.promise;
+    },
+  };
+  const controller = new WebApproverController({
+    runtime: fakeRuntime,
+    nowMs: () => NOW,
+  });
+
+  await controller.sync([request]);
+  const inFlight = controller.decide(request.id, "approved");
+  assert.equal(controller.detail(request.id)?.status, "deciding");
+
+  // Another device's verdict wins the race while ours is still signing.
+  assert.equal(controller.retract(request.id), true, "a 'deciding' record is still retractable");
+  assert.equal(controller.detail(request.id), undefined);
+
+  signing.resolve({ requestId: request.id, decision: "approved", signedVerdictJson: "{}" });
+  await inFlight;
+
+  // The now-orphaned decide() call must not resurrect the retracted record.
+  assert.equal(controller.detail(request.id), undefined, "retract wins — no resurrection");
+  assert.deepEqual(controller.history(), [], "the discarded local decision never reaches history");
+});
+
+test("retract removes expired and unverified requests too (both are still deny-only, not decided)", async () => {
+  const expired = envelope("req-retract-expired", { expires_at: NOW - 1 });
+  const tampered = envelope("req-retract-tampered");
+  const controller = new WebApproverController({
+    runtime: runtime(
+      new Map([
+        [expired.id, { requestHash: "hash-retract-expired", context: context() }],
+        [tampered.id, new Error("hash mismatch")],
+      ]),
+    ),
+    nowMs: () => NOW,
+  });
+
+  await controller.sync([expired, tampered]);
+  assert.equal(controller.detail(expired.id)?.status, "expired");
+  assert.equal(controller.detail(tampered.id)?.status, "unverified");
+
+  assert.equal(controller.retract(expired.id), true);
+  assert.equal(controller.retract(tampered.id), true);
+
+  assert.equal(controller.detail(expired.id), undefined);
+  assert.equal(controller.detail(tampered.id), undefined);
+});

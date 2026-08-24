@@ -39,6 +39,7 @@ import { createLocalPairingStore, mountPairingGate } from "./pairing.js";
 import { mountRelayConfigGate, resolveRelayUrl } from "./relay-config.js";
 import { createBrowserRuntime, type ApproverIdentity } from "./runtime.js";
 import { createLocalAccountStateFloorStore } from "./sequence-floor.js";
+import { createLocalSurfaceIdStore, resolveSurfaceId } from "./surface-id.js";
 
 /** The default poll interval for the live inbox once mounted (matches `relay-poll.ts`'s default). */
 const POLL_INTERVAL_MS = 2_000;
@@ -100,6 +101,9 @@ async function bootInbox(
       deviceId: identity.deviceId,
       deviceAuthToken: identity.deviceAuthToken,
       pollIntervalMs: POLL_INTERVAL_MS,
+      // Cross-device retraction (#150): a stable per-install surface id opens the live
+      // `connect` WebSocket that removes a request as soon as another device resolves it.
+      surfaceId: resolveSurfaceId(createLocalSurfaceIdStore()),
     },
   });
 }
