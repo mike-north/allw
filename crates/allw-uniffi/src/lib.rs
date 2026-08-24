@@ -4,6 +4,7 @@
 //! JSON-string boundary so native apps consume the same canonical wire types as TypeScript.
 
 use allw_core::{
+    action_from_agent_tool_call as core_action_from_agent_tool_call,
     action_from_command as core_action_from_command,
     compute_request_hash as core_compute_request_hash, decrypt_context as core_decrypt_context,
     derive_number_match_challenge as core_derive_number_match_challenge,
@@ -145,6 +146,37 @@ pub fn action_from_command_json(command: String, cwd: String) -> Result<String, 
     };
     let action = core_action_from_command(&command, &ctx)
         .map_err(|e| AllwFfiError::failure(format!("failed to build command action: {e}")))?;
+    to_json(&action, "ActionRecord")
+}
+
+/// Builds an [`ActionRecord`] for an agent-runtime/plugin-owned tool call, returning it as JSON.
+/// This is the **agent_tool_call** surface (`docs/openclaw-integration.md` §5.2,
+/// `docs/policy-seam.md` §Structure vs. data in the ActionRecord): a tool call gated by the
+/// harness rather than served by an MCP server. Reuses the `(server, tool, params)`
+/// function-identity substrate from `mcp_tool_call` — `server` holds the gating provider id, not
+/// an MCP server name — but is tagged with a distinct `surface` so an `mcp_tool_call`-scoped
+/// policy rule never matches it, even with an identical `(server, tool)` pair.
+///
+/// `params_json` is the tool-call parameters as a JSON value, or an empty string when the caller
+/// has no structured parameters to offer (e.g. OpenClaw plugin permission requests expose only
+/// prose to the reviewer — pass an empty string rather than synthesizing a params value).
+///
+/// # Errors
+///
+/// Fails if `params_json` is non-empty and not valid JSON — fail-closed rather than building a
+/// record from unparseable parameters.
+#[uniffi::export]
+pub fn action_from_agent_tool_call_json(
+    server: String,
+    tool: String,
+    params_json: String,
+) -> Result<String, AllwFfiError> {
+    let params: Option<serde_json::Value> = if params_json.is_empty() {
+        None
+    } else {
+        Some(parse_json(&params_json, "agent tool params")?)
+    };
+    let action = core_action_from_agent_tool_call(&server, &tool, params);
     to_json(&action, "ActionRecord")
 }
 

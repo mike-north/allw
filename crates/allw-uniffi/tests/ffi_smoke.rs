@@ -13,9 +13,9 @@ use allw_core::{
     SigningKeyPair, Surface, SyntacticSubstrate, X25519KeyPair,
 };
 use allw_uniffi::{
-    action_from_command_json, compute_request_hash_b64, derive_device_keys_json,
-    derive_signing_pubkey_b64, issue_device_cert_json, prepare_approval_json, sign_verdict_json,
-    verify_verdict_json,
+    action_from_agent_tool_call_json, action_from_command_json, compute_request_hash_b64,
+    derive_device_keys_json, derive_signing_pubkey_b64, issue_device_cert_json,
+    prepare_approval_json, sign_verdict_json, verify_verdict_json,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand_chacha::rand_core::SeedableRng;
@@ -648,4 +648,109 @@ fn prepare_revoked_actor_yields_attestation_unverified_not_err() {
         context_json.contains("force push to main"),
         "the decrypted context must still be returned so the human can issue an explicit deny"
     );
+}
+
+// ---------------------------------------------------------------------------
+// action_from_agent_tool_call_json (issue #194)
+// ---------------------------------------------------------------------------
+
+/// Builds an `agent_tool_call` record through the native FFI surface and pins the wire shape a
+/// real Swift/Kotlin app depends on: `surface` is `agent_tool_call` (not `mcp_tool_call`), and
+/// `server`/`tool` are populated from the arguments.
+#[test]
+fn action_from_agent_tool_call_json_builds_agent_tool_call_action() {
+    let action_json = action_from_agent_tool_call_json(
+        "openclaw".to_string(),
+        "deploy_service".to_string(),
+        String::new(),
+    )
+    .unwrap();
+    let action: serde_json::Value = serde_json::from_str(&action_json).unwrap();
+
+    assert_eq!(action["surface"], "agent_tool_call");
+    assert_eq!(action["syntactic"]["server"], "openclaw");
+    assert_eq!(action["syntactic"]["tool"], "deploy_service");
+    assert!(
+        action["syntactic"].get("params").is_none(),
+        "params must be absent (not null) when params_json is empty"
+    );
+}
+
+/// An empty `params_json` (the native "no structured params" convention used by
+/// `action_from_command_json`'s `cwd` argument) must produce a record with `params` omitted,
+/// matching the `agent_tool_call` semantics: OpenClaw plugin permission requests expose no
+/// structured parameters (docs/openclaw-integration.md §5.2).
+#[test]
+fn action_from_agent_tool_call_json_with_params_preserves_them_verbatim() {
+    let action_json = action_from_agent_tool_call_json(
+        "openclaw".to_string(),
+        "deploy_service".to_string(),
+        json!({ "target": "prod" }).to_string(),
+    )
+    .unwrap();
+    let action: serde_json::Value = serde_json::from_str(&action_json).unwrap();
+
+    assert_eq!(action["syntactic"]["params"], json!({ "target": "prod" }));
+}
+
+/// A distinct-surface `agent_tool_call` record and an `mcp_tool_call` record built from the
+/// identical `(server, tool)` pair must round-trip into a request_hash that a policy rule scoped
+/// to the wrong surface cannot match — the FFI-level analogue of the core's non-collision
+/// guarantee. Here we just confirm the two JSON `surface` values differ so a native app cannot
+/// accidentally conflate them.
+#[test]
+fn action_from_agent_tool_call_json_surface_differs_from_mcp_tool_call() {
+    let agent_action_json = action_from_agent_tool_call_json(
+        "shared-name".to_string(),
+        "shared-tool".to_string(),
+        String::new(),
+    )
+    .unwrap();
+    let agent_action: serde_json::Value = serde_json::from_str(&agent_action_json).unwrap();
+
+    assert_eq!(agent_action["surface"], "agent_tool_call");
+    assert_ne!(agent_action["surface"], "mcp_tool_call");
+}
+
+/// Fail-closed: malformed `params_json` must return `Err`, never build a record from
+/// unparseable input.
+#[test]
+fn action_from_agent_tool_call_json_rejects_malformed_params() {
+    let result = action_from_agent_tool_call_json(
+        "openclaw".to_string(),
+        "deploy_service".to_string(),
+        "{not json".to_string(),
+    );
+    assert!(
+        result.is_err(),
+        "malformed params_json must return Err, not a record built from garbage"
+    );
+}
+
+/// An `agent_tool_call` action built through the native FFI surface can compute a request_hash
+/// through the same `compute_request_hash_b64` path as every other surface — WYSIWYS coverage at
+/// the FFI boundary, not just the Rust core.
+#[test]
+fn agent_tool_call_action_and_request_hash_round_trip_over_json_strings() {
+    let action: serde_json::Value = serde_json::from_str(
+        &action_from_agent_tool_call_json(
+            "openclaw".to_string(),
+            "deploy_service".to_string(),
+            String::new(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let context = json!({
+        "action": action,
+        "summary": "deploy service to prod",
+        "actor": { "id": "actor-1", "kind": "agent" },
+        "risk": "medium",
+        "reversible": true,
+        "constraints": { "allowed_decisions": ["approved", "denied"], "challenge_required": false }
+    });
+
+    let hash = compute_request_hash_b64(context.to_string(), 4_102_444_800_000).unwrap();
+
+    assert_eq!(hash.len(), 43);
 }
