@@ -141,7 +141,7 @@ export class OpenClawBridge {
   /** Install the broadcast listener. Must be called **before** {@link project} (§4.3). */
   listen(): () => void {
     return this.deps.gateway.addEventListener((event) => {
-      void this.handleEvent(event);
+      void this.handle(event);
     });
   }
 
@@ -176,8 +176,11 @@ export class OpenClawBridge {
     }
   }
 
-  /** Route one broadcast frame. */
-  private async handleEvent(event: GatewayEvent): Promise<ApprovalOutcome> {
+  /**
+   * Route one broadcast frame and drive it to completion. Public (rather than an internal callback)
+   * so the fail-closed matrix can be asserted per row without racing an un-awaited promise.
+   */
+  async handle(event: GatewayEvent): Promise<ApprovalOutcome> {
     if (event.event.endsWith(".approval.resolved")) {
       const id = readResolvedId(event.payload);
       if (id !== null) {

@@ -153,16 +153,18 @@ export function loadConfig(env: BridgeEnv, homeDir: string): BridgeConfig {
         `deadline, got ${String(deadlineMarginMs)}ms`,
     );
   }
-  if (fetchTimeoutMs > DEFAULT_FETCH_TIMEOUT_MS) {
-    throw new ConfigError(
-      `ALLW_FETCH_TIMEOUT_MS may only lower the SDK default of ` +
-        `${String(DEFAULT_FETCH_TIMEOUT_MS)}ms, got ${String(fetchTimeoutMs)}ms`,
-    );
-  }
+  // The nesting violation is checked first: it is the more specific failure, and reporting "your
+  // fetch timeout is not inside your margin" is more actionable than the cap message below.
   if (fetchTimeoutMs >= deadlineMarginMs) {
     throw new ConfigError(
       `ALLW_FETCH_TIMEOUT_MS (${String(fetchTimeoutMs)}ms) must stay below ` +
         `ALLW_DEADLINE_MARGIN_MS (${String(deadlineMarginMs)}ms)`,
+    );
+  }
+  if (fetchTimeoutMs > DEFAULT_FETCH_TIMEOUT_MS) {
+    throw new ConfigError(
+      `ALLW_FETCH_TIMEOUT_MS may only lower the SDK default of ` +
+        `${String(DEFAULT_FETCH_TIMEOUT_MS)}ms, got ${String(fetchTimeoutMs)}ms`,
     );
   }
   if (minTimeoutMs >= maxTimeoutMs) {
