@@ -95,7 +95,13 @@ app, not the package); consider renaming the product to `AllwAppleApprover` (opt
    build phase / script). This is the single most important production gap.
 3. **Pairing / onboarding UI** (enrollment ceremony per `docs/enrollment.md`): establish account +
    device, persist via `KeychainNativeCredentialStorage`, register the APNs token via
-   `PushInboxCoordinator.registerApnsToken`. Inbox is unreachable until paired.
+   `PushInboxCoordinator.registerApnsToken`. The app is **not** the account-root holder, so it also runs the
+   **cross-device `device_cert` ceremony** (`docs/enrollment.md` §Cross-Device `device_cert` Issuance
+   Ceremony, #175): scan the enrollment QR (or open the `allw://enroll#…` deep link), generate both seeds
+   on-device with the signing key in the Secure Enclave, deposit the MAC-authenticated CSR, show the six-digit
+   confirmation code for the human to compare against the root holder's screen, then poll for the cert and
+   verify it against the pinned account-root pubkey before persisting. Inbox is unreachable until a
+   **root-verified `device_cert`** is stored — "paired but uncertified" is not a usable state.
 4. **Inbox + detail (WYSIWYS) UI** per surface, driven by `ApprovalInboxStore` / `ApprovalListItem` /
    `ApprovalDetail`. Detail must render the **exact** bound plaintext (command argv/raw or MCP
    server+tool+params-summary), actor + attestation badge, risk/reversibility, expiry countdown, and
