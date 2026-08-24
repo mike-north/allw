@@ -13,14 +13,15 @@ relay source + tests; this doc is the source of truth for client implementations
 
 ## 0. Base URL & environments
 
-The relay is a Cloudflare Worker. **It is not yet deployed** — production `wrangler.jsonc` still has
-`REPLACE_ME` and deploy is a human `[OPERATOR]` step (`docs/relay-deploy.md`). Point the app at a
-**configurable base URL**, never a hardcoded host.
+The relay is a Cloudflare Worker. A production deploy is live at `https://allw-relay.mnorth.workers.dev`
+(the hosted relay `docs/quickstart.md` defaults new users to); operators may also deploy their own
+per `docs/relay-deploy.md`. Point the app at a **configurable base URL**, never a hardcoded host.
 
-| Environment    | Base URL                                                                                             | How                                                   |
-| -------------- | ---------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
-| **Local dev**  | `http://127.0.0.1:8787` (WS: `ws://127.0.0.1:8787`)                                                  | `cd packages/relay && node_modules/.bin/wrangler dev` |
-| **Production** | custom domain (e.g. `https://relay.example.com`) **or** `https://allw-relay.<subdomain>.workers.dev` | `wrangler deploy --env production` (operator)         |
+| Environment          | Base URL                                                                                             | How                                                   |
+| -------------------- | ---------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| **Local dev**        | `http://127.0.0.1:8787` (WS: `ws://127.0.0.1:8787`)                                                  | `cd packages/relay && node_modules/.bin/wrangler dev` |
+| **Hosted (default)** | `https://allw-relay.mnorth.workers.dev`                                                              | Already deployed — no operator step needed            |
+| **Self-hosted prod** | custom domain (e.g. `https://relay.example.com`) **or** `https://allw-relay.<subdomain>.workers.dev` | `wrangler deploy --env production` (operator)         |
 
 WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
 

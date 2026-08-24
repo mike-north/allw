@@ -20,18 +20,18 @@ Get a real shell command **blocked until you approve it from a second device** �
 Full walkthrough with troubleshooting: **[docs/quickstart.md](./docs/quickstart.md)**.
 
 > Requires Node ≥ 24 and Claude Code. **No Rust toolchain needed** — the audited core ships pre-built
-> as WASM inside `@allw/sdk`. v0 stand-ins (CLI approver instead of a phone app; software-held keys;
-> self-hosted relay) are called out in the full doc.
+> as WASM inside `@allw/sdk`. v0 stand-ins (CLI approver instead of a phone app; software-held keys)
+> are called out in the full doc.
 
 ```sh
-# 0. Run a relay (local). In its own terminal, from a checkout of this repo:
-pnpm install && pnpm --filter @allw/relay dev        # → http://127.0.0.1:8787
+# 0. Use the hosted relay — no Cloudflare account needed (self-host instead per
+#    docs/quickstart.md §0): https://allw-relay.mnorth.workers.dev
 
 # 1. Install the CLIs in your project (the @allw/sdk + bundled WASM come along automatically):
 npm install @allw/hook @allw/approver
 
 # 2. Pair a second device (a second terminal). Prints your account-root public key:
-npx allw-approver pair --relay http://127.0.0.1:8787 --account my-account --label my-laptop
+npx allw-approver pair --relay https://allw-relay.mnorth.workers.dev --account my-account --label my-laptop
 
 # 3. Watch for requests on that device (leave running — this is your "phone" for now):
 npx allw-approver watch

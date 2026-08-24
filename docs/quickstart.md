@@ -16,7 +16,9 @@ stand-ins, called out inline. Where a step is **not yet wired**, it says so rath
 >   for the Codex-specific hook config; steps 0–3 below (relay, install, pairing, watch) are identical.
 > - A **second-device approver** (`@allw/approver`) that renders the exact action (WYSIWYS), prompts
 >   Approve / Deny, and returns a signed verdict.
-> - A **zero-knowledge relay** (`@allw/relay`) you run on Cloudflare (or locally via `wrangler dev`).
+> - A **zero-knowledge relay** (`@allw/relay`) — this quickstart defaults to the hosted relay at
+>   `https://allw-relay.mnorth.workers.dev`; you can also run your own (Cloudflare or locally via
+>   `wrangler dev`).
 >
 > **v0 stand-ins (not production):**
 >
@@ -33,9 +35,9 @@ stand-ins, called out inline. Where a step is **not yet wired**, it says so rath
 ## Prerequisites
 
 - **Node.js ≥ 24** (the surfaces use Node 24 globals: `fetch`, `WebSocket`, `WebAssembly`).
-- A **Cloudflare account** for the relay (free tier is fine), **or** run the relay locally with
-  `wrangler dev` (no account needed for local-only testing).
 - **Claude Code** (for the hook step).
+- No Cloudflare account needed — step 0 below defaults to the hosted relay. A Cloudflare account is
+  only required if you choose to self-host instead.
 
 You do **not** need Rust or `wasm-pack`: the WASM core ships pre-built inside `@allw/sdk`'s npm
 package, and `@allw/hook` / `@allw/approver` load it from there.
@@ -44,33 +46,37 @@ package, and `@allw/hook` / `@allw/approver` load it from there.
 
 ## 0. The relay endpoint
 
-`allw` routes encrypted requests through a **zero-knowledge relay**. There is **no default hosted
-relay yet**, so you stand up your own. It is a single Cloudflare Worker + Durable Object.
+`allw` routes encrypted requests through a **zero-knowledge relay**. This quickstart uses the
+**hosted relay** so you can start without standing up any infrastructure:
 
-**Option A — local relay (fastest for trying it out).** In a terminal you'll leave running:
-
-```sh
-# In a checkout of this repo (the relay is not published to npm; you deploy it from source):
-git clone https://github.com/mike-north/allw.git
-cd allw
-pnpm install
-pnpm --filter @allw/relay dev          # boots `wrangler dev` → http://127.0.0.1:8787
+```
+https://allw-relay.mnorth.workers.dev
 ```
 
-Your relay URL is then `http://127.0.0.1:8787`.
-
-**Option B — deploy to Cloudflare (shareable, for real phone-in-pocket use later).**
-
-```sh
-cd allw
-pnpm install
-pnpm --filter @allw/relay deploy       # `wrangler deploy`; prints your https://<name>.workers.dev URL
-```
-
-Your relay URL is the `https://…workers.dev` URL it prints.
+That's the `<RELAY_URL>` referenced in the steps below — no Cloudflare account or setup needed.
 
 > The relay only ever sees **ciphertext + signed verdicts** — never plaintext or any signing key
-> (`docs/architecture.md`, `docs/contract.md`). Running your own is safe by design.
+> (`docs/architecture.md`, `docs/contract.md`). That's true whether you use the hosted relay above
+> or run your own.
+
+**Prefer to self-host?** Either option below gives you a `<RELAY_URL>` to use in place of the
+hosted one — everything else in this quickstart is unchanged.
+
+- **Local relay** (fastest for trying it out; no Cloudflare account needed). In a terminal you'll
+  leave running:
+
+  ```sh
+  # In a checkout of this repo (the relay is not published to npm; you deploy it from source):
+  git clone https://github.com/mike-north/allw.git
+  cd allw
+  pnpm install
+  pnpm --filter @allw/relay dev          # boots `wrangler dev` → http://127.0.0.1:8787
+  ```
+
+  Your relay URL is then `http://127.0.0.1:8787`.
+
+- **Deploy your own to Cloudflare** (shareable, for real phone-in-pocket use) — follow the full
+  runbook in [`docs/relay-deploy.md`](./relay-deploy.md).
 
 ---
 
@@ -109,7 +115,8 @@ npx allw-approver pair \
   --label "my-laptop"
 ```
 
-- `<RELAY_URL>` is from step 0 (e.g. `http://127.0.0.1:8787` or your `…workers.dev` URL).
+- `<RELAY_URL>` is from step 0 — `https://allw-relay.mnorth.workers.dev` by default, or your own
+  URL if you chose to self-host.
 - `--account` is any id you choose; it routes requests to this device.
 
 This generates a local keyfile (`~/.allw/approver-keyfile.json`, mode `0600`), registers the device,
@@ -224,7 +231,6 @@ end-to-end-encrypted and cryptographically verified.
 - **A phone/web approval surface.** Today the approver is the `allw-approver` CLI. The hosted web
   inbox is designed (`design/`) but not shipped; when it lands, the relay/account/keys here are
   unchanged.
-- **A hosted relay.** You run your own (step 0). A hosted default relay URL is a future addition.
 - **Hardware key custody** ([#23](https://github.com/mike-north/allw/issues/23)) and **verified actor
   identity** ([#16](https://github.com/mike-north/allw/issues/16)).
 
