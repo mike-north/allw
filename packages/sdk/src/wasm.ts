@@ -109,6 +109,19 @@ export interface AllwWasm {
    * has no structured parameters to offer.
    */
   action_from_agent_tool_call(server: string, tool: string, paramsJson?: string | null): string;
+  /**
+   * Build an ActionRecord JSON for an agent-runtime/plugin-owned tool call (`agent_tool_call`
+   * surface), binding `raw` **verbatim** instead of the synthesized `<server>.<tool>(...)`
+   * display. Use this when the caller already holds human-authored reviewer prose for the action
+   * (`docs/openclaw-integration.md` §5.2: `syntactic.raw` = `description`, plus `detail` when
+   * present); use {@link action_from_agent_tool_call} when no such prose exists.
+   */
+  action_from_agent_tool_call_with_raw(
+    server: string,
+    tool: string,
+    raw: string,
+    paramsJson?: string | null,
+  ): string;
   /** Sign an unsigned PolicyRule JSON with a device key and cert, returning signed JSON. */
   sign_policy_rule(
     unsignedRuleJson: string,

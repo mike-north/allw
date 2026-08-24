@@ -1953,6 +1953,66 @@ test("agent_tool_call fixture vector: WASM compute_request_hash matches the Rust
   );
 });
 
+// ── action_from_agent_tool_call_with_raw (issue #213) ─────────────────────────────────────
+//
+// @see ../../../docs/openclaw-integration.md §5.2 (syntactic.raw = description, plus detail)
+
+test("action_from_agent_tool_call_with_raw binds raw verbatim instead of synthesizing it", async () => {
+  const wasm = await loadWasm();
+
+  const record = JSON.parse(
+    wasm.action_from_agent_tool_call_with_raw(
+      "openclaw",
+      "deploy_service",
+      "This plugin wants to deploy to production.",
+      undefined,
+    ),
+  );
+
+  assert.equal(record.surface, "agent_tool_call");
+  assert.equal(record.syntactic.server, "openclaw");
+  assert.equal(record.syntactic.tool, "deploy_service");
+  assert.equal(
+    record.syntactic.raw,
+    "This plugin wants to deploy to production.",
+    "raw is bound verbatim, never the synthesized <server>.<tool>() display",
+  );
+  assert.ok(!("params" in record.syntactic), "params must be absent (not null) when omitted");
+});
+
+test("action_from_agent_tool_call_with_raw never re-derives raw from params", async () => {
+  const wasm = await loadWasm();
+
+  const params = { target: "prod" };
+  const record = JSON.parse(
+    wasm.action_from_agent_tool_call_with_raw(
+      "openclaw",
+      "deploy_service",
+      "custom reviewer prose",
+      JSON.stringify(params),
+    ),
+  );
+
+  assert.equal(record.syntactic.raw, "custom reviewer prose");
+  assert.deepEqual(record.syntactic.params, params, "params are still preserved verbatim");
+});
+
+test("action_from_agent_tool_call_with_raw throws on malformed params JSON (fail-closed)", async () => {
+  const wasm = await loadWasm();
+
+  assert.throws(
+    () =>
+      wasm.action_from_agent_tool_call_with_raw(
+        "openclaw",
+        "deploy_service",
+        "custom reviewer prose",
+        "{not json",
+      ),
+    /invalid agent tool params JSON/,
+    "unparseable params must surface as a thrown JS error (fail-closed), even with raw supplied",
+  );
+});
+
 // ── action_from_argv: binding a canonical, pre-tokenized argv ─────────────────────────────
 //
 // @see ../../../docs/openclaw-integration.md §5.1 (never re-tokenize when a canonical argv exists)

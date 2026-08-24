@@ -53,6 +53,19 @@ export interface HookWasm {
    */
   action_from_mcp_tool_call(server: string, tool: string, paramsJson: string): string;
   /**
+   * Build an `ActionRecord` JSON for an agent-runtime/plugin-owned tool call (the
+   * `agent_tool_call` surface), binding `raw` **verbatim** instead of the core's synthesized
+   * `<server>.<tool>(...)` display. Used when the caller already holds human-authored reviewer
+   * prose for the action — e.g. an OpenClaw plugin permission request's `description`/`detail`
+   * (`docs/openclaw-integration.md` §5.2). **Throws** on invalid `paramsJson`.
+   */
+  action_from_agent_tool_call_with_raw(
+    server: string,
+    tool: string,
+    raw: string,
+    paramsJson?: string | null,
+  ): string;
+  /**
    * Build an `ActionRecord` JSON for a file edit (the `file_edit` surface). `pathsJson` is a JSON
    * string array. **Throws** when paths are malformed/empty, so the hook denies rather than
    * presenting a pathless edit to the human.
