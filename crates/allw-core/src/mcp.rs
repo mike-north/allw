@@ -1,4 +1,14 @@
-//! Builders for MCP tool call [`ActionRecord`]s.
+//! Builders for [`ActionRecord`]s sharing the MCP-style `(server, tool, params)` function-identity
+//! substrate: the **`mcp_tool_call`** and **`agent_tool_call`** surfaces.
+//!
+//! `agent_tool_call` is an agent-runtime or plugin-owned tool call gated by the harness rather
+//! than by an MCP server (`docs/openclaw-integration.md` §5.2). It reuses the exact same
+//! `(server, tool, params)` fields as `mcp_tool_call` — `server` holds the gating provider id
+//! instead of an MCP server name — so both builders share one reduction path
+//! ([`build_tool_call_action`]) and differ only in the `surface` tag they stamp. Keeping them
+//! distinct surfaces (rather than one builder always emitting `mcp_tool_call`) is deliberate: a
+//! policy rule or registry scoped to `mcp_tool_call` must never silently match a tool call no MCP
+//! server ever served (`docs/policy-seam.md` §Structure vs. data in the ActionRecord).
 //!
 //! **Scope:** syntactic substrate only (T1). No capability inference, no semantic enrichment.
 //! The `capabilities` and `scope` fields of every produced `ActionRecord` are always `None`;
@@ -12,12 +22,19 @@
 //! <server>.<tool>(<compact-json-params>)
 //! ```
 //!
+//! or, when there are no params (`agent_tool_call` with `params = None`):
+//!
+//! ```text
+//! <server>.<tool>()
+//! ```
+//!
 //! where `<compact-json-params>` is the params value serialised with
 //! [`serde_json::to_string`] (no extra whitespace). Examples:
 //!
 //! - `omnifocus.delete_project({"project_id":"abc","list":"Agent Inbox"})`
 //! - `github.list_repos({})`
 //! - `files.read_file(["path/to/file"])`
+//! - `openclaw.deploy_service()`
 //!
 //! The format is intended for display and fallback pattern matching only; the canonical,
 //! matchable params form lives in `syntactic.params` as a structured [`serde_json::Value`].
@@ -92,18 +109,89 @@ pub fn action_from_mcp_tool_call(
     tool: &str,
     params: serde_json::Value,
 ) -> ActionRecord {
+    build_tool_call_action(Surface::McpToolCall, server, tool, Some(params))
+}
+
+/// Build an [`ActionRecord`] for an agent-runtime/plugin-owned tool call gated by the harness
+/// rather than an MCP server (`docs/openclaw-integration.md` §5.2), populating only the syntactic
+/// substrate. Shares [`build_tool_call_action`] with [`action_from_mcp_tool_call`] — the two
+/// differ only in the `surface` tag stamped on the record.
+///
+/// # Arguments
+///
+/// * `server` – the gating provider identity (e.g. an OpenClaw plugin id). Reuses the
+///   `mcp_tool_call` function-identity slot; it is **not** an MCP server name.
+/// * `tool`   – the tool name within that provider.
+/// * `params` – tool call parameters, if any structured form is available. `None` when the
+///   caller has no structured parameters to offer (e.g. OpenClaw plugin permission requests
+///   expose only prose to the reviewer — `docs/openclaw-integration.md` §5.2 — so the bridge must
+///   pass `None` rather than synthesizing a params value).
+///
+/// # Returns
+///
+/// An [`ActionRecord`] with:
+///
+/// - `surface = Surface::AgentToolCall`
+/// - `record_schema_version = 1`
+/// - `syntactic.server`, `syntactic.tool` populated from the arguments; `syntactic.params` set
+///   only when `params` is `Some`
+/// - `syntactic.raw` set to `"<server>.<tool>(<compact-json-params>)"`, or `"<server>.<tool>()"`
+///   when `params` is `None` (see module-level docs)
+/// - All command-surface and file-edit-surface syntactic fields set to `None`
+/// - `risk` assigned by the v1 name-based heuristic (see module-level docs) — identical to
+///   `mcp_tool_call`; T3 will replace this with capability-derived risk
+/// - `capabilities = None` and `scope = None` (reserved for T3; see `docs/policy-seam.md`)
+///
+/// # Example
+///
+/// ```rust
+/// use allw_core::mcp::action_from_agent_tool_call;
+/// use allw_core::contract::Surface;
+///
+/// let record = action_from_agent_tool_call("openclaw", "deploy_service", None);
+///
+/// assert_eq!(record.surface, Surface::AgentToolCall);
+/// assert_eq!(record.syntactic.server.as_deref(), Some("openclaw"));
+/// assert_eq!(record.syntactic.tool.as_deref(), Some("deploy_service"));
+/// assert!(record.syntactic.params.is_none());
+/// ```
+pub fn action_from_agent_tool_call(
+    server: &str,
+    tool: &str,
+    params: Option<serde_json::Value>,
+) -> ActionRecord {
+    build_tool_call_action(Surface::AgentToolCall, server, tool, params)
+}
+
+/// Shared syntactic-substrate reduction for the `mcp_tool_call` and `agent_tool_call` surfaces.
+///
+/// Both surfaces reduce to the same `(server, tool, params)` function-identity shape
+/// (`docs/policy-seam.md` §Structure vs. data in the ActionRecord); only the `surface` tag
+/// differs. Kept private so the two public builders above cannot drift apart on risk heuristic,
+/// `raw` formatting, or which fields are populated.
+fn build_tool_call_action(
+    surface: Surface,
+    server: &str,
+    tool: &str,
+    params: Option<serde_json::Value>,
+) -> ActionRecord {
     // A serde_json::Value always serializes; surface any unexpected failure rather than
     // silently emitting a `raw` that disagrees with `syntactic.params`.
-    let compact_params =
-        serde_json::to_string(&params).expect("serde_json::Value always serializes to a string");
-    let raw = format!("{server}.{tool}({compact_params})");
+    let raw = match &params {
+        Some(value) => {
+            let compact_params = serde_json::to_string(value)
+                .expect("serde_json::Value always serializes to a string");
+            format!("{server}.{tool}({compact_params})")
+        }
+        None => format!("{server}.{tool}()"),
+    };
     let risk = v1_risk_from_tool_name(tool);
 
     ActionRecord {
         record_schema_version: 1,
-        surface: Surface::McpToolCall,
+        surface,
         syntactic: SyntacticSubstrate {
-            // command-surface fields — all None for mcp_tool_call
+            // command-surface fields — all None for mcp_tool_call / agent_tool_call
             bin: None,
             argv: None,
             flags: None,
@@ -111,10 +199,11 @@ pub fn action_from_mcp_tool_call(
             cwd: None,
             host: None,
             env_refs: None,
-            // mcp-surface fields
+            // shared function-identity fields
             server: Some(server.to_string()),
             tool: Some(tool.to_string()),
-            params: Some(params),
+            params,
+            // file_edit-surface fields — always None here
             operation: None,
             paths: None,
             diff_summary: None,
@@ -455,5 +544,154 @@ mod tests {
             Some(array_params),
             "array params must survive a serde round-trip"
         );
+    }
+
+    // ── action_from_agent_tool_call ──────────────────────────────────────────────
+
+    /// Surface must be AgentToolCall (not McpToolCall) and schema version must be 1 — the
+    /// distinct-surface tag is the whole point of the `agent_tool_call` surface
+    /// (docs/openclaw-integration.md §5.2).
+    #[test]
+    fn agent_tool_call_surface_is_agent_tool_call_and_schema_version_is_1() {
+        let r = action_from_agent_tool_call("openclaw", "deploy_service", None);
+        assert_eq!(r.surface, Surface::AgentToolCall);
+        assert_ne!(
+            r.surface,
+            Surface::McpToolCall,
+            "agent_tool_call must never be tagged mcp_tool_call"
+        );
+        assert_eq!(r.record_schema_version, 1);
+    }
+
+    /// server and tool must be populated from the arguments, exactly like `mcp_tool_call`.
+    #[test]
+    fn agent_tool_call_server_and_tool_are_set() {
+        let r = action_from_agent_tool_call("openclaw", "deploy_service", None);
+        assert_eq!(r.syntactic.server.as_deref(), Some("openclaw"));
+        assert_eq!(r.syntactic.tool.as_deref(), Some("deploy_service"));
+    }
+
+    /// docs/openclaw-integration.md §5.2: `syntactic.params` is absent (not `null`) when the
+    /// caller has no structured parameters to offer.
+    #[test]
+    fn agent_tool_call_params_absent_when_none() {
+        let r = action_from_agent_tool_call("openclaw", "deploy_service", None);
+        assert!(
+            r.syntactic.params.is_none(),
+            "params must be None when the caller passes None"
+        );
+        let val: serde_json::Value = serde_json::to_value(&r).unwrap();
+        assert!(
+            val["syntactic"].get("params").is_none(),
+            "params: None must be omitted from JSON, not serialized as null"
+        );
+    }
+
+    /// `params` is preserved verbatim when a caller does have structured parameters — the
+    /// builder does not force `agent_tool_call` calls to be paramless, only allows it.
+    #[test]
+    fn agent_tool_call_params_preserved_when_some() {
+        let params = json!({ "target": "prod" });
+        let r = action_from_agent_tool_call("openclaw", "deploy_service", Some(params.clone()));
+        assert_eq!(r.syntactic.params, Some(params));
+    }
+
+    /// raw must be `"<server>.<tool>()"` when params is None (see module-level doc format).
+    #[test]
+    fn agent_tool_call_raw_uses_empty_parens_when_params_absent() {
+        let r = action_from_agent_tool_call("openclaw", "deploy_service", None);
+        assert_eq!(
+            r.syntactic.raw.as_deref(),
+            Some("openclaw.deploy_service()")
+        );
+    }
+
+    /// raw must be `"<server>.<tool>(<compact-json-params>)"` when params is Some, matching
+    /// `mcp_tool_call`'s format exactly.
+    #[test]
+    fn agent_tool_call_raw_matches_mcp_format_when_params_present() {
+        let params = json!({ "target": "prod" });
+        let r = action_from_agent_tool_call("openclaw", "deploy_service", Some(params.clone()));
+        let expected_raw = format!(
+            "openclaw.deploy_service({})",
+            serde_json::to_string(&params).unwrap()
+        );
+        assert_eq!(r.syntactic.raw.as_deref(), Some(expected_raw.as_str()));
+    }
+
+    /// Command-surface and file-edit-surface fields must all be None for an agent_tool_call
+    /// record, exactly like `mcp_tool_call`.
+    #[test]
+    fn agent_tool_call_command_and_file_edit_fields_are_none() {
+        let r = action_from_agent_tool_call("openclaw", "deploy_service", None);
+        assert!(r.syntactic.bin.is_none());
+        assert!(r.syntactic.argv.is_none());
+        assert!(r.syntactic.flags.is_none());
+        assert!(r.syntactic.positionals.is_none());
+        assert!(r.syntactic.cwd.is_none());
+        assert!(r.syntactic.host.is_none());
+        assert!(r.syntactic.env_refs.is_none());
+        assert!(r.syntactic.operation.is_none());
+        assert!(r.syntactic.paths.is_none());
+        assert!(r.syntactic.diff_summary.is_none());
+        assert!(r.syntactic.diff_hash.is_none());
+    }
+
+    /// capabilities and scope MUST be None in v1, same forward-compat requirement as every
+    /// other surface (policy-seam.md §forward-compat req #3).
+    #[test]
+    fn agent_tool_call_capabilities_and_scope_are_none() {
+        let r = action_from_agent_tool_call("openclaw", "deploy_service", None);
+        assert!(r.capabilities.is_none());
+        assert!(r.scope.is_none());
+    }
+
+    /// The risk heuristic is shared verbatim with `mcp_tool_call` (same tool-name prefixes).
+    #[test]
+    fn agent_tool_call_shares_risk_heuristic_with_mcp_tool_call() {
+        let destructive = action_from_agent_tool_call("openclaw", "delete_deployment", None);
+        assert_eq!(destructive.risk, Risk::High);
+
+        let benign = action_from_agent_tool_call("openclaw", "deploy_service", None);
+        assert_eq!(benign.risk, Risk::Medium);
+    }
+
+    /// Same inputs (including the `None` params) must produce identical ActionRecords.
+    #[test]
+    fn agent_tool_call_deterministic_same_inputs_produce_identical_records() {
+        let r1 = action_from_agent_tool_call("openclaw", "deploy_service", None);
+        let r2 = action_from_agent_tool_call("openclaw", "deploy_service", None);
+        assert_eq!(r1, r2);
+    }
+
+    /// An `agent_tool_call` record must survive a full serde round-trip, including the
+    /// omitted-when-None `params` field.
+    #[test]
+    fn agent_tool_call_action_record_round_trips_through_json() {
+        let record = action_from_agent_tool_call("openclaw", "deploy_service", None);
+        let serialised = serde_json::to_string(&record).expect("ActionRecord must serialise");
+        let deserialised: ActionRecord =
+            serde_json::from_str(&serialised).expect("ActionRecord must deserialise");
+        assert_eq!(record, deserialised);
+    }
+
+    /// An `mcp_tool_call` record and an `agent_tool_call` record built from the identical
+    /// `(server, tool)` pair must differ ONLY in `surface` — everything else about the shared
+    /// function-identity substrate stays byte-identical, matching the "reuses the (server, tool)
+    /// pair" decision in docs/policy-seam.md and docs/openclaw-integration.md §5.2.
+    #[test]
+    fn agent_tool_call_and_mcp_tool_call_share_identical_substrate_except_surface() {
+        let params = json!({ "list": "Agent Inbox" });
+        let mcp = action_from_mcp_tool_call("shared-name", "shared-tool", params.clone());
+        let agent = action_from_agent_tool_call("shared-name", "shared-tool", Some(params));
+
+        assert_ne!(mcp.surface, agent.surface);
+        assert_eq!(agent.surface, Surface::AgentToolCall);
+        assert_eq!(mcp.surface, Surface::McpToolCall);
+        assert_eq!(mcp.syntactic.server, agent.syntactic.server);
+        assert_eq!(mcp.syntactic.tool, agent.syntactic.tool);
+        assert_eq!(mcp.syntactic.params, agent.syntactic.params);
+        assert_eq!(mcp.syntactic.raw, agent.syntactic.raw);
+        assert_eq!(mcp.risk, agent.risk);
     }
 }

@@ -68,7 +68,7 @@ mod wire_b64 {
 /// The interception paradigm an action arrived through.
 ///
 /// `#[non_exhaustive]` preserves forward-compat as new surfaces are added
-/// (e.g. `AgentToolCall`, `DelegatedFetch`).
+/// (e.g. `DelegatedFetch`).
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -79,7 +79,15 @@ pub enum Surface {
     McpToolCall,
     /// A direct file-edit tool call such as Codex `apply_patch` or Claude Code `Edit`/`Write`.
     FileEdit,
-    // Future: AgentToolCall, DelegatedFetch.
+    /// An agent-runtime or plugin-owned tool call gated by the harness rather than by an MCP
+    /// server (e.g. an OpenClaw plugin permission request; see
+    /// `docs/openclaw-integration.md` §5.2). Reuses the `(server, tool)` function-identity pair
+    /// from `mcp_tool_call` — `server` holds the gating provider id, `tool` the tool name — but
+    /// is a **distinct surface** so a rule or registry scoped to `mcp_tool_call` never silently
+    /// sweeps in tool calls no MCP server ever served. See `docs/policy-seam.md` §Structure vs.
+    /// data in the ActionRecord.
+    AgentToolCall,
+    // Future: DelegatedFetch.
 }
 
 /// The human's decision.
@@ -116,6 +124,8 @@ pub enum Risk {
 ///
 /// - `surface = command`: `bin`, `argv`, `flags`, `positionals`, `cwd`, `host`, `env_refs`
 /// - `surface = mcp_tool_call`: `server`, `tool`, `params`
+/// - `surface = agent_tool_call`: `server`, `tool`, `params` — same fields as `mcp_tool_call`
+///   (`server` holds the gating provider id, not an MCP server name); `params` is often absent.
 /// - `surface = file_edit`: `operation`, `paths`, `diff_summary`, `diff_hash`, `raw`
 /// - File edits set `raw` to the exact edit/patch text for WYSIWYS display.
 /// - Other surfaces may set `raw` for display/fallback.
@@ -153,16 +163,18 @@ pub struct SyntacticSubstrate {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub env_refs: Option<Vec<String>>,
 
-    // ── mcp_tool_call-surface fields ─────────────────────────────────────────
-    /// MCP server name.
+    // ── mcp_tool_call / agent_tool_call-surface fields ───────────────────────
+    /// Function-identity server/provider name — an MCP server for `mcp_tool_call`, or the
+    /// gating provider id (e.g. a plugin id) for `agent_tool_call`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub server: Option<String>,
 
-    /// MCP tool name within the server.
+    /// Tool name within `server`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tool: Option<String>,
 
-    /// Tool call parameters as raw/structured JSON values.
+    /// Tool call parameters as raw/structured JSON values. Often absent for `agent_tool_call`
+    /// (docs/openclaw-integration.md §5.2: OpenClaw exposes no structured parameters).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub params: Option<serde_json::Value>,
 
@@ -720,7 +732,12 @@ mod tests {
 
     #[test]
     fn surface_round_trip() {
-        for v in [Surface::Command, Surface::McpToolCall, Surface::FileEdit] {
+        for v in [
+            Surface::Command,
+            Surface::McpToolCall,
+            Surface::FileEdit,
+            Surface::AgentToolCall,
+        ] {
             let json = serde_json::to_string(&v).unwrap();
             let back: Surface = serde_json::from_str(&json).unwrap();
             assert_eq!(v, back);
@@ -969,6 +986,53 @@ mod tests {
     fn surface_command_serializes_to_snake_case() {
         let v: Value = serde_json::to_value(Surface::Command).unwrap();
         assert_eq!(v, json!("command"));
+    }
+
+    /// docs/openclaw-integration.md §5.2 + docs/policy-seam.md: the new surface's wire name is
+    /// `agent_tool_call`, distinct from `mcp_tool_call` — the whole point is that a rule scoped
+    /// to one string never matches the other.
+    #[test]
+    fn surface_agent_tool_call_serializes_to_snake_case() {
+        let v: Value = serde_json::to_value(Surface::AgentToolCall).unwrap();
+        assert_eq!(
+            v,
+            json!("agent_tool_call"),
+            "Surface::AgentToolCall must serialize to \"agent_tool_call\" (snake_case)"
+        );
+        assert_ne!(
+            v,
+            serde_json::to_value(Surface::McpToolCall).unwrap(),
+            "agent_tool_call must be a distinct wire value from mcp_tool_call"
+        );
+    }
+
+    /// Fail-closed: an unrecognized `surface` string must not deserialize to any variant (e.g. by
+    /// silently defaulting), matching the contract's fail-closed invariant for unverifiable/
+    /// malformed input (docs/contract.md §Invariants).
+    #[test]
+    fn unknown_surface_string_fails_closed_on_deserialize() {
+        let result: Result<Surface, _> = serde_json::from_str(r#""delegated_fetch""#);
+        assert!(
+            result.is_err(),
+            "an unrecognized surface string must fail to deserialize, not silently pick a variant"
+        );
+    }
+
+    /// Same fail-closed requirement, exercised through a full [`ActionRecord`] the way a real
+    /// wire payload would arrive.
+    #[test]
+    fn action_record_with_unknown_surface_fails_closed_on_deserialize() {
+        let bad_json = r#"{
+            "record_schema_version": 1,
+            "surface": "totally_unknown_surface",
+            "syntactic": {},
+            "risk": "low"
+        }"#;
+        let result: Result<ActionRecord, _> = serde_json::from_str(bad_json);
+        assert!(
+            result.is_err(),
+            "an ActionRecord with an unknown surface must fail to deserialize (fail-closed)"
+        );
     }
 
     #[test]

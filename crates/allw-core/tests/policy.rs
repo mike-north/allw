@@ -1,12 +1,12 @@
 use allw_core::{
-    action_from_argv, action_from_file_edit, action_from_mcp_tool_call, evaluate,
-    evaluate_for_actor, issue_device_cert, sign_account_state, sign_policy_rule, sign_verdict,
-    verify_policy_rule, verify_policy_rule_for_account, verify_policy_rule_with_account_states,
-    AccountState, AccountStateRevocation, AccountStateRevocationKind, Actor, Approver,
-    CommandContext, Decision, McpMatcher, ParamMatcher, PolicyDecision, PolicyEffect,
-    PolicyPredicate, PolicyProvenance, PolicyRuleBuildError, PolicyRuleError, PolicyRuleScope,
-    PolicyTier, Risk, SigningKeyPair, Surface, SyntacticSubstrate, UnsignedPolicyRule,
-    UnsignedVerdict, Verdict,
+    action_from_agent_tool_call, action_from_argv, action_from_file_edit,
+    action_from_mcp_tool_call, evaluate, evaluate_for_actor, issue_device_cert, sign_account_state,
+    sign_policy_rule, sign_verdict, verify_policy_rule, verify_policy_rule_for_account,
+    verify_policy_rule_with_account_states, AccountState, AccountStateRevocation,
+    AccountStateRevocationKind, Actor, Approver, CommandContext, Decision, McpMatcher,
+    ParamMatcher, PolicyDecision, PolicyEffect, PolicyPredicate, PolicyProvenance,
+    PolicyRuleBuildError, PolicyRuleError, PolicyRuleScope, PolicyTier, Risk, SigningKeyPair,
+    Surface, SyntacticSubstrate, UnsignedPolicyRule, UnsignedVerdict, Verdict,
 };
 use serde_json::json;
 
@@ -196,6 +196,7 @@ fn command_and_mcp_rules_do_not_match_file_edit_actions() {
                 tool: Some("write_file".to_string()),
                 ..McpMatcher::default()
             }),
+            agent_tool: None,
         },
         effect: PolicyEffect::Deny,
         bounds: None,
@@ -219,6 +220,7 @@ fn file_edit_deny_precedes_file_edit_allow() {
         surface: Some(Surface::FileEdit),
         command: None,
         mcp: None,
+        agent_tool: None,
     };
     let allow = signed(UnsignedPolicyRule {
         id: "allow-file-edit".to_string(),
@@ -261,6 +263,7 @@ fn over_budget_file_edit_match_input_escalates_before_policy_match() {
             surface: Some(Surface::FileEdit),
             command: None,
             mcp: None,
+            agent_tool: None,
         },
         effect: PolicyEffect::Allow,
         bounds: None,
@@ -560,6 +563,7 @@ fn signed_policy_rule_rejects_empty_predicate() {
             surface: None,
             command: None,
             mcp: None,
+            agent_tool: None,
         },
         effect: PolicyEffect::Allow,
         bounds: None,
@@ -739,6 +743,7 @@ fn oversized_mcp_param_cannot_bypass_deny_with_broad_allow() {
                     string_glob: Some("*secret*".to_string()),
                 }],
             }),
+            agent_tool: None,
         },
         effect: PolicyEffect::Deny,
         bounds: None,
@@ -789,6 +794,7 @@ fn signed_policy_rule_rejects_over_length_mcp_glob_pattern() {
                     string_glob: Some(oversized),
                 }],
             }),
+            agent_tool: None,
         },
         effect: PolicyEffect::Allow,
         bounds: None,
@@ -1049,4 +1055,322 @@ fn verdict_wire_shape_stays_one_shot_and_scope_free() {
     assert!(json.get("scope").is_none());
     assert!(json.get("rule_id").is_none());
     assert!(json.get("policy_rule").is_none());
+}
+
+// ── agent_tool_call T1 policy-matcher coverage (issue #194) ───────────────────────────────
+
+/// docs/policy-seam.md + docs/openclaw-integration.md §5.2: `agent_tool_call` is a distinct
+/// surface from `mcp_tool_call` precisely so a rule scoped to one never sweeps in the other, even
+/// when the `(server, tool)` pair is byte-identical. THIS is the acceptance-criterion negative
+/// test: an `mcp_tool_call`-scoped rule must NOT match an `agent_tool_call` record.
+#[test]
+fn mcp_scoped_rule_does_not_match_agent_tool_call_action_with_identical_server_and_tool() {
+    let mcp_deny = signed(UnsignedPolicyRule {
+        id: "deny-mcp-scoped".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate::mcp_tool("openclaw", "deploy_service"),
+        effect: PolicyEffect::Deny,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    });
+
+    // Identical (server, tool) pair as the rule above, but built on the agent_tool_call surface.
+    let agent_action = action_from_agent_tool_call("openclaw", "deploy_service", None);
+
+    assert_eq!(
+        evaluate(&agent_action, &[mcp_deny]).decision,
+        PolicyDecision::Escalate,
+        "an mcp_tool_call-scoped rule must NOT match an agent_tool_call record with the same \
+         (server, tool) — that non-collision is the entire reason agent_tool_call is a distinct \
+         surface (docs/policy-seam.md, docs/openclaw-integration.md §5.2)"
+    );
+}
+
+/// The mirror image: an `agent_tool_call`-scoped rule must NOT match an `mcp_tool_call` action
+/// with the identical `(server, tool)` pair.
+#[test]
+fn agent_tool_scoped_rule_does_not_match_mcp_tool_call_action_with_identical_server_and_tool() {
+    let agent_deny = signed(UnsignedPolicyRule {
+        id: "deny-agent-tool-scoped".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate::agent_tool("openclaw", "deploy_service"),
+        effect: PolicyEffect::Deny,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    });
+
+    let mcp_action = action_from_mcp_tool_call("openclaw", "deploy_service", json!({}));
+
+    assert_eq!(
+        evaluate(&mcp_action, &[agent_deny]).decision,
+        PolicyDecision::Escalate,
+        "an agent_tool_call-scoped rule must NOT match an mcp_tool_call record with the same \
+         (server, tool)"
+    );
+}
+
+/// Positive T1 coverage: an `agent_tool`-scoped rule DOES match the `agent_tool_call` action it
+/// was written for (server + tool exact match).
+#[test]
+fn agent_tool_scoped_rule_matches_agent_tool_call_action_by_server_and_tool() {
+    let allow = signed(UnsignedPolicyRule {
+        id: "allow-agent-tool".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate::agent_tool("openclaw", "deploy_service"),
+        effect: PolicyEffect::Allow,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    });
+
+    let matching = action_from_agent_tool_call("openclaw", "deploy_service", None);
+    assert_eq!(
+        evaluate(&matching, std::slice::from_ref(&allow)).decision,
+        PolicyDecision::Allow
+    );
+
+    let different_tool = action_from_agent_tool_call("openclaw", "rollback_service", None);
+    assert_eq!(
+        evaluate(&different_tool, std::slice::from_ref(&allow)).decision,
+        PolicyDecision::Escalate,
+        "an agent_tool rule scoped to one tool must not match a different tool on the same server"
+    );
+
+    let different_server = action_from_agent_tool_call("other-plugin", "deploy_service", None);
+    assert_eq!(
+        evaluate(&different_server, &[allow]).decision,
+        PolicyDecision::Escalate,
+        "an agent_tool rule scoped to one server must not match a different server"
+    );
+}
+
+/// Deny precedence must hold on the `agent_tool_call` surface exactly like every other surface.
+#[test]
+fn agent_tool_call_deny_precedes_agent_tool_call_allow() {
+    let action = action_from_agent_tool_call("openclaw", "deploy_service", None);
+    let allow = signed(UnsignedPolicyRule {
+        id: "allow-agent-tool".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate::agent_tool("openclaw", "deploy_service"),
+        effect: PolicyEffect::Allow,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    });
+    let deny = signed(UnsignedPolicyRule {
+        id: "deny-agent-tool".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate::agent_tool("openclaw", "deploy_service"),
+        effect: PolicyEffect::Deny,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    });
+
+    let decision = evaluate(&action, &[allow, deny]);
+    assert_eq!(decision.decision, PolicyDecision::Deny);
+    assert_eq!(decision.rule_id.as_deref(), Some("deny-agent-tool"));
+}
+
+/// Command-surface rules must not match `agent_tool_call` actions either (the surface guard is
+/// symmetric across every surface pair, not special-cased for mcp vs. agent_tool).
+#[test]
+fn command_scoped_rule_does_not_match_agent_tool_call_action() {
+    let deny_command = signed(UnsignedPolicyRule {
+        id: "deny-deploy-command".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate::command_bin("deploy_service"),
+        effect: PolicyEffect::Deny,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    });
+    let action = action_from_agent_tool_call("openclaw", "deploy_service", None);
+
+    assert_eq!(
+        evaluate(&action, &[deny_command]).decision,
+        PolicyDecision::Escalate,
+        "a command-scoped rule must not match an agent_tool_call record"
+    );
+}
+
+/// Oversized `agent_tool_call` params must escalate before matching even a broad allow — mirrors
+/// the existing `mcp_tool_call` over-budget-cannot-bypass-deny coverage.
+#[test]
+fn oversized_agent_tool_call_param_cannot_bypass_deny_with_broad_allow() {
+    let oversized = format!("secret-{}", "a".repeat(4097));
+    let deny_secret = signed(UnsignedPolicyRule {
+        id: "deny-secret-agent-param".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate {
+            surface: Some(Surface::AgentToolCall),
+            command: None,
+            mcp: None,
+            agent_tool: Some(McpMatcher {
+                server: Some("openclaw".to_string()),
+                tool: Some("deploy_service".to_string()),
+                params_exact: None,
+                params: vec![ParamMatcher {
+                    path: "target".to_string(),
+                    equals: None,
+                    string_glob: Some("*secret*".to_string()),
+                }],
+            }),
+        },
+        effect: PolicyEffect::Deny,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    });
+    let allow_tool = signed(UnsignedPolicyRule {
+        id: "allow-deploy-service".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        subject: allw_core::ActorMatcher::Any,
+        predicate: PolicyPredicate::agent_tool("openclaw", "deploy_service"),
+        effect: PolicyEffect::Allow,
+        bounds: None,
+        provenance: PolicyProvenance::Manual,
+        tier: PolicyTier::Syntactic,
+        created_at: 1_700_000_000_000,
+        expires_at: None,
+    });
+    let action = action_from_agent_tool_call(
+        "openclaw",
+        "deploy_service",
+        Some(json!({ "target": oversized })),
+    );
+
+    assert_eq!(
+        evaluate(&action, &[deny_secret, allow_tool]).decision,
+        PolicyDecision::Escalate,
+        "over-cap agent_tool_call params must escalate before a broad allow can bypass a deny"
+    );
+}
+
+/// `UnsignedPolicyRule::from_approval` with `CommandOrToolAnyArgs` on an `agent_tool_call`
+/// approval must derive a rule scoped to `agent_tool_call` (not `mcp_tool_call`), and that rule
+/// must round-trip through evaluate exactly like the existing MCP coverage.
+#[test]
+fn from_approval_command_or_tool_any_args_scopes_to_agent_tool_call_surface() {
+    let actor = actor();
+    let action = action_from_agent_tool_call(
+        "openclaw",
+        "deploy_service",
+        Some(json!({ "target": "prod" })),
+    );
+    let verified = signed(
+        UnsignedPolicyRule::from_approval(
+            "approval-agent-tool-any-args",
+            ACCOUNT_ID,
+            &actor,
+            &action,
+            PolicyRuleScope::CommandOrToolAnyArgs,
+            1_700_000_000_000,
+        )
+        .expect("agent_tool_call action can emit a CommandOrToolAnyArgs rule"),
+    );
+
+    let same_tool_different_params = action_from_agent_tool_call(
+        "openclaw",
+        "deploy_service",
+        Some(json!({ "target": "dev" })),
+    );
+    assert_eq!(
+        evaluate_for_actor(
+            &actor,
+            &same_tool_different_params,
+            std::slice::from_ref(&verified)
+        )
+        .decision,
+        PolicyDecision::Allow,
+        "CommandOrToolAnyArgs must match the same server/tool regardless of params"
+    );
+
+    let mcp_same_server_tool = action_from_mcp_tool_call("openclaw", "deploy_service", json!({}));
+    assert_eq!(
+        evaluate_for_actor(&actor, &mcp_same_server_tool, &[verified]).decision,
+        PolicyDecision::Escalate,
+        "a rule derived from an agent_tool_call approval must not widen to mcp_tool_call"
+    );
+}
+
+/// `UnsignedPolicyRule::from_approval` with `McpParamEquals` on an `agent_tool_call` approval
+/// must derive an `agent_tool`-scoped predicate (not `mcp`-scoped) so the rule actually matches
+/// future `agent_tool_call` calls — regression coverage for the surface-aware fix to
+/// `mcp_param_equals_predicate`.
+#[test]
+fn from_approval_mcp_param_equals_scopes_to_agent_tool_call_surface() {
+    let actor = actor();
+    let action = action_from_agent_tool_call(
+        "openclaw",
+        "deploy_service",
+        Some(json!({ "target": "prod", "region": "us-east" })),
+    );
+    let verified = signed(
+        UnsignedPolicyRule::from_approval(
+            "approval-agent-tool-param",
+            ACCOUNT_ID,
+            &actor,
+            &action,
+            PolicyRuleScope::McpParamEquals {
+                path: "target".to_string(),
+            },
+            1_700_000_000_000,
+        )
+        .expect("agent_tool_call action can emit a param-equals rule"),
+    );
+
+    let matching = action_from_agent_tool_call(
+        "openclaw",
+        "deploy_service",
+        Some(json!({ "target": "prod", "region": "us-west" })),
+    );
+    assert_eq!(
+        evaluate_for_actor(&actor, &matching, std::slice::from_ref(&verified)).decision,
+        PolicyDecision::Allow,
+        "a param-equals rule derived from an agent_tool_call approval must match a future call \
+         with the same target value"
+    );
+
+    let different_target = action_from_agent_tool_call(
+        "openclaw",
+        "deploy_service",
+        Some(json!({ "target": "staging", "region": "us-east" })),
+    );
+    assert_eq!(
+        evaluate_for_actor(&actor, &different_target, &[verified]).decision,
+        PolicyDecision::Escalate,
+        "a different target value must not match the derived rule"
+    );
+}
+
+/// Fail-closed: `evaluate` on an `agent_tool_call` action with no rules at all still escalates
+/// (never silently allows) — mirrors the existing no-rules-escalates coverage for other surfaces.
+#[test]
+fn agent_tool_call_action_with_no_rules_escalates() {
+    let action = action_from_agent_tool_call("openclaw", "deploy_service", None);
+    assert_eq!(evaluate(&action, &[]).decision, PolicyDecision::Escalate);
 }

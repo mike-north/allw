@@ -1874,3 +1874,81 @@ test("action_from_file_edit throws on empty paths (fail-closed)", async () => {
     "pathless edits must be denied before they reach approval",
   );
 });
+
+// ── action_from_agent_tool_call (issue #194) ──────────────────────────────────────────────
+
+test("action_from_agent_tool_call builds an agent_tool_call ActionRecord distinct from mcp_tool_call", async () => {
+  const wasm = await loadWasm();
+
+  const record = JSON.parse(
+    wasm.action_from_agent_tool_call("openclaw", "deploy_service", undefined),
+  );
+
+  assert.equal(record.surface, "agent_tool_call", "surface must be 'agent_tool_call'");
+  assert.notEqual(record.surface, "mcp_tool_call", "must never be tagged mcp_tool_call");
+  assert.equal(record.record_schema_version, 1, "v1 record schema version");
+  assert.equal(record.syntactic.server, "openclaw", "server is preserved");
+  assert.equal(record.syntactic.tool, "deploy_service", "tool is preserved");
+  assert.equal(
+    record.syntactic.raw,
+    "openclaw.deploy_service()",
+    "raw uses empty parens when params absent",
+  );
+  assert.ok(!("params" in record.syntactic), "params must be absent (not null) when omitted");
+  assert.ok(!("capabilities" in record), "capabilities reserved (absent) in v1");
+  assert.ok(!("scope" in record), "scope reserved (absent) in v1");
+});
+
+test("action_from_agent_tool_call preserves structured params when provided", async () => {
+  const wasm = await loadWasm();
+
+  const params = { target: "prod" };
+  const record = JSON.parse(
+    wasm.action_from_agent_tool_call("openclaw", "deploy_service", JSON.stringify(params)),
+  );
+
+  assert.deepEqual(record.syntactic.params, params, "params are preserved verbatim");
+  assert.equal(
+    record.syntactic.raw,
+    `openclaw.deploy_service(${JSON.stringify(params)})`,
+    "raw matches the mcp_tool_call display format when params are present",
+  );
+});
+
+test("action_from_agent_tool_call shares the mcp_tool_call risk heuristic", async () => {
+  const wasm = await loadWasm();
+
+  const destructive = JSON.parse(
+    wasm.action_from_agent_tool_call("openclaw", "delete_deployment", undefined),
+  );
+  assert.equal(destructive.risk, "high", "delete* prefix → High, same heuristic as mcp_tool_call");
+
+  const benign = JSON.parse(
+    wasm.action_from_agent_tool_call("openclaw", "deploy_service", undefined),
+  );
+  assert.equal(benign.risk, "medium", "non-destructive tool names → Medium");
+});
+
+test("action_from_agent_tool_call throws on malformed params JSON (fail-closed)", async () => {
+  const wasm = await loadWasm();
+
+  assert.throws(
+    () => wasm.action_from_agent_tool_call("openclaw", "deploy_service", "{not json"),
+    /invalid agent tool params JSON/,
+    "unparseable params must surface as a thrown JS error (fail-closed)",
+  );
+});
+
+test("agent_tool_call fixture vector: WASM compute_request_hash matches the Rust-computed hash (parity, issue #194)", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+
+  const got = wasm.compute_request_hash(v.agent_tool_call_context_json, v.expires_at);
+
+  assert.equal(
+    got,
+    v.agent_tool_call_expected_request_hash_b64,
+    "WASM compute_request_hash must equal the shared vector's agent_tool_call base64url hash \
+     (proves WYSIWYS canonicalization stays in parity across Rust and WASM for the new surface)",
+  );
+});

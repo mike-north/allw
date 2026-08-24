@@ -58,7 +58,7 @@ pub use hash::{canonical_request_bytes, compute_request_hash};
 pub use jwe::{
     decrypt_context, encrypt_context, ContextRecipient, JweError, X25519KeyPair, X25519PublicKey,
 };
-pub use mcp::action_from_mcp_tool_call;
+pub use mcp::{action_from_agent_tool_call, action_from_mcp_tool_call};
 pub use policy::{
     evaluate, evaluate_for_actor, sign_policy_rule, verify_policy_rule,
     verify_policy_rule_for_account, verify_policy_rule_with_account_states,
