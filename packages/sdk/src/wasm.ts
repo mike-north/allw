@@ -80,6 +80,17 @@ export interface AllwWasm {
     expectedAccountId: string,
     accountRootPubkeyB64: string,
   ): string;
+  /**
+   * Resolves the device ids revoked in the highest-sequence valid account state(s), returning a
+   * JSON array of device id strings (empty when `accountStatesJson` is `"[]"`). Used to filter
+   * revoked devices out of the JWE recipient set **before** encrypting a new request (issue #204
+   * fix 1) — the parse/verify/resolve logic stays in core; the caller only drops matching ids.
+   */
+  revoked_device_ids(
+    accountStatesJson: string,
+    expectedAccountId: string,
+    accountRootPubkeyB64: string,
+  ): string;
   /** Derive the Ed25519 public key for a 32-byte signing seed (base64url). */
   ed25519_public_key(seedB64: string): string;
   /** Build an ActionRecord JSON for a shell command using the core T1 command parser. */

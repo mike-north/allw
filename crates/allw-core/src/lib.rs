@@ -44,13 +44,14 @@ pub use contract::{
     Decision, PolicyBlock, PolicyDecision, Risk, Surface, SyntacticSubstrate, Verdict,
 };
 pub use crypto::{
-    derive_number_match_challenge, effective_allow, issue_device_cert, sign_account_state,
-    sign_verdict, verify_account_state, verify_verdict, verify_verdict_for_account,
-    verify_verdict_with_account_states, verify_verdict_with_account_states_for_account,
-    AccountState, AccountStateActor, AccountStateDevice, AccountStateError,
-    AccountStatePreviousRoot, AccountStateRevocation, AccountStateRevocationKind, DeviceCertClaims,
-    InMemoryNonceStore, JwsError, KeyError, NonceStore, PublicKey, SigningKeyPair, UnsignedVerdict,
-    VerdictClaims, VerifiedVerdict, VerifyError,
+    derive_number_match_challenge, effective_allow, issue_device_cert, revoked_device_ids,
+    sign_account_state, sign_verdict, verify_account_state, verify_verdict,
+    verify_verdict_for_account, verify_verdict_with_account_states,
+    verify_verdict_with_account_states_for_account, AccountState, AccountStateActor,
+    AccountStateDevice, AccountStateError, AccountStatePreviousRoot, AccountStateRevocation,
+    AccountStateRevocationKind, DeviceCertClaims, InMemoryNonceStore, JwsError, KeyError,
+    NonceStore, PublicKey, SigningKeyPair, UnsignedVerdict, VerdictClaims, VerifiedVerdict,
+    VerifyError,
 };
 pub use file_edit::action_from_file_edit;
 pub use hash::{canonical_request_bytes, compute_request_hash};

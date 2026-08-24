@@ -115,7 +115,16 @@ function makeApprover(wasm) {
   const deviceX25519Pub = wasm.x25519_public_key(deviceX25519Seed);
   const deviceId = "dev_sdk_test_01";
   const cert = wasm.issue_device_cert(accountSeed, ACCOUNT_ID, deviceId, devicePub, NOW_MS - 1000);
-  return { accountSeed, deviceSeed, deviceX25519Pub, accountRootPub, devicePub, deviceId, cert };
+  return {
+    accountSeed,
+    deviceSeed,
+    deviceX25519Seed,
+    deviceX25519Pub,
+    accountRootPub,
+    devicePub,
+    deviceId,
+    cert,
+  };
 }
 
 /** One enrolled device record as the relay's `GET /:acct/devices` returns it. */
@@ -125,6 +134,35 @@ function deviceRecord(approver) {
     pubkey: approver.deviceX25519Pub,
     label: null,
     created_at: 0,
+  };
+}
+
+/**
+ * Build a SECOND device enrolled under the same account root as `primary` (e.g. a since-revoked
+ * device) — same account-state/relay shape as {@link makeApprover}, but distinguishable by
+ * `deviceId`/keys so recipient-filtering tests can tell the two devices' ciphertext access apart.
+ */
+function makeSecondDevice(wasm, primary, { seedByte, deviceId }) {
+  const deviceSeed = Buffer.alloc(32, seedByte).toString("base64url");
+  const deviceX25519Seed = Buffer.alloc(32, seedByte + 1).toString("base64url");
+  const devicePub = wasm.ed25519_public_key(deviceSeed);
+  const deviceX25519Pub = wasm.x25519_public_key(deviceX25519Seed);
+  const cert = wasm.issue_device_cert(
+    primary.accountSeed,
+    ACCOUNT_ID,
+    deviceId,
+    devicePub,
+    NOW_MS - 1000,
+  );
+  return {
+    accountSeed: primary.accountSeed,
+    deviceSeed,
+    deviceX25519Seed,
+    deviceX25519Pub,
+    accountRootPub: primary.accountRootPub,
+    devicePub,
+    deviceId,
+    cert,
   };
 }
 
@@ -390,23 +428,30 @@ test("(a') happy poll round-trip (no WebSocket) → approved", async () => {
 
 test("(a-revoked) accountStates reject an otherwise valid verdict from a revoked device", async () => {
   const wasm = await loadWasm();
-  const approver = makeApprover(wasm);
+  // Two enrolled devices so the sender-side filter (issue #204 fix 1) does not itself short-circuit
+  // the request (that all-revoked path is covered by (fix1-c)) — this test targets the INDEPENDENT
+  // defense-in-depth layer: verdict verification must reject a revoked device's signature even if a
+  // verdict from it is somehow delivered (e.g. a compromised relay replaying/fabricating a poll
+  // response), regardless of whether it was ever a JWE recipient for this particular request.
+  const kept = makeApprover(wasm);
+  const revokedDevice = makeSecondDevice(wasm, kept, { seedByte: 40, deviceId: "dev_revoked_03" });
   const req = sampleRequest();
-  const revokedState = signAccountState(wasm, approver, {
+  const revokedState = signAccountState(wasm, kept, {
     sequence: 1,
-    revokedDeviceIds: [approver.deviceId],
+    revokedDeviceIds: [revokedDevice.deviceId],
   });
 
   const relay = makeRelayDouble({
-    devices: [deviceRecord(approver)],
+    devices: [deviceRecord(kept), deviceRecord(revokedDevice)],
     behavior: {
-      poll: (env) => (env ? signVerdict(wasm, approver, req, env, { decision: "approved" }) : null),
+      poll: (env) =>
+        env ? signVerdict(wasm, revokedDevice, req, env, { decision: "approved" }) : null,
     },
   });
   const client = createClient({
     relayUrl: RELAY_URL,
     accountId: ACCOUNT_ID,
-    approverRootKey: approver.accountRootPub,
+    approverRootKey: kept.accountRootPub,
     fetchImpl: relay.fetchImpl,
     nowImpl: () => NOW_MS,
     webSocketFactory: undefined,
@@ -421,9 +466,140 @@ test("(a-revoked) accountStates reject an otherwise valid verdict from a revoked
     "a revoked device's otherwise valid approval fails closed to denied",
   );
   assert.equal(
-    await verdict.verify(approver.accountRootPub),
+    await verdict.verify(kept.accountRootPub),
     false,
     "verify() uses the client account-state set by default",
+  );
+});
+
+// ── Sender-side recipient filtering (issue #204 fix 1) ──────────────────────────────────
+//
+// The relay-listed device set is untrusted; these assert on the actual JWE recipient set the
+// SDK builds by attempting to decrypt the SUBMITTED ciphertext as each device. A revoked
+// device's absence from that recipient set is the real, end-to-end analogue of "assert on the
+// set passed to encrypt_context" (there is no seam to intercept the WASM call directly from a
+// compiled-`dist` test, so the ciphertext itself — the only thing a hostile relay ever sees —
+// is the artifact under test).
+
+test("(fix1-a) a device revoked in account state receives NO JWE recipient entry", async () => {
+  const wasm = await loadWasm();
+  const kept = makeApprover(wasm);
+  const revokedDevice = makeSecondDevice(wasm, kept, { seedByte: 20, deviceId: "dev_revoked_01" });
+  const req = sampleRequest();
+  const revokedState = signAccountState(wasm, kept, {
+    sequence: 1,
+    revokedDeviceIds: [revokedDevice.deviceId],
+  });
+
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(kept), deviceRecord(revokedDevice)],
+    behavior: {
+      poll: (env) => (env ? signVerdict(wasm, kept, req, env, { decision: "approved" }) : null),
+    },
+  });
+  const client = createClient({
+    relayUrl: RELAY_URL,
+    accountId: ACCOUNT_ID,
+    approverRootKey: kept.accountRootPub,
+    fetchImpl: relay.fetchImpl,
+    nowImpl: () => NOW_MS,
+    webSocketFactory: undefined,
+    pollIntervalMs: 5,
+    accountStates: [revokedState],
+  });
+
+  const verdict = await client.requestApproval(req);
+  assert.equal(verdict.decision, "approved", "the non-revoked device's verdict still verifies");
+
+  const jwe = relay.state.captured.context_ciphertext;
+  const decrypted = JSON.parse(wasm.decrypt_context(jwe, kept.deviceId, kept.deviceX25519Seed));
+  assert.deepEqual(
+    decrypted,
+    wireContext(req),
+    "the kept (non-revoked) device can still decrypt the submitted context",
+  );
+  assert.throws(
+    () => wasm.decrypt_context(jwe, revokedDevice.deviceId, revokedDevice.deviceX25519Seed),
+    /no recipient header kid matches the requested device id/,
+    "the revoked device has NO recipient entry in the JWE — it cannot even attempt decryption",
+  );
+});
+
+test("(fix1-b) a lower-sequence account state does not resurrect a revoked device's recipient entry", async () => {
+  const wasm = await loadWasm();
+  const kept = makeApprover(wasm);
+  const revokedDevice = makeSecondDevice(wasm, kept, { seedByte: 30, deviceId: "dev_revoked_02" });
+  const req = sampleRequest();
+  // Highest sequence (5) revokes the device; a STALE lower-sequence (4) document that omits the
+  // revocation must not roll it back (mirrors the core's
+  // `stale_account_state_does_not_override_newer_device_revocation`).
+  const newerRevocation = signAccountState(wasm, kept, {
+    sequence: 5,
+    revokedDeviceIds: [revokedDevice.deviceId],
+  });
+  const staleWithoutRevocation = signAccountState(wasm, kept, {
+    sequence: 4,
+    revokedDeviceIds: [],
+  });
+
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(kept), deviceRecord(revokedDevice)],
+    behavior: {
+      poll: (env) => (env ? signVerdict(wasm, kept, req, env, { decision: "approved" }) : null),
+    },
+  });
+  const client = createClient({
+    relayUrl: RELAY_URL,
+    accountId: ACCOUNT_ID,
+    approverRootKey: kept.accountRootPub,
+    fetchImpl: relay.fetchImpl,
+    nowImpl: () => NOW_MS,
+    webSocketFactory: undefined,
+    pollIntervalMs: 5,
+    accountStates: [staleWithoutRevocation, newerRevocation],
+  });
+
+  await client.requestApproval(req);
+  const jwe = relay.state.captured.context_ciphertext;
+  assert.throws(
+    () => wasm.decrypt_context(jwe, revokedDevice.deviceId, revokedDevice.deviceX25519Seed),
+    /no recipient header kid matches the requested device id/,
+    "a stale lower-sequence document must not resurrect the highest-sequence revocation",
+  );
+});
+
+test("(fix1-c) all enrolled devices revoked → requestApproval rejects without submitting", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const revokedState = signAccountState(wasm, approver, {
+    sequence: 1,
+    revokedDeviceIds: [approver.deviceId],
+  });
+
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: { poll: () => null },
+  });
+  const client = createClient({
+    relayUrl: RELAY_URL,
+    accountId: ACCOUNT_ID,
+    approverRootKey: approver.accountRootPub,
+    fetchImpl: relay.fetchImpl,
+    nowImpl: () => NOW_MS,
+    webSocketFactory: undefined,
+    pollIntervalMs: 5,
+    accountStates: [revokedState],
+  });
+
+  await assert.rejects(
+    () => client.requestApproval(sampleRequest()),
+    /no non-revoked devices/,
+    "an account with every enrolled device revoked must fail loudly (deny), never submit to nobody",
+  );
+  assert.equal(
+    relay.state.submitted,
+    false,
+    "no envelope may be submitted when every recipient was filtered out as revoked",
   );
 });
 

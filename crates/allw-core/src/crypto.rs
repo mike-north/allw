@@ -682,28 +682,58 @@ pub(crate) fn account_state_revokes_device(
     account_root: &PublicKey,
     device_id: &str,
 ) -> Result<bool, AccountStateError> {
+    Ok(revoked_device_ids(account_states, expected_account_id, account_root)?.contains(device_id))
+}
+
+/// Resolves the set of device ids revoked in the **highest-sequence** verified root-signed
+/// account-state document(s) among `account_states`.
+///
+/// This is the shared revocation-resolution logic behind [`account_state_revokes_device`]
+/// (verdict/policy-rule verification) and the SDK's sender-side recipient filter (issue #204
+/// fix 1): dropping a revoked device from the JWE recipient set *before* encrypting a new
+/// request, so a revoked device's plaintext confidentiality is cut off immediately rather than
+/// only at verdict-verification time.
+///
+/// Every supplied document must verify against `account_root` for `expected_account_id`, or the
+/// whole call fails closed with [`AccountStateError`] — a malformed/wrong-account/wrong-root
+/// document is never silently ignored (a caller-controlled "just drop the bad one" would let a
+/// forged low document mask a real revocation).
+///
+/// When multiple valid documents are supplied, only the **highest** `sequence` contributes
+/// revocations — a lower-sequence document that omits a revocation can never resurrect a device
+/// the account owner already revoked. Conflicting same-sequence documents are fail-closed: the
+/// union of every highest-sequence document's revocations applies.
+pub fn revoked_device_ids(
+    account_states: &[&str],
+    expected_account_id: &str,
+    account_root: &PublicKey,
+) -> Result<HashSet<String>, AccountStateError> {
     let mut highest_sequence = None;
-    let mut revoked_at_highest = false;
+    let mut revoked_at_highest: HashSet<String> = HashSet::new();
 
     for compact in account_states {
         let state = verify_account_state(compact, expected_account_id, account_root)?;
-        let state_revokes_device = state.revocations.iter().any(|revocation| {
-            revocation.kind == AccountStateRevocationKind::Device && revocation.id == device_id
-        });
+        let device_revocations_at_state = || {
+            state
+                .revocations
+                .iter()
+                .filter(|revocation| revocation.kind == AccountStateRevocationKind::Device)
+                .map(|revocation| revocation.id.clone())
+        };
 
         match highest_sequence {
             None => {
                 highest_sequence = Some(state.sequence);
-                revoked_at_highest = state_revokes_device;
+                revoked_at_highest = device_revocations_at_state().collect();
             }
             Some(sequence) if state.sequence > sequence => {
                 highest_sequence = Some(state.sequence);
-                revoked_at_highest = state_revokes_device;
+                revoked_at_highest = device_revocations_at_state().collect();
             }
             Some(sequence) if state.sequence == sequence => {
-                // Conflicting same-sequence states are fail-closed: if any highest sequence
-                // valid state says the device is revoked, treat it as revoked.
-                revoked_at_highest |= state_revokes_device;
+                // Conflicting same-sequence states are fail-closed: the union of every
+                // highest-sequence valid state's revocations applies.
+                revoked_at_highest.extend(device_revocations_at_state());
             }
             Some(_) => {}
         }
@@ -2414,6 +2444,87 @@ mod tests {
         )
         .expect_err("lower-sequence account state must not roll back a device revocation");
         assert_eq!(err, VerifyError::DeviceRevoked);
+    }
+
+    // ── revoked_device_ids (issue #204 fix 1: sender-side recipient filtering) ───────
+
+    /// A device revoked in the highest-sequence account state is returned by
+    /// `revoked_device_ids`, which is the predicate the SDK uses to drop a revoked device from
+    /// the JWE recipient set before encrypting a new request (issue #204 fix 1).
+    #[test]
+    fn revoked_device_ids_includes_highest_sequence_revocation() {
+        let revoked = signed_account_state(2, &[DEVICE_ID]);
+
+        let ids = revoked_device_ids(&[revoked.as_str()], ACCOUNT_ID, &root_key().public_key())
+            .expect("a valid account state must resolve");
+        assert!(ids.contains(DEVICE_ID));
+    }
+
+    /// A lower-sequence document that omits a revocation must not resurrect a device the
+    /// highest-sequence document revoked (mirrors
+    /// `stale_account_state_does_not_override_newer_device_revocation` for verdict verification).
+    #[test]
+    fn revoked_device_ids_ignores_lower_sequence_document() {
+        let newer_revocation = signed_account_state(5, &[DEVICE_ID]);
+        let stale_without_revocation = signed_account_state(4, &[]);
+
+        let ids = revoked_device_ids(
+            &[newer_revocation.as_str(), stale_without_revocation.as_str()],
+            ACCOUNT_ID,
+            &root_key().public_key(),
+        )
+        .expect("valid account states must resolve");
+        assert!(
+            ids.contains(DEVICE_ID),
+            "a stale lower-sequence document must not roll back a newer revocation"
+        );
+    }
+
+    /// A higher-sequence document that no longer lists a device as revoked must not leave it
+    /// revoked (the highest sequence wins outright, not a union across all sequences).
+    #[test]
+    fn revoked_device_ids_reflects_un_revocation_at_highest_sequence() {
+        let older_revocation = signed_account_state(1, &[DEVICE_ID]);
+        let newer_without_revocation = signed_account_state(2, &[]);
+
+        let ids = revoked_device_ids(
+            &[older_revocation.as_str(), newer_without_revocation.as_str()],
+            ACCOUNT_ID,
+            &root_key().public_key(),
+        )
+        .expect("valid account states must resolve");
+        assert!(
+            !ids.contains(DEVICE_ID),
+            "the highest-sequence document is authoritative even when it un-revokes a device"
+        );
+    }
+
+    /// No supplied account states ⇒ no known revocations ⇒ an empty set (never an error) so the
+    /// SDK's filter is a no-op when the caller has no account-state material yet.
+    #[test]
+    fn revoked_device_ids_empty_when_no_account_states_supplied() {
+        let ids = revoked_device_ids(&[], ACCOUNT_ID, &root_key().public_key())
+            .expect("no account states is not itself an error");
+        assert!(ids.is_empty());
+    }
+
+    /// An invalid account-state document (wrong account id) fails the whole resolution closed
+    /// rather than silently treating it as "no revocations known" — a caller must never be able
+    /// to mask a real revocation by mixing in a bad document.
+    #[test]
+    fn revoked_device_ids_fails_closed_on_invalid_account_state() {
+        let wrong_account = sign_account_state(
+            &account_state_claims(1, "acc_other", 1, &root_key(), &[DEVICE_ID]),
+            &root_key(),
+        );
+
+        let err = revoked_device_ids(
+            &[wrong_account.as_str()],
+            ACCOUNT_ID,
+            &root_key().public_key(),
+        )
+        .expect_err("an account state for the wrong account must fail closed");
+        assert_eq!(err, AccountStateError::AccountMismatch);
     }
 
     /// An empty challenge response is treated as missing (presence must be non-empty).
