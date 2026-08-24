@@ -13,9 +13,10 @@ use allw_core::{
     SigningKeyPair, Surface, SyntacticSubstrate, X25519KeyPair,
 };
 use allw_uniffi::{
-    action_from_agent_tool_call_json, action_from_command_json, compute_request_hash_b64,
-    derive_device_keys_json, derive_signing_pubkey_b64, issue_device_cert_json,
-    prepare_approval_json, sign_verdict_json, verify_verdict_json,
+    action_from_agent_tool_call_json, action_from_agent_tool_call_with_raw_json,
+    action_from_command_json, compute_request_hash_b64, derive_device_keys_json,
+    derive_signing_pubkey_b64, issue_device_cert_json, prepare_approval_json, sign_verdict_json,
+    verify_verdict_json,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand_chacha::rand_core::SeedableRng;
@@ -753,4 +754,51 @@ fn agent_tool_call_action_and_request_hash_round_trip_over_json_strings() {
     let hash = compute_request_hash_b64(context.to_string(), 4_102_444_800_000).unwrap();
 
     assert_eq!(hash.len(), 43);
+}
+
+// ---------------------------------------------------------------------------
+// action_from_agent_tool_call_with_raw_json (issue #213)
+// ---------------------------------------------------------------------------
+
+/// The whole point of the `_with_raw` FFI surface: `raw` is bound verbatim through the native
+/// boundary, never the synthesized `<server>.<tool>()` display
+/// (`docs/openclaw-integration.md` §5.2).
+#[test]
+fn action_from_agent_tool_call_with_raw_json_binds_raw_verbatim() {
+    let action_json = action_from_agent_tool_call_with_raw_json(
+        "openclaw".to_string(),
+        "deploy_service".to_string(),
+        "This plugin wants to deploy to production.".to_string(),
+        String::new(),
+    )
+    .unwrap();
+    let action: serde_json::Value = serde_json::from_str(&action_json).unwrap();
+
+    assert_eq!(action["surface"], "agent_tool_call");
+    assert_eq!(action["syntactic"]["server"], "openclaw");
+    assert_eq!(action["syntactic"]["tool"], "deploy_service");
+    assert_eq!(
+        action["syntactic"]["raw"],
+        "This plugin wants to deploy to production."
+    );
+    assert!(
+        action["syntactic"].get("params").is_none(),
+        "params must be absent (not null) when params_json is empty"
+    );
+}
+
+/// Fail-closed: malformed `params_json` must return `Err`, never build a record from
+/// unparseable input, even though `raw` is supplied verbatim.
+#[test]
+fn action_from_agent_tool_call_with_raw_json_rejects_malformed_params() {
+    let result = action_from_agent_tool_call_with_raw_json(
+        "openclaw".to_string(),
+        "deploy_service".to_string(),
+        "custom reviewer prose".to_string(),
+        "{not json".to_string(),
+    );
+    assert!(
+        result.is_err(),
+        "malformed params_json must return Err, not a record built from garbage"
+    );
 }

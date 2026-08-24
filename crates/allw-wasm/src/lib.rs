@@ -38,6 +38,7 @@
 
 use allw_core::{
     action_from_agent_tool_call as core_action_from_agent_tool_call,
+    action_from_agent_tool_call_with_raw as core_action_from_agent_tool_call_with_raw,
     action_from_argv as core_action_from_argv, action_from_command as core_action_from_command,
     action_from_file_edit as core_action_from_file_edit,
     action_from_mcp_tool_call as core_action_from_mcp_tool_call,
@@ -1176,6 +1177,39 @@ pub fn action_from_agent_tool_call(
         .map(|json_str| parse_json(&json_str, "agent tool params"))
         .transpose()?;
     let record = core_action_from_agent_tool_call(server, tool, params);
+    to_json(&record, "ActionRecord")
+}
+
+/// Builds an [`ActionRecord`](allw_core::ActionRecord) for an agent-runtime/plugin-owned tool
+/// call, returning it as JSON, with an **explicit** `raw` override instead of the synthesized
+/// `"<server>.<tool>(...)"` display. Use this when the caller already holds human-authored
+/// reviewer prose for the action (e.g. an OpenClaw plugin permission request's
+/// `description`/`detail` — `docs/openclaw-integration.md` §5.2: `syntactic.raw` = `description`,
+/// plus `detail` when present); use [`action_from_agent_tool_call`] when no such prose exists.
+///
+/// `raw` is bound **verbatim** — it is never re-derived from `params_json`.
+///
+/// - `server` — the gating provider identity (e.g. `"openclaw"`).
+/// - `tool` — the tool name within that provider (e.g. `"deploy_service"`).
+/// - `raw` — the reviewer-facing prose to bind verbatim as `syntactic.raw`.
+/// - `params_json` — the tool-call parameters as a JSON value, or `undefined`/`null` when the
+///   caller has no structured parameters to offer.
+///
+/// # Errors
+///
+/// Throws if `params_json` is present but not valid JSON — fail-closed: the hook denies rather
+/// than submitting a record built from unparseable parameters.
+#[wasm_bindgen]
+pub fn action_from_agent_tool_call_with_raw(
+    server: &str,
+    tool: &str,
+    raw: &str,
+    params_json: Option<String>,
+) -> Result<String, JsError> {
+    let params: Option<serde_json::Value> = params_json
+        .map(|json_str| parse_json(&json_str, "agent tool params"))
+        .transpose()?;
+    let record = core_action_from_agent_tool_call_with_raw(server, tool, raw, params);
     to_json(&record, "ActionRecord")
 }
 
