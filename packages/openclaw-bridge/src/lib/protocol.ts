@@ -86,6 +86,32 @@ export interface ExecApprovalRequestedEvent {
   readonly request: ExecApprovalRequest;
 }
 
+/**
+ * The plugin runtime request carried on the (untyped) `plugin.approval.requested` event payload
+ * (spec §5.2). Its function identity is the `(pluginId, toolName)` pair — structurally parallel to
+ * an MCP call's `(server, tool)` and to a command's program name.
+ */
+export interface PluginApprovalRequest {
+  readonly pluginId?: string | undefined;
+  readonly title?: string | undefined;
+  readonly description?: string | undefined;
+  readonly detail?: string | undefined;
+  readonly severity?: string | undefined;
+  readonly toolName?: string | undefined;
+  readonly toolCallId?: string | undefined;
+  readonly agentId?: string | undefined;
+  readonly sessionKey?: string | undefined;
+}
+
+/** The `plugin.approval.requested` event payload. */
+export interface PluginApprovalRequestedEvent {
+  readonly id: string;
+  readonly approvalKind?: string | undefined;
+  readonly createdAtMs?: number | undefined;
+  readonly expiresAtMs: number;
+  readonly request: PluginApprovalRequest;
+}
+
 /** The sanitized reviewer projection returned by `approval.get` (spec §6.1). */
 export interface ApprovalPresentation {
   readonly kind: string;
@@ -205,6 +231,48 @@ function readExecApprovalRequest(request: Record<string, unknown>): ExecApproval
     nodeId: readNonEmptyString(request.nodeId),
     warningText: readNonEmptyString(request.warningText),
     systemRunPlan: readSystemRunPlan(request.systemRunPlan),
+  };
+}
+
+/**
+ * Parse a `plugin.approval.requested` payload. Returns `null` when the payload is not an object,
+ * lacks a non-empty `id` or a safe-integer `expiresAtMs`, carries no `request` object, or declares
+ * an `approvalKind` other than `plugin` (the family/payload cross-check from spec §5.3).
+ */
+export function readPluginApprovalRequestedEvent(
+  payload: unknown,
+): PluginApprovalRequestedEvent | null {
+  const root = asRecord(payload);
+  if (root === null) return null;
+
+  const id = readNonEmptyString(root.id);
+  const expiresAtMs = readSafeInt(root.expiresAtMs);
+  const request = asRecord(root.request);
+  if (id === undefined || expiresAtMs === undefined || request === null) return null;
+
+  const declaredKind = readNonEmptyString(root.approvalKind);
+  if (declaredKind !== undefined && declaredKind !== "plugin") return null;
+
+  return {
+    id,
+    expiresAtMs,
+    approvalKind: declaredKind,
+    createdAtMs: readSafeInt(root.createdAtMs),
+    request: readPluginApprovalRequest(request),
+  };
+}
+
+function readPluginApprovalRequest(request: Record<string, unknown>): PluginApprovalRequest {
+  return {
+    pluginId: readNonEmptyString(request.pluginId),
+    title: readNonEmptyString(request.title),
+    description: readNonEmptyString(request.description),
+    detail: readNonEmptyString(request.detail),
+    severity: readNonEmptyString(request.severity),
+    toolName: readNonEmptyString(request.toolName),
+    toolCallId: readNonEmptyString(request.toolCallId),
+    agentId: readNonEmptyString(request.agentId),
+    sessionKey: readNonEmptyString(request.sessionKey),
   };
 }
 

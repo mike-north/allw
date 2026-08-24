@@ -66,12 +66,17 @@ export {
 
 export {
   buildExecApprovalRequest,
+  buildPluginApprovalRequest,
   execSummary,
   floorRisk,
+  pluginSummary,
   reversibleForRisk,
+  slugifyTitle,
   type BridgeApprovalRequest,
   type DenyReason,
+  type ExecMappingInput,
   type MappingOutcome,
+  type PluginMappingInput,
   type Risk,
 } from "./lib/mapping.js";
 
@@ -89,10 +94,13 @@ export {
   readApprovalResolveResult,
   readApprovalSnapshot,
   readExecApprovalRequestedEvent,
+  readPluginApprovalRequestedEvent,
   type ApprovalDecision,
   type ApprovalKind,
   type ApprovalSnapshot,
   type ExecApprovalRequestedEvent,
+  type PluginApprovalRequest,
+  type PluginApprovalRequestedEvent,
 } from "./lib/protocol.js";
 
 export { getVersion } from "./version.js";

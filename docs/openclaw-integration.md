@@ -619,13 +619,18 @@ The bridge is decomposed into six slices, each independently reviewable and each
 changed lines. Slices 1 and 2 are core work that the bridge depends on; they can land in parallel
 with each other but must precede slice 4.
 
-**Landed so far:** slice 1 (`action_from_argv` carrying the original command text, exported to WASM
-and UniFFI), slice 2 (the `agent_tool_call` surface in the core), and — for the **exec family only** —
-slices 3, 4, 5, and the UAT half of 6. What remains is the **plugin permission-request family**:
-§5.2's `agent_tool_call` mapping, the SDK `Surface` union widening and relay `action_structure`
-acceptance that mapping needs, and the plugin rows of the §11 checklist. Until that lands the bridge
-treats a plugin approval exactly like an unsupported kind (§5.3) — logged, neither approved nor
-denied — so it is never a denial-of-service on a family it cannot yet render.
+**Landed:** slice 1 (`action_from_argv` carrying the original command text, exported to WASM and
+UniFFI), slice 2 (the `agent_tool_call` surface in the core, plus an `action_from_agent_tool_call_with_raw`
+builder so a plugin's reviewer prose can bind verbatim as `syntactic.raw` instead of a synthesized
+display, and the SDK `Surface` union widening), and slices 3–6 for **both** the exec and the plugin
+permission-request families, including the §11 UAT checklist's plugin rows.
+
+The `action_structure` envelope field ([contract.md](./contract.md) §Messages) — the relay-visible
+plaintext structure summary — is **not yet implemented in any surface** (the wire `ApprovalRequest`
+envelope carries only `{ v, id, created_at, expires_at, approver, context_ciphertext }`). Building it
+is a separate, materially larger slice than either family's mapping and is not required for either
+family's fail-closed correctness: an unrecognized `Surface` string already fails to deserialize in the
+Rust core rather than being silently accepted. Tracked separately from this document.
 
 | #   | Scope                                                                                                                                                                                                                                                                                                                              | Deliverable                                                                                                                                                         | Tests                                                                                                                                                                                                                                                    |
 | --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

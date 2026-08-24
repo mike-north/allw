@@ -21,7 +21,11 @@
 import type { HookWasm } from "@allw/hook";
 
 import { actorIdForGateway, normalizeGatewayId } from "./config.js";
-import type { ApprovalSnapshot, ExecApprovalRequestedEvent } from "./protocol.js";
+import type {
+  ApprovalSnapshot,
+  ExecApprovalRequestedEvent,
+  PluginApprovalRequestedEvent,
+} from "./protocol.js";
 
 /** Coarse risk tiers, in ascending order (the core's `Risk`). */
 export type Risk = "low" | "medium" | "high" | "critical";
@@ -51,8 +55,11 @@ export type DenyReason =
 export interface BridgeApprovalRequest {
   readonly action: {
     readonly recordSchemaVersion: number;
-    /** Always `command` for the exec family — asserted, not assumed (spec §5.1). */
-    readonly surface: "command";
+    /**
+     * `command` for the exec family, `agent_tool_call` for the plugin family — asserted, not
+     * assumed (spec §5.1, §5.2).
+     */
+    readonly surface: "command" | "agent_tool_call";
     readonly syntactic: unknown;
     readonly risk: Risk;
   };
@@ -78,6 +85,16 @@ export type MappingOutcome =
 /** Inputs to {@link buildExecApprovalRequest}. */
 export interface ExecMappingInput {
   readonly event: ExecApprovalRequestedEvent;
+  readonly snapshot: ApprovalSnapshot;
+  /** Operator-configured gateway label; re-validated per request (spec §7.1). */
+  readonly gatewayId: string;
+  /** The derived allw deadline, already budgeted against `expiresAtMs` (spec §8). */
+  readonly timeoutMs: number;
+}
+
+/** Inputs to {@link buildPluginApprovalRequest}. */
+export interface PluginMappingInput {
+  readonly event: PluginApprovalRequestedEvent;
   readonly snapshot: ApprovalSnapshot;
   /** Operator-configured gateway label; re-validated per request (spec §7.1). */
   readonly gatewayId: string;
@@ -302,6 +319,235 @@ export function buildExecApprovalRequest(wasm: HookWasm, input: ExecMappingInput
       action: {
         recordSchemaVersion: parsed.record_schema_version,
         surface: "command",
+        syntactic: parsed.syntactic,
+        risk,
+      },
+      summary,
+      actor: { id: actorIdForGateway(gatewayId), kind: "openclaw" },
+      risk,
+      reversible: reversibleForRisk(risk),
+      // §6.2: the allw verdict vocabulary is fixed. OpenClaw's `allowedDecisions` constrains what
+      // the *bridge* may submit downstream (§7.4), never what the human may choose upstream.
+      constraints: {
+        allowedDecisions: ["approved", "denied"],
+        challengeRequired: risk === "critical",
+      },
+      chain,
+      timeoutMs: input.timeoutMs,
+    },
+  };
+}
+
+// ── §5.2 plugin permission requests ─────────────────────────────────────────────
+
+/** `severity` → `risk` (spec §5.2, §6.4). Absent `severity` defaults upstream to `warning`. */
+const SEVERITY_RISK: Readonly<Record<string, Risk>> = {
+  info: "low",
+  warning: "medium",
+  critical: "critical",
+};
+
+/** The risk for the upstream default `severity: "warning"` when a plugin request omits it. */
+const DEFAULT_SEVERITY_RISK: Risk = "medium";
+
+/**
+ * Normalize a plugin's `title` into a slug usable as `syntactic.tool` when `toolName` is absent
+ * (spec §5.2: "else a normalized slug of `title`"). Returns `undefined` when `title` is absent or
+ * reduces to an empty slug (e.g. a title with no alphanumeric characters), so the caller can fail
+ * closed with `build-error` rather than binding an empty tool identity.
+ */
+export function slugifyTitle(title: string | undefined): string | undefined {
+  if (title === undefined) return undefined;
+  const slug = title
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug.length > 0 ? slug : undefined;
+}
+
+/**
+ * The plugin `summary` (spec §6.2): `OpenClaw <gateway-id> · agent <agentId> ·
+ * <server>/<tool>: <title> — <description>`. `server`/`tool` are the already-resolved function
+ * identity (i.e. after the `pluginId → "openclaw"` / `toolName → title slug` fallbacks in
+ * {@link buildPluginApprovalRequest} have run), so this only ever renders a non-empty pair.
+ * `agentId`/`title`/`description` render as the literal `unknown` when OpenClaw did not supply
+ * them — a missing field must be visible, not invisible (spec §6.2 notes).
+ */
+export function pluginSummary(input: {
+  readonly gatewayId: string;
+  readonly agentId?: string | undefined;
+  readonly server: string;
+  readonly tool: string;
+  readonly title?: string | undefined;
+  readonly description?: string | undefined;
+}): string {
+  const title = input.title !== undefined && input.title.length > 0 ? input.title : UNKNOWN;
+  const description =
+    input.description !== undefined && input.description.length > 0 ? input.description : UNKNOWN;
+  return (
+    `OpenClaw ${input.gatewayId} · agent ${input.agentId ?? UNKNOWN} · ` +
+    `${input.server}/${input.tool}: ${title} — ${description}`
+  );
+}
+
+/**
+ * Build the allw request for one plugin permission request, or the fail-closed reason it cannot
+ * be built.
+ *
+ * Order matters, mirroring {@link buildExecApprovalRequest}: the reconcile (§6.1) runs **before**
+ * any record is constructed, so a divergent pair is never rendered to a human at all.
+ */
+export function buildPluginApprovalRequest(
+  wasm: HookWasm,
+  input: PluginMappingInput,
+): MappingOutcome {
+  const { event, snapshot } = input;
+
+  const gatewayId = normalizeGatewayId(input.gatewayId);
+  if (gatewayId === null) {
+    return {
+      kind: "deny",
+      reason: "config-error",
+      detail: `gateway id '${input.gatewayId}' is not a valid <gateway-id>`,
+    };
+  }
+
+  if (snapshot.id !== event.id) {
+    return {
+      kind: "deny",
+      reason: "presentation-divergence",
+      detail: `approval.get returned id '${snapshot.id}' for event id '${event.id}'`,
+    };
+  }
+
+  // §5.3: the kind comes from the event family and is cross-checked against the pinned snapshot.
+  if (snapshot.presentation.kind !== "plugin") {
+    return {
+      kind: "deny",
+      reason: "presentation-divergence",
+      detail: `plugin.approval.requested carried a snapshot of kind '${snapshot.presentation.kind}'`,
+    };
+  }
+
+  // §6.1 rule 4: a terminal approval gets no allw request and no resolve.
+  if (snapshot.status !== "pending") {
+    return { kind: "not-pending", status: snapshot.status };
+  }
+
+  // §5.2: function identity is (pluginId, toolName); pluginId falls back to "openclaw", toolName
+  // falls back to a normalized slug of title. Fail closed if neither yields a non-empty token.
+  const server = event.request.pluginId ?? "openclaw";
+  const tool = event.request.toolName ?? slugifyTitle(event.request.title);
+  if (tool === undefined) {
+    return {
+      kind: "deny",
+      reason: "build-error",
+      detail: "plugin approval carried neither toolName nor a usable title slug",
+    };
+  }
+
+  // §5.2/§6.4: an unrecognized severity is rejected rather than guessed at — silently defaulting
+  // an out-of-band value would misclassify risk for a condition OpenClaw's own schema never
+  // documented. Absent severity uses the upstream default (`warning` → medium).
+  let risk: Risk;
+  if (event.request.severity === undefined) {
+    risk = DEFAULT_SEVERITY_RISK;
+  } else {
+    const mapped = SEVERITY_RISK[event.request.severity];
+    if (mapped === undefined) {
+      return {
+        kind: "deny",
+        reason: "build-error",
+        detail: `plugin approval declared an unrecognized severity '${event.request.severity}'`,
+      };
+    }
+    risk = mapped;
+  }
+
+  // §5.2: syntactic.raw = description, plus detail when present — the prose the plugin author
+  // wrote for the approver. syntactic.params stays absent: OpenClaw exposes no structured
+  // parameters to a reviewer, so none is synthesized.
+  const description =
+    event.request.description !== undefined && event.request.description.length > 0
+      ? event.request.description
+      : UNKNOWN;
+  const raw =
+    event.request.detail !== undefined && event.request.detail.length > 0
+      ? `${description}\n\n${event.request.detail}`
+      : description;
+
+  let recordJson: string;
+  try {
+    recordJson = wasm.action_from_agent_tool_call_with_raw(server, tool, raw, null);
+  } catch (err) {
+    return {
+      kind: "deny",
+      reason: "build-error",
+      detail: `core rejected the plugin substrate: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(recordJson);
+  } catch {
+    return {
+      kind: "deny",
+      reason: "build-error",
+      detail: "core returned unparseable ActionRecord",
+    };
+  }
+  if (!isCoreActionRecord(parsed)) {
+    return {
+      kind: "deny",
+      reason: "build-error",
+      detail: "core ActionRecord was not in the expected shape",
+    };
+  }
+  if (parsed.syntactic === null || typeof parsed.syntactic !== "object") {
+    return {
+      kind: "deny",
+      reason: "build-error",
+      detail: "core ActionRecord carried no syntactic substrate",
+    };
+  }
+  if (parsed.surface !== "agent_tool_call") {
+    // A plugin approval must reduce to the `agent_tool_call` surface. Anything else means the
+    // core builder and this mapping disagree about the family, which must never reach a human as
+    // an approval.
+    return {
+      kind: "deny",
+      reason: "build-error",
+      detail: `plugin approval reduced to surface '${parsed.surface}', expected 'agent_tool_call'`,
+    };
+  }
+
+  const summary = pluginSummary({
+    gatewayId,
+    agentId: event.request.agentId,
+    server,
+    tool,
+    title: event.request.title,
+    description: event.request.description,
+  });
+
+  // §6.2: `chain` is the contract's home for upstream-gate ids. Plugin approvals additionally
+  // carry `openclaw:tool_call:<toolCallId>` when OpenClaw supplied one.
+  const chain = [`openclaw:${gatewayId}:approval:${event.id}`];
+  if (event.request.sessionKey !== undefined && event.request.sessionKey.length > 0) {
+    chain.push(`openclaw:session:${event.request.sessionKey}`);
+  }
+  if (event.request.toolCallId !== undefined && event.request.toolCallId.length > 0) {
+    chain.push(`openclaw:tool_call:${event.request.toolCallId}`);
+  }
+
+  return {
+    kind: "request",
+    request: {
+      action: {
+        recordSchemaVersion: parsed.record_schema_version,
+        surface: "agent_tool_call",
         syntactic: parsed.syntactic,
         risk,
       },

@@ -22,12 +22,18 @@ before changing behavior here — every rule below is a spec section, not a pref
 
 ## Current scope
 
-This package currently implements the **exec** approval family (`surface: "command"`) end to end.
+This package implements both approval families the gateway raises to `operator.approvals`:
 
-Plugin permission requests (§5.2, the `agent_tool_call` surface) are **not** mapped yet: they are
-logged and left for a surface that understands them, exactly like an unsupported kind, because
-denying a family the bridge cannot render would make it a denial-of-service on that family.
-`system-agent` approvals (§5.3) are out of scope for v1 by design and get the same treatment.
+- **exec** approvals (§5.1, `surface: "command"`).
+- **plugin permission requests** (§5.2, `surface: "agent_tool_call"`). Function identity is the
+  `(pluginId, toolName)` pair — `pluginId` falls back to `"openclaw"`, `toolName` falls back to a
+  normalized slug of `title`; a request with neither denies `build-error`. `syntactic.params` stays
+  absent (OpenClaw exposes no structured parameters to a reviewer) and `syntactic.raw` carries
+  `description` (plus `detail` when present) verbatim.
+
+`system-agent` approvals (§5.3) are out of scope for v1 by design: they are logged and left for a
+surface that understands them, exactly like any other unrecognized approval kind, because denying a
+family the bridge cannot render would make it a denial-of-service on that family.
 
 ## Operator prerequisites
 

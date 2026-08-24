@@ -25,8 +25,11 @@ import {
   CONFIG,
   CREATED_AT_MS,
   EXPIRES_AT_MS,
+  PLUGIN_APPROVAL_ID,
   execEvent,
   execSnapshot,
+  pluginEvent,
+  pluginSnapshot,
 } from "./support/fixtures.mjs";
 
 const wasm = await loadWasm();
@@ -45,6 +48,7 @@ function makeBridge({
   now = fixedClock(),
   config = CONFIG,
   listIds,
+  pluginListIds,
   handlers = {},
 } = {}) {
   const queue = snapshots === undefined ? null : [...snapshots];
@@ -63,6 +67,7 @@ function makeBridge({
       return resolveResult;
     },
     "exec.approval.list": () => ({ approvals: (listIds ?? []).map((id) => ({ id })) }),
+    "plugin.approval.list": () => ({ approvals: (pluginListIds ?? []).map((id) => ({ id })) }),
     ...handlers,
   });
   const { logger, records } = recordingLogger();
@@ -86,6 +91,10 @@ function makeBridge({
 
 function requested(event = execEvent()) {
   return { event: "exec.approval.requested", payload: event };
+}
+
+function pluginRequested(event = pluginEvent()) {
+  return { event: "plugin.approval.requested", payload: event };
 }
 
 // ── the happy path, so the negatives below are meaningful ───────────────────────
@@ -481,4 +490,142 @@ test("no log record carries the approval plaintext (§6.5)", async () => {
   for (const secret of ["git push --force", "/srv/app", "OpenClaw home-mini ·"]) {
     assert.ok(!serialized.includes(secret), `log must not contain '${secret}'`);
   }
+});
+
+// ── §5.2 the plugin permission-request family ───────────────────────────────────
+
+test("a verified approved plugin verdict resolves allow-once with kind 'plugin' (§5.2, §7.2)", async () => {
+  const { bridge, gateway, requests } = makeBridge({ snapshot: pluginSnapshot() });
+  const outcome = await bridge.handle(pluginRequested());
+
+  assert.deepEqual(outcome, { kind: "resolved", decision: "allow-once", applied: true });
+  assert.deepEqual(gateway.resolves, [
+    { id: PLUGIN_APPROVAL_ID, kind: "plugin", decision: "allow-once" },
+  ]);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].action.surface, "agent_tool_call");
+});
+
+test("a plugin verdict resolves deny with kind 'plugin' on the exact same reason codes as exec (§9)", async () => {
+  const { bridge, gateway, records } = makeBridge({
+    snapshot: pluginSnapshot(),
+    approval: verdict("denied"),
+  });
+  const outcome = await bridge.handle(pluginRequested());
+
+  assert.deepEqual(outcome, { kind: "resolved", decision: "deny", applied: true });
+  assert.deepEqual(gateway.resolves, [
+    { id: PLUGIN_APPROVAL_ID, kind: "plugin", decision: "deny" },
+  ]);
+  assert.ok(
+    records.some((r) => r.event === "approval.denied" && r.fields.reason === "no-approval"),
+  );
+});
+
+test("a plugin approval with allow-once unavailable denies no-expressible-allow (§7.3, §7.4)", async () => {
+  for (const allowedDecisions of [["deny"], ["allow-always", "deny"]]) {
+    const { bridge, gateway, records } = makeBridge({
+      snapshot: pluginSnapshot({ presentation: { allowedDecisions } }),
+    });
+    const outcome = await bridge.handle(pluginRequested());
+
+    assert.equal(outcome.decision, "deny");
+    assert.deepEqual(gateway.resolves, [
+      { id: PLUGIN_APPROVAL_ID, kind: "plugin", decision: "deny" },
+    ]);
+    assert.ok(records.some((r) => r.fields.reason === "no-expressible-allow"));
+  }
+});
+
+test("allow-always is never submitted for a plugin approval under any input (§7.3)", async () => {
+  const inputs = [
+    { approval: verdict("approved") },
+    { approval: verdict("denied") },
+    { approval: verdict("approved", { verifies: false }) },
+    { snapshot: pluginSnapshot({ presentation: { allowedDecisions: ["allow-always", "deny"] } }) },
+    { snapshot: pluginSnapshot({ presentation: { allowedDecisions: ["allow-always"] } }) },
+  ];
+  for (const input of inputs) {
+    const { bridge, gateway } = makeBridge({
+      snapshot: pluginSnapshot(),
+      ...input,
+    });
+    await bridge.handle(pluginRequested());
+    for (const params of gateway.resolves) {
+      assert.notEqual(params.decision, "allow-always");
+      assert.ok(["allow-once", "deny"].includes(params.decision));
+    }
+  }
+});
+
+test("a plugin approval carrying an insufficient budget denies immediately, raising nothing (§8, §9)", async () => {
+  const { bridge, gateway, requests } = makeBridge({
+    snapshot: pluginSnapshot({ expiresAtMs: CREATED_AT_MS + 1_000 }),
+  });
+  const outcome = await bridge.handle(pluginRequested());
+
+  assert.equal(outcome.decision, "deny");
+  assert.equal(requests.length, 0);
+  assert.deepEqual(gateway.resolves, [
+    { id: PLUGIN_APPROVAL_ID, kind: "plugin", decision: "deny" },
+  ]);
+});
+
+// ── §4.3 backfill drives both families ──────────────────────────────────────────
+
+test("backfill drives pending plugin approvals from plugin.approval.list (§4.3)", async () => {
+  const { bridge, gateway } = makeBridge({
+    snapshot: pluginSnapshot(),
+    pluginListIds: [PLUGIN_APPROVAL_ID],
+  });
+  await bridge.project();
+
+  assert.deepEqual(gateway.resolves, [
+    { id: PLUGIN_APPROVAL_ID, kind: "plugin", decision: "allow-once" },
+  ]);
+});
+
+test("a single project() call backfills both exec and plugin lists (§4.3)", async () => {
+  const { bridge, gateway } = makeBridge({
+    listIds: [APPROVAL_ID],
+    pluginListIds: [PLUGIN_APPROVAL_ID],
+    handlers: {
+      "approval.get": (params) =>
+        params.id === PLUGIN_APPROVAL_ID ? pluginSnapshot() : execSnapshot(),
+    },
+  });
+  await bridge.project();
+
+  const resolvedIds = gateway.resolves.map((r) => r.id).sort();
+  assert.deepEqual(resolvedIds, [APPROVAL_ID, PLUGIN_APPROVAL_ID].sort());
+  assert.ok(
+    gateway.resolves.every((r) => r.decision === "allow-once"),
+    "both families resolve allow-once on the happy path",
+  );
+});
+
+test("a backfilled plugin approval reporting a mismatched kind is left for another surface (§5.3)", async () => {
+  const { bridge, gateway, records } = makeBridge({
+    pluginListIds: [PLUGIN_APPROVAL_ID],
+    snapshot: pluginSnapshot({ presentation: { kind: "exec" } }),
+  });
+  await bridge.project();
+
+  assert.deepEqual(gateway.resolves, []);
+  assert.ok(records.some((r) => r.event === "unsupported-approval-kind"));
+});
+
+test("a failing plugin.approval.list backfill logs and does not block the exec backfill (§4.3)", async () => {
+  const { bridge, gateway, records } = makeBridge({
+    listIds: [APPROVAL_ID],
+    handlers: {
+      "plugin.approval.list": () => {
+        throw new Error("connection lost");
+      },
+    },
+  });
+  await bridge.project();
+
+  assert.deepEqual(gateway.resolves, [{ id: APPROVAL_ID, kind: "exec", decision: "allow-once" }]);
+  assert.ok(records.some((r) => r.event === "backfill.failed" && r.fields.family === "plugin"));
 });

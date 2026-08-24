@@ -12,11 +12,18 @@ export const CREATED_AT_MS = 1_700_000_000_000;
 /** Default exec approval TTL upstream is 1 800 000 ms (`DEFAULT_EXEC_APPROVAL_TIMEOUT_MS`). */
 export const EXEC_TTL_MS = 1_800_000;
 export const EXPIRES_AT_MS = CREATED_AT_MS + EXEC_TTL_MS;
+/** Default plugin approval TTL upstream is 120 000 ms, capped at 600 000 ms (spec §8 table). */
+export const PLUGIN_TTL_MS = 120_000;
+export const PLUGIN_EXPIRES_AT_MS = CREATED_AT_MS + PLUGIN_TTL_MS;
 
 export const GATEWAY_ID = "home-mini";
 export const APPROVAL_ID = "apr_01HZX0EXECAPPROVAL";
+export const PLUGIN_APPROVAL_ID = "apr_01HZX0PLUGINAPPROVAL";
 export const SESSION_KEY = "sess_01HZX0SESSION";
 export const AGENT_ID = "agent-main";
+export const TOOL_CALL_ID = "toolcall_01HZX0TOOLCALL";
+export const PLUGIN_ID = "deploy-plugin";
+export const TOOL_NAME = "deploy_service";
 
 /** A fully-populated exec config; individual tests override just what they exercise. */
 export const CONFIG = {
@@ -71,6 +78,48 @@ export function execSnapshot(overrides = {}) {
       kind: "exec",
       title: "Run a command",
       commandText: "git push --force",
+      allowedDecisions: ["allow-once", "deny"],
+      ...presentationOverrides,
+    },
+    ...rest,
+  };
+}
+
+/** A `plugin.approval.requested` payload carrying the plugin permission request substrate. */
+export function pluginEvent(overrides = {}) {
+  const { request: requestOverrides, ...rest } = overrides;
+  return {
+    id: PLUGIN_APPROVAL_ID,
+    approvalKind: "plugin",
+    createdAtMs: CREATED_AT_MS,
+    expiresAtMs: PLUGIN_EXPIRES_AT_MS,
+    request: {
+      pluginId: PLUGIN_ID,
+      toolName: TOOL_NAME,
+      title: "Deploy service",
+      description: "This plugin wants to deploy to production.",
+      severity: "warning",
+      toolCallId: TOOL_CALL_ID,
+      agentId: AGENT_ID,
+      sessionKey: SESSION_KEY,
+      ...requestOverrides,
+    },
+    ...rest,
+  };
+}
+
+/** The pinned `approval.get` snapshot that agrees with {@link pluginEvent}. */
+export function pluginSnapshot(overrides = {}) {
+  const { presentation: presentationOverrides, ...rest } = overrides;
+  return {
+    id: PLUGIN_APPROVAL_ID,
+    createdAtMs: CREATED_AT_MS,
+    expiresAtMs: PLUGIN_EXPIRES_AT_MS,
+    status: "pending",
+    presentation: {
+      kind: "plugin",
+      title: "Deploy service",
+      description: "This plugin wants to deploy to production.",
       allowedDecisions: ["allow-once", "deny"],
       ...presentationOverrides,
     },
