@@ -97,6 +97,12 @@ The first run prompts for Cloudflare authentication (or reuses `wrangler login` 
 No environment variables, secrets, or build configuration are required on the Pages side — the
 bundle is fully static and reads its relay URL at runtime (§2 above).
 
+> **Live deployment.** The hosted web approver is live at
+> [https://allw-web-approver.pages.dev](https://allw-web-approver.pages.dev). Point it at the hosted
+> relay from any browser (including a phone) with
+> `https://allw-web-approver.pages.dev/?relay=https://allw-relay.mnorth.workers.dev` — no install
+> required. Redeploys follow the command above; the project name is `allw-web-approver`.
+
 ### Alternative: any static host
 
 Since `dist-site/` has no Cloudflare-specific runtime dependency, any static host works instead:
