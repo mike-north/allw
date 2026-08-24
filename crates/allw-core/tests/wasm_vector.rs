@@ -33,9 +33,9 @@
 use std::path::PathBuf;
 
 use allw_core::{
-    compute_request_hash, issue_device_cert, sign_verdict, ActionRecord, Actor, ApprovalContext,
-    ApprovalRequest, Approver, Constraints, Decision, Risk, SigningKeyPair, Surface,
-    SyntacticSubstrate, UnsignedVerdict,
+    action_from_agent_tool_call, compute_request_hash, issue_device_cert, sign_verdict,
+    ActionRecord, Actor, ApprovalContext, ApprovalRequest, Approver, Constraints, Decision, Risk,
+    SigningKeyPair, Surface, SyntacticSubstrate, UnsignedVerdict,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
@@ -81,6 +81,16 @@ struct WasmVector {
     approver_root_pubkey_b64: String,
     /// A `now_ms` inside `[created_at, expires_at]` so the fixture verdict verifies.
     now_ms: i64,
+
+    /// JSON `ApprovalContext` whose `action` is an `agent_tool_call` record (issue #194) — same
+    /// shape as `context_json` but for the new surface, so the WASM/TS surface can prove it
+    /// computes byte-identical `request_hash` bytes for `agent_tool_call` too, not only
+    /// `command`. Built via [`action_from_agent_tool_call`] so the fixture exercises the real
+    /// builder, not a hand-assembled record.
+    agent_tool_call_context_json: String,
+    /// Expected `request_hash` for `agent_tool_call_context_json` (bound to the same
+    /// `expires_at` above), as base64url-unpadded — the WASM `compute_request_hash` return shape.
+    agent_tool_call_expected_request_hash_b64: String,
 }
 
 // ── Builders (mirror hash::tests::make_minimal_context exactly) ───────────────────
@@ -113,6 +123,29 @@ fn make_minimal_context() -> ApprovalContext {
             capabilities: None,
             scope: None,
         },
+        summary: "push to main".to_string(),
+        actor: Actor {
+            id: "machine:x".to_string(),
+            kind: "claude-code".to_string(),
+            attestation: None,
+        },
+        risk: Risk::High,
+        reversible: false,
+        constraints: Constraints {
+            allowed_decisions: vec![Decision::Approved, Decision::Denied],
+            challenge_required: false,
+        },
+        chain: None,
+    }
+}
+
+/// An `agent_tool_call` counterpart to [`make_minimal_context`] (issue #194) — same summary,
+/// actor, risk, constraints; only `action` differs (built via [`action_from_agent_tool_call`]
+/// instead of the hand-assembled command record) so the two fixtures isolate the surface
+/// difference precisely.
+fn make_agent_tool_call_context() -> ApprovalContext {
+    ApprovalContext {
+        action: action_from_agent_tool_call("openclaw", "deploy_service", None),
         summary: "push to main".to_string(),
         actor: Actor {
             id: "machine:x".to_string(),
@@ -177,6 +210,9 @@ fn build_vector() -> WasmVector {
     };
     let verdict = sign_verdict(&unsigned, &device, NONCE, Some(cert));
 
+    let agent_tool_call_context = make_agent_tool_call_context();
+    let agent_tool_call_request_hash = compute_request_hash(&agent_tool_call_context, TS_EXPIRES);
+
     WasmVector {
         context_json: serde_json::to_string(&context).expect("context serializes"),
         expires_at: TS_EXPIRES,
@@ -186,6 +222,10 @@ fn build_vector() -> WasmVector {
         request_json: serde_json::to_string(&make_request()).expect("request serializes"),
         approver_root_pubkey_b64: URL_SAFE_NO_PAD.encode(root.public_key().to_bytes()),
         now_ms: NOW_MS,
+        agent_tool_call_context_json: serde_json::to_string(&agent_tool_call_context)
+            .expect("agent_tool_call context serializes"),
+        agent_tool_call_expected_request_hash_b64: URL_SAFE_NO_PAD
+            .encode(agent_tool_call_request_hash),
     }
 }
 
@@ -245,5 +285,42 @@ fn fixture_hash_equals_frozen_vector() {
     assert_eq!(
         hex, FROZEN_HASH_HEX,
         "fixture context must hash to the frozen request-hash/v2 vector"
+    );
+}
+
+/// WYSIWYS coverage for the `agent_tool_call` surface (issue #194): re-derive the hash for
+/// `agent_tool_call_context_json` independently of [`build_vector`] and assert it equals the
+/// committed fixture's `agent_tool_call_expected_request_hash_b64` — the same cross-check
+/// `fixture_hash_equals_frozen_vector` performs for the command surface, so a WASM/TS
+/// implementation replaying the fixture proves it hashes `agent_tool_call` records identically to
+/// the Rust core, not just `command` ones.
+#[test]
+fn agent_tool_call_fixture_hash_matches_independent_recompute() {
+    let context = make_agent_tool_call_context();
+    let hash = compute_request_hash(&context, TS_EXPIRES);
+
+    let raw = std::fs::read_to_string(fixture_path()).expect("fixture must exist for this test");
+    let committed: WasmVector =
+        serde_json::from_str(&raw).expect("committed fixture is valid WasmVector JSON");
+
+    assert_eq!(
+        URL_SAFE_NO_PAD.encode(hash),
+        committed.agent_tool_call_expected_request_hash_b64,
+        "an independently recomputed agent_tool_call request_hash must match the committed fixture"
+    );
+}
+
+/// The `agent_tool_call` and `command` fixtures differ only in `action.surface` /
+/// `action.syntactic` — proving `surface` is actually hashed (not silently ignored) and that the
+/// two surfaces produce different `request_hash` values despite sharing the same summary, actor,
+/// risk, and constraints.
+#[test]
+fn agent_tool_call_and_command_fixtures_hash_differently() {
+    let command_hash = compute_request_hash(&make_minimal_context(), TS_EXPIRES);
+    let agent_tool_call_hash = compute_request_hash(&make_agent_tool_call_context(), TS_EXPIRES);
+
+    assert_ne!(
+        command_hash, agent_tool_call_hash,
+        "changing action.surface (and its syntactic substrate) must change request_hash"
     );
 }

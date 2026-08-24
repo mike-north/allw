@@ -90,6 +90,14 @@ pub struct PolicyPredicate {
     /// MCP tool-call matcher.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub mcp: Option<McpMatcher>,
+
+    /// Agent-tool-call matcher. Same `(server, tool, params)` shape as `mcp` — `agent_tool_call`
+    /// reuses the `mcp_tool_call` function-identity substrate (docs/policy-seam.md) — but kept as
+    /// a **separate field, gated on a separate surface**, so an `mcp`-scoped rule can never match
+    /// an `agent_tool_call` record and vice versa. That non-collision is the entire reason
+    /// `agent_tool_call` exists as its own surface rather than widening `mcp_tool_call`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub agent_tool: Option<McpMatcher>,
 }
 
 impl PolicyPredicate {
@@ -103,6 +111,7 @@ impl PolicyPredicate {
                 ..CommandMatcher::default()
             }),
             mcp: None,
+            agent_tool: None,
         }
     }
 
@@ -113,6 +122,26 @@ impl PolicyPredicate {
             surface: Some(Surface::McpToolCall),
             command: None,
             mcp: Some(McpMatcher {
+                server: Some(server.to_string()),
+                tool: Some(tool.to_string()),
+                ..McpMatcher::default()
+            }),
+            agent_tool: None,
+        }
+    }
+
+    /// Match an `agent_tool_call` action by (provider) server and tool.
+    ///
+    /// Mirrors [`mcp_tool`](Self::mcp_tool) but scopes to [`Surface::AgentToolCall`] and the
+    /// `agent_tool` matcher field, so this predicate never matches an `mcp_tool_call` record even
+    /// when the `(server, tool)` pair is identical — see the `agent_tool` field doc.
+    #[must_use]
+    pub fn agent_tool(server: &str, tool: &str) -> Self {
+        Self {
+            surface: Some(Surface::AgentToolCall),
+            command: None,
+            mcp: None,
+            agent_tool: Some(McpMatcher {
                 server: Some(server.to_string()),
                 tool: Some(tool.to_string()),
                 ..McpMatcher::default()
@@ -153,11 +182,19 @@ impl PolicyPredicate {
                 return false;
             }
         }
+        if let Some(agent_tool) = &self.agent_tool {
+            if action.surface != Surface::AgentToolCall || !agent_tool.matches(action) {
+                return false;
+            }
+        }
         true
     }
 
     fn is_empty(&self) -> bool {
-        self.surface.is_none() && self.command.is_none() && self.mcp.is_none()
+        self.surface.is_none()
+            && self.command.is_none()
+            && self.mcp.is_none()
+            && self.agent_tool.is_none()
     }
 }
 
@@ -774,12 +811,25 @@ fn exact_call_predicate(action: &ActionRecord) -> Result<PolicyPredicate, Policy
                 surface: Some(Surface::Command),
                 command: Some(matcher),
                 mcp: None,
+                agent_tool: None,
             })
         }
         Surface::McpToolCall => Ok(PolicyPredicate {
             surface: Some(Surface::McpToolCall),
             command: None,
             mcp: Some(McpMatcher {
+                server: action.syntactic.server.clone(),
+                tool: action.syntactic.tool.clone(),
+                params_exact: action.syntactic.params.clone(),
+                params: Vec::new(),
+            }),
+            agent_tool: None,
+        }),
+        Surface::AgentToolCall => Ok(PolicyPredicate {
+            surface: Some(Surface::AgentToolCall),
+            command: None,
+            mcp: None,
+            agent_tool: Some(McpMatcher {
                 server: action.syntactic.server.clone(),
                 tool: action.syntactic.tool.clone(),
                 params_exact: action.syntactic.params.clone(),
@@ -792,6 +842,7 @@ fn exact_call_predicate(action: &ActionRecord) -> Result<PolicyPredicate, Policy
             surface: Some(Surface::FileEdit),
             command: None,
             mcp: None,
+            agent_tool: None,
         }),
     }
 }
@@ -805,6 +856,7 @@ fn command_or_tool_predicate(action: &ActionRecord) -> PolicyPredicate {
                 ..CommandMatcher::default()
             }),
             mcp: None,
+            agent_tool: None,
         },
         Surface::McpToolCall => PolicyPredicate {
             surface: Some(Surface::McpToolCall),
@@ -814,11 +866,23 @@ fn command_or_tool_predicate(action: &ActionRecord) -> PolicyPredicate {
                 tool: action.syntactic.tool.clone(),
                 ..McpMatcher::default()
             }),
+            agent_tool: None,
+        },
+        Surface::AgentToolCall => PolicyPredicate {
+            surface: Some(Surface::AgentToolCall),
+            command: None,
+            mcp: None,
+            agent_tool: Some(McpMatcher {
+                server: action.syntactic.server.clone(),
+                tool: action.syntactic.tool.clone(),
+                ..McpMatcher::default()
+            }),
         },
         Surface::FileEdit => PolicyPredicate {
             surface: Some(Surface::FileEdit),
             command: None,
             mcp: None,
+            agent_tool: None,
         },
     }
 }
@@ -830,19 +894,34 @@ fn mcp_param_equals_predicate(action: &ActionRecord, path: &str) -> PolicyPredic
         .as_ref()
         .and_then(|params| json_path(params, path))
         .cloned();
-    PolicyPredicate {
-        surface: Some(Surface::McpToolCall),
-        command: None,
-        mcp: Some(McpMatcher {
-            server: action.syntactic.server.clone(),
-            tool: action.syntactic.tool.clone(),
-            params: vec![ParamMatcher {
-                path: path.to_string(),
-                equals,
-                string_glob: None,
-            }],
-            ..McpMatcher::default()
-        }),
+    let matcher = McpMatcher {
+        server: action.syntactic.server.clone(),
+        tool: action.syntactic.tool.clone(),
+        params: vec![ParamMatcher {
+            path: path.to_string(),
+            equals,
+            string_glob: None,
+        }],
+        ..McpMatcher::default()
+    };
+    // `agent_tool_call` gets its own predicate field (never `mcp`) so the derived rule stays
+    // scoped to the surface the approval was actually taken on — the non-collision guarantee
+    // this issue exists to preserve. Every other surface keeps the pre-existing `mcp`-scoped
+    // shape (the caller is only expected to invoke this scope from an MCP-shaped action).
+    if action.surface == Surface::AgentToolCall {
+        PolicyPredicate {
+            surface: Some(Surface::AgentToolCall),
+            command: None,
+            mcp: None,
+            agent_tool: Some(matcher),
+        }
+    } else {
+        PolicyPredicate {
+            surface: Some(Surface::McpToolCall),
+            command: None,
+            mcp: Some(matcher),
+            agent_tool: None,
+        }
     }
 }
 
@@ -880,7 +959,7 @@ fn action_has_over_budget_match_input(action: &ActionRecord) -> bool {
         Surface::Command => command_candidates(action)
             .iter()
             .any(|candidate| candidate.len() > MAX_PATTERN_MATCH_BYTES),
-        Surface::McpToolCall => action
+        Surface::McpToolCall | Surface::AgentToolCall => action
             .syntactic
             .params
             .as_ref()
