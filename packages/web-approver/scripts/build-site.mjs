@@ -4,9 +4,12 @@
  * Bundles `src/app.ts` (the production bootstrap — `../src/app.ts`) into `dist-site/app.js` with
  * esbuild, copies the vendored `allw-wasm` browser artifact next to it (so `app.ts`'s
  * `import.meta.url`-relative asset URLs resolve on any static host, at any subpath), and copies
- * the static `public/` shell (`index.html`, `styles.css`) alongside. The result is a flat
- * directory of plain static files — no server-side runtime, no Cloudflare-specific API — hostable
- * on Cloudflare Pages or any static host (`docs/web-approver-deploy.md`).
+ * the static `public/` shell (`index.html`, `tokens.css`, `styles.css`) alongside. `tokens.css` is
+ * the vendored `design/web-approver/inbox/tokens.css` (issue #162) that `styles.css`'s `var(--…)`
+ * declarations and `index.html`'s `theme-light`/`theme-dark` class resolve against — it must ship
+ * next to `styles.css` or those custom properties are undefined on the deployed site. The result
+ * is a flat directory of plain static files — no server-side runtime, no Cloudflare-specific API —
+ * hostable on Cloudflare Pages or any static host (`docs/web-approver-deploy.md`).
  *
  * # Why esbuild (not Vite)
  * The repo's existing tooling taste is plain `tsc` plus small `scripts/*.mjs` (e.g.
@@ -77,6 +80,7 @@ export async function buildSite({ outDir = defaultOutDir } = {}) {
   cpSync(wasmGlue, join(vendorOutDir, "allw_wasm.js"));
 
   cpSync(join(packageDir, "public", "index.html"), join(outDir, "index.html"));
+  cpSync(join(packageDir, "public", "tokens.css"), join(outDir, "tokens.css"));
   cpSync(join(packageDir, "public", "styles.css"), join(outDir, "styles.css"));
 
   console.log(`[web-approver] site bundle written to ${outDir}`);

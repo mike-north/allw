@@ -1,9 +1,38 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" class="theme-light">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>allw approvals</title>
+    <!--
+      Theme selection (issue #162): `.theme-light` above is the no-JS/pre-paint default so the
+      page never renders unstyled. This inline script (no external dependency, so it runs before
+      the stylesheets below are even requested) upgrades to `.theme-dark` when the OS/browser
+      reports a dark preference, and keeps following live changes to that preference. It is pure
+      presentation wiring — it does not touch `#app` or any approver runtime state.
+    -->
+    <script>
+      (function () {
+        var media =
+          typeof window.matchMedia === "function"
+            ? window.matchMedia("(prefers-color-scheme: dark)")
+            : null;
+        function applyTheme(prefersDark) {
+          var root = document.documentElement;
+          root.classList.toggle("theme-dark", prefersDark);
+          root.classList.toggle("theme-light", !prefersDark);
+        }
+        if (media) {
+          applyTheme(media.matches);
+          if (typeof media.addEventListener === "function") {
+            media.addEventListener("change", function (event) {
+              applyTheme(event.matches);
+            });
+          }
+        }
+      })();
+    </script>
+    <link rel="stylesheet" href="./tokens.css" />
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>

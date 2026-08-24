@@ -79,6 +79,7 @@ describe("site bundle (build-site.mjs)", { skip: !wasmAvailable }, () => {
   test("produces the expected flat static-file layout", () => {
     for (const relativePath of [
       "index.html",
+      "tokens.css",
       "styles.css",
       "app.js",
       "vendor/allw-wasm/allw_wasm.js",
@@ -91,6 +92,52 @@ describe("site bundle (build-site.mjs)", { skip: !wasmAvailable }, () => {
   test("index.html references the bundled app.js as a same-directory sibling", () => {
     const html = readFileSync(join(outDir, "index.html"), "utf8");
     assert.match(html, /<script[^>]*type="module"[^>]*src="\.\/app\.js"/);
+  });
+
+  // Criterion (issue #162): tokens.css must ride into the built site output — the whole point of
+  // vendoring it is that the deployed static bundle (not just the local dev checkout) resolves
+  // styles.css's var(--…) declarations.
+  test("the bundled tokens.css is an exact copy of the design source of truth (issue #162)", () => {
+    const bundled = readFileSync(join(outDir, "tokens.css"), "utf8");
+    const designSource = readFileSync(
+      new URL("../../../design/web-approver/inbox/tokens.css", import.meta.url),
+      "utf8",
+    );
+    assert.equal(bundled, designSource, "tokens.css must be vendored verbatim (ENG rule 19)");
+  });
+
+  test("index.html links tokens.css before styles.css so the custom properties are defined first", () => {
+    const html = readFileSync(join(outDir, "index.html"), "utf8");
+    const tokensIndex = html.indexOf('href="./tokens.css"');
+    const stylesIndex = html.indexOf('href="./styles.css"');
+    assert.ok(tokensIndex >= 0, "index.html must link tokens.css");
+    assert.ok(stylesIndex >= 0, "index.html must link styles.css");
+    assert.ok(tokensIndex < stylesIndex, "tokens.css must be linked before styles.css");
+  });
+
+  test("index.html defaults to theme-light and upgrades to theme-dark via prefers-color-scheme", () => {
+    const html = readFileSync(join(outDir, "index.html"), "utf8");
+    assert.match(
+      html,
+      /<html[^>]*class="theme-light"/,
+      "the <html> element must default to theme-light so the page is never unstyled before JS runs",
+    );
+    assert.match(
+      html,
+      /prefers-color-scheme:\s*dark/,
+      "index.html must switch to theme-dark based on the OS/browser color-scheme preference",
+    );
+  });
+
+  test("styles.css contains no hardcoded hex/rgb color literals (issue #162 — must use var(--…) tokens)", () => {
+    const css = readFileSync(join(outDir, "styles.css"), "utf8");
+    // Strip comments first so an issue-number reference like "issue #162" in a comment heading
+    // doesn't false-positive as a hex color literal.
+    const withoutComments = css.replace(/\/\*[\s\S]*?\*\//g, "");
+    const hexMatches = withoutComments.match(/#[0-9a-fA-F]{3,8}\b/g) ?? [];
+    const rgbMatches = withoutComments.match(/rgba?\(/g) ?? [];
+    assert.deepEqual(hexMatches, [], "styles.css must not contain literal hex colors");
+    assert.deepEqual(rgbMatches, [], "styles.css must not contain literal rgb()/rgba() colors");
   });
 
   test("the bundled app.js does not embed a literal relay URL at build time", () => {
