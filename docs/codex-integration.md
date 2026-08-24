@@ -62,10 +62,12 @@ This is the Codex-parallel install path for developers who already have a paired
    npx allw-codex-hook --version
    ```
 
-2. Export the relay and account trust anchor:
+2. Export the relay and account trust anchor (the hosted relay,
+   `https://allw-relay.mnorth.workers.dev`, needs no Cloudflare account; substitute your own URL if
+   you self-hosted per [`docs/relay-deploy.md`](./relay-deploy.md)):
 
    ```sh
-   export ALLW_RELAY_URL="https://relay.example"
+   export ALLW_RELAY_URL="https://allw-relay.mnorth.workers.dev"
    export ALLW_ACCOUNT_ID="acct_..."
    export ALLW_APPROVER_ROOT_KEY="..."
    ```

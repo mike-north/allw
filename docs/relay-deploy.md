@@ -275,16 +275,14 @@ being absent.
 
 ---
 
-## 9. Quickstart wiring (TODO)
+## 9. Quickstart wiring
 
-<!-- TODO(#96): once a hosted relay URL is stable, offer it as the default ALLW_RELAY_URL in
-     docs/quickstart.md §0 "The relay endpoint" so first-time users can skip self-hosting.
-     Replace the "Option B — deploy to Cloudflare" block with the hosted URL and keep Option B
-     for operators who want their own deployment. See issue #96 for the full quickstart scope. -->
-
-Once a hosted relay URL is stable, update `docs/quickstart.md` §0 to offer it as the default
-`ALLW_RELAY_URL`. Users who do not want to run their own relay can point the hook and approver at
-the hosted URL without any Cloudflare account. Reference issue #96 for the full quickstart scope.
+`docs/quickstart.md` §0 "The relay endpoint" now defaults new users to the hosted relay at
+`https://allw-relay.mnorth.workers.dev`, so a first-time user never needs a Cloudflare account or
+this runbook. Run through this runbook instead when you want your own deployment — isolation,
+control over uptime, or scale beyond the shared hosted relay. The `ALLW_RELAY_URL` your deploy
+prints in step 5 above drops directly into the quickstart's pairing and hook-wiring steps in place
+of the hosted URL.
 
 ---
 
@@ -299,13 +297,13 @@ deployed via this runbook without a rebuild), and deploying to Cloudflare Pages 
 
 ## Appendix: what this runbook has and has not verified
 
-| Item                                                             | Status                                                             |
-| ---------------------------------------------------------------- | ------------------------------------------------------------------ |
-| `wrangler deploy --env production --dry-run` passes locally      | Verified (67 KiB upload, DO binding listed correctly)              |
-| All 83 relay Vitest tests pass (DO migration + full API surface) | Verified                                                           |
-| TypeScript type-check passes                                     | Verified                                                           |
-| Push no-op default when credentials absent                       | Verified (`buildPushTransports` at `src/index.ts:1602`)            |
-| Actual deploy to a real Cloudflare account                       | **Not run** — human operator step                                  |
-| APNs / FCM push wakeup with live credentials                     | **Not verified** — requires real APNs/FCM account                  |
-| Custom domain DNS propagation                                    | **Not verified** — depends on operator's zone config               |
-| APNs JWT rotation strategy                                       | **Not implemented** — tokens expire hourly; tracked as a follow-up |
+| Item                                                             | Status                                                                        |
+| ---------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `wrangler deploy --env production --dry-run` passes locally      | Verified (67 KiB upload, DO binding listed correctly)                         |
+| All 83 relay Vitest tests pass (DO migration + full API surface) | Verified                                                                      |
+| TypeScript type-check passes                                     | Verified                                                                      |
+| Push no-op default when credentials absent                       | Verified (`buildPushTransports` at `src/index.ts:1602`)                       |
+| Actual deploy to a real Cloudflare account                       | Verified — live at `https://allw-relay.mnorth.workers.dev` (production `env`) |
+| APNs / FCM push wakeup with live credentials                     | **Not verified** — requires real APNs/FCM account                             |
+| Custom domain DNS propagation                                    | **Not verified** — depends on operator's zone config                          |
+| APNs JWT rotation strategy                                       | **Not implemented** — tokens expire hourly; tracked as a follow-up            |
