@@ -21,13 +21,23 @@
  * check; a forged per-request attestation will fail the actor-pubkey check. Both paths require the
  * account-root private key the relay has never seen.
  *
+ * # Surfacing `max_sequence` (#171 — the web analogue of #115's approver-keyfile floor)
+ * The relay's response also carries its own `max_sequence` publish bookkeeping (`docs/relay-api.md`
+ * `GET /{account_id}/account-states`). This resolver now surfaces that alongside the account-state
+ * documents so `runtime.ts` can require it to be backed by a root-verified document at least that
+ * new, and can compare it against the device-persisted rollback floor (`./sequence-floor.ts`). A
+ * `max_sequence` field that fails to parse as a non-negative safe integer is treated the same as any
+ * other malformed response shape — the WHOLE body fails closed to an empty resolution, never a
+ * resolution missing just the metadata that is supposed to gate it.
+ *
  * @see ../../../docs/enrollment.md §Account State, §Actor-Key Enrollment
  * @see ../../../docs/contract.md §Invariants #5, #6
- * @see ./runtime.ts (resolveAttestation — the consumer of these documents)
+ * @see ./runtime.ts (resolveAttestation — the consumer of these documents + the sequence-floor gate)
+ * @see ./sequence-floor.ts (the device-persisted rollback floor `max_sequence` is compared against)
  */
 
 import type { FetchImpl } from "./relay-poll.js";
-import type { AccountStateResolver } from "./runtime.js";
+import type { AccountStateResolution, AccountStateResolver } from "./runtime.js";
 
 /**
  * HTTP fetch timeout for account-state requests (ms). Short enough that a hung relay downgrades
@@ -62,16 +72,33 @@ function accountStatesUrl(relayUrl: string, accountId: string): string {
 }
 
 /**
- * Validate the raw response body from `GET /account-states`. Returns the typed array on success,
- * or `null` if the body is malformed. The relay is zero-knowledge and cannot forge root signatures,
- * but the shape must be validated before passing to the WASM core.
+ * Validate the raw response body from `GET /account-states`. Returns the typed
+ * {@link AccountStateResolution} on success, or `null` if the body is malformed. The relay is
+ * zero-knowledge and cannot forge root signatures, but the shape must be validated before passing to
+ * the WASM core.
+ *
+ * `max_sequence` is optional in the parsed shape (a relay that omits it entirely just yields no
+ * per-fetch metadata gate), but if PRESENT it must be a non-negative safe integer — a malformed
+ * `max_sequence` is itself a sign of a tampered/misbehaving relay response, so the whole body fails
+ * closed to `null` (never a resolution that silently drops just the metadata field).
  */
-function parseAccountStatesBody(body: unknown): readonly string[] | null {
+function parseAccountStatesBody(body: unknown): AccountStateResolution | null {
   if (typeof body !== "object" || body === null) return null;
-  const raw = (body as Record<string, unknown>).account_states;
+  const record = body as Record<string, unknown>;
+  const raw = record.account_states;
   if (!Array.isArray(raw)) return null;
   if (!raw.every((item): item is string => typeof item === "string")) return null;
-  return raw;
+
+  const rawMaxSequence = record.max_sequence;
+  if (rawMaxSequence === undefined) return { accountStates: raw };
+  if (
+    typeof rawMaxSequence !== "number" ||
+    !Number.isSafeInteger(rawMaxSequence) ||
+    rawMaxSequence < 0
+  ) {
+    return null;
+  }
+  return { accountStates: raw, maxSequence: rawMaxSequence };
 }
 
 /**
@@ -101,7 +128,7 @@ export function createRelayAccountStateResolver(
   const url = accountStatesUrl(relayUrl, accountId);
   const headers = { Authorization: `Bearer ${deviceAuthToken}` };
 
-  return async function resolve(_actorId: string): Promise<readonly string[]> {
+  return async function resolve(_actorId: string): Promise<AccountStateResolution | readonly []> {
     let body: unknown;
     try {
       const resp = await fetchImpl(url, {
@@ -119,11 +146,11 @@ export function createRelayAccountStateResolver(
       return [];
     }
 
-    const accountStates = parseAccountStatesBody(body);
-    if (accountStates === null) {
+    const resolution = parseAccountStatesBody(body);
+    if (resolution === null) {
       // Malformed response shape — downgrade to unverified rather than passing garbage to the core.
       return [];
     }
-    return accountStates;
+    return resolution;
   };
 }

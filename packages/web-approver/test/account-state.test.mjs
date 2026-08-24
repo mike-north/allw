@@ -9,14 +9,18 @@
  *     #6): network error, timeout, HTTP non-2xx, malformed body — all return `[]` without throwing;
  *   - **relay-substituted / invalid account state → never VERIFIED** (the WASM core rejects any
  *     account-state document that doesn't carry a valid root signature, regardless of what the relay
- *     serves).
+ *     serves);
+ *   - **`max_sequence` is surfaced, not discarded** (#171): a valid response carries it through to
+ *     the returned resolution; an omitted field yields no metadata (not malformed); a `max_sequence`
+ *     that fails to parse as a non-negative safe integer fails closed on the WHOLE body.
  *
  * All timestamps are fixed constants — never `Date.now()` in test data.
  *
  * @see ../src/account-state.ts (the unit under test)
- * @see ../src/runtime.ts (AccountStateResolver consumer)
+ * @see ../src/runtime.ts (AccountStateResolver consumer + the sequence-floor gate)
  * @see ../../../docs/enrollment.md §Account State, §Actor-Key Enrollment
  * @see ../../../docs/contract.md §Invariants #5, #6
+ * @see ./account-state-sequence-floor.test.mjs (the sequence-floor gate's own negative-test suite)
  */
 
 import { test } from "node:test";
@@ -270,15 +274,26 @@ test("relay timeout: AbortSignal.timeout causes a fail-closed empty array (no th
     relayUrl: RELAY_URL,
     accountId: ACCOUNT_ID,
     deviceAuthToken: DEVICE_AUTH_TOKEN,
-    timeoutMs: 1, // 1ms — will fire before the promise resolves
-    fetchImpl: async () => {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({ account_states: [], max_sequence: 0 }),
-      };
-    },
+    timeoutMs: 1, // 1ms — will fire before the slow response below resolves
+    // A real `fetch` rejects once its `signal` aborts; this mock must honor that contract too, or
+    // the test would pass merely because the eventual (never-aborted) response happens to be
+    // empty — it would then no longer be exercising the timeout path at all.
+    fetchImpl: (_url, init) =>
+      new Promise((resolve, reject) => {
+        const timer = setTimeout(
+          () =>
+            resolve({
+              ok: true,
+              status: 200,
+              json: async () => ({ account_states: ["should-never-be-returned"], max_sequence: 9 }),
+            }),
+          100,
+        );
+        init?.signal?.addEventListener("abort", () => {
+          clearTimeout(timer);
+          reject(new DOMException("The operation was aborted.", "AbortError"));
+        });
+      }),
   });
 
   const result = await resolver("actor-1");
@@ -363,6 +378,88 @@ test("malformed response — account_states contains non-strings: returns [] (fa
 
   const result = await resolver("actor-1");
   assert.deepEqual(result, [], "non-string array elements return empty array");
+});
+
+// ── Surfacing max_sequence (#171) ──────────────────────────────────────────────────────────────
+
+test("max_sequence: a valid response surfaces both account_states and maxSequence", async () => {
+  const resolver = createRelayAccountStateResolver({
+    relayUrl: RELAY_URL,
+    accountId: ACCOUNT_ID,
+    deviceAuthToken: DEVICE_AUTH_TOKEN,
+    fetchImpl: fakeFetch(["state-a", "state-b"], 7),
+  });
+
+  const result = await resolver("actor-1");
+  assert.deepEqual(
+    result,
+    { accountStates: ["state-a", "state-b"], maxSequence: 7 },
+    "the resolver must surface the relay's max_sequence alongside the account-state documents",
+  );
+});
+
+test("max_sequence: an omitted field resolves without a maxSequence key (no metadata, not malformed)", async () => {
+  const resolver = createRelayAccountStateResolver({
+    relayUrl: RELAY_URL,
+    accountId: ACCOUNT_ID,
+    deviceAuthToken: DEVICE_AUTH_TOKEN,
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ account_states: ["state-a"] }),
+    }),
+  });
+
+  const result = await resolver("actor-1");
+  assert.deepEqual(result, { accountStates: ["state-a"] });
+});
+
+test("malformed response — max_sequence is not a number: fails closed to [] (never a resolution missing just the metadata)", async () => {
+  const resolver = createRelayAccountStateResolver({
+    relayUrl: RELAY_URL,
+    accountId: ACCOUNT_ID,
+    deviceAuthToken: DEVICE_AUTH_TOKEN,
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ account_states: ["state-a"], max_sequence: "not-a-number" }),
+    }),
+  });
+
+  const result = await resolver("actor-1");
+  assert.deepEqual(result, [], "a malformed max_sequence must fail closed on the WHOLE body");
+});
+
+test("malformed response — max_sequence is negative: fails closed to []", async () => {
+  const resolver = createRelayAccountStateResolver({
+    relayUrl: RELAY_URL,
+    accountId: ACCOUNT_ID,
+    deviceAuthToken: DEVICE_AUTH_TOKEN,
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ account_states: [], max_sequence: -1 }),
+    }),
+  });
+
+  const result = await resolver("actor-1");
+  assert.deepEqual(result, []);
+});
+
+test("malformed response — max_sequence is not a safe integer: fails closed to []", async () => {
+  const resolver = createRelayAccountStateResolver({
+    relayUrl: RELAY_URL,
+    accountId: ACCOUNT_ID,
+    deviceAuthToken: DEVICE_AUTH_TOKEN,
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ account_states: [], max_sequence: 1.5 }),
+    }),
+  });
+
+  const result = await resolver("actor-1");
+  assert.deepEqual(result, []);
 });
 
 test("malformed response — body is not a JSON object: returns [] (fail-closed)", async () => {
