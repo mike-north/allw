@@ -9,6 +9,7 @@ This document covers:
 
 - account identity and the account-root trust anchor;
 - approver device enrollment and `device_cert` validation;
+- the cross-device `device_cert` issuance ceremony for devices that do not hold the account root (#175);
 - actor-key enrollment for requester attestation;
 - work-stream attestation: the work-stream label, the machine Secure-Enclave keypair (the cryptographic trust
   root), and the asserted-not-verified harness session-ID (Decisions 4 + 5, #133);
@@ -76,6 +77,9 @@ configured account-root public key plus the `device_cert` carried in the verdict
    account-state material.
 8. Recovery must preserve the user's account identity when possible; when impossible, recovery creates a new
    trust anchor and requires relying parties to reconfigure trust.
+9. A device that does not hold the account root must obtain its `device_cert` through a ceremony whose
+   enrollee→root leg is authenticated by out-of-band key material the relay never receives. The relay may carry
+   ceremony bytes; it must never be able to cause a key it chose to be certified.
 
 ## Device Enrollment
 
@@ -93,12 +97,18 @@ The v1 pairing flow is:
 1. Account owner starts a short-lived pairing: `POST /{account_id}/pairing/start`.
 2. Relay returns `{ code, expires_at, pairing_auth_token }`; the code and bearer token are shown
    out-of-band to the device or delivered through the account-owner pairing ceremony.
-3. Device completes pairing with `{ code, encryption_pubkey, signing_pubkey, label? }`, where
-   `encryption_pubkey` is its X25519 encryption public key and `signing_pubkey` is the Ed25519 public key to
-   certify for verdict and policy-rule signatures.
+3. Device completes pairing with `{ code, pubkey, label?, push_tokens? }`, where `pubkey` is its **X25519
+   encryption public key** — the single key the relay registers. The Ed25519 **signing** key is deliberately
+   **not** sent to the relay: it is certified out of band through the `device_cert`, and routing the signing key
+   through the relay would make the relay the carrier of the verdict-key binding. (An earlier draft of this doc
+   listed `encryption_pubkey` + `signing_pubkey` here; the implemented relay contract is single-key, and that is
+   the intended design, not a shortfall — see §Cross-Device `device_cert` Issuance Ceremony.)
 4. Relay validates the pairing bearer token, consumes the code exactly once, creates `device_id`,
    returns `device_auth_token`, and stores only public key material plus relay-token hashes.
-5. Account root signs a `device_cert` for the device signing key:
+5. Account root signs a `device_cert` for the device signing key. When the device _is_ the root holder it signs
+   its own cert locally; when it is not — the phone, a browser, a second Mac — the signing key travels no
+   further than its own hardware and the cert is obtained through the ceremony in
+   §Cross-Device `device_cert` Issuance Ceremony:
 
    ```jsonc
    // compact JWS payload, typ = "allw-device-cert+jws"
@@ -135,6 +145,264 @@ Given a verdict and configured account-root public key, a verifier must:
 
 What this proves: the relay cannot cause an arbitrary device key to be trusted by listing it in `/devices`; only a
 root-signed `device_cert` can make a verdict key trusted.
+
+## Cross-Device `device_cert` Issuance Ceremony
+
+> **Status:** decided (#175). This section owns the path by which a device that is **not** the account-root
+> holder — an iPhone, a Mac, a browser — obtains a root-signed `device_cert` without its signing key ever
+> leaving the hardware that generated it. Wire detail for the relay endpoints lives in
+> [relay-api.md](./relay-api.md) §Enrollment courier; the adversary analysis lives in
+> [threat-model.md](./threat-model.md) §R8.
+
+### The gap this closes
+
+The walking-skeleton `allw-approver pair` holds the account-root seed and the device seeds in one keyfile, so it
+self-mints its own `device_cert`. Every other approver surface is in a different position: the **phone is not the
+root holder**. Its signing key is generated in the Secure Enclave and can never be exported, the relay neither
+issues nor stores `device_cert`, and a verdict without a valid root-signed cert is denied by integrators
+(§Device Certificate Validation). Without a built ceremony there is simply no path from "the phone paired with
+the relay" to "the phone can produce a verdict anyone will accept."
+
+### What actually has to move — and why the problem is asymmetric
+
+Only two artifacts cross between the enrollee and the root holder, and **both are public**:
+
+| Direction                       | Artifact                                                                   | Confidentiality | Integrity                                                     |
+| ------------------------------- | -------------------------------------------------------------------------- | --------------- | ------------------------------------------------------------- |
+| enrollee → root holder ("out")  | a **CSR**: `device_id` + Ed25519 signing pubkey + X25519 encryption pubkey | not required    | **critical** — this is what the root is about to bless        |
+| root holder → enrollee ("back") | the issued `device_cert` (compact JWS)                                     | not required    | **self-verifying** — it is signed by the root the device pins |
+
+The asymmetry is the whole design:
+
+- The **back** leg needs no protection at all. A `device_cert` is worthless to anyone who does not hold the
+  matching signing key, and the enrollee verifies the JWS against the account-root public key it already pinned.
+  A hostile carrier can withhold or corrupt it — which fails closed (no cert, no accepted verdicts) — but cannot
+  forge or substitute one.
+- The **out** leg is the entire attack surface. If a carrier can swap the CSR's `signing_pubkey`, the account
+  root will mint a valid cert over an attacker-held key, and the attacker can sign verdicts that every integrator
+  accepts. That is full account compromise. So the CSR — and only the CSR — must be authenticated by something
+  the carrier does not know.
+
+### Options considered
+
+| Option                                                                                                                           | Relay trust required                                                    | Works for the real consumer pairs?                                                                                                                                                                                           |
+| -------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **A. Two-QR ceremony** — enrollee displays the CSR as a QR, root holder scans it; root displays the cert QR, enrollee scans back | none                                                                    | **No.** The root holder in v1 is a **terminal CLI**, which can _display_ a QR but cannot _scan_ one. The enrollee→root leg would degrade to hand-typing a 43-char pubkey plus a UUID. The web approver has no camera either. |
+| **B. Relay store-and-forward courier + MAC-authenticated CSR** _(chosen)_                                                        | **none for trust** — the relay carries opaque bytes it cannot forge     | **Yes**, for every pair: CLI↔phone, CLI↔browser, Mac↔phone. Needs exactly one out-of-band channel, in the direction every consumer already supports.                                                                         |
+| C. Relay courier with a human-compared code only (no MAC)                                                                        | **yes** — a substituting relay only has to beat a short comparison code | Yes, but the phishing-resistance control would be a ~20-bit code an adversary who sees the genuine CSR can grind. Rejected as the _primary_ control; kept as defense-in-depth (below).                                       |
+| D. Ship a pre-issued `device_cert` in a provisioning bundle                                                                      | n/a                                                                     | Dev-only. Requires the root holder to know the device key before the device exists, so it cannot honor the Secure-Enclave invariant for a real device. See §Dev stub.                                                        |
+
+**Decision: option B.** The ceremony needs exactly **one** out-of-band channel, and it runs in the _easy_
+direction — root holder → enrollee — where every consumer already has an affordance: the CLI prints a QR that the
+phone's camera reads, or prints a link the browser pastes. The hard direction (enrollee → root holder, which would
+demand a camera on the root side) is replaced by a relay mailbox whose contents the root holder authenticates
+cryptographically. The relay gains no trust: it carries a MAC it cannot forge and a JWS it cannot sign.
+
+### The enrollment bundle (the one out-of-band payload)
+
+The root holder mints a fresh **enrollment secret** (32 random bytes) locally. **It is never sent to the relay.**
+The bundle carries everything the enrollee needs to bootstrap, as compact JSON:
+
+```jsonc
+{
+  "v": 1,
+  "relay_url": "https://relay.example.com",
+  "account_id": "acct_123",
+  "account_root_pubkey": "<base64url Ed25519 public key>", // the trust anchor the enrollee pins
+  "pairing_code": "ABCD2345",
+  "pairing_auth_token": "<base64url>",
+  "enrollment_id": "<base64url 16 bytes>", // relay mailbox id (public)
+  "enrollment_secret": "<base64url 32 bytes>", // NEVER leaves this channel
+  "expires_at": 1760000600000,
+  "label": "Mike's iPhone", // optional suggestion from the root holder
+}
+```
+
+Serialized as `base64url(JCS(bundle))` and presented **two ways from the same bytes**:
+
+- **QR code** (phone camera) and
+- **a link the human can copy**: `allw://enroll#<b64url>` for the native app, or
+  `https://<web-approver-host>/#<b64url>` for the web approver.
+
+The payload rides in the URL **fragment**, never the query string, so a bundle pasted into a browser address bar
+is never transmitted to a server. Treat the whole bundle as secret material: it is single-use, expires with the
+pairing code (10 minutes), and is invalidated by the abort path below.
+
+### Derived key material and the confirmation code
+
+Every derivation is domain-separated, matching the conventions in [contract.md](./contract.md) §Wire encoding:
+
+```
+K_csr     = HKDF-SHA256(ikm = enrollment_secret, salt = "", info = b"allw/enroll-csr-key/v1",     L = 32)
+K_confirm = HKDF-SHA256(ikm = enrollment_secret, salt = "", info = b"allw/enroll-confirm-key/v1", L = 32)
+
+csr_mac      = HMAC-SHA256(K_csr,     b"allw/enroll-csr/v1"     || 0x00 || JCS(csr))          // base64url-unpadded
+confirm_code = zero_pad_6_decimal(
+                 uint32_be( HMAC-SHA256(K_confirm, b"allw/enroll-confirm/v1" || 0x00 || JCS(csr))[0..4] ) mod 1_000_000
+               )
+```
+
+`csr_mac` is the load-bearing control: it proves the CSR was authored by whoever received the out-of-band bundle.
+`confirm_code` is a six-digit human cross-check, computed **independently on both sides from the CSR bytes each
+side holds**. It is never transmitted — a relay that carried the code could substitute a CSR and replay the
+genuine code, so a wire-supplied confirmation code would be worse than none. Both sides display it; the human
+compares.
+
+> **Honest ceiling.** `confirm_code` is ~20 bits. An adversary who _already holds the enrollment secret_ and has
+> seen the genuine CSR can grind a colliding code offline. It is therefore defense-in-depth for the
+> secret-leak / race case and a guard against accidental mismatch — **not** the phishing-resistance control.
+> The MAC is that control (threat-model.md §R8).
+
+### The certificate signing request
+
+```jsonc
+// the MACed object; `mac` travels beside it in the request body, never inside it
+{
+  "v": 1,
+  "enrollment_id": "<base64url 16 bytes>", // binds the CSR to this ceremony instance
+  "account_id": "acct_123",
+  "device_id": "dev_abc", // relay-assigned by POST /pairing/complete
+  "signing_pubkey": "<base64url Ed25519 public key>", // what the root is asked to certify
+  "encryption_pubkey": "<base64url X25519 public key>", // for the account-state devices[] entry
+  "label": "Mike's iPhone",
+  "purpose": "enroll", // "enroll" | "rotate"
+  "created_at": 1760000000000,
+}
+```
+
+`encryption_pubkey` is included **deliberately**: the root holder must build the account-state `devices[]` entry
+from MAC-authenticated material, not from the relay's `GET /devices` response. Reading it from the relay would
+let the relay choose which X25519 key the root vouches for.
+
+### Ceremony sequence
+
+`A` = the **account-root holder** (v1: `allw-approver`; later a root-holding Mac app).
+`B` = the **enrollee** (iPhone/iPad/Mac app, or the web approver).
+
+1. **A** `POST /{acct}/pairing/start` → `{ code, expires_at, pairing_auth_token }`.
+2. **A** `POST /{acct}/enrollments/start` → `{ enrollment_id, expires_at, enrollment_auth_token }`, and
+   generates `enrollment_secret` locally. The relay never sees the secret.
+3. **A** renders the enrollment bundle (QR + copyable link) and waits, polling the CSR mailbox.
+4. **B** scans or pastes the bundle, **pins** `relay_url` / `account_id` / `account_root_pubkey`, and generates
+   its two independent seeds on-device (signing key in Secure Enclave / StrongBox where available).
+5. **B** `POST /{acct}/pairing/complete` with `pubkey` = its X25519 encryption key (+ `label`, `push_tokens`)
+   → `{ device_id, device_auth_token }`.
+6. **B** builds the CSR, computes `csr_mac`, `POST /{acct}/enrollments/{id}/csr` (Bearer `device_auth_token`),
+   and displays its locally-derived `confirm_code`.
+7. **A** `GET /{acct}/enrollments/{id}/csr` (Bearer `enrollment_auth_token`) and checks, in order, failing
+   closed at the first failure: `v == 1`; `enrollment_id` matches this ceremony; `account_id` matches; both
+   pubkeys are 32-byte base64url; `created_at` inside the enrollment window; **`csr_mac` verifies under
+   `K_csr`**; `device_id` is not revoked in the account's highest-sequence account state.
+8. **A** displays the CSR's `label` and its own derived `confirm_code`; the human compares it with **B**'s screen
+   and gives an explicit confirmation (a `y` at the CLI, biometric in an app). No confirmation ⇒ abort.
+9. **A** `issue_device_cert(root, account_id, device_id, signing_pubkey, now, expires_at)` — an explicit
+   `expires_at` (default 180 days) is **recommended**, so a forgotten device eventually fails closed even if it
+   is never revoked.
+10. **A** `POST /{acct}/enrollments/{id}/cert` with the compact JWS, and **publishes updated account state**
+    (`sequence + 1`, a `devices[]` entry carrying both pubkeys from the CSR plus `cert_expires_at`) via
+    `POST /{acct}/account-states`. Verdict verification chains through the cert alone, so this step is not
+    required for the device to work — but it is what gives offline verifiers and the inbox a complete trust view.
+11. **B** polls `GET /{acct}/enrollments/{id}/cert` (Bearer `device_auth_token`) and, before persisting
+    anything, verifies the cert against the **pinned** root: compact JWS with `typ = "allw-device-cert+jws"` and
+    `alg = EdDSA`, `kid == account_id`, signature under the pinned `account_root_pubkey`, claims
+    `account_id` == pinned, `device_id` == its own, **`device_pubkey` == its own signing pubkey**, and
+    `expires_at` (when present) in the future.
+12. Only on full success does **B** persist `{ account_id, device_id, device_auth_token, device_cert,
+account_root_pubkey }` and unlock its inbox. The enrollment is consumed; the relay may drop the row at TTL.
+
+### Failure and abort paths — all fail-closed
+
+| #   | Situation                                                   | Behavior                                                                                                                                                                                                                                |
+| --- | ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Bundle expired / enrollment TTL elapsed                     | Every courier call answers `410`. **B** shows "enrollment expired — start again"; no cert exists, nothing is persisted.                                                                                                                 |
+| 2   | CSR mailbox already claimed (first write wins)              | Second poster gets `409`. **B** aborts visibly and the human restarts with a **fresh** secret. A squatted mailbox must never be silently reused.                                                                                        |
+| 3   | `csr_mac` fails at **A**                                    | **A** never signs. It calls `POST …/abort`, prints what failed, and the enrollment is dead. This is the relay-substitution case.                                                                                                        |
+| 4   | `confirm_code` mismatch, or the human declines              | Same as 3 — explicit abort, no signature.                                                                                                                                                                                               |
+| 5   | `device_id` appears in the highest-sequence revocation list | **A** refuses to issue and aborts. A revoked device id is never re-certified (§Revocation and rotation interaction).                                                                                                                    |
+| 6   | Abort called                                                | The enrollment row is terminal. Both mailboxes answer `409`; **B** stops polling and reports the abort instead of timing out silently.                                                                                                  |
+| 7   | Relay withholds, corrupts, or never delivers the cert       | **B** times out with no cert. It stays **uncertified**, which is indistinguishable from unpaired at the UI layer: the inbox is unreachable.                                                                                             |
+| 8   | Cert fails any device-side check in step 11                 | **B** discards it (never persists), reports the failure, and **self-revokes** its relay registration (`POST /devices/{id}/revoke`) so it does not linger in `GET /devices` as a recipient that can never produce an acceptable verdict. |
+| 9   | **B** crashes between pairing and cert receipt              | Its seeds are already persisted (a device that lost its seeds could never use a cert). On restart it may re-poll the cert mailbox with the same `enrollment_id`; if the enrollment is gone it self-revokes and restarts the ceremony.   |
+
+**The structural UI invariant:** a surface has no approvable inbox until a **root-verified** `device_cert` is
+persisted. "Paired but uncertified" is not a usable state and must not be rendered as one — the approve path is
+unreachable, not merely disabled (mirrors `docs/apple-approver-app.md` §6.7).
+
+### Revocation and rotation interaction
+
+- **Revocation is unchanged.** The ceremony issues certs; it never revokes. Revoking a device remains: relay
+  device revocation plus a `revocations` entry in the next account-state document (§Revocation).
+- **A revoked `device_id` is never re-certified.** Step 7 makes that a hard precondition. A replaced device
+  re-runs the whole ceremony and receives a **new** relay-assigned `device_id`; the old id stays revoked
+  forever, so an old cert can never be resurrected.
+- **Rotation reuses this ceremony as its transport.** A device rotating its signing key generates a new key,
+  submits a CSR with `purpose: "rotate"` and its **existing** `device_id`, and the root issues a fresh cert.
+  The grace-period rules in §Device-Key Rotation apply unchanged: both certs may verify during the grace window,
+  and a device suspected compromised is revoked rather than rotated.
+- **Encryption-key rotation** still goes through re-pairing (the relay registry is the encryption-key source of
+  truth); a `purpose: "rotate"` CSR carrying a changed `encryption_pubkey` tells the root to publish the updated
+  `devices[]` entry in the same account-state bump.
+- **Known gap (not solved here):** the relay's `POST /devices/{id}/revoke` is **self-revoke only**, so the root
+  holder cannot evict a lost phone from the relay registry — it can only publish account-state revocation, which
+  is what verifiers actually enforce. An account-root-authorized revoke endpoint is a separate change; see
+  §Deferred Decisions.
+
+### What a hostile relay can and cannot do
+
+| Relay behavior                        | Outcome                                                                                                                    |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| Substitute the CSR's `signing_pubkey` | **Blocked.** `csr_mac` is keyed by a secret the relay never receives; **A** aborts.                                        |
+| Forge or substitute a `device_cert`   | **Blocked.** The cert is a JWS under the account root; **B** verifies against the pinned root and its own pubkey.          |
+| Replay an old CSR or cert             | **Blocked.** Both are bound to a single-use `enrollment_id` with a 10-minute TTL; both mailboxes are write-once.           |
+| Read the CSR / cert                   | Allowed and harmless — both are public key material, the same class of data as `GET /devices` and `GET /actors`.           |
+| Withhold, delay, or drop either leg   | Denial of service only ⇒ no cert ⇒ fail-closed. Availability is an accepted residual (threat-model.md).                    |
+| Enumerate or squat enrollments        | Mitigated by 128-bit random `enrollment_id`, bearer-token auth on every courier call, short TTL, and write-once mailboxes. |
+
+The relay stores only an opaque CSR object and an opaque compact JWS. It **must not** validate the MAC (it has no
+key) or the certificate (it is not a trust anchor). Its shape/ownership checks are anti-abuse, never trust.
+
+### Consumer notes
+
+- **Apple approver app** (`docs/apple-approver-app.md` §3.3): camera QR scan is the primary path; the
+  `allw://enroll#…` deep link covers AirDrop/Messages hand-off and macOS, where the bundle is pasted. Seeds are
+  generated on-device; the signing seed goes to Keychain/Secure Enclave and is never part of the CSR.
+- **Web approver**: no camera required — the human pastes the `https://<host>/#<b64url>` link, and the fragment
+  never reaches the server. Everything else is identical.
+- **`allw-approver` CLI** plays **A** (`enroll` verb: start, render QR + link, poll, verify MAC, prompt with the
+  confirmation code, issue, publish, post). It can also play **B** for a second CLI install, which makes the
+  ceremony testable end-to-end without a phone.
+
+### Dev stub (superseded, dev-only)
+
+A provisioning bundle carrying relay coordinates, `account_id`, the account-root pubkey, and a **pre-issued**
+`device_cert` remains acceptable in **development builds only**, and **must never** carry the device signing
+seed. It exists so surfaces could be exercised before this ceremony shipped; once the ceremony lands, production
+builds must use it, and any stub path must be compiled out or refuse to run against a non-local relay.
+
+### UAT checklist
+
+Drive these through the real surfaces (CLI subprocess + app/browser), not in-process helpers:
+
+1. **Happy path, phone:** CLI `enroll` → QR scanned by the app → cert issued → the app signs a verdict an
+   integrator accepts against the account-root pubkey alone.
+2. **Happy path, browser:** same bundle pasted as a link into the web approver → cert issued → verdict accepted.
+3. **Confirmation codes match** on both screens in the happy path, and the CLI refuses to proceed without an
+   explicit confirmation.
+4. **Tampered CSR:** flip one byte of `signing_pubkey` in flight → CLI reports a MAC failure, issues nothing,
+   and the enrollment is terminal.
+5. **Wrong secret:** enrollee uses a bundle from a different ceremony → MAC failure → no cert.
+6. **Expired bundle:** wait past the TTL → `410` on both legs → enrollee reports expiry, nothing persisted.
+7. **Squatted mailbox:** post a second CSR → `409` → the genuine enrollee aborts visibly.
+8. **Abort:** operator declines at the confirmation prompt → enrollee's poll reports abort (not a timeout) and
+   the enrollee holds no cert.
+9. **Forged cert:** relay returns a cert signed by a different root, or one whose `device_pubkey` is not the
+   enrollee's → the enrollee discards it, persists nothing, self-revokes, and its inbox stays unreachable.
+10. **Revoked-device refusal:** revoke a device, then re-run the ceremony reusing its `device_id` → the root
+    holder refuses to certify.
+11. **Rotation:** `purpose: "rotate"` with an existing `device_id` → a fresh cert; verdicts under both keys
+    verify during the grace window and the old key fails after it.
+12. **Relay silence:** kill the relay mid-ceremony → both sides time out fail-closed; the enrollee's inbox is
+    unreachable.
 
 ## Actor-Key Enrollment
 
@@ -544,8 +812,9 @@ If at least one trusted device or recovery authority remains:
 
 1. Revoke the lost device immediately.
 2. Publish account state with the revocation.
-3. Pair the replacement device.
-4. Issue a fresh `device_cert`.
+3. Pair the replacement device — it receives a **new** `device_id`; the lost one stays revoked forever.
+4. Issue a fresh `device_cert` (via §Cross-Device `device_cert` Issuance Ceremony when the replacement is not
+   the root holder).
 5. Reconfigure or refresh integrators that cache device/account state.
 
 This preserves `account_id` and account-root trust.
@@ -575,6 +844,12 @@ Current relay mechanics cover the registry subset and #89 adds relay-scoped endp
 | ---------------------------------- | --------------------------------------------------------------------------------------- |
 | `POST /pairing/start`              | Create a short-lived single-use device enrollment code.                                 |
 | `POST /pairing/complete`           | Redeem the code with its pairing bearer token and store a device encryption public key. |
+| `POST /enrollments/start`          | Open a single-use cert-issuance mailbox pair for the ceremony (#175).                   |
+| `POST /enrollments/{id}/csr`       | Enrollee deposits its MAC-authenticated CSR (write-once).                               |
+| `GET /enrollments/{id}/csr`        | Root holder collects the CSR to verify and certify.                                     |
+| `POST /enrollments/{id}/cert`      | Root holder deposits the issued `device_cert` (write-once, opaque to the relay).        |
+| `GET /enrollments/{id}/cert`       | Enrollee collects its `device_cert` and verifies it against the pinned root.            |
+| `POST /enrollments/{id}/abort`     | Root holder terminates a ceremony fail-closed and visibly.                              |
 | `GET /devices`                     | Return active device encryption public keys for JWE recipients.                         |
 | `POST /devices/{device_id}/revoke` | Remove an active device and close its live socket.                                      |
 | `POST /actors`                     | Enroll an actor public key.                                                             |
@@ -584,10 +859,16 @@ Current relay mechanics cover the registry subset and #89 adds relay-scoped endp
 
 Endpoint authentication and authorization rules:
 
-- `POST /pairing/start` and `POST /requests` are deliberately unauthenticated token issuers:
-  pairing start is an account-owner ceremony boundary, while request submit returns a per-request read
-  capability that can only tighten the caller's authority;
+- `POST /pairing/start`, `POST /enrollments/start`, and `POST /requests` are deliberately unauthenticated token
+  issuers: pairing start and enrollment start are account-owner ceremony boundaries that only mint a capability
+  scoped to the object they create, while request submit returns a per-request read capability that can only
+  tighten the caller's authority;
 - completing pairing requires the code plus the `pairing_auth_token`;
+- depositing a CSR and collecting a cert require the enrollee's `device_auth_token`, and the relay additionally
+  requires the CSR's `device_id` to be the authenticated device — a device may only ever request a certificate
+  for itself;
+- collecting a CSR, depositing a cert, and aborting require the `enrollment_auth_token` returned by
+  `POST /enrollments/start`, which is scoped to that one enrollment;
 - actor enrollment requires an enrolled device token;
 - device revocation requires the target device token;
 - device presence requires the target device token, passed as a bearer header or `auth` query on WebSocket upgrade;
@@ -608,7 +889,14 @@ Implementation PRs for this spec should add fixtures or tests for:
 - account-root rotation via old-root cross-signature and post-grace old-root rejection;
 - actor attestation verification and revoked-actor downgrade;
 - relay revocation closing live device sockets and preventing revoked-device verdict resolution;
-- offline verifier keeping the highest valid account-state sequence and rejecting stale state rollback.
+- offline verifier keeping the highest valid account-state sequence and rejecting stale state rollback;
+- cross-device ceremony (#175): CSR MAC verification, and a direct negative test for **every** rejection branch —
+  wrong enrollment secret, tampered `signing_pubkey`, tampered `encryption_pubkey`, wrong `enrollment_id`,
+  wrong `account_id`, `device_id` not matching the authenticated device, malformed/oversized bodies, expired
+  enrollment, second CSR (`409`), second cert (`409`), post-abort operations, and a cert whose `device_pubkey`,
+  `device_id`, `account_id`, `typ`, `kid`, signing root, or `expires_at` does not satisfy the enrollee's checks;
+- ceremony confirmation-code derivation agreeing byte-for-byte across the Rust core and the WASM/TS surface, and
+  never appearing on the wire.
 
 ## Deferred Decisions
 
@@ -616,8 +904,18 @@ Implementation PRs for this spec should add fixtures or tests for:
   hardware security key.
 - Account-state transport format: compact JWS payload versus JSON document plus detached signature.
 - Root-transition grace-period defaults.
+- **Account-root-authorized device revocation at the relay.** `POST /devices/{id}/revoke` is self-revoke only, so
+  the root holder cannot evict a lost device from the relay registry (account-state revocation, which is what
+  verifiers enforce, still works). A root-signed revoke request would close that gap.
+- **A push/WebSocket wakeup for the ceremony.** v1 polls both mailboxes; a socket would shorten the ceremony but
+  changes no trust property.
 
 Resolved (was deferred):
+
+- Cross-device `device_cert` issuance for a device that is not the account-root holder: **#175 chose a relay
+  store-and-forward courier with a MAC-authenticated CSR** over a two-QR ceremony, because the ceremony then
+  needs only one out-of-band channel in the direction every consumer supports, while the relay gains no trust.
+  See §Cross-Device `device_cert` Issuance Ceremony.
 
 - Whether actor keys are anchored via a root-signed `actor_cert` or via signed account-state: **#16 chose signed
   account-state** (`actors` entries), reusing the device-trust/revocation machinery.

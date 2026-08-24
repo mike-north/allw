@@ -35,13 +35,14 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   **WebSocket** upgrades (which can't easily set headers), pass `?auth=<token>` as a query param.
   The relay stores only `SHA-256(token)`; the plaintext is returned **once** at issuance — cache it.
   Missing token ⇒ **401**; wrong/expired/cross-scope token ⇒ **403**.
-- **Three token scopes:**
+- **Four token scopes:**
 
-  | Token                | Issued by                     | Used for                                         | Lifetime                  |
-  | -------------------- | ----------------------------- | ------------------------------------------------ | ------------------------- |
-  | `pairing_auth_token` | `POST /pairing/start`         | `POST /pairing/complete`                         | 10 min (`PAIRING_TTL_MS`) |
-  | `device_auth_token`  | `POST /pairing/complete`      | all `devices/{id}/…`, `actors`, `account-states` | until revoked             |
-  | `request_auth_token` | `POST /requests` (integrator) | `requests/{id}` polling/wait                     | 7 days post-terminal      |
+  | Token                   | Issued by                     | Used for                                                                      | Lifetime                     |
+  | ----------------------- | ----------------------------- | ----------------------------------------------------------------------------- | ---------------------------- |
+  | `pairing_auth_token`    | `POST /pairing/start`         | `POST /pairing/complete`                                                      | 10 min (`PAIRING_TTL_MS`)    |
+  | `enrollment_auth_token` | `POST /enrollments/start`     | `GET …/enrollments/{id}/csr`, `POST …/cert`, `POST …/abort` (the root holder) | 10 min (`ENROLLMENT_TTL_MS`) |
+  | `device_auth_token`     | `POST /pairing/complete`      | all `devices/{id}/…`, `actors`, `account-states`, the enrollee's courier legs | until revoked                |
+  | `request_auth_token`    | `POST /requests` (integrator) | `requests/{id}` polling/wait                                                  | 7 days post-terminal         |
 
 - **Errors** are plain bodies with the status code; `400` covers malformed JSON / bad fields /
   unexpected envelope keys (zero-knowledge guard).
@@ -57,6 +58,13 @@ PAIR (once)
   POST /{acct}/pairing/complete         (Bearer pairing_auth_token)
      body: { code, pubkey, label?, push_tokens? }   ← APNs token goes HERE
                                         → { device_id, device_auth_token }   (cache both)
+
+GET A device_cert (once, right after pairing — you cannot approve without one)
+  POST /{acct}/enrollments/{id}/csr     (Bearer device_auth_token)
+     body: { csr: {…signing_pubkey…}, mac }        ← mac keyed by the out-of-band enrollment secret
+  GET  /{acct}/enrollments/{id}/cert    (Bearer device_auth_token; poll)
+                                        → { status:"issued", device_cert }
+     VERIFY it against your pinned account-root pubkey before persisting. See §3 Enrollment courier.
 
 RECEIVE PENDING  (pick one; native app SHOULD use the WebSocket)
   A) GET  /{acct}/devices/{device_id}/inbox        (Bearer device_auth_token)
@@ -81,6 +89,7 @@ REFRESH TRUST  (periodically, to verify actor attestation / feed AccountStateRes
 | Need                                     | Endpoint                             | Package seam                                                                                                                                                                                                                                                        |
 | ---------------------------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Pair + store creds                       | `pairing/start` + `pairing/complete` | persist via `NativeCredentialStore` (`device_id`, `device_auth_token`, account-root pubkey)                                                                                                                                                                         |
+| Obtain the `device_cert`                 | `enrollments/{id}/csr` + `…/cert`    | scan the enrollment QR, generate keys on-device, deposit the MAC'd CSR, poll for the cert, verify against the pinned root, persist via `NativeCredentialStore` — no cert ⇒ no inbox                                                                                 |
 | Register APNs token                      | `push_tokens` in `pairing/complete`  | `PushTokenRegistering` / `HexApnsTokenRegistrar` `send` closure posts it here                                                                                                                                                                                       |
 | Poll inbox                               | `GET …/inbox`                        | `RelayInboxFetching` / `UrlSessionRelayInboxClient.fetchPendingEnvelopes()`                                                                                                                                                                                         |
 | Live push + **verdict submit + retract** | `…/connect` WebSocket                | **NOT in the package yet — the app builds this WS client.** Feed `{type:"request"}` into `ApprovalInboxStore.sync`; on resolve, send the `SignedVerdict.signedVerdictJson` as `{type:"verdict"}`; on `{type:"retract"}` clear via `PushInboxCoordinator.didResolve` |
@@ -117,6 +126,70 @@ Code is single-use, 10-min TTL.
 → **201** `{ device_id: string, device_auth_token: string }`. APNs `token` = 64-char hex.
 Errors: 400 (bad body/pubkey/push_token/unexpected key), 401/403 (token), 404 (code unknown),
 409 (code already used), 410 (code expired). Atomic — no half-enrollment.
+
+### Enrollment courier (cross-device `device_cert` issuance, #175)
+
+Two write-once mailboxes that carry a **certificate signing request** from a new device to the account-root
+holder, and the issued **`device_cert`** back. Full ceremony, derivations, and failure semantics:
+`docs/enrollment.md` §Cross-Device `device_cert` Issuance Ceremony.
+
+> **The relay is a courier, not a validator.** It stores an opaque CSR object and an opaque compact JWS. It
+> **never** checks `mac` (it holds no key that could), **never** parses or validates `device_cert`, and is never
+> a trust anchor for either. Its shape/ownership checks below are anti-abuse only. The `enrollment_secret` that
+> keys the CSR MAC travels **only** out of band (QR / pasted link) and must never appear in any request to the
+> relay.
+
+**`POST /{acct}/enrollments/start`** — no auth (account-owner ceremony boundary, same rationale as
+`pairing/start`). Body `{ label?: string }`. → **201**
+`{ enrollment_id: string (base64url 16 bytes), expires_at: number(ms), enrollment_auth_token: string }`.
+Single-use, 10-min TTL.
+
+**`POST /{acct}/enrollments/{enrollment_id}/csr`** — Bearer `device_auth_token` (the **enrollee**). Body:
+
+```json
+{
+  "csr": {
+    "v": 1,
+    "enrollment_id": "string",
+    "account_id": "string",
+    "device_id": "string",
+    "signing_pubkey": "base64url 32-byte Ed25519 key, 43 chars",
+    "encryption_pubkey": "base64url 32-byte X25519 key, 43 chars",
+    "label": "string (optional)",
+    "purpose": "enroll" | "rotate",
+    "created_at": 0
+  },
+  "mac": "base64url HMAC-SHA256, 43 chars"
+}
+```
+
+→ **201** `{ status: "awaiting_cert" }`. Errors: `400` (malformed body, bad pubkey/mac encoding, unexpected key,
+body > 4 KiB), `401`/`403` (missing/wrong device token), **`403` when `csr.device_id` is not the authenticated
+device** (a device may only request a certificate for itself), `404` (unknown enrollment), `409` (a CSR is
+already stored, or the enrollment was aborted/issued — write-once), `410` (enrollment expired).
+
+**`GET /{acct}/enrollments/{enrollment_id}/csr`** — Bearer `enrollment_auth_token` (the **root holder**). → **200**
+`{ status: "awaiting_csr" }` while empty, or `{ status: "awaiting_cert", csr: {…}, mac: "…" }`. `404` unknown,
+`409` aborted, `410` expired. The relay returns the deposited bytes verbatim; the root holder authenticates them
+with the MAC before trusting any field.
+
+**`POST /{acct}/enrollments/{enrollment_id}/cert`** — Bearer `enrollment_auth_token`. Body
+`{ device_cert: string (compact JWS, ≤ 4 KiB) }` → **200** `{ issued: true }`. `400` (malformed/oversized),
+`404`, `409` (already issued, aborted, or no CSR deposited yet), `410` (expired). Stored opaquely.
+
+**`GET /{acct}/enrollments/{enrollment_id}/cert`** — Bearer `device_auth_token`, and only for the device that
+deposited the CSR (cross-device ⇒ `403`). → **200** `{ status: "pending" }` or
+`{ status: "issued", device_cert: "<compact JWS>" }`. `409` aborted, `410` expired. **Verify the cert against
+your pinned account-root pubkey before persisting anything** — signature, `typ`/`kid`, `account_id`, `device_id`,
+`device_pubkey` == your own signing key, `expires_at`. A failing cert is discarded, never stored.
+
+**`POST /{acct}/enrollments/{enrollment_id}/abort`** — Bearer `enrollment_auth_token`. → **200**
+`{ aborted: true }`. Terminal: both mailboxes answer `409` afterwards, so the enrollee learns the ceremony died
+instead of timing out silently. The root holder MUST call this on MAC failure, confirmation-code mismatch, a
+declining human, or a revoked `device_id`.
+
+Polling is the v1 delivery mechanism for both sides (2 s interval, bounded by the enrollment TTL); a socket
+wakeup would shorten the ceremony but changes no trust property.
 
 ### Device (approver) endpoints — Bearer `device_auth_token`
 
@@ -210,9 +283,10 @@ then fetches the full envelope via the socket or `/inbox`. (WebPush reserved, no
 ## 6. Known gaps / client-owned concerns
 
 1. **Pairing-code delivery** (QR / deep-link / manual entry) is a UX layer — not defined by the relay.
-2. **`device_cert`** (binds the device signing key to the account root) is produced at enrollment and
-   persisted **on device**; the relay never stores/validates it. Include it in verdicts per the Verdict
-   schema.
+2. **`device_cert`** (binds the device signing key to the account root) is signed by the **account-root
+   holder** and persisted **on device**; the relay never issues or validates it. A device that is not the root
+   holder obtains one through the enrollment courier (§3) — the relay stores the CSR and the cert as opaque
+   bytes and can neither forge nor authenticate either. Include the cert in verdicts per the Verdict schema.
 3. **Verdict submission is WS-only** (§2 build note) — there is no HTTP fallback today. If the app
    needs an HTTP verdict path (e.g. background-task constraints), that's a relay change — file an issue.
 4. **Account-state signing/publishing** (who holds the root, how docs are produced) is out of relay
@@ -269,27 +343,28 @@ approver:{account_id,device_id}, sig:<compact JWS>, note?, challenge_response?, 
 6. **Pairing & `device_cert` (read carefully — the relay is a single-key surface).**
    - `POST /pairing/complete` registers **exactly one `pubkey` = the device X25519 _encryption_ key**
      (used by integrators to JWE-encrypt to the device). The Ed25519 **signing** key is **not** sent to
-     the relay. (`enrollment.md` step 3 lists two keys; the implemented relay contract is single-key —
-     the signing key is handled via `device_cert` below.)
+     the relay — by design, so the relay is never the carrier of the verdict-key binding. It is certified
+     out of band instead (`enrollment.md` §Pairing Flow step 3 documents this single-key surface).
    - The device also needs a **`device_cert`** — an account-root-signed JWS binding its Ed25519 signing
-     pubkey (`issue_device_cert`). **The relay does NOT issue or store it.** Verdicts without a valid
+     pubkey (`issue_device_cert`). **The relay does NOT issue or validate it.** Verdicts without a valid
      `device_cert` are denied by integrators (`enrollment.md` §Device Certificate Validation).
    - Who calls `/pairing/start`: the **account owner** (the root-seed holder), or the reference
      `allw-approver pair` CLI drives `start` itself when `--code` is omitted. The new device calls only
      `/pairing/complete` with the `pairing_auth_token` shown out-of-band.
-   - **Cross-device gap (PM decision):** the walking-skeleton CLI holds the account-root seed and
-     self-mints the `device_cert` into one keyfile. The phone is **not** the root holder, so it must
-     obtain its `device_cert` out-of-band. **v1 direction (honors the Secure-Enclave invariant — the
-     signing key is generated on-device and never leaves it):** the phone generates its keys on-device,
-     completes relay pairing with its encryption pubkey, and the account-root holder issues the
-     `device_cert` over the phone's signing pubkey out-of-band (delivered back to the phone). A
-     dev-only provisioning bundle (relay coords + `account_id` + account-root pubkey + a pre-issued
-     `device_cert`) is acceptable as the v1 **dev stub** (mirrors the web approver's credential stub),
-     but **must not** ship the device _signing seed_ off-device. Tracked for a proper cross-device
-     cert-issuance ceremony (and an optional relay courier endpoint) in a follow-up.
-   - **Onboarding UX:** prioritize a **single QR / `allw://` deep-link** that bundles `relay_url`,
-     `account_id`, `account_root_pubkey`, the pairing `code`, and `pairing_auth_token` — do **not** make
-     the user hand-type the ~43-char token. Manual paste is an acceptable dev fallback only.
+   - **Cross-device issuance (resolved, #175):** the walking-skeleton CLI holds the account-root seed and
+     self-mints its own cert; the phone and the web approver are **not** root holders. They generate their
+     keys on-device (signing key never exported), complete relay pairing with the encryption pubkey, then
+     deposit a **MAC-authenticated CSR** in the enrollment courier (§3). The root holder verifies the MAC
+     under a secret carried only in the out-of-band enrollment bundle (QR or pasted link), confirms a
+     six-digit code shown on both screens, issues the cert, and deposits it for collection. Full spec:
+     `docs/enrollment.md` §Cross-Device `device_cert` Issuance Ceremony. A dev-only provisioning bundle
+     with a pre-issued `device_cert` remains acceptable **in development builds only** and must never
+     carry the device _signing seed_.
+   - **Onboarding UX:** a **single QR / `allw://enroll#…` link** carries the whole enrollment bundle
+     (`relay_url`, `account_id`, `account_root_pubkey`, pairing `code`, `pairing_auth_token`,
+     `enrollment_id`, `enrollment_secret`) — do **not** make the user hand-type a ~43-char token. The
+     payload rides in the URL **fragment** so a bundle pasted into a browser never reaches a server; that
+     paste is the web approver's first-class path, not a fallback.
 
 ## References
 
