@@ -7,12 +7,36 @@ import {
 } from "./index.js";
 import { mountPairingGate, type PairingStore } from "./pairing.js";
 import { createRelayPoller, type RelayPollerOptions } from "./relay-poll.js";
+import {
+  createRetractListener,
+  type ConnectImpl,
+  type ReconnectCanceller,
+  type ReconnectScheduler,
+} from "./retract-listener.js";
 
 /** Configuration for automatic relay polling. When supplied, `fetchInbox` is ignored. */
 export type RelayPollConfig = Pick<
   RelayPollerOptions,
   "relayUrl" | "accountId" | "deviceId" | "deviceAuthToken" | "pollIntervalMs" | "fetchImpl"
->;
+> & {
+  /**
+   * This install's persisted `surface_id` (`./surface-id.ts`, `docs/relay-api.md` §7.4). When
+   * present, {@link mountWebApprover} also opens a live cross-device retraction listener (#150)
+   * alongside the poll loop, so a request resolved on another device disappears from the inbox as
+   * soon as the relay's `{type:"retract"}` message arrives — not just on the next poll tick.
+   * Omit to keep the poll-only behavior from #147 (e.g. test harnesses that don't exercise the
+   * WebSocket path).
+   */
+  readonly surfaceId?: string;
+  /** Injectable WebSocket connector for the retraction listener; test-only. */
+  readonly connectImpl?: ConnectImpl;
+  /** Injectable reconnect scheduler for the retraction listener; test-only. */
+  readonly scheduleReconnect?: ReconnectScheduler;
+  /** Injectable reconnect canceller for the retraction listener; test-only. */
+  readonly cancelReconnect?: ReconnectCanceller;
+  /** Injectable jitter source for the retraction listener's reconnect backoff; test-only. */
+  readonly randomImpl?: () => number;
+};
 
 interface BrowserConfig {
   readonly root: HTMLElement;
@@ -155,7 +179,36 @@ async function mountWebApproverInbox(config: BrowserConfig): Promise<WebApprover
       },
     });
 
-    return { controller, stop: poller.stop };
+    // Live cross-device retraction listener (#150), opt-in via `surfaceId` (see `RelayPollConfig`
+    // doc). `controller.retract` structurally removes the record (unreachable, not just hidden);
+    // a successful removal repaints immediately rather than waiting for the next poll tick.
+    const { relay } = config;
+    const retractListener = relay.surfaceId
+      ? createRetractListener({
+          relayUrl: relay.relayUrl,
+          accountId: relay.accountId,
+          deviceId: relay.deviceId,
+          deviceAuthToken: relay.deviceAuthToken,
+          surfaceId: relay.surfaceId,
+          ...(relay.connectImpl ? { connectImpl: relay.connectImpl } : {}),
+          ...(relay.scheduleReconnect ? { scheduleReconnect: relay.scheduleReconnect } : {}),
+          ...(relay.cancelReconnect ? { cancelReconnect: relay.cancelReconnect } : {}),
+          ...(relay.randomImpl ? { randomImpl: relay.randomImpl } : {}),
+          onRetract: (requestId) => {
+            if (controller.retract(requestId)) {
+              rerender();
+            }
+          },
+        })
+      : null;
+
+    return {
+      controller,
+      stop: () => {
+        poller.stop();
+        retractListener?.stop();
+      },
+    };
   }
 
   // Manual / test path: a single fetch on mount; caller re-drives via returned controller.

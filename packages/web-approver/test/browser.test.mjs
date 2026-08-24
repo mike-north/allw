@@ -294,3 +294,185 @@ describe("mountWebApprover (relay path)", () => {
     }
   });
 });
+
+// ── mountWebApprover — live cross-device retraction listener (#150) ────────
+//
+// These cover the WS wiring introduced alongside `RelayPollConfig.surfaceId`: when set, mounting
+// also opens a `createRetractListener` connection, and a `{type:"retract"}` message removes the
+// item from the rendered inbox without waiting for the next poll tick.
+
+/** A stub `LiveSocket` whose listeners the test can fire directly (mirrors retract-listener.test). */
+function stubLiveSocket() {
+  const listeners = { open: [], message: [], error: [], close: [] };
+  let closed = false;
+  return {
+    closed: () => closed,
+    addEventListener(type, listener) {
+      listeners[type].push(listener);
+    },
+    close() {
+      closed = true;
+    },
+    emitMessage(data) {
+      for (const l of listeners.message) l({ data });
+    },
+  };
+}
+
+/** A connector that records every URL requested and returns fresh stub sockets. */
+function recordingConnector() {
+  const sockets = [];
+  const urls = [];
+  const connect = (url) => {
+    urls.push(url);
+    const socket = stubLiveSocket();
+    sockets.push(socket);
+    return socket;
+  };
+  connect.sockets = sockets;
+  connect.urls = urls;
+  return connect;
+}
+
+describe("mountWebApprover — live retraction listener (#150)", () => {
+  test("a {type:'retract'} message removes the item from the rendered inbox immediately", async () => {
+    const { root, restore } = installDom();
+    try {
+      const fetchImpl = countingFetch([envelope("req-1")]);
+      const scheduler = fakeScheduler();
+      const connect = recordingConnector();
+      const fixtures = new Map([["req-1", { context: context() }]]);
+
+      const { controller, stop } = await mountWebApprover({
+        root,
+        nowMs: () => NOW,
+        runtime: runtime(fixtures),
+        relay: {
+          ...RELAY_CONFIG,
+          fetchImpl,
+          scheduleInterval: scheduler.schedule,
+          cancelInterval: scheduler.cancel,
+          surfaceId: "surface-abc",
+          connectImpl: connect,
+        },
+      });
+
+      await flushMicrotasks();
+      assert.deepEqual(
+        controller.inbox().map((i) => i.id),
+        ["req-1"],
+        "the item is pending after the initial poll",
+      );
+      assert.ok(root.querySelector("article.approval-card"), "a card is rendered for it");
+
+      connect.sockets[0].emitMessage(JSON.stringify({ type: "retract", request_id: "req-1" }));
+
+      assert.deepEqual(controller.inbox(), [], "the controller drops the retracted item");
+      assert.equal(
+        root.querySelector("article.approval-card"),
+        null,
+        "the retracted item's card is removed from the DOM by the immediate re-render",
+      );
+
+      stop();
+    } finally {
+      restore();
+    }
+  });
+
+  test("connect URL is built from the relay config and includes the surface id", async () => {
+    const { root, restore } = installDom();
+    try {
+      const fetchImpl = countingFetch([]);
+      const scheduler = fakeScheduler();
+      const connect = recordingConnector();
+
+      const { stop } = await mountWebApprover({
+        root,
+        nowMs: () => NOW,
+        runtime: runtime(new Map()),
+        relay: {
+          ...RELAY_CONFIG,
+          fetchImpl,
+          scheduleInterval: scheduler.schedule,
+          cancelInterval: scheduler.cancel,
+          surfaceId: "surface-abc",
+          connectImpl: connect,
+        },
+      });
+
+      await flushMicrotasks();
+      const url = new URL(connect.urls[0]);
+      assert.equal(url.searchParams.get("surface_id"), "surface-abc");
+      assert.equal(url.searchParams.get("auth"), RELAY_CONFIG.deviceAuthToken);
+
+      stop();
+    } finally {
+      restore();
+    }
+  });
+
+  test("omitting surfaceId keeps the poll-only path — no WebSocket connect attempted", async () => {
+    const { root, restore } = installDom();
+    try {
+      const fetchImpl = countingFetch([]);
+      const scheduler = fakeScheduler();
+
+      // No `connectImpl` is supplied and no `surfaceId` is set — if the retraction listener were
+      // mounted unconditionally, this would try to construct a real global `WebSocket` and throw
+      // in this Node/jsdom test environment. Not throwing proves the listener stayed opt-in.
+      const { stop } = await mountWebApprover({
+        root,
+        nowMs: () => NOW,
+        runtime: runtime(new Map()),
+        relay: {
+          ...RELAY_CONFIG,
+          fetchImpl,
+          scheduleInterval: scheduler.schedule,
+          cancelInterval: scheduler.cancel,
+        },
+      });
+
+      await flushMicrotasks();
+      stop();
+    } finally {
+      restore();
+    }
+  });
+
+  test("stop() also tears down the retraction listener (closes its socket)", async () => {
+    const { root, restore } = installDom();
+    try {
+      const fetchImpl = countingFetch([]);
+      const scheduler = fakeScheduler();
+      const connect = recordingConnector();
+
+      const { stop } = await mountWebApprover({
+        root,
+        nowMs: () => NOW,
+        runtime: runtime(new Map()),
+        relay: {
+          ...RELAY_CONFIG,
+          fetchImpl,
+          scheduleInterval: scheduler.schedule,
+          cancelInterval: scheduler.cancel,
+          surfaceId: "surface-abc",
+          connectImpl: connect,
+        },
+      });
+
+      await flushMicrotasks();
+      assert.equal(connect.sockets[0].closed(), false);
+
+      stop();
+
+      assert.equal(
+        connect.sockets[0].closed(),
+        true,
+        "stop() closes the retraction listener's socket",
+      );
+    } finally {
+      restore();
+    }
+  });
+});
