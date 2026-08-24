@@ -95,6 +95,20 @@ export interface AllwWasm {
   ed25519_public_key(seedB64: string): string;
   /** Build an ActionRecord JSON for a shell command using the core T1 command parser. */
   action_from_command(commandLine: string, cwd?: string | null): string;
+  /**
+   * Build an ActionRecord JSON from a **canonical, pre-tokenized** argv (JSON array of strings).
+   * For callers that hold the exact token vector that will execute and must bind it verbatim —
+   * re-tokenizing their command text would risk binding different tokens than the ones that run
+   * (`docs/openclaw-integration.md` §5.1). `raw` is the original command text (recorded verbatim
+   * and the only source of `env_refs`; never re-tokenized).
+   */
+  action_from_argv(argvJson: string, raw?: string | null, cwd?: string | null): string;
+  /**
+   * Build an ActionRecord JSON for an agent-runtime/plugin-owned tool call (`agent_tool_call`
+   * surface). `server` holds the gating provider identity; `paramsJson` is omitted when the caller
+   * has no structured parameters to offer.
+   */
+  action_from_agent_tool_call(server: string, tool: string, paramsJson?: string | null): string;
   /** Sign an unsigned PolicyRule JSON with a device key and cert, returning signed JSON. */
   sign_policy_rule(
     unsignedRuleJson: string,

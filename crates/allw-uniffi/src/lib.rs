@@ -5,7 +5,7 @@
 
 use allw_core::{
     action_from_agent_tool_call as core_action_from_agent_tool_call,
-    action_from_command as core_action_from_command,
+    action_from_argv as core_action_from_argv, action_from_command as core_action_from_command,
     compute_request_hash as core_compute_request_hash, decrypt_context as core_decrypt_context,
     derive_number_match_challenge as core_derive_number_match_challenge,
     issue_device_cert as core_issue_device_cert, sign_verdict as core_sign_verdict,
@@ -137,6 +137,24 @@ fn decode_b64_vec(value: &str, what: &str) -> Result<Vec<u8>, AllwFfiError> {
     URL_SAFE_NO_PAD
         .decode(value)
         .map_err(|e| AllwFfiError::failure(format!("{what} is not valid base64url: {e}")))
+}
+
+/// Builds an [`ActionRecord`] from a **pre-tokenized** argv, returning it as JSON — the
+/// command-surface builder for callers holding a canonical execution plan they must bind verbatim
+/// (`docs/openclaw-integration.md` §5.1). `raw` carries the original command text (empty string
+/// when the caller has none) and is used only to record `syntactic.raw` and extract `env_refs`
+/// names; it is never re-tokenized. `cwd` is the bound working directory, empty when unbound.
+#[uniffi::export]
+pub fn action_from_argv_json(
+    argv: Vec<String>,
+    raw: String,
+    cwd: String,
+) -> Result<String, AllwFfiError> {
+    let ctx = CommandContext {
+        cwd: if cwd.is_empty() { None } else { Some(cwd) },
+    };
+    let action = core_action_from_argv(&argv, if raw.is_empty() { None } else { Some(&raw) }, &ctx);
+    to_json(&action, "ActionRecord")
 }
 
 #[uniffi::export]

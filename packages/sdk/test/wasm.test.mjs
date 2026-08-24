@@ -1952,3 +1952,110 @@ test("agent_tool_call fixture vector: WASM compute_request_hash matches the Rust
      (proves WYSIWYS canonicalization stays in parity across Rust and WASM for the new surface)",
   );
 });
+
+// ── action_from_argv: binding a canonical, pre-tokenized argv ─────────────────────────────
+//
+// @see ../../../docs/openclaw-integration.md §5.1 (never re-tokenize when a canonical argv exists)
+
+test("action_from_argv binds the caller's argv verbatim instead of re-parsing raw", async () => {
+  const wasm = await loadWasm();
+
+  // A canonical plan whose third token contains spaces, alongside the display rendering an upstream
+  // gate shows its reviewers. `commandText` is a rendering, not shell-safe quoting — re-tokenizing
+  // it yields six tokens and binds a vector that is NOT the one that will execute.
+  const argv = ["bash", "-lc", "echo one two three"];
+  const raw = "bash -lc echo one two three";
+  const record = JSON.parse(wasm.action_from_argv(JSON.stringify(argv), raw, "/srv/app"));
+
+  assert.equal(record.surface, "command");
+  assert.equal(record.record_schema_version, 1);
+  assert.deepEqual(record.syntactic.argv, argv, "argv is the caller's canonical vector");
+  assert.equal(record.syntactic.bin, "bash");
+  assert.equal(record.syntactic.raw, raw, "raw is recorded verbatim");
+  assert.equal(record.syntactic.cwd, "/srv/app");
+  assert.notDeepEqual(
+    record.syntactic.argv,
+    JSON.parse(wasm.action_from_command(raw, "/srv/app")).syntactic.argv,
+    "the two builders must genuinely differ for this input, or the test proves nothing",
+  );
+});
+
+test("action_from_argv extracts env_refs (names only) from raw", async () => {
+  const wasm = await loadWasm();
+
+  const record = JSON.parse(
+    wasm.action_from_argv(
+      JSON.stringify([
+        "curl",
+        "-H",
+        "Authorization: Bearer $API_TOKEN",
+        "https://x.test/${TENANT}",
+      ]),
+      'curl -H "Authorization: Bearer $API_TOKEN" https://x.test/${TENANT}',
+      undefined,
+    ),
+  );
+
+  assert.deepEqual(record.syntactic.env_refs, ["API_TOKEN", "TENANT"]);
+  assert.ok(!("cwd" in record.syntactic), "an omitted cwd stays absent, not null");
+});
+
+test("action_from_argv without raw records no raw and no env_refs", async () => {
+  const wasm = await loadWasm();
+
+  const record = JSON.parse(
+    wasm.action_from_argv(JSON.stringify(["echo", "$HOME"]), undefined, undefined),
+  );
+
+  assert.ok(!("raw" in record.syntactic), "raw stays absent when the caller has no command text");
+  assert.ok(
+    !("env_refs" in record.syntactic),
+    "a token vector has already had its $VAR references expanded by whatever produced it",
+  );
+});
+
+test("action_from_argv shares the core risk heuristic with action_from_command", async () => {
+  const wasm = await loadWasm();
+
+  const fromArgv = JSON.parse(
+    wasm.action_from_argv(
+      JSON.stringify(["git", "push", "--force"]),
+      "git push --force",
+      undefined,
+    ),
+  );
+  const fromCommand = JSON.parse(wasm.action_from_command("git push --force", undefined));
+
+  assert.equal(fromArgv.risk, "high");
+  assert.deepEqual(fromArgv, fromCommand, "identical inputs must produce byte-identical records");
+});
+
+test("action_from_argv throws on a malformed argv JSON (fail-closed)", async () => {
+  const wasm = await loadWasm();
+
+  assert.throws(
+    () => wasm.action_from_argv("{not json", "ls", undefined),
+    /invalid command argv JSON/,
+    "an unparseable plan must deny, never build a record from a guess",
+  );
+  assert.throws(
+    () => wasm.action_from_argv(JSON.stringify(["ls", 7]), "ls", undefined),
+    /invalid command argv JSON/,
+    "a non-string token must deny",
+  );
+  assert.throws(
+    () => wasm.action_from_argv(JSON.stringify({ argv: ["ls"] }), "ls", undefined),
+    /invalid command argv JSON/,
+    "argv must be a JSON array, not an object",
+  );
+});
+
+test("action_from_argv with an empty argv still records raw (visible, not erased)", async () => {
+  const wasm = await loadWasm();
+
+  const record = JSON.parse(wasm.action_from_argv("[]", "  ", undefined));
+
+  assert.ok(!("bin" in record.syntactic));
+  assert.ok(!("argv" in record.syntactic));
+  assert.equal(record.syntactic.raw, "  ");
+});

@@ -1,0 +1,50 @@
+{
+  "name": "@allw/openclaw-bridge",
+  "version": "0.1.0",
+  "description": "OpenClaw gateway operator client that turns pending OpenClaw approvals into verified human decisions from the allw inbox (Node + WASM), fail-closed.",
+  "type": "module",
+  "bin": {
+    "allw-openclaw-bridge": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:deps": "pnpm --filter @allw/sdk build && pnpm --filter @allw/hook build",
+    "typecheck": "pnpm run build:deps && tsc -p tsconfig.json --noEmit",
+    "lint": "pnpm run build:deps && eslint src",
+    "test": "pnpm run build:deps && tsc -p tsconfig.json && node --test \"test/**/*.test.mjs\""
+  },
+  "dependencies": {
+    "@allw/hook": "workspace:*",
+    "@allw/sdk": "workspace:*",
+    "@openclaw/gateway-client": "2026.8.1-beta.3",
+    "@openclaw/gateway-protocol": "2026.8.1-beta.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.12",
+    "ws": "^8.21.1"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mike-north/allw.git",
+    "directory": "packages/openclaw-bridge"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
