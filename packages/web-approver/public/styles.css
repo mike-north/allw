@@ -1,6 +1,6 @@
 :root {
-  color: #171717;
-  background: #f7f7f3;
+  color: var(--ink);
+  background: var(--bg);
   font-family:
     Inter,
     ui-sans-serif,
@@ -31,7 +31,7 @@ input {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  border-bottom: 1px solid #d7d7cf;
+  border-bottom: 1px solid var(--border);
   padding-bottom: 16px;
 }
 
@@ -43,9 +43,9 @@ input {
 .icon-button {
   inline-size: 40px;
   block-size: 40px;
-  border: 1px solid #b9b9ad;
+  border: 1px solid var(--border-strong);
   border-radius: 8px;
-  background: #ffffff;
+  background: var(--surface);
 }
 
 .approver-section {
@@ -65,15 +65,15 @@ input {
 }
 
 .approval-card {
-  border: 1px solid #d7d7cf;
+  border: 1px solid var(--border);
   border-radius: 8px;
-  background: #ffffff;
+  background: var(--surface);
   padding: 16px;
 }
 
 .approval-card--unverified,
 .approval-card--expired {
-  border-color: #b84545;
+  border-color: var(--no);
 }
 
 .approval-card h3 {
@@ -83,7 +83,7 @@ input {
 
 .approval-meta {
   margin: 4px 0;
-  color: #44443f;
+  color: var(--ink-2);
 }
 
 .approval-plaintext {
@@ -91,11 +91,11 @@ input {
   margin: 12px 0;
   padding: 12px;
   border-radius: 6px;
-  background: #f0f0ea;
+  background: var(--surface-sunk);
 }
 
 .verification-warning {
-  color: #8a1f1f;
+  color: var(--risk-crit-fg);
   font-weight: 600;
 }
 
@@ -108,22 +108,22 @@ input {
 .decision-controls input {
   min-inline-size: 180px;
   padding: 8px 10px;
-  border: 1px solid #b9b9ad;
+  border: 1px solid var(--border-strong);
   border-radius: 6px;
 }
 
 .decision-controls button {
   min-inline-size: 96px;
   padding: 8px 12px;
-  border: 1px solid #222;
+  border: 1px solid var(--ink);
   border-radius: 6px;
-  background: #171717;
-  color: #fff;
+  background: var(--ink);
+  color: var(--surface);
 }
 
 .decision-controls button[value="denied"] {
-  background: #fff;
-  color: #171717;
+  background: var(--surface);
+  color: var(--ink);
 }
 
 .decision-controls button:disabled {
@@ -132,14 +132,10 @@ input {
 }
 
 .empty-state {
-  color: #5f5f57;
+  color: var(--ink-2);
 }
 
-/* ── Audit-history view ────────────────────────────────────────────────────────────────────────
-   The color constants below are hardcoded light-theme hex values that mirror the theme-light
-   block of design/web-approver/inbox/tokens.css. The trailing comment on each declaration names
-   the source token, but these are literal values, not var(--…) references. Full migration to CSS
-   custom properties (plus dark-mode support) is tracked in #162. ──────────────────────────────── */
+/* ── Audit-history view ──────────────────────────────────────────────────────────────────────── */
 
 .audit-history {
   padding: 24px 0;
@@ -153,7 +149,7 @@ input {
 }
 
 .audit-history__empty {
-  color: #5f5f57;
+  color: var(--ink-2);
 }
 
 /* Chain cue — persistent header badge showing overall chain health */
@@ -169,15 +165,15 @@ input {
 }
 
 .audit-chain-cue[data-chain-status="verified"] {
-  color: #128a4e; /* --ok */
-  background: rgba(18, 138, 78, 0.1); /* --ok-soft */
-  border: 1px solid rgba(18, 138, 78, 0.3); /* --ok-edge */
+  color: var(--ok);
+  background: var(--ok-soft);
+  border: 1px solid var(--ok-edge);
 }
 
 .audit-chain-cue[data-chain-status="broken"] {
-  color: #cf3b2a; /* --no */
-  background: rgba(207, 59, 42, 0.1); /* --no-soft */
-  border: 1px solid rgba(207, 59, 42, 0.32); /* --no-edge */
+  color: var(--no);
+  background: var(--no-soft);
+  border: 1px solid var(--no-edge);
 }
 
 .audit-chain-cue__icon {
@@ -199,14 +195,14 @@ input {
   grid-template-columns: 18px 140px minmax(0, 1fr) auto;
   align-items: start;
   gap: 10px;
-  border: 1px solid #e6e0d3; /* --border */
+  border: 1px solid var(--border);
   border-radius: 8px; /* --r-sm */
-  background: #ffffff; /* --surface */
+  background: var(--surface);
   padding: 12px;
 }
 
 .audit-row[data-chain-status="broken"] {
-  border-color: #cf3b2a; /* --no */
+  border-color: var(--no);
 }
 
 /* Rail dot */
@@ -216,20 +212,20 @@ input {
   width: 10px;
   height: 10px;
   border-radius: 50%;
-  background: #128a4e; /* --ok */
-  box-shadow: 0 0 0 4px rgba(18, 138, 78, 0.1); /* --ok-soft ring */
+  background: var(--ok);
+  box-shadow: 0 0 0 4px var(--ok-soft);
 }
 
 .audit-row[data-chain-status="broken"] .audit-row__dot {
-  background: #cf3b2a; /* --no */
-  box-shadow: 0 0 0 4px rgba(207, 59, 42, 0.1); /* --no-soft ring */
+  background: var(--no);
+  box-shadow: 0 0 0 4px var(--no-soft);
 }
 
 /* Time */
 .audit-row__time {
   font-family: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace; /* --font-mono */
   font-size: 12px;
-  color: #908a7c; /* --ink-3 */
+  color: var(--ink-3);
   padding-top: 2px;
 }
 
@@ -244,7 +240,7 @@ input {
   overflow: hidden;
   font-size: 14px;
   font-weight: 700;
-  color: #1c1a15; /* --ink */
+  color: var(--ink);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -252,18 +248,18 @@ input {
 .audit-row__meta {
   overflow: hidden;
   font-size: 12px;
-  color: #908a7c; /* --ink-3 */
+  color: var(--ink-3);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 /* Decision chip */
 .audit-decision-chip {
-  border: 1px solid #e6e0d3; /* --border */
+  border: 1px solid var(--border);
   border-radius: 999px; /* --r-pill */
   padding: 4px 8px;
-  color: #5c574c; /* --ink-2 */
-  background: #ffffff; /* --surface */
+  color: var(--ink-2);
+  background: var(--surface);
   font-size: 11px;
   font-weight: 800;
   text-transform: uppercase;
@@ -271,15 +267,15 @@ input {
 }
 
 .audit-row[data-decision="approved"] .audit-decision-chip {
-  color: #128a4e; /* --ok */
-  background: rgba(18, 138, 78, 0.1); /* --ok-soft */
-  border-color: rgba(18, 138, 78, 0.3); /* --ok-edge */
+  color: var(--ok);
+  background: var(--ok-soft);
+  border-color: var(--ok-edge);
 }
 
 .audit-row[data-decision="denied"] .audit-decision-chip {
-  color: #cf3b2a; /* --no */
-  background: rgba(207, 59, 42, 0.1); /* --no-soft */
-  border-color: rgba(207, 59, 42, 0.32); /* --no-edge */
+  color: var(--no);
+  background: var(--no-soft);
+  border-color: var(--no-edge);
 }
 
 /* Detail pane — spans full width below the row header */
@@ -287,7 +283,7 @@ input {
   grid-column: 1 / -1;
   margin-top: 8px;
   padding-top: 12px;
-  border-top: 1px solid #eae5d9; /* --bg-tint */
+  border-top: 1px solid var(--bg-tint);
   display: grid;
   gap: 10px;
 }
@@ -319,9 +315,9 @@ input {
   grid-template-columns: 32px minmax(0, 1fr);
   align-items: center;
   gap: 8px;
-  border: 1px solid #e6e0d3; /* --border */
+  border: 1px solid var(--border);
   border-radius: 8px; /* --r-sm */
-  background: #faf7f0; /* --surface-2 */
+  background: var(--surface-2);
   padding: 8px;
 }
 
@@ -331,14 +327,14 @@ input {
   width: 32px;
   height: 32px;
   border-radius: 8px; /* --r-sm */
-  color: #128a4e; /* --ok */
-  background: rgba(18, 138, 78, 0.1); /* --ok-soft */
+  color: var(--ok);
+  background: var(--ok-soft);
   font-size: 14px;
 }
 
 .audit-evidence--bad .audit-evidence__icon {
-  color: #cf3b2a; /* --no */
-  background: rgba(207, 59, 42, 0.1); /* --no-soft */
+  color: var(--no);
+  background: var(--no-soft);
 }
 
 .audit-evidence__body {
@@ -349,7 +345,7 @@ input {
 
 .audit-evidence__label {
   display: block;
-  color: #908a7c; /* --ink-3 */
+  color: var(--ink-3);
   font-size: 10px;
   font-weight: 800;
   text-transform: uppercase;
@@ -357,7 +353,7 @@ input {
 
 .audit-evidence__value {
   display: block;
-  color: #1c1a15; /* --ink */
+  color: var(--ink);
   font-size: 12px;
   font-weight: 700;
   font-family: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace; /* --font-mono */
@@ -369,14 +365,14 @@ input {
 /* WYSIWYS receipt */
 .audit-wysiwys {
   border-radius: 8px; /* --r-sm */
-  background: #15140f; /* --code-bg */
-  color: #efede6; /* --code-ink */
+  background: var(--code-bg);
+  color: var(--code-ink);
   padding: 12px;
 }
 
 .audit-wysiwys__label {
   display: block;
-  color: #9a958a; /* --code-dim */
+  color: var(--code-dim);
   font-size: 10px;
   font-weight: 800;
   text-transform: uppercase;
@@ -398,9 +394,9 @@ input {
   gap: 8px;
   border-radius: 8px; /* --r-sm */
   padding: 10px;
-  color: #cf3b2a; /* --no */
-  background: rgba(207, 59, 42, 0.1); /* --no-soft */
-  border: 1px solid rgba(207, 59, 42, 0.32); /* --no-edge */
+  color: var(--no);
+  background: var(--no-soft);
+  border: 1px solid var(--no-edge);
   font-size: 13px;
   font-weight: 700;
 }
@@ -408,14 +404,12 @@ input {
 /* Verification error text */
 .audit-verification-error {
   margin: 0;
-  color: #8a1f1f;
+  color: var(--risk-crit-fg);
   font-size: 13px;
   font-weight: 600;
 }
 
-/* ── Login / pairing-ceremony gate (issue #148) ────────────────────────────────────────────────
-   Color constants mirror tokens.css theme-light values (see design/web-approver/inbox/tokens.css).
-   Full CSS custom property migration is tracked in #162. ─────────────────────────────────────── */
+/* ── Login / pairing-ceremony gate (issue #148) ──────────────────────────────────────────────── */
 
 .pairing-shell {
   max-width: 680px;
@@ -431,13 +425,13 @@ input {
   margin: 0;
   font-size: 1.4rem;
   font-weight: 700;
-  color: #1c1a15; /* --ink */
+  color: var(--ink);
 }
 
 .pairing-screen {
-  border: 1px solid #e6e0d3; /* --border */
+  border: 1px solid var(--border);
   border-radius: 18px; /* --r-xl */
-  background: #ffffff; /* --surface */
+  background: var(--surface);
   padding: 32px;
   display: grid;
   gap: 20px;
@@ -447,8 +441,8 @@ input {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  color: #3b5bff; /* --accent */
-  background: rgba(59, 91, 255, 0.1); /* --accent-soft */
+  color: var(--accent);
+  background: var(--accent-soft);
   width: fit-content;
   padding: 6px 10px;
   border-radius: 999px; /* --r-pill */
@@ -462,13 +456,13 @@ input {
   margin: 0;
   font-size: 2rem;
   font-weight: 700;
-  color: #1c1a15; /* --ink */
+  color: var(--ink);
   line-height: 1.1;
 }
 
 .pairing-subcopy {
   margin: 0;
-  color: #5c574c; /* --ink-2 */
+  color: var(--ink-2);
   font-size: 15px;
   line-height: 1.55;
 }
@@ -479,29 +473,29 @@ input {
   justify-content: space-between;
   align-items: center;
   gap: 14px;
-  border: 1px solid #e6e0d3; /* --border */
+  border: 1px solid var(--border);
   border-radius: 8px; /* --r-sm */
-  background: #faf7f0; /* --surface-2 */
+  background: var(--surface-2);
   padding: 14px 16px;
 }
 
 .pairing-device-title {
   font-size: 15px;
   font-weight: 700;
-  color: #1c1a15; /* --ink */
+  color: var(--ink);
 }
 
 .pairing-device-meta {
   margin-top: 4px;
   font-size: 12px;
-  color: #908a7c; /* --ink-3 */
+  color: var(--ink-3);
   font-family: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
 }
 
 .pairing-status-pill {
-  color: #128a4e; /* --ok */
-  background: rgba(18, 138, 78, 0.1); /* --ok-soft */
-  border: 1px solid rgba(18, 138, 78, 0.3); /* --ok-edge */
+  color: var(--ok);
+  background: var(--ok-soft);
+  border: 1px solid var(--ok-edge);
   border-radius: 999px; /* --r-pill */
   padding: 4px 10px;
   font-size: 12px;
@@ -523,7 +517,7 @@ input {
 .pairing-trust-item {
   display: flex;
   gap: 10px;
-  color: #5c574c; /* --ink-2 */
+  color: var(--ink-2);
   font-size: 14px;
   line-height: 1.4;
 }
@@ -532,8 +526,8 @@ input {
   width: 20px;
   height: 20px;
   border-radius: 50%;
-  color: #128a4e; /* --ok */
-  background: rgba(18, 138, 78, 0.1); /* --ok-soft */
+  color: var(--ok);
+  background: var(--ok-soft);
   display: grid;
   place-items: center;
   font-size: 12px;
@@ -555,22 +549,22 @@ input {
 .pairing-label {
   font-size: 13px;
   font-weight: 700;
-  color: #5c574c; /* --ink-2 */
+  color: var(--ink-2);
 }
 
 .pairing-input {
   width: 100%;
   padding: 9px 11px;
-  border: 1px solid #d6cfbe; /* --border-strong */
+  border: 1px solid var(--border-strong);
   border-radius: 8px; /* --r-sm */
-  background: #faf7f0; /* --surface-2 */
-  color: #1c1a15; /* --ink */
+  background: var(--surface-2);
+  color: var(--ink);
   font-size: 14px;
   font-family: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
 }
 
 .pairing-input:focus {
-  outline: 2px solid #3b5bff; /* --accent */
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
@@ -596,23 +590,23 @@ input {
 }
 
 .pairing-btn--primary {
-  color: #ffffff; /* --accent-ink */
-  background: #3b5bff; /* --accent */
+  color: var(--accent-ink);
+  background: var(--accent);
 }
 
 .pairing-btn--secondary {
-  color: #1c1a15; /* --ink */
-  background: #faf7f0; /* --surface-2 */
-  border: 1px solid #e6e0d3; /* --border */
+  color: var(--ink);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
 }
 
 /* Error banner — fail-closed: always visible on validation failure */
 .pairing-error-banner {
   border-radius: 8px; /* --r-sm */
   padding: 10px 14px;
-  color: #cf3b2a; /* --no */
-  background: rgba(207, 59, 42, 0.1); /* --no-soft */
-  border: 1px solid rgba(207, 59, 42, 0.32); /* --no-edge */
+  color: var(--no);
+  background: var(--no-soft);
+  border: 1px solid var(--no-edge);
   font-size: 13px;
   font-weight: 600;
 }

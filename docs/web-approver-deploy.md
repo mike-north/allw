@@ -27,6 +27,7 @@ This produces `packages/web-approver/dist-site/`:
 ```
 dist-site/
   index.html                    # copied from public/index.html
+  tokens.css                    # copied from public/tokens.css (vendored design/web-approver/inbox/tokens.css)
   styles.css                    # copied from public/styles.css
   app.js (+ app.js.map)         # esbuild bundle of src/app.ts
   vendor/allw-wasm/allw_wasm.js
