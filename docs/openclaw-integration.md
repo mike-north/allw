@@ -155,10 +155,13 @@ Rules that follow from OpenClaw's auth model:
   when the caller declares narrower scopes. The shared secret is a bootstrap step only; the
   long-lived credential is the paired device token.
 - **Do not hand-edit `openclaw.json` to mint a token.** Pairing is the supported path.
-- The device private key and device token are **secrets at rest**: OS keystore (the same backend
-  abstraction the allw approver uses), never a config file, never an environment variable in a
-  process list, never a log line. They are exactly the class of value
-  [policy-seam.md](./policy-seam.md) §Network egress says belongs in a credential vault.
+- The device private key and device token are **secrets at rest**: they live in the same custody
+  backend the allw approver uses, never a config file the operator edits, never an environment
+  variable in a process list, never a log line. They are exactly the class of value
+  [policy-seam.md](./policy-seam.md) §Network egress says belongs in a credential vault. Concretely,
+  that backend is today an owner-only (`0600`) file under the bridge's state directory, matching
+  `packages/approver/src/lib/keyfile.ts`'s v0 custody; swapping it for a real OS keystore is a
+  follow-up that replaces one module and touches no gateway or protocol code.
 
 ### 4.3 Protocol version, capabilities, subscription
 
@@ -615,6 +618,14 @@ actually routes to allw and honors the result.
 The bridge is decomposed into six slices, each independently reviewable and each roughly ≤1000
 changed lines. Slices 1 and 2 are core work that the bridge depends on; they can land in parallel
 with each other but must precede slice 4.
+
+**Landed so far:** slice 1 (`action_from_argv` carrying the original command text, exported to WASM
+and UniFFI), slice 2 (the `agent_tool_call` surface in the core), and — for the **exec family only** —
+slices 3, 4, 5, and the UAT half of 6. What remains is the **plugin permission-request family**:
+§5.2's `agent_tool_call` mapping, the SDK `Surface` union widening and relay `action_structure`
+acceptance that mapping needs, and the plugin rows of the §11 checklist. Until that lands the bridge
+treats a plugin approval exactly like an unsupported kind (§5.3) — logged, neither approved nor
+denied — so it is never a denial-of-service on a family it cannot yet render.
 
 | #   | Scope                                                                                                                                                                                                                                                                                                                              | Deliverable                                                                                                                                                         | Tests                                                                                                                                                                                                                                                    |
 | --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

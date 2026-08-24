@@ -43,8 +43,10 @@ test("Codex UAT helper prepares the gate without invoking Codex", async () => {
   assert.match(script, /pnpm run build:wasm/);
   assert.match(script, /pnpm -r build/);
   assert.match(script, /pnpm --filter @allw\/relay dev/);
-  assert.match(script, /allw-approver pair/);
-  assert.match(script, /allw-approver watch/);
+  // The helper invokes the built approver CLI directly (#189): pnpm does not link a package's own
+  // bin into its own node_modules/.bin, so the filtered exec form breaks on a fresh checkout.
+  assert.match(script, /approver\/dist\/cli\.js" pair/);
+  assert.match(script, /approver\/dist\/cli\.js" watch/);
   assert.match(script, /\.codex\/hooks\.json/);
   assert.doesNotMatch(script, /~\/\.codex/);
   assert.match(script, /Bash\|apply_patch\|mcp__\.\*/);
