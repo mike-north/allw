@@ -4,6 +4,13 @@ export { initWasm, initWasmSync, resetWasmForTests } from "./wasm.js";
 export type { PairingStore, PairingGateOptions } from "./pairing.js";
 export { createLocalPairingStore, mountPairingGate } from "./pairing.js";
 
+export type { OnboardingWalkthroughOptions, OnboardingGateOptions } from "./onboarding.js";
+export {
+  isOnboardingComplete,
+  mountOnboardingWalkthrough,
+  mountOnboardingGate,
+} from "./onboarding.js";
+
 export type {
   FetchImpl as RelayFetchImpl,
   IntervalScheduler,
