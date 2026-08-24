@@ -18,6 +18,7 @@ export { createRelayPoller } from "./relay-poll.js";
 export type {
   ApproverIdentity,
   AccountStateResolver,
+  AccountStateResolution,
   WasmRuntimeOptions,
   BrowserRuntimeOptions,
 } from "./runtime.js";
@@ -28,6 +29,13 @@ export {
   ACCOUNT_STATE_FETCH_TIMEOUT_MS,
   createRelayAccountStateResolver,
 } from "./account-state.js";
+
+export type { AccountStateFloorStore } from "./sequence-floor.js";
+export {
+  ACCOUNT_STATE_FLOOR_STORAGE_KEY,
+  createLocalAccountStateFloorStore,
+  createInMemoryAccountStateFloorStore,
+} from "./sequence-floor.js";
 
 export { mountAuditHistory } from "./audit-history.js";
 

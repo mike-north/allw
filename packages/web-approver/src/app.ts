@@ -29,6 +29,7 @@
  * @see ./pairing.ts (the login / pairing-ceremony gate)
  * @see ./runtime.ts (the WASM-backed `WebApproverRuntime`)
  * @see ./browser.ts (the inbox mount + relay poll loop)
+ * @see ./sequence-floor.ts (the persisted account-state rollback floor, #171)
  * @see ../../../docs/web-approver-deploy.md
  */
 
@@ -37,6 +38,7 @@ import { mountWebApprover } from "./browser.js";
 import { createLocalPairingStore, mountPairingGate } from "./pairing.js";
 import { mountRelayConfigGate, resolveRelayUrl } from "./relay-config.js";
 import { createBrowserRuntime, type ApproverIdentity } from "./runtime.js";
+import { createLocalAccountStateFloorStore } from "./sequence-floor.js";
 
 /** The default poll interval for the live inbox once mounted (matches `relay-poll.ts`'s default). */
 const POLL_INTERVAL_MS = 2_000;
@@ -84,6 +86,9 @@ async function bootInbox(
       accountId: identity.accountId,
       deviceAuthToken: identity.deviceAuthToken,
     }),
+    // Persists the account-state rollback floor (#171) in localStorage so it survives reloads —
+    // the in-memory default `createWasmRuntime` falls back to would reset on every page load.
+    sequenceFloorStore: createLocalAccountStateFloorStore(),
   });
 
   await mountWebApprover({

@@ -32,6 +32,8 @@ import type {
   SignedVerdict,
   WebApproverRuntime,
 } from "./index.js";
+import type { AccountStateFloorStore } from "./sequence-floor.js";
+import { createInMemoryAccountStateFloorStore } from "./sequence-floor.js";
 import type { AllwWasm, WasmModuleSource } from "./wasm.js";
 import { initWasm } from "./wasm.js";
 
@@ -75,13 +77,75 @@ export interface ApproverIdentity {
 }
 
 /**
+ * The relay-visible resolution for an actor's root-signed account-state documents, optionally
+ * carrying the relay's own `max_sequence` publish bookkeeping for THIS fetch (`docs/relay-api.md`
+ * `GET /{account_id}/account-states`; #171). `maxSequence` is never a substitute for root-signature
+ * verification — it only tells the sequence-floor gate in {@link resolveAttestation} what the relay
+ * itself is currently asserting, so a relay that under-reports it (to match a re-served older
+ * document) can be caught even before comparing against the device-persisted floor.
+ */
+export interface AccountStateResolution {
+  readonly accountStates: readonly string[];
+  readonly maxSequence?: number;
+}
+
+/**
  * Resolve the root-signed account-state documents (compact `allw-account-state+jws`) that
  * root-anchor an actor's verifying key for origin verification (#16, `docs/enrollment.md` §Account
- * State). Returns an empty list when no root-anchored trust material is available → the origin
- * renders `unverified` (never an abort; a relay-supplied key is NEVER trusted). Defaults to
- * "no resolution" so the runtime is usable before relay account-state wiring (#147+) lands.
+ * State). Returns an empty list (or a resolution with an empty `accountStates`) when no
+ * root-anchored trust material is available → the origin renders `unverified` (never an abort; a
+ * relay-supplied key is NEVER trusted). Defaults to "no resolution" so the runtime is usable before
+ * relay account-state wiring (#147+) lands.
+ *
+ * A resolver may return either the bare array (no `max_sequence` metadata available) or the full
+ * {@link AccountStateResolution} (with `maxSequence`) — {@link createRelayAccountStateResolver}
+ * returns the latter on a successful fetch.
  */
-export type AccountStateResolver = (actorId: string) => Promise<readonly string[]>;
+export type AccountStateResolver = (
+  actorId: string,
+) => Promise<readonly string[] | AccountStateResolution>;
+
+/** Normalize either return shape of {@link AccountStateResolver} to the full resolution object. */
+function normalizeAccountStateResolution(
+  resolution: readonly string[] | AccountStateResolution,
+): AccountStateResolution {
+  if (Array.isArray(resolution)) return { accountStates: resolution };
+  return resolution as AccountStateResolution;
+}
+
+/**
+ * The highest ROOT-VERIFIED `sequence` among `accountStates`, or `null` if any entry fails root
+ * verification or lacks a well-formed `sequence` (fail-closed: a single bad/unparseable document
+ * must not let a lower verified sequence pass silently). Delegates all signature/shape verification
+ * to the WASM core (`wasm.verify_account_state`); this only reduces the verified results to a
+ * maximum — no crypto or trust logic lives here (thin shell, `docs/architecture.md`). Never throws
+ * (mirrors `packages/approver/src/commands/watch.ts`'s Node analogue, but catches per-document
+ * verification failures locally so a malformed account state downgrades the origin display instead
+ * of aborting the whole `prepare()` call).
+ */
+function highestVerifiedAccountStateSequence(
+  wasm: AllwWasm,
+  accountStates: readonly string[],
+  accountId: string,
+  accountRootPubkey: string,
+): number | null {
+  let highest: number | null = null;
+  for (const accountState of accountStates) {
+    let verified: { sequence?: unknown };
+    try {
+      verified = JSON.parse(
+        wasm.verify_account_state(accountState, accountId, accountRootPubkey),
+      ) as { sequence?: unknown };
+    } catch {
+      return null;
+    }
+    if (typeof verified.sequence !== "number" || !Number.isSafeInteger(verified.sequence)) {
+      return null;
+    }
+    highest = highest === null ? verified.sequence : Math.max(highest, verified.sequence);
+  }
+  return highest;
+}
 
 /** Options for {@link createWasmRuntime}. */
 export interface WasmRuntimeOptions {
@@ -89,6 +153,12 @@ export interface WasmRuntimeOptions {
   readonly identity: ApproverIdentity;
   /** Resolve root-signed account-state docs for origin verification. Defaults to none (unverified). */
   readonly resolveAccountStates?: AccountStateResolver;
+  /**
+   * Persists the device-side account-state rollback floor (#171) across `prepare()` calls. Defaults
+   * to an in-memory store (no cross-reload persistence) — the production boot sequence (`app.ts`)
+   * supplies {@link createLocalAccountStateFloorStore} explicitly so the floor survives reloads.
+   */
+  readonly sequenceFloorStore?: AccountStateFloorStore;
   /** Clock seam (ms). Defaults to `Date.now`; injected so fail-closed expiry is deterministic. */
   readonly nowMs?: () => number;
 }
@@ -232,8 +302,24 @@ function toApprovalContext(
 /**
  * Verify the actor attestation through the core and reduce it to the rendered attestation badge.
  * Fail-closed *display*: any failure (no attestation, no root-anchored trust, spoofed/altered
- * origin, revoked actor) yields `unverified` — never `verified`. A relay-supplied key is never
- * trusted; only a root-signed account-state document can drive `verified`.
+ * origin, revoked actor, stale/rolled-back account state) yields `unverified` — never `verified`. A
+ * relay-supplied key is never trusted; only a root-signed account-state document can drive
+ * `verified`.
+ *
+ * # Device-side account-state rollback floor (#171, `docs/enrollment.md` §Account State step 5)
+ * Before delegating to `verify_actor_attestation`, this gates on TWO independent signals so a
+ * compromised relay cannot suppress a newer revocation by re-serving an older, still-validly
+ * root-signed account-state document:
+ *
+ * 1. **This fetch's relay `max_sequence` metadata** must be backed by a root-verified document at
+ *    least that new (a relay that under-reports its own metadata to match a stale doc is caught).
+ * 2. **The device-persisted floor** (`sequenceFloorStore`, survives reloads) — the highest
+ *    root-verified sequence this device has EVER accepted. A fetch below it fails closed even if
+ *    the relay's metadata for THIS call is internally consistent with the stale documents it served.
+ *
+ * A verified-highest-sequence below EITHER signal renders `unverified` — the effective threshold a
+ * fetch must reach is the higher of the two. On success (and only then) the floor is bumped to the
+ * newly observed highest sequence, never lowered.
  */
 function resolveAttestation(
   wasm: AllwWasm,
@@ -243,11 +329,41 @@ function resolveAttestation(
   accountId: string,
   accountRootPubkey: string,
   accountStates: readonly string[],
+  relayMaxSequence: number | undefined,
+  sequenceFloorStore: AccountStateFloorStore,
 ): ApprovalActor["attestation"] {
   if (wire.actor.attestation === undefined || wire.actor.attestation.length === 0) {
     return "unverified";
   }
   if (accountStates.length === 0) return "unverified";
+
+  const persistedFloor = sequenceFloorStore.load();
+  // Only pay for verifying every account-state document's sequence when a comparison is actually
+  // needed — neither signal present means there is nothing to gate against yet.
+  const verifiedHighestSequence =
+    (relayMaxSequence !== undefined && relayMaxSequence > 0) || persistedFloor > 0
+      ? highestVerifiedAccountStateSequence(wasm, accountStates, accountId, accountRootPubkey)
+      : null;
+
+  if (
+    relayMaxSequence !== undefined &&
+    relayMaxSequence > 0 &&
+    (verifiedHighestSequence === null || verifiedHighestSequence < relayMaxSequence)
+  ) {
+    // The relay's own metadata for THIS fetch is not backed by what it actually served.
+    return "unverified";
+  }
+  if (
+    persistedFloor > 0 &&
+    (verifiedHighestSequence === null || verifiedHighestSequence < persistedFloor)
+  ) {
+    // This fetch never reaches the highest sequence this device has previously accepted.
+    return "unverified";
+  }
+  if (verifiedHighestSequence !== null && verifiedHighestSequence > persistedFloor) {
+    sequenceFloorStore.save(verifiedHighestSequence);
+  }
+
   try {
     wasm.verify_actor_attestation(
       JSON.stringify(wire.actor),
@@ -280,6 +396,8 @@ export function createWasmRuntime(options: WasmRuntimeOptions): WebApproverRunti
   const nowMs = options.nowMs ?? Date.now;
   const resolveAccountStates: AccountStateResolver =
     options.resolveAccountStates ?? (() => Promise.resolve([]));
+  const sequenceFloorStore: AccountStateFloorStore =
+    options.sequenceFloorStore ?? createInMemoryAccountStateFloorStore();
 
   // The recomputed request_hash is the binding the verdict carries; cache it per request id so
   // `signDecision` signs over exactly the bytes `prepare` recomputed (never re-derived from the
@@ -327,8 +445,11 @@ export function createWasmRuntime(options: WasmRuntimeOptions): WebApproverRunti
       : undefined;
 
     let accountStates: readonly string[] = [];
+    let relayMaxSequence: number | undefined;
     try {
-      accountStates = await resolveAccountStates(wire.actor.id);
+      const resolved = normalizeAccountStateResolution(await resolveAccountStates(wire.actor.id));
+      accountStates = resolved.accountStates;
+      relayMaxSequence = resolved.maxSequence;
     } catch {
       // A resolver outage downgrades origin to unverified — it must never block the action review.
       accountStates = [];
@@ -341,6 +462,8 @@ export function createWasmRuntime(options: WasmRuntimeOptions): WebApproverRunti
       identity.accountId,
       identity.accountRootPubkey,
       accountStates,
+      relayMaxSequence,
+      sequenceFloorStore,
     );
 
     hashByRequestId.set(envelope.id, requestHash);
@@ -418,6 +541,8 @@ export interface BrowserRuntimeOptions {
   readonly moduleSource: WasmModuleSource | Promise<WasmModuleSource>;
   readonly identity: ApproverIdentity;
   readonly resolveAccountStates?: AccountStateResolver;
+  /** Persists the device-side account-state rollback floor (#171) across reloads when supplied. */
+  readonly sequenceFloorStore?: AccountStateFloorStore;
   readonly nowMs?: () => number;
 }
 
@@ -435,6 +560,7 @@ export async function createBrowserRuntime(
     wasm,
     identity: options.identity,
     ...(options.resolveAccountStates ? { resolveAccountStates: options.resolveAccountStates } : {}),
+    ...(options.sequenceFloorStore ? { sequenceFloorStore: options.sequenceFloorStore } : {}),
     ...(options.nowMs ? { nowMs: options.nowMs } : {}),
   });
 }

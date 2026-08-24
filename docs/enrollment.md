@@ -717,7 +717,9 @@ Validation:
 SDK callers that use the revocation-aware `*_with_account_states` verification APIs must supply all known
 account-state JWS documents, or must first enforce a durably stored highest sequence for the account. The SDK and
 WASM core reject stale lower-sequence rollback within one supplied set, but monotonic persistence across calls is
-integrator-owned when using the SDK directly. The `allw-approver watch` CLI persists that floor in its keyfile.
+integrator-owned when using the SDK directly. The `allw-approver watch` CLI persists that floor in its keyfile;
+the web approver persists it in browser storage (`localStorage`, mirroring its paired-device identity's storage
+tradeoff), surviving page reloads.
 The plain `requestApproval` / `Verdict.verify` SDK path enforces account-state revocation only when
 `ClientConfig.accountStates` or `Verdict.verify(..., { accountStates })` is supplied.
 
