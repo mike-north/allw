@@ -1,20 +1,25 @@
 /**
  * Tests for the Codex PreToolUse hook wire contract.
  *
- * These pin the current Codex hook schema documented at developers.openai.com/codex/hooks:
- * Codex sends one JSON object on stdin with `hook_event_name`, `tool_name`, `tool_input`, and
- * optional `cwd`; a PreToolUse denial/allow decision is returned under `hookSpecificOutput`.
+ * These pin the current Codex hook schema documented at learn.chatgpt.com/docs/hooks: Codex sends
+ * one JSON object on stdin with `hook_event_name`, `tool_name`, `tool_input`, and optional `cwd`;
+ * a PreToolUse decision is returned under `hookSpecificOutput` on stdout, or nothing at all.
  *
- * Deny outputs carry a `denyReason` category in `hookSpecificOutput` so operators can
- * distinguish failure kinds without parsing the human-readable `permissionDecisionReason`.
+ * `hookSpecificOutput` is documented as `additionalProperties: false`, so this package never emits
+ * a field outside the documented set (see `../src/lib/codex-io.ts` and
+ * `./support/codex-schema.mjs`). The machine-readable deny category is preserved by prefixing
+ * `permissionDecisionReason` with `allw[<category>]: ` instead of adding an undocumented field.
+ * Regression coverage for #191 (the undocumented `denyReason` field that made Codex silently
+ * discard every deny) lives in `./regression-191.test.mjs`.
  *
- * @see https://developers.openai.com/codex/hooks
+ * @see https://learn.chatgpt.com/docs/hooks
  */
 
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { allowOutput, denyOutput, parseCodexHookInput } from "../dist/lib/codex-io.js";
+import { denyOutput, noBlockOutput, parseCodexHookInput } from "../dist/lib/codex-io.js";
+import { assertConformsToPreToolUseOutputContract } from "./support/codex-schema.mjs";
 
 test("parses a well-formed Codex Bash PreToolUse input", () => {
   const raw = JSON.stringify({
@@ -70,28 +75,39 @@ test("malformed stdin fails closed during parse with denyReason=input-parse-erro
   }
 });
 
-test("allowOutput emits the Codex PreToolUse hookSpecificOutput shape without denyReason", () => {
-  assert.deepEqual(allowOutput("approved by allw"), {
-    hookSpecificOutput: {
-      hookEventName: "PreToolUse",
-      permissionDecision: "allow",
-      permissionDecisionReason: "approved by allw",
-    },
-  });
+test("noBlockOutput emits null — never a wire permissionDecision:'allow'", () => {
+  assert.equal(noBlockOutput(), null);
+  assertConformsToPreToolUseOutputContract(noBlockOutput());
 });
 
-test("denyOutput emits the Codex PreToolUse hookSpecificOutput shape with denyReason", () => {
-  assert.deepEqual(denyOutput("blocked by allw", "no-approval"), {
+test("denyOutput emits only documented hookSpecificOutput fields, no denyReason", () => {
+  const output = denyOutput("blocked by allw", "no-approval");
+
+  assert.deepEqual(output, {
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
       permissionDecision: "deny",
-      permissionDecisionReason: "blocked by allw",
-      denyReason: "no-approval",
+      permissionDecisionReason: "allw[no-approval]: blocked by allw",
     },
   });
+  assert.equal(
+    Object.hasOwn(output.hookSpecificOutput, "denyReason"),
+    false,
+    "denyReason is not part of Codex's documented PreToolUse output contract (#191)",
+  );
+  assertConformsToPreToolUseOutputContract(output);
 });
 
-test("denyOutput carries all DenyReason categories correctly", () => {
+test("denyOutput strips a redundant leading 'allw: ' so the category prefix never doubles up", () => {
+  const output = denyOutput("allw: ALLW_RELAY_URL is not set (fail-closed deny)", "config-error");
+
+  assert.equal(
+    output.hookSpecificOutput.permissionDecisionReason,
+    "allw[config-error]: ALLW_RELAY_URL is not set (fail-closed deny)",
+  );
+});
+
+test("denyOutput carries all DenyReason categories as a schema-conformant prefix", () => {
   /** @type {Array<import('../dist/lib/codex-io.js').DenyReason>} */
   const reasons = [
     "input-parse-error",
@@ -102,9 +118,21 @@ test("denyOutput carries all DenyReason categories correctly", () => {
     "timeout",
     "aborted",
   ];
-  for (const reason of reasons) {
-    const output = denyOutput("test", reason);
-    assert.equal(output.hookSpecificOutput.denyReason, reason);
+  for (const category of reasons) {
+    const output = denyOutput("test", category);
     assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+    assert.match(
+      output.hookSpecificOutput.permissionDecisionReason,
+      new RegExp(`^allw\\[${category}\\]: `),
+      `expected category '${category}' preserved as a permissionDecisionReason prefix`,
+    );
+    assertConformsToPreToolUseOutputContract(output);
   }
+});
+
+test("denyOutput never produces an empty permissionDecisionReason, even with an empty detail", () => {
+  const output = denyOutput("", "build-error");
+
+  assert.ok(output.hookSpecificOutput.permissionDecisionReason.length > 0);
+  assertConformsToPreToolUseOutputContract(output);
 });

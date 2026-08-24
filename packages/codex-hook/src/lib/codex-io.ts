@@ -5,18 +5,29 @@
  * shapes the JSON decision Codex reads from stdout. Every malformed input path returns a parse
  * error so the CLI can emit an explicit fail-closed `deny`.
  *
+ * Codex's `PreToolUse` `hookSpecificOutput` object is documented as accepting exactly
+ * `hookEventName`, `permissionDecision`, `permissionDecisionReason`, `updatedInput`, and
+ * `additionalContext` — nothing else — and its schema declares `additionalProperties: false` (the
+ * open-source implementation deserializes it with `#[serde(deny_unknown_fields)]`:
+ * `codex-rs/hooks/src/schema.rs`, `PreToolUseHookSpecificOutputWire`). This module therefore never
+ * emits a field outside that set (see {@link CodexHookSpecificOutput}), and a bare
+ * `permissionDecision: "allow"` (without `updatedInput`) is an unsupported decision on the current
+ * release, so "allw does not block this call" is represented as `null` here and encoded by the CLI
+ * as empty stdout + exit 0 — the documented clean-success path — never a wire `allow` (see
+ * {@link CodexHookResult}). Fixed in #191; see docs/codex-integration.md, "Decision Mapping".
+ *
  * @see ../../../../docs/codex-integration.md
- * @see https://developers.openai.com/codex/hooks
+ * @see https://learn.chatgpt.com/docs/hooks
  */
 
 /** The Codex hook event this package implements. */
 export const HOOK_EVENT_NAME = "PreToolUse" as const;
 
-/** Codex currently supports `allow` and `deny` as useful PreToolUse permission decisions. */
-export type PermissionDecision = "allow" | "deny";
-
 /**
- * Machine-readable category for the deny reason, surfaced in `hookSpecificOutput.denyReason`.
+ * Machine-readable category for a deny reason. Not a Codex wire field — Codex's PreToolUse
+ * `hookSpecificOutput` schema has no room for one (`additionalProperties: false`). {@link
+ * denyOutput} preserves the category by prefixing `permissionDecisionReason` with
+ * `allw[<category>]: ` instead.
  *
  * - `input-parse-error` — stdin was malformed or missing required fields.
  * - `config-error` — required allw env vars were absent or invalid.
@@ -50,21 +61,29 @@ export interface CodexPreToolUseInput {
 /**
  * The `hookSpecificOutput` object Codex reads as a PreToolUse decision.
  *
- * On deny decisions, `denyReason` carries a machine-readable category so operators can
- * distinguish no-approval from timeout from config errors without parsing the reason string.
+ * This package only ever emits `deny` here — see the module doc comment for why "allw did not
+ * block" is never encoded as a wire `permissionDecision` value. `permissionDecisionReason` carries
+ * the machine-readable {@link DenyReason} category as an `allw[<category>]: ` prefix; there is
+ * deliberately no separate `denyReason` field, because Codex rejects any key on this object beyond
+ * the documented set.
  */
 export interface CodexHookSpecificOutput {
   readonly hookEventName: typeof HOOK_EVENT_NAME;
-  readonly permissionDecision: PermissionDecision;
+  readonly permissionDecision: "deny";
   readonly permissionDecisionReason: string;
-  /** Present only on `deny` decisions; absent on `allow`. */
-  readonly denyReason?: DenyReason;
 }
 
-/** The full JSON stdout payload emitted by the hook. */
+/** The full JSON stdout payload emitted by the hook for a `deny` decision. */
 export interface CodexPreToolUseOutput {
   readonly hookSpecificOutput: CodexHookSpecificOutput;
 }
+
+/**
+ * The hook's full decision. `null` means "allw does not block this call" — approvals and
+ * non-gated pass-throughs — and must be encoded as empty stdout + exit 0, never a wire
+ * `permissionDecision: "allow"`. A non-null value is always an explicit, schema-conformant `deny`.
+ */
+export type CodexHookResult = CodexPreToolUseOutput | null;
 
 /** Parse result: either a validated input or the fail-closed reason to deny with. */
 export type ParseResult =
@@ -76,35 +95,36 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** Build a Codex PreToolUse output payload. */
-export function makeOutput(
-  decision: PermissionDecision,
-  reason: string,
-  denyReason?: DenyReason,
-): CodexPreToolUseOutput {
-  return {
-    hookSpecificOutput: {
-      hookEventName: HOOK_EVENT_NAME,
-      permissionDecision: decision,
-      permissionDecisionReason: reason,
-      ...(denyReason !== undefined ? { denyReason } : {}),
-    },
-  };
-}
-
-/** Build an `allow` output. Only verified approvals and non-gated pass-throughs use this. */
-export function allowOutput(reason: string): CodexPreToolUseOutput {
-  return makeOutput("allow", reason);
+/**
+ * "allw does not block this call." Approved verdicts and non-gated pass-throughs return this.
+ * Named rather than a bare `null` at call sites so the intent — silence, not a wire `allow` — reads
+ * at the call site. See the module doc comment for why.
+ */
+export function noBlockOutput(): CodexHookResult {
+  return null;
 }
 
 /**
- * Build a `deny` output. This is the default for every error or ambiguous gated path.
+ * Build a `deny` output. This is the default for every error or ambiguous gated path, and the only
+ * decision this package ever writes to stdout.
  *
- * The `denyReason` parameter is required to ensure every deny path carries a machine-readable
- * category that operators can use to distinguish the cause without parsing the reason string.
+ * The emitted object contains only the fields Codex's `PreToolUse` `hookSpecificOutput` schema
+ * documents (`hookEventName`, `permissionDecision`, `permissionDecisionReason`) — never a
+ * `denyReason` field. The `category` parameter is required so every deny path still carries a
+ * machine-readable reason for operators; it is preserved by prefixing `permissionDecisionReason`
+ * with `allw[<category>]: ` rather than by adding an undocumented field. Any leading `allw: ` on
+ * `reason` (several call sites already write their own) is stripped first so the prefix never
+ * doubles up.
  */
-export function denyOutput(reason: string, denyReason: DenyReason): CodexPreToolUseOutput {
-  return makeOutput("deny", reason, denyReason);
+export function denyOutput(reason: string, category: DenyReason): CodexPreToolUseOutput {
+  const detail = reason.replace(/^allw:\s*/, "");
+  return {
+    hookSpecificOutput: {
+      hookEventName: HOOK_EVENT_NAME,
+      permissionDecision: "deny",
+      permissionDecisionReason: `allw[${category}]: ${detail}`,
+    },
+  };
 }
 
 /**

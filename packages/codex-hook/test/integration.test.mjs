@@ -1,7 +1,8 @@
 /**
  * Integration tests for the Codex PreToolUse hook: feed realistic Codex hook stdin to
  * `runCodexHook` with the real `@allw/sdk` client pointed at a relay double, then assert the Codex
- * allow/deny output.
+ * decision — `null` (silence) for an approval, or a schema-conformant `deny` (see
+ * `./support/codex-schema.mjs`) otherwise.
  *
  * This mirrors the Claude Code hook integration test but pins the Codex actor identity and output
  * shape. No verdict is stubbed: the relay double captures the encrypted request, decrypts it as the
@@ -14,6 +15,7 @@ import test from "node:test";
 
 import { runCodexHook } from "../dist/cli.js";
 import { loadWasm } from "@allw/hook";
+import { assertConformsToPreToolUseOutputContract } from "./support/codex-schema.mjs";
 
 const NOW_MS = 1_700_000_000_000;
 const TIMEOUT_MS = 300_000;
@@ -166,7 +168,7 @@ function overrides(fetchImpl) {
   };
 }
 
-test("end-to-end: a WASM-signed approved verdict makes Codex emit allow without denyReason", async () => {
+test("end-to-end: a WASM-signed approved verdict makes Codex hook emit nothing (silence, not allow)", async () => {
   const wasm = await loadWasm();
   const approver = await pairedApprover(wasm);
   const { fetchImpl } = relayDouble(wasm, approver, "approved");
@@ -177,13 +179,15 @@ test("end-to-end: a WASM-signed approved verdict makes Codex emit allow without 
     overrides(fetchImpl),
   );
 
-  assert.equal(output.hookSpecificOutput.hookEventName, "PreToolUse");
-  assert.equal(output.hookSpecificOutput.permissionDecision, "allow");
-  assert.match(output.hookSpecificOutput.permissionDecisionReason, /approved by the human/);
-  assert.equal(output.hookSpecificOutput.denyReason, undefined, "allow must not carry denyReason");
+  assert.equal(
+    output,
+    null,
+    "an approved verdict must produce empty stdout, never permissionDecision:'allow' (#191)",
+  );
+  assertConformsToPreToolUseOutputContract(output);
 });
 
-test("end-to-end: a WASM-signed denied verdict makes Codex emit deny with denyReason=no-approval", async () => {
+test("end-to-end: a WASM-signed denied verdict makes Codex emit a schema-conformant deny (category=no-approval)", async () => {
   const wasm = await loadWasm();
   const approver = await pairedApprover(wasm);
   const { fetchImpl } = relayDouble(wasm, approver, "denied");
@@ -196,10 +200,11 @@ test("end-to-end: a WASM-signed denied verdict makes Codex emit deny with denyRe
 
   assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
   assert.match(output.hookSpecificOutput.permissionDecisionReason, /verdict: denied/);
-  assert.equal(output.hookSpecificOutput.denyReason, "no-approval");
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /^allw\[no-approval\]: /);
+  assertConformsToPreToolUseOutputContract(output);
 });
 
-test("end-to-end: no approver response makes Codex emit fail-closed deny with denyReason=timeout", async () => {
+test("end-to-end: no approver response makes Codex emit a schema-conformant fail-closed deny (category=timeout)", async () => {
   const wasm = await loadWasm();
   const approver = await pairedApprover(wasm);
   const { fetchImpl } = relayDouble(wasm, approver, "timeout");
@@ -212,5 +217,6 @@ test("end-to-end: no approver response makes Codex emit fail-closed deny with de
 
   assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
   assert.match(output.hookSpecificOutput.permissionDecisionReason, /verdict: expired/);
-  assert.equal(output.hookSpecificOutput.denyReason, "timeout");
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /^allw\[timeout\]: /);
+  assertConformsToPreToolUseOutputContract(output);
 });

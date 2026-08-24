@@ -2,11 +2,12 @@
  * Decision tests for the Codex PreToolUse hook.
  *
  * The hook must mirror the Claude Code hook's fail-closed mapping while using a distinct Codex
- * actor identity. Only a verified `approved` verdict becomes a Codex `allow`; denied, expired,
- * aborted, build failures, and approval transport errors all produce `deny`.
- *
- * Each deny path also carries a machine-readable `denyReason` category in `hookSpecificOutput`
- * so operators can distinguish no-approval from timeout from config/build errors.
+ * actor identity. Only a verified `approved` verdict (and non-gated tools) become "allw does not
+ * block" — encoded as `null` (empty stdout), never a wire `permissionDecision: "allow"` (#191).
+ * Denied, expired, aborted, build failures, and approval transport errors all produce an explicit,
+ * schema-conformant `deny` whose `permissionDecisionReason` carries the machine-readable category
+ * as an `allw[<category>]: ` prefix (Codex's `hookSpecificOutput` has no room for a separate
+ * `denyReason` field — see `../src/lib/codex-io.ts`).
  */
 
 import assert from "node:assert/strict";
@@ -14,6 +15,7 @@ import test from "node:test";
 
 import { decide } from "../dist/lib/decide.js";
 import { loadWasm } from "@allw/hook";
+import { assertConformsToPreToolUseOutputContract } from "./support/codex-schema.mjs";
 
 const HOSTNAME = "devbox-1";
 const CONFIG = {
@@ -43,15 +45,7 @@ function recording(decision) {
   };
 }
 
-function decisionOf(output) {
-  return output.hookSpecificOutput.permissionDecision;
-}
-
-function denyReasonOf(output) {
-  return output.hookSpecificOutput.denyReason;
-}
-
-test("approved Bash verdict allows Codex and carries a distinct Codex actor", async () => {
+test("approved Bash verdict does not block and carries a distinct Codex actor", async () => {
   const wasm = await loadWasm();
   const approver = recording("approved");
 
@@ -61,8 +55,8 @@ test("approved Bash verdict allows Codex and carries a distinct Codex actor", as
     HOSTNAME,
   );
 
-  assert.equal(decisionOf(output), "allow");
-  assert.equal(denyReasonOf(output), undefined, "allow decisions must not carry denyReason");
+  assert.equal(output, null, "an approved verdict must be silence, not permissionDecision:'allow'");
+  assertConformsToPreToolUseOutputContract(output);
   assert.equal(approver.calls.length, 1);
   assert.equal(approver.calls[0].actor.id, `codex:${HOSTNAME}`);
   assert.equal(approver.calls[0].actor.kind, "codex");
@@ -71,7 +65,7 @@ test("approved Bash verdict allows Codex and carries a distinct Codex actor", as
   assert.deepEqual(approver.calls[0].chain, ["codex:tool_use_id:call-1"]);
 });
 
-test("non-approved verdicts deny Codex fail-closed with the correct denyReason", async () => {
+test("non-approved verdicts deny Codex fail-closed with the correct category prefix", async () => {
   const wasm = await loadWasm();
 
   /** @type {Array<[string, import('../dist/lib/codex-io.js').DenyReason]>} */
@@ -80,23 +74,24 @@ test("non-approved verdicts deny Codex fail-closed with the correct denyReason",
     ["expired", "timeout"],
     ["aborted", "aborted"],
   ];
-  for (const [verdict, expectedDenyReason] of cases) {
+  for (const [verdict, expectedCategory] of cases) {
     const output = await decide(
       bashInput("rm -rf build"),
       { wasm, config: CONFIG, requestApproval: () => Promise.resolve({ decision: verdict }) },
       HOSTNAME,
     );
-    assert.equal(decisionOf(output), "deny", `${verdict} must deny`);
+    assert.equal(output.hookSpecificOutput.permissionDecision, "deny", `${verdict} must deny`);
     assert.match(output.hookSpecificOutput.permissionDecisionReason, new RegExp(verdict));
-    assert.equal(
-      denyReasonOf(output),
-      expectedDenyReason,
-      `verdict '${verdict}' must map to denyReason '${expectedDenyReason}'`,
+    assert.match(
+      output.hookSpecificOutput.permissionDecisionReason,
+      new RegExp(`^allw\\[${expectedCategory}\\]: `),
+      `verdict '${verdict}' must carry category '${expectedCategory}' as a reason prefix`,
     );
+    assertConformsToPreToolUseOutputContract(output);
   }
 });
 
-test("approval transport errors deny Codex fail-closed with denyReason=transport-error", async () => {
+test("approval transport errors deny Codex fail-closed with category=transport-error", async () => {
   const wasm = await loadWasm();
   const output = await decide(
     bashInput("rm -rf build"),
@@ -108,12 +103,13 @@ test("approval transport errors deny Codex fail-closed with denyReason=transport
     HOSTNAME,
   );
 
-  assert.equal(decisionOf(output), "deny");
+  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
   assert.match(output.hookSpecificOutput.permissionDecisionReason, /relay unavailable/);
-  assert.equal(denyReasonOf(output), "transport-error");
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /^allw\[transport-error\]: /);
+  assertConformsToPreToolUseOutputContract(output);
 });
 
-test("malformed gated inputs deny before asking the approver with denyReason=build-error", async () => {
+test("malformed gated inputs deny before asking the approver with category=build-error", async () => {
   const wasm = await loadWasm();
   const approver = recording("approved");
 
@@ -123,9 +119,10 @@ test("malformed gated inputs deny before asking the approver with denyReason=bui
     HOSTNAME,
   );
 
-  assert.equal(decisionOf(output), "deny");
-  assert.equal(denyReasonOf(output), "build-error");
+  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /^allw\[build-error\]: /);
   assert.equal(approver.calls.length, 0);
+  assertConformsToPreToolUseOutputContract(output);
 });
 
 test("MCP tools are gated through the shared ActionRecord builder", async () => {
@@ -142,8 +139,8 @@ test("MCP tools are gated through the shared ActionRecord builder", async () => 
     HOSTNAME,
   );
 
-  assert.equal(decisionOf(output), "allow");
-  assert.equal(denyReasonOf(output), undefined, "allow decisions must not carry denyReason");
+  assert.equal(output, null, "an approved verdict must be silence, not permissionDecision:'allow'");
+  assertConformsToPreToolUseOutputContract(output);
   assert.equal(approver.calls[0].action.surface, "mcp_tool_call");
   assert.equal(approver.calls[0].action.syntactic.server, "filesystem");
   assert.equal(approver.calls[0].action.syntactic.tool, "write_file");
@@ -177,7 +174,8 @@ test("Codex apply_patch is gated through the file_edit ActionRecord builder", as
     HOSTNAME,
   );
 
-  assert.equal(decisionOf(output), "allow");
+  assert.equal(output, null, "an approved verdict must be silence, not permissionDecision:'allow'");
+  assertConformsToPreToolUseOutputContract(output);
   assert.equal(approver.calls.length, 1, "apply_patch must request approval");
   assert.equal(approver.calls[0].action.surface, "file_edit");
   assert.equal(approver.calls[0].action.syntactic.operation, "patch");
@@ -196,7 +194,7 @@ test("non-gated Codex tools pass through without config-time approval", async ()
     HOSTNAME,
   );
 
-  assert.equal(decisionOf(output), "allow");
-  assert.equal(denyReasonOf(output), undefined, "allow decisions must not carry denyReason");
+  assert.equal(output, null, "a non-gated tool must be silence, not permissionDecision:'allow'");
+  assertConformsToPreToolUseOutputContract(output);
   assert.equal(approver.calls.length, 0);
 });

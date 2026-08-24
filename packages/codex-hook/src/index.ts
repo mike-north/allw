@@ -17,14 +17,13 @@ export {
 
 export {
   HOOK_EVENT_NAME,
-  allowOutput,
   denyOutput,
-  makeOutput,
+  noBlockOutput,
   parseCodexHookInput,
+  type CodexHookResult,
   type CodexHookSpecificOutput,
   type CodexPreToolUseInput,
   type CodexPreToolUseOutput,
   type DenyReason,
   type ParseResult,
-  type PermissionDecision,
 } from "./lib/codex-io.js";
