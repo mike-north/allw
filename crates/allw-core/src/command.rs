@@ -14,7 +14,11 @@
 //!
 //! // From a pre-tokenized argv (e.g. when the shell has already split arguments):
 //! let argv = vec!["git".to_string(), "push".to_string(), "--force".to_string()];
-//! let record = action_from_argv(&argv, &CommandContext::default());
+//! let record = action_from_argv(&argv, None, &CommandContext::default());
+//!
+//! // …or a pre-tokenized argv that also carries the original command text, so `raw` (and the
+//! // `env_refs` derived from it) are populated without re-tokenizing:
+//! let record = action_from_argv(&argv, Some("git push --force"), &CommandContext::default());
 //! ```
 //!
 //! # Tokenization
@@ -163,22 +167,32 @@ pub fn action_from_command(
     Ok(build_record(argv, ctx, Some(command_line.to_string())))
 }
 
-/// Build an [`ActionRecord`] from a pre-tokenized argument vector.
+/// Build an [`ActionRecord`] from a pre-tokenized argument vector, optionally carrying the
+/// original command text.
 ///
 /// This is the infallible variant for callers that have already split the command into
-/// tokens (e.g. received from a shell hook or process execution API).
+/// tokens (e.g. received from a shell hook, a process execution API, or an agent runtime that
+/// stores a canonical execution plan). Such callers **must not** re-tokenize their own command
+/// text: re-parsing risks binding a different token vector than the one that actually executes
+/// (`docs/openclaw-integration.md` §5.1).
+///
+/// `raw` is the original command string as the upstream gate renders it, when the caller has one.
+/// It is recorded verbatim in [`SyntacticSubstrate::raw`] and is the **only** source the builder
+/// extracts `env_refs` from — passing `None` therefore also yields `env_refs: None`, since a token
+/// vector has already had its `$VAR` references resolved by whatever produced it.
 ///
 /// An empty `argv` slice produces an [`ActionRecord`] whose `bin`, `argv`, `flags`, and
-/// `positionals` are all `None` (there is nothing to populate), and `raw` is `None`.
+/// `positionals` are all `None` (there is nothing to populate); `raw` still reflects the argument.
 ///
 /// # Examples
 ///
 /// ```rust,ignore
 /// let argv = vec!["git".to_string(), "push".to_string()];
-/// let record = action_from_argv(&argv, &CommandContext::default());
+/// let record = action_from_argv(&argv, None, &CommandContext::default());
+/// let bound = action_from_argv(&argv, Some("git push"), &CommandContext::default());
 /// ```
-pub fn action_from_argv(argv: &[String], ctx: &CommandContext) -> ActionRecord {
-    build_record(argv.to_vec(), ctx, None)
+pub fn action_from_argv(argv: &[String], raw: Option<&str>, ctx: &CommandContext) -> ActionRecord {
+    build_record(argv.to_vec(), ctx, raw.map(str::to_string))
 }
 
 // ── Core builder ─────────────────────────────────────────────────────────────
@@ -757,7 +771,7 @@ mod tests {
     #[test]
     fn action_from_argv_basic() {
         let argv = vec!["git".to_string(), "push".to_string(), "--force".to_string()];
-        let r = action_from_argv(&argv, &ctx_with_cwd());
+        let r = action_from_argv(&argv, None, &ctx_with_cwd());
 
         assert_eq!(bin(&r), "git");
         assert_eq!(positionals(&r), vec!["push"]);
@@ -768,7 +782,7 @@ mod tests {
     /// action_from_argv with empty argv → all command fields None.
     #[test]
     fn action_from_argv_empty() {
-        let r = action_from_argv(&[], &ctx_no_cwd());
+        let r = action_from_argv(&[], None, &ctx_no_cwd());
 
         assert!(r.syntactic.bin.is_none());
         assert!(r.syntactic.argv.is_none());
@@ -776,6 +790,73 @@ mod tests {
         assert!(r.syntactic.positionals.is_none());
         // raw is None for action_from_argv (no original string available)
         assert!(r.syntactic.raw.is_none());
+    }
+
+    /// An empty argv still records the caller's `raw`, so a malformed upstream plan is visible in
+    /// the record rather than silently erased.
+    #[test]
+    fn action_from_argv_empty_keeps_raw() {
+        let r = action_from_argv(&[], Some("  "), &ctx_no_cwd());
+
+        assert!(r.syntactic.bin.is_none());
+        assert!(r.syntactic.argv.is_none());
+        assert_eq!(r.syntactic.raw.as_deref(), Some("  "));
+    }
+
+    /// `raw` is recorded verbatim and is **not** re-tokenized: the bound `argv` stays exactly the
+    /// caller's canonical token vector even when the raw text would word-split differently
+    /// (`docs/openclaw-integration.md` §5.1).
+    #[test]
+    fn action_from_argv_binds_caller_argv_not_a_reparse_of_raw() {
+        let argv = vec![
+            "bash".to_string(),
+            "-lc".to_string(),
+            "echo hello world".to_string(),
+        ];
+        let raw = "bash -lc echo hello world";
+        let r = action_from_argv(&argv, Some(raw), &ctx_no_cwd());
+
+        assert_eq!(r.syntactic.raw.as_deref(), Some(raw));
+        assert_eq!(
+            r.syntactic.argv.as_deref(),
+            Some(argv.as_slice()),
+            "argv must be the caller's canonical tokens, never a re-parse of raw"
+        );
+        // A re-parse of `raw` would have produced 6 tokens; the canonical vector has 3.
+        assert_eq!(r.syntactic.argv.as_ref().map(Vec::len), Some(3));
+    }
+
+    /// `env_refs` are extracted from `raw`, so an argv-based caller that supplies the original
+    /// command text gets the same name-only capture `action_from_command` produces.
+    #[test]
+    fn action_from_argv_extracts_env_refs_from_raw() {
+        let argv = vec![
+            "curl".to_string(),
+            "-H".to_string(),
+            "Authorization: Bearer $API_TOKEN".to_string(),
+            "https://example.test/${TENANT}".to_string(),
+        ];
+        let r = action_from_argv(
+            &argv,
+            Some("curl -H \"Authorization: Bearer $API_TOKEN\" https://example.test/${TENANT}"),
+            &ctx_no_cwd(),
+        );
+
+        assert_eq!(
+            r.syntactic.env_refs.as_deref(),
+            Some(&["API_TOKEN".to_string(), "TENANT".to_string()][..]),
+            "env_refs come from raw, names only, in first-seen order"
+        );
+    }
+
+    /// Without `raw` there is no text to scan, so `env_refs` stays `None` even when a token
+    /// happens to contain a `$VAR` sequence (the producing shell already expanded it).
+    #[test]
+    fn action_from_argv_without_raw_has_no_env_refs() {
+        let argv = vec!["echo".to_string(), "$HOME".to_string()];
+        let r = action_from_argv(&argv, None, &ctx_no_cwd());
+
+        assert!(r.syntactic.env_refs.is_none());
     }
 
     // ── Risk heuristic ───────────────────────────────────────────────────────
@@ -926,14 +1007,14 @@ mod tests {
         );
     }
 
-    /// raw field is None for action_from_argv (no original string available).
+    /// raw field is None for action_from_argv when the caller has no original string.
     #[test]
     fn raw_is_none_for_action_from_argv() {
         let argv = vec!["ls".to_string()];
-        let r = action_from_argv(&argv, &ctx_no_cwd());
+        let r = action_from_argv(&argv, None, &ctx_no_cwd());
         assert!(
             r.syntactic.raw.is_none(),
-            "action_from_argv sets raw to None (no original string)"
+            "action_from_argv with raw=None sets raw to None"
         );
     }
 

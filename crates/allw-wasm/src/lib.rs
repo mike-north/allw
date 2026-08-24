@@ -38,7 +38,7 @@
 
 use allw_core::{
     action_from_agent_tool_call as core_action_from_agent_tool_call,
-    action_from_command as core_action_from_command,
+    action_from_argv as core_action_from_argv, action_from_command as core_action_from_command,
     action_from_file_edit as core_action_from_file_edit,
     action_from_mcp_tool_call as core_action_from_mcp_tool_call,
     compute_request_hash as core_compute_request_hash, decrypt_context as core_decrypt_context,
@@ -1090,6 +1090,35 @@ pub fn action_from_command(command_line: &str, cwd: Option<String>) -> Result<St
     let ctx = CommandContext { cwd };
     let record = core_action_from_command(command_line, &ctx)
         .map_err(|e| JsError::new(&format!("action_from_command failed: {e}")))?;
+    to_json(&record, "ActionRecord")
+}
+
+/// Builds an [`ActionRecord`](allw_core::ActionRecord) from a **pre-tokenized** argv, returning it
+/// as JSON. This is the **command** surface for callers that already hold a canonical execution
+/// plan and must bind it verbatim — an agent runtime that stores the exact `argv` it will later
+/// execute (`docs/openclaw-integration.md` §5.1). Re-tokenizing such a caller's command text with
+/// [`action_from_command`] risks binding a *different* token vector than the one that runs, which
+/// would break the WYSIWYS guarantee that the verdict is bound to the exact action.
+///
+/// - `argv_json` — JSON array of the canonical argument tokens.
+/// - `raw` — the original command text as the upstream gate renders it, or `undefined`/`null` when
+///   the caller has none. Recorded verbatim and used (only) to extract `env_refs` names; it is
+///   **never** re-tokenized.
+/// - `cwd` — the working directory the command is bound to, or `undefined`/`null` when unbound.
+///
+/// # Errors
+///
+/// Throws if `argv_json` is not a JSON array of strings — fail-closed: the caller denies rather
+/// than submitting a record built from an unparseable plan.
+#[wasm_bindgen]
+pub fn action_from_argv(
+    argv_json: &str,
+    raw: Option<String>,
+    cwd: Option<String>,
+) -> Result<String, JsError> {
+    let argv: Vec<String> = parse_json(argv_json, "command argv")?;
+    let ctx = CommandContext { cwd };
+    let record = core_action_from_argv(&argv, raw.as_deref(), &ctx);
     to_json(&record, "ActionRecord")
 }
 

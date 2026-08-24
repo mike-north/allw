@@ -38,6 +38,15 @@ export interface HookWasm {
    */
   action_from_command(commandLine: string, cwd?: string | null): string;
   /**
+   * Build an `ActionRecord` JSON from a **canonical, pre-tokenized** argv (the `command` surface).
+   * `argvJson` is a JSON string array; `raw` is the original command text, recorded verbatim and
+   * used only to extract `env_refs` names — it is never re-tokenized. Use this instead of
+   * {@link HookWasm.action_from_command} whenever the upstream gate already owns the exact token
+   * vector that will execute (`docs/openclaw-integration.md` §5.1). **Throws** when `argvJson` is
+   * not a JSON array of strings.
+   */
+  action_from_argv(argvJson: string, raw?: string | null, cwd?: string | null): string;
+  /**
    * Build an `ActionRecord` JSON for an MCP tool call (the `mcp_tool_call` surface). `paramsJson`
    * is the tool parameters as a JSON string. **Throws** on invalid JSON — the hook denies rather
    * than submitting a record built from unparseable parameters.
