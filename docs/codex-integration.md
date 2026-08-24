@@ -125,12 +125,18 @@ record the result on issue #97:
    than the Claude Code actor.
 5. **File-edit path**: ask Codex for a simple file edit through `apply_patch` and confirm the hook
    gates the resulting `file_edit` action with the target path, summary, and diff hash visible.
+6. **Schema conformance (catches drift)**: for the deny in step 2, capture the raw JSON the hook
+   wrote to stdout (e.g. temporarily redirect the wrapper's `exec` to `tee /tmp/allw-hook-stdout`)
+   and confirm `hookSpecificOutput` has only `hookEventName`, `permissionDecision`, and
+   `permissionDecisionReason` — no `denyReason` or other field — and that `permissionDecisionReason`
+   is non-empty and starts with `allw[`. This is the live-Codex proof that the automated
+   schema-conformance tests (`packages/codex-hook/test/codex-io.test.mjs`, `regression-191.test.mjs`)
+   match what a real Codex build actually accepts; a future Codex schema change would show up here
+   as a rejected/ignored field before it reaches production.
 
-> **Known defect affecting step 2.** The deny path is expected to FAIL until
-> [#191](https://github.com/mike-north/allw/issues/191) lands: the hook emits an undocumented
-> `denyReason` field that Codex rejects, so the deny is discarded and the command runs. Record the
-> observed behavior rather than skipping the step — it is the acceptance proof for that fix. See
-> [Fail-Open Residual](#fail-open-residual).
+Fixed in [#191](https://github.com/mike-north/allw/issues/191): the hook used to emit an
+undocumented `denyReason` field that Codex rejected, silently discarding every deny (step 2 was
+expected to FAIL). See [Fail-Open Residual](#fail-open-residual).
 
 Use this comment template on #97:
 
@@ -140,6 +146,7 @@ Deny: PASS/FAIL - command was blocked after denial
 Timeout: PASS/FAIL - command failed closed after ALLW_TIMEOUT_MS
 Actor identity: PASS/FAIL - inbox showed codex:<hostname>
 File edit: PASS/FAIL - apply_patch was gated with path, summary, and diff hash
+Schema conformance: PASS/FAIL - deny stdout had only documented fields, no denyReason
 Notes:
 ```
 
@@ -166,30 +173,32 @@ The hook reads the same allw environment as the Claude Code hook:
 | `ALLW_FETCH_TIMEOUT_MS`  | no       | Per-relay-fetch timeout in ms, only allowed to lower the cap. |
 
 For gated calls, the hook builds the syntactic `ActionRecord`, requests approval through
-`@allw/sdk`, and returns Codex's `hookSpecificOutput.permissionDecision`:
+`@allw/sdk`, and maps the verdict to what it writes to stdout. Only `deny` is ever an explicit wire
+decision; "allw does not block" is empty stdout and exit 0, never a bare
+`permissionDecision: "allow"` — see [Fail-Open Residual](#fail-open-residual) item 3 for why:
 
-| allw result                              | Codex decision | `hookSpecificOutput.denyReason` |
-| ---------------------------------------- | -------------- | ------------------------------- |
-| verified verdict `decision === approved` | `allow`        | _(absent)_                      |
-| verified verdict `decision === denied`   | `deny`         | `no-approval`                   |
-| verified verdict `decision === expired`  | `deny`         | `timeout`                       |
-| verified verdict `decision === aborted`  | `deny`         | `aborted`                       |
-| malformed gated input / ActionRecord     | `deny`         | `build-error`                   |
-| missing or invalid allw config           | `deny`         | `config-error`                  |
-| relay/network/approval error             | `deny`         | `transport-error`               |
-| malformed hook stdin                     | `deny`         | `input-parse-error`             |
-| non-gated tool                           | `allow`        | _(absent)_                      |
+| allw result                              | Hook output              | `permissionDecisionReason` prefix |
+| ---------------------------------------- | ------------------------ | --------------------------------- |
+| verified verdict `decision === approved` | _(empty stdout, exit 0)_ | —                                 |
+| verified verdict `decision === denied`   | `deny`                   | `allw[no-approval]: …`            |
+| verified verdict `decision === expired`  | `deny`                   | `allw[timeout]: …`                |
+| verified verdict `decision === aborted`  | `deny`                   | `allw[aborted]: …`                |
+| malformed gated input / ActionRecord     | `deny`                   | `allw[build-error]: …`            |
+| missing or invalid allw config           | `deny`                   | `allw[config-error]: …`           |
+| relay/network/approval error             | `deny`                   | `allw[transport-error]: …`        |
+| malformed hook stdin                     | `deny`                   | `allw[input-parse-error]: …`      |
+| non-gated tool                           | _(empty stdout, exit 0)_ | —                                 |
 
-On deny decisions, `denyReason` carries a machine-readable category so operators can distinguish
-why the hook blocked an action without parsing the human-readable `permissionDecisionReason` string.
-
-> **Defect — `denyReason` is not a Codex field.** The 2026-08-23 re-verification found that
-> `denyReason` is outside Codex's documented `PreToolUse` output contract, and that Codex rejects
-> unknown fields inside `hookSpecificOutput`. On the current implementation that makes the entire
-> deny payload unparseable, which Codex reports as a hook error and then **continues the tool
-> call**. The table above describes what the hook emits today, not a shape that works. See
-> [Fail-Open Residual](#fail-open-residual) and
-> [#191](https://github.com/mike-north/allw/issues/191); the emitted shape changes there, not here.
+A `deny`'s `hookSpecificOutput` contains only `hookEventName`, `permissionDecision`, and
+`permissionDecisionReason` — the exact fields Codex's `PreToolUse` output schema documents
+(`additionalProperties: false`). There is no `denyReason` field: the machine-readable category is
+instead carried as an `allw[<category>]: ` prefix on `permissionDecisionReason`, so operators can
+still distinguish no-approval from timeout from config errors without parsing the rest of the
+string. An earlier version of this hook added a `denyReason` field directly to
+`hookSpecificOutput`; Codex rejected it as an unknown field, which discarded the _entire_ deny
+payload and let the tool call proceed. Fixed in
+[#191](https://github.com/mike-north/allw/issues/191) — see
+[Fail-Open Residual](#fail-open-residual) for the full defect writeup.
 
 The actor is distinct from the Claude Code hook: Codex requests use `actor.kind = "codex"` and
 `actor.id = "codex:<hostname>"`, so a single allw inbox can distinguish "Claude Code on devbox-1"
@@ -371,21 +380,26 @@ explicit, well-formed `deny` before Codex's pinned 480 second hook timeout:
 
 The CLI catch-all still converts internal throws into a `deny`, so in-process failures are covered.
 
-### Implementation residual (new, and fixable)
+### Implementation residual (fixed in #191)
 
-1. **Every deny is currently dropped.** `hookSpecificOutput.denyReason` is not part of Codex's
+1. **Every deny was dropped.** `hookSpecificOutput.denyReason` was not part of Codex's
    `PreToolUse` output contract, and Codex rejects unknown fields inside that object, so the whole
-   payload fails to parse and the tool call continues. This is the single largest gap on this
-   surface: today the deny path is _inside_ the fail-open set rather than outside it. Fixed in
-   [#191](https://github.com/mike-north/allw/issues/191).
+   payload failed to parse and the tool call continued. This was the single largest gap on this
+   surface: the deny path was _inside_ the fail-open set rather than outside it. Fixed in
+   [#191](https://github.com/mike-north/allw/issues/191) — the machine-readable category now rides
+   as an `allw[<category>]: ` prefix on `permissionDecisionReason` instead of a separate field (see
+   [Decision Mapping](#decision-mapping)).
 2. **Deny without a reason degrades to fail-open.** `permissionDecision: "deny"` requires a
    non-empty `permissionDecisionReason`; an empty one is treated as an invalid decision, i.e. a
-   hook error, i.e. proceed. Also covered by [#191](https://github.com/mike-north/allw/issues/191).
-3. **`allow` is not the right encoding of an approval.** A bare `permissionDecision: "allow"`
+   hook error, i.e. proceed. Also fixed in [#191](https://github.com/mike-north/allw/issues/191):
+   the `allw[<category>]: ` prefix means `permissionDecisionReason` can never be empty, even if the
+   underlying detail string is.
+3. **`allow` was not the right encoding of an approval.** A bare `permissionDecision: "allow"`
    without `updatedInput` is an unsupported decision that Codex reports as a hook failure (the
-   tool then proceeds, which is the intended outcome, so this is noise rather than risk). The
-   correct encoding of "allw did not block" is **empty stdout and exit 0** — which is also the
-   encoding `docs/contract.md` §6 requires, since the primitive never returns "allow."
+   tool then proceeds, which is the intended outcome, so this was noise rather than risk). Fixed in
+   [#191](https://github.com/mike-north/allw/issues/191): the hook now encodes "allw did not block"
+   as **empty stdout and exit 0** — which is also the encoding `docs/contract.md` §6 requires,
+   since the primitive never returns "allow."
 
 ### What is _not_ residual
 
@@ -445,19 +459,3 @@ Sources (all re-checked 2026-08-23):
 - Cross-checks against the open-source implementation: <https://github.com/openai/codex/tree/main/codex-rs/hooks>
   (the docs note that `main`-branch schemas may include fields absent from the current release, so
   the docs page is the release-behavior reference and the source is corroboration only).
-
-## Codex Hook Constraints
-
-This design depends on the current OpenAI Codex hooks contract, checked on 2026-06-12:
-
-- Hook commands receive one JSON object on stdin and may return JSON on stdout.
-- `PreToolUse` can intercept Bash, `apply_patch`, and MCP tool calls, but the docs describe it as a
-  guardrail rather than a complete enforcement boundary.
-- A failed, malformed, or timed-out hook invocation is a non-blocking error; Codex reports the hook
-  problem and continues the tool call.
-- Matching command hooks can run concurrently, and multiple hook sources all load.
-- Non-managed hooks must be reviewed and trusted with `/hooks` before Codex runs them.
-- Hook `timeout` is in seconds and defaults to 600; allw pins 480 seconds so the SDK deadline wins
-  before Codex can time the hook out.
-
-Source: OpenAI Codex hooks docs, <https://developers.openai.com/codex/hooks>.

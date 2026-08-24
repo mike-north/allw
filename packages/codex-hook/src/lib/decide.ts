@@ -10,10 +10,10 @@
 import { gateToolCall, type HookConfig, type HookWasm } from "@allw/hook";
 
 import {
-  allowOutput,
   denyOutput,
+  noBlockOutput,
+  type CodexHookResult,
   type CodexPreToolUseInput,
-  type CodexPreToolUseOutput,
   type DenyReason,
 } from "./codex-io.js";
 
@@ -114,11 +114,11 @@ export async function decide(
   input: CodexPreToolUseInput,
   deps: DecideDeps,
   hostname: string,
-): Promise<CodexPreToolUseOutput> {
+): Promise<CodexHookResult> {
   const gate = gateToolCall(deps.wasm, input.toolName, input.toolInput, input.cwd);
 
   if (gate.kind === "pass-through") {
-    return allowOutput(gate.reason);
+    return noBlockOutput();
   }
   if (gate.kind === "build-error") {
     return denyOutput(gate.reason, "build-error");
@@ -151,7 +151,7 @@ export async function decide(
   }
 
   if (verdict.decision === "approved") {
-    return allowOutput(`allw: ${gate.summary} — approved by the human`);
+    return noBlockOutput();
   }
 
   const verdictDenyReason: DenyReason =

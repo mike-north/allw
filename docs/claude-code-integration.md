@@ -140,10 +140,14 @@ config-read time — see [Fail-Closed Analysis](#fail-closed-analysis).
 ## Decision Mapping
 
 `decide` (`packages/hook/src/lib/decide.ts`) reduces every path to exactly one of `allow`/`deny`.
-Unlike the Codex hook, the Claude Code hook's `hookSpecificOutput` carries no machine-readable
-`denyReason` field — only the human-readable `permissionDecisionReason` string shown below (the
-Codex hook added `denyReason` in [#166](https://github.com/mike-north/allw/pull/166); it has no
-Claude Code equivalent):
+The Claude Code hook's `hookSpecificOutput` carries no machine-readable category field — only the
+human-readable `permissionDecisionReason` string shown below. The Codex hook briefly added a
+`denyReason` field in [#166](https://github.com/mike-north/allw/pull/166), but Codex's `PreToolUse`
+output schema rejects unknown fields on that object, which silently discarded every deny; it now
+carries the same category as an `allw[<category>]: ` prefix on `permissionDecisionReason` instead
+(see [`docs/codex-integration.md`](./codex-integration.md#decision-mapping) and
+[#191](https://github.com/mike-north/allw/issues/191)) — there still isn't a Claude Code
+equivalent field, nor should there be:
 
 | allw result                                                                                                                                               | `permissionDecision` | `permissionDecisionReason` (pattern)                                                                     |
 | --------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- | -------------------------------------------------------------------------------------------------------- |

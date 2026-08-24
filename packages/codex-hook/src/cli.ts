@@ -16,11 +16,10 @@ import { isGatedTool, loadWasm, readConfig } from "@allw/hook";
 
 import { decide, type RequestApprovalFn } from "./lib/decide.js";
 import {
-  allowOutput,
   denyOutput,
+  noBlockOutput,
   parseCodexHookInput,
-  type CodexPreToolUseOutput,
-  type DenyReason,
+  type CodexHookResult,
 } from "./lib/codex-io.js";
 import { getVersion } from "./version.js";
 
@@ -46,27 +45,29 @@ async function readStdin(): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-/** Emit one Codex decision JSON object. */
-function emit(output: CodexPreToolUseOutput): void {
+/**
+ * Emit the Codex decision. `null` ("allw does not block this call") means writing nothing at all:
+ * Codex's documented `PreToolUse` contract treats exit 0 with no output as a clean success, and a
+ * bare `permissionDecision: "allow"` is an unsupported decision on the current release (see
+ * `lib/codex-io.ts` module doc comment). A non-null decision is always an explicit `deny`.
+ */
+function emit(output: CodexHookResult): void {
+  if (output === null) return;
   process.stdout.write(`${JSON.stringify(output)}\n`);
 }
 
 /**
- * Append a single deny-reason log line to `.codex/allw-hook.log` in the given directory.
+ * Append a single deny log line to `.codex/allw-hook.log` in the given directory.
  *
  * The file is created if it does not exist. Errors are swallowed: log appending must never
  * convert a deny into a process crash. The log is intentionally non-leaky — only the
- * `denyReason` category and the `permissionDecisionReason` string are written, not raw input.
+ * `permissionDecisionReason` string (which already carries the machine-readable
+ * `allw[<category>]: ` prefix from `denyOutput`) is written, not raw input.
  */
-function appendDenyLog(
-  cwd: string,
-  isoTimestamp: string,
-  denyReason: DenyReason,
-  detail: string,
-): void {
+function appendDenyLog(cwd: string, isoTimestamp: string, permissionDecisionReason: string): void {
   try {
     const logPath = `${cwd}/.codex/allw-hook.log`;
-    appendFileSync(logPath, `${isoTimestamp} [allw] deny reason=${denyReason} detail=${detail}\n`);
+    appendFileSync(logPath, `${isoTimestamp} [allw] deny reason=${permissionDecisionReason}\n`);
   } catch {
     // Intentionally swallowed — log failure must never affect the deny decision.
   }
@@ -81,16 +82,14 @@ export async function runCodexHook(
   raw: string,
   env: NodeJS.ProcessEnv,
   overrides: RunCodexHookOverrides = {},
-): Promise<CodexPreToolUseOutput> {
+): Promise<CodexHookResult> {
   const parsed = parseCodexHookInput(raw);
   if (!parsed.ok) {
     return denyOutput(parsed.reason, parsed.denyReason);
   }
 
   if (!isGatedTool(parsed.input.toolName)) {
-    return allowOutput(
-      `allw: tool '${parsed.input.toolName}' is not gated by allw; passing through`,
-    );
+    return noBlockOutput();
   }
 
   const configResult = readConfig(env);
@@ -135,7 +134,7 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  let output: CodexPreToolUseOutput;
+  let output: CodexHookResult;
   try {
     output = await runCodexHook(await readStdin(), process.env);
   } catch (err) {
@@ -147,17 +146,13 @@ async function main(): Promise<void> {
     );
   }
 
-  // Append a deny-reason line to the project log so operators can audit without parsing stdout.
-  const { hookSpecificOutput } = output;
-  if (
-    hookSpecificOutput.permissionDecision === "deny" &&
-    hookSpecificOutput.denyReason !== undefined
-  ) {
+  // Append a deny line to the project log so operators can audit without parsing stdout. `output`
+  // is non-null only for an explicit `deny` (see `emit`); approvals/pass-throughs log nothing.
+  if (output !== null) {
     appendDenyLog(
       process.cwd(),
       new Date().toISOString(),
-      hookSpecificOutput.denyReason,
-      hookSpecificOutput.permissionDecisionReason,
+      output.hookSpecificOutput.permissionDecisionReason,
     );
   }
 
