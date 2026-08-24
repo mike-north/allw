@@ -13,8 +13,9 @@
  * `WebApproverRuntime` before the module loads — but a real runtime needs the paired device
  * identity, which is only known *after* the pairing gate resolves, and the WASM core must be
  * fetched from a same-origin asset URL rather than read from a Node path. This module sequences
- * those steps explicitly: resolve the relay URL → run the pairing gate → load WASM → build the
- * runtime from the paired identity → mount the live inbox.
+ * those steps explicitly: resolve the relay URL → run the first-run onboarding walkthrough
+ * (pre-enrollment only, #151) → run the pairing gate → load WASM → build the runtime from the
+ * paired identity → mount the live inbox.
  *
  * # WASM asset loading (never a bare package specifier at runtime)
  * The vendored `--target web` glue and `.wasm` binary are copied by `scripts/build-site.mjs` to
@@ -26,6 +27,7 @@
  * subpath or host (Cloudflare Pages, any static host — `docs/web-approver-deploy.md`).
  *
  * @see ./relay-config.ts (runtime relay-URL resolution + the fallback config prompt)
+ * @see ./onboarding.ts (the first-run walkthrough gate, pre-enrollment only, #151)
  * @see ./pairing.ts (the login / pairing-ceremony gate)
  * @see ./runtime.ts (the WASM-backed `WebApproverRuntime`)
  * @see ./browser.ts (the inbox mount + relay poll loop)
@@ -35,6 +37,7 @@
 
 import { createRelayAccountStateResolver } from "./account-state.js";
 import { mountWebApprover } from "./browser.js";
+import { mountOnboardingGate } from "./onboarding.js";
 import { createLocalPairingStore, mountPairingGate } from "./pairing.js";
 import { mountRelayConfigGate, resolveRelayUrl } from "./relay-config.js";
 import { createBrowserRuntime, type ApproverIdentity } from "./runtime.js";
@@ -50,6 +53,21 @@ const POLL_INTERVAL_MS = 2_000;
  */
 const WASM_GLUE_URL = new URL("./vendor/allw-wasm/allw_wasm.js", import.meta.url);
 const WASM_BINARY_URL = new URL("./vendor/allw-wasm/allw_wasm_bg.wasm", import.meta.url);
+
+/**
+ * Resolve the static HTML shell's `#app` mount element, or throw. Returning a non-nullable
+ * `HTMLElement` (rather than narrowing `HTMLElement | null` inline in `boot()`) keeps the type
+ * non-null when `root` is later captured by `boot()`'s nested closures (`startPairing`,
+ * `onPaired`) — TypeScript's control-flow narrowing of an `if (!root) throw` guard does not
+ * survive into a function declared later in the same scope.
+ */
+function requireRootElement(): HTMLElement {
+  const root = document.getElementById("app");
+  if (!root) {
+    throw new Error("allw web approver: missing '#app' mount element in the static HTML shell");
+  }
+  return root;
+}
 
 /** Resolve the relay URL, prompting with {@link mountRelayConfigGate} if none is configured yet. */
 function ensureRelayUrl(root: HTMLElement): Promise<string> {
@@ -108,22 +126,33 @@ async function bootInbox(
   });
 }
 
-/** The full boot sequence: relay URL → pairing gate → (on success) WASM + live inbox. */
+/**
+ * The full boot sequence: relay URL → first-run onboarding walkthrough (pre-enrollment only,
+ * #151) → pairing gate → (on success) WASM + live inbox.
+ */
 async function boot(): Promise<void> {
-  const root = document.getElementById("app");
-  if (!root) {
-    throw new Error("allw web approver: missing '#app' mount element in the static HTML shell");
+  const root = requireRootElement();
+  const relayUrl = await ensureRelayUrl(root);
+  const pairingStore = createLocalPairingStore();
+
+  function startPairing(): void {
+    mountPairingGate({
+      root,
+      pairingStore,
+      onPaired: (identity) => {
+        void bootInbox(root, identity, relayUrl);
+      },
+    });
   }
 
-  const relayUrl = await ensureRelayUrl(root);
-
-  const pairingStore = createLocalPairingStore();
-  mountPairingGate({
+  // The walkthrough is scoped to pre-enrollment (#151): an already-paired device (a stored
+  // identity exists) skips straight to the pairing gate's returning-device screen, and a device
+  // that has already completed/skipped the walkthrough is never shown it again.
+  mountOnboardingGate({
     root,
-    pairingStore,
-    onPaired: (identity) => {
-      void bootInbox(root, identity, relayUrl);
-    },
+    storage: window.localStorage,
+    hasStoredIdentity: pairingStore.load() !== null,
+    onComplete: startPairing,
   });
 }
 
