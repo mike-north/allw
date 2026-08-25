@@ -19,6 +19,7 @@
  */
 
 import type {
+  AgentToolCallAction,
   ApprovalActor,
   ApprovalContext,
   ApprovalDecision,
@@ -253,8 +254,10 @@ function toCommandAction(syntactic: unknown): CommandAction | undefined {
   return typeof syntactic.raw === "string" ? { ...withCwd, raw: syntactic.raw } : withCwd;
 }
 
-/** Map an untrusted, decrypted wire syntactic substrate onto the controller's {@link McpCallAction}. */
-function toMcpAction(syntactic: unknown): McpCallAction | undefined {
+/** Map an untrusted, decrypted wire syntactic substrate onto a `(server, tool, params)` action —
+ * shared by `mcp_tool_call` ({@link McpCallAction}) and `agent_tool_call`
+ * ({@link AgentToolCallAction}), which reduce to the identical wire shape (spec §5.2). */
+function toToolCallAction(syntactic: unknown): McpCallAction | AgentToolCallAction | undefined {
   if (!isRecord(syntactic)) return undefined;
   if (typeof syntactic.server !== "string" || typeof syntactic.tool !== "string") return undefined;
   return { server: syntactic.server, tool: syntactic.tool, params: syntactic.params };
@@ -262,10 +265,18 @@ function toMcpAction(syntactic: unknown): McpCallAction | undefined {
 
 /**
  * Map the decrypted wire context + verified attestation + (optional) derived challenge onto the
- * controller's {@link ApprovalContext} view model. Surfaces other than `command`/`mcp_tool_call`
- * (e.g. `file_edit`) render as `command` with an empty action so the controller shows them as an
- * "Unknown action" rather than fabricating structure — the WYSIWYS hash still binds the full
- * plaintext regardless of this display mapping.
+ * controller's {@link ApprovalContext} view model. Surfaces other than `command`/`mcp_tool_call`/
+ * `agent_tool_call` (e.g. `file_edit`) render as `command` with an empty action so the controller
+ * shows them as an "Unknown action" rather than fabricating structure — the WYSIWYS hash still
+ * binds the full plaintext regardless of this display mapping.
+ *
+ * `agent_tool_call` (an agent-runtime/plugin-owned tool call, e.g. an OpenClaw plugin permission
+ * request — `docs/openclaw-integration.md` §5.2) is its own `kind`, distinct from `mcp`: it shares
+ * the `(server, tool)` wire shape with `mcp_tool_call`, but `server` holds a plugin id, not an MCP
+ * server name. Folding it into `mcp` would show the human a false MCP label and drop the
+ * hash-bound function identity into the generic "command" fallback (which only reads
+ * `argv`/`cwd`/`raw` — `agent_tool_call` records carry no `argv`, so the identity would be lost
+ * from the rendered plaintext even though it is inside `request_hash`).
  */
 function toApprovalContext(
   wire: WireApprovalContext,
@@ -283,15 +294,23 @@ function toApprovalContext(
     summary: wire.summary,
   };
   const allowed = toAllowedDecisions(wire.constraints.allowed_decisions);
-  const kind: ApprovalContext["kind"] = wire.action.surface === "mcp_tool_call" ? "mcp" : "command";
+  const kind: ApprovalContext["kind"] =
+    wire.action.surface === "mcp_tool_call"
+      ? "mcp"
+      : wire.action.surface === "agent_tool_call"
+        ? "agent_tool_call"
+        : "command";
 
   // Spread the surface-specific action only when present so `exactOptionalPropertyTypes` keeps the
-  // optional `command`/`mcp`/`challenge` keys absent (not explicitly `undefined`).
+  // optional `command`/`mcp`/`agentToolCall`/`challenge` keys absent (not explicitly `undefined`).
   const base = { kind, actor, risk, allowed_decisions: allowed } as const;
   let withAction: ApprovalContext;
   if (kind === "mcp") {
-    const mcp = toMcpAction(wire.action.syntactic);
+    const mcp = toToolCallAction(wire.action.syntactic);
     withAction = mcp ? { ...base, mcp } : base;
+  } else if (kind === "agent_tool_call") {
+    const agentToolCall = toToolCallAction(wire.action.syntactic);
+    withAction = agentToolCall ? { ...base, agentToolCall } : base;
   } else {
     const command = toCommandAction(wire.action.syntactic);
     withAction = command ? { ...base, command } : base;
