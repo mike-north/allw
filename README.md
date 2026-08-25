@@ -11,6 +11,8 @@ governance layer that grows around it. See [`docs/`](./docs):
 - [contract.md](./docs/contract.md) — the approval-primitive contract (the keystone).
 - [enrollment.md](./docs/enrollment.md) — account/device enrollment, rotation, revocation, and recovery.
 - [policy-seam.md](./docs/policy-seam.md) — the seam to the (later) policy layer.
+- [hitl-seam.md](./docs/hitl-seam.md) — the provider-neutral, layered policy + human-decision contract;
+  [decision log](./docs/hitl-seam-decisions.md).
 - [decision-history.md](./docs/decision-history.md) — on-device, encrypted, ephemeral decision history and the reflection pass (post-v1).
 - [decision-flywheel.md](./docs/decision-flywheel.md) — recognized-tool tallies: the only sanctioned, aggregate-only egress.
 - [threat-model.md](./docs/threat-model.md) — adversaries, residual risks, and the security review checklist.
@@ -47,14 +49,14 @@ terminal. The exact hook config block and env vars are in
 
 Polyglot monorepo — one audited Rust core, thin surfaces around it.
 
-| Path                       | What                                                                                               |
-| -------------------------- | -------------------------------------------------------------------------------------------------- |
-| `crates/allw-core`         | Rust core: contract types, crypto, verdict signing/verification, audit chaining.                   |
-| `packages/sdk`             | TypeScript SDK (`@allw/sdk`) — the integrator call site; wraps the core via WASM.                  |
-| `packages/relay`           | Zero-knowledge relay (`@allw/relay`) — Cloudflare Workers + Durable Objects.                       |
-| `packages/hook`            | Claude Code `PreToolUse` hook — gates Bash/MCP through allw, fail-closed.                          |
-| `packages/codex-hook`      | Codex `PreToolUse` hook — same allw gate with a distinct Codex actor identity.                     |
-| `packages/openclaw-bridge` | OpenClaw gateway operator client — turns pending OpenClaw approvals into verified human decisions. |
+| Path                       | What                                                                                                                                                         |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `crates/allw-core`         | Rust core: contract types, crypto, verdict signing/verification, audit chaining.                                                                             |
+| `packages/sdk`             | TypeScript SDK (`@allw/sdk`) — the integrator call site; wraps the core via WASM.                                                                            |
+| `packages/relay`           | Zero-knowledge relay (`@allw/relay`) — Cloudflare Workers + Durable Objects.                                                                                 |
+| `packages/hook`            | Claude Code `PreToolUse` hook — gates Bash/MCP through allw, fail-closed.                                                                                    |
+| `packages/codex-hook`      | Codex `PreToolUse` hook — same allw gate with a distinct Codex actor identity.                                                                               |
+| `packages/openclaw-bridge` | OpenClaw gateway operator client; current upstream reviewer-visibility blocker is documented in [`openclaw-integration.md`](./docs/openclaw-integration.md). |
 
 ### Demo
 
