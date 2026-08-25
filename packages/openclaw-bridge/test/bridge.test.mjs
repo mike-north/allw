@@ -629,3 +629,131 @@ test("a failing plugin.approval.list backfill logs and does not block the exec b
   assert.deepEqual(gateway.resolves, [{ id: APPROVAL_ID, kind: "exec", decision: "allow-once" }]);
   assert.ok(records.some((r) => r.event === "backfill.failed" && r.fields.family === "plugin"));
 });
+
+// ── §4.3 per-family prune safety (regression: a failed family must never prune the OTHER
+// family's — or its own — genuinely-still-pending in-flight ids) ──────────────────────────────
+
+test("REGRESSION: a failed plugin.approval.list must not prune in-flight plugin ids, while exec reconciliation is unaffected", async () => {
+  let releasePluginVerdict;
+  let releaseExecVerdict;
+  const pluginVerdict = new Promise((resolve) => {
+    releasePluginVerdict = resolve;
+  });
+  const execVerdict = new Promise((resolve) => {
+    releaseExecVerdict = resolve;
+  });
+  let pluginCalls = 0;
+  let execCalls = 0;
+
+  const { bridge } = makeBridge({
+    listIds: [], // exec's own list call succeeds and reports nothing pending
+    handlers: {
+      "approval.get": (params) =>
+        params.id === PLUGIN_APPROVAL_ID ? pluginSnapshot() : execSnapshot(),
+      "plugin.approval.list": () => {
+        throw new Error("connection lost");
+      },
+    },
+    requestApproval: (req) => {
+      if (req.action.surface === "agent_tool_call") {
+        pluginCalls += 1;
+        return pluginVerdict;
+      }
+      execCalls += 1;
+      return execVerdict;
+    },
+  });
+
+  // Start driving both approvals but do not await completion — by the time each `handle()` call
+  // returns, its synchronous prefix has already recorded it in the bridge's in-flight map (the
+  // first `await` inside `driveApproval` comes later, at the `approval.get` round trip).
+  const pluginInFlight = bridge.handle(pluginRequested());
+  const execInFlight = bridge.handle(requested());
+
+  await bridge.project();
+
+  // The plugin id's family failed to enumerate it — pre-fix, the prune deleted it anyway (it
+  // checked membership in the UNION of both lists' ids, not per-family success), so a duplicate
+  // live event would be driven a second time: a second prompt to the human for the exact same
+  // approval. Post-fix it must still be recognized as in flight.
+  const duplicatePlugin = await bridge.handle(pluginRequested());
+  assert.deepEqual(
+    duplicatePlugin,
+    { kind: "ignored" },
+    "an approval whose family's list call failed must still be recognized as in flight",
+  );
+  assert.equal(pluginCalls, 1, "the plugin approval must never be prompted twice");
+
+  // The exec id's family succeeded and reported nothing pending, so it is legitimately pruned —
+  // exec reconciliation must be unaffected by the plugin family's list failure, so a duplicate
+  // live event IS driven again.
+  releaseExecVerdict(verdict("denied"));
+  const duplicateExec = await bridge.handle(requested());
+  assert.notDeepEqual(duplicateExec, { kind: "ignored" });
+  assert.equal(execCalls, 2, "the exec approval is correctly re-driven once legitimately pruned");
+
+  await execInFlight;
+  releasePluginVerdict(verdict("denied"));
+  await pluginInFlight;
+});
+
+test("both list calls succeeding still prunes an in-flight id no longer reported pending (unchanged behavior)", async () => {
+  let releaseVerdict;
+  const pendingVerdict = new Promise((resolve) => {
+    releaseVerdict = resolve;
+  });
+  let calls = 0;
+
+  const { bridge } = makeBridge({
+    snapshot: pluginSnapshot(),
+    requestApproval: () => {
+      calls += 1;
+      return pendingVerdict;
+    },
+    listIds: [],
+    pluginListIds: [], // succeeds; PLUGIN_APPROVAL_ID is no longer reported pending
+  });
+
+  const inFlight = bridge.handle(pluginRequested());
+  await bridge.project();
+
+  // Both list calls succeeded, and neither reports PLUGIN_APPROVAL_ID pending, so it is
+  // legitimately pruned — a duplicate live event is driven again, not short-circuited as
+  // "ignored". This is the pre-existing prune behavior and must be unchanged by the fix.
+  releaseVerdict(verdict("denied"));
+  const duplicate = await bridge.handle(pluginRequested());
+  assert.notDeepEqual(duplicate, { kind: "ignored" });
+  assert.equal(calls, 2, "pruning when both lists succeed is unchanged: the id is re-driven");
+
+  await inFlight;
+});
+
+test("an id pruned by a successful list is not re-driven within the same project() call", async () => {
+  let releaseVerdict;
+  const pendingVerdict = new Promise((resolve) => {
+    releaseVerdict = resolve;
+  });
+  let calls = 0;
+
+  const { bridge, gateway } = makeBridge({
+    snapshot: pluginSnapshot(),
+    requestApproval: () => {
+      calls += 1;
+      return pendingVerdict;
+    },
+    listIds: [],
+    pluginListIds: [], // succeeds; PLUGIN_APPROVAL_ID is not (no longer) pending
+  });
+
+  const inFlight = bridge.handle(pluginRequested());
+  await bridge.project();
+
+  // project()'s own backfill loop only drives ids present in the freshly-fetched pending list —
+  // the pruned id isn't in it, so pruning itself must never trigger a second requestApproval call
+  // or a resolve within the SAME project() pass.
+  assert.equal(calls, 1, "the prune itself must never trigger a duplicate requestApproval call");
+  assert.deepEqual(gateway.resolves, []);
+
+  releaseVerdict(verdict("denied"));
+  await inFlight;
+});

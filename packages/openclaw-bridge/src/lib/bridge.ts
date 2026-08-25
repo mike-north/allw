@@ -155,8 +155,12 @@ function pluginEventFromSnapshot(snapshot: ApprovalSnapshot): PluginApprovalRequ
  */
 export class OpenClawBridge {
   private readonly deps: BridgeDeps;
-  /** Approval ids currently being driven, so a backfill racing a live event never double-raises. */
-  private readonly inFlight = new Set<string>();
+  /**
+   * Approval ids currently being driven, so a backfill racing a live event never double-raises.
+   * Keyed to each id's family so {@link project}'s per-family prune never drops an id whose OWN
+   * family's list call failed (§4.3) — see the prune-safety note there.
+   */
+  private readonly inFlight = new Map<string, ApprovalKind>();
   /** Ids the gateway has reported resolved, so a late backfill cannot resurrect them. */
   private readonly settled = new Set<string>();
 
@@ -180,9 +184,21 @@ export class OpenClawBridge {
    * The two lists are backfilled independently: a failure fetching one family's list (e.g. the
    * gateway drops mid-request) is logged and does not prevent the other family's backfill from
    * running.
+   *
+   * **Prune safety.** The reconcile prune below MUST only drop an in-flight id when that id's OWN
+   * family's list call succeeded. If it pruned by the union of both lists, a failed `plugin`
+   * list call would make every in-flight *exec* id — genuinely still pending, just absent from an
+   * error rather than absent from a real list — look unreconciled too, but worse: a failed
+   * `plugin` list call would incorrectly prune in-flight *plugin* ids (they are silently absent
+   * from `kindById` because their list call errored, not because the gateway stopped reporting
+   * them pending). A pruned-but-still-pending id then gets re-driven by the next live event or
+   * backfill pass, raising a duplicate approval prompt for the same approval. Tracking which
+   * families' list calls actually succeeded and gating the prune per id's own family on that
+   * closes the hole.
    */
   async project(): Promise<void> {
     const kindById = new Map<string, ApprovalKind>();
+    const succeededFamilies = new Set<ApprovalKind>();
     for (const [kind, method] of [
       ["exec", EXEC_APPROVAL_LIST_METHOD],
       ["plugin", PLUGIN_APPROVAL_LIST_METHOD],
@@ -190,6 +206,7 @@ export class OpenClawBridge {
       try {
         const ids = readApprovalListIds(await this.deps.gateway.request(method, {}));
         for (const id of ids) kindById.set(id, kind);
+        succeededFamilies.add(kind);
       } catch (err) {
         this.deps.logger.error("backfill.failed", {
           family: kind,
@@ -199,10 +216,13 @@ export class OpenClawBridge {
     }
 
     const pending = new Set(kindById.keys());
-    // Reconcile by approval id: anything we still hold that the gateway no longer lists as pending
-    // was resolved elsewhere; drop it rather than continuing to drive it.
-    for (const id of [...this.inFlight]) {
-      if (!pending.has(id)) this.inFlight.delete(id);
+    // Reconcile by approval id, but only within a family whose list call actually succeeded
+    // (see the prune-safety note above): anything we still hold in a succeeded family that the
+    // gateway no longer lists as pending was resolved elsewhere, so drop it. An id whose family's
+    // list call failed is left exactly as-is — neither pruned nor resurrected — until a later
+    // successful projection can reconcile it for real.
+    for (const [id, trackedKind] of [...this.inFlight]) {
+      if (succeededFamilies.has(trackedKind) && !pending.has(id)) this.inFlight.delete(id);
     }
     this.deps.logger.info("backfill.projected", { pending: pending.size });
 
@@ -329,7 +349,7 @@ export class OpenClawBridge {
     known?: ApprovalSnapshot,
   ): Promise<ApprovalOutcome> {
     if (this.settled.has(event.id) || this.inFlight.has(event.id)) return { kind: "ignored" };
-    this.inFlight.add(event.id);
+    this.inFlight.set(event.id, kind);
     try {
       // §6.1: `approval.get` is the authority for lifecycle and the reviewer contract, and it is
       // read *before* the context is built so a divergent pair is never shown to a human at all.
