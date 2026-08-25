@@ -197,6 +197,33 @@ device(s) once any surface resolves, and **dedupe** across transports. See [arch
 
 ---
 
+## Cancellation (integrator-initiated retract, #195)
+
+The **integrator** — not just a device — may cancel its own pending request before any human decides (e.g. an
+OpenClaw-style multi-surface integration where another surface answered first, so the human's phone/web inbox
+would otherwise keep showing a prompt whose outcome is already decided). This is **inbox hygiene, not
+authorization**, and is structurally distinct from a `Verdict`:
+
+- **Not a verdict.** A retract carries no `decision`, no signature, and is never produced by a device. It **never
+  appears in the audit chain** as a decision — there is nothing to append (no `AuditRecord` is written for a
+  retract). `requestApproval` surfaces it as a rejected call (`RequestRetractedError` in `@allw/sdk`), not as a
+  `Verdict` with some new decision value.
+- **A distinct terminal status: `retracted`.** Requests resolve to exactly one of `pending → {resolved | expired |
+retracted}`. `retracted` (cancelled by the submitting integrator) is **distinct from** `expired` (the fail-closed
+  timeout, §Invariants #7) — different cause, same "no verdict will ever arrive" shape.
+- **Cannot discard a real decision.** A retract is refused once the request already reached a terminal state:
+  `resolved` (a device decided — the recorded verdict stands) or `expired`. Only a still-`pending` request can be
+  retracted; a race between a human deciding and an integrator cancelling always resolves in the human's favor.
+- **Scoped to the submitting integrator.** Authorized the same way as polling/wait — the `request_auth_token`
+  `POST /requests` returned — so an integrator can retract only the request it submitted, never an arbitrary one.
+- **Devices clear it live.** A retract fans out the SAME `{ type: "retract", request_id }` message devices already
+  receive when any other surface resolves a request (§Cross-device coordination) — from the device's point of
+  view, "someone else settled this" and "the integrator cancelled it" both mean "stop showing it."
+
+See §Transport → Relay routing API for the endpoint and wire messages.
+
+---
+
 ## Transport
 
 Relay routes only — it sees the **ApprovalRequest envelope** (routing + lifecycle + the opaque
@@ -220,8 +247,9 @@ and the signed verdict — never plaintext, never a key it could sign with.
 | Method / path                                  | Who        | Purpose                                                                                                                                                                   |
 | ---------------------------------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `POST /requests`                               | integrator | Submit an ApprovalRequest envelope; fans out to online devices.                                                                                                           |
-| `GET  /requests/{id}`                          | integrator | Poll status → `pending` / terminal `expired` / `resolved` + verdict.                                                                                                      |
+| `GET  /requests/{id}`                          | integrator | Poll status → `pending` / terminal `expired` / `retracted` / `resolved` + verdict.                                                                                        |
 | `GET  /requests/{id}/wait` (WS)                | integrator | Block for the verdict; it is pushed the instant a device decides.                                                                                                         |
+| `POST /requests/{id}/retract`                  | integrator | Cancel its own still-`pending` request (#195, NOT a verdict) — 409 once `resolved`/`expired`.                                                                             |
 | `GET  /devices/{id}/connect?surface_id=…` (WS) | device     | Presence socket (hibernatable); flushes the offline queue on open. `surface_id` is optional visible-screen topology for deduping mirrored/native notification transports. |
 | `POST /account-states`                         | device     | Replace the relay-distributed set of root-signed account-state JWS documents for the account.                                                                             |
 | `GET  /account-states`                         | device     | Fetch root-signed account-state JWS documents before local actor-origin verification.                                                                                     |
@@ -234,7 +262,9 @@ upgrades). `POST /requests` returns `request_auth_token`; `GET /requests/{id}` a
 `GET /requests/{id}/wait` require it. `POST /account-states` and `GET /account-states`
 also require an enrolled device token: the relay distributes only opaque compact JWS account-state
 documents and cannot make a substituted actor key trusted. The relay stores only SHA-256 hashes of
-these bearer tokens.
+these bearer tokens. `POST /requests/{id}/retract` requires that SAME `request_auth_token` — scoped
+to exactly the request it was issued for, so an integrator can never retract a request it did not
+submit (#195).
 
 **Device socket messages** (JSON): relay → device `{ type: "request", request_id, envelope }` and
 `{ type: "retract", request_id }` (another surface resolved it); device → relay
@@ -257,6 +287,15 @@ that retracts expired requests from devices without waiting for a read is tracke
 still enrolled — a revoked device cannot drive a request to `resolved`. `GET /requests/{id}` no longer treats
 `request_id` alone as sufficient authority; callers must also present the request token returned by
 `POST /requests` (#89).
+
+**Integrator retract** (§Cancellation, #195): `POST /requests/{id}/retract` transitions a `pending` request straight
+to the terminal `retracted` status — NOT a verdict, distinct from `expired`. It fans out `{ type: "retract",
+request_id }` to connected devices (the same message a resolve/expiry already sends) and pushes
+`{ type: "retracted", request_id }` to any live `…/wait` socket, then closes it. A verdict submitted for an
+already-retracted request is refused (acked `retracted`, not stored) — retraction, like expiry, can never be
+overridden by a late decision. Retracting a `resolved` or already-`expired` request is refused (409): a retract can
+only affect a request still awaiting a decision, never discard one that already landed. Retracting an
+already-`retracted` request is idempotent (200).
 
 ---
 

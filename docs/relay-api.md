@@ -42,7 +42,7 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   | `pairing_auth_token`    | `POST /pairing/start`         | `POST /pairing/complete`                                                      | 10 min (`PAIRING_TTL_MS`)    |
   | `enrollment_auth_token` | `POST /enrollments/start`     | `GET …/enrollments/{id}/csr`, `POST …/cert`, `POST …/abort` (the root holder) | 10 min (`ENROLLMENT_TTL_MS`) |
   | `device_auth_token`     | `POST /pairing/complete`      | all `devices/{id}/…`, `actors`, `account-states`, the enrollee's courier legs | until revoked                |
-  | `request_auth_token`    | `POST /requests` (integrator) | `requests/{id}` polling/wait                                                  | 7 days post-terminal         |
+  | `request_auth_token`    | `POST /requests` (integrator) | `requests/{id}` polling/wait, `requests/{id}/retract`                         | 7 days post-terminal         |
 
 - **Errors** are plain bodies with the status code; `400` covers malformed JSON / bad fields /
   unexpected envelope keys (zero-knowledge guard).
@@ -71,13 +71,13 @@ RECEIVE PENDING  (pick one; native app SHOULD use the WebSocket)
         → { envelopes: [ ApprovalEnvelope … ] }    (poll, 1–5s)
   B) GET  /{acct}/devices/{device_id}/connect?surface_id=…&auth=<device_auth_token>  (WebSocket)
         ← { type:"request", request_id, envelope }   (on connect: offline queue flush; then live)
-        ← { type:"retract", request_id }             (another surface/device resolved it, or expired)
+        ← { type:"retract", request_id }             (resolved/expired elsewhere, or the integrator cancelled it — #195)
 
 DECRYPT / VERIFY / RENDER  (on device, via AllwIOSApprover → UniFFI → core; NOT the relay)
 
 SUBMIT VERDICT   ⚠ WebSocket ONLY — there is no HTTP verdict endpoint
   → { type:"verdict", request_id, verdict }   (verdict = JWS signed by the device key)
-  ← { type:"ack", request_id, status:"resolved" | "already_resolved" | "expired" }
+  ← { type:"ack", request_id, status:"resolved" | "already_resolved" | "expired" | "retracted" }
 
 REFRESH TRUST  (periodically, to verify actor attestation / feed AccountStateResolver)
   GET /{acct}/account-states            (Bearer device_auth_token)
@@ -227,7 +227,18 @@ account-root signature on device**; reject rollbacks below your highest-verified
 `privacy_preference?`-reserved; any other key ⇒ 400; `expires_at ≤ now` ⇒ 400). → **202**
 `{ request_id, status:"pending", delivered_to, push_wakeups, request_auth_token }`. 409 on dup `id`.
 **`GET /{acct}/requests/{id}`** and **`GET /{acct}/requests/{id}/wait`** (WS) — Bearer
-`request_auth_token`; poll/await `{ status, verdict? }`.
+`request_auth_token`; poll/await `{ status, verdict? }`. `status` is `pending`, terminal `expired`,
+terminal `retracted` (see below), or `resolved` (+ `verdict`).
+
+**`POST /{acct}/requests/{id}/retract`** — Bearer `request_auth_token`, scoped to exactly the
+request that token was issued for (issue #195). Cancels the integrator's own still-`pending`
+request — **NOT a verdict**; it never appears in the audit chain as a decision. No body. → **200**
+`{ request_id, status:"retracted" }`. Fans out `{type:"retract", request_id}` to connected devices
+(the same message a resolve/expiry already sends) and pushes `{type:"retracted", request_id}` to
+any live `…/wait` socket, then closes it. **409** if the request already reached a real terminal
+state (`resolved` — a device decided, the verdict stands; or `expired`) — a retract can never
+discard a decision or override the fail-closed timeout. Idempotent on an already-`retracted`
+request (200). `404` unknown request; `401`/`403` missing/wrong/cross-request token.
 
 ---
 
@@ -239,16 +250,19 @@ offline queue (still-pending, non-expired) as `request` messages. Hibernatable.
 **relay → device**
 
 - `{ "type": "request", "request_id": string, "envelope": ApprovalEnvelope }`
-- `{ "type": "retract", "request_id": string }` — resolved elsewhere or expired; clear the notification.
+- `{ "type": "retract", "request_id": string }` — resolved elsewhere, expired, or the submitting
+  integrator cancelled it (`POST …/requests/{id}/retract`, #195); clear the notification either way.
 - `{ "type": "error", "error": string }` — your last message was malformed.
 
 **device → relay**
 
 - `{ "type": "verdict", "request_id": string, "verdict": <Verdict object> }` — the JWS-signed
   decision (the `SignedVerdict.signedVerdictJson` the core produced; see `docs/contract.md` Verdict).
-- relay replies `{ "type": "ack", "request_id": string, "status": "resolved" | "already_resolved" | "expired" }`.
+- relay replies
+  `{ "type": "ack", "request_id": string, "status": "resolved" | "already_resolved" | "expired" | "retracted" }`.
   Idempotent: a second verdict is `already_resolved` (not overwritten); a verdict past `expires_at`
-  is `expired` (rejected, fail-closed).
+  is `expired` (rejected, fail-closed); a verdict for a request the integrator already cancelled is
+  `retracted` (rejected — a retract is never overridable, #195).
 
 Only device sockets may submit verdicts. On the first valid verdict the relay marks the request
 `resolved`, retracts it from other device sockets, and pushes it to any waiting integrator.
@@ -314,6 +328,9 @@ approver:{account_id,device_id}, sig:<compact JWS>, note?, challenge_response?, 
    - `expired` — the request passed its deadline before your verdict landed; **refused, fail-closed.**
      Surface this to the user ("expired before your approval reached the relay") — they must not believe
      it took effect.
+   - `retracted` — the submitting integrator cancelled the request before your verdict landed (#195);
+     **refused — a retract is never overridable.** Treat like `already_resolved`: clear the row (it
+     will also arrive as a `retract`), but there is no winning decision to reconcile against.
 
    Keep the package's local terminal commit in `decide()` (sign-failure already restores `.pending`);
    treat a **non-`resolved` ack as a correction** and reconcile (a `GET /inbox` is the simplest
