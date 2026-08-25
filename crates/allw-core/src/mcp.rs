@@ -109,7 +109,7 @@ pub fn action_from_mcp_tool_call(
     tool: &str,
     params: serde_json::Value,
 ) -> ActionRecord {
-    build_tool_call_action(Surface::McpToolCall, server, tool, Some(params))
+    build_tool_call_action(Surface::McpToolCall, server, tool, Some(params), None)
 }
 
 /// Build an [`ActionRecord`] for an agent-runtime/plugin-owned tool call gated by the harness
@@ -160,31 +160,78 @@ pub fn action_from_agent_tool_call(
     tool: &str,
     params: Option<serde_json::Value>,
 ) -> ActionRecord {
-    build_tool_call_action(Surface::AgentToolCall, server, tool, params)
+    build_tool_call_action(Surface::AgentToolCall, server, tool, params, None)
+}
+
+/// Builds an [`ActionRecord`] for an agent-runtime/plugin-owned tool call using an **explicit**
+/// `raw` override instead of the synthesized `"<server>.<tool>(...)"` display.
+///
+/// Some callers already hold human-authored reviewer prose for the action — e.g. an OpenClaw
+/// plugin permission request's `description`/`detail` (`docs/openclaw-integration.md` §5.2:
+/// "`syntactic.raw` = `description`, plus `detail` when present"). For those callers the
+/// synthesized `<server>.<tool>()` display (what [`action_from_agent_tool_call`] produces when
+/// `params` is `None`) would silently discard that prose from the one syntactic field meant to
+/// carry the reviewer-facing text. Use this builder instead; use
+/// [`action_from_agent_tool_call`] when no such prose exists and the synthesized display is the
+/// best available `raw`.
+///
+/// `raw` is bound **verbatim** — it is never re-derived from `params`, mirroring
+/// [`crate::command::action_from_argv`]'s "bind the caller's raw, never re-tokenize/re-derive"
+/// discipline for the `command` surface.
+///
+/// # Arguments
+///
+/// * `server` – the gating provider identity (e.g. an OpenClaw plugin id).
+/// * `tool`   – the tool name within that provider.
+/// * `raw`    – the reviewer-facing prose to bind verbatim as `syntactic.raw`.
+/// * `params` – tool call parameters, if any structured form is available. `None` when the
+///   caller has no structured parameters to offer.
+///
+/// # Returns
+///
+/// An [`ActionRecord`] identical to [`action_from_agent_tool_call`]'s, except `syntactic.raw` is
+/// `raw` verbatim rather than the synthesized display.
+pub fn action_from_agent_tool_call_with_raw(
+    server: &str,
+    tool: &str,
+    raw: &str,
+    params: Option<serde_json::Value>,
+) -> ActionRecord {
+    build_tool_call_action(
+        Surface::AgentToolCall,
+        server,
+        tool,
+        params,
+        Some(raw.to_string()),
+    )
 }
 
 /// Shared syntactic-substrate reduction for the `mcp_tool_call` and `agent_tool_call` surfaces.
 ///
 /// Both surfaces reduce to the same `(server, tool, params)` function-identity shape
 /// (`docs/policy-seam.md` §Structure vs. data in the ActionRecord); only the `surface` tag
-/// differs. Kept private so the two public builders above cannot drift apart on risk heuristic,
+/// differs. Kept private so the public builders above cannot drift apart on risk heuristic,
 /// `raw` formatting, or which fields are populated.
+///
+/// `raw_override`, when `Some`, is bound verbatim as `syntactic.raw` instead of the synthesized
+/// `"<server>.<tool>(...)"` display (see [`action_from_agent_tool_call_with_raw`]).
 fn build_tool_call_action(
     surface: Surface,
     server: &str,
     tool: &str,
     params: Option<serde_json::Value>,
+    raw_override: Option<String>,
 ) -> ActionRecord {
     // A serde_json::Value always serializes; surface any unexpected failure rather than
     // silently emitting a `raw` that disagrees with `syntactic.params`.
-    let raw = match &params {
+    let raw = raw_override.unwrap_or_else(|| match &params {
         Some(value) => {
             let compact_params = serde_json::to_string(value)
                 .expect("serde_json::Value always serializes to a string");
             format!("{server}.{tool}({compact_params})")
         }
         None => format!("{server}.{tool}()"),
-    };
+    });
     let risk = v1_risk_from_tool_name(tool);
 
     ActionRecord {
@@ -693,5 +740,81 @@ mod tests {
         assert_eq!(mcp.syntactic.params, agent.syntactic.params);
         assert_eq!(mcp.syntactic.raw, agent.syntactic.raw);
         assert_eq!(mcp.risk, agent.risk);
+    }
+
+    // ── action_from_agent_tool_call_with_raw ─────────────────────────────────────
+
+    /// The whole point of the `_with_raw` builder: `raw` is bound verbatim, never the synthesized
+    /// `<server>.<tool>()` display (docs/openclaw-integration.md §5.2: `syntactic.raw` =
+    /// `description`, plus `detail` when present).
+    #[test]
+    fn agent_tool_call_with_raw_binds_raw_verbatim() {
+        let r = action_from_agent_tool_call_with_raw(
+            "openclaw",
+            "deploy_service",
+            "This plugin wants to deploy to production.",
+            None,
+        );
+        assert_eq!(
+            r.syntactic.raw.as_deref(),
+            Some("This plugin wants to deploy to production.")
+        );
+    }
+
+    /// `raw` is bound verbatim even when `params` is `Some` — unlike the plain builder, `raw` is
+    /// never re-derived from `params` here.
+    #[test]
+    fn agent_tool_call_with_raw_ignores_params_for_raw_derivation() {
+        let params = json!({ "target": "prod" });
+        let r = action_from_agent_tool_call_with_raw(
+            "openclaw",
+            "deploy_service",
+            "custom reviewer prose",
+            Some(params.clone()),
+        );
+        assert_eq!(r.syntactic.raw.as_deref(), Some("custom reviewer prose"));
+        assert_eq!(r.syntactic.params.as_ref(), Some(&params));
+    }
+
+    /// Surface, schema version, server/tool identity, risk heuristic, and the None-in-v1 reserved
+    /// fields must all match [`action_from_agent_tool_call`] exactly — only `raw` differs.
+    #[test]
+    fn agent_tool_call_with_raw_matches_plain_builder_except_raw() {
+        let plain = action_from_agent_tool_call("openclaw", "deploy_service", None);
+        let with_raw =
+            action_from_agent_tool_call_with_raw("openclaw", "deploy_service", "custom", None);
+
+        assert_eq!(plain.surface, with_raw.surface);
+        assert_eq!(plain.record_schema_version, with_raw.record_schema_version);
+        assert_eq!(plain.syntactic.server, with_raw.syntactic.server);
+        assert_eq!(plain.syntactic.tool, with_raw.syntactic.tool);
+        assert_eq!(plain.syntactic.params, with_raw.syntactic.params);
+        assert_eq!(plain.risk, with_raw.risk);
+        assert_eq!(plain.capabilities, with_raw.capabilities);
+        assert_eq!(plain.scope, with_raw.scope);
+        assert_ne!(plain.syntactic.raw, with_raw.syntactic.raw);
+    }
+
+    /// An empty `raw` string is bound as-is (empty string, not `None`) — the caller is
+    /// responsible for supplying a non-empty gloss; this builder does not validate prose content.
+    #[test]
+    fn agent_tool_call_with_raw_accepts_empty_string_verbatim() {
+        let r = action_from_agent_tool_call_with_raw("openclaw", "deploy_service", "", None);
+        assert_eq!(r.syntactic.raw.as_deref(), Some(""));
+    }
+
+    /// An `agent_tool_call_with_raw` record must survive a full serde round-trip.
+    #[test]
+    fn agent_tool_call_with_raw_round_trips_through_json() {
+        let record = action_from_agent_tool_call_with_raw(
+            "openclaw",
+            "deploy_service",
+            "custom reviewer prose",
+            None,
+        );
+        let serialised = serde_json::to_string(&record).expect("ActionRecord must serialise");
+        let deserialised: ActionRecord =
+            serde_json::from_str(&serialised).expect("ActionRecord must deserialise");
+        assert_eq!(record, deserialised);
     }
 }

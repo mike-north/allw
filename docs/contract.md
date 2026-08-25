@@ -96,14 +96,20 @@ function identity, parallel to a command's program name; both are structure. In 
 tier the integrator SHOULD populate this field so the relay can use structure for routing intelligence. In the
 paranoid/enterprise tier (reserved; not built in v1) this field is omitted.
 
+**`action_structure` itself is not yet implemented in any surface** (v1's `ApprovalRequest` envelope carries only
+`v` · `id` · `created_at` · `expires_at` · `approver` · `context_ciphertext` — routing + lifecycle metadata, with
+no structure field at all). An unrecognized `surface` string still fails closed today: it fails to deserialize in
+the Rust core rather than being silently accepted, so this gap has no fail-open consequence; it only means the
+relay cannot yet use structure for routing intelligence. See `docs/openclaw-integration.md` §12 for tracking.
+
 `privacy_preference` is a **RESERVED** field: `null` (or absent) in v1 is equivalent to `"default"`.
 The three tiers — and what each allows the relay to observe — are:
 
-| Value                        | Relay sees in plaintext                                | v1 status               |
-| ---------------------------- | ------------------------------------------------------ | ----------------------- |
-| `"default"` (or null/absent) | `action_structure` (structure only) + routing metadata | **implemented**         |
-| `"paranoid"`                 | routing metadata only; `action_structure` omitted      | **reserved; not built** |
-| `"ai-summary"`               | future tier                                            | **reserved; not built** |
+| Value                        | Relay sees in plaintext                                | v1 status                                                          |
+| ---------------------------- | ------------------------------------------------------ | ------------------------------------------------------------------ |
+| `"default"` (or null/absent) | `action_structure` (structure only) + routing metadata | routing metadata **implemented**; `action_structure` **not built** |
+| `"paranoid"`                 | routing metadata only; `action_structure` omitted      | **reserved; not built**                                            |
+| `"ai-summary"`               | future tier                                            | **reserved; not built**                                            |
 
 Routing + lifecycle + the opaque ciphertext, and at most action structure — nothing more. `request_hash` is
 **not** an envelope field — it is computed over the `ApprovalContext` (below) by the integrator (locally,

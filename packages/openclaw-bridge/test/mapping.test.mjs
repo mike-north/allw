@@ -17,17 +17,26 @@ import { loadWasm } from "@allw/hook";
 
 import {
   buildExecApprovalRequest,
+  buildPluginApprovalRequest,
   execSummary,
   floorRisk,
+  pluginSummary,
   reversibleForRisk,
+  slugifyTitle,
 } from "../dist/index.js";
 import {
   AGENT_ID,
   APPROVAL_ID,
   GATEWAY_ID,
+  PLUGIN_APPROVAL_ID,
+  PLUGIN_ID,
   SESSION_KEY,
+  TOOL_CALL_ID,
+  TOOL_NAME,
   execEvent,
   execSnapshot,
+  pluginEvent,
+  pluginSnapshot,
 } from "./support/fixtures.mjs";
 
 const wasm = await loadWasm();
@@ -37,6 +46,15 @@ function build(overrides = {}) {
   return buildExecApprovalRequest(wasm, {
     event: overrides.event ?? execEvent(),
     snapshot: overrides.snapshot ?? execSnapshot(),
+    gatewayId: overrides.gatewayId ?? GATEWAY_ID,
+    timeoutMs: overrides.timeoutMs ?? TIMEOUT_MS,
+  });
+}
+
+function buildPlugin(overrides = {}) {
+  return buildPluginApprovalRequest(wasm, {
+    event: overrides.event ?? pluginEvent(),
+    snapshot: overrides.snapshot ?? pluginSnapshot(),
     gatewayId: overrides.gatewayId ?? GATEWAY_ID,
     timeoutMs: overrides.timeoutMs ?? TIMEOUT_MS,
   });
@@ -361,5 +379,317 @@ test("execSummary composes host/nodeId into a single locus component (§6.2)", (
       cwd: "/",
     }),
     "OpenClaw gw · node/n1 · agent a · ls",
+  );
+});
+
+// ── §5.2 plugin permission requests ─────────────────────────────────────────────
+
+test("plugin approvals map to surface 'agent_tool_call' (§5.2)", () => {
+  const result = buildPlugin();
+  assert.equal(result.kind, "request");
+  assert.equal(result.request.action.surface, "agent_tool_call");
+  assert.equal(result.request.action.recordSchemaVersion, 1);
+});
+
+test("syntactic.server is pluginId, syntactic.tool is toolName (§5.2)", () => {
+  const result = buildPlugin();
+  assert.equal(result.request.action.syntactic.server, PLUGIN_ID);
+  assert.equal(result.request.action.syntactic.tool, TOOL_NAME);
+});
+
+test("syntactic.server falls back to 'openclaw' when pluginId is absent (§5.2)", () => {
+  const result = buildPlugin({ event: pluginEvent({ request: { pluginId: undefined } }) });
+  assert.equal(result.kind, "request");
+  assert.equal(result.request.action.syntactic.server, "openclaw");
+});
+
+test("syntactic.tool falls back to a normalized slug of title when toolName is absent (§5.2)", () => {
+  const result = buildPlugin({
+    event: pluginEvent({ request: { toolName: undefined, title: "Deploy Service Now!" } }),
+    snapshot: pluginSnapshot({ presentation: { title: "Deploy Service Now!" } }),
+  });
+  assert.equal(result.kind, "request");
+  assert.equal(result.request.action.syntactic.tool, "deploy-service-now");
+});
+
+test("syntactic.params is absent — OpenClaw exposes no structured parameters (§5.2)", () => {
+  const result = buildPlugin();
+  assert.ok(
+    !("params" in result.request.action.syntactic),
+    "params must be absent, not synthesized",
+  );
+});
+
+test("syntactic.raw is description, plus detail when present (§5.2)", () => {
+  const withoutDetail = buildPlugin();
+  assert.equal(
+    withoutDetail.request.action.syntactic.raw,
+    "This plugin wants to deploy to production.",
+  );
+
+  const withDetail = buildPlugin({
+    event: pluginEvent({ request: { detail: "It will restart 3 pods." } }),
+  });
+  assert.equal(
+    withDetail.request.action.syntactic.raw,
+    "This plugin wants to deploy to production.\n\nIt will restart 3 pods.",
+  );
+});
+
+test("risk comes from severity: info→low, warning→medium, critical→critical (§5.2, §6.4)", () => {
+  const info = buildPlugin({ event: pluginEvent({ request: { severity: "info" } }) });
+  assert.equal(info.request.risk, "low");
+
+  const warning = buildPlugin({ event: pluginEvent({ request: { severity: "warning" } }) });
+  assert.equal(warning.request.risk, "medium");
+
+  const critical = buildPlugin({ event: pluginEvent({ request: { severity: "critical" } }) });
+  assert.equal(critical.request.risk, "critical");
+});
+
+test("absent severity defaults to the upstream 'warning' default (medium risk) (§5.2)", () => {
+  const result = buildPlugin({ event: pluginEvent({ request: { severity: undefined } }) });
+  assert.equal(result.request.risk, "medium");
+});
+
+test("summary follows the §6.2 plugin template", () => {
+  assert.equal(
+    buildPlugin().request.summary,
+    `OpenClaw ${GATEWAY_ID} · agent ${AGENT_ID} · ${PLUGIN_ID}/${TOOL_NAME}: Deploy service — ` +
+      "This plugin wants to deploy to production.",
+  );
+});
+
+test("summary renders unknown components as the literal 'unknown' (§6.2)", () => {
+  // The snapshot is canonical (§6.1) — both sources must omit a field for it to render "unknown".
+  const result = buildPlugin({
+    event: pluginEvent({
+      request: { agentId: undefined, title: undefined, description: undefined },
+    }),
+    snapshot: pluginSnapshot({
+      presentation: { title: undefined, description: undefined, agentId: undefined },
+    }),
+  });
+  assert.equal(
+    result.request.summary,
+    `OpenClaw ${GATEWAY_ID} · agent unknown · ${PLUGIN_ID}/${TOOL_NAME}: unknown — unknown`,
+  );
+});
+
+test("actor is openclaw:<gateway-id> with kind 'openclaw' (§6.2, §7.1)", () => {
+  assert.deepEqual(buildPlugin().request.actor, { id: `openclaw:${GATEWAY_ID}`, kind: "openclaw" });
+});
+
+test("chain carries the approval id, session key, and tool call id (§6.2)", () => {
+  assert.deepEqual(buildPlugin().request.chain, [
+    `openclaw:${GATEWAY_ID}:approval:${PLUGIN_APPROVAL_ID}`,
+    `openclaw:session:${SESSION_KEY}`,
+    `openclaw:tool_call:${TOOL_CALL_ID}`,
+  ]);
+});
+
+test("chain omits session/tool-call components OpenClaw did not supply (§6.2)", () => {
+  const result = buildPlugin({
+    event: pluginEvent({ request: { sessionKey: undefined, toolCallId: undefined } }),
+  });
+  assert.deepEqual(result.request.chain, [`openclaw:${GATEWAY_ID}:approval:${PLUGIN_APPROVAL_ID}`]);
+});
+
+test("allowed_decisions is always ['approved','denied'] for plugin approvals too (§6.2)", () => {
+  for (const allowedDecisions of [["deny"], ["allow-once", "deny"], ["allow-always", "deny"]]) {
+    const result = buildPlugin({
+      snapshot: pluginSnapshot({ presentation: { allowedDecisions } }),
+    });
+    assert.deepEqual(result.request.constraints.allowedDecisions, ["approved", "denied"]);
+  }
+});
+
+test("challenge_required/reversible follow the shared risk rule for plugin approvals (§6.4)", () => {
+  const critical = buildPlugin({ event: pluginEvent({ request: { severity: "critical" } }) });
+  assert.equal(critical.request.constraints.challengeRequired, true);
+  assert.equal(critical.request.reversible, false);
+
+  const info = buildPlugin({ event: pluginEvent({ request: { severity: "info" } }) });
+  assert.equal(info.request.constraints.challengeRequired, false);
+  assert.equal(info.request.reversible, true);
+});
+
+test("the derived timeout is carried onto the plugin request (§8)", () => {
+  assert.equal(buildPlugin({ timeoutMs: 31_337 }).request.timeoutMs, 31_337);
+});
+
+// ── negatives: the four rejection paths at the boundary (§9) ───────────────────
+
+test("neither toolName nor a usable title slug is build-error (§5.2, §9)", () => {
+  const result = buildPlugin({
+    event: pluginEvent({ request: { toolName: undefined, title: "!!!" } }),
+    snapshot: pluginSnapshot({ presentation: { title: "!!!" } }),
+  });
+  assert.equal(result.kind, "deny");
+  assert.equal(result.reason, "build-error");
+});
+
+test("a divergent presentation.kind is presentation-divergence (§5.3, §9)", () => {
+  const result = buildPlugin({ snapshot: pluginSnapshot({ presentation: { kind: "exec" } }) });
+  assert.equal(result.kind, "deny");
+  assert.equal(result.reason, "presentation-divergence");
+});
+
+test("a snapshot title that differs from the event's is presentation-divergence (§6.1, §9)", () => {
+  const result = buildPlugin({
+    snapshot: pluginSnapshot({ presentation: { title: "Something else entirely" } }),
+  });
+  assert.equal(result.kind, "deny");
+  assert.equal(result.reason, "presentation-divergence");
+  assert.equal(result.detail.includes("title"), true);
+});
+
+test("a snapshot description that differs from the event's is presentation-divergence (§6.1, §9)", () => {
+  const result = buildPlugin({
+    snapshot: pluginSnapshot({ presentation: { description: "Something else entirely" } }),
+  });
+  assert.equal(result.kind, "deny");
+  assert.equal(result.reason, "presentation-divergence");
+  assert.equal(result.detail.includes("description"), true);
+});
+
+test("a snapshot pluginId that differs from the event's is presentation-divergence (§6.1, §9)", () => {
+  const result = buildPlugin({
+    snapshot: pluginSnapshot({ presentation: { pluginId: "some-other-plugin" } }),
+  });
+  assert.equal(result.kind, "deny");
+  assert.equal(result.reason, "presentation-divergence");
+  assert.equal(result.detail.includes("pluginId"), true);
+});
+
+test("a snapshot toolName that differs from the event's is presentation-divergence (§6.1, §9)", () => {
+  const result = buildPlugin({
+    snapshot: pluginSnapshot({ presentation: { toolName: "some_other_tool" } }),
+  });
+  assert.equal(result.kind, "deny");
+  assert.equal(result.reason, "presentation-divergence");
+  assert.equal(result.detail.includes("toolName"), true);
+});
+
+test("a snapshot detail that differs from the event's is presentation-divergence (§6.1, §9)", () => {
+  const result = buildPlugin({
+    event: pluginEvent({ request: { detail: "It will restart 3 pods." } }),
+    snapshot: pluginSnapshot({ presentation: { detail: "It will do something else entirely." } }),
+  });
+  assert.equal(result.kind, "deny");
+  assert.equal(result.reason, "presentation-divergence");
+  assert.equal(result.detail.includes("detail"), true);
+});
+
+test("a snapshot agentId that differs from the event's is presentation-divergence (§6.1, §9)", () => {
+  const result = buildPlugin({
+    snapshot: pluginSnapshot({ presentation: { agentId: "some-other-agent" } }),
+  });
+  assert.equal(result.kind, "deny");
+  assert.equal(result.reason, "presentation-divergence");
+  assert.equal(result.detail.includes("agentId"), true);
+});
+
+test("severity divergence is the sharpest case: a lower event severity never suppresses the snapshot's higher one (§5.2, §6.4, §9)", () => {
+  // The event claims "warning" (medium risk); the pinned, canonical snapshot says "critical". If
+  // this were not caught, the number-match challenge would be silently skipped for what is really
+  // a critical-risk approval.
+  const result = buildPlugin({
+    event: pluginEvent({ request: { severity: "warning" } }),
+    snapshot: pluginSnapshot({ presentation: { severity: "critical" } }),
+  });
+  assert.equal(result.kind, "deny");
+  assert.equal(result.reason, "presentation-divergence");
+  assert.equal(result.detail.includes("severity"), true);
+});
+
+test("the snapshot's severity is canonical when the event omits it (§5.2, §6.1)", () => {
+  const result = buildPlugin({
+    event: pluginEvent({ request: { severity: undefined } }),
+    snapshot: pluginSnapshot({ presentation: { severity: "critical" } }),
+  });
+  assert.equal(result.kind, "request");
+  assert.equal(result.request.risk, "critical");
+  assert.equal(result.request.constraints.challengeRequired, true);
+});
+
+test("an allowedDecisions mismatch between the event and the snapshot is presentation-divergence (§6.1, §9)", () => {
+  const result = buildPlugin({
+    event: pluginEvent({ request: { allowedDecisions: ["deny"] } }),
+    snapshot: pluginSnapshot({ presentation: { allowedDecisions: ["allow-once", "deny"] } }),
+  });
+  assert.equal(result.kind, "deny");
+  assert.equal(result.reason, "presentation-divergence");
+  assert.equal(result.detail.includes("allowedDecisions"), true);
+});
+
+test("allowedDecisions order does not count as divergence (§6.1)", () => {
+  const result = buildPlugin({
+    event: pluginEvent({ request: { allowedDecisions: ["deny", "allow-once"] } }),
+    snapshot: pluginSnapshot({ presentation: { allowedDecisions: ["allow-once", "deny"] } }),
+  });
+  assert.equal(result.kind, "request");
+});
+
+test("a sanitized snapshot that omits title/description is NOT a divergence (§6.1)", () => {
+  // The reviewer projection is allowed to withhold fields; only a *different* value is divergence.
+  const result = buildPlugin({
+    snapshot: pluginSnapshot({ presentation: { title: undefined, description: undefined } }),
+  });
+  assert.equal(result.kind, "request");
+});
+
+test("a severity value outside the known set is build-error (§5.2, §9)", () => {
+  const result = buildPlugin({ event: pluginEvent({ request: { severity: "urgent" } }) });
+  assert.equal(result.kind, "deny");
+  assert.equal(result.reason, "build-error");
+});
+
+test("a plugin snapshot id that differs from the event id is presentation-divergence (§6.1, §9)", () => {
+  const result = buildPlugin({ snapshot: pluginSnapshot({ id: "apr_SOMETHING_ELSE" }) });
+  assert.equal(result.kind, "deny");
+  assert.equal(result.reason, "presentation-divergence");
+});
+
+test("a malformed gateway id denies config-error for plugin approvals too (§7.1, §9)", () => {
+  for (const bad of ["", "  ", "Has Space", "x".repeat(64)]) {
+    const result = buildPlugin({ gatewayId: bad });
+    assert.equal(result.kind, "deny", `expected '${bad}' to deny`);
+    assert.equal(result.reason, "config-error");
+  }
+});
+
+test("a non-pending plugin snapshot raises no allw request at all (§6.1 rule 4)", () => {
+  for (const status of ["resolved", "expired", "cancelled"]) {
+    const result = buildPlugin({ snapshot: pluginSnapshot({ status }) });
+    assert.equal(result.kind, "not-pending");
+    assert.equal(result.status, status);
+  }
+});
+
+// ── slugifyTitle / pluginSummary in isolation ───────────────────────────────────
+
+test("slugifyTitle normalizes to a lowercase, hyphenated token", () => {
+  assert.equal(slugifyTitle("Deploy Service Now!"), "deploy-service-now");
+  assert.equal(slugifyTitle("  leading/trailing  "), "leading-trailing");
+});
+
+test("slugifyTitle returns undefined for an absent or unusable title", () => {
+  assert.equal(slugifyTitle(undefined), undefined);
+  assert.equal(slugifyTitle("!!!"), undefined, "no alphanumeric characters ⇒ no usable slug");
+  assert.equal(slugifyTitle(""), undefined);
+});
+
+test("pluginSummary renders the §6.2 template with the resolved server/tool identity", () => {
+  assert.equal(
+    pluginSummary({
+      gatewayId: "gw",
+      agentId: "a",
+      server: "openclaw",
+      tool: "deploy_service",
+      title: "Deploy",
+      description: "deploy now",
+    }),
+    "OpenClaw gw · agent a · openclaw/deploy_service: Deploy — deploy now",
   );
 });

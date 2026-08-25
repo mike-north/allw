@@ -190,9 +190,17 @@ Checks to run (docs/openclaw-integration.md §11):
   5. Plan divergence     - after approving, mutate the command/cwd before the
                            forwarded system.run; the GATEWAY must reject it as an
                            approval mismatch (the two bindings compose).
-
-Deferred to a later slice (do not test here): plugin permission requests, the
-allow-once-unavailable path on a plugin request, and the plugin surface race.
+  6. Plugin approval     - trigger a plugin requireApproval hook; confirm the
+                           inbox renders <pluginId>/<toolName> with the plugin's
+                           title and description, and approving lets exactly
+                           that one call proceed.
+  7. allow-once          - trigger a plugin request declaring
+     unavailable            allowedDecisions: ["deny"], approve it in allw, and
+                           confirm the bridge resolves deny with
+                           no-expressible-allow rather than allow-always.
+  8. Surface race        - with the Control UI also connected, resolve there
+                           first and confirm the bridge observes applied:false,
+                           adopts the recorded winner, and does not re-submit.
 
 Paste this UAT result template back onto #182:
 
@@ -201,6 +209,9 @@ Paste this UAT result template back onto #182:
   Timeout: PASS/FAIL - bridge denied before the gateway deadline
   Actor identity: PASS/FAIL - inbox showed openclaw:$GATEWAY_ID
   Plan divergence: PASS/FAIL - gateway rejected the mutated run
+  Plugin approval: PASS/FAIL - plugin/tool identity and prose rendered; single call proceeded
+  allow-once unavailable: PASS/FAIL - denied with no-expressible-allow
+  Surface race: PASS/FAIL - applied:false honored, no re-submit
   Notes:
 
 Press Ctrl-C in this terminal when UAT is complete; cleanup will stop the relay

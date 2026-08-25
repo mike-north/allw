@@ -109,6 +109,20 @@ export interface McpCallAction {
   readonly params: unknown;
 }
 
+/**
+ * An agent-runtime/plugin-owned tool call (`agent_tool_call` surface,
+ * `docs/openclaw-integration.md` §5.2) — e.g. an OpenClaw plugin permission request. Shares the
+ * `(server, tool, params)` shape with {@link McpCallAction}, but `server` holds a gating provider
+ * id (a plugin id), never an MCP server name. Kept as its own type/`ApprovalContext.kind` branch
+ * (not folded into `"mcp"`) so the view model — and every renderer built on it — can never label a
+ * plugin-owned call as an MCP call it never was.
+ */
+export interface AgentToolCallAction {
+  readonly server: string;
+  readonly tool: string;
+  readonly params: unknown;
+}
+
 export interface NumberMatchChallenge {
   readonly kind: "number-match";
   readonly code: string;
@@ -116,9 +130,10 @@ export interface NumberMatchChallenge {
 }
 
 export interface ApprovalContext {
-  readonly kind: "command" | "mcp";
+  readonly kind: "command" | "mcp" | "agent_tool_call";
   readonly command?: CommandAction;
   readonly mcp?: McpCallAction;
+  readonly agentToolCall?: AgentToolCallAction;
   readonly actor: ApprovalActor;
   readonly risk: ApprovalRisk;
   readonly allowed_decisions: readonly ApprovalDecision[];
@@ -502,6 +517,9 @@ export function actionSummary(context: ApprovalContext): string {
   if (context.kind === "mcp" && context.mcp) {
     return `${context.mcp.server}.${context.mcp.tool}`;
   }
+  if (context.kind === "agent_tool_call" && context.agentToolCall) {
+    return `${context.agentToolCall.server}.${context.agentToolCall.tool}`;
+  }
   return "Unknown action";
 }
 
@@ -515,6 +533,13 @@ export function exactPlaintext(context: ApprovalContext): string {
   if (context.kind === "mcp" && context.mcp) {
     return `mcp: ${context.mcp.server}.${context.mcp.tool}\nparams: ${JSON.stringify(
       context.mcp.params,
+      null,
+      2,
+    )}`;
+  }
+  if (context.kind === "agent_tool_call" && context.agentToolCall) {
+    return `agent_tool_call: ${context.agentToolCall.server}.${context.agentToolCall.tool}\nparams: ${JSON.stringify(
+      context.agentToolCall.params,
       null,
       2,
     )}`;

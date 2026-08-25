@@ -5,6 +5,7 @@
 
 use allw_core::{
     action_from_agent_tool_call as core_action_from_agent_tool_call,
+    action_from_agent_tool_call_with_raw as core_action_from_agent_tool_call_with_raw,
     action_from_argv as core_action_from_argv, action_from_command as core_action_from_command,
     compute_request_hash as core_compute_request_hash, decrypt_context as core_decrypt_context,
     derive_number_match_challenge as core_derive_number_match_challenge,
@@ -195,6 +196,38 @@ pub fn action_from_agent_tool_call_json(
         Some(parse_json(&params_json, "agent tool params")?)
     };
     let action = core_action_from_agent_tool_call(&server, &tool, params);
+    to_json(&action, "ActionRecord")
+}
+
+/// Builds an [`ActionRecord`] for an agent-runtime/plugin-owned tool call, returning it as JSON,
+/// with an **explicit** `raw` override instead of the synthesized `"<server>.<tool>(...)"`
+/// display. Use this when the caller already holds human-authored reviewer prose for the action
+/// (e.g. an OpenClaw plugin permission request's `description`/`detail` —
+/// `docs/openclaw-integration.md` §5.2: `syntactic.raw` = `description`, plus `detail` when
+/// present); use [`action_from_agent_tool_call_json`] when no such prose exists.
+///
+/// `raw` is bound **verbatim** — it is never re-derived from `params_json`.
+///
+/// `params_json` is the tool-call parameters as a JSON value, or an empty string when the caller
+/// has no structured parameters to offer.
+///
+/// # Errors
+///
+/// Fails if `params_json` is non-empty and not valid JSON — fail-closed rather than building a
+/// record from unparseable parameters.
+#[uniffi::export]
+pub fn action_from_agent_tool_call_with_raw_json(
+    server: String,
+    tool: String,
+    raw: String,
+    params_json: String,
+) -> Result<String, AllwFfiError> {
+    let params: Option<serde_json::Value> = if params_json.is_empty() {
+        None
+    } else {
+        Some(parse_json(&params_json, "agent tool params")?)
+    };
+    let action = core_action_from_agent_tool_call_with_raw(&server, &tool, &raw, params);
     to_json(&action, "ActionRecord")
 }
 

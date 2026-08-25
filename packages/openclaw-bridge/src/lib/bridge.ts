@@ -34,6 +34,7 @@ import type { ApprovalGateway, GatewayEvent } from "./gateway.js";
 import type { Logger } from "./logging.js";
 import {
   buildExecApprovalRequest,
+  buildPluginApprovalRequest,
   type BridgeApprovalRequest,
   type DenyReason,
 } from "./mapping.js";
@@ -41,14 +42,23 @@ import {
   APPROVAL_GET_METHOD,
   APPROVAL_RESOLVE_METHOD,
   EXEC_APPROVAL_LIST_METHOD,
+  PLUGIN_APPROVAL_LIST_METHOD,
+  isExecPresentation,
+  isPluginPresentation,
   kindForEvent,
-  readApprovalListIds,
+  readApprovalList,
   readApprovalResolveResult,
   readApprovalSnapshot,
   readExecApprovalRequestedEvent,
+  readPluginApprovalRequestedEvent,
+  type ApprovalKind,
   type ApprovalSnapshot,
   type ExecApprovalRequestedEvent,
+  type PluginApprovalRequestedEvent,
 } from "./protocol.js";
+
+/** Either family's requested-event shape, once parsed (spec §5.1, §5.2). */
+type RequestedEvent = ExecApprovalRequestedEvent | PluginApprovalRequestedEvent;
 
 /** The verdict surface the bridge consumes from `@allw/sdk`. */
 export interface BridgeVerdict {
@@ -113,6 +123,7 @@ function gatewayNowMs(
  * §5.1's documented last-resort branch: the core tokenizes `presentation.commandText`, and the
  * absent `cwd` renders as an explicit "working directory not bound" line (§6.3). */
 function execEventFromSnapshot(snapshot: ApprovalSnapshot): ExecApprovalRequestedEvent | null {
+  if (!isExecPresentation(snapshot.presentation)) return null;
   const commandText = snapshot.presentation.commandText;
   if (commandText === undefined) return null;
   return {
@@ -124,13 +135,51 @@ function execEventFromSnapshot(snapshot: ApprovalSnapshot): ExecApprovalRequeste
 }
 
 /**
+ * Synthesize the plugin event shape from a sanitized snapshot, for approvals discovered by
+ * backfill (§4.3). Unlike exec, this is a **faithful** binding, not a last resort: the pinned
+ * `PluginApprovalPresentation` carries the real `pluginId`, `toolName`, `severity`, `detail`, and
+ * `agentId` (verified against the installed `@openclaw/gateway-protocol` schema — `title`,
+ * `description`, `severity`, and `allowedDecisions` are schema-required; `detail`/`pluginId`/
+ * `toolName`/`agentId` schema-optional). There is no untyped event to reconcile against during
+ * backfill, so every overlapping field here is copied straight from the snapshot; downstream
+ * reconciliation in `buildPluginApprovalRequest` trivially agrees with itself and the snapshot's
+ * values are used as canonical, exactly as they would be for a live event.
+ */
+function pluginEventFromSnapshot(snapshot: ApprovalSnapshot): PluginApprovalRequestedEvent | null {
+  if (!isPluginPresentation(snapshot.presentation)) return null;
+  const p = snapshot.presentation;
+  return {
+    id: snapshot.id,
+    expiresAtMs: snapshot.expiresAtMs,
+    ...(snapshot.createdAtMs !== undefined ? { createdAtMs: snapshot.createdAtMs } : {}),
+    request: {
+      pluginId: p.pluginId,
+      title: p.title,
+      description: p.description,
+      detail: p.detail,
+      severity: p.severity,
+      toolName: p.toolName,
+      agentId: p.agentId,
+      allowedDecisions: p.allowedDecisions,
+      // `toolCallId`/`sessionKey` are not part of the pinned presentation — backfill loses the
+      // `openclaw:tool_call:<id>` chain component a live event would have carried. That is a
+      // best-effort audit-correlation gap, not missing required substrate.
+    },
+  };
+}
+
+/**
  * The bridge: subscribes to approval broadcasts, projects pending approvals on every connect, and
  * drives each exec approval to a resolve.
  */
 export class OpenClawBridge {
   private readonly deps: BridgeDeps;
-  /** Approval ids currently being driven, so a backfill racing a live event never double-raises. */
-  private readonly inFlight = new Set<string>();
+  /**
+   * Approval ids currently being driven, so a backfill racing a live event never double-raises.
+   * Keyed to each id's family so {@link project}'s per-family prune never drops an id whose OWN
+   * family's list call failed (§4.3) — see the prune-safety note there.
+   */
+  private readonly inFlight = new Map<string, ApprovalKind>();
   /** Ids the gateway has reported resolved, so a late backfill cannot resurrect them. */
   private readonly settled = new Set<string>();
 
@@ -146,33 +195,62 @@ export class OpenClawBridge {
   }
 
   /**
-   * Re-project pending approvals from scratch: backfill the gateway's pending list, drop any
-   * in-memory entry the gateway no longer reports as pending, and drive the rest. Treating every
-   * reconnect as a fresh projection (not a delta) is what makes a transition that raced the backfill
-   * neither lost nor resurrected (§4.3).
+   * Re-project pending approvals from scratch: backfill **both** families' pending lists
+   * (`exec.approval.list`, `plugin.approval.list` — §4.3), drop any in-memory entry the gateway no
+   * longer reports as pending, and drive the rest. Treating every reconnect as a fresh projection
+   * (not a delta) is what makes a transition that raced the backfill neither lost nor resurrected.
+   *
+   * The two lists are backfilled independently: a failure fetching one family's list (e.g. the
+   * gateway drops mid-request) is logged and does not prevent the other family's backfill from
+   * running.
+   *
+   * **Prune safety.** The reconcile prune below MUST only drop an in-flight id when that id's OWN
+   * family's list call succeeded. If it pruned by the union of both lists, a failed `plugin`
+   * list call would make every in-flight *exec* id — genuinely still pending, just absent from an
+   * error rather than absent from a real list — look unreconciled too, but worse: a failed
+   * `plugin` list call would incorrectly prune in-flight *plugin* ids (they are silently absent
+   * from `kindById` because their list call errored, not because the gateway stopped reporting
+   * them pending). A pruned-but-still-pending id then gets re-driven by the next live event or
+   * backfill pass, raising a duplicate approval prompt for the same approval. Tracking which
+   * families' list calls actually succeeded and gating the prune per id's own family on that
+   * closes the hole.
    */
   async project(): Promise<void> {
-    let ids: readonly string[];
-    try {
-      ids = readApprovalListIds(await this.deps.gateway.request(EXEC_APPROVAL_LIST_METHOD, {}));
-    } catch (err) {
-      this.deps.logger.error("backfill.failed", {
-        message: err instanceof Error ? err.message : String(err),
-      });
-      return;
+    const byId = new Map<
+      string,
+      { readonly kind: ApprovalKind; readonly snapshot: ApprovalSnapshot | null }
+    >();
+    const succeededFamilies = new Set<ApprovalKind>();
+    for (const [kind, method] of [
+      ["exec", EXEC_APPROVAL_LIST_METHOD],
+      ["plugin", PLUGIN_APPROVAL_LIST_METHOD],
+    ] as const) {
+      try {
+        const entries = readApprovalList(await this.deps.gateway.request(method, {}));
+        for (const entry of entries) byId.set(entry.id, { kind, snapshot: entry.snapshot });
+        succeededFamilies.add(kind);
+      } catch (err) {
+        this.deps.logger.error("backfill.failed", {
+          family: kind,
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
 
-    const pending = new Set(ids);
-    // Reconcile by approval id: anything we still hold that the gateway no longer lists as pending
-    // was resolved elsewhere; drop it rather than continuing to drive it.
-    for (const id of [...this.inFlight]) {
-      if (!pending.has(id)) this.inFlight.delete(id);
+    const pending = new Set(byId.keys());
+    // Reconcile by approval id, but only within a family whose list call actually succeeded
+    // (see the prune-safety note above): anything we still hold in a succeeded family that the
+    // gateway no longer lists as pending was resolved elsewhere, so drop it. An id whose family's
+    // list call failed is left exactly as-is — neither pruned nor resurrected — until a later
+    // successful projection can reconcile it for real.
+    for (const [id, trackedKind] of [...this.inFlight]) {
+      if (succeededFamilies.has(trackedKind) && !pending.has(id)) this.inFlight.delete(id);
     }
     this.deps.logger.info("backfill.projected", { pending: pending.size });
 
-    for (const id of pending) {
+    for (const [id, { kind, snapshot }] of byId) {
       if (this.settled.has(id) || this.inFlight.has(id)) continue;
-      await this.driveFromBackfill(id);
+      await this.driveFromBackfill(id, kind, snapshot);
     }
   }
 
@@ -197,18 +275,11 @@ export class OpenClawBridge {
       this.deps.logger.warn("unsupported-approval-kind", { event: event.event });
       return { kind: "left-open", why: "unsupported-approval-kind" };
     }
-    if (family === "plugin") {
-      // The plugin permission-request family (§5.2, `agent_tool_call`) is not implemented in this
-      // slice. It gets the same treatment as an unsupported kind — left for another surface —
-      // because denying a family the bridge cannot render would be a denial-of-service on it.
-      this.deps.logger.warn("approval-family-not-implemented", { event: event.event });
-      return { kind: "left-open", why: "unsupported-approval-kind" };
-    }
 
     const declaredKind = readDeclaredKind(event.payload);
-    if (declaredKind !== null && declaredKind !== "exec") {
-      // A payload riding the exec event but declaring another kind (e.g. `system-agent`) fails the
-      // family/payload cross-check (§5.3). Neither approve nor deny it.
+    if (declaredKind !== null && declaredKind !== family) {
+      // A payload riding one family's event but declaring another kind (e.g. `system-agent` on
+      // the exec channel) fails the family/payload cross-check (§5.3). Neither approve nor deny it.
       this.deps.logger.warn("unsupported-approval-kind", {
         event: event.event,
         approvalKind: declaredKind,
@@ -216,7 +287,26 @@ export class OpenClawBridge {
       return { kind: "left-open", why: "unsupported-approval-kind" };
     }
 
-    const parsed = readExecApprovalRequestedEvent(event.payload);
+    if (family === "exec") {
+      const parsed = readExecApprovalRequestedEvent(event.payload);
+      if (parsed === null) {
+        const id = readResolvedId(event.payload);
+        if (id === null) {
+          // No readable id ⇒ nothing can be resolved. OpenClaw's own deadline closes it.
+          this.deps.logger.error("event.unreadable", { event: event.event });
+          return { kind: "left-open", why: "unresolvable" };
+        }
+        return await this.resolveDeny(
+          id,
+          "exec",
+          "build-error",
+          "exec.approval.requested payload unreadable",
+        );
+      }
+      return await this.driveApproval("exec", parsed, this.deps.now());
+    }
+
+    const parsed = readPluginApprovalRequestedEvent(event.payload);
     if (parsed === null) {
       const id = readResolvedId(event.payload);
       if (id === null) {
@@ -226,49 +316,90 @@ export class OpenClawBridge {
       }
       return await this.resolveDeny(
         id,
+        "plugin",
         "build-error",
-        "exec.approval.requested payload unreadable",
+        "plugin.approval.requested payload unreadable",
       );
     }
-
-    return await this.driveExec(parsed, this.deps.now());
+    return await this.driveApproval("plugin", parsed, this.deps.now());
   }
 
-  /** Drive an approval discovered by backfill rather than by a live event. */
-  private async driveFromBackfill(id: string): Promise<ApprovalOutcome> {
-    const snapshot = await this.readSnapshot(id);
+  /**
+   * Drive an approval discovered by backfill rather than by a live event.
+   *
+   * `known` is the full record when the `*.approval.list` entry itself carried one (§4.3 —
+   * `exec.approval.list`/`plugin.approval.list` are legacy pre-2026.7 methods without a schema-
+   * pinned `Result`, but every *other* "list approvals" surface in the pinned protocol returns
+   * full `ApprovalSnapshot`-shaped records, e.g. `approval.history`'s `items[]`; see
+   * `readApprovalList`). When `known` is `null` (a bare-id list entry, or the family's list call
+   * failed to enumerate this id), the bridge falls back to a fresh `approval.get` — the same call
+   * every live-event drive already makes.
+   *
+   * Once a snapshot is in hand, plugin backfill is now a **faithful** binding, not a fabrication:
+   * the pinned `PluginApprovalPresentation` carries the real `pluginId`, `toolName`, `severity`,
+   * `detail`, and `agentId` (`docs/openclaw-integration.md` §5.2), so it drives through the exact
+   * same path a live event would, including the exact same `build-error` (no usable tool identity)
+   * and `presentation-divergence` (unreadable/mismatched snapshot) fail-closed outcomes.
+   */
+  private async driveFromBackfill(
+    id: string,
+    kind: ApprovalKind,
+    known: ApprovalSnapshot | null,
+  ): Promise<ApprovalOutcome> {
+    const snapshot = known ?? (await this.readSnapshot(id));
     if (snapshot === null) {
-      return await this.resolveDeny(id, "presentation-divergence", "approval.get unreadable");
+      return await this.resolveDeny(id, kind, "presentation-divergence", "approval.get unreadable");
     }
     if (snapshot.status !== "pending") {
       this.settled.add(id);
       return { kind: "left-open", why: "not-pending" };
     }
-    if (snapshot.presentation.kind !== "exec") {
+    if (snapshot.presentation.kind !== kind) {
+      // The list method that reported `id` is the backfill's stand-in for the "event family" the
+      // live path cross-checks against (§5.3); a snapshot declaring a different kind is exactly
+      // the unsupported-kind case, not a divergence (there is only one source here, not two).
       this.deps.logger.warn("unsupported-approval-kind", {
         approvalKind: snapshot.presentation.kind,
       });
       return { kind: "left-open", why: "unsupported-approval-kind" };
     }
-    const synthesized = execEventFromSnapshot(snapshot);
+    if (kind === "exec") {
+      const synthesized = execEventFromSnapshot(snapshot);
+      if (synthesized === null) {
+        return await this.resolveDeny(
+          id,
+          "exec",
+          "build-error",
+          "backfilled exec approval carried no command text",
+        );
+      }
+      return await this.driveApproval("exec", synthesized, this.deps.now(), snapshot);
+    }
+
+    const synthesized = pluginEventFromSnapshot(snapshot);
     if (synthesized === null) {
+      // Unreachable in practice (the kind check above already confirmed `presentation.kind ===
+      // "plugin"`), kept only so the narrowing in `pluginEventFromSnapshot` has a defined,
+      // fail-closed return for every input rather than an unsafe assertion.
       return await this.resolveDeny(
         id,
+        "plugin",
         "build-error",
-        "backfilled exec approval carried no command text",
+        "backfilled plugin approval snapshot was not a plugin presentation",
       );
     }
-    return await this.driveExec(synthesized, this.deps.now(), snapshot);
+    return await this.driveApproval("plugin", synthesized, this.deps.now(), snapshot);
   }
 
-  /** The exec end-to-end path: reconcile → budget → request → verify → resolve. */
-  private async driveExec(
-    event: ExecApprovalRequestedEvent,
+  /** The end-to-end path for either family: reconcile → budget → request → verify → resolve. */
+  private async driveApproval(
+    kind: ApprovalKind,
+    event: RequestedEvent,
     receivedAtMs: number,
     known?: ApprovalSnapshot,
   ): Promise<ApprovalOutcome> {
     if (this.settled.has(event.id) || this.inFlight.has(event.id)) return { kind: "ignored" };
-    this.inFlight.add(event.id);
+    this.inFlight.set(event.id, kind);
     try {
       // §6.1: `approval.get` is the authority for lifecycle and the reviewer contract, and it is
       // read *before* the context is built so a divergent pair is never shown to a human at all.
@@ -276,6 +407,7 @@ export class OpenClawBridge {
       if (snapshot === null) {
         return await this.resolveDeny(
           event.id,
+          kind,
           "presentation-divergence",
           "approval.get returned an unreadable snapshot; the two sources cannot be reconciled",
         );
@@ -297,19 +429,28 @@ export class OpenClawBridge {
         // §8: raising a prompt that is doomed to expire is worse than an immediate, explainable deny.
         return await this.resolveDeny(
           event.id,
+          kind,
           "insufficient-budget",
           `remaining budget ${String(budget.budgetMs)}ms is below the minimum`,
         );
       }
 
-      const mapped = buildExecApprovalRequest(this.deps.wasm, {
-        event,
-        snapshot,
-        gatewayId: this.deps.config.gatewayId,
-        timeoutMs: budget.timeoutMs,
-      });
+      const mapped =
+        kind === "exec"
+          ? buildExecApprovalRequest(this.deps.wasm, {
+              event,
+              snapshot,
+              gatewayId: this.deps.config.gatewayId,
+              timeoutMs: budget.timeoutMs,
+            })
+          : buildPluginApprovalRequest(this.deps.wasm, {
+              event,
+              snapshot,
+              gatewayId: this.deps.config.gatewayId,
+              timeoutMs: budget.timeoutMs,
+            });
       if (mapped.kind === "deny") {
-        return await this.resolveDeny(event.id, mapped.reason, mapped.detail);
+        return await this.resolveDeny(event.id, kind, mapped.reason, mapped.detail);
       }
       if (mapped.kind === "not-pending") {
         // §6.1 rule 4 — the recorded record is authoritative; submit nothing.
@@ -327,6 +468,7 @@ export class OpenClawBridge {
       } catch (err) {
         return await this.resolveDeny(
           event.id,
+          kind,
           "transport-error",
           err instanceof Error ? err.message : String(err),
         );
@@ -335,6 +477,7 @@ export class OpenClawBridge {
       if (verdict.decision !== "approved") {
         return await this.resolveDeny(
           event.id,
+          kind,
           VERDICT_DENY_REASON[verdict.decision],
           `verdict decision was '${verdict.decision}'`,
         );
@@ -352,12 +495,13 @@ export class OpenClawBridge {
       if (!verified) {
         return await this.resolveDeny(
           event.id,
+          kind,
           "verify-error",
           "approved verdict failed re-verification",
         );
       }
 
-      return await this.submitApproval(event.id, snapshot);
+      return await this.submitApproval(event.id, kind, snapshot);
     } finally {
       this.inFlight.delete(event.id);
     }
@@ -369,6 +513,7 @@ export class OpenClawBridge {
    */
   private async submitApproval(
     id: string,
+    kind: ApprovalKind,
     priorSnapshot: ApprovalSnapshot,
   ): Promise<ApprovalOutcome> {
     const current = await this.readSnapshot(id);
@@ -396,27 +541,30 @@ export class OpenClawBridge {
     if (!offered.includes("allow-once")) {
       return await this.resolveDeny(
         id,
+        kind,
         "no-expressible-allow",
         `approval offered ${JSON.stringify(offered)}; an approved verdict cannot be expressed`,
       );
     }
 
-    return await this.submit(id, "allow-once", null);
+    return await this.submit(id, kind, "allow-once", null);
   }
 
   /** Resolve `deny` with a machine-readable reason. `deny` is always in `allowedDecisions` (§7.4). */
   private async resolveDeny(
     id: string,
+    kind: ApprovalKind,
     reason: DenyReason,
     detail: string,
   ): Promise<ApprovalOutcome> {
     this.deps.logger.warn("approval.denied", { approvalId: id, reason, detail });
-    return await this.submit(id, "deny", reason);
+    return await this.submit(id, kind, "deny", reason);
   }
 
   /** Issue the kind-agnostic `approval.resolve` and honour the first-answer-wins response. */
   private async submit(
     id: string,
+    kind: ApprovalKind,
     decision: "allow-once" | "deny",
     reason: DenyReason | null,
   ): Promise<ApprovalOutcome> {
@@ -425,7 +573,7 @@ export class OpenClawBridge {
       const result = readApprovalResolveResult(
         // The exact canonical id and the kind derived from the event family — never a truncated id,
         // a hash prefix, or a kind inferred from an id prefix (§7.4).
-        await this.deps.gateway.request(APPROVAL_RESOLVE_METHOD, { id, kind: "exec", decision }),
+        await this.deps.gateway.request(APPROVAL_RESOLVE_METHOD, { id, kind, decision }),
       );
       applied = result.applied;
       if (!applied) {

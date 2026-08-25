@@ -104,7 +104,7 @@ test("the generated OpenClaw config carries the §3 operator prerequisites", asy
   assert.equal(config.approvals.plugin.enabled, false);
 });
 
-test("the printed checklist covers the exec UAT steps and names the deferred ones", async () => {
+test("the printed checklist covers both the exec and plugin UAT steps (§11)", async () => {
   const script = await readScript();
 
   assert.match(script, /Approve \(exec\): PASS\/FAIL/);
@@ -112,16 +112,19 @@ test("the printed checklist covers the exec UAT steps and names the deferred one
   assert.match(script, /Timeout: PASS\/FAIL/);
   assert.match(script, /Actor identity: PASS\/FAIL/);
   assert.match(script, /Plan divergence: PASS\/FAIL/);
+  assert.match(script, /Plugin approval: PASS\/FAIL/);
+  assert.match(script, /allow-once unavailable: PASS\/FAIL/);
+  assert.match(script, /Surface race: PASS\/FAIL/);
   assert.match(script, /openclaw:\$GATEWAY_ID/, "the inbox actor identity must be shown verbatim");
   assert.match(
     script,
     /openclaw devices approve/,
     "pairing is operator-driven and must be printed",
   );
-  assert.match(
+  assert.doesNotMatch(
     script,
     /Deferred to a later slice/,
-    "the checklist must say which upstream steps this slice does not cover",
+    "the plugin family has landed — the checklist must no longer defer it",
   );
 });
 

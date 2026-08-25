@@ -24,7 +24,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { createWasmRuntime } from "../dist/index.js";
+import { actionSummary, createWasmRuntime, exactPlaintext } from "../dist/index.js";
 import { loadTestWasm } from "./wasm-helper.mjs";
 
 // ── Deterministic fixtures (fixed timestamps; never Date.now() in test data) ──────────────────
@@ -179,6 +179,58 @@ test("valid envelope: prepare decrypts + recomputes the WYSIWYS hash; the signed
   assert.equal(result.approved, true, "the runtime's verdict verifies under the account root");
   assert.equal(result.device_id, DEVICE_ID, "verified device_id matches the paired device");
   assert.equal(result.decided_at, NOW_MS, "verified decided_at echoes the runtime clock");
+});
+
+test("agent_tool_call surface: maps to its own kind, distinct from mcp, with (server,tool) shown explicitly (Refs #217)", async () => {
+  // An OpenClaw plugin permission request (docs/openclaw-integration.md §5.2) reuses the
+  // (server, tool) wire shape from mcp_tool_call, but `server` holds a plugin id — folding it into
+  // "mcp" would tell the human a false origin and, worse, the generic "command" fallback only
+  // reads argv/cwd/raw, so the hash-bound function identity would be entirely absent from the
+  // rendered plaintext even though it is inside request_hash.
+  const AGENT_TOOL_CALL_CONTEXT = {
+    action: {
+      record_schema_version: 1,
+      surface: "agent_tool_call",
+      syntactic: {
+        server: "deploy-plugin",
+        tool: "deploy_service",
+        raw: "This plugin wants to deploy to production.",
+      },
+      risk: "medium",
+    },
+    summary:
+      "OpenClaw home-mini · agent agent-main · deploy-plugin/deploy_service: Deploy — deploy now",
+    actor: { id: "openclaw:home-mini", kind: "openclaw" },
+    risk: "medium",
+    reversible: true,
+    constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
+  };
+  const contextJson = JSON.stringify(AGENT_TOOL_CALL_CONTEXT);
+
+  const wasm = await loadTestWasm();
+  const { identity, encryptTo } = pairedIdentity(wasm);
+  const runtime = runtimeAt(wasm, identity);
+
+  const prepared = await runtime.prepare(makeEnvelope(encryptTo(contextJson)));
+
+  assert.equal(
+    prepared.context.kind,
+    "agent_tool_call",
+    "the agent_tool_call surface must map to its own kind, not 'mcp'",
+  );
+  assert.equal(prepared.context.mcp, undefined, "must not also populate the mcp action");
+  assert.deepEqual(prepared.context.agentToolCall, {
+    server: "deploy-plugin",
+    tool: "deploy_service",
+    params: undefined,
+  });
+
+  assert.equal(actionSummary(prepared.context), "deploy-plugin.deploy_service");
+  assert.match(
+    exactPlaintext(prepared.context),
+    /^agent_tool_call: deploy-plugin\.deploy_service/,
+    "the exact plaintext explicitly shows the (server, tool) identity under its own label",
+  );
 });
 
 // ── Negative: already-expired request fails closed in prepare ────────────────────────────────
