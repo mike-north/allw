@@ -177,6 +177,15 @@ Rules that follow from OpenClaw's auth model:
   first, then call `exec.approval.list` and `plugin.approval.list` to pick up approvals that predate
   the connection. Reconcile the list against live events **by approval id** so a transition racing
   the backfill is neither lost nor resurrected.
+  - **Consume the full record each list entry carries — never reduce it to a bare id.**
+    `exec.approval.list` / `plugin.approval.list` are legacy methods (`since: "<=2026.7"` in the
+    installed `@openclaw/gateway-protocol` schema) predating the kind-agnostic RPC redesign, so the
+    schema does not pin a typed `Result` for them the way it does their successor,
+    `approval.history` (`ApprovalHistoryResult.items[]` — full `…ApprovalSnapshot`-shaped records,
+    structurally identical to `approval.get`'s own `ApprovalGetResult.approval`). That is the
+    demonstrated convention for every other "list approvals" surface in this protocol version. When
+    a list entry already carries a full record, use it directly and skip the otherwise-redundant
+    `approval.get` round trip for that id; fall back to `approval.get` only for a bare-id entry.
 - **Treat every reconnect as a fresh projection**, not a delta: re-backfill, re-reconcile, and drop
   any in-memory pending entry whose id the gateway no longer reports as pending.
 - A dropped gateway connection while an allw request is in flight is a **fail-closed** condition:
@@ -216,18 +225,27 @@ command targets_ (an ssh/scp destination). They are unrelated. OpenClaw's execut
 ### 5.2 Family 2 — plugin permission requests → `surface: "agent_tool_call"`
 
 A plugin permission request carries `{ pluginId?, title, description, detail?, severity?, toolName?,
-toolCallId?, allowedDecisions?, agentId?, sessionKey? }`. Its function identity is the
-`(pluginId, toolName)` pair — structurally parallel to an MCP call's `(server, tool)` and to a
+toolCallId?, allowedDecisions?, agentId?, sessionKey? }` on the untyped event. Its function identity
+is the `(pluginId, toolName)` pair — structurally parallel to an MCP call's `(server, tool)` and to a
 command's program name.
 
-| `ActionRecord` field | Source                                                              | Notes                                                                                   |
-| -------------------- | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| `surface`            | constant `"agent_tool_call"`                                        | New surface; see the decision below.                                                    |
-| `syntactic.server`   | `pluginId` → else `"openclaw"`                                      | The gating provider identity — the function-identity slot, shared with `mcp_tool_call`. |
-| `syntactic.tool`     | `toolName` → else a normalized slug of `title`                      | Fail closed if neither yields a non-empty token.                                        |
-| `syntactic.params`   | **absent**                                                          | OpenClaw exposes no structured parameters to a reviewer. Do not synthesize one.         |
-| `syntactic.raw`      | `description`, plus `detail` when present                           | The prose the plugin author wrote for the approver; display + fallback matching.        |
-| `risk`               | `severity`: `info`→`low`, `warning`→`medium`, `critical`→`critical` | `severity` defaults to `warning` upstream.                                              |
+**The pinned `approval.get` presentation (`PluginApprovalPresentation`) is the canonical source**,
+not the event (§6.1) — verified against the installed `@openclaw/gateway-protocol` schema: `title`,
+`description`, `severity`, and `allowedDecisions` are schema-**required**; `detail`, `pluginId`,
+`toolName`, `agentId` are schema-optional. Every field below is read from the snapshot first, the
+event only when the snapshot omits it, and a value present on **both** that disagrees is a
+`presentation-divergence` deny (§6.1, §9) — extended beyond `title`/`description` to every field the
+two sources both carry, including `severity` (the sharpest case: a lower event severity must never
+silently suppress a higher, canonical snapshot severity and its number-match challenge).
+
+| `ActionRecord` field | Source                                                                     | Notes                                                                                   |
+| -------------------- | -------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `surface`            | constant `"agent_tool_call"`                                               | New surface; see the decision below.                                                    |
+| `syntactic.server`   | pinned `pluginId` → else event `pluginId` → else `"openclaw"`              | The gating provider identity — the function-identity slot, shared with `mcp_tool_call`. |
+| `syntactic.tool`     | pinned `toolName` → else event `toolName` → else a slug of `title`         | Fail closed if neither yields a non-empty token.                                        |
+| `syntactic.params`   | **absent**                                                                 | OpenClaw exposes no structured parameters to a reviewer. Do not synthesize one.         |
+| `syntactic.raw`      | pinned `description`, plus pinned `detail` when present                    | The prose the plugin author wrote for the approver; display + fallback matching.        |
+| `risk`               | pinned `severity`: `info`→`low`, `warning`→`medium`, `critical`→`critical` | `severity` defaults to `warning` upstream when genuinely absent from both sources.      |
 
 **Decision: a new `agent_tool_call` surface, not `mcp_tool_call`.** `surface` is a permanent,
 relay-visible (`action_structure`), policy-matchable namespace — the single most expensive kind of
@@ -248,24 +266,33 @@ it keeps one function-identity slot for the structure/data boundary to classify,
 `action_structure` shape unchanged, and adds no syntactic field that would need a new
 structure-vs-data ruling ([policy-seam.md](./policy-seam.md) forward-compat requirement #5).
 
-**Backfilled instances: never fabricate the substrate.** §4.3's backfill (`plugin.approval.list`)
-discovers approvals that predate the connection from the pinned `ApprovalSnapshot` alone — there is
-no untyped `plugin.approval.requested` event to read `pluginId`, `toolName`, `detail`, `severity`, or
-`toolCallId` from. The snapshot's `ApprovalPresentation` carries only `title`/`description` for a
-plugin approval. That is **not enough to build a faithful `agent_tool_call` record**: falling back to
-`pluginId → "openclaw"` / `toolName → slug(title)` / `severity → medium` the way the live-event path
-does would fabricate a specific-looking identity and risk tier for data the bridge never actually
-observed, silently disabling the number-match challenge for a request that may in fact be
-`severity: "critical"` — a WYSIWYS violation the human has no way to detect. This differs from the
-exec family's backfill (§5.1), whose pinned `commandText` genuinely **is** the real command text, so
-tokenizing it is a faithful (if degraded, argv-less) binding, not a fabrication.
+**Backfilled instances are driven faithfully — the pinned snapshot IS the canonical source.**
+§4.3's backfill (`exec.approval.list` / `plugin.approval.list`) discovers approvals that predate the
+connection with no untyped `*.approval.requested` event to read from. For a plugin approval, the
+pinned `PluginApprovalPresentation` returned by `approval.get` (and by these list methods
+themselves — see §4.3's `readApprovalList` note) is **not** limited to `title`/`description`: per
+the installed `@openclaw/gateway-protocol` schema, `title`, `description`, `severity`, and
+`allowedDecisions` are schema-**required** on this presentation, and `detail`, `pluginId`,
+`toolName`, `agentId` are schema-optional. That is the same real data a live event's reconcile
+cross-checks against — it is simply the _only_ source during backfill, so it is used directly as
+canonical rather than merely as a cross-check. There is nothing to fabricate: `pluginId`/`toolName`
+fall back to `"openclaw"`/`slug(title)` only when the _pinned presentation itself_ omits them (the
+same fallback a live event gets when its own untyped payload omits them), and `severity` drives risk
+exactly as it does for a live event.
 
-The bridge therefore treats a backfilled plugin approval exactly like an unsupported kind (§5.3): it
-raises no allw request and resolves nothing, logging `unrenderable-backfill` and leaving the approval
-for the Control UI, a later live event, or another surface. Denying it would make the bridge a
-denial-of-service on an approval another surface can render faithfully; OpenClaw's own deadline and
-`askFallback: deny` still close it if nobody answers. A live `plugin.approval.requested` event for the
-same approval is unaffected — it carries the full request and is mapped normally.
+A backfilled plugin approval therefore drives through the identical path a live event does,
+including the identical fail-closed outcomes: `build-error` when the pinned presentation itself
+carries neither a usable `toolName` nor a `title` that reduces to a usable slug (the substrate is
+genuinely absent, not merely unobserved), and `presentation-divergence` when `approval.get` itself
+is unreadable or reports the wrong kind. There is no longer a backfill-specific "leave it open"
+case — denying or approving a backfilled plugin approval is exactly as informed as denying or
+approving a live one.
+
+This differs from a common but wrong intuition: a _synthesized_ event object built purely from the
+snapshot (no live payload ever existed) might look like it is "missing" fields the live event
+normally supplies (`toolCallId`, `sessionKey`) — but those are correlation-only (`chain`), never
+required substrate, so their absence during backfill is a minor audit-correlation gap, not a
+fail-closed condition.
 
 ### 5.3 Family 3 — `system-agent` approvals: out of scope, fail closed
 
@@ -534,16 +561,14 @@ parsing prose.
 | Gateway connection lost, not restored before the allw deadline                                                                        | _cannot resolve_  | `transport-error`                     |
 | Invalid or missing `<gateway-id>`, relay config, or account root                                                                      | `deny`            | `config-error`                        |
 | Unknown or unsupported `ApprovalKind` (incl. `system-agent`)                                                                          | _no resolve_      | `unsupported-approval-kind`           |
-| Backfilled plugin approval (substrate unrecoverable from the pinned snapshot — §5.2)                                                  | _no resolve_      | `unrenderable-backfill`               |
 
-The three **non**-deny rows are deliberate:
+The two **non**-deny rows are deliberate:
 
 - **Unknown kind** (§5.3): an unrecognized approval family is left for a surface that understands it.
   Denying another surface's approval family would make the bridge a denial-of-service on approvals it
-  cannot even render.
-- **Unrenderable backfill** (§5.2): a backfilled plugin approval cannot be built without fabricating
-  `pluginId`/`toolName`/`severity`, which the pinned snapshot never carries. The same DoS reasoning as
-  unknown kind applies — another surface, or a later live event, may still render it faithfully.
+  cannot even render. This applies identically whether the approval was discovered live or by
+  backfill (§4.3) — a backfilled plugin approval otherwise drives through the exact same path a live
+  one does (§5.2), so there is no separate "cannot render a backfilled instance" case.
 - **Lost connection**: the bridge has no channel on which to submit anything. OpenClaw's own deadline
   plus `askFallback: deny` closes it, which is why §3 requires that fallback stay `deny`.
 

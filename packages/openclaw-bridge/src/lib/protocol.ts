@@ -101,6 +101,10 @@ export interface PluginApprovalRequest {
   readonly toolCallId?: string | undefined;
   readonly agentId?: string | undefined;
   readonly sessionKey?: string | undefined;
+  /** Present on `PluginApprovalRequestParams` per the pinned schema; used only to cross-check
+   * against the snapshot's `presentation.allowedDecisions` (§6.1) — never as the value the bridge
+   * submits (that is always sourced fresh from `approval.get` at resolve time, §7.4). */
+  readonly allowedDecisions?: readonly ApprovalDecision[] | undefined;
 }
 
 /** The `plugin.approval.requested` event payload. */
@@ -112,13 +116,72 @@ export interface PluginApprovalRequestedEvent {
   readonly request: PluginApprovalRequest;
 }
 
-/** The sanitized reviewer projection returned by `approval.get` (spec §6.1). */
-export interface ApprovalPresentation {
-  readonly kind: string;
+/**
+ * The sanitized reviewer projection returned by `approval.get` (spec §6.1) — a discriminated union
+ * on `kind`, matching `@openclaw/gateway-protocol`'s `ExecApprovalPresentation` /
+ * `PluginApprovalPresentation` schema definitions exactly (verified against the installed
+ * `protocol.schema.json`, `since: "2026.7"`). Every field below is still read **defensively**
+ * (optional at this boundary) even where the pinned schema marks it `required` — the bridge does
+ * not trust a wire response to honor its own schema, mirroring the existing `commandText`
+ * precedent (§6.1: a sanitized snapshot may omit a field; only a genuinely different value is a
+ * divergence).
+ */
+export interface ExecApprovalPresentation {
+  readonly kind: "exec";
+  readonly commandText?: string | undefined;
+  /** Schema-present but not yet consumed by the mapping; kept for completeness/future use. */
+  readonly warningText?: string | undefined;
+  readonly host?: string | undefined;
+  readonly nodeId?: string | undefined;
+  readonly agentId?: string | undefined;
+  readonly allowedDecisions: readonly ApprovalDecision[];
+}
+
+/**
+ * `PluginApprovalPresentation` per the pinned schema: `kind`, `title`, `description`, `severity`,
+ * and `allowedDecisions` are schema-**required**; `detail`, `pluginId`, `toolName`, `agentId` are
+ * schema-optional (and nullable on the wire — `readNonEmptyString` folds `null` to `undefined`).
+ * This is the **canonical** source for plugin function identity, risk, and reviewer prose
+ * (`docs/openclaw-integration.md` §5.2, §6.1) — the untyped event is only a cross-check.
+ */
+export interface PluginApprovalPresentation {
+  readonly kind: "plugin";
   readonly title?: string | undefined;
   readonly description?: string | undefined;
-  readonly commandText?: string | undefined;
+  readonly detail?: string | undefined;
+  /** Schema enum `"info" | "warning" | "critical"`; kept as a raw string so an out-of-enum value
+   * reaches the mapping's own validation (`build-error`) rather than being silently normalized
+   * away here. */
+  readonly severity?: string | undefined;
+  readonly pluginId?: string | undefined;
+  readonly toolName?: string | undefined;
+  readonly agentId?: string | undefined;
   readonly allowedDecisions: readonly ApprovalDecision[];
+}
+
+/** Any other kind (`system-agent`, or a future one) — out of scope for v1 mapping (spec §5.3); only
+ * `kind` and `allowedDecisions` are modeled since nothing else is consumed. */
+export interface OtherApprovalPresentation {
+  readonly kind: string;
+  readonly allowedDecisions: readonly ApprovalDecision[];
+}
+
+export type ApprovalPresentation =
+  | ExecApprovalPresentation
+  | PluginApprovalPresentation
+  | OtherApprovalPresentation;
+
+/**
+ * Type predicates for {@link ApprovalPresentation}. Plain `kind !== "exec"` narrowing does not
+ * eliminate {@link OtherApprovalPresentation} on its own — its `kind` is a general `string`, not a
+ * literal, so TS cannot prove it excludes `"exec"`/`"plugin"` from that comparison alone. These
+ * predicates make the narrowing explicit instead.
+ */
+export function isExecPresentation(p: ApprovalPresentation): p is ExecApprovalPresentation {
+  return p.kind === "exec";
+}
+export function isPluginPresentation(p: ApprovalPresentation): p is PluginApprovalPresentation {
+  return p.kind === "plugin";
 }
 
 /** The pinned `ApprovalSnapshot` — authority for lifecycle and the reviewer contract (spec §6.1). */
@@ -273,6 +336,7 @@ function readPluginApprovalRequest(request: Record<string, unknown>): PluginAppr
     toolCallId: readNonEmptyString(request.toolCallId),
     agentId: readNonEmptyString(request.agentId),
     sessionKey: readNonEmptyString(request.sessionKey),
+    allowedDecisions: readAllowedDecisions(request.allowedDecisions) ?? undefined,
   };
 }
 
@@ -286,6 +350,45 @@ function readAllowedDecisions(value: unknown): readonly ApprovalDecision[] | nul
   // An unrecognized decision string is dropped rather than passed through: the bridge may only
   // submit a decision the request actually offered, so an unknown token must never widen the set.
   return allowed;
+}
+
+/**
+ * Parse an `approval.get` response's `presentation` into the discriminated
+ * {@link ApprovalPresentation}, given the already-read `kind` and `allowedDecisions` (common to
+ * every variant). `exec` and `plugin` each pick up their kind-specific fields per the pinned
+ * schema (`ExecApprovalPresentation` / `PluginApprovalPresentation`); any other kind (`system-agent`,
+ * or a future one) keeps only the common fields (spec §5.3 — v1 does not map it).
+ */
+function readApprovalPresentation(
+  presentation: Record<string, unknown>,
+  kind: string,
+  allowedDecisions: readonly ApprovalDecision[],
+): ApprovalPresentation {
+  if (kind === "exec") {
+    return {
+      kind: "exec",
+      allowedDecisions,
+      commandText: readNonEmptyString(presentation.commandText),
+      warningText: readNonEmptyString(presentation.warningText),
+      host: readNonEmptyString(presentation.host),
+      nodeId: readNonEmptyString(presentation.nodeId),
+      agentId: readNonEmptyString(presentation.agentId),
+    };
+  }
+  if (kind === "plugin") {
+    return {
+      kind: "plugin",
+      allowedDecisions,
+      title: readNonEmptyString(presentation.title),
+      description: readNonEmptyString(presentation.description),
+      detail: readNonEmptyString(presentation.detail),
+      severity: readNonEmptyString(presentation.severity),
+      pluginId: readNonEmptyString(presentation.pluginId),
+      toolName: readNonEmptyString(presentation.toolName),
+      agentId: readNonEmptyString(presentation.agentId),
+    };
+  }
+  return { kind, allowedDecisions };
 }
 
 /**
@@ -320,13 +423,7 @@ export function readApprovalSnapshot(payload: unknown): ApprovalSnapshot | null 
     expiresAtMs,
     status,
     createdAtMs: readSafeInt(root.createdAtMs),
-    presentation: {
-      kind,
-      allowedDecisions,
-      title: readNonEmptyString(presentation.title),
-      description: readNonEmptyString(presentation.description),
-      commandText: readNonEmptyString(presentation.commandText),
-    },
+    presentation: readApprovalPresentation(presentation, kind, allowedDecisions),
   };
 }
 
@@ -351,20 +448,50 @@ export function readApprovalResolveResult(payload: unknown): ApprovalResolveResu
   };
 }
 
+/** One entry from an `*.approval.list` response: an id, plus the full snapshot when the entry
+ * itself carried one. */
+export interface ApprovalListEntry {
+  readonly id: string;
+  /** `null` when the entry was a bare id (or an object with an id but no readable snapshot) —
+   * the caller must fall back to a fresh `approval.get` for it. */
+  readonly snapshot: ApprovalSnapshot | null;
+}
+
 /**
- * Parse an `*.approval.list` response into the pending approval ids it reports. Accepts either a
- * bare array or `{ approvals: [...] }`; entries without a readable `id` are skipped rather than
- * defaulted.
+ * Parse an `*.approval.list` response into its entries, preserving each one's **full record**
+ * when the entry itself carries one — never reducing to bare ids.
+ *
+ * `exec.approval.list` / `plugin.approval.list` are legacy methods (`since: "<=2026.7"` in the
+ * installed `@openclaw/gateway-protocol` schema) predating the 2026.7 kind-agnostic RPC redesign,
+ * so the schema does not pin a typed `Result` for them the way it does for their successor,
+ * `approval.history` (`ApprovalHistoryResult.items[]`) — whose items are full
+ * `PendingApprovalSnapshot`/`…ApprovalSnapshot`-shaped records, matching `approval.get`'s own
+ * `ApprovalGetResult.approval` shape exactly. That is the demonstrated convention for every
+ * *other* "list approvals" surface in this protocol version, and it is why the entries here are
+ * parsed as full records first: reducing an already-full record to its `id` would silently discard
+ * data the bridge needs (`docs/openclaw-integration.md` §5.2, §6.1) and force a wasted extra
+ * `approval.get` round trip per approval.
+ *
+ * Each entry is parsed with the **same** {@link readApprovalSnapshot} used for `approval.get`
+ * responses — the two are structurally identical `ApprovalSnapshot` shapes. An entry that does not
+ * parse as a full record falls back to reading a bare `id` (a bare string, or an object exposing
+ * only `id`) so the caller can still discover it and fetch its snapshot separately; this fallback
+ * is defensive/backward-compatible, never the expected shape.
  */
-export function readApprovalListIds(payload: unknown): readonly string[] {
+export function readApprovalList(payload: unknown): readonly ApprovalListEntry[] {
   const entries = Array.isArray(payload)
     ? payload
     : (asRecord(payload)?.approvals ?? asRecord(payload)?.items);
   if (!Array.isArray(entries)) return [];
-  const ids: string[] = [];
+  const result: ApprovalListEntry[] = [];
   for (const entry of entries) {
+    const snapshot = readApprovalSnapshot(entry);
+    if (snapshot !== null) {
+      result.push({ id: snapshot.id, snapshot });
+      continue;
+    }
     const id = typeof entry === "string" ? entry : readNonEmptyString(asRecord(entry)?.id);
-    if (id !== undefined && id.length > 0) ids.push(id);
+    if (id !== undefined && id.length > 0) result.push({ id, snapshot: null });
   }
-  return ids;
+  return result;
 }

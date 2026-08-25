@@ -26,6 +26,9 @@ import {
   CREATED_AT_MS,
   EXPIRES_AT_MS,
   PLUGIN_APPROVAL_ID,
+  PLUGIN_EXPIRES_AT_MS,
+  PLUGIN_ID,
+  TOOL_NAME,
   execEvent,
   execSnapshot,
   pluginEvent,
@@ -573,29 +576,69 @@ test("a plugin approval carrying an insufficient budget denies immediately, rais
 
 // ── §4.3 backfill drives both families ──────────────────────────────────────────
 
-test("a backfilled plugin approval raises no allw request and is not resolved, only logged (§5.2, §5.3)", async () => {
-  // The pinned ApprovalSnapshot carries only title/description for a plugin approval — never
-  // pluginId/toolName/severity. Building a record from that alone would fabricate the function
-  // identity and risk tier (a WYSIWYS violation), so the bridge must neither raise a request nor
-  // resolve anything; it must leave the approval exactly as an unsupported kind is left (§5.3).
-  const { bridge, gateway, requests, records } = makeBridge({
-    snapshot: pluginSnapshot(),
+test("a backfilled plugin approval is driven faithfully via a fresh approval.get (§5.2, §5.3)", async () => {
+  // A bare-id `plugin.approval.list` entry (the makeBridge default) has no embedded record, so the
+  // bridge falls back to `approval.get` — which carries the real pluginId/toolName/severity per the
+  // pinned schema. There is no fabrication and no reason to leave this open: it drives exactly like
+  // a live event.
+  const { bridge, gateway, requests } = makeBridge({
+    snapshot: pluginSnapshot({ presentation: { pluginId: PLUGIN_ID, toolName: TOOL_NAME } }),
     pluginListIds: [PLUGIN_APPROVAL_ID],
   });
   await bridge.project();
 
-  assert.deepEqual(gateway.resolves, [], "a backfilled plugin approval must never be resolved");
-  assert.equal(requests.length, 0, "no allw request may be raised from fabricated substrate");
-  assert.ok(
-    records.some(
-      (r) => r.event === "unrenderable-backfill" && r.fields.approvalId === PLUGIN_APPROVAL_ID,
-    ),
+  assert.deepEqual(gateway.resolves, [
+    { id: PLUGIN_APPROVAL_ID, kind: "plugin", decision: "allow-once" },
+  ]);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].action.syntactic.server, PLUGIN_ID);
+  assert.equal(requests[0].action.syntactic.tool, TOOL_NAME);
+});
+
+test("a plugin.approval.list entry carrying the full record skips the redundant reconcile approval.get call (§4.3)", async () => {
+  // When the list entry itself is a full ApprovalSnapshot-shaped record, the bridge must use it
+  // directly for the backfill reconcile rather than issuing a redundant approval.get first. A
+  // single approval.get call still happens later — submitApproval's independent, pre-existing
+  // re-read of the canonical status right before submitting allow-once (§9) — so the assertion is
+  // "exactly one call", not "never called".
+  let approvalGetCalls = 0;
+  const { bridge, gateway, requests } = makeBridge({
+    handlers: {
+      "plugin.approval.list": () => ({ approvals: [pluginSnapshot()] }),
+      "approval.get": () => {
+        approvalGetCalls += 1;
+        return pluginSnapshot();
+      },
+    },
+  });
+  await bridge.project();
+
+  assert.deepEqual(gateway.resolves, [
+    { id: PLUGIN_APPROVAL_ID, kind: "plugin", decision: "allow-once" },
+  ]);
+  assert.equal(requests.length, 1);
+  assert.equal(
+    approvalGetCalls,
+    1,
+    "exactly one approval.get call (the final re-verify, §9) — not a second one for the initial reconcile",
   );
 });
 
-test("a live plugin event is unaffected by the backfill restriction (§5.2)", async () => {
-  // The restriction above is specific to backfill's synthesized substrate — a live
-  // `plugin.approval.requested` event carries the full request and must still be driven normally.
+test("a backfilled plugin approval with no usable identity denies build-error, not left-open (§5.2, §9)", async () => {
+  // Genuinely absent required substrate (no toolName and no usable title slug) is the SAME
+  // build-error outcome a live event gets — not a special backfill left-open case.
+  const { bridge, gateway } = makeBridge({
+    snapshot: pluginSnapshot({ presentation: { title: "!!!", toolName: undefined } }),
+    pluginListIds: [PLUGIN_APPROVAL_ID],
+  });
+  await bridge.project();
+
+  assert.deepEqual(gateway.resolves, [
+    { id: PLUGIN_APPROVAL_ID, kind: "plugin", decision: "deny" },
+  ]);
+});
+
+test("a live plugin event is driven the same way a backfilled one now is (§5.2)", async () => {
   const { bridge, gateway, requests } = makeBridge({ snapshot: pluginSnapshot() });
   const outcome = await bridge.handle(pluginRequested());
 
@@ -606,8 +649,8 @@ test("a live plugin event is unaffected by the backfill restriction (§5.2)", as
   assert.equal(requests.length, 1);
 });
 
-test("a single project() call backfills exec normally while leaving plugin open (§4.3)", async () => {
-  const { bridge, gateway, records } = makeBridge({
+test("a single project() call backfills both exec and plugin faithfully (§4.3)", async () => {
+  const { bridge, gateway } = makeBridge({
     listIds: [APPROVAL_ID],
     pluginListIds: [PLUGIN_APPROVAL_ID],
     handlers: {
@@ -617,12 +660,9 @@ test("a single project() call backfills exec normally while leaving plugin open 
   });
   await bridge.project();
 
-  assert.deepEqual(gateway.resolves, [{ id: APPROVAL_ID, kind: "exec", decision: "allow-once" }]);
-  assert.ok(
-    records.some(
-      (r) => r.event === "unrenderable-backfill" && r.fields.approvalId === PLUGIN_APPROVAL_ID,
-    ),
-  );
+  const resolvedIds = gateway.resolves.map((r) => r.id).sort();
+  assert.deepEqual(resolvedIds, [APPROVAL_ID, PLUGIN_APPROVAL_ID].sort());
+  assert.ok(gateway.resolves.every((r) => r.decision === "allow-once"));
 });
 
 test("a backfilled plugin approval reporting a mismatched kind is left for another surface (§5.3)", async () => {
@@ -650,6 +690,74 @@ test("a failing plugin.approval.list backfill logs and does not block the exec b
   assert.deepEqual(gateway.resolves, [{ id: APPROVAL_ID, kind: "exec", decision: "allow-once" }]);
   assert.ok(records.some((r) => r.event === "backfill.failed" && r.fields.family === "plugin"));
 });
+
+// ── the plugin event reader's required-field validation matrix (§9) ────────────
+
+for (const testCase of [
+  {
+    name: "non-object payload",
+    payload: 42,
+    outcome: { kind: "left-open", why: "unresolvable" },
+  },
+  {
+    name: "non-object request",
+    payload: {
+      id: PLUGIN_APPROVAL_ID,
+      expiresAtMs: PLUGIN_EXPIRES_AT_MS,
+      request: "not an object",
+    },
+    denies: true,
+  },
+  {
+    // "Readable" is length-based, not trim-based, throughout this reader (matches `id`,
+    // `title`, `description`, … uniformly) — an empty string is the actual "blank" case; a
+    // whitespace-only string is a well-formed (if unusual) id that parses normally.
+    name: "empty-string id",
+    payload: { id: "", expiresAtMs: PLUGIN_EXPIRES_AT_MS, request: {} },
+    outcome: { kind: "left-open", why: "unresolvable" },
+  },
+  {
+    name: "missing id",
+    payload: { expiresAtMs: PLUGIN_EXPIRES_AT_MS, request: {} },
+    outcome: { kind: "left-open", why: "unresolvable" },
+  },
+  {
+    name: "non-safe-integer expiresAtMs",
+    payload: { id: PLUGIN_APPROVAL_ID, expiresAtMs: "soon", request: {} },
+    denies: true,
+  },
+  {
+    name: "approvalKind disagreeing with the event family",
+    payload: {
+      id: PLUGIN_APPROVAL_ID,
+      expiresAtMs: PLUGIN_EXPIRES_AT_MS,
+      request: {},
+      approvalKind: "exec",
+    },
+    outcome: { kind: "left-open", why: "unsupported-approval-kind" },
+  },
+]) {
+  test(`plugin event reader: ${testCase.name} (§9)`, async () => {
+    const { bridge, gateway, requests } = makeBridge();
+    const outcome = await bridge.handle({
+      event: "plugin.approval.requested",
+      payload: testCase.payload,
+    });
+
+    assert.equal(requests.length, 0, "no allw request may be raised from an unreadable event");
+    if (testCase.denies) {
+      // A readable id but otherwise malformed/unreadable request payload: build-error, never a
+      // silently-defaulted record.
+      assert.equal(outcome.decision, "deny");
+      assert.deepEqual(gateway.resolves, [
+        { id: PLUGIN_APPROVAL_ID, kind: "plugin", decision: "deny" },
+      ]);
+    } else {
+      assert.deepEqual(outcome, testCase.outcome);
+      assert.deepEqual(gateway.resolves, [], "nothing can be submitted without a canonical id");
+    }
+  });
+}
 
 // ── §4.3 per-family prune safety (regression: a failed family must never prune the OTHER
 // family's — or its own — genuinely-still-pending in-flight ids) ──────────────────────────────

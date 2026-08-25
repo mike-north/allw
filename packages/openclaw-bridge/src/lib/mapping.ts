@@ -21,6 +21,7 @@
 import type { HookWasm } from "@allw/hook";
 
 import { actorIdForGateway, normalizeGatewayId } from "./config.js";
+import { isExecPresentation, isPluginPresentation } from "./protocol.js";
 import type {
   ApprovalSnapshot,
   ExecApprovalRequestedEvent,
@@ -197,13 +198,14 @@ export function buildExecApprovalRequest(wasm: HookWasm, input: ExecMappingInput
   }
 
   // §5.3: the kind comes from the event family and is cross-checked against the pinned snapshot.
-  if (snapshot.presentation.kind !== "exec") {
+  if (!isExecPresentation(snapshot.presentation)) {
     return {
       kind: "deny",
       reason: "presentation-divergence",
       detail: `exec.approval.requested carried a snapshot of kind '${snapshot.presentation.kind}'`,
     };
   }
+  const execPresentation = snapshot.presentation;
 
   const plan = event.request.systemRunPlan;
   const commandText = plan?.commandText ?? event.request.command;
@@ -219,10 +221,7 @@ export function buildExecApprovalRequest(wasm: HookWasm, input: ExecMappingInput
   // §6.1 rule 3: the sanitized projection and the untyped event must agree about what is approved.
   // A snapshot that omits `commandText` is not a divergence — the projection is allowed to sanitize
   // — but a *different* value is, and neither source can then be trusted to be what runs.
-  if (
-    snapshot.presentation.commandText !== undefined &&
-    snapshot.presentation.commandText !== commandText
-  ) {
+  if (execPresentation.commandText !== undefined && execPresentation.commandText !== commandText) {
     return {
       kind: "deny",
       reason: "presentation-divergence",
@@ -350,6 +349,49 @@ const SEVERITY_RISK: Readonly<Record<string, Risk>> = {
 /** The risk for the upstream default `severity: "warning"` when a plugin request omits it. */
 const DEFAULT_SEVERITY_RISK: Risk = "medium";
 
+/** The outcome of reconciling one field the pinned snapshot and the untyped event both carry. */
+interface ReconciledField {
+  /** The canonical value — the snapshot's, falling back to the event's only when the snapshot
+   * omits the field (§6.1: the pinned presentation is authoritative). */
+  readonly value: string | undefined;
+  /** Set when both sources supplied a value and it differs; the caller must deny
+   * `presentation-divergence` and never proceed to build a record. */
+  readonly divergence: string | undefined;
+}
+
+/**
+ * Reconcile one named field between the pinned `approval.get` presentation (canonical) and the
+ * untyped event (cross-check only). A value present on only one side is not a divergence — the
+ * sanitized projection is allowed to omit fields (mirrors exec's `commandText` rule, §6.1); a value
+ * present on **both** sides that disagrees is.
+ */
+function reconcileString(
+  fieldName: string,
+  snapshotValue: string | undefined,
+  eventValue: string | undefined,
+): ReconciledField {
+  if (snapshotValue !== undefined && eventValue !== undefined && snapshotValue !== eventValue) {
+    return {
+      value: snapshotValue,
+      divergence: `approval.get presentation.${fieldName} does not equal the event's ${fieldName}`,
+    };
+  }
+  return { value: snapshotValue ?? eventValue, divergence: undefined };
+}
+
+/** Order-independent divergence check for two `allowedDecisions` sets (the schema declares the
+ * field a set: `uniqueItems: true`). `undefined` on either side means nothing to compare. */
+function decisionsDiverge(
+  a: readonly string[] | undefined,
+  b: readonly string[] | undefined,
+): boolean {
+  if (a === undefined || b === undefined) return false;
+  if (a.length !== b.length) return true;
+  const sortedA = [...a].sort();
+  const sortedB = [...b].sort();
+  return sortedA.some((value, index) => value !== sortedB[index]);
+}
+
 /**
  * Normalize a plugin's `title` into a slug usable as `syntactic.tool` when `toolName` is absent
  * (spec §5.2: "else a normalized slug of `title`"). Returns `undefined` when `title` is absent or
@@ -422,39 +464,67 @@ export function buildPluginApprovalRequest(
   }
 
   // §5.3: the kind comes from the event family and is cross-checked against the pinned snapshot.
-  if (snapshot.presentation.kind !== "plugin") {
+  if (!isPluginPresentation(snapshot.presentation)) {
     return {
       kind: "deny",
       reason: "presentation-divergence",
       detail: `plugin.approval.requested carried a snapshot of kind '${snapshot.presentation.kind}'`,
     };
   }
+  const presentation = snapshot.presentation;
 
-  // §6.1 rule 3, extended to every field the two sources both carry: a sanitized snapshot may
-  // withhold `title`/`description` (omission is not divergence — mirrors exec's `commandText`
-  // rule), but when BOTH sources supply a value they must agree. `title`/`description` feed
-  // directly into `syntactic.raw` and `summary` below, so an unchecked mismatch here would let the
-  // untyped event's prose diverge from the pinned reviewer contract without ever being caught.
-  if (
-    snapshot.presentation.title !== undefined &&
-    event.request.title !== undefined &&
-    snapshot.presentation.title !== event.request.title
-  ) {
-    return {
-      kind: "deny",
-      reason: "presentation-divergence",
-      detail: "approval.get presentation.title does not equal the event's title",
-    };
+  // §6.1 rule 3, extended to every field BOTH sources carry (not only `commandText`/prose): the
+  // pinned `PluginApprovalPresentation` is the **canonical** source for function identity
+  // (`pluginId`, `toolName`), risk (`severity`), reviewer prose (`title`, `description`, `detail`),
+  // and actor context (`agentId`) — @openclaw/gateway-protocol's schema marks `title`,
+  // `description`, `severity`, and `allowedDecisions` schema-**required** on this presentation, and
+  // `detail`/`pluginId`/`toolName`/`agentId` schema-optional. The untyped event is only a
+  // cross-check: a sanitized snapshot may omit a field (that is not divergence, mirroring exec's
+  // `commandText` rule), but when BOTH sources supply a value they must agree, or neither can be
+  // trusted to be what the human is actually being asked to approve.
+  const pluginId = reconcileString("pluginId", presentation.pluginId, event.request.pluginId);
+  if (pluginId.divergence !== undefined) {
+    return { kind: "deny", reason: "presentation-divergence", detail: pluginId.divergence };
   }
-  if (
-    snapshot.presentation.description !== undefined &&
-    event.request.description !== undefined &&
-    snapshot.presentation.description !== event.request.description
-  ) {
+  const toolName = reconcileString("toolName", presentation.toolName, event.request.toolName);
+  if (toolName.divergence !== undefined) {
+    return { kind: "deny", reason: "presentation-divergence", detail: toolName.divergence };
+  }
+  const title = reconcileString("title", presentation.title, event.request.title);
+  if (title.divergence !== undefined) {
+    return { kind: "deny", reason: "presentation-divergence", detail: title.divergence };
+  }
+  const descriptionField = reconcileString(
+    "description",
+    presentation.description,
+    event.request.description,
+  );
+  if (descriptionField.divergence !== undefined) {
+    return { kind: "deny", reason: "presentation-divergence", detail: descriptionField.divergence };
+  }
+  const detailField = reconcileString("detail", presentation.detail, event.request.detail);
+  if (detailField.divergence !== undefined) {
+    return { kind: "deny", reason: "presentation-divergence", detail: detailField.divergence };
+  }
+  const severityField = reconcileString("severity", presentation.severity, event.request.severity);
+  if (severityField.divergence !== undefined) {
+    return { kind: "deny", reason: "presentation-divergence", detail: severityField.divergence };
+  }
+  const agentId = reconcileString("agentId", presentation.agentId, event.request.agentId);
+  if (agentId.divergence !== undefined) {
+    return { kind: "deny", reason: "presentation-divergence", detail: agentId.divergence };
+  }
+  // `allowedDecisions` is present on both sources' schemas; the sharpest divergence case (a
+  // severity of `medium` on the event vs. `critical` on the snapshot silently skipping the
+  // number-match challenge) is caught above, but a decision-set mismatch is checked too for the
+  // same reason — an unchecked disagreement here would leave the two sources' reviewer contracts
+  // silently inconsistent. Order-independent: the schema declares `allowedDecisions` a set.
+  if (decisionsDiverge(presentation.allowedDecisions, event.request.allowedDecisions)) {
     return {
       kind: "deny",
       reason: "presentation-divergence",
-      detail: "approval.get presentation.description does not equal the event's description",
+      detail:
+        "approval.get presentation.allowedDecisions does not equal the event's allowedDecisions",
     };
   }
 
@@ -465,8 +535,8 @@ export function buildPluginApprovalRequest(
 
   // §5.2: function identity is (pluginId, toolName); pluginId falls back to "openclaw", toolName
   // falls back to a normalized slug of title. Fail closed if neither yields a non-empty token.
-  const server = event.request.pluginId ?? "openclaw";
-  const tool = event.request.toolName ?? slugifyTitle(event.request.title);
+  const server = pluginId.value ?? "openclaw";
+  const tool = toolName.value ?? slugifyTitle(title.value);
   if (tool === undefined) {
     return {
       kind: "deny",
@@ -479,15 +549,15 @@ export function buildPluginApprovalRequest(
   // an out-of-band value would misclassify risk for a condition OpenClaw's own schema never
   // documented. Absent severity uses the upstream default (`warning` → medium).
   let risk: Risk;
-  if (event.request.severity === undefined) {
+  if (severityField.value === undefined) {
     risk = DEFAULT_SEVERITY_RISK;
   } else {
-    const mapped = SEVERITY_RISK[event.request.severity];
+    const mapped = SEVERITY_RISK[severityField.value];
     if (mapped === undefined) {
       return {
         kind: "deny",
         reason: "build-error",
-        detail: `plugin approval declared an unrecognized severity '${event.request.severity}'`,
+        detail: `plugin approval declared an unrecognized severity '${severityField.value}'`,
       };
     }
     risk = mapped;
@@ -497,12 +567,12 @@ export function buildPluginApprovalRequest(
   // wrote for the approver. syntactic.params stays absent: OpenClaw exposes no structured
   // parameters to a reviewer, so none is synthesized.
   const description =
-    event.request.description !== undefined && event.request.description.length > 0
-      ? event.request.description
+    descriptionField.value !== undefined && descriptionField.value.length > 0
+      ? descriptionField.value
       : UNKNOWN;
   const raw =
-    event.request.detail !== undefined && event.request.detail.length > 0
-      ? `${description}\n\n${event.request.detail}`
+    detailField.value !== undefined && detailField.value.length > 0
+      ? `${description}\n\n${detailField.value}`
       : description;
 
   let recordJson: string;
@@ -553,11 +623,11 @@ export function buildPluginApprovalRequest(
 
   const summary = pluginSummary({
     gatewayId,
-    agentId: event.request.agentId,
+    agentId: agentId.value,
     server,
     tool,
-    title: event.request.title,
-    description: event.request.description,
+    title: title.value,
+    description: descriptionField.value,
   });
 
   // §6.2: `chain` is the contract's home for upstream-gate ids. Plugin approvals additionally

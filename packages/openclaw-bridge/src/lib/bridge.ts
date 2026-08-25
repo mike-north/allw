@@ -43,8 +43,10 @@ import {
   APPROVAL_RESOLVE_METHOD,
   EXEC_APPROVAL_LIST_METHOD,
   PLUGIN_APPROVAL_LIST_METHOD,
+  isExecPresentation,
+  isPluginPresentation,
   kindForEvent,
-  readApprovalListIds,
+  readApprovalList,
   readApprovalResolveResult,
   readApprovalSnapshot,
   readExecApprovalRequestedEvent,
@@ -89,11 +91,7 @@ export type ApprovalOutcome =
   /** Deliberately left for another surface / OpenClaw's own fallback. */
   | {
       readonly kind: "left-open";
-      readonly why:
-        | "unsupported-approval-kind"
-        | "not-pending"
-        | "unresolvable"
-        | "unrenderable-backfill";
+      readonly why: "unsupported-approval-kind" | "not-pending" | "unresolvable";
     }
   /** Already handled (in flight or terminal). */
   | { readonly kind: "ignored" };
@@ -125,6 +123,7 @@ function gatewayNowMs(
  * §5.1's documented last-resort branch: the core tokenizes `presentation.commandText`, and the
  * absent `cwd` renders as an explicit "working directory not bound" line (§6.3). */
 function execEventFromSnapshot(snapshot: ApprovalSnapshot): ExecApprovalRequestedEvent | null {
+  if (!isExecPresentation(snapshot.presentation)) return null;
   const commandText = snapshot.presentation.commandText;
   if (commandText === undefined) return null;
   return {
@@ -132,6 +131,40 @@ function execEventFromSnapshot(snapshot: ApprovalSnapshot): ExecApprovalRequeste
     expiresAtMs: snapshot.expiresAtMs,
     ...(snapshot.createdAtMs !== undefined ? { createdAtMs: snapshot.createdAtMs } : {}),
     request: { command: commandText },
+  };
+}
+
+/**
+ * Synthesize the plugin event shape from a sanitized snapshot, for approvals discovered by
+ * backfill (§4.3). Unlike exec, this is a **faithful** binding, not a last resort: the pinned
+ * `PluginApprovalPresentation` carries the real `pluginId`, `toolName`, `severity`, `detail`, and
+ * `agentId` (verified against the installed `@openclaw/gateway-protocol` schema — `title`,
+ * `description`, `severity`, and `allowedDecisions` are schema-required; `detail`/`pluginId`/
+ * `toolName`/`agentId` schema-optional). There is no untyped event to reconcile against during
+ * backfill, so every overlapping field here is copied straight from the snapshot; downstream
+ * reconciliation in `buildPluginApprovalRequest` trivially agrees with itself and the snapshot's
+ * values are used as canonical, exactly as they would be for a live event.
+ */
+function pluginEventFromSnapshot(snapshot: ApprovalSnapshot): PluginApprovalRequestedEvent | null {
+  if (!isPluginPresentation(snapshot.presentation)) return null;
+  const p = snapshot.presentation;
+  return {
+    id: snapshot.id,
+    expiresAtMs: snapshot.expiresAtMs,
+    ...(snapshot.createdAtMs !== undefined ? { createdAtMs: snapshot.createdAtMs } : {}),
+    request: {
+      pluginId: p.pluginId,
+      title: p.title,
+      description: p.description,
+      detail: p.detail,
+      severity: p.severity,
+      toolName: p.toolName,
+      agentId: p.agentId,
+      allowedDecisions: p.allowedDecisions,
+      // `toolCallId`/`sessionKey` are not part of the pinned presentation — backfill loses the
+      // `openclaw:tool_call:<id>` chain component a live event would have carried. That is a
+      // best-effort audit-correlation gap, not missing required substrate.
+    },
   };
 }
 
@@ -183,15 +216,18 @@ export class OpenClawBridge {
    * closes the hole.
    */
   async project(): Promise<void> {
-    const kindById = new Map<string, ApprovalKind>();
+    const byId = new Map<
+      string,
+      { readonly kind: ApprovalKind; readonly snapshot: ApprovalSnapshot | null }
+    >();
     const succeededFamilies = new Set<ApprovalKind>();
     for (const [kind, method] of [
       ["exec", EXEC_APPROVAL_LIST_METHOD],
       ["plugin", PLUGIN_APPROVAL_LIST_METHOD],
     ] as const) {
       try {
-        const ids = readApprovalListIds(await this.deps.gateway.request(method, {}));
-        for (const id of ids) kindById.set(id, kind);
+        const entries = readApprovalList(await this.deps.gateway.request(method, {}));
+        for (const entry of entries) byId.set(entry.id, { kind, snapshot: entry.snapshot });
         succeededFamilies.add(kind);
       } catch (err) {
         this.deps.logger.error("backfill.failed", {
@@ -201,7 +237,7 @@ export class OpenClawBridge {
       }
     }
 
-    const pending = new Set(kindById.keys());
+    const pending = new Set(byId.keys());
     // Reconcile by approval id, but only within a family whose list call actually succeeded
     // (see the prune-safety note above): anything we still hold in a succeeded family that the
     // gateway no longer lists as pending was resolved elsewhere, so drop it. An id whose family's
@@ -212,9 +248,9 @@ export class OpenClawBridge {
     }
     this.deps.logger.info("backfill.projected", { pending: pending.size });
 
-    for (const [id, kind] of kindById) {
+    for (const [id, { kind, snapshot }] of byId) {
       if (this.settled.has(id) || this.inFlight.has(id)) continue;
-      await this.driveFromBackfill(id, kind);
+      await this.driveFromBackfill(id, kind, snapshot);
     }
   }
 
@@ -288,9 +324,29 @@ export class OpenClawBridge {
     return await this.driveApproval("plugin", parsed, this.deps.now());
   }
 
-  /** Drive an approval discovered by backfill rather than by a live event. */
-  private async driveFromBackfill(id: string, kind: ApprovalKind): Promise<ApprovalOutcome> {
-    const snapshot = await this.readSnapshot(id);
+  /**
+   * Drive an approval discovered by backfill rather than by a live event.
+   *
+   * `known` is the full record when the `*.approval.list` entry itself carried one (§4.3 —
+   * `exec.approval.list`/`plugin.approval.list` are legacy pre-2026.7 methods without a schema-
+   * pinned `Result`, but every *other* "list approvals" surface in the pinned protocol returns
+   * full `ApprovalSnapshot`-shaped records, e.g. `approval.history`'s `items[]`; see
+   * `readApprovalList`). When `known` is `null` (a bare-id list entry, or the family's list call
+   * failed to enumerate this id), the bridge falls back to a fresh `approval.get` — the same call
+   * every live-event drive already makes.
+   *
+   * Once a snapshot is in hand, plugin backfill is now a **faithful** binding, not a fabrication:
+   * the pinned `PluginApprovalPresentation` carries the real `pluginId`, `toolName`, `severity`,
+   * `detail`, and `agentId` (`docs/openclaw-integration.md` §5.2), so it drives through the exact
+   * same path a live event would, including the exact same `build-error` (no usable tool identity)
+   * and `presentation-divergence` (unreadable/mismatched snapshot) fail-closed outcomes.
+   */
+  private async driveFromBackfill(
+    id: string,
+    kind: ApprovalKind,
+    known: ApprovalSnapshot | null,
+  ): Promise<ApprovalOutcome> {
+    const snapshot = known ?? (await this.readSnapshot(id));
     if (snapshot === null) {
       return await this.resolveDeny(id, kind, "presentation-divergence", "approval.get unreadable");
     }
@@ -320,22 +376,19 @@ export class OpenClawBridge {
       return await this.driveApproval("exec", synthesized, this.deps.now(), snapshot);
     }
 
-    // Plugin backfill is structurally unable to produce a faithful §5.2 substrate. The pinned
-    // `ApprovalSnapshot` carries only `title`/`description` — never `pluginId`, `toolName`,
-    // `detail`, `severity`, or `toolCallId` (those travel solely on the untyped
-    // `plugin.approval.requested` event, which backfill never receives). Unlike exec — where the
-    // pinned `commandText` genuinely IS the real command, so tokenizing it is a faithful (if
-    // degraded) binding — there is no such faithful fallback for plugin identity/risk: absent
-    // `pluginId`/`toolName`/`severity` here does not mean the real approval lacks them, only that
-    // backfill never asked. Building a record anyway would fabricate `syntactic.server` (always
-    // "openclaw"), `syntactic.tool` (a slug of `title`, not the real tool name), and `risk`
-    // (always the default-severity tier, silently disabling the number-match challenge even when
-    // the real severity is `critical`) — a WYSIWYS violation the human would never see. Denying it
-    // would make the bridge a denial-of-service on an approval another surface (or a later live
-    // event / reconnect) may still resolve faithfully — exactly the problem §5.3 solves for
-    // unsupported kinds. Leave it open, parallel to that treatment.
-    this.deps.logger.warn("unrenderable-backfill", { approvalId: id, family: "plugin" });
-    return { kind: "left-open", why: "unrenderable-backfill" };
+    const synthesized = pluginEventFromSnapshot(snapshot);
+    if (synthesized === null) {
+      // Unreachable in practice (the kind check above already confirmed `presentation.kind ===
+      // "plugin"`), kept only so the narrowing in `pluginEventFromSnapshot` has a defined,
+      // fail-closed return for every input rather than an unsafe assertion.
+      return await this.resolveDeny(
+        id,
+        "plugin",
+        "build-error",
+        "backfilled plugin approval snapshot was not a plugin presentation",
+      );
+    }
+    return await this.driveApproval("plugin", synthesized, this.deps.now(), snapshot);
   }
 
   /** The end-to-end path for either family: reconcile → budget → request → verify → resolve. */

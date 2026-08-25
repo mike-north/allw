@@ -461,9 +461,13 @@ test("summary follows the §6.2 plugin template", () => {
 });
 
 test("summary renders unknown components as the literal 'unknown' (§6.2)", () => {
+  // The snapshot is canonical (§6.1) — both sources must omit a field for it to render "unknown".
   const result = buildPlugin({
     event: pluginEvent({
       request: { agentId: undefined, title: undefined, description: undefined },
+    }),
+    snapshot: pluginSnapshot({
+      presentation: { title: undefined, description: undefined, agentId: undefined },
     }),
   });
   assert.equal(
@@ -547,6 +551,84 @@ test("a snapshot description that differs from the event's is presentation-diver
   assert.equal(result.kind, "deny");
   assert.equal(result.reason, "presentation-divergence");
   assert.equal(result.detail.includes("description"), true);
+});
+
+test("a snapshot pluginId that differs from the event's is presentation-divergence (§6.1, §9)", () => {
+  const result = buildPlugin({
+    snapshot: pluginSnapshot({ presentation: { pluginId: "some-other-plugin" } }),
+  });
+  assert.equal(result.kind, "deny");
+  assert.equal(result.reason, "presentation-divergence");
+  assert.equal(result.detail.includes("pluginId"), true);
+});
+
+test("a snapshot toolName that differs from the event's is presentation-divergence (§6.1, §9)", () => {
+  const result = buildPlugin({
+    snapshot: pluginSnapshot({ presentation: { toolName: "some_other_tool" } }),
+  });
+  assert.equal(result.kind, "deny");
+  assert.equal(result.reason, "presentation-divergence");
+  assert.equal(result.detail.includes("toolName"), true);
+});
+
+test("a snapshot detail that differs from the event's is presentation-divergence (§6.1, §9)", () => {
+  const result = buildPlugin({
+    event: pluginEvent({ request: { detail: "It will restart 3 pods." } }),
+    snapshot: pluginSnapshot({ presentation: { detail: "It will do something else entirely." } }),
+  });
+  assert.equal(result.kind, "deny");
+  assert.equal(result.reason, "presentation-divergence");
+  assert.equal(result.detail.includes("detail"), true);
+});
+
+test("a snapshot agentId that differs from the event's is presentation-divergence (§6.1, §9)", () => {
+  const result = buildPlugin({
+    snapshot: pluginSnapshot({ presentation: { agentId: "some-other-agent" } }),
+  });
+  assert.equal(result.kind, "deny");
+  assert.equal(result.reason, "presentation-divergence");
+  assert.equal(result.detail.includes("agentId"), true);
+});
+
+test("severity divergence is the sharpest case: a lower event severity never suppresses the snapshot's higher one (§5.2, §6.4, §9)", () => {
+  // The event claims "warning" (medium risk); the pinned, canonical snapshot says "critical". If
+  // this were not caught, the number-match challenge would be silently skipped for what is really
+  // a critical-risk approval.
+  const result = buildPlugin({
+    event: pluginEvent({ request: { severity: "warning" } }),
+    snapshot: pluginSnapshot({ presentation: { severity: "critical" } }),
+  });
+  assert.equal(result.kind, "deny");
+  assert.equal(result.reason, "presentation-divergence");
+  assert.equal(result.detail.includes("severity"), true);
+});
+
+test("the snapshot's severity is canonical when the event omits it (§5.2, §6.1)", () => {
+  const result = buildPlugin({
+    event: pluginEvent({ request: { severity: undefined } }),
+    snapshot: pluginSnapshot({ presentation: { severity: "critical" } }),
+  });
+  assert.equal(result.kind, "request");
+  assert.equal(result.request.risk, "critical");
+  assert.equal(result.request.constraints.challengeRequired, true);
+});
+
+test("an allowedDecisions mismatch between the event and the snapshot is presentation-divergence (§6.1, §9)", () => {
+  const result = buildPlugin({
+    event: pluginEvent({ request: { allowedDecisions: ["deny"] } }),
+    snapshot: pluginSnapshot({ presentation: { allowedDecisions: ["allow-once", "deny"] } }),
+  });
+  assert.equal(result.kind, "deny");
+  assert.equal(result.reason, "presentation-divergence");
+  assert.equal(result.detail.includes("allowedDecisions"), true);
+});
+
+test("allowedDecisions order does not count as divergence (§6.1)", () => {
+  const result = buildPlugin({
+    event: pluginEvent({ request: { allowedDecisions: ["deny", "allow-once"] } }),
+    snapshot: pluginSnapshot({ presentation: { allowedDecisions: ["allow-once", "deny"] } }),
+  });
+  assert.equal(result.kind, "request");
 });
 
 test("a sanitized snapshot that omits title/description is NOT a divergence (§6.1)", () => {
