@@ -395,6 +395,125 @@ test("an approval already settled by a resolved broadcast is not driven again (�
   assert.deepEqual(gateway.resolves, []);
 });
 
+// ── issue #222: integrator-initiated retract ─────────────────────────────────────
+//
+// When OpenClaw resolves an approval on another surface while the bridge's own `requestApproval`
+// call for the SAME id is still in flight, the bridge aborts its `AbortSignal` — telling
+// `@allw/sdk` to retract the pending relay request so connected approver devices drop the stale
+// prompt live instead of riding out the full timeout. This is inbox hygiene only: it never
+// changes the outcome the bridge submits, and it must never produce a second `approval.resolve`
+// for an id already learned to be settled.
+
+test("resolved-elsewhere aborts the in-flight request exactly once, and the retraction is never re-resolved (issue #222)", async () => {
+  let abortCount = 0;
+  let rejectPending;
+  const pending = new Promise((_resolve, reject) => {
+    rejectPending = reject;
+  });
+  // Resolved once `requestApproval` has actually been called (and so has armed its controller —
+  // `driveApproval` sets it in `abortControllers` synchronously, immediately before calling in),
+  // so the test fires the resolved-elsewhere broadcast only once there is something to abort.
+  let requestSeen;
+  const requestSeenPromise = new Promise((resolve) => {
+    requestSeen = resolve;
+  });
+  const { bridge, gateway, records } = makeBridge({
+    requestApproval: (req) => {
+      req.signal.addEventListener(
+        "abort",
+        () => {
+          abortCount += 1;
+          // Mirrors `@allw/sdk`: a retracted request rejects rather than resolving to a Verdict.
+          rejectPending(new Error("allw: request was retracted before a verdict was received"));
+        },
+        { once: true },
+      );
+      requestSeen();
+      return pending;
+    },
+  });
+
+  const driving = bridge.handle(requested());
+  await requestSeenPromise;
+  const resolvedElsewhere = await bridge.handle({
+    event: "exec.approval.resolved",
+    payload: { id: APPROVAL_ID },
+  });
+  const outcome = await driving;
+
+  assert.deepEqual(resolvedElsewhere, { kind: "ignored" });
+  assert.deepEqual(outcome, { kind: "ignored" }, "a retraction is never resolved as a deny");
+  assert.equal(abortCount, 1, "retract must be issued exactly once for the in-flight request");
+  assert.deepEqual(
+    gateway.resolves,
+    [],
+    "the winner recorded elsewhere is never re-submitted by the bridge",
+  );
+  assert.ok(
+    records.some((r) => r.event === "approval.retracted" && r.fields.approvalId === APPROVAL_ID),
+  );
+});
+
+test("a request's own `requestApproval` call passes a live AbortSignal that is not aborted at submission time (issue #222)", async () => {
+  const { bridge, requests } = makeBridge();
+  await bridge.handle(requested());
+
+  assert.equal(requests.length, 1);
+  assert.ok(requests[0].signal instanceof AbortSignal, "an AbortSignal must be armed per request");
+  assert.equal(requests[0].signal.aborted, false);
+});
+
+test("a retract that fails to land does not crash driveApproval or trigger a duplicate resolve (§7.5, issue #222)", async () => {
+  // Simulates a failed relay retract call: `@allw/sdk` documents this as best-effort — the
+  // original request keeps riding its own deadline rather than rejecting — so the pending call
+  // eventually settles with an ordinary decision instead of throwing. The recorded winner from
+  // the resolved-elsewhere broadcast must still stand; this decision must never be re-submitted.
+  let resolvePending;
+  const pending = new Promise((resolve) => {
+    resolvePending = resolve;
+  });
+  let requestSeen;
+  const requestSeenPromise = new Promise((resolve) => {
+    requestSeen = resolve;
+  });
+  const { bridge, gateway, records } = makeBridge({
+    requestApproval: () => {
+      requestSeen();
+      return pending;
+    },
+  });
+
+  const driving = bridge.handle(requested());
+  await requestSeenPromise;
+  await bridge.handle({ event: "exec.approval.resolved", payload: { id: APPROVAL_ID } });
+  // The retract had no effect (simulated relay error): the call still eventually resolves.
+  resolvePending(verdict("expired"));
+  const outcome = await driving;
+
+  assert.deepEqual(outcome, { kind: "ignored" });
+  assert.deepEqual(gateway.resolves, [], "a decision arriving after the id is settled is dropped");
+  assert.ok(records.some((r) => r.event === "approval.retracted"));
+});
+
+test("a request the bridge itself resolved is not retracted (§7.5, issue #222)", async () => {
+  const { bridge, gateway, records } = makeBridge();
+  const outcome = await bridge.handle(requested());
+  assert.deepEqual(outcome, { kind: "resolved", decision: "allow-once", applied: true });
+  assert.equal(gateway.resolves.length, 1);
+
+  // OpenClaw broadcasts `*.approval.resolved` for every resolution, including the bridge's own —
+  // by the time this arrives, driveApproval already removed its controller (it settled before
+  // ever submitting), so there is nothing left to abort and no retraction is logged for it.
+  const echoed = await bridge.handle({
+    event: "exec.approval.resolved",
+    payload: { id: APPROVAL_ID },
+  });
+
+  assert.deepEqual(echoed, { kind: "ignored" });
+  assert.equal(gateway.resolves.length, 1, "the bridge's own resolution is never retracted");
+  assert.ok(!records.some((r) => r.event === "approval.retracted"));
+});
+
 // ── §7.3 the structural absence of allow-always ─────────────────────────────────
 
 test("allow-always is never submitted under any input (§7.3)", async () => {

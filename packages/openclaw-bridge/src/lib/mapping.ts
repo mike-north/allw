@@ -74,6 +74,16 @@ export interface BridgeApprovalRequest {
   };
   readonly chain: readonly string[];
   readonly timeoutMs: number;
+  /**
+   * Integrator-initiated cancellation (issue #195, issue #222). `OpenClawBridge` arms an
+   * `AbortController` per in-flight approval id and aborts it the moment it learns — via a
+   * `*.approval.resolved` broadcast — that the SAME id was decided on another OpenClaw surface
+   * first. Aborting tells `@allw/sdk` to retract the pending relay request so connected approver
+   * devices drop the stale prompt live, instead of riding out the full timeout
+   * (`docs/openclaw-integration.md` §7.5). This is inbox hygiene only: first-answer-wins (§9) has
+   * already decided the outcome, and a retract never enters the audit chain as a decision.
+   */
+  readonly signal?: AbortSignal;
 }
 
 /** Outcome of mapping one approval. */
