@@ -47,11 +47,15 @@ export class RelayError extends Error {
  * - `verdict`: a device decided; `value` is the opaque signed `Verdict` JSON (unverified here —
  *   the SDK verifies it through the WASM core before exposing it).
  * - `expired`: the relay reported the request past its deadline (fail-closed terminal state).
+ * - `retracted`: the integrator that submitted the request cancelled it before a verdict arrived
+ *   (issue #195). NOT a verdict — no device ever decided, so this never carries a `value` and can
+ *   never resolve `approved`.
  * - `timeout`: the SDK's own deadline elapsed with no terminal relay signal (fail-closed).
  */
 export type VerdictOutcome =
   | { readonly kind: "verdict"; readonly value: unknown }
   | { readonly kind: "expired" }
+  | { readonly kind: "retracted" }
   | { readonly kind: "timeout" };
 
 /** A monotonic-ish clock injectable for deterministic tests (defaults to `Date.now`). */
@@ -275,6 +279,9 @@ export class RelayClient {
     if (status === "expired") {
       return { kind: "expired" };
     }
+    if (status === "retracted") {
+      return { kind: "retracted" };
+    }
     // "pending" (or anything non-terminal) — keep waiting.
     return null;
   }
@@ -284,5 +291,30 @@ export class RelayClient {
     const path = `${toWsUrl(this.base)}/requests/${encodeURIComponent(requestId)}/wait`;
     const token = this.requestAuthTokens.get(requestId);
     return token === undefined ? path : `${path}?auth=${encodeURIComponent(token)}`;
+  }
+
+  /**
+   * Cancel a request this client submitted (`POST /:acct/requests/:id/retract`, issue #195).
+   * Bearer-authenticated with the `request_auth_token` returned by {@link submit} — the relay
+   * scopes the retract to exactly the request that token was issued for, so an integrator can
+   * never retract a request it did not submit. Best-effort by design: the caller (`requestApproval`'s
+   * abort handling) does not treat a failed retract as fatal — the original deadline still governs,
+   * so a failure here can only make cancellation a no-op, never fabricate an approval or discard an
+   * already-recorded verdict (the relay itself refuses to retract a `resolved` request).
+   *
+   * @throws {RelayError} on a non-2xx response (e.g. 404 unknown request, 409 already resolved/expired).
+   */
+  async retract(requestId: string): Promise<void> {
+    const token = this.requestAuthTokens.get(requestId);
+    const resp = await this.timedFetch(
+      `${this.base}/requests/${encodeURIComponent(requestId)}/retract`,
+      {
+        method: "POST",
+        ...(token === undefined ? {} : { headers: { Authorization: `Bearer ${token}` } }),
+      },
+    );
+    if (!resp.ok) {
+      throw new RelayError(`relay retract failed (HTTP ${String(resp.status)})`, resp.status);
+    }
   }
 }

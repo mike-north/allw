@@ -27,11 +27,15 @@ import { awaitVerdict, type WebSocketFactory } from "./wait.js";
 import { loadWasm, type AllwWasm } from "./wasm.js";
 
 /**
- * A verdict decision. In v0 `requestApproval` only ever *resolves* to `approved` (verified),
- * `denied` (a verified human "no" or a fail-closed synthesis), or `expired` (timeout / past
- * deadline). `aborted` is part of the wire vocabulary but originates **only from a signed device
- * verdict** — there is no client-side cancellation (`AbortSignal`) in v0, so the SDK never
+ * A verdict decision. `requestApproval` *resolves* to `approved` (verified), `denied` (a verified
+ * human "no" or a fail-closed synthesis), or `expired` (timeout / past deadline). `aborted` is part
+ * of the wire vocabulary but originates **only from a signed device verdict** — the SDK never
  * synthesizes it.
+ *
+ * Integrator-initiated cancellation (issue #195, {@link ApprovalRequest.signal}) is a **separate**
+ * mechanism from this enum: a retracted request was never decided by any device, so it is not a
+ * verdict at all — `requestApproval` *rejects* with {@link RequestRetractedError} for that outcome
+ * rather than resolving to a `Decision`.
  */
 export type Decision = "approved" | "denied" | "expired" | "aborted";
 export type Risk = "low" | "medium" | "high" | "critical";
@@ -94,6 +98,29 @@ export interface ApprovalRequest {
   readonly chain?: readonly string[];
   /** Fail-closed deadline (ms from now); on expiry the verdict resolves to `expired`. */
   readonly timeoutMs?: number;
+  /**
+   * Integrator-initiated cancellation (issue #195): when this signal aborts, `requestApproval`
+   * tells the relay to retract the pending request — so connected approver devices clear the
+   * notification live — and the call **rejects** with {@link RequestRetractedError} instead of
+   * resolving to a `Verdict`. A retract is NOT a verdict; it never enters the audit chain as a
+   * decision. It is best-effort and cannot discard an already-recorded decision: if the request was
+   * already `resolved` (a device decided first) the retract is refused server-side and
+   * `requestApproval` still resolves normally to that verdict. Aborting before the request has even
+   * been submitted skips the network round-trip entirely and rejects immediately.
+   */
+  readonly signal?: AbortSignal;
+}
+
+/**
+ * Thrown by `requestApproval` when the caller's {@link ApprovalRequest.signal} aborted before a
+ * verdict was received (issue #195). Distinct from every {@link Decision}: a retracted request was
+ * never decided by any device, so it is not a verdict and never appears in the audit chain.
+ */
+export class RequestRetractedError extends Error {
+  constructor(readonly requestId: string) {
+    super(`allw: request '${requestId}' was retracted before a verdict was received`);
+    this.name = "RequestRetractedError";
+  }
 }
 
 /**
@@ -704,6 +731,34 @@ function isPreDeadlineTransportFailure(err: unknown): boolean {
 }
 
 /**
+ * Arm the integrator-initiated cancellation (issue #195): once the request has a
+ * `request_auth_token` (i.e. `submit` succeeded), tell the relay to retract it the moment `signal`
+ * aborts — immediately, if it is already aborted. Fire-and-forget and best-effort by design: the
+ * awaiting `requestApproval` call learns of the retraction through the normal wait mechanism (the
+ * relay pushes/reports the terminal `retracted` status back over the same WS/poll path a verdict
+ * would arrive on — `wait.ts`), so a failed retract call here can only leave the original deadline
+ * in force, never fabricate an approval or silently drop an already-recorded verdict.
+ */
+function armRetractOnAbort(
+  relay: RelayClient,
+  requestId: string,
+  signal: AbortSignal | undefined,
+): void {
+  if (!signal) return;
+  const doRetract = (): void => {
+    relay.retract(requestId).catch(() => {
+      // Best-effort: a failed retract just means cancellation had no effect; the deadline still
+      // governs (fail-closed default), and a verdict recorded first is never discarded by this.
+    });
+  };
+  if (signal.aborted) {
+    doRetract();
+    return;
+  }
+  signal.addEventListener("abort", doRetract, { once: true });
+}
+
+/**
  * Construct a relay-bound client. The returned {@link Client.requestApproval} runs the full
  * E2EE round-trip and resolves to a verified {@link Verdict} — never a bare "allow".
  */
@@ -739,6 +794,12 @@ export function createClient(config: ClientConfig): Client {
     // The request id is generated up front so a fail-closed `Verdict` (below) can carry it even if
     // the pre-deadline relay round-trip never completes.
     const id = newRequestId();
+
+    // A caller that cancels before the request was ever submitted has nothing to retract on the
+    // relay — reject immediately rather than paying for a network round-trip (issue #195).
+    if (req.signal?.aborted) {
+      throw new RequestRetractedError(id);
+    }
 
     // 3–4. Fetch devices, filter out revoked ones, encrypt, and submit. These run BEFORE the
     // await-verdict deadline timer is armed, so a hung relay (TCP-accepted but never responding)
@@ -786,6 +847,8 @@ export function createClient(config: ClientConfig): Client {
         context_ciphertext: contextCiphertext,
       };
       await relay.submit(envelope);
+      // The request now has a `request_auth_token` to retract with — arm cancellation (issue #195).
+      armRetractOnAbort(relay, id, req.signal);
     } catch (err) {
       if (isPreDeadlineTransportFailure(err)) {
         // A hung/black-holed connection or a bare network error before the deadline ⇒ no verified
@@ -844,6 +907,11 @@ export function createClient(config: ClientConfig): Client {
       acceptedNonceB64 = verified?.nonceB64;
     } else if (outcome.kind === "expired") {
       decision = "expired";
+    } else if (outcome.kind === "retracted") {
+      // NOT a verdict (issue #195) — no device ever decided, so this must never surface as a
+      // `Decision`. Reject instead of resolving; contrast with `expired`/`timeout`, which are
+      // fail-closed *decisions* about an unanswered request.
+      throw new RequestRetractedError(id);
     } else {
       // timeout — fail closed.
       decision = "expired";

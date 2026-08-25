@@ -622,6 +622,11 @@ export class AccountRelay implements DurableObject {
       return this.handleGetRequest(path1, request);
     }
 
+    // POST /requests/{request_id}/retract — integrator cancels its own pending request (#195).
+    if (method === "POST" && path0 === "requests" && path1 !== "" && path2 === "retract") {
+      return this.handleRetract(path1, request);
+    }
+
     // 405 only for a KNOWN route path reached with an unsupported method; any other (unknown)
     // sub-path is a 404 — e.g. `GET /devices/<id>` or `GET /pairing/unknown` are not routes.
     const isKnownRoutePath =
@@ -640,7 +645,11 @@ export class AccountRelay implements DurableObject {
         (subSegments[3] ?? "") === "") ||
       (path0 === "requests" && path1 === "") ||
       (path0 === "requests" && path1 !== "" && path2 === "" && (subSegments[2] ?? "") === "") ||
-      (path0 === "requests" && path1 !== "" && path2 === "wait" && (subSegments[3] ?? "") === "");
+      (path0 === "requests" && path1 !== "" && path2 === "wait" && (subSegments[3] ?? "") === "") ||
+      (path0 === "requests" &&
+        path1 !== "" &&
+        path2 === "retract" &&
+        (subSegments[3] ?? "") === "");
     if (isKnownRoutePath) {
       return json({ error: "method not allowed" }, 405);
     }
@@ -1286,6 +1295,46 @@ export class AccountRelay implements DurableObject {
   }
 
   /**
+   * POST /requests/{request_id}/retract  (issue #195)
+   *
+   * Integrator-authenticated cancellation of a request it submitted. Bearer `request_auth_token`,
+   * scoped by {@link authorizeRequestRead} to exactly the request that token was issued for — an
+   * integrator can never retract a request it did not submit (401/403, same as polling/wait).
+   *
+   * A retract is **NOT a verdict**: it never touches the `verdict` table and can never appear in
+   * the audit chain as a decision. It transitions a `pending` request straight to the terminal
+   * `retracted` status — distinct from the fail-closed `expired` timeout (`docs/contract.md`
+   * §Lifecycle) — and is refused (409) once a real decision (`resolved`) or a timeout (`expired`)
+   * already landed, so a legitimate verdict or a fail-closed expiry can never be discarded by a
+   * racing cancellation. Retracting an already-retracted request is idempotent (200).
+   */
+  private async handleRetract(requestId: string, request: Request): Promise<Response> {
+    const authorized = await this.authorizeRequestRead(requestId, request);
+    if (authorized instanceof Response) return authorized;
+    const status = authorized.status;
+    if (status === "resolved") {
+      return json({ error: "request already resolved; cannot retract a recorded decision" }, 409);
+    }
+    if (status === "expired") {
+      return json({ error: "request already expired" }, 409);
+    }
+    if (status === "retracted") {
+      return json({ request_id: requestId, status: "retracted" });
+    }
+
+    const now = Date.now();
+    this.sql.exec(
+      `UPDATE request SET status = 'retracted', terminal_at = ?
+       WHERE request_id = ? AND status = 'pending'`,
+      now,
+      requestId,
+    );
+    this.notifyRetractedRequest(requestId);
+    await this.armExpiryAlarm();
+    return json({ request_id: requestId, status: "retracted" });
+  }
+
+  /**
    * GET /requests/{request_id}/wait  (WebSocket upgrade)
    *
    * A live waiting integrator: the verdict is pushed the instant a device decides (or immediately
@@ -1293,8 +1342,9 @@ export class AccountRelay implements DurableObject {
    * terminal status is pushed at once (fail-closed). Returns 404 for an unknown request (a request
    * without a WebSocket upgrade header is rejected earlier, at the router, with 426).
    *
-   * Protocol (relay → integrator): `{ type: "verdict", request_id, verdict }` or
-   * `{ type: "expired", request_id }` (terminal, no verdict will come).
+   * Protocol (relay → integrator): `{ type: "verdict", request_id, verdict }`,
+   * `{ type: "expired", request_id }`, or `{ type: "retracted", request_id }` (terminal, no verdict
+   * will come for either of the latter two).
    */
   private async handleIntegratorWait(requestId: string, request: Request): Promise<Response> {
     const authorized = await this.authorizeRequestRead(requestId, request);
@@ -1322,6 +1372,14 @@ export class AccountRelay implements DurableObject {
       trySendJson(server, { type: "expired", request_id: requestId });
       try {
         server.close(1000, "expired");
+      } catch {
+        // already closing — ignore
+      }
+    } else if (status === "retracted") {
+      // Cancelled by the submitting integrator (#195) — not a verdict; tell the waiter at once.
+      trySendJson(server, { type: "retracted", request_id: requestId });
+      try {
+        server.close(1000, "retracted");
       } catch {
         // already closing — ignore
       }
@@ -1519,6 +1577,13 @@ export class AccountRelay implements DurableObject {
       return;
     }
 
+    // A retract is NOT a verdict and must not be overridden by a late-arriving one (#195) — the
+    // integrator that cancelled has already stopped waiting for a decision.
+    if (req.status === "retracted") {
+      trySendJson(ws, { type: "ack", request_id: requestId, status: "retracted" });
+      return;
+    }
+
     // Fail-closed (contract §Invariants #6): a request past its deadline must NEVER become
     // approvable. Transition pending→expired and refuse to record the verdict.
     const now = Date.now();
@@ -1636,12 +1701,31 @@ export class AccountRelay implements DurableObject {
     }
   }
 
+  /**
+   * Fan out a cancellation (#195): clear it from device pending lists — reusing the SAME `retract`
+   * message devices already understand for cross-device dedupe — and tell any live integrator
+   * waiter it will never receive a verdict for this request.
+   */
+  private notifyRetractedRequest(requestId: string): void {
+    for (const sock of this.ctx.getWebSockets(DEVICE_TAG)) {
+      trySendJson(sock, { type: "retract", request_id: requestId });
+    }
+    for (const sock of this.ctx.getWebSockets(integratorTag(requestId))) {
+      trySendJson(sock, { type: "retracted", request_id: requestId });
+      try {
+        sock.close(1000, "retracted");
+      } catch {
+        // already closing — ignore
+      }
+    }
+  }
+
   /** Bound storage growth by removing old terminal request rows and their stored verdicts. */
   private sweepTerminalRows(now: number): void {
     const cutoff = now - REQUEST_RETENTION_MS;
     this.sql.exec(
       `DELETE FROM request
-       WHERE status IN ('expired', 'resolved') AND terminal_at IS NOT NULL AND terminal_at < ?`,
+       WHERE status IN ('expired', 'resolved', 'retracted') AND terminal_at IS NOT NULL AND terminal_at < ?`,
       cutoff,
     );
     this.sql.exec(`DELETE FROM verdict WHERE request_id NOT IN (SELECT request_id FROM request)`);

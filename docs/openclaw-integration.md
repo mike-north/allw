@@ -699,12 +699,14 @@ Explicitly out of scope for all six slices: the `allow-always` → `PolicyRule` 
 
 ## 13. Open decisions
 
-- **No integrator-side cancellation.** `@allw/sdk` has no `AbortSignal` in v0 — `aborted` originates
-  only from a signed device verdict. So when OpenClaw resolves an approval at another surface first,
-  the bridge cannot retract the pending allw prompt, and the human may decide a request that is
-  already terminal. That is safe (the resolve returns `applied: false` and the recorded winner
-  stands) but it is bad UX and it wastes a decision. Closing it needs an SDK cancellation path plus
-  an integrator-initiated relay retract; both are outside this spec and should be filed separately.
+- **Bridge-side wiring of integrator cancellation is still open.** `@allw/sdk` now has an
+  `ApprovalRequest.signal` (`AbortSignal`) that retracts the pending relay request and rejects
+  `requestApproval` with `RequestRetractedError` (issue #195, `docs/contract.md` §Cancellation) — so
+  when OpenClaw resolves an approval at another surface first, the bridge CAN now tell allw to stop
+  waiting instead of riding out the full timeout. The bridge itself does not call it yet: `handle()`'s
+  `*.approval.resolved` branch would need to hold an `AbortController` per in-flight id (armed when
+  `driveApproval` calls `requestApproval`) and abort it there. Filed as a follow-up so slice 5 lands
+  independently of the SDK/relay mechanism.
 - **Which gateway identity to standardize on.** `<gateway-id>` is operator-asserted today because the
   protocol exposes no stable gateway identity. If OpenClaw later surfaces one (or once work-stream
   attestation lands per [enrollment.md](./enrollment.md)), the asserted label should become a

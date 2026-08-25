@@ -17,6 +17,9 @@
  *  (c-sig) verdict from an uncertified key → never approved;
  *  (c') authenticated human "denied" → resolves `denied` (the verified decision), `verify()` false;
  *  (d) negative: no devices, relay submit error;
+ *  (i) integrator-initiated cancellation (`ApprovalRequest.signal`, issue #195) → rejects with
+ *      `RequestRetractedError`, discovered via WS push, via poll fallback, or short-circuited
+ *      pre-submission; a failed retract call is best-effort and leaves the deadline in force;
  *  plus a zero-leak envelope-shape assertion.
  *
  * Run order (the wasm must be built and the SDK compiled first):
@@ -34,7 +37,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 
-import { createClient } from "../dist/index.js";
+import { createClient, RequestRetractedError } from "../dist/index.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const vendorDir = join(here, "..", "vendor", "allw-wasm");
@@ -223,7 +226,13 @@ function signAccountState(wasm, approver, { sequence, revokedDeviceIds = [] }) {
  * submitted envelope so a test can mint a matching verdict afterwards.
  */
 function makeRelayDouble({ devices, behavior }) {
-  const state = { captured: null, submitted: false, requestAuthToken: null };
+  const state = {
+    captured: null,
+    submitted: false,
+    requestAuthToken: null,
+    retracted: false,
+    retractCalls: 0,
+  };
 
   const fetchImpl = async (url, init = {}) => {
     const u = new URL(url);
@@ -251,10 +260,23 @@ function makeRelayDouble({ devices, behavior }) {
         202,
       );
     }
+    if (method === "POST" && path.endsWith("/retract")) {
+      state.retractCalls += 1;
+      if (init.headers?.Authorization !== `Bearer ${state.requestAuthToken}`) {
+        return jsonResponse({ error: "authorization denied" }, 403);
+      }
+      if (behavior.retractStatus && behavior.retractStatus !== 200) {
+        return jsonResponse({ error: "conflict" }, behavior.retractStatus);
+      }
+      state.retracted = true;
+      behavior.onRetract?.();
+      return jsonResponse({ request_id: state.captured?.id ?? "x", status: "retracted" });
+    }
     if (method === "GET" && path.includes("/requests/")) {
       if (init.headers?.Authorization !== `Bearer ${state.requestAuthToken}`) {
         return jsonResponse({ error: "authorization denied" }, 403);
       }
+      if (state.retracted) return jsonResponse({ request_id: "x", status: "retracted" });
       const outcome = behavior.poll(state.captured);
       if (outcome === null) return jsonResponse({ request_id: "x", status: "pending" });
       if (outcome === "expired") return jsonResponse({ request_id: "x", status: "expired" });
@@ -297,6 +319,40 @@ class FakeWebSocket {
       if (frame === undefined) return;
       for (const l of this.listeners.message) l({ data: JSON.stringify(frame) });
     });
+  }
+  addEventListener(type, listener) {
+    this.listeners[type].push(listener);
+  }
+  close() {
+    this.closed = true;
+  }
+}
+
+/**
+ * A controllable fake `…/wait` socket that emits nothing on its own — a test drives it explicitly
+ * via `emit()`, modeling the relay pushing a message (e.g. `{type:"retracted"}`) on the SAME
+ * integrator wait socket sometime AFTER connection, in response to a separate action (like the
+ * client's own `POST …/retract` call landing).
+ */
+function makeControllableWebSocketFactory() {
+  let instance = null;
+  const factory = (url) => {
+    instance = new ControllableFakeWebSocket(url);
+    return instance;
+  };
+  factory.emit = (frame) => instance?.emit(frame);
+  return factory;
+}
+
+class ControllableFakeWebSocket {
+  constructor(url) {
+    this.url = url;
+    this.listeners = { message: [], open: [], error: [], close: [] };
+    this.closed = false;
+  }
+  emit(frame) {
+    if (this.closed) return;
+    for (const l of this.listeners.message) l({ data: JSON.stringify(frame) });
   }
   addEventListener(type, listener) {
     this.listeners[type].push(listener);
@@ -356,6 +412,20 @@ async function withFixedRequestId(id, fn) {
     } else {
       delete globalThis.crypto.randomUUID;
     }
+  }
+}
+
+/**
+ * Poll `predicate` (real timers; the fake-clock helpers above don't advance until something
+ * `await`s) until it is true, so a test can deterministically wait for an async side effect (e.g.
+ * "the envelope was submitted") before driving the next step, instead of guessing a microtask
+ * count.
+ */
+async function waitFor(predicate, { timeoutMs = 2000, stepMs = 1 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error("waitFor: condition never became true");
+    await new Promise((resolve) => setTimeout(resolve, stepMs));
   }
 }
 
@@ -987,4 +1057,143 @@ test("(h) WS closes without a verdict → poll fallback delivers the approval", 
     "approved",
     "WS close falls back to polling, which delivers approval",
   );
+});
+
+// ── Integrator-initiated cancellation (issue #195) ─────────────────────────────────────
+
+test("(i) an already-aborted signal rejects immediately without ever submitting", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: { poll: () => null },
+  });
+  const controller = new AbortController();
+  controller.abort();
+
+  await assert.rejects(
+    () =>
+      pollClient(approver, relay).requestApproval({
+        ...sampleRequest(),
+        signal: controller.signal,
+      }),
+    RequestRetractedError,
+    "an already-aborted signal must reject with RequestRetractedError",
+  );
+  assert.equal(relay.state.submitted, false, "no envelope is ever submitted to the relay");
+});
+
+test("(i') cancellation discovered over the wait WebSocket rejects with RequestRetractedError", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const req = sampleRequest();
+  const controller = new AbortController();
+
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: {
+      poll: () => null,
+      // Simulate the relay pushing `{type:"retracted"}` back on the SAME wait socket once the
+      // client's own retract call lands (mirrors `notifyRetractedRequest` in the real relay).
+      onRetract: () => wsFactory.emit({ type: "retracted", request_id: relay.state.captured.id }),
+    },
+  });
+  const wsFactory = makeControllableWebSocketFactory();
+
+  const client = createClient({
+    relayUrl: RELAY_URL,
+    accountId: ACCOUNT_ID,
+    approverRootKey: approver.accountRootPub,
+    fetchImpl: relay.fetchImpl,
+    nowImpl: () => NOW_MS,
+    webSocketFactory: wsFactory,
+  });
+
+  const pending = client.requestApproval({ ...req, signal: controller.signal });
+  // Cancel once the submit has had a chance to land (a real caller cancels asynchronously, e.g. on
+  // learning the approval was resolved elsewhere).
+  await waitFor(() => relay.state.submitted);
+  controller.abort();
+
+  await assert.rejects(
+    () => pending,
+    RequestRetractedError,
+    "a WS-pushed 'retracted' terminal state rejects the pending requestApproval call",
+  );
+  assert.equal(
+    relay.state.retractCalls,
+    1,
+    "aborting calls the relay retract endpoint exactly once",
+  );
+});
+
+test("(i'') cancellation discovered via poll fallback rejects with RequestRetractedError", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const req = sampleRequest();
+  const controller = new AbortController();
+
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: { poll: () => null },
+  });
+
+  const client = createClient({
+    relayUrl: RELAY_URL,
+    accountId: ACCOUNT_ID,
+    approverRootKey: approver.accountRootPub,
+    fetchImpl: relay.fetchImpl,
+    nowImpl: () => NOW_MS,
+    webSocketFactory: undefined, // poll-only path
+    pollIntervalMs: 5,
+  });
+
+  const pending = client.requestApproval({ ...req, signal: controller.signal });
+  await waitFor(() => relay.state.submitted);
+  controller.abort();
+
+  await assert.rejects(
+    () => pending,
+    RequestRetractedError,
+    "the poll fallback discovers the relay's 'retracted' status and rejects",
+  );
+});
+
+test("(i''') a failed retract call is best-effort: the original deadline still governs", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const req = sampleRequest();
+  const controller = new AbortController();
+
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    // The relay refuses the retract (e.g. the request was already terminal server-side); no
+    // verdict is ever produced either, so only the fail-closed deadline can resolve the call.
+    behavior: { poll: () => null, retractStatus: 409 },
+  });
+  const clock = makeTimeoutClock();
+
+  const client = createClient({
+    relayUrl: RELAY_URL,
+    accountId: ACCOUNT_ID,
+    approverRootKey: approver.accountRootPub,
+    fetchImpl: relay.fetchImpl,
+    nowImpl: clock.now,
+    webSocketFactory: undefined,
+    pollIntervalMs: 5,
+    scheduleImpl: clock.schedule,
+  });
+
+  const pending = client.requestApproval({ ...req, signal: controller.signal });
+  await waitFor(() => relay.state.submitted);
+  controller.abort();
+
+  const verdict = await pending;
+  assert.equal(
+    verdict.decision,
+    "expired",
+    "a best-effort retract failure never blocks or corrupts the fail-closed timeout",
+  );
+  assert.equal(relay.state.retractCalls, 1, "the retract attempt was still made");
+  assert.equal(relay.state.retracted, false, "the relay-side status was never actually flipped");
 });
