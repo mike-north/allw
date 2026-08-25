@@ -555,6 +555,57 @@ test("renderRequest surfaces MCP server/tool even when a benign raw masks them, 
   assert.match(rendered, /delete_all_files/, "the dangerous MCP tool token is visible");
 });
 
+test("renderRequest labels an agent_tool_call's (server,tool) identity distinctly from MCP (Refs #217)", async () => {
+  // An `agent_tool_call` (e.g. an OpenClaw plugin permission request — docs/openclaw-integration.md
+  // §5.2) reuses the (server, tool) function-identity fields from mcp_tool_call, but it is NOT an
+  // MCP call: `server` holds a plugin id, not an MCP server name. The renderer must never label it
+  // "MCP" — that would tell the human something false about where the action came from.
+  const wasm = await loadWasm();
+  const { keyfile } = pairedApprover(wasm);
+
+  const ctx = {
+    action: {
+      record_schema_version: 1,
+      surface: "agent_tool_call",
+      syntactic: {
+        server: "deploy-plugin",
+        tool: "deploy_service",
+        raw: "This plugin wants to deploy to production.",
+      },
+      risk: "medium",
+    },
+    summary:
+      "OpenClaw home-mini · agent agent-main · deploy-plugin/deploy_service: Deploy — deploy now",
+    actor: { id: "openclaw:home-mini", kind: "openclaw" },
+    risk: "medium",
+    reversible: true,
+    constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
+  };
+  const ctxJson = JSON.stringify(ctx);
+  const jwe = wasm.encrypt_context(
+    ctxJson,
+    JSON.stringify([{ device_id: DEVICE_ID, public_key_b64: keyfile.device_encryption_pubkey }]),
+  );
+  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
+  const rendered = renderRequest(prepared);
+
+  assert.match(
+    rendered,
+    /Agent\/plugin:\s+deploy-plugin :: deploy_service/,
+    "the (server, tool) identity is shown under an agent/plugin label, not MCP",
+  );
+  assert.doesNotMatch(
+    rendered,
+    /MCP:/,
+    "an agent_tool_call must never be labeled MCP — server is a plugin id, not an MCP server name",
+  );
+  assert.match(
+    rendered,
+    /Surface:\s+agent_tool_call/,
+    "the raw surface value is also shown verbatim",
+  );
+});
+
 test("renderRequest surfaces file-edit paths, operation, summary, and diff hash (#106)", async () => {
   const wasm = await loadWasm();
   const { keyfile } = pairedApprover(wasm);

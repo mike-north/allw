@@ -146,7 +146,7 @@ function renderActionHeadline(action: ActionRecord): string {
     const reconstructed = reconstructCommand(syntactic);
     if (reconstructed !== undefined) return reconstructed;
 
-    // MCP headline when there is no command form: "server :: tool".
+    // MCP / agent_tool_call headline when there is no command form and no `raw`: "server :: tool".
     const tool = readString(syntactic, "tool");
     if (tool !== undefined) {
       const server = readString(syntactic, "server");
@@ -216,13 +216,20 @@ function substrateDetailLines(action: ActionRecord): string[] {
     lines.push(`  Env refs:   ${envRefs.join(", ")}`);
   }
 
-  // MCP server/tool are hash-bound but were rendered on NO line when a `raw` headline ran — so a
+  // Server/tool are hash-bound but were rendered on NO line when a `raw` headline ran — so a
   // benign `raw` ("echo hello") could mask a dangerous `fs :: delete_all_files`. Surface them on an
   // unconditional labeled line whenever both are present (mirrors the command-surface fix; #56).
+  // The label distinguishes an actual MCP tool call from an `agent_tool_call` (a harness/plugin
+  // gating a tool call itself, not an MCP server — `docs/openclaw-integration.md` §5.2) so the
+  // human is never told a plugin-owned action is an MCP call it never was.
   const tool = readString(syntactic, "tool");
   const server = readString(syntactic, "server");
   if (server !== undefined && tool !== undefined) {
-    lines.push(`  MCP:        ${server} :: ${tool}`);
+    const line =
+      action.surface === "agent_tool_call"
+        ? `  Agent/plugin: ${server} :: ${tool}`
+        : `  MCP:        ${server} :: ${tool}`;
+    lines.push(line);
   }
 
   // MCP params are the entire call payload — show them in full (compact JSON), never elided.
