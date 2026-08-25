@@ -95,6 +95,13 @@ async function post<T>(
     );
     if (token !== undefined) finalHeaders.Authorization = `Bearer ${token}`;
   }
+  const retractMatch = /^\/requests\/([^/]+)\/retract$/.exec(subPath);
+  if (retractMatch && finalHeaders.Authorization === undefined) {
+    const token = requestAuthTokens.get(
+      tokenKey(accountId, decodeURIComponent(retractMatch[1] ?? "")),
+    );
+    if (token !== undefined) finalHeaders.Authorization = `Bearer ${token}`;
+  }
   const resp = await SELF.fetch(relayUrl(accountId, subPath), {
     method: "POST",
     headers: { "Content-Type": "application/json", ...finalHeaders },
@@ -1226,6 +1233,213 @@ describe("AccountRelay — fail-closed expiry", () => {
     // A de-enrolled device must not drive resolution — the request stays pending.
     const polled = await get<{ status: string }>(acct, "/requests/req-rev-1");
     expect(polled.data.status).toBe("pending");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Integrator-initiated retract (issue #195) — NOT a verdict, distinct from `expired`
+// ---------------------------------------------------------------------------
+
+describe("AccountRelay — retract (issue #195)", () => {
+  it("retracts a pending request: terminal 'retracted', no verdict, distinct from expired", async () => {
+    const acct = "acct-retract-basic";
+    const submit = await post<SubmitResult>(acct, "/requests", makeEnvelope("req-retract-basic"));
+    expect(submit.status).toBe(202);
+
+    const retract = await post<{ request_id: string; status: string }>(
+      acct,
+      "/requests/req-retract-basic/retract",
+      {},
+    );
+    expect(retract.status).toBe(200);
+    expect(retract.data.status).toBe("retracted");
+
+    const polled = await get<{ status: string; verdict?: unknown }>(
+      acct,
+      "/requests/req-retract-basic",
+    );
+    expect(polled.data.status).toBe("retracted");
+    expect(polled.data.status).not.toBe("expired");
+    expect(polled.data.verdict).toBeUndefined();
+  });
+
+  it("clears the pending prompt from connected devices (reuses the {type:'retract'} fan-out)", async () => {
+    const acct = "acct-retract-devices";
+    await enrollDevice(acct);
+    const deviceId = await firstDeviceId(acct);
+    const device = await connectWs(acct, `/devices/${deviceId}/connect`);
+
+    await post(acct, "/requests", makeEnvelope("req-retract-devices"));
+    expect((await device.next()).type).toBe("request");
+
+    await post(acct, "/requests/req-retract-devices/retract", {});
+
+    const retract = await device.next();
+    expect(retract.type).toBe("retract");
+    expect(retract.request_id).toBe("req-retract-devices");
+  });
+
+  it("pushes {type:'retracted'} to a live integrator wait socket and closes it", async () => {
+    const acct = "acct-retract-wait-live";
+    await post(acct, "/requests", makeEnvelope("req-retract-wait-live"));
+    const integrator = await connectWs(acct, "/requests/req-retract-wait-live/wait");
+
+    await post(acct, "/requests/req-retract-wait-live/retract", {});
+
+    const msg = await integrator.next();
+    expect(msg.type).toBe("retracted");
+    expect(msg.request_id).toBe("req-retract-wait-live");
+  });
+
+  it("…/wait opened AFTER a retract immediately reports 'retracted' and closes (symmetric with expired)", async () => {
+    const acct = "acct-retract-wait-late";
+    await post(acct, "/requests", makeEnvelope("req-retract-wait-late"));
+    await post(acct, "/requests/req-retract-wait-late/retract", {});
+
+    const integrator = await connectWs(acct, "/requests/req-retract-wait-late/wait");
+    const msg = await integrator.next();
+    expect(msg.type).toBe("retracted");
+    expect(msg.request_id).toBe("req-retract-wait-late");
+  });
+
+  it("is idempotent: retracting an already-retracted request succeeds (200)", async () => {
+    const acct = "acct-retract-idempotent";
+    await post(acct, "/requests", makeEnvelope("req-retract-idempotent"));
+    const first = await post<{ status: string }>(
+      acct,
+      "/requests/req-retract-idempotent/retract",
+      {},
+    );
+    expect(first.status).toBe(200);
+
+    const second = await post<{ status: string }>(
+      acct,
+      "/requests/req-retract-idempotent/retract",
+      {},
+    );
+    expect(second.status).toBe(200);
+    expect(second.data.status).toBe("retracted");
+  });
+
+  it("refuses a device verdict for an already-retracted request (retract is not overridable)", async () => {
+    const acct = "acct-retract-then-verdict";
+    await enrollDevice(acct);
+    const deviceId = await firstDeviceId(acct);
+    const device = await connectWs(acct, `/devices/${deviceId}/connect`);
+
+    await post(acct, "/requests", makeEnvelope("req-retract-then-verdict"));
+    await device.next(); // request push
+    await post(acct, "/requests/req-retract-then-verdict/retract", {});
+    await device.next(); // the cross-device retract fan-out
+
+    device.send({
+      type: "verdict",
+      request_id: "req-retract-then-verdict",
+      verdict: makeVerdict("req-retract-then-verdict"),
+    });
+    const ack = await device.next();
+    expect(ack.type).toBe("ack");
+    expect(ack.status).toBe("retracted");
+
+    // A late verdict must never resurrect a retracted request as resolved.
+    const polled = await get<{ status: string; verdict?: unknown }>(
+      acct,
+      "/requests/req-retract-then-verdict",
+    );
+    expect(polled.data.status).toBe("retracted");
+    expect(polled.data.verdict).toBeUndefined();
+  });
+
+  it("SECURITY: refuses to retract a request that already resolved — the recorded verdict stands (409)", async () => {
+    const acct = "acct-retract-vs-resolved";
+    await enrollDevice(acct);
+    const deviceId = await firstDeviceId(acct);
+    const device = await connectWs(acct, `/devices/${deviceId}/connect`);
+
+    await post(acct, "/requests", makeEnvelope("req-retract-vs-resolved"));
+    await device.next();
+    const winning = makeVerdict("req-retract-vs-resolved", "approved");
+    device.send({ type: "verdict", request_id: "req-retract-vs-resolved", verdict: winning });
+    expect((await device.next()).status).toBe("resolved");
+
+    const retract = await post<{ error: string }>(
+      acct,
+      "/requests/req-retract-vs-resolved/retract",
+      {},
+    );
+    expect(retract.status).toBe(409);
+
+    // A retract that lost the race must never discard the already-recorded human decision.
+    const polled = await get<{ status: string; verdict: Record<string, unknown> }>(
+      acct,
+      "/requests/req-retract-vs-resolved",
+    );
+    expect(polled.data.status).toBe("resolved");
+    expect(polled.data.verdict).toEqual(winning);
+  });
+
+  it("SECURITY: refuses to retract an already-expired request (409)", async () => {
+    const acct = "acct-retract-vs-expired";
+    await seedExpiredRequest(acct, "req-retract-vs-expired");
+
+    const retract = await post<{ error: string }>(
+      acct,
+      "/requests/req-retract-vs-expired/retract",
+      {},
+    );
+    expect(retract.status).toBe(409);
+
+    const polled = await get<{ status: string }>(acct, "/requests/req-retract-vs-expired");
+    expect(polled.data.status).toBe("expired");
+  });
+
+  it("SECURITY: returns 404 retracting an unknown request", async () => {
+    const { status } = await post("acct-retract-unknown", "/requests/does-not-exist/retract", {});
+    expect(status).toBe(404);
+  });
+
+  it("SECURITY: requires the per-request token, scoped to exactly that request (no cross-request retract)", async () => {
+    const acct = "acct-retract-auth-scoped";
+    const submitA = await post<SubmitResult>(acct, "/requests", makeEnvelope("req-retract-auth-a"));
+    const submitB = await post<SubmitResult>(acct, "/requests", makeEnvelope("req-retract-auth-b"));
+    expect(submitA.status).toBe(202);
+    expect(submitB.status).toBe(202);
+
+    const noAuth = await SELF.fetch(relayUrl(acct, "/requests/req-retract-auth-a/retract"), {
+      method: "POST",
+    });
+    expect(noAuth.status).toBe(401);
+
+    const wrongAuth = await SELF.fetch(relayUrl(acct, "/requests/req-retract-auth-a/retract"), {
+      method: "POST",
+      headers: bearer("wrong-request-token"),
+    });
+    expect(wrongAuth.status).toBe(403);
+
+    // An integrator holding a REAL, currently-valid token for a DIFFERENT request must not be able
+    // to retract this one — the token is scoped to exactly the request it was issued for (#195).
+    const crossRequest = await SELF.fetch(relayUrl(acct, "/requests/req-retract-auth-a/retract"), {
+      method: "POST",
+      headers: bearer(submitB.data.request_auth_token),
+    });
+    expect(crossRequest.status).toBe(403);
+
+    const ok = await post<{ status: string }>(acct, "/requests/req-retract-auth-a/retract", {});
+    expect(ok.status).toBe(200);
+
+    // The OTHER request is unaffected by the cross-scoped attempt above.
+    const stillPendingB = await get<{ status: string }>(acct, "/requests/req-retract-auth-b");
+    expect(stillPendingB.data.status).toBe("pending");
+  });
+
+  it("returns 405 retracting via the wrong method", async () => {
+    const acct = "acct-retract-method";
+    await post(acct, "/requests", makeEnvelope("req-retract-method"));
+    const resp = await SELF.fetch(relayUrl(acct, "/requests/req-retract-method/retract"), {
+      method: "GET",
+      headers: bearer(requestAuthTokens.get(tokenKey(acct, "req-retract-method")) ?? ""),
+    });
+    expect(resp.status).toBe(405);
   });
 });
 

@@ -2,13 +2,17 @@
  * Awaiting a verdict, fail-closed (`docs/contract.md` §Invariants #6).
  *
  * Strategy: open the live `…/wait` WebSocket and race it against a deadline tied to the request's
- * `expires_at`. The relay pushes `{ type: "verdict", … }` the instant a device decides, or
- * `{ type: "expired", … }` for a past-deadline request. If the socket cannot be used (no global
- * `WebSocket`, or it errors), fall back to polling `GET /:acct/requests/:id` until a terminal
- * status or the deadline. On the deadline elapsing with no terminal signal, resolve to `timeout`.
+ * `expires_at`. The relay pushes `{ type: "verdict", … }` the instant a device decides,
+ * `{ type: "expired", … }` for a past-deadline request, or `{ type: "retracted", … }` if the
+ * integrator that submitted the request cancelled it (issue #195). If the socket cannot be used
+ * (no global `WebSocket`, or it errors), fall back to polling `GET /:acct/requests/:id` until a
+ * terminal status or the deadline. On the deadline elapsing with no terminal signal, resolve to
+ * `timeout`.
  *
  * Every path that is not a delivered verdict is a **deny** outcome (`expired`/`timeout`) — the SDK
- * never fabricates an approval.
+ * never fabricates an approval. `retracted` is different in kind, not degree: it is not a verdict at
+ * all (no device ever decided), so the caller (`requestApproval`) rejects rather than resolves for
+ * that outcome — see `index.ts`.
  */
 
 import type { NowImpl, RelayClient, VerdictOutcome } from "./relay.js";
@@ -74,6 +78,9 @@ function frameToOutcome(frame: Record<string, unknown>): VerdictOutcome | null {
   }
   if (frame.type === "expired") {
     return { kind: "expired" };
+  }
+  if (frame.type === "retracted") {
+    return { kind: "retracted" };
   }
   return null;
 }
