@@ -406,6 +406,7 @@ test("syntactic.server falls back to 'openclaw' when pluginId is absent (§5.2)"
 test("syntactic.tool falls back to a normalized slug of title when toolName is absent (§5.2)", () => {
   const result = buildPlugin({
     event: pluginEvent({ request: { toolName: undefined, title: "Deploy Service Now!" } }),
+    snapshot: pluginSnapshot({ presentation: { title: "Deploy Service Now!" } }),
   });
   assert.equal(result.kind, "request");
   assert.equal(result.request.action.syntactic.tool, "deploy-service-now");
@@ -518,6 +519,7 @@ test("the derived timeout is carried onto the plugin request (§8)", () => {
 test("neither toolName nor a usable title slug is build-error (§5.2, §9)", () => {
   const result = buildPlugin({
     event: pluginEvent({ request: { toolName: undefined, title: "!!!" } }),
+    snapshot: pluginSnapshot({ presentation: { title: "!!!" } }),
   });
   assert.equal(result.kind, "deny");
   assert.equal(result.reason, "build-error");
@@ -527,6 +529,32 @@ test("a divergent presentation.kind is presentation-divergence (§5.3, §9)", ()
   const result = buildPlugin({ snapshot: pluginSnapshot({ presentation: { kind: "exec" } }) });
   assert.equal(result.kind, "deny");
   assert.equal(result.reason, "presentation-divergence");
+});
+
+test("a snapshot title that differs from the event's is presentation-divergence (§6.1, §9)", () => {
+  const result = buildPlugin({
+    snapshot: pluginSnapshot({ presentation: { title: "Something else entirely" } }),
+  });
+  assert.equal(result.kind, "deny");
+  assert.equal(result.reason, "presentation-divergence");
+  assert.equal(result.detail.includes("title"), true);
+});
+
+test("a snapshot description that differs from the event's is presentation-divergence (§6.1, §9)", () => {
+  const result = buildPlugin({
+    snapshot: pluginSnapshot({ presentation: { description: "Something else entirely" } }),
+  });
+  assert.equal(result.kind, "deny");
+  assert.equal(result.reason, "presentation-divergence");
+  assert.equal(result.detail.includes("description"), true);
+});
+
+test("a sanitized snapshot that omits title/description is NOT a divergence (§6.1)", () => {
+  // The reviewer projection is allowed to withhold fields; only a *different* value is divergence.
+  const result = buildPlugin({
+    snapshot: pluginSnapshot({ presentation: { title: undefined, description: undefined } }),
+  });
+  assert.equal(result.kind, "request");
 });
 
 test("a severity value outside the known set is build-error (§5.2, §9)", () => {

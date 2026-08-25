@@ -248,6 +248,25 @@ it keeps one function-identity slot for the structure/data boundary to classify,
 `action_structure` shape unchanged, and adds no syntactic field that would need a new
 structure-vs-data ruling ([policy-seam.md](./policy-seam.md) forward-compat requirement #5).
 
+**Backfilled instances: never fabricate the substrate.** §4.3's backfill (`plugin.approval.list`)
+discovers approvals that predate the connection from the pinned `ApprovalSnapshot` alone — there is
+no untyped `plugin.approval.requested` event to read `pluginId`, `toolName`, `detail`, `severity`, or
+`toolCallId` from. The snapshot's `ApprovalPresentation` carries only `title`/`description` for a
+plugin approval. That is **not enough to build a faithful `agent_tool_call` record**: falling back to
+`pluginId → "openclaw"` / `toolName → slug(title)` / `severity → medium` the way the live-event path
+does would fabricate a specific-looking identity and risk tier for data the bridge never actually
+observed, silently disabling the number-match challenge for a request that may in fact be
+`severity: "critical"` — a WYSIWYS violation the human has no way to detect. This differs from the
+exec family's backfill (§5.1), whose pinned `commandText` genuinely **is** the real command text, so
+tokenizing it is a faithful (if degraded, argv-less) binding, not a fabrication.
+
+The bridge therefore treats a backfilled plugin approval exactly like an unsupported kind (§5.3): it
+raises no allw request and resolves nothing, logging `unrenderable-backfill` and leaving the approval
+for the Control UI, a later live event, or another surface. Denying it would make the bridge a
+denial-of-service on an approval another surface can render faithfully; OpenClaw's own deadline and
+`askFallback: deny` still close it if nobody answers. A live `plugin.approval.requested` event for the
+same approval is unaffected — it carries the full request and is mapped normally.
+
 ### 5.3 Family 3 — `system-agent` approvals: out of scope, fail closed
 
 `ApprovalKind` also admits `system-agent`, whose presentation is `{ title, description,
@@ -291,10 +310,13 @@ Rule:
 2. `approval.get` is the **authority for lifecycle and reviewer contract** — `status`,
    `expiresAtMs`, `allowedDecisions`, and the canonical id.
 3. The bridge calls `approval.get` for every approval it intends to act on, **before** building the
-   context, and reconciles: `presentation.commandText` must equal the command text taken from the
-   event, and `presentation.kind` must match the event family. A mismatch is a fail-closed
-   `presentation-divergence` deny (§9) — it means the untyped event payload and the pinned
-   projection disagree about what is being approved, and neither can be trusted to be what runs.
+   context, and reconciles: for every field **both** sources carry (exec: `commandText`; plugin:
+   `title`, `description`), the event's value must equal the snapshot's, and `presentation.kind`
+   must match the event family. A snapshot that **omits** a field is not a divergence — the
+   sanitized projection is allowed to withhold — only a genuinely _different_ value is. A mismatch
+   is a fail-closed `presentation-divergence` deny (§9) — it means the untyped event payload and
+   the pinned projection disagree about what is being approved, and neither can be trusted to be
+   what runs.
 4. If `approval.get` reports a non-`pending` status, the bridge does not raise an allw request.
 
 ### 6.2 The `ApprovalContext`, per family
@@ -496,28 +518,32 @@ to `allow-once`, and never to silence when the bridge could have denied. Reason 
 machine-readable and mirror the Codex hook's `denyReason` categories so operators can triage without
 parsing prose.
 
-| Condition                                                        | OpenClaw decision | Reason code                           |
-| ---------------------------------------------------------------- | ----------------- | ------------------------------------- |
-| Verified verdict `denied` / `expired` / `aborted`                | `deny`            | `no-approval` / `timeout` / `aborted` |
-| Verdict signature invalid, wrong account root, or revoked device | `deny`            | `verify-error`                        |
-| Verdict bound to a different `request_id` / `request_hash`       | `deny`            | `binding-error`                       |
-| Verdict nonce already seen (replay)                              | `deny`            | `replay`                              |
-| Required number-match challenge response missing or wrong        | `deny`            | `challenge-error`                     |
-| Event payload and `approval.get` snapshot disagree               | `deny`            | `presentation-divergence`             |
-| `commandText` empty, or no usable argv for an exec approval      | `deny`            | `build-error`                         |
-| Plugin approval with neither `toolName` nor a usable title slug  | `deny`            | `build-error`                         |
-| Remaining budget below `ALLW_OPENCLAW_MIN_TIMEOUT_MS`            | `deny`            | `insufficient-budget`                 |
-| `allow-once` not in `allowedDecisions` for an approved verdict   | `deny`            | `no-expressible-allow`                |
-| Relay / network / SDK transport failure                          | `deny`            | `transport-error`                     |
-| Gateway connection lost, not restored before the allw deadline   | _cannot resolve_  | `transport-error`                     |
-| Invalid or missing `<gateway-id>`, relay config, or account root | `deny`            | `config-error`                        |
-| Unknown or unsupported `ApprovalKind` (incl. `system-agent`)     | _no resolve_      | `unsupported-approval-kind`           |
+| Condition                                                                                                                             | OpenClaw decision | Reason code                           |
+| ------------------------------------------------------------------------------------------------------------------------------------- | ----------------- | ------------------------------------- |
+| Verified verdict `denied` / `expired` / `aborted`                                                                                     | `deny`            | `no-approval` / `timeout` / `aborted` |
+| Verdict signature invalid, wrong account root, or revoked device                                                                      | `deny`            | `verify-error`                        |
+| Verdict bound to a different `request_id` / `request_hash`                                                                            | `deny`            | `binding-error`                       |
+| Verdict nonce already seen (replay)                                                                                                   | `deny`            | `replay`                              |
+| Required number-match challenge response missing or wrong                                                                             | `deny`            | `challenge-error`                     |
+| Event payload and `approval.get` snapshot disagree on `commandText`, `kind`, `title`, or `description` (whichever both sources carry) | `deny`            | `presentation-divergence`             |
+| `commandText` empty, or no usable argv for an exec approval                                                                           | `deny`            | `build-error`                         |
+| Plugin approval with neither `toolName` nor a usable title slug, or an unrecognized `severity`                                        | `deny`            | `build-error`                         |
+| Remaining budget below `ALLW_OPENCLAW_MIN_TIMEOUT_MS`                                                                                 | `deny`            | `insufficient-budget`                 |
+| `allow-once` not in `allowedDecisions` for an approved verdict                                                                        | `deny`            | `no-expressible-allow`                |
+| Relay / network / SDK transport failure                                                                                               | `deny`            | `transport-error`                     |
+| Gateway connection lost, not restored before the allw deadline                                                                        | _cannot resolve_  | `transport-error`                     |
+| Invalid or missing `<gateway-id>`, relay config, or account root                                                                      | `deny`            | `config-error`                        |
+| Unknown or unsupported `ApprovalKind` (incl. `system-agent`)                                                                          | _no resolve_      | `unsupported-approval-kind`           |
+| Backfilled plugin approval (substrate unrecoverable from the pinned snapshot — §5.2)                                                  | _no resolve_      | `unrenderable-backfill`               |
 
-The two **non**-deny rows are deliberate:
+The three **non**-deny rows are deliberate:
 
 - **Unknown kind** (§5.3): an unrecognized approval family is left for a surface that understands it.
   Denying another surface's approval family would make the bridge a denial-of-service on approvals it
   cannot even render.
+- **Unrenderable backfill** (§5.2): a backfilled plugin approval cannot be built without fabricating
+  `pluginId`/`toolName`/`severity`, which the pinned snapshot never carries. The same DoS reasoning as
+  unknown kind applies — another surface, or a later live event, may still render it faithfully.
 - **Lost connection**: the bridge has no channel on which to submit anything. OpenClaw's own deadline
   plus `askFallback: deny` closes it, which is why §3 requires that fallback stay `deny`.
 

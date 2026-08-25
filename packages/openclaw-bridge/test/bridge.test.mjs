@@ -573,20 +573,41 @@ test("a plugin approval carrying an insufficient budget denies immediately, rais
 
 // ── §4.3 backfill drives both families ──────────────────────────────────────────
 
-test("backfill drives pending plugin approvals from plugin.approval.list (§4.3)", async () => {
-  const { bridge, gateway } = makeBridge({
+test("a backfilled plugin approval raises no allw request and is not resolved, only logged (§5.2, §5.3)", async () => {
+  // The pinned ApprovalSnapshot carries only title/description for a plugin approval — never
+  // pluginId/toolName/severity. Building a record from that alone would fabricate the function
+  // identity and risk tier (a WYSIWYS violation), so the bridge must neither raise a request nor
+  // resolve anything; it must leave the approval exactly as an unsupported kind is left (§5.3).
+  const { bridge, gateway, requests, records } = makeBridge({
     snapshot: pluginSnapshot(),
     pluginListIds: [PLUGIN_APPROVAL_ID],
   });
   await bridge.project();
 
+  assert.deepEqual(gateway.resolves, [], "a backfilled plugin approval must never be resolved");
+  assert.equal(requests.length, 0, "no allw request may be raised from fabricated substrate");
+  assert.ok(
+    records.some(
+      (r) => r.event === "unrenderable-backfill" && r.fields.approvalId === PLUGIN_APPROVAL_ID,
+    ),
+  );
+});
+
+test("a live plugin event is unaffected by the backfill restriction (§5.2)", async () => {
+  // The restriction above is specific to backfill's synthesized substrate — a live
+  // `plugin.approval.requested` event carries the full request and must still be driven normally.
+  const { bridge, gateway, requests } = makeBridge({ snapshot: pluginSnapshot() });
+  const outcome = await bridge.handle(pluginRequested());
+
+  assert.deepEqual(outcome, { kind: "resolved", decision: "allow-once", applied: true });
   assert.deepEqual(gateway.resolves, [
     { id: PLUGIN_APPROVAL_ID, kind: "plugin", decision: "allow-once" },
   ]);
+  assert.equal(requests.length, 1);
 });
 
-test("a single project() call backfills both exec and plugin lists (§4.3)", async () => {
-  const { bridge, gateway } = makeBridge({
+test("a single project() call backfills exec normally while leaving plugin open (§4.3)", async () => {
+  const { bridge, gateway, records } = makeBridge({
     listIds: [APPROVAL_ID],
     pluginListIds: [PLUGIN_APPROVAL_ID],
     handlers: {
@@ -596,11 +617,11 @@ test("a single project() call backfills both exec and plugin lists (§4.3)", asy
   });
   await bridge.project();
 
-  const resolvedIds = gateway.resolves.map((r) => r.id).sort();
-  assert.deepEqual(resolvedIds, [APPROVAL_ID, PLUGIN_APPROVAL_ID].sort());
+  assert.deepEqual(gateway.resolves, [{ id: APPROVAL_ID, kind: "exec", decision: "allow-once" }]);
   assert.ok(
-    gateway.resolves.every((r) => r.decision === "allow-once"),
-    "both families resolve allow-once on the happy path",
+    records.some(
+      (r) => r.event === "unrenderable-backfill" && r.fields.approvalId === PLUGIN_APPROVAL_ID,
+    ),
   );
 });
 

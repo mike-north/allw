@@ -89,7 +89,11 @@ export type ApprovalOutcome =
   /** Deliberately left for another surface / OpenClaw's own fallback. */
   | {
       readonly kind: "left-open";
-      readonly why: "unsupported-approval-kind" | "not-pending" | "unresolvable";
+      readonly why:
+        | "unsupported-approval-kind"
+        | "not-pending"
+        | "unresolvable"
+        | "unrenderable-backfill";
     }
   /** Already handled (in flight or terminal). */
   | { readonly kind: "ignored" };
@@ -128,24 +132,6 @@ function execEventFromSnapshot(snapshot: ApprovalSnapshot): ExecApprovalRequeste
     expiresAtMs: snapshot.expiresAtMs,
     ...(snapshot.createdAtMs !== undefined ? { createdAtMs: snapshot.createdAtMs } : {}),
     request: { command: commandText },
-  };
-}
-
-/** Synthesize the plugin event shape from a sanitized snapshot, for approvals that predate the
- * connection (backfill, §4.3). Unlike exec's substrate, `title`/`description` ARE part of the
- * pinned `ApprovalPresentation` (they are the plugin's reviewer contract, not withheld runtime
- * state), so backfill can build a plugin request directly from the snapshot; there is no separate
- * "no usable substrate" case to special-case here — {@link buildPluginApprovalRequest} itself
- * fails closed with `build-error` when neither a `toolName` nor a usable title slug exists. */
-function pluginEventFromSnapshot(snapshot: ApprovalSnapshot): PluginApprovalRequestedEvent {
-  return {
-    id: snapshot.id,
-    expiresAtMs: snapshot.expiresAtMs,
-    ...(snapshot.createdAtMs !== undefined ? { createdAtMs: snapshot.createdAtMs } : {}),
-    request: {
-      title: snapshot.presentation.title,
-      description: snapshot.presentation.description,
-    },
   };
 }
 
@@ -333,12 +319,23 @@ export class OpenClawBridge {
       }
       return await this.driveApproval("exec", synthesized, this.deps.now(), snapshot);
     }
-    return await this.driveApproval(
-      "plugin",
-      pluginEventFromSnapshot(snapshot),
-      this.deps.now(),
-      snapshot,
-    );
+
+    // Plugin backfill is structurally unable to produce a faithful §5.2 substrate. The pinned
+    // `ApprovalSnapshot` carries only `title`/`description` — never `pluginId`, `toolName`,
+    // `detail`, `severity`, or `toolCallId` (those travel solely on the untyped
+    // `plugin.approval.requested` event, which backfill never receives). Unlike exec — where the
+    // pinned `commandText` genuinely IS the real command, so tokenizing it is a faithful (if
+    // degraded) binding — there is no such faithful fallback for plugin identity/risk: absent
+    // `pluginId`/`toolName`/`severity` here does not mean the real approval lacks them, only that
+    // backfill never asked. Building a record anyway would fabricate `syntactic.server` (always
+    // "openclaw"), `syntactic.tool` (a slug of `title`, not the real tool name), and `risk`
+    // (always the default-severity tier, silently disabling the number-match challenge even when
+    // the real severity is `critical`) — a WYSIWYS violation the human would never see. Denying it
+    // would make the bridge a denial-of-service on an approval another surface (or a later live
+    // event / reconnect) may still resolve faithfully — exactly the problem §5.3 solves for
+    // unsupported kinds. Leave it open, parallel to that treatment.
+    this.deps.logger.warn("unrenderable-backfill", { approvalId: id, family: "plugin" });
+    return { kind: "left-open", why: "unrenderable-backfill" };
   }
 
   /** The end-to-end path for either family: reconcile → budget → request → verify → resolve. */

@@ -430,6 +430,34 @@ export function buildPluginApprovalRequest(
     };
   }
 
+  // §6.1 rule 3, extended to every field the two sources both carry: a sanitized snapshot may
+  // withhold `title`/`description` (omission is not divergence — mirrors exec's `commandText`
+  // rule), but when BOTH sources supply a value they must agree. `title`/`description` feed
+  // directly into `syntactic.raw` and `summary` below, so an unchecked mismatch here would let the
+  // untyped event's prose diverge from the pinned reviewer contract without ever being caught.
+  if (
+    snapshot.presentation.title !== undefined &&
+    event.request.title !== undefined &&
+    snapshot.presentation.title !== event.request.title
+  ) {
+    return {
+      kind: "deny",
+      reason: "presentation-divergence",
+      detail: "approval.get presentation.title does not equal the event's title",
+    };
+  }
+  if (
+    snapshot.presentation.description !== undefined &&
+    event.request.description !== undefined &&
+    snapshot.presentation.description !== event.request.description
+  ) {
+    return {
+      kind: "deny",
+      reason: "presentation-divergence",
+      detail: "approval.get presentation.description does not equal the event's description",
+    };
+  }
+
   // §6.1 rule 4: a terminal approval gets no allw request and no resolve.
   if (snapshot.status !== "pending") {
     return { kind: "not-pending", status: snapshot.status };
