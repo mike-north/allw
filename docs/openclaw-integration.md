@@ -3,24 +3,55 @@
 **Status:** design spec. No implementation lands from this document; the bridge package is tracked
 separately and is decomposed in §Implementation slices below.
 
-> **Upstream compatibility blocker (checked 2026-08-25, OpenClaw 2026.8.1).** The scope-only
-> external-client projection assumed by §§1–4 is no longer available. Approval events and legacy
-> list/get records are filtered by requester/connection/client identity or explicit
-> `approvalReviewerDeviceIds`; a newly paired generic `operator.approvals` client is neither the
-> requester nor a designated reviewer. The unified `approval.get` projection is sanitized and
-> omits the `systemRunPlan`, so it cannot rehydrate the exact execution binding missing from the
-> event stream. The bridge MUST remain unavailable/fail closed until OpenClaw exposes a supported
-> reviewer binding that carries the canonical plan. See
-> [hitl-seam.md §11.1](./hitl-seam.md#openclaw-compatibility-finding) for pinned sources and the
-> contract consequence. The historical sections below remain useful design context but MUST NOT be
-> treated as a currently implementable public seam.
+> **Upstream access model (verified 2026-08-26 @ [`1d526c5c`](https://github.com/openclaw/openclaw/commit/1d526c5c0ef635b4b7fda952c2b26da0c0290652)).**
+> Approval delivery is **filtered, not scope-only**. Read this before implementing §§4–6:
+>
+> - **Two-stage delivery.** An approval event first passes an event-level scope guard
+>   (`operator.approvals`, with `operator.admin` admitted unconditionally), then goes only to a
+>   targeted recipient set: the client must pass `canDeliverApprovals` — hold `operator.admin` or
+>   `operator.approvals` **and** be an internal approval runtime, a known first-party client id, or
+>   a client that self-declared the public handshake capability `caps: ["approvals"]` — and then the
+>   record must pass a per-record visibility check.
+>   ([broadcast scope table](https://github.com/openclaw/openclaw/blob/1d526c5c0ef635b4b7fda952c2b26da0c0290652/src/gateway/server-broadcast.ts#L53-L60),
+>   [admin bypass](https://github.com/openclaw/openclaw/blob/1d526c5c0ef635b4b7fda952c2b26da0c0290652/src/gateway/server-broadcast.ts#L197-L199),
+>   [`canDeliverApprovals`](https://github.com/openclaw/openclaw/blob/1d526c5c0ef635b4b7fda952c2b26da0c0290652/src/gateway/server-request-context.ts#L135-L161),
+>   [recipient filter](https://github.com/openclaw/openclaw/blob/1d526c5c0ef635b4b7fda952c2b26da0c0290652/src/gateway/server-methods/approval-shared.ts#L188-L206),
+>   [`caps` registry](https://github.com/openclaw/openclaw/blob/1d526c5c0ef635b4b7fda952c2b26da0c0290652/packages/gateway-protocol/src/client-info.ts#L82-L95),
+>   [client caps docs](https://github.com/openclaw/openclaw/blob/1d526c5c0ef635b4b7fda952c2b26da0c0290652/docs/gateway/clients.md#L98-L100))
+> - **Per-record visibility.** `operator.admin` returns visible unconditionally; otherwise a record
+>   is visible only to the internal approval runtime, a device listed in the record's
+>   `approvalReviewerDeviceIds`, the recording requester connection/device, or — for a record with
+>   no binding at all — any `operator.approvals` client.
+>   ([`isApprovalRecordVisibleToClient`](https://github.com/openclaw/openclaw/blob/1d526c5c0ef635b4b7fda952c2b26da0c0290652/src/gateway/server-methods/approval-record-lookup.ts#L72-L120))
+> - **`approvalReviewerDeviceIds` is not an enablement path.** It only ever _narrows_ access, it is
+>   bound solely by the server-trusted internal approval runtime, and it has no config, CLI, or
+>   documented client surface.
+>   ([bind guard](https://github.com/openclaw/openclaw/blob/1d526c5c0ef635b4b7fda952c2b26da0c0290652/src/gateway/server-methods/exec-approval.ts#L416-L423),
+>   [`bindApprovalReviewerDeviceIds`](https://github.com/openclaw/openclaw/blob/1d526c5c0ef635b4b7fda952c2b26da0c0290652/src/gateway/server-methods/approval-shared.ts#L103-L111))
+> - **The substrate is present where it matters.** `exec.approval.requested` / `plugin.approval.requested`
+>   events and `exec.approval.list` / `plugin.approval.list` carry the **raw stored request verbatim**
+>   — for exec that includes `systemRunPlan`, `systemRunBinding`, `commandArgv`, `cwd`, and `envKeys`.
+>   The unified `approval.get` projection _is_ sanitized and omits `systemRunPlan`, but that is not
+>   load-bearing: the bridge renders and binds from the event/list `request`, not from `approval.get`.
+>   ([stored request shape](https://github.com/openclaw/openclaw/blob/1d526c5c0ef635b4b7fda952c2b26da0c0290652/src/gateway/server-methods/exec-approval.ts#L328-L379),
+>   [event payload](https://github.com/openclaw/openclaw/blob/1d526c5c0ef635b4b7fda952c2b26da0c0290652/src/gateway/server-methods/approval-shared.ts#L146-L160),
+>   [verbatim list](https://github.com/openclaw/openclaw/blob/1d526c5c0ef635b4b7fda952c2b26da0c0290652/src/gateway/server-methods/approval-record-lookup.ts#L122-L149),
+>   [sanitized presentation](https://github.com/openclaw/openclaw/blob/1d526c5c0ef635b4b7fda952c2b26da0c0290652/src/infra/approval-presentation.ts#L46-L72))
+>
+> **Consequence:** the integration is implementable today, in the trusted-deployment (admin) mode
+> described in §4.1 — this is upstream's own CLI pattern. The least-privilege
+> (`operator.approvals`-only) mode is specified but **inert for discovery** until upstream ships
+> reviewer designation; a bridge configured that way MUST fail closed and report itself unavailable.
+> See [§4.1](#41-scopes--dual-mode-operatorapprovals-and-the-admin-opt-in),
+> [hitl-seam.md §11.1](./hitl-seam.md#openclaw-external-client-access-model), and the upstream ask in
+> [upstream-asks/openclaw-reviewer-designation.md](./upstream-asks/openclaw-reviewer-designation.md).
 
 [OpenClaw](https://github.com/openclaw/openclaw) is a self-hosted gateway that connects chat
-channels to AI coding agents. It has a mature approval subsystem with a dedicated
-`operator.approvals` auth scope and kind-agnostic durable approval RPCs. This document originally
-specified allw as a **gateway operator client** that would turn each pending OpenClaw approval into
-a verified human decision from the allw inbox. The visibility and exact-binding blocker above now
-supersedes that integration shape until OpenClaw exposes a supported reviewer projection.
+channels to AI coding agents. It has a mature approval subsystem with a first-class seam for
+external approvers: a dedicated `operator.approvals` auth scope, kind-agnostic durable approval RPCs,
+and broadcast events for every pending approval. This document specifies how allw sits in that seam
+— as a **gateway operator client** that turns each pending OpenClaw approval into a verified human
+decision from the allw inbox.
 
 Companion reading: [contract.md](./contract.md) (the invariants this must honor),
 [policy-seam.md](./policy-seam.md) (the `ActionRecord`), [architecture.md](./architecture.md) (the
@@ -35,47 +66,50 @@ Every claim below was checked against OpenClaw's published documentation, its ge
 schema, and its source on **2026-08-23**. Anything this spec depends on that is _not_ in this table
 is a fact the implementation must re-verify before relying on it.
 
-| Fact                                                                                                                                                                                                                                                | Source                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `operator.approvals` is a closed-set operator scope meaning "Exec and plugin approval APIs". `operator.write` does **not** subsume it.                                                                                                              | [operator-scopes](https://docs.openclaw.ai/gateway/operator-scopes), [`src/gateway/operator-scopes.ts`](https://github.com/openclaw/openclaw/blob/main/src/gateway/operator-scopes.ts)                                                                                                                                                                                                                                                                                                            |
-| Approval RPCs: `exec.approval.request` / `get` / `list` / `waitDecision` / `resolve`; `plugin.approval.request` / `list` / `waitDecision` / `resolve`.                                                                                              | [gateway protocol](https://docs.openclaw.ai/gateway/protocol)                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| Kind-agnostic durable RPCs: `approval.get { id }`, `approval.resolve { id, kind, decision }`, `approval.history`. The legacy per-kind methods are adapters over the same registry.                                                                  | [gateway protocol](https://docs.openclaw.ai/gateway/protocol), [multi-surface operator approvals](https://docs.openclaw.ai/refactor/operator-approvals)                                                                                                                                                                                                                                                                                                                                           |
-| Broadcasts: `exec.approval.requested` / `resolved`, `plugin.approval.requested` / `resolved`, scope-gated to `operator.approvals`.                                                                                                                  | [gateway protocol](https://docs.openclaw.ai/gateway/protocol)                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `ApprovalKind` is **three** values: `exec`, `plugin`, **`system-agent`**.                                                                                                                                                                           | [`protocol.schema.json`](https://unpkg.com/@openclaw/gateway-protocol@beta/protocol.schema.json)                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `ApprovalDecision` is `allow-once` \| `allow-always` \| `deny`. `deny` is always present in `allowedDecisions` ("so malformed or unsafe input can fail closed").                                                                                    | [`protocol.schema.json`](https://unpkg.com/@openclaw/gateway-protocol@beta/protocol.schema.json)                                                                                                                                                                                                                                                                                                                                                                                                  |
-| The gateway **rejects a resolve for any decision the request did not offer**.                                                                                                                                                                       | [plugin permission requests](https://docs.openclaw.ai/plugins/plugin-permission-requests)                                                                                                                                                                                                                                                                                                                                                                                                         |
-| Resolution is **first-answer-wins** compare-and-set; a losing resolve returns `applied: false` plus the recorded canonical winner.                                                                                                                  | [multi-surface operator approvals](https://docs.openclaw.ai/refactor/operator-approvals)                                                                                                                                                                                                                                                                                                                                                                                                          |
-| For `host=node`, `exec.approval.request` **must** include a canonical `systemRunPlan`; the forwarded `system.run` reuses that stored plan.                                                                                                          | [gateway protocol](https://docs.openclaw.ai/gateway/protocol), [exec approvals](https://docs.openclaw.ai/tools/exec-approvals)                                                                                                                                                                                                                                                                                                                                                                    |
-| Caller-supplied `command`, `rawCommand`, `cwd`, `agentId`, or `sessionKey` changes after approval do not alter the run: the gateway forwards the stored plan, and the node host rejects a supplied approval plan that does not match the final run. | [request validation](https://github.com/openclaw/openclaw/blob/1d526c5c0ef635b4b7fda952c2b26da0c0290652/src/gateway/server-methods/exec-approval.ts#L231-L245), [gateway canonicalization](https://github.com/openclaw/openclaw/blob/1d526c5c0ef635b4b7fda952c2b26da0c0290652/src/gateway/node-invoke-system-run-approval.ts#L417-L450), [node-host enforcement](https://github.com/openclaw/openclaw/blob/1d526c5c0ef635b4b7fda952c2b26da0c0290652/src/node-host/invoke-system-run.ts#L386-L451) |
-| `askFallback` defaults to `deny`; a required prompt with no reachable UI resolves by that fallback. Approval timeout is a terminal host-command denial.                                                                                             | [exec approvals](https://docs.openclaw.ai/tools/exec-approvals), [exec approvals — advanced](https://docs.openclaw.ai/tools/exec-approvals-advanced)                                                                                                                                                                                                                                                                                                                                              |
-| Pending exec approvals expire after **30 minutes** by default (`DEFAULT_EXEC_APPROVAL_TIMEOUT_MS = 1_800_000`).                                                                                                                                     | [`src/infra/exec-approvals-core.ts`](https://github.com/openclaw/openclaw/blob/main/src/infra/exec-approvals-core.ts)                                                                                                                                                                                                                                                                                                                                                                             |
-| Plugin approvals default to **120 000 ms**, capped at **600 000 ms**.                                                                                                                                                                               | [`src/infra/plugin-approvals.ts`](https://github.com/openclaw/openclaw/blob/main/src/infra/plugin-approvals.ts)                                                                                                                                                                                                                                                                                                                                                                                   |
-| Third-party clients pair with an Ed25519 device identity + `connect.challenge`, then persist `hello-ok.auth.deviceToken`. Current wire protocol is **4**.                                                                                           | [building a gateway client](https://docs.openclaw.ai/gateway/clients)                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| The established "native approval client" pattern for Slack/Discord/Telegram/Matrix lives in `src/plugin-sdk/approval-client-helpers.ts` with `channels.<channel>.execApprovals.*`.                                                                  | [`approval-client-helpers.ts`](https://github.com/openclaw/openclaw/blob/main/src/plugin-sdk/approval-client-helpers.ts)                                                                                                                                                                                                                                                                                                                                                                          |
+| Fact                                                                                                                                                                                                                                                          | Source                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `operator.approvals` is a closed-set operator scope meaning "Exec and plugin approval APIs". `operator.write` does **not** subsume it.                                                                                                                        | [operator-scopes](https://docs.openclaw.ai/gateway/operator-scopes), [`src/gateway/operator-scopes.ts`](https://github.com/openclaw/openclaw/blob/main/src/gateway/operator-scopes.ts)                                                                                                                                                                                                                                                                                                            |
+| Approval RPCs: `exec.approval.request` / `get` / `list` / `waitDecision` / `resolve`; `plugin.approval.request` / `list` / `waitDecision` / `resolve`.                                                                                                        | [gateway protocol](https://docs.openclaw.ai/gateway/protocol)                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Kind-agnostic durable RPCs: `approval.get { id }`, `approval.resolve { id, kind, decision }`, `approval.history`. The legacy per-kind methods are adapters over the same registry.                                                                            | [gateway protocol](https://docs.openclaw.ai/gateway/protocol), [multi-surface operator approvals](https://docs.openclaw.ai/refactor/operator-approvals)                                                                                                                                                                                                                                                                                                                                           |
+| Broadcasts: `exec.approval.requested` / `resolved`, `plugin.approval.requested` / `resolved`. Scope-gated to `operator.approvals`, **then** narrowed to a recipient set (`canDeliverApprovals`) and filtered per record — see the access-model callout above. | [gateway protocol](https://docs.openclaw.ai/gateway/protocol), [recipient set](https://github.com/openclaw/openclaw/blob/1d526c5c0ef635b4b7fda952c2b26da0c0290652/src/gateway/server-request-context.ts#L135-L161), [per-record filter](https://github.com/openclaw/openclaw/blob/1d526c5c0ef635b4b7fda952c2b26da0c0290652/src/gateway/server-methods/approval-record-lookup.ts#L72-L120)                                                                                                         |
+| `ApprovalKind` is **three** values: `exec`, `plugin`, **`system-agent`**.                                                                                                                                                                                     | [`protocol.schema.json`](https://unpkg.com/@openclaw/gateway-protocol@beta/protocol.schema.json)                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `ApprovalDecision` is `allow-once` \| `allow-always` \| `deny`. `deny` is always present in `allowedDecisions` ("so malformed or unsafe input can fail closed").                                                                                              | [`protocol.schema.json`](https://unpkg.com/@openclaw/gateway-protocol@beta/protocol.schema.json)                                                                                                                                                                                                                                                                                                                                                                                                  |
+| The gateway **rejects a resolve for any decision the request did not offer**.                                                                                                                                                                                 | [plugin permission requests](https://docs.openclaw.ai/plugins/plugin-permission-requests)                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Resolution is **first-answer-wins** compare-and-set; a losing resolve returns `applied: false` plus the recorded canonical winner.                                                                                                                            | [multi-surface operator approvals](https://docs.openclaw.ai/refactor/operator-approvals)                                                                                                                                                                                                                                                                                                                                                                                                          |
+| For `host=node`, `exec.approval.request` **must** include a canonical `systemRunPlan`; the forwarded `system.run` reuses that stored plan.                                                                                                                    | [gateway protocol](https://docs.openclaw.ai/gateway/protocol), [exec approvals](https://docs.openclaw.ai/tools/exec-approvals)                                                                                                                                                                                                                                                                                                                                                                    |
+| Caller-supplied `command`, `rawCommand`, `cwd`, `agentId`, or `sessionKey` changes after approval do not alter the run: the gateway forwards the stored plan, and the node host rejects a supplied approval plan that does not match the final run.           | [request validation](https://github.com/openclaw/openclaw/blob/1d526c5c0ef635b4b7fda952c2b26da0c0290652/src/gateway/server-methods/exec-approval.ts#L231-L245), [gateway canonicalization](https://github.com/openclaw/openclaw/blob/1d526c5c0ef635b4b7fda952c2b26da0c0290652/src/gateway/node-invoke-system-run-approval.ts#L417-L450), [node-host enforcement](https://github.com/openclaw/openclaw/blob/1d526c5c0ef635b4b7fda952c2b26da0c0290652/src/node-host/invoke-system-run.ts#L386-L451) |
+| `askFallback` defaults to `deny`; a required prompt with no reachable UI resolves by that fallback. Approval timeout is a terminal host-command denial.                                                                                                       | [exec approvals](https://docs.openclaw.ai/tools/exec-approvals), [exec approvals — advanced](https://docs.openclaw.ai/tools/exec-approvals-advanced)                                                                                                                                                                                                                                                                                                                                              |
+| Pending exec approvals expire after **30 minutes** by default (`DEFAULT_EXEC_APPROVAL_TIMEOUT_MS = 1_800_000`).                                                                                                                                               | [`src/infra/exec-approvals-core.ts`](https://github.com/openclaw/openclaw/blob/main/src/infra/exec-approvals-core.ts)                                                                                                                                                                                                                                                                                                                                                                             |
+| Plugin approvals default to **120 000 ms**, capped at **600 000 ms**.                                                                                                                                                                                         | [`src/infra/plugin-approvals.ts`](https://github.com/openclaw/openclaw/blob/main/src/infra/plugin-approvals.ts)                                                                                                                                                                                                                                                                                                                                                                                   |
+| Third-party clients pair with an Ed25519 device identity + `connect.challenge`, then persist `hello-ok.auth.deviceToken`. Current wire protocol is **4**.                                                                                                     | [building a gateway client](https://docs.openclaw.ai/gateway/clients)                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| The established "native approval client" pattern for Slack/Discord/Telegram/Matrix lives in `src/plugin-sdk/approval-client-helpers.ts` with `channels.<channel>.execApprovals.*`.                                                                            | [`approval-client-helpers.ts`](https://github.com/openclaw/openclaw/blob/main/src/plugin-sdk/approval-client-helpers.ts)                                                                                                                                                                                                                                                                                                                                                                          |
 
 Two premises that the original scoping got wrong, and which this spec corrects:
 
 1. **There are three approval kinds, not two.** `system-agent` exists and carries its own
    presentation (`title`, `description`, `proposalHash`, `allowedDecisions: ["allow-once", "deny"]`).
    §5.3 handles it explicitly so an unknown kind can never pass silently.
-2. **The reviewer projection is sanitized.** `ApprovalPresentation` for exec deliberately omits
-   "runtime cwd, environment, system-run binding, and execution plan". The full runtime request —
-   including `systemRunPlan` — travels only on the legacy `*.approval.requested` event payload,
-   whose shape is **not** pinned in the generated protocol schema. §6 defines the WYSIWYS plaintext
-   accordingly and fails closed when the two sources disagree.
+2. **The unified reviewer projection is sanitized.** `ApprovalPresentation` for exec deliberately
+   omits "runtime cwd, environment, system-run binding, and execution plan". The full runtime
+   request — including `systemRunPlan` — travels on the legacy `*.approval.requested` event payload
+   and on `exec.approval.list` / `plugin.approval.list`, which return the raw stored request
+   verbatim; neither shape is pinned in the generated protocol schema. The bridge therefore sources
+   request identity from those carriers and **never** from `approval.get`. §6 defines the WYSIWYS
+   plaintext accordingly and fails closed when the two sources disagree.
 
 ---
 
 ## 2. Integration shape: an external operator client
 
 **Decision: allw connects as its own OpenClaw gateway operator client** — a separate `node` process
-holding exactly `operator.approvals` — not as an in-gateway OpenClaw plugin.
+holding approval-scoped operator authority (see §4.1 for the two supported scope modes) — not as an
+in-gateway OpenClaw plugin.
 
 ```
  OpenClaw agent ── exec / plugin tool call
         │
         ▼
- OpenClaw Gateway ──── exec.approval.requested ─────▶ allw-openclaw-bridge  (operator.approvals)
+ OpenClaw Gateway ──── exec.approval.requested ─────▶ allw-openclaw-bridge  (approval-scoped)
    (enforcement)  ◀─── approval.resolve ────────────       │  node + WASM
                                                             ▼
                                                      @allw/sdk ── E2EE relay ── approver device
@@ -135,18 +169,90 @@ record and never re-submits (§7.4).
 
 ## 4. Gateway client: scopes, pairing, and subscription
 
-### 4.1 Scopes — `operator.approvals` and nothing else
+### 4.1 Scopes — dual mode: `operator.approvals` and the admin opt-in
 
-The bridge requests `role: "operator"` with exactly `["operator.approvals"]`.
+Because upstream delivery is filtered rather than scope-only (see the access-model callout at the
+top of this document), the bridge ships **two explicit modes**. The mode is a deployment
+configuration decision, it is recorded in the bridge's startup log line, and it is surfaced in the
+allw inbox alongside the actor identity. There is no implicit escalation between them: a bridge
+configured for least-privilege never silently upgrades itself to admin.
 
-- It must **never** request `operator.admin`. Admin satisfies every `operator.*` scope, is required
-  for config mutation and native hooks, and would let a compromised bridge rewrite the very exec
-  policy it exists to enforce.
-- It must **not** request `operator.read`. Read scope is what gates chat, agent, and tool-result
+In both modes the bridge:
+
+- **must not** request `operator.read`. Read scope is what gates chat, agent, and tool-result
   broadcast frames; omitting it means the bridge never receives session content it has no business
   seeing. The four approval broadcasts are registered under `operator.approvals` directly.
-- `operator.approvals` is remote-execution-grade authority in OpenClaw's own words. It is granted
-  deliberately, to one paired device identity, and is revocable from the gateway host.
+- **must** declare the `approvals` handshake capability (§4.3). Without it the connection is not
+  admitted to the approval recipient set at all, regardless of scope.
+- treats its credential as remote-execution-grade authority in OpenClaw's own words: granted
+  deliberately, to one paired device identity, and revocable from the gateway host.
+
+#### (a) Least-privilege mode — the default posture
+
+`role: "operator"`, scopes exactly `["operator.approvals"]`.
+
+This is the mode allw wants to run in, and the one every security property in this document is
+written against. **It is currently non-functional for discovery.** A newly paired generic bridge is
+neither the recording requester nor a designated reviewer, and gateway-raised exec/plugin approvals
+bind the requester identity at record creation, so per-record visibility excludes the bridge from
+the event stream and from `exec.approval.list` / `plugin.approval.list`. (A record with _no_ binding
+at all is visible and resolvable on `operator.approvals` alone — so "cannot see anything" is too
+strong — but the bridge cannot rely on that: the records it exists to gate are bound.)
+
+Required behavior, today:
+
+- The bridge **MUST fail closed and report itself unavailable** in this mode. Concretely: at
+  startup, after `hello-ok` and the first backfill, it probes whether it is in the approval
+  recipient set; if it is not, it refuses to enter the watch loop, logs a single unambiguous error
+  naming this mode and linking the upstream ask, and exits non-zero. It must **never** run in a
+  degraded "connected but blind" state that looks like it is gating.
+- This mode becomes active — with no protocol change on allw's side — once upstream ships
+  least-privilege reviewer designation. That request is drafted at
+  [upstream-asks/openclaw-reviewer-designation.md](./upstream-asks/openclaw-reviewer-designation.md).
+
+#### (b) Trusted-deployment (admin) mode — explicit opt-in
+
+`role: "operator"`, scopes `["operator.admin", "operator.approvals"]`.
+
+This is the mode in which the integration actually works against OpenClaw today, and it is
+upstream's own pattern: the `openclaw approvals pending` CLI requests admin explicitly, precisely
+because "approval records otherwise retain requester/reviewer filtering"
+([`exec-approvals-cli.ts`](https://github.com/openclaw/openclaw/blob/1d526c5c0ef635b4b7fda952c2b26da0c0290652/src/cli/exec-approvals-cli.ts#L517-L534),
+[CLI docs](https://github.com/openclaw/openclaw/blob/1d526c5c0ef635b4b7fda952c2b26da0c0290652/docs/cli/approvals.md#L79)).
+It is also the profile a default pairing handoff already grants: the default handed-off operator
+token includes `operator.admin`, while Control UI **Limited access** and `openclaw qr --limited`
+omit it
+([pairing profiles](https://github.com/openclaw/openclaw/blob/1d526c5c0ef635b4b7fda952c2b26da0c0290652/docs/channels/pairing.md#L182-L184)).
+A bridge paired with `--limited` will not see bound approvals.
+
+Requirements for this mode:
+
+- It is **opt-in only**, via explicit configuration (`ALLW_OPENCLAW_MODE=trusted-admin` or the
+  equivalent config key). It is never the default, and never inferred from a token that happens to
+  carry admin.
+- The bridge logs the elevated mode at startup and records it in the audit chain entry for every
+  verdict it produces, so an auditor can tell which authority the decision was taken under.
+
+**Risk delta, stated plainly.** `operator.admin` satisfies every `operator.*` scope, including
+config mutation and native hooks. A compromised bridge holding admin can rewrite the very exec
+policy it exists to gate — it could lower `tools.exec.mode`, edit the allowlist, or add its own
+standing grants, and thereby remove the need to ask a human at all. This is strictly worse than the
+least-privilege mode, where a compromised bridge can at most deny (fail-closed) or approve requests
+it was already shown.
+
+Mitigations that make the tradeoff acceptable for a trusted deployment, and which the docs and the
+UAT both assume:
+
+- **Self-hosted gateway.** The gateway and the bridge are operated by the same person or team; admin
+  on that gateway is not authority over anyone else's infrastructure.
+- **Revocable device pairing.** The bridge holds one paired Ed25519 device identity whose token the
+  operator can revoke from the gateway host at any time (§4.2), independent of any shared secret.
+- **Audit.** Every verdict is chained in allw's audit log with the mode recorded; unexpected config
+  mutation from the bridge's device id is detectable after the fact.
+
+Upstream states the caveat directly, and allw honors it as written: a restricted third-party client
+should not request admin merely to emulate the operator CLI. Admin mode exists here as a deliberate,
+documented trusted-deployment posture with a named risk — not as a shortcut around the filter.
 
 ### 4.2 Pairing and credential handling
 
@@ -633,6 +739,12 @@ writes a throwaway OpenClaw config with `tools.exec.mode: ask` / `ask: always` /
 into a temp state directory, prints the pairing command for the operator to approve, and then runs
 `allw-approver watch` in the foreground. It never starts the gateway itself.
 
+**Which mode this checklist exercises.** Steps 1–8 exercise **trusted-deployment (admin) mode**
+(§4.1b): pair with the **default** handoff profile — the one whose operator token includes
+`operator.admin` — and **not** `openclaw qr --limited` or Control UI **Limited access**, which omit
+admin and will leave the bridge unable to see bound approvals. Step 9 is the least-privilege
+regression check and is the only step run on a `--limited` pairing.
+
 Run these against a live gateway and record the result on the implementation issue:
 
 1. **Approve path (exec).** Ask the agent to run a harmless gated command, approve on the second
@@ -656,10 +768,15 @@ Run these against a live gateway and record the result on the implementation iss
    `no-expressible-allow` rather than escalating to `allow-always`.
 8. **Race with another surface.** With the Control UI also connected, resolve there first and confirm
    the bridge observes `applied: false`, adopts the recorded winner, and does not re-submit.
+9. **Least-privilege unavailability (fail-closed).** Re-pair the bridge with `openclaw qr --limited`
+   (no `operator.admin`) and start it in least-privilege mode. Confirm it refuses to enter the watch
+   loop, exits non-zero, and prints the unavailability error naming the mode — rather than
+   connecting and silently seeing no approvals.
 
 Comment template:
 
 ```md
+Mode: trusted-admin (steps 1-8) / least-privilege (step 9)
 Approve (exec): PASS/FAIL - command ran only after approval
 Deny (exec): PASS/FAIL - command was blocked after denial
 Timeout: PASS/FAIL - bridge denied before the gateway deadline
@@ -668,6 +785,7 @@ Plan divergence: PASS/FAIL - gateway retained the stored plan; node host rejecte
 Plugin approval: PASS/FAIL - plugin/tool identity and prose rendered; single call proceeded
 allow-once unavailable: PASS/FAIL - denied with no-expressible-allow
 Surface race: PASS/FAIL - applied:false honored, no re-submit
+Least-privilege unavailability: PASS/FAIL - refused to watch, exited non-zero, named the mode
 Notes:
 ```
 
