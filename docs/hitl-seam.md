@@ -80,21 +80,38 @@ adapter keeps signed verdicts and signed policy rules behind the opaque `evidenc
 
 ## 2. Package and dependency layout
 
-The recommended package name is **`@allw/hitl-seam`**. The `@allw` scope gives the package a known
-owner and avoids an unscoped-name or namespace-squatting dependency; the exported vocabulary and
-implementation remain provider-neutral. The name was unclaimed on npm when checked 2026-08-25.
-An independently governed neutral scope can be considered after there are independent maintainers,
-but neutrality is a property of the contract and dependency graph, not of an unowned package name.
+**Decided (2026-08-25):** the package is the unscoped **`hitl-policy`**, published from the
+standalone repo [github.com/mike-north/hitl-policy](https://github.com/mike-north/hitl-policy).
+allw [#218](https://github.com/mike-north/allw/issues/218) remains the allw-side tracking anchor;
+the contract itself does not live in this repo.
+
+The earlier recommendation was a scoped `@allw/hitl-seam`, on the argument that an owned scope gives
+clear provenance and forecloses namespace squatting on a bare name. That consideration was
+**noted and overruled**: the contract is provider-neutral and is meant to be adopted by hosts with
+no allw relationship, and an `@allw`-scoped name reads as an allw artifact regardless of what the
+exports say. Neutrality of the dependency graph is necessary but was judged not sufficient — the
+name is the first thing an adopting host sees. The standalone repo, rather than a scope, is what
+carries provenance and release authority.
+
+Operational consequence of an unscoped name: **the bare name must be claimable — or already
+claimed by the owner — on npm before first publish.** Checked 2026-08-27: `hitl-policy` is
+published at `0.0.0` under the maintainer `northm <michael.l.north@gmail.com>`, so the name is held
+by the owner and the squatting exposure is closed for this name. Re-verify before the first real
+release; if the placeholder is ever unpublished, the name becomes re-registrable by anyone.
 
 The package exposes subpaths, not a root barrel:
 
 ```text
-@allw/hitl-seam/decision       L0 leaf
-@allw/hitl-seam/policy         L1 leaf
-@allw/hitl-seam/escalation     L2; imports L0 + L1
-@allw/hitl-seam/suggestions    L3; imports L0 + L2
-@allw/hitl-seam/conformance    optional adapter test harnesses
+hitl-policy/decision       L0 leaf
+hitl-policy/policy         L1 leaf
+hitl-policy/escalation     L2; imports L0 + L1
+hitl-policy/suggestions    L3; imports L0 + L2
+hitl-policy/conformance    optional adapter test harnesses
 ```
+
+The `hitl-policy/policy` subpath is L1 — the host's own policy evaluation — and is deliberately
+_not_ the whole package under a package of the same name. `hitl-policy` names the problem domain
+(policy around human-in-the-loop decisions); `/policy` names one layer within it.
 
 ```text
  decision (L0)       policy (L1)
@@ -107,7 +124,7 @@ The package exposes subpaths, not a root barrel:
  decision + policy + escalation + suggestions ---> conformance
 ```
 
-There is deliberately no `@allw/hitl-seam` root export in v1. A root barrel would make the easiest
+There is deliberately no `hitl-policy` root export in v1. A root barrel would make the easiest
 import pull every layer into a consumer and would hide accidental upward dependencies. Declaration
 and import-graph tests MUST prove that:
 
@@ -356,8 +373,8 @@ import type {
   DecisionRequest,
   DecisionResult,
   JsonValue,
-} from "@allw/hitl-seam/decision";
-import type { PolicyEvaluation } from "@allw/hitl-seam/policy";
+} from "hitl-policy/decision";
+import type { PolicyEvaluation } from "hitl-policy/policy";
 
 export type EscalationPolicyDecision = "allow" | "deny" | "ask" | "no-match";
 
@@ -538,8 +555,8 @@ import type {
   DecisionRequest,
   DecisionResult,
   JsonValue,
-} from "@allw/hitl-seam/decision";
-import type { TerminalPolicyDecision } from "@allw/hitl-seam/escalation";
+} from "hitl-policy/decision";
+import type { TerminalPolicyDecision } from "hitl-policy/escalation";
 
 export interface HostPolicyDescriptor<TValue extends JsonValue = JsonValue> {
   /** Host/vendor namespace that owns this descriptor's semantics. */
@@ -794,8 +811,9 @@ Recommended sequence:
 
 1. Merge macts #111 with its reviewed local SPI; do not block it on this package.
 2. Merge/reconcile macts #112 so terminal composition and governing-layer attribution are settled.
-3. Implement, publish, and stabilize `@allw/hitl-seam` under
-   [#220](https://github.com/mike-north/allw/issues/220) after this spec is approved.
+3. Implement, publish, and stabilize `hitl-policy` in
+   [github.com/mike-north/hitl-policy](https://github.com/mike-north/hitl-policy), tracked under
+   [#220](https://github.com/mike-north/allw/issues/220), after this spec is approved.
 4. Migrate macts under #114 **after #112**, in one mechanical change:
    - neutralize L0 permission/API-key names through adapter types;
    - map macts's already-contextualized `allowed | confirm-first | denied` directly into L2 rather

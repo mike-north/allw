@@ -29,22 +29,32 @@ to L3. L0 remains a complete, useful HITL interface on its own.
 
 ---
 
-## D2 — `@allw/hitl-seam`, with provider-neutral exports
+## D2 — `hitl-policy`, standalone and unscoped, with provider-neutral exports
 
-**Chosen:** publish under the owned `@allw` npm scope as `@allw/hitl-seam`.
+**Chosen (2026-08-25):** publish as the unscoped **`hitl-policy`** from the standalone repo
+[github.com/mike-north/hitl-policy](https://github.com/mike-north/hitl-policy). allw #218 remains
+the allw-side tracking anchor only; the contract does not live in the allw repo.
 
-**Rejected:** an unscoped `hitl-seam`/`hitl-contract`, an unowned `@hitl/*` scope, or pretending the
-package has independent governance before it does. Also rejected `@allw/hitl-contract`: “contract”
-is easily confused with allw's cryptographic wire contract, while “seam” names the embed boundary
-tracked by #218.
+**Rejected:** an `@allw`-scoped name (`@allw/hitl-seam`, `@allw/hitl-contract`), an unowned
+`@hitl/*` scope, or pretending the package has independent governance before it does.
+`@allw/hitl-contract` was separately rejected because “contract” is easily confused with allw's
+cryptographic wire contract.
 
-**Why:** an owned scope gives consumers clear provenance, release authority, and supply-chain
-expectations. Package neutrality comes from names, dependency direction, and no allw types—not
-from an ownerless name. The recommended name and nearby neutral candidates were unclaimed on npm
-when checked 2026-08-25.
+**Why:** the contract is meant to be adopted by hosts with no allw relationship, and an
+`@allw`-scoped name reads as an allw artifact whatever the exports say. Provenance and release
+authority come from the standalone repo rather than from a vendor scope. `policy` names the problem
+domain more directly than `seam`, which described the boundary from allw's side.
 
-**Consequence:** all exported types avoid allw branding. A later transfer to independent governance
-requires an explicit migration rather than an ambiguous parallel package.
+**Noted and overruled:** an owned scope forecloses namespace squatting on a bare name and signals
+supply-chain ownership. Real, but outweighed — the name is the first thing an adopting host sees,
+and the squatting exposure is addressable by holding the bare name (see Consequence).
+
+**Consequence:** all exported types avoid allw branding. The bare npm name must be claimable, or
+already claimed by the owner, before first publish — checked 2026-08-27, `hitl-policy` is published
+at `0.0.0` under maintainer `northm <michael.l.north@gmail.com>`, so it is held; re-verify before
+the first real release, since unpublishing the placeholder would make it re-registrable by anyone.
+A later transfer to independent governance requires an explicit migration rather than an ambiguous
+parallel package.
 
 ---
 
