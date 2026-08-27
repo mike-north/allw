@@ -12,6 +12,13 @@ updates the owning section of [hitl-seam.md](./hitl-seam.md) in the same change.
 
 ## D1 — Four structurally independent layers
 
+> **Superseded 2026-08-27 by the repo architecture ruling.** Layering is now **behavioral**: one
+> `createGate(...)` surface with optional `policy`, `hitl`, and `policyChanges` adapters, exported
+> from a root barrel plus `./conformance`. The adoptability requirement below is unchanged and is
+> met by adapter optionality; what is lost is the build-time enforceability the declaration-graph
+> tests provided, replaced by the adapter-optionality conformance requirements in
+> `hitl-seam.md` §2.2. The rest of this entry records the original reasoning.
+
 **Chosen:** L0 decision and L1 policy are leaf entrypoints; L2 imports both; L3 imports L0/L2. The
 package has no root barrel.
 
@@ -98,6 +105,13 @@ must disclose that residual rather than claim end-to-end fail-closed coverage.
 
 ## D5 — L1 preserves `no-match`; failures are `deny`
 
+> **Superseded 2026-08-27.** There is no `no-match` in the ruled design. An adapter resolves its own
+> no-match and reports how it resolved it through `source: "directive" | "default"`, which keeps the
+> distinction auditable. The safety half — never infer allow from an absent match — is preserved by
+> construction, since an adapter with no applicable rule must return an explicit `allow` or `deny`.
+> What moves to the adapter is the guarantee that the default was _configured_ rather than assumed.
+> Failures still never present as a successful evaluation; they surface as `policy-error`.
+
 **Chosen:** `allow | deny | no-match`; a successful no-match needs an explicit caller fallback,
 while evaluation/transport/malformed failures normalize to deny.
 
@@ -115,6 +129,14 @@ allows explicit ask. Invalid or missing defaults deny.
 ---
 
 ## D6 — L2 composes only terminal evaluations
+
+> **Superseded 2026-08-27.** The seam no longer composes layers at all. A gate has one
+> `PolicyAdapter` returning one evaluation; multi-layer composition — the `allow < ask < deny`
+> lattice, governing-layer attribution, per-layer provenance — is now host-internal. The seam
+> retains only requirement normalization within a single `ask` (`hitl-seam.md` §5.2): coalescing on
+> matching `authorityId` **and** `approvalKey`, conjunction across distinct authorities, and
+> `route-conflict` on two explicit routes. The macts counterexample below is why an adapter must
+> still evaluate before composing, so the reasoning survives the move.
 
 **Chosen:** terminalize each layer, then take the strictest `allow < ask < deny`; broader layers
 come first and win a tie only as the primary explanation. Every raw ask remains in the retained
@@ -137,6 +159,12 @@ not rewrite the composed evaluation to allow, and current policy is re-evaluated
 
 ## D7 — Policy routing is L2, not caller identity
 
+> **Amended 2026-08-27.** The principle holds; two mechanisms changed. There are no provider
+> capability flags — routing capability is expressed by whether `HitlAdapter.route` is supplied —
+> and there is no sanitized `displayContext` channel, so a routed request carries `operation`,
+> `summary`, `riskClass`, and its one `ApprovalRequirement` and nothing else. Fail-closed on an
+> unroutable requirement is unchanged (`route-unavailable`).
+
 **Chosen:** host-owned `approvalAuthorityId` and `routeId` on terminal layer evaluations and
 `supportsDistinctRouting` in the L2 capability surface.
 
@@ -154,6 +182,20 @@ provider request carries only its approval requirement and explicitly sanitized 
 ---
 
 ## D8 — L3 is a companion envelope, validated independently
+
+> **Superseded 2026-08-27 — direction inverted.** The provider no longer proposes a rule. The host
+> authors a `PolicyChangeOffer` (options and/or a namespaced draft); the human picks or edits; the
+> provider returns `PolicyChangeResponse` values on `DecisionResult.policyChanges`; the host's
+> `prepare`/`apply` install it. This makes **host-applied-only structural** rather than merely
+> normative — a provider cannot name a rule the host did not author.
+>
+> The core invariant below survives intact and is enforced: the decision is validated independently
+> of the change batch, and a malformed batch is discarded whole while the valid one-shot decision is
+> retained. Three properties this entry claimed do **not** yet exist in the ruled types and are
+> tracked as gaps: change-specific evidence (so allw's separately signed rule artifact currently has
+> no carrier), an explicit request/target binding beyond positional association, and replay
+> idempotency. Generation staleness replaces the last of these only partially — it blocks applying
+> against changed policy, but does not dedupe a repeated response.
 
 **Chosen:** `DecisionWithPolicySuggestion` holds a complete L0 result and an optional sibling
 suggestion. The suggestion has its own id, request/target binding, issuance time, evidence, and
@@ -178,6 +220,14 @@ independently.
 
 ## D9 — Minimal namespaced scope envelope, host-owned semantics
 
+> **Partly superseded 2026-08-27.** The namespaced envelope survives as `PolicyDraft`
+> (`{ namespace, kind, value, display? }`) — still host-owned semantics, still not a universal
+> selector language. Removed: the separate target/scope split, the per-descriptor `schemaVersion`,
+> and the common `PolicyBounds` (`ttlMs`, `maxUses`, time window). Bounds are now whatever a host
+> encodes inside its own `draft.value`, which means the seam cannot detect a dropped bound — the
+> "never dropped" rule remains normative for hosts and is listed as a gap. Closed-world guarding of
+> policy-affecting records also remains normative but is not yet enforced.
+
 **Chosen:** separate target and scope descriptors shaped as
 `{ namespace, schemaVersion, kind, value: JsonValue, display? }`, plus common conjunctive `ttlMs`,
 `maxUses`, and an absolute half-open time window.
@@ -199,6 +249,14 @@ are closed-world so an older host cannot silently ignore a newer narrowing const
 ---
 
 ## D10 — The host classifies widening and owns provenance
+
+> **Amended 2026-08-27 — principle retained, mechanism absent.** "The host classifies widening, and
+> mixed or unknown counts as widening" is unchanged and remains normative. But the ruled types carry
+> no `effect` and no impact classification, and `PolicyChangeResponse` has no evidence slot, so the
+> contract neither requires nor records the determination and there is nowhere to put
+> widening-specific provenance. The offer model reduces the exposure — a provider can only pick
+> among host-authored options — without removing it, since an `edit` response can still widen. Both
+> are tracked as gaps against `hitl-seam.md` §6.2 invariants 3 and 4.
 
 **Chosen:** the suggestion carries the desired effect/scope/bounds, but the host computes whether
 the native before/after change is widening, tightening, mixed, or unknown. Mixed/unknown is
@@ -248,10 +306,10 @@ or adding union members in a minor release.
 fail closed, and adding a discriminant breaks exhaustive consumers even when its producer sees it
 as additive.
 
-**Consequence:** explicitly non-authoritative optional metadata and new subpaths are minor;
-decision-union members, required fields, failure-default changes, removals, and new L3 constraints
-are major after 1.0. L3 constraints also require a new runtime schema version so an older host can
-never ignore a narrowing field. Conformance fixtures are versioned with each supported major.
+**Consequence:** explicitly non-authoritative optional metadata and new optional adapter slots are
+minor; decision-union members, required fields, failure-default changes, removals, and new
+policy-modification constraints are major after 1.0. Those constraints also require a new runtime
+schema version so an older host can never ignore a narrowing field. Conformance fixtures are versioned with each supported major.
 During 0.x, consumers pin `~`; patch preserves a minor, while a documented new minor may correct
 the pre-1.0 design.
 

@@ -27,14 +27,15 @@ The terms **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative in the s
 
 ## 1. Scope and safety model
 
-The seam standardizes four independent layers:
+The seam standardizes four **contract roles**. They are roles, not modules: a host adopts one, some,
+or all of them by choosing which optional adapters it passes to a single `createGate(...)` (§2.1).
 
-| Layer                | Standalone use case                                                         | Vocabulary                                                     | May depend on                 |
-| -------------------- | --------------------------------------------------------------------------- | -------------------------------------------------------------- | ----------------------------- |
-| **L0 — decision**    | Ask a human about an operation, with no policy engine                       | `approved \| rejected \| timeout`                              | nothing above L0              |
-| **L1 — policy**      | Evaluate policy without ever asking a human                                 | `allow \| deny \| no-match`                                    | nothing above L1; no L0 types |
-| **L2 — escalation**  | Add `ask`, compose tightening policy layers, and invoke L0 only when needed | `allow \| ask \| deny \| no-match`                             | L0 and L1                     |
-| **L3 — suggestions** | Carry a prospective host-policy change alongside an L0 result               | `allow \| ask \| deny` effect plus host-owned scope and bounds | L0 and L2                     |
+| Role                | Standalone use case                                           | Vocabulary                                       | Adopted by                      |
+| ------------------- | ------------------------------------------------------------- | ------------------------------------------------ | ------------------------------- |
+| **L0 — decision**   | Ask a human about an operation, with no policy engine         | `approved \| rejected \| timeout`                | `hitl` alone                    |
+| **L1 — policy**     | Evaluate policy without ever asking a human                   | `allow \| deny` (terminal), `ask`                | `policy` alone                  |
+| **L2 — escalation** | Invoke a provider when, and only when, policy asks            | the gate's `satisfied \| unsatisfied` + failure  | `policy` + `hitl`               |
+| **L3 — change**     | Negotiate a host-authored standing-policy change with a human | host-authored options and drafts; choice or edit | `policyChanges`, with the above |
 
 The contract is an **enforcement input**, never an ambient-authority grant. A caller still owns the
 final conjunction:
@@ -54,12 +55,14 @@ evidence, the provider adapter or host verifier MUST validate it before treating
 decision as a satisfied human gate.
 
 For L2, `all_requirements_approved_and_evidence_accepted` is true only when every distinct
-conjunctive approval requirement has an `approved` L0 result and any evidence required for that
-specific result has been accepted. A primary/governing explanation never substitutes for the
-remaining authorities.
+conjunctive approval requirement has an `approved` decision and any evidence required for that
+specific result has been accepted. Approving one authority never substitutes for the remaining ones.
 
-An L3 suggestion is absent from all three formulas. It can affect only a later evaluation after the
-host has independently accepted and installed it through its normal policy path.
+A satisfied `GateResult` computes the `policy_gate` term above and nothing else. It is not
+`effective_allow`: the host still owns `ambient_authority` and every other gate.
+
+An L3 change is absent from all three formulas. It can affect only a later evaluation, after the
+host has independently prepared and applied it through its normal policy path.
 
 ### 1.1 Non-goals
 
@@ -99,48 +102,101 @@ published at `0.0.0` under the maintainer `northm <michael.l.north@gmail.com>`, 
 by the owner and the squatting exposure is closed for this name. Re-verify before the first real
 release; if the placeholder is ever unpublished, the name becomes re-registrable by anyone.
 
-The package exposes subpaths, not a root barrel:
+### 2.1 Entrypoints
+
+The package exposes **one root barrel plus a conformance subpath**:
 
 ```text
-hitl-policy/decision       L0 leaf
-hitl-policy/policy         L1 leaf
-hitl-policy/escalation     L2; imports L0 + L1
-hitl-policy/suggestions    L3; imports L0 + L2
-hitl-policy/conformance    optional adapter test harnesses
+hitl-policy               the whole contract: createGate, invokeDecision, guards, types
+hitl-policy/conformance   fixtures and requirement ids for adapter authors
 ```
 
-The `hitl-policy/policy` subpath is L1 — the host's own policy evaluation — and is deliberately
-_not_ the whole package under a package of the same name. `hitl-policy` names the problem domain
-(policy around human-in-the-loop decisions); `/policy` names one layer within it.
+Layering is **behavioral, not structural**. A host adopts layers by choosing which optional adapters
+it passes to `createGate`:
 
 ```text
- decision (L0)       policy (L1)
-       \               /
-        \             /
-         escalation (L2)
-          /          \
-   decision            suggestions (L3)
-
- decision + policy + escalation + suggestions ---> conformance
+createGate({ policy })                      policy without ask
+createGate({ hitl })                        human decision without policy
+createGate({ policy, hitl })                escalation: policy asks, human answers
+createGate({ policy, hitl, policyChanges }) + interactive policy modification
 ```
 
-There is deliberately no `hitl-policy` root export in v1. A root barrel would make the easiest
-import pull every layer into a consumer and would hide accidental upward dependencies. Declaration
-and import-graph tests MUST prove that:
+Every adapter slot is optional and independently omittable, so the adopt-in-layers requirement is
+satisfied by the shape of the configuration object rather than by the shape of the module graph.
 
-- `/decision` exports no policy, escalation, or suggestion symbol;
-- `/policy` exports no provider, human-decision, evidence, or suggestion symbol;
-- `/escalation` has no L3 dependency; and
-- `/suggestions` is the only production entrypoint that mentions `PolicySuggestion`.
+**Considered and overruled: structural entrypoints.** The earlier design split the package into five
+subpaths (`/decision`, `/policy`, `/escalation`, `/suggestions`, `/conformance`) with no root barrel,
+and required declaration/import-graph tests proving no upward dependency between them. The argument
+was that the easiest import should not pull every layer into a consumer, and that a physical
+boundary makes an accidental upward dependency a build failure rather than a review finding.
+
+That was overruled for three reasons:
+
+1. **Adapter optionality achieves the same adoptability with less ceremony.** A consumer that passes
+   only `policy` has, observably, no HITL behavior — which is the property the split existed to
+   guarantee. Enforcing it twice, once in the module graph and once in the runtime configuration,
+   buys nothing the conformance requirements below do not already prove.
+2. **The root-barrel cost is largely notional for a dependency-free types package.** Most of the
+   surface is type-only, so it is erased entirely at build time; the runtime surface is a handful of
+   guards and two functions, and tree-shaking removes what a consumer does not reference. There is
+   no transitive dependency weight to keep out of a consumer's bundle, because the package has zero
+   runtime dependencies.
+3. **The layers are not separable in the ruled design.** Escalation is not a module that imports
+   policy and decision — it is what the single gate does when both adapters are present. There is no
+   longer a `/escalation` unit to give its own entrypoint.
+
+The cost accepted with this ruling is real and worth naming: an upward dependency between contract
+roles can no longer be caught by a build-time graph assertion, so role separation now rests on
+review and on the adapter-optionality conformance requirements.
+
+### 2.2 Adapter-optionality conformance requirements
+
+Replacing the import-graph assertions, the conformance suite MUST prove that:
+
+- **Policy-only is constructible and fully functional.** A gate configured with `policy` and no
+  `hitl` reaches both terminal outcomes — a satisfied `allow` and an unsatisfied `deny` — and no
+  HITL code path is exercised. The negative half MUST be asserted against a real configured
+  provider spy, not against a provider that was never wired to the gate.
+- **HITL-only is constructible and fully functional.** A gate configured with `hitl` and no `policy`
+  reaches a satisfied result through the implicit ask path, and a gate with neither adapter fails
+  closed with `hitl-unavailable` rather than defaulting open.
+- **Mixed composes.** With both adapters present, a terminal policy result does not invoke HITL, and
+  an `ask` does — and the resulting approval is reported as a satisfied gate, never as a policy
+  `allow`.
+
+Repo status (checked 2026-08-27): the behavior is covered by
+[`test/gate.test.ts`](https://github.com/mike-north/hitl-policy/blob/main/test/gate.test.ts) —
+`GATE-001`/`GATE-002` (policy-only allow/deny), `GATE-003`/`GATE-004` (HITL-only and
+neither-adapter fail-closed), `GATE-005` (mixed terminal does not invoke HITL), `GATE-006` (mixed
+ask invokes HITL and is not authorization) — and the entrypoint shape is asserted by
+[`test/package-boundary.test.ts`](https://github.com/mike-north/hitl-policy/blob/main/test/package-boundary.test.ts),
+which pins `exports` to `.` + `./conformance` and asserts the four old subpaths are absent.
+
+Three gaps remain against the requirements above, tracked under
+[#220](https://github.com/mike-north/allw/issues/220):
+
+1. `./conformance` ships **fixtures only** — builders plus a `CONFORMANCE_REQUIREMENTS` id list. The
+   assertions live in `test/`, which is not exported, so an adapter author cannot execute the
+   conformance cases against their own adapter.
+2. `CONFORMANCE_REQUIREMENTS` is stale relative to the suite: it lists 24 ids, while the tests also
+   implement `GATE-007`–`GATE-010`, `RELOAD-007`/`008`, `RECHECK-005`–`007`, `CHANGE-009`–`014`,
+   `FAIL-001`, and `ASSURE-001`/`002`.
+3. `GATE-001` and `GATE-002` assert non-invocation against a `vi.fn()` that is never passed to the
+   gate, so those two assertions are vacuous. `GATE-005` carries the real non-invocation proof.
 
 ---
 
-## 3. L0 — human decision, without policy
+## 3. L0 — the human-decision role
 
-L0 answers one question: **what did a human decide about this exact request?** It contains no
-`allow`, `deny`, `ask`, rule, policy-layer, policy-scope, or standing-reuse field.
+L0 is a **contract role, not a package layer.** It answers one question: **what did a human decide
+about this exact request?** It is realized by `DecisionProvider`, `DecisionRequest`, and
+`DecisionResult`, and a host adopts it alone by passing `hitl` to `createGate` with no `policy`
+adapter.
 
-### 3.1 Type sketch
+The role carries no rule, policy-layer, policy-scope, or standing-reuse field. It does carry the one
+approval obligation the gate selected — see the note on `ApprovalDecisionRequest` below.
+
+### 3.1 Types
 
 ```ts
 /** JSON-safe data accepted across Node, browser, plugin, and WASM boundaries. */
@@ -152,7 +208,7 @@ export type JsonValue =
   | readonly JsonValue[]
   | { readonly [key: string]: JsonValue };
 
-/** A neutral caller identity. Host-specific identity fields stay on a subtype. */
+/** A neutral caller identity. */
 export interface CallerIdentity {
   readonly kind: string;
   readonly id: string;
@@ -163,27 +219,32 @@ export interface CallerIdentity {
  * The request a provider presents to a human. TOperation is deliberately host-owned:
  * this package does not define a common command, MCP, capability, or selector model.
  */
-export interface DecisionRequest<
-  TOperation extends JsonValue = JsonValue,
-  TCaller extends CallerIdentity = CallerIdentity,
-> {
+export interface DecisionRequest<TOperation extends JsonValue = JsonValue> {
   readonly schemaVersion: 1;
   readonly id: string;
   readonly operationId: string;
   readonly operation: TOperation;
-  readonly caller: TCaller;
-  /** A non-empty, host-owned display label; there is no shared risk taxonomy. */
-  readonly riskClass: string;
+  readonly caller: CallerIdentity;
+  /** A host-owned display label; there is no shared risk taxonomy. */
+  readonly riskClass?: string;
   readonly summary: string;
   readonly requestedAtMs: number;
   readonly timeoutMs: number;
 }
 
+/** What a provider actually receives: the request plus the selected obligation. */
+export interface ApprovalDecisionRequest<
+  TOperation extends JsonValue = JsonValue,
+> extends DecisionRequest<TOperation> {
+  readonly approval: ApprovalRequirement;
+  readonly policyChange?: PolicyChangeRequest;
+}
+
 export type DecisionFailure =
+  | "invalid-request"
   | "provider-error"
   | "provider-unavailable"
   | "malformed-result"
-  | "invalid-request"
   | "caller-aborted"
   | "deadline-exceeded";
 
@@ -199,17 +260,19 @@ export type DecisionOutcome =
 export interface DecisionResult {
   readonly schemaVersion: 1;
   readonly decision: DecisionOutcome;
-  /** Provider-specific proof. L0 preserves it but never interprets it. */
+  /** Provider-specific proof. The seam preserves it but never interprets it. */
   readonly evidence?: unknown;
+  /** L3 material, validated independently of the one-shot decision (§6). */
+  readonly policyChanges?: readonly PolicyChangeResponse[];
 }
 
-export interface DecisionProvider<
-  TRequest extends DecisionRequest = DecisionRequest,
-  TResult extends DecisionResult = DecisionResult,
-> {
+export interface DecisionProvider<TOperation extends JsonValue = JsonValue> {
   readonly apiVersion: 1;
   readonly providerId: string;
-  requestDecision(request: TRequest, context: { readonly signal: AbortSignal }): Promise<TResult>;
+  request(
+    request: ApprovalDecisionRequest<TOperation>,
+    context: { readonly signal: AbortSignal },
+  ): Promise<DecisionResult>;
 }
 ```
 
@@ -218,18 +281,27 @@ Recursive JSON values are subject to the documented depth and size bounds in §7
 
 `operationId` names the operation in the host's namespace; it is not a shared policy selector.
 `operation` is the provider-facing exact JSON-safe description and MAY be specialized by a host.
-Caller extensions crossing a process/plugin/WASM boundary MUST also be JSON-safe. `riskClass` is
-display metadata, not a common severity ordering. A macts adapter can carry its permission and
-API-key identity; an allw adapter can carry its `ActionRecord`; neither shape leaks into the base
-package. `unknown` is reserved for evidence the common package must not interpret.
+`riskClass` is display metadata, not a common severity ordering. An allw adapter can carry its
+`ActionRecord` inside `operation`; that shape never leaks into the base package. `unknown` is
+reserved for evidence the common package must not interpret.
 
-The base provider has no policy-related capability flags. `supportsDistinctRouting` belongs to L2,
-and `supportsPolicySuggestions` belongs to L3.
+**On `approval` in the provider request.** Every provider request carries exactly one
+`ApprovalRequirement`, including in HITL-only mode: when no policy adapter is configured, the gate
+synthesizes an implicit requirement (`hitl.implicitRequirement`, or
+`{ authorityId: "implicit-human", approvalKey: operationId }`). This is deliberate — it gives the
+provider a stable obligation identity to render and lets the post-decision recheck in §5 compare
+obligations rather than re-prompting. It is an obligation identifier, not a policy rule: it carries
+no effect, no scope, and no reuse semantics.
+
+There are no provider capability flags. Routing capability is expressed by whether
+`HitlAdapter.route` is supplied (§5); policy-change capability is expressed by whether a
+`policyChanges` adapter is configured (§6).
 
 ### 3.2 Provider invocation contract
 
-The implementation package MUST expose one safe invocation helper. Its exact function name is an
-implementation detail; its behavior is not:
+The implementation package MUST expose one safe invocation helper — in the repo, the exported
+`invokeDecision` ([`src/callbacks.ts`](https://github.com/mike-north/hitl-policy/blob/main/src/callbacks.ts)).
+Its behavior is normative:
 
 1. Validate the standard request fields before invoking the provider.
 2. Compute the absolute deadline as `requestedAtMs + timeoutMs`, reject future/unsafe timestamps,
@@ -271,13 +343,25 @@ mismatch in required evidence MUST NOT satisfy the human gate.
 | `timeoutMs` is non-positive, non-finite, unsafe, not an integer, or exceeds the documented maximum            | `timeout`; provider is not invoked             | No                                                                 |
 | `requestedAtMs` is future, non-finite, unsafe, or produces an overflowing deadline                            | `timeout`; provider is not invoked             | No                                                                 |
 | Caller cancels before a terminal provider result                                                              | `rejected`; signal aborted                     | No                                                                 |
-| Required evidence is absent, malformed, unverifiable, stale, for another caller/request, or revoked           | Host evidence gate fails                       | No                                                                 |
-| Required durable audit/persistence fails after approval                                                       | Host audit gate fails                          | No                                                                 |
+| Required evidence is absent, malformed, unverifiable, stale, for another caller/request, or revoked           | Gate `evidence-failed`                         | No                                                                 |
+| Required durable audit/persistence fails after approval                                                       | Gate `audit-failed`                            | No                                                                 |
+
+The last two rows are enforced by the gate rather than by the host: `HitlAdapter.verify` runs over
+every decision record before the gate can be satisfied, and `GateConfig.audit` must return `true`.
+Both failures are terminal (`gate.ts` `#verifyEvidence` / `#audit`).
 
 The safe helper sets the corresponding negative-only `failure` category for failures it
 normalizes. A provider's well-formed explicit human `rejected` or `timeout` response need not carry
 one. The guard rejects `failure` on `approved`, so audit can distinguish a person's “no” from a
 provider/channel failure without adding a fourth decision state.
+
+> **Open divergence (for ruling, tracked under [#220](https://github.com/mike-north/allw/issues/220)).**
+> The table's "malformed standard field other than its deadline ⇒ `rejected`" row is not what the
+> repo does. `invokeDecision` first tests whether the value merely _has_ `requestedAtMs` and
+> `timeoutMs` keys; if it does, any other malformed field normalizes to `timeout`/`invalid-request`
+> rather than `rejected`/`invalid-request`. Both fail closed, so this is a normalization and
+> audit-legibility difference, not a safety one — but it currently makes a malformed `summary`
+> indistinguishable from a bad deadline. The row above remains normative pending a ruling.
 
 Silence is never consent. A local UI provider that produces no cryptographic artifact MAY omit
 `evidence`; that is an explicit host assurance choice, not a reason for the common guard to invent
@@ -294,456 +378,617 @@ unknown discriminants; and unknown `schemaVersion`/`apiVersion`.
 Unknown additive properties are ignored for forward compatibility. Unknown discriminants or
 versions fail closed.
 
+Repo status: covered by `test/decision-lifecycle.test.ts` and `test/guards.test.ts`, plus the
+`FAIL-001` normalization case in `test/gate.test.ts`. The fixtures an adapter author needs —
+`createDecisionRequestFixture`, `createApprovedDecisionFixture`, `createRejectedDecisionFixture`,
+`createHungProviderFixture` — are exported from `hitl-policy/conformance`; the assertions that use
+them are not (§2.2 gap 1).
+
 ---
 
-## 4. L1 — policy evaluation, without a human
+## 4. L1 — the policy-evaluation role
 
-L1 is a pure decision contract: it evaluates host-owned policy input and returns policy data. It
-MUST NOT prompt, suspend for a person, import L0, or mention an approval provider.
+L1 is a **contract role**, realized by `PolicyAdapter` and `PolicyEvaluation`. It evaluates
+host-owned policy state and returns policy data. It never prompts and never suspends for a person: a
+host adopts it alone by passing `policy` to `createGate` with no `hitl` adapter, and in that
+configuration only the terminal `allow`/`deny` results can satisfy or refuse the gate.
 
-### 4.1 Type sketch
+### 4.1 Types
 
 ```ts
-export type PolicyDecision = "allow" | "deny" | "no-match";
-
-export interface PolicyEvaluation<TDetails = unknown> {
-  readonly schemaVersion: 1;
-  readonly decision: PolicyDecision;
+/** A terminal allow or deny returned by a host policy adapter. */
+export interface TerminalPolicyEvaluation {
+  readonly decision: "allow" | "deny";
+  /** Whether a rule matched (`directive`) or the adapter's default applied. */
+  readonly source: "directive" | "default";
   readonly reason?: string;
-  /** Host-native rule ids, obligations, traces, or other diagnostics. */
-  readonly details?: TDetails;
+  /** Opaque host-local provenance which is never inspected or serialized. */
+  readonly details?: unknown;
 }
 
-export interface PolicyEvaluator<TInput = unknown, TDetails = unknown> {
+/** A terminal ask; the escalation role in §5 consumes it. */
+export interface AskPolicyEvaluation {
+  readonly decision: "ask";
+  readonly requirements: readonly [ApprovalRequirement, ...ApprovalRequirement[]];
+  readonly reason?: string;
+  readonly details?: unknown;
+}
+
+export type PolicyEvaluation = TerminalPolicyEvaluation | AskPolicyEvaluation;
+
+/** A validated, host-owned policy snapshot with an opaque host-issued revision. */
+export interface PolicyState<TPolicy = unknown> {
+  readonly revision: string;
+  readonly state: TPolicy;
+}
+
+/** A successful load that intentionally removes the active policy. */
+export interface AbsentPolicyState {
+  readonly revision: string;
+  readonly state?: undefined;
+}
+
+export type LoadedPolicyState<TPolicy = unknown> = PolicyState<TPolicy> | AbsentPolicyState;
+
+export interface PolicyAdapter<TInput = unknown, TPolicy = unknown> {
+  readonly apiVersion?: 1;
+  readonly initial?: LoadedPolicyState<TPolicy>;
+  load?(context: {
+    readonly signal: AbortSignal;
+    readonly generation: number;
+  }): Promise<LoadedPolicyState<TPolicy>>;
   evaluate(
     input: TInput,
-    context: { readonly signal: AbortSignal },
-  ): PolicyEvaluation<TDetails> | Promise<PolicyEvaluation<TDetails>>;
+    context: {
+      readonly signal: AbortSignal;
+      readonly generation: number;
+      readonly revision?: string;
+      readonly state: TPolicy;
+    },
+  ): PolicyEvaluation | Promise<PolicyEvaluation>;
 }
 ```
 
-`no-match` is a successful, explicit result: the evaluator ran and found no applicable rule. It is
-not an alias for an evaluator error, missing policy, unavailable PDP, malformed response, or
-`undefined`.
+**There is no `no-match`.** The earlier design surfaced `no-match` as a third successful decision
+that the enforcement point resolved through an explicit configured fallback. In the ruled design the
+adapter resolves its own no-match internally and reports _how_ it resolved it through
+`source: "directive" | "default"`. The safety property the fallback existed to guarantee — never
+infer allow from the absence of a match — is preserved by construction, because an adapter that has
+no applicable rule must return an explicit `allow` or `deny` and label it `default`. What is lost is
+the seam's ability to enforce that the default was configured rather than assumed; that
+responsibility now sits with the adapter. `source` is also what makes the distinction auditable
+after the fact.
 
-The enforcement point MUST resolve `no-match` with an explicit `allow` or `deny` default before it
-uses the evaluation as a gate. An explicit `allow` default is permitted for a policy layer intended
-to be neutral on no match; it MUST NOT be inferred from an omitted default. Missing or malformed
-fallback configuration fails to `deny`.
+**Policy state is reloadable and versioned.** This has no counterpart in the earlier design and is
+load-bearing for §5's recheck. The gate holds one immutable snapshot at a time, identified by a
+monotonic `generation` and the host's opaque `revision`:
 
-The safe evaluator helper takes a positive, bounded evaluation deadline independently of policy
-input, composes its abort signal with caller cancellation, and never lets an async evaluator wait
-indefinitely. Synchronous evaluators may ignore the signal. An optional layer that is not configured
-is omitted entirely: absence is neither `no-match` nor an error. An empty configured layer set fails
-closed at the enforcement point.
+- `initial` seeds the first snapshot without I/O, so `createGate` is synchronous.
+- `reload()` calls `load`, and advances `generation` only when the host's `revision` changes.
+  Opaque state is never compared — the host MUST issue a new revision whenever the meaning of
+  `state` changes, or the gate will treat the reload as `unchanged`.
+- Snapshot replacement is a single synchronous assignment: a reader observes the complete old or the
+  complete new snapshot, never a mixed revision/state pair.
+- Concurrent `reload()` calls coalesce onto one in-flight operation.
+- A failed reload retains the last good snapshot and returns a `failed` status; it never leaves the
+  gate policy-less.
+
+**Configured-but-broken is not the same as absent.** A gate with no `policy` adapter has no policy
+and falls through to the implicit ask (§5). A gate whose configured adapter fails validation — a
+bad `apiVersion`, an accessor-backed registration, a missing `evaluate` — fails with `policy-error`
+rather than degrading into implicit ask. Otherwise HITL could silently replace a broken host policy
+boundary.
 
 ### 4.2 Normative failure table
 
-| Evaluator condition                                                                                                                 | Normalized evaluation | Notes                                               |
-| ----------------------------------------------------------------------------------------------------------------------------------- | --------------------- | --------------------------------------------------- |
-| Well-formed `allow`                                                                                                                 | `allow`               | A policy signal only; other gates still apply       |
-| Well-formed `deny`                                                                                                                  | `deny`                | Terminal refusal                                    |
-| Well-formed `no-match`                                                                                                              | `no-match`            | Resolve only through the caller's explicit fallback |
-| Throw, rejected promise, timeout, caller abort, transport error, unavailable evaluator, or missing policy that was expected to load | `deny`                | Failure is not `no-match`                           |
-| Null, primitive, missing field, unknown decision/version, or malformed standard field                                               | `deny`                | Fail closed                                         |
-| `no-match` with no valid fallback                                                                                                   | `deny`                | Never infer allow                                   |
+| Adapter condition                                                                                                  | Normalized evaluation         | Notes                                         |
+| ------------------------------------------------------------------------------------------------------------------ | ----------------------------- | --------------------------------------------- |
+| Well-formed `allow`                                                                                                | `allow`                       | A policy signal only; other gates still apply |
+| Well-formed `deny`                                                                                                 | `deny` ⇒ gate `policy-denied` | Terminal refusal                              |
+| Well-formed `ask`                                                                                                  | `ask`                         | Consumed by the escalation role (§5)          |
+| Adapter absent (no `policy` configured)                                                                            | Implicit `ask`                | Absence is not allow; see §5                  |
+| Configured adapter fails registration validation                                                                   | Gate `policy-error`           | Never degrades to implicit ask                |
+| Throw, rejected promise, callback timeout, caller abort, transport error, or missing policy expected to load       | Gate `policy-error`           | Failure is never a successful evaluation      |
+| Null, primitive, missing field, unknown decision, `allow`/`deny` without a valid `source`, or empty `requirements` | Gate `policy-error`           | Fail closed                                   |
+| Policy generation changes under an in-flight evaluation more than three times                                      | Gate `policy-unstable`        | Bounded restart; see §5                       |
 
-The safe evaluation helper MUST never reject, MUST sanitize implementation exceptions, and MUST
-preserve host-native `details` only for a response that passes the standard guard.
+Evaluation never rejects to the caller, sanitizes implementation exceptions into an operator-only
+diagnostic channel, and preserves host-native `details` by reference without inspecting or
+serializing it.
 
 ### 4.3 L1 conformance cases
 
-The harness MUST accept exactly the three decisions, reject L2's `ask`, distinguish no-match from
-errors, exercise both explicit no-match fallbacks, normalize sync/async errors and malformed output
-to deny, and prove the `/policy` declaration graph has no L0 dependency.
+The harness MUST accept exactly `allow`, `deny`, and `ask`; require a valid `source` on the terminal
+pair; reject an `ask` with an empty or malformed `requirements` array; distinguish a configured-but-
+broken adapter (`policy-error`) from an absent one (implicit ask); normalize sync/async errors,
+callback timeouts, and malformed output to `policy-error`; and cover the snapshot lifecycle —
+generation advancing only on a revision change, a failed reload retaining the last good snapshot,
+coalesced concurrent reloads, and a successful load of absent state returning the gate to implicit
+ask.
+
+Repo status: `RELOAD-001`–`RELOAD-008` in `test/gate.test.ts` and
+`test/policy-state-machine.test.ts` cover the snapshot lifecycle; `GATE-010` covers a class-based
+adapter with prototype-defined methods; `test/guards.test.ts` covers evaluation-shape rejection.
 
 ---
 
-## 5. L2 — escalation and tightening composition
+## 5. L2 — the escalation role
 
-L2 adds `ask` to the policy vocabulary, composes nested restriction layers, and invokes an L0
-provider only when the composed policy asks. It does not turn the human decision into ambient
-authorization.
+L2 is a **contract role**, not a module: it is what the gate does when a policy evaluation returns
+`ask`. It normalizes the ask's approval obligations, invokes one L0 provider per obligation, and
+re-checks policy before reporting a satisfied gate. It never turns a human decision into ambient
+authorization, and it never synthesizes a policy `allow` from an approval.
 
-### 5.1 Type sketch
+### 5.1 Types
 
 ```ts
-import type {
-  DecisionProvider,
-  DecisionRequest,
-  DecisionResult,
-  JsonValue,
-} from "hitl-policy/decision";
-import type { PolicyEvaluation } from "hitl-policy/policy";
-
-export type EscalationPolicyDecision = "allow" | "deny" | "ask" | "no-match";
-
-export type TerminalPolicyDecision = Exclude<EscalationPolicyDecision, "no-match">;
-
-export interface EscalationPolicyEvaluation<TDetails = unknown> extends Omit<
-  PolicyEvaluation<TDetails>,
-  "decision"
-> {
-  readonly decision: EscalationPolicyDecision;
-}
-
-/** A layer after no-match has been explicitly terminalized. */
-export interface TerminalLayerEvaluation<TDetails = unknown> {
-  readonly layerId: string;
-  /** Required for ask: equal ids explicitly mean one decision may satisfy both layers. */
-  readonly approvalAuthorityId?: string;
-  readonly routeId?: string;
-  readonly evaluation: EscalationPolicyEvaluation<TDetails> & {
-    readonly decision: TerminalPolicyDecision;
-  };
-}
-
+/**
+ * One stable human-approval obligation emitted by a policy adapter.
+ *
+ * `approvalKey` identifies the exact obligation that may reuse an in-flight approval
+ * after policy re-evaluation. `authorityId` keeps independent authorities conjunctive
+ * even when their keys happen to match.
+ */
 export interface ApprovalRequirement {
   readonly authorityId: string;
+  readonly approvalKey: string;
   readonly routeId?: string;
-  readonly layerIds: readonly string[];
 }
 
-export interface ComposedPolicyEvaluation<TDetails = unknown> {
-  readonly decision: TerminalPolicyDecision;
-  readonly governingLayerId: string;
-  readonly governingRouteId?: string;
-  readonly layers: readonly TerminalLayerEvaluation<TDetails>[];
-  /** Empty for allow/deny; all entries are conjunctive when decision is ask. */
-  readonly approvalRequirements: readonly ApprovalRequirement[];
+/** A provider route selected for one approval requirement. */
+export type DecisionRoute<TOperation extends JsonValue = JsonValue> =
+  | DecisionProvider<TOperation>
+  | {
+      readonly providerId?: string;
+      request(
+        request: ApprovalDecisionRequest<TOperation>,
+        context: { readonly signal: AbortSignal },
+      ): Promise<DecisionResult>;
+    };
+
+/** Host-owned HITL configuration. Supplying this alone is HITL-without-policy. */
+export interface HitlAdapter<TOperation extends JsonValue = JsonValue> {
+  /** Used when no policy adapter is configured and the gate asks implicitly. */
+  readonly implicitRequirement: ApprovalRequirement;
+  readonly providerId?: string;
+  request(
+    request: ApprovalDecisionRequest<TOperation>,
+    context: { readonly signal: AbortSignal },
+  ): Promise<DecisionResult>;
+  route?(requirement: ApprovalRequirement): DecisionRoute<TOperation> | undefined;
+  verify?(result: DecisionResult, request: ApprovalDecisionRequest): boolean | Promise<boolean>;
 }
 
-export interface EscalationDecisionRequest<
-  TOperation extends JsonValue = JsonValue,
-  TDisplayContext extends JsonValue = JsonValue,
-> extends DecisionRequest<TOperation> {
-  readonly escalation: {
-    readonly requirement: ApprovalRequirement;
-    /** Optional sanitized display data; never policy input or authoritative provenance. */
-    readonly displayContext?: TDisplayContext;
-  };
-}
+/** Policy provenance retained by a gate result. */
+export type PolicyResolution =
+  | (TerminalPolicyEvaluation & { readonly generation: number; readonly revision?: string })
+  | (AskPolicyEvaluation & {
+      /** `implicit` marks an ask the gate synthesized because no policy was configured. */
+      readonly source: "directive" | "implicit";
+      readonly generation: number;
+      readonly revision?: string;
+    });
 
-export interface EscalationProviderCapabilities {
-  readonly supportsDistinctRouting: boolean;
-}
+export type GateFailure =
+  | "invalid-input"
+  | "policy-denied"
+  | "policy-error"
+  | "hitl-unavailable"
+  | "route-conflict"
+  | "route-unavailable"
+  | "decision-rejected"
+  | "decision-timeout"
+  | "decision-error"
+  | "malformed-decision"
+  | "caller-aborted"
+  | "evidence-failed"
+  | "audit-failed"
+  | "policy-changed"
+  | "policy-unstable";
 
-export interface EscalationProvider<
-  TRequest extends EscalationDecisionRequest = EscalationDecisionRequest,
-  TResult extends DecisionResult = DecisionResult,
-> extends DecisionProvider<TRequest, TResult> {
-  readonly capabilities: EscalationProviderCapabilities;
+export interface SatisfiedGateResult<TOperation extends JsonValue = JsonValue> {
+  readonly state: "satisfied";
+  /** The detached immutable input that was actually evaluated and approved. */
+  readonly input: GateInput<TOperation>;
+  readonly generation: number;
+  readonly revision?: string;
+  readonly policy: PolicyResolution;
+  readonly human?: HumanResolution;
 }
 ```
 
-Each raw layer couples its `no-match` evaluation with an explicit fallback of `allow`, `ask`, or
-`deny`. Terminalization happens before composition. An omitted/invalid fallback or an evaluator
-failure terminalizes to `deny`, not to the configured no-match fallback.
+`authorityId` is the host's canonical identity for an approval obligation; `approvalKey` identifies
+the exact obligation. Two requirements coalesce only when **both** match. `routeId` is a host-owned
+provider-routing label, not a closed enum. A required route with no capable provider fails closed
+with `route-unavailable`; it MUST NOT silently fall back to the default provider.
 
-`approvalAuthorityId` is the host's canonical identity for an approval obligation. Equal ids are an
-explicit assertion that one human decision may satisfy the asks from those layers. Different ids
-remain separate conjunctive obligations. `routeId` is a host-owned provider-routing label, not a
-closed `host | key` enum. These fields move the macts `layer` concern out of L0. A required
-non-default route with no capable router/provider fails closed; it MUST NOT silently use the
-default route.
+Host-native `details` on a policy evaluation are retained in the gate result for audit and
+explanation. They MUST NOT be copied into a provider request.
 
-The complete `ComposedPolicyEvaluation`, including host-native `details`, remains inside the host
-for audit, explanation, re-evaluation, and final enforcement. It MUST NOT be copied into a provider
-request. A host MAY add an explicitly constructed JSON-safe `displayContext` to the one request for
-a selected requirement. That context is presentational only, is bounded by the same JSON guard as
-`operation`, and cannot be used to reconstruct or enforce native policy.
+> **Removed in the ruled design: sanitized display context.** The earlier design let a host attach
+> an explicitly constructed, JSON-guarded `displayContext` to the one request for a selected
+> requirement. The repo has no such field: a provider sees `operation`, `summary`, `riskClass`, and
+> the `approval` obligation, and nothing else. Anything a reviewer must see has to be inside
+> `operation`, which is already bounded by the same JSON guard. This is a narrowing, so it is safe
+> by default — but hosts that were relying on a separate presentational channel no longer have one.
+> Listed for ruling under [#220](https://github.com/mike-north/allw/issues/220).
 
-### 5.2 Composition algorithm
+### 5.2 Requirement normalization
 
-Layers are supplied from broader to narrower, such as macts host policy followed by per-key policy.
-The input MUST be non-empty and terminal. The composer chooses the strictest decision:
+The earlier design specified a **multi-layer composer**: layers supplied broadest-to-narrowest, an
+`allow < ask < deny` strictest-wins lattice, an exhaustive 3×3 matrix, `governingLayerId`
+attribution, and full per-layer provenance retained for audit.
 
-```text
-allow < ask < deny
-```
+**That composer is not part of the ruled design.** A gate has exactly one `PolicyAdapter`, which
+returns one `PolicyEvaluation`. Composing nested restriction layers — a host policy plus a per-key
+policy, in the macts case — is now entirely the adapter's job, inside host-owned code, using
+host-owned types. The seam composes nothing.
 
-| Broader \\ narrower | `allow`           | `ask`                                         | `deny`            |
-| ------------------- | ----------------- | --------------------------------------------- | ----------------- |
-| `allow`             | `allow` (broader) | `ask` (narrower requirement)                  | `deny` (narrower) |
-| `ask`               | `ask` (broader)   | `ask` (broader explanation; retain both asks) | `deny` (narrower) |
-| `deny`              | `deny` (broader)  | `deny` (broader)                              | `deny` (broader)  |
+What survives at the seam is narrower: normalizing the requirement list carried by a single `ask`.
 
-Earlier/broader input wins a tie only for the primary explanation. A narrower layer is named as
-governing only when it actually tightens the accumulated scalar decision. The composed result
-retains every terminal layer for audit and explanation. When the final decision is `ask`, it groups
-every ask into `approvalRequirements` by canonical `approvalAuthorityId`. Two ask layers with
-different authority ids require two approvals. Two asks with the same authority id coalesce into
-one requirement only because the host explicitly declared their equivalence. When the final
-decision is `allow` or `deny`, `approvalRequirements` is empty; any raw ask remains visible in
-`layers` but is not actionable. A missing authority id on ask, or one authority id mapped to
-conflicting routes, is malformed and fails closed even when another layer denies.
+- The list MUST be non-empty and every element MUST be a valid `ApprovalRequirement`; otherwise
+  `policy-error`.
+- Two requirements coalesce only when `authorityId` **and** `approvalKey` are equal. Distinct
+  authorities remain separate conjunctive obligations and MUST NOT be collapsed into one prompt.
+- Within a coalescing pair, an unspecified `routeId` is compatible with one explicit `routeId`, and
+  the explicit one wins. Two different explicit routes are a `route-conflict` and fail closed.
+- Every surviving requirement is conjunctive: all must be approved.
 
-Composition MUST NOT compare pre-evaluation policy declarations. In macts, `read-only` and
-`confirm-first` are incomparable before the operation risk is known: `read-only` allows a read but
-denies a mutation, while `confirm-first` asks for both. Ranking declarations would either erase the
-key's ask on reads or resurrect the host's deny on writes. Evaluate first; compose only the terminal
-result.
-
-Path restrictions, argument globs, allowlist intersections, risk classification, and other native
-policy algebra remain inside each host evaluator. The common composer combines only terminal
-decisions and attribution.
-
-This algorithm supports both nested refinement and independent authorities. A single approval may
-satisfy several nested asks only when their canonical authority ids match. Independent authorities
-remain separate approval requirements and are conjoined; the composer MUST NOT tie-collapse them
-into one prompt.
+The reasoning that made the old composer refuse to rank pre-evaluation declarations still holds and
+now applies inside the adapter: in macts, `read-only` and `confirm-first` are incomparable before
+the operation's risk is known, so an adapter MUST evaluate first and compose only terminal results.
+The macts regressions that §5.5 used to require of the seam are now adapter-owned tests.
 
 ### 5.3 Escalation algorithm
 
-After terminalization and composition:
+Given a policy resolution:
 
-1. `deny`: refuse. Do not invoke L0.
-2. `allow`: satisfy this policy gate. Do not invoke L0.
-3. `ask`: create one uniquely identified L0 request per distinct approval requirement, route it to
-   that authority, and invoke each idempotently. Every requirement is conjunctive.
-4. Any L0 `rejected`, `timeout`, provider failure, malformed response, missing route, or failed
-   required evidence makes the policy gate fail. A late approval cannot revive it.
-5. Accepted `approved` results satisfy only the corresponding asks. The L2 helper MUST return the
-   original `ask` evaluation and the L0 results; it MUST NOT synthesize a policy `allow` from them.
-6. Immediately before execution, the host MUST re-evaluate current policy, confirm the same
-   approval requirements remain applicable, durably record its audit event, and intersect ambient
-   authority and all other gates. A policy change to deny while a human was deciding is terminal;
-   an approval never grandfathers the earlier ask.
+1. `deny` ⇒ `policy-denied`. No provider is invoked.
+2. `allow` ⇒ audit, then satisfied. No provider is invoked.
+3. Absent policy adapter ⇒ the gate synthesizes an **implicit ask** carrying
+   `hitl.implicitRequirement` (or `{ authorityId: "implicit-human", approvalKey: operationId }`),
+   marked `source: "implicit"` so audit can distinguish it from a policy directive.
+4. `ask` with no `hitl` adapter configured ⇒ `hitl-unavailable`. Fail closed; never allow.
+5. `ask` with `hitl` ⇒ normalize requirements (§5.2), build one bounded request per requirement, and
+   invoke the routed provider for each. Requests are issued concurrently and each provider is called
+   at most once per requirement per `evaluate()` call.
+6. Any `rejected`, `timeout`, provider failure, malformed response, or unavailable route fails the
+   gate. A late approval cannot revive it.
+7. If `hitl.verify` is configured, it MUST return `true` for **every** decision record; otherwise
+   `evidence-failed`.
+8. **Re-check policy.** The gate re-evaluates current policy after the human answers. A `deny`, or
+   an `ask` whose normalized requirements are not covered by the approvals just collected, is
+   `policy-changed`. Coverage requires a matching `authorityId` and `approvalKey`, plus a matching
+   `routeId` when the latest requirement names one.
+9. Audit (`GateConfig.audit`) MUST return `true`, or `audit-failed`.
+10. Re-check the generation once more after audit; a policy reload that landed during the audit
+    callback is `policy-changed`.
+11. Only then is the result satisfied — and it is a satisfied **gate**, not an authorization. The
+    result retains the original `ask` and the human records; it never reports a policy `allow`.
+
+Policy evaluation is retried on a bounded loop when the snapshot generation changes underneath it:
+at most three restarts, after which the gate fails `policy-unstable` rather than spinning or
+evaluating against a torn snapshot.
+
+Two things the earlier design assigned to the host are now enforced by the gate itself: the
+pre-execution policy re-check (step 8) and the durable audit gate (step 9). This is a strengthening
+— a host can no longer forget them — but hosts MUST still intersect ambient authority and every
+other application gate before acting on a satisfied result. `Gate.isCurrent(result)` reports whether
+the policy generation that produced a result is still current, using the gate-issued generation
+rather than caller-mutable result fields.
 
 ### 5.4 Normative failure table
 
-| L2 condition                                                                                                                   | Result                                                | Provider invoked?             |
-| ------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------- | ----------------------------- |
-| All layers terminalize to `allow`                                                                                              | `allow`                                               | No                            |
-| Any layer terminalizes to `deny` and none is stricter                                                                          | `deny`                                                | No                            |
-| Strictest result is `ask`                                                                                                      | Seek one L0 decision per distinct requirement         | Once per requirement          |
-| Empty layer list, unresolved `no-match`, unknown decision, invalid/missing ask authority, route conflict, or composition error | `deny`                                                | No                            |
-| Policy evaluator throws/rejects or returns malformed output                                                                    | That layer terminalizes to `deny`                     | No if composed result is deny |
-| Any required route is unavailable, ambiguous, or unsupported                                                                   | Human gate fails                                      | No or aborted                 |
-| Provider missing/cannot load/throws/returns malformed                                                                          | Human gate fails                                      | At most once per requirement  |
-| Any provider returns `rejected` or `timeout`                                                                                   | Human gate fails                                      | Once for that requirement     |
-| Provider returns `approved`, but required evidence/audit fails                                                                 | Human gate fails                                      | Once for that requirement     |
-| Every provider returns accepted `approved` and current policy re-evaluates compatibly                                          | Ask obligations are satisfied; never an ambient grant | Once per requirement          |
+| Condition                                                                 | Result                            | Provider invoked?            |
+| ------------------------------------------------------------------------- | --------------------------------- | ---------------------------- |
+| Policy `allow` and audit succeeds                                         | Satisfied                         | No                           |
+| Policy `deny`                                                             | `policy-denied`                   | No                           |
+| Policy `ask`, no `hitl` configured                                        | `hitl-unavailable`                | No                           |
+| No policy adapter, no `hitl` configured                                   | `hitl-unavailable`                | No                           |
+| Invalid input, or a clock returning an unsafe value                       | `invalid-input`                   | No                           |
+| Empty/malformed `requirements`, or a configured-but-broken policy adapter | `policy-error`                    | No                           |
+| One authority/key pair mapped to two different explicit routes            | `route-conflict`                  | No                           |
+| A requirement's route resolves to no provider, or `route` throws          | `route-unavailable`               | No for that requirement      |
+| Provider returns `rejected` without a failure category                    | `decision-rejected`               | Once per requirement         |
+| Provider returns `timeout`, or the deadline expires                       | `decision-timeout`                | Once per requirement         |
+| Provider throws, rejects, is unavailable, or reports a failure category   | `decision-error`                  | At most once per requirement |
+| Provider returns a malformed result                                       | `malformed-decision`              | Once per requirement         |
+| Caller aborts before a terminal result                                    | `caller-aborted`                  | At most once per requirement |
+| `hitl.verify` returns false, throws, or times out for any record          | `evidence-failed`                 | Once per requirement         |
+| Re-check yields `deny`, or an `ask` the approvals do not cover            | `policy-changed`                  | Once per requirement         |
+| Audit returns false, throws, or times out                                 | `audit-failed`                    | Once per requirement         |
+| Generation changes during audit                                           | `policy-changed`                  | Once per requirement         |
+| Generation changes under evaluation more than three times                 | `policy-unstable`                 | No                           |
+| Every provider approves, verification and re-check pass, audit succeeds   | Satisfied; never an ambient grant | Once per requirement         |
+
+`evaluate()` never rejects. Every path above resolves to a `GateResult`, and every unsatisfied
+result still carries the detached input and the policy provenance that produced it.
 
 ### 5.5 L2 conformance cases
 
-The harness MUST cover the exhaustive 3×3 terminal matrix; broad-layer primary explanation while
-retaining all provenance; every explicit no-match fallback; rejected unresolved no-match; no
-provider call for allow/deny; one idempotent call per distinct approval authority; same-authority
-coalescing; different-authority conjunction; missing/conflicting authority routing; current-policy
-re-evaluation after a wait; routing capability failure; rejection of unsanitized/non-JSON display
-context; proof that host-native evaluation details never cross the provider boundary; and these
-macts regressions:
+The harness MUST cover: no provider call for a terminal policy result; one call per distinct
+authority/key pair; same authority/key coalescing; distinct-authority conjunction; unspecified-route
+compatibility and two-explicit-route conflict; an unavailable route; the implicit-ask path and its
+`source: "implicit"` marking; `hitl-unavailable` fail-closed with no adapter; every failure row
+above; the post-decision re-check reaching `policy-changed` on a changed approval key without
+automatically re-prompting; the bounded restart limit; and proof that host-native evaluation
+`details` never cross the provider boundary.
 
-- host `read-only` on a read → allow, key `confirm-first` → ask governed by key;
-- host `read-only` on a mutation → deny, key `confirm-first` → deny governed by host, never ask;
-- host forbid + key allow → deny, never ask.
+Repo status: `GATE-001`–`GATE-010`, `FAIL-001`, `ASSURE-001`/`002`, and `RECHECK-001`–`RECHECK-007`
+in `test/gate.test.ts`, plus `test/routing.test.ts` for normalization and coverage.
+
+Two gaps against the list above, tracked under [#220](https://github.com/mike-north/allw/issues/220):
+
+1. **Idempotency across invocations is unspecified and unimplemented.** The earlier design required
+   each requirement be invoked "idempotently". The repo generates a fresh request id per
+   `evaluate()` call from an internal counter, so a retried evaluation re-prompts the human for the
+   same obligation. Whether cross-invocation dedupe belongs in the seam or in the host adapter needs
+   a ruling.
+2. No test asserts that `details` from a policy evaluation are absent from the provider request.
+   The property holds by construction — `buildDecisionRequest` copies named fields only — but it is
+   a stated invariant with no regression guard.
 
 ---
 
-## 6. L3 — policy modification via human decision
+## 6. L3 — the policy-modification role
 
-L3 carries a **suggestion**, not a rule and not a decision. It adds no reuse field to
-`DecisionOutcome`. A suggestion can be accepted, rejected, or malformed independently of the one-shot
-L0 result.
+L3 carries a **policy change negotiation**, not a rule and not a decision. It adds no reuse field to
+`DecisionOutcome`. A change can be accepted, rejected, or malformed independently of the one-shot
+decision that accompanied it.
 
-### 6.1 Type sketch
+**The direction is inverted from the earlier design, and this is the most consequential part of the
+ruling.** Previously the _provider_ proposed a `PolicySuggestion` — effect, target, scope, bounds —
+attached to its result, and the host validated, mapped, and applied it. In the ruled design the
+**host offers** the change material and the human picks or edits it:
+
+```text
+host  → PolicyChangeOffer   { options?: PolicyChangeOption[], draft?: PolicyDraft }
+       ↓ carried on the request as PolicyChangeRequest
+human → PolicyChangeResponse { type: "choice", optionId } | { type: "edit", draft }
+       ↓ returned on DecisionResult.policyChanges
+host  → prepare(response) → TModification → apply(modifications[])
+```
+
+This makes the **host-applied-only** invariant structural rather than merely normative: a provider
+cannot propose a rule the host did not author, because every option and the draft's namespace and
+kind originate with the host. The provider's contribution is a selection or an edit within material
+the host already validated.
+
+### 6.1 Types
 
 ```ts
-import type {
-  DecisionProvider,
-  DecisionRequest,
-  DecisionResult,
-  JsonValue,
-} from "hitl-policy/decision";
-import type { TerminalPolicyDecision } from "hitl-policy/escalation";
+/** One host-authored standing-policy choice displayed by a provider. */
+export interface PolicyChangeOption {
+  readonly id: string;
+  readonly label: string;
+  readonly description?: string;
+}
 
-export interface HostPolicyDescriptor<TValue extends JsonValue = JsonValue> {
-  /** Host/vendor namespace that owns this descriptor's semantics. */
+/** A host-authored, namespaced editable JSON draft. */
+export interface PolicyDraft {
   readonly namespace: string;
-  readonly schemaVersion: number;
   readonly kind: string;
-  readonly value: TValue;
+  readonly value: JsonValue;
   /** Human-facing only; hosts MUST NOT enforce from this string. */
   readonly display?: string;
 }
 
-export type PolicyTargetDescriptor<TValue extends JsonValue = JsonValue> =
-  HostPolicyDescriptor<TValue>;
-
-export type PolicyScopeDescriptor<TValue extends JsonValue = JsonValue> =
-  HostPolicyDescriptor<TValue>;
-
-export interface PolicyTimeWindow {
-  readonly startsAtMs: number;
-  readonly endsAtMs: number;
+/** Host-authored offer returned before a human request. */
+export interface PolicyChangeOffer {
+  readonly options?: readonly PolicyChangeOption[];
+  readonly draft?: PolicyDraft;
 }
 
-export interface PolicyBounds {
-  /** Maximum lifetime measured from PolicySuggestion.issuedAtMs. */
-  readonly ttlMs?: number;
-  readonly maxUses?: number;
-  readonly timeWindow?: PolicyTimeWindow;
-}
-
-export interface PolicySuggestion {
+/** Versioned change material carried to the provider on the request. */
+export interface PolicyChangeRequest {
   readonly schemaVersion: 1;
-  /** Idempotency key within the provider namespace. */
-  readonly id: string;
-  /** Exact sibling L0 DecisionRequest.id this suggestion accompanied. */
-  readonly requestId: string;
-  readonly issuedAtMs: number;
-  readonly effect: TerminalPolicyDecision;
-  /** Which native policy store/layer/subject may receive the candidate rule. */
-  readonly target: PolicyTargetDescriptor;
-  /** Which future operations the candidate rule would cover. */
-  readonly scope: PolicyScopeDescriptor;
-  readonly bounds?: PolicyBounds;
-  readonly rationale?: string;
-  /** Suggestion-specific proof; never borrowed from the one-shot decision artifact. */
-  readonly evidence?: unknown;
+  /** The policy generation this offer was authored against. */
+  readonly generation: number;
+  readonly options?: readonly PolicyChangeOption[];
+  readonly draft?: PolicyDraft;
 }
 
-export interface PolicySuggestionProviderCapabilities {
-  readonly supportsPolicySuggestions: true;
+export interface PolicyChoiceResponse {
+  readonly schemaVersion: 1;
+  readonly type: "choice";
+  readonly optionId: string;
 }
 
-/** The suggestion is a sibling of the complete L0 result, never part of its decision. */
-export type DecisionWithPolicySuggestion<TResult extends DecisionResult = DecisionResult> =
-  TResult & {
-    readonly policySuggestion?: PolicySuggestion;
-  };
+export interface PolicyEditResponse {
+  readonly schemaVersion: 1;
+  readonly type: "edit";
+  readonly draft: PolicyDraft;
+}
 
-export interface PolicySuggestionProvider<
-  TRequest extends DecisionRequest = DecisionRequest,
-  TResult extends DecisionResult = DecisionResult,
-> extends DecisionProvider<TRequest, DecisionWithPolicySuggestion<TResult>> {
-  readonly capabilities: PolicySuggestionProviderCapabilities;
+export type PolicyChangeResponse = PolicyChoiceResponse | PolicyEditResponse;
+
+/**
+ * Host integration which validates and atomically applies policy changes.
+ * TModification is deliberately opaque: the gate never interprets or persists it.
+ */
+export interface PolicyChangeAdapter<TInput = unknown, TModification = unknown> {
+  readonly apiVersion?: 1;
+  offers?(
+    context: PolicyChangeContext<TInput>,
+  ):
+    | PolicyChangeOffer
+    | readonly PolicyChangeOption[]
+    | Promise<PolicyChangeOffer | readonly PolicyChangeOption[]>;
+  prepare(
+    change: PolicyChangeResponse,
+    context: PolicyChangeContext<TInput>,
+  ): TModification | Promise<TModification>;
+  apply(
+    modifications: readonly TModification[],
+    context: PolicyChangeContext<TInput>,
+  ): boolean | void | Promise<boolean | void>;
 }
 ```
 
-This is a deliberately minimal common target/scope shape:
+`namespace` and `kind` have meaning only inside the named host namespace; there is no universal
+selector language and no common capability taxonomy. `display` is an untrusted hint and the host
+SHOULD render the mapped native candidate for confirmation. The runtime guard rejects cyclic,
+non-JSON, excessively deep, or excessively large draft values using the documented bounds in §7,
+and caps an offer at `LIMITS.maxPolicyChangeOptions` and a response batch at
+`LIMITS.maxPolicyChangeResponses` (100 each). An oversized option array is rejected on its length
+alone, before any element is read.
 
-- It is more structured than `unknown`: a host can guard, namespace, version, display, log, and
-  reject the target and scope deterministically.
-- It is not a universal selector language: `kind` and `value` have meaning only inside the named
-  host/vendor namespace.
-- It does not contain a common capability taxonomy. Hosts map the descriptor to their own
-  syntactic or semantic policy language.
-
-The common package MUST NOT provide `applySuggestion`. Applying policy is a host authority. The L3
-invocation helper MUST validate and normalize the L0 result exactly as the L0 helper does, then
-validate `policySuggestion` independently. A malformed suggestion is omitted/rejected without
-changing the normalized result. A plain L0 consumer can safely ignore the additive sibling field;
-an L3 consumer must use the L3 guard before considering it.
+The package provides no `applyChange` helper that installs policy itself: `prepare` and `apply` are
+**host callbacks over a host-opaque modification type**. The gate orchestrates their invocation,
+bounds them, and serializes `apply` against snapshot replacement, but it never inspects, persists,
+or interprets a modification.
 
 ### 6.2 Non-negotiable invariants
 
-1. **Suggestion is not decision.** Parsing, support, evidence, mapping, persistence, audit, or
-   activation failure for the suggestion MUST NOT alter the sibling L0 result. The suggestion MUST
+These are unchanged in force and re-expressed against the offer model. Where the repo does not yet
+enforce one, the invariant remains normative and the gap is called out.
+
+1. **A change negotiation outcome is not a decision.** Parsing, support, mapping, persistence,
+   audit, or application failure for a change MUST NOT alter the sibling one-shot result, and MUST
    NOT affect the operation currently awaiting a decision.
-2. **Host-applied only.** A suggestion takes effect exclusively after the host recognizes its
-   namespace/version/kind, maps it to native policy, validates it, persists/audits it, and makes it
+   _Enforced._ The provider result is validated in two passes: the decision alone, then the change
+   batch. A malformed batch is discarded while the valid decision and its opaque evidence are
+   retained (`callbacks.ts` `normalizeProviderResult`, `guards.ts` `hasValidDecision`). Changes are
+   applied only **after** the gate result has been constructed, and a failed apply or a failed
+   post-apply reload does not alter it (`gate.ts`; `CHANGE-006`, `CHANGE-008`).
+2. **Host-applied only.** A change takes effect exclusively after the host recognizes its
+   namespace/kind, maps it to native policy, validates it, persists and audits it, and makes it
    visible to the ordinary evaluation path. Providers do not install policy.
+   _Structural._ The host authors every option and the draft envelope; the provider can only select
+   or edit. `prepare` and `apply` are host code, and only an approved decision reaches them
+   (`CHANGE-003`).
 3. **No implicit widening.** The host, not the provider, determines whether the native before/after
-   policy change is widening, tightening, mixed, or unknown at the **target layer** over the
-   suggested scope, even when a broader deny currently masks it. Mixed or unknown impact MUST be
-   handled as widening.
-4. **Provenance may be asymmetric.** Every suggestion requires baseline source authentication,
-   request binding, idempotency, and auditability. A host MAY require stronger identity, evidence,
-   user presence, or signatures for widening than tightening. Required widening evidence that is
-   missing or invalid rejects only the suggestion. allw's separately signed
-   `policy_rule_from_approval` artifact is the reference case and remains inside the suggestion's
-   opaque `evidence`; the one-shot verdict remains in `DecisionResult.evidence` and cannot authorize
-   a standing rule.
-5. **Bounds only tighten.** `ttlMs`, `maxUses`, and `timeWindow` are conjunctive. A host that cannot
-   enforce a supplied bound MUST reject the suggestion or replace it with a strictly tighter bound;
-   it MUST NOT silently discard the bound.
+   change is widening, tightening, mixed, or unknown at the target layer over the changed scope,
+   even when a broader deny currently masks it. **Mixed or unknown impact MUST be handled as
+   widening.**
+   _Not enforced; gap._ The ruled types carry no `effect` and no impact classification, so nothing
+   in the contract represents or requires this determination. A host may do it inside `prepare`,
+   but the seam neither demands nor records it.
+4. **Provenance may be asymmetric.** Every change requires baseline source authentication, request
+   binding, and auditability. A host MAY require stronger identity, evidence, presence, or
+   signatures for widening than for tightening.
+   _Not enforced; gap._ `PolicyChangeResponse` carries no evidence field, so there is no place for
+   change-specific provenance. The only artifact available is `DecisionResult.evidence`, which is
+   the one-shot verdict — and this spec's own rule is that a one-shot verdict cannot authorize a
+   standing rule. allw's separately signed `policy_rule_from_approval` artifact currently has no
+   carrier.
+5. **Bounds only tighten.** TTL, use caps, and time windows are conjunctive. A host that cannot
+   enforce a supplied bound MUST reject the change or replace it with a strictly tighter bound; it
+   MUST NOT silently discard the bound.
+   _Not enforced; gap._ There is no `PolicyBounds` type. Bounds, if any, are whatever a host encodes
+   inside its own `draft.value` under its own `kind`, and the seam cannot tell that a bound was
+   dropped. The normative rules still stand for hosts: TTL and use caps MUST be positive safe
+   integers; a TTL expires from issuance, never from a replay or retry; a time window is the
+   absolute half-open interval `[startsAtMs, endsAtMs)` with `endsAtMs > startsAtMs`; recurring
+   local-time/DST semantics are out of scope; a use cap MUST be consumed atomically with the native
+   authorization that uses it.
 6. **Future evaluation is authoritative.** Accepted policy is re-evaluated for each later operation
-   through the host's native path. No L0 result becomes a reusable bearer grant.
+   through the host's native path. No one-shot result becomes a reusable bearer grant.
+   _Enforced._ An applied change triggers exactly one coalesced `reload()`, and the comment on that
+   path states the consequence directly: the change is visible only to future evaluations, and the
+   current result retains its old policy (`gate.ts`; `CHANGE-006`).
 
-`ttlMs` and `maxUses` MUST be positive safe integers. `ttlMs` expires at
-`issuedAtMs + ttlMs`, never at a replay or retry time. Time values MUST be finite safe-integer Unix
-milliseconds. A time window is the absolute half-open interval `[startsAtMs, endsAtMs)` and MUST
-satisfy `endsAtMs > startsAtMs`; recurring local-time/DST semantics are out of scope. `maxUses`
-MUST be consumed atomically with the native authorization that uses it. `namespace`, `kind`, and
-`display` are data, never code; `display` is an untrusted hint and the host SHOULD render the
-mapped native candidate for confirmation. The runtime guard MUST reject cyclic, non-JSON,
-excessively deep, or excessively large target/scope values using documented bounds.
+**Closed-world guards.** `PolicyChangeOption`, `PolicyDraft`, `PolicyChangeRequest`, and
+`PolicyChangeResponse` are policy-affecting records. Their guards MUST reject unknown properties, so
+that an older consumer can never ignore a field that would have made the proposed change narrower. A
+future constraint requires a new `schemaVersion` and a major release.
+_Not enforced; gap._ The repo's guards validate the known keys and require plain data properties,
+but do not reject additional ones — `{ schemaVersion: 1, type: "choice", optionId: "x", extra: 1 }`
+passes `isPolicyChangeResponse`.
 
-`PolicySuggestion`, `HostPolicyDescriptor`, `PolicyBounds`, and `PolicyTimeWindow` are
-**closed-world policy-affecting records**. Their guards MUST reject unknown properties. A future
-constraint or bound requires a new `schemaVersion` and a package release whose major-version policy
-forces consumers to opt into its semantics; an older consumer must never ignore a field that could
-make the proposed rule narrower. Only fields explicitly documented as non-authoritative metadata
-may be added compatibly.
-
-The tuple `(providerId, PolicySuggestion.id)` is the idempotency key. A replay MUST return the
-existing accept/reject state and MUST NOT reset TTL, use count, provenance, or audit history.
-`requestId` MUST equal the sibling L0 request id. A host MUST reject a target it cannot prove is the
-intended native policy layer/subject; a key-scoped decision, for example, cannot silently target a
-host-wide policy store.
+**Idempotency and binding.** The earlier design keyed idempotency on
+`(providerId, PolicySuggestion.id)` and required a replay to return the existing state without
+resetting TTL, use count, provenance, or audit history; it also required the suggestion to name its
+sibling request id.
+_Replaced by a different mechanism, with a residual gap._ The repo binds a change to the policy
+`generation` it was offered against, and discards the batch if the generation moved before `prepare`
+or `apply` (`CHANGE-005`). Request binding is positional — a response arrives on the record of the
+request that carried the offer. There is no response id and therefore no replay dedupe: a provider
+that returns the same response twice produces two prepared modifications. Generation staleness
+prevents applying against changed policy; it does not make application idempotent.
 
 ### 6.3 Host application protocol
 
-For a suggestion the host chooses to consider:
+For a change the host chooses to consider:
 
-1. Validate the envelope, idempotency key, `requestId`, issuance time, and baseline source
-   authentication without changing the normalized L0 fields.
-2. Confirm the provider declared `supportsPolicySuggestions`.
-3. Recognize and parse target and scope namespaces/versions/kinds with host-owned parsers.
-4. Prove the target policy layer/subject is authorized by the bound request and source.
-5. Map effect, scope, and every bound to a candidate native rule.
-6. Determine the candidate's widening/tightening impact at that target itself.
-7. Verify the suggestion-specific provenance required for that impact.
-8. Apply host-local caps by intersection; never loosen a suggested bound.
-9. Use the ordinary native validation, idempotent durable write, audit, atomic use-count, expiry,
-   and revocation path.
-10. Re-evaluate only later operations against the installed rule.
+1. Author the offer in `offers()` — options and/or a namespaced draft — bounded by the documented
+   limits, against the current generation.
+2. Validate the returned response envelope without changing the normalized decision fields.
+3. Confirm the response is a selection of an option the host actually offered, or an edit within the
+   namespace and kind the host authored. A response naming an unknown option MUST be rejected.
+4. Map the response to a candidate native rule in `prepare`.
+5. Determine the candidate's widening/tightening impact at that target, treating mixed or unknown as
+   widening (invariant 3).
+6. Verify the provenance required for that impact (invariant 4).
+7. Apply host-local caps by intersection; never loosen a bound (invariant 5).
+8. In `apply`, use the ordinary native validation, idempotent durable write, audit, atomic
+   use-count, expiry, and revocation path — atomically over the whole batch.
+9. Re-evaluate only later operations against the installed rule.
+
+Steps 5–7 are host obligations the seam cannot currently check; see the gaps in §6.2.
 
 ### 6.4 Normative failure table
 
-| Suggestion condition                                                                                                                             | Current L0 result | Standing policy                                             |
-| ------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------- | ----------------------------------------------------------- |
-| Absent                                                                                                                                           | Unchanged         | Unchanged                                                   |
-| Valid but provider did not declare support                                                                                                       | Unchanged         | Suggestion ignored/rejected                                 |
-| Malformed, cyclic/oversized, unknown property/version/discriminant, request mismatch, stale issuance, or unsupported target/scope namespace/kind | Unchanged         | Suggestion rejected                                         |
-| Bound is invalid or cannot be enforced                                                                                                           | Unchanged         | Suggestion rejected or tightened; never installed unbounded |
-| Baseline source authentication fails, or widening/mixed/unknown impact lacks stronger required provenance                                        | Unchanged         | Suggestion rejected                                         |
-| Native parse, validation, persistence, or audit fails                                                                                            | Unchanged         | No rule becomes active                                      |
-| Same idempotency key is replayed                                                                                                                 | Unchanged         | Prior state returned; TTL/uses not reset                    |
-| Valid and accepted                                                                                                                               | Unchanged         | Native rule affects only later evaluations                  |
-| Installed rule expires, exhausts uses, or is revoked                                                                                             | Unchanged         | Host-native lifecycle removes/disables it                   |
+| Change condition                                                    | Current one-shot result | Standing policy                                       |
+| ------------------------------------------------------------------- | ----------------------- | ----------------------------------------------------- |
+| No `policyChanges` adapter configured, or it supplies no `offers`   | Unchanged               | No offer is made; unchanged                           |
+| Adapter fails registration validation, or `offers` throws/times out | Unchanged               | No offer is made; unchanged                           |
+| Host offer is malformed, oversized, or non-JSON                     | Unchanged               | No offer is made; unchanged                           |
+| Provider returns no change responses                                | Unchanged               | Unchanged                                             |
+| Any response in the batch is malformed                              | Unchanged               | **Whole batch** discarded                             |
+| Batch exceeds the response limit                                    | Unchanged               | Whole batch discarded                                 |
+| Any decision in the gate is not `approved`                          | Unchanged               | No change is prepared or applied                      |
+| Generation moved between offer and prepare/apply                    | Unchanged               | Batch discarded as stale                              |
+| Any `prepare` fails, throws, or times out                           | Unchanged               | Whole batch discarded; nothing applied                |
+| `apply` returns `false`                                             | Unchanged               | Not applied; no reload                                |
+| `apply` throws, times out, or settles late after being invoked      | Unchanged               | Treated as possibly persisted; reconciled by a reload |
+| `apply` succeeds                                                    | Unchanged               | One coalesced reload; affects only later evaluations  |
+| Post-apply reload fails                                             | Unchanged               | Last good snapshot retained                           |
+| Caller aborts before apply                                          | Unchanged               | Nothing applied                                       |
 
-This independent validation deliberately differs from the current macts #111 local SPI, where a
-malformed suggestion makes the whole provider response malformed. Structural separation is
-stronger: malformed optional policy advice cannot erase or manufacture what the human decided.
+The whole-batch discard on any malformed member is deliberate and stronger than per-item filtering:
+it prevents a provider from getting a partial policy change applied by attaching one valid response
+to several invalid ones. It also differs from the macts #111 local SPI, where a malformed suggestion
+made the entire provider response malformed — structural separation is stronger, because malformed
+optional policy material cannot erase or manufacture what the human decided.
+
+The "possibly persisted" row is worth stating explicitly: once `apply` has been invoked, the gate
+assumes an external write may have landed even if the callback later rejects or exceeds its
+deadline, and reconciles by reloading rather than retaining state it can no longer trust. That
+reload is deliberately independent of caller cancellation.
 
 ### 6.5 L3 conformance cases
 
-The harness MUST prove that the L0 result is byte/reference-identical whether the suggestion is
-absent, valid, malformed, unsupported, or rejected; validate namespace/version/kind and bounded
-JSON; compile a suggestion-capable provider through the L0 provider constraint; reject unknown
-policy-affecting properties; bind suggestion/request/target; preserve separate decision and
-suggestion evidence; exercise every bound; reject silent bound dropping; make replay idempotent
-without resetting TTL/uses; require host-native application; classify unknown/mixed impact as
-widening at the target; reject
-missing baseline or widening provenance; and verify atomic use count, expiry, and revocation through
-adapter-owned tests.
+The harness MUST prove that the one-shot result is identical whether change material is absent,
+valid, malformed, or rejected; that a malformed member discards the whole batch; that nothing is
+prepared or applied unless every decision is approved; that a stale generation discards the batch;
+that `apply` is invoked once and atomically over the batch; that a successful apply triggers exactly
+one reload and does not alter the current result; that a failed reload after apply leaves the result
+unchanged; that a timed-out late apply stays inside the snapshot mutation barrier; that oversized
+offers are rejected before their elements are read; and that the aggregate JSON budget is enforced.
+
+Repo status: `CHANGE-001`–`CHANGE-014` in `test/policy-changes.test.ts` cover all of the above.
+
+Not yet covered, tracked under [#220](https://github.com/mike-north/allw/issues/220): unknown-property
+rejection on policy-affecting records; rejection of a `choice` naming an option the host never
+offered; change-specific provenance; bound expression and tightening; widening/mixed impact
+classification; and replay idempotency.
 
 ---
 
 ## 7. Runtime guards and diagnostics
 
 The implementation should be small enough to audit. It needs guards and normalizers for standard
-fields, terminal composition, and optional conformance fixtures—not a framework.
+fields, requirement normalization, and optional conformance fixtures—not a framework.
 
-All entrypoints follow these rules:
+The rules below apply to every value crossing a boundary, regardless of which contract role it
+belongs to:
 
 - Treat values crossing a provider/plugin/process boundary as `unknown` at runtime.
-- L0–L2 accept unknown additive object properties but reject unknown discriminants and versions.
-  L3 policy-affecting records are closed-world and reject unknown properties as well as unknown
-  discriminants and versions.
+- The decision, policy, and escalation roles accept unknown additive object properties but reject
+  unknown discriminants and versions.
+  Policy-modification records are closed-world and reject unknown properties as well as unknown
+  discriminants and versions (see the §6.2 gap: not yet enforced in the repo).
 - Validate finite/safe integer time values and non-empty identifiers before invoking side effects.
 - Bound recursive validation work and reject accessors/prototypes that make validation effectful.
 - Never deserialize code, execute host-supplied policy, or inspect opaque evidence.
@@ -765,8 +1010,8 @@ The npm package and runtime schemas have distinct version axes:
 - `schemaVersion` versions each runtime value family.
 
 The package remains `0.x` through the first conforming macts migration and allw adapter. `1.0.0`
-requires those two independent consumers, frozen L0–L3 fixtures, declaration-graph tests, and the
-complete fail-closed conformance suites.
+requires those two independent consumers, frozen conformance fixtures covering every contract role,
+the adapter-optionality requirements in §2.2, and the complete fail-closed conformance suites.
 
 During `0.x`, patch releases preserve the current minor contract; a new minor MAY make a breaking
 design correction called out in release notes. Consumers SHOULD pin a compatible minor with `~`
@@ -778,14 +1023,15 @@ After 1.0:
 | Change                                                                                                                                                             | SemVer treatment                         |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------- |
 | Bug fix that preserves valid accepted values and public types                                                                                                      | patch                                    |
-| New explicitly non-authoritative optional metadata field, guard/helper, conformance fixture, or independent subpath                                                | minor                                    |
+| New explicitly non-authoritative optional metadata field, guard/helper, conformance fixture, or optional adapter slot                                              | minor                                    |
 | New union/discriminant member, new required field, changed default/failure behavior, moved symbol, removed/renamed field, or newly rejected previously valid value | major                                    |
-| New L3 policy constraint, bound, or other policy-affecting field                                                                                                   | major plus a new runtime `schemaVersion` |
+| New policy-modification constraint, bound, or other policy-affecting field                                                                                         | major plus a new runtime `schemaVersion` |
 
 Adding a union member is major because exhaustive consumers would otherwise compile against an
-incomplete decision set. Unknown additive object fields remain accepted in L0–L2 so compatible
-producers can deploy non-authoritative optional fields before consumers. L3 policy-affecting
-records remain closed-world. Unknown versions and discriminants remain fail-closed everywhere.
+incomplete decision set. Unknown additive object fields remain accepted on decision, policy, and
+escalation values so compatible producers can deploy non-authoritative optional fields before
+consumers. Policy-modification records remain closed-world. Unknown versions and discriminants
+remain fail-closed everywhere.
 
 Deprecations SHOULD remain for at least one minor release before a major removal. A security patch
 MAY reject a value that was never valid under the documented schema, but MUST NOT silently change
@@ -811,23 +1057,29 @@ Recommended sequence:
 
 1. Merge macts #111 with its reviewed local SPI; do not block it on this package.
 2. Merge/reconcile macts #112 so terminal composition and governing-layer attribution are settled.
-3. Implement, publish, and stabilize `hitl-policy` in
-   [github.com/mike-north/hitl-policy](https://github.com/mike-north/hitl-policy), tracked under
-   [#220](https://github.com/mike-north/allw/issues/220), after this spec is approved.
+3. Close the §10 gap list in
+   [github.com/mike-north/hitl-policy](https://github.com/mike-north/hitl-policy) — the repo already
+   implements this spec — then publish and stabilize it, tracked under
+   [#220](https://github.com/mike-north/allw/issues/220).
 4. Migrate macts under #114 **after #112**, in one mechanical change:
-   - neutralize L0 permission/API-key names through adapter types;
-   - map macts's already-contextualized `allowed | confirm-first | denied` directly into L2 rather
-     than forcing its native evaluator through L1;
-   - move `layer` and `supportsDistinctRouting` to L2;
-   - move `policySuggestion` and `supportsPolicySuggestions` to L3;
+   - neutralize permission/API-key names through adapter types;
+   - keep macts's multi-layer composition of `allowed | confirm-first | denied` **inside its own
+     `PolicyAdapter`**, emitting one terminal `allow`/`deny`/`ask` per evaluation. The seam no
+     longer composes layers (§5.2), so `layer` attribution stays host-native;
+   - express routing through `HitlAdapter.route` rather than a `supportsDistinctRouting` capability
+     flag, which no longer exists;
+   - re-express `policySuggestion` as host-authored `offers()` material, since the provider no
+     longer proposes rules (§6);
    - retain macts's native risk classes, dispositions, rules, restrictions, and audit schema; and
    - preserve request ids, sanitized failures, and durable-audit-before-execute while keeping the
      #111 fail-closed/audit regression suite green. If downstream compatibility exists by then,
      retain deprecated macts-local aliases for one release.
-5. Implement the allw adapter under #219. It maps only a fully verified allw approval to L0
+5. Implement the allw adapter under #219. It maps only a fully verified allw approval to
    `approved`; `denied` and signed `aborted` map to `rejected`; `expired` maps to `timeout`; SDK
-   errors map to `rejected`; the signed verdict remains opaque decision evidence and a separately
-   signed policy rule remains opaque suggestion evidence.
+   errors map to `rejected`; the signed verdict remains opaque decision evidence. Note the
+   dependency: allw's separately signed `policy_rule_from_approval` artifact has **no carrier** in
+   the current change-negotiation types (§6.2, invariant 4), so #219 either lands without it or
+   waits on that gap being closed under #220.
 6. Make #183 a thin macts specialization of #219. If it ships first against local macts types,
    migrate both in the same compatibility window.
 
@@ -840,24 +1092,44 @@ targets.
 
 ## 10. Package implementation acceptance criteria
 
-The follow-on package issue is complete only when it delivers:
+**The repo implements this spec.** [github.com/mike-north/hitl-policy](https://github.com/mike-north/hitl-policy)
+is the design of record; this document describes it. The criteria below are therefore a gap list,
+not a greenfield checklist — the delivered items say what is already true, and the remaining items
+are tracked under [#220](https://github.com/mike-north/allw/issues/220).
 
-- the five subpath exports and no root barrel;
-- zero runtime dependencies and no allw/core/crypto/native imports;
-- fully documented types corresponding to the sketches above;
-- bounded runtime guards and safe L0/L1 invocation helpers;
-- terminal-only L2 composition, full layer provenance, distinct approval requirements, and primary
-  governing-layer attribution;
-- provider-facing L2 requests that carry only one requirement plus sanitized JSON display context,
-  never arbitrary host-native evaluation details;
-- a type-compatible L3 provider/envelope and independent invocation guard;
-- closed-world, independently guarded/idempotent L3 suggestions with explicit request/target
-  binding, separate suggestion evidence, and no policy-application helper;
-- type/declaration tests proving the dependency graph;
-- L0–L3 conformance fixtures and every failure case in this document;
-- a WASM-under-node/browser import smoke test; and
-- package documentation that states the effective-allow conjunction and one-shot/suggestion
-  invariants before any quickstart example.
+Delivered:
+
+- a root barrel plus `./conformance`, with the four superseded subpaths asserted absent;
+- zero runtime dependencies and no allw/core/crypto/native imports, verified against the built
+  declarations and runtime entrypoints;
+- documented types corresponding to §§3–6, with an API report under `api-report/`;
+- bounded runtime guards, the safe `invokeDecision` helper, and bounded host-callback invocation;
+- adapter optionality: policy-only, HITL-only, and mixed gates, with terminal policy results never
+  invoking a provider;
+- provider-facing requests carrying one approval obligation and no host-native evaluation details;
+- reloadable host-owned policy snapshots with opaque revisions, coalesced reloads, last-good
+  retention, and bounded restart on an unstable generation;
+- gate-enforced post-decision policy re-check, evidence verification, and durable audit;
+- the interactive change-negotiation model — host-authored offers, provider choice/edit responses,
+  whole-batch discard on any malformed member, generation-staleness rejection, atomic apply
+  serialized against snapshot replacement, and exactly one coalesced reload afterward; and
+- a portable-import smoke test proving the built entrypoints carry no `node:`, `require(`, `.node`,
+  or `.wasm` references.
+
+Remaining, tracked under #220:
+
+- an **executable** conformance suite exported from `./conformance`, not fixtures alone, so an
+  adapter author can run the cases against their own adapter;
+- a `CONFORMANCE_REQUIREMENTS` list that matches the implemented suite;
+- non-vacuous adapter-optionality assertions (§2.2 gap 3);
+- closed-world guards that reject unknown properties on policy-affecting records;
+- rejection of a `choice` response naming an option the host never offered;
+- a carrier for change-specific provenance, and the widening/tightening impact and bounds
+  expression that invariants 3–5 require;
+- replay idempotency for change responses, and a ruling on cross-invocation decision idempotency;
+- a regression guard proving policy `details` never reach a provider request; and
+- package documentation that states the effective-allow conjunction and the
+  one-shot/change-negotiation invariants before any quickstart example.
 
 ---
 
