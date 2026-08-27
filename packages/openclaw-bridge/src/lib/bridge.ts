@@ -22,7 +22,15 @@
  * is no field to carry it and no code path that can emit it — the mapping is structurally absent,
  * not merely unsupported.
  *
- * @see ../../../../docs/openclaw-integration.md §5.3, §6.1, §7.2–7.4, §8, §9
+ * **Integrator-initiated retract (issue #222).** While a request is in flight, `handle()` holds an
+ * `AbortController` for its approval id. If a `*.approval.resolved` broadcast for that SAME id
+ * arrives before the bridge's own `requestApproval` call settles, the controller is aborted —
+ * telling `@allw/sdk` to retract the pending relay request so connected approver devices drop the
+ * stale prompt live rather than riding out the full timeout. This is purely inbox hygiene: it never
+ * changes the outcome the bridge submits (first-answer-wins, §9, already decided that), and the
+ * bridge never issues a second `approval.resolve` for an id it has already learned is `settled`.
+ *
+ * @see ../../../../docs/openclaw-integration.md §5.3, §6.1, §7.2–7.5, §8, §9
  * @see ../../../../docs/contract.md §Invariants #6 (fail-closed), #5 (a verdict only tightens)
  */
 
@@ -182,6 +190,13 @@ export class OpenClawBridge {
   private readonly inFlight = new Map<string, ApprovalKind>();
   /** Ids the gateway has reported resolved, so a late backfill cannot resurrect them. */
   private readonly settled = new Set<string>();
+  /**
+   * One `AbortController` per approval id **while its `requestApproval` call is actually
+   * outstanding** (issue #222) — armed in {@link driveApproval} and removed the instant that call
+   * settles. Because it is removed before the bridge submits its own resolve, a `*.approval.resolved`
+   * broadcast for an id the bridge itself just decided finds nothing here to abort.
+   */
+  private readonly abortControllers = new Map<string, AbortController>();
 
   constructor(deps: BridgeDeps) {
     this.deps = deps;
@@ -264,6 +279,14 @@ export class OpenClawBridge {
       if (id !== null) {
         this.inFlight.delete(id);
         this.settled.add(id);
+        // Retract, if we are still waiting on our own `requestApproval` call for this SAME id
+        // (issue #222): another OpenClaw surface already won (§9 first-answer-wins), so the
+        // pending allw prompt is now dead weight — abort() tells `@allw/sdk` to retract it so
+        // connected approver devices drop it live instead of riding out the full timeout. A
+        // no-op when the bridge has no live controller for `id` — including when this broadcast
+        // is an echo of the bridge's OWN resolve (driveApproval already removed its controller
+        // before submitting).
+        this.abortControllers.get(id)?.abort();
       }
       return { kind: "ignored" };
     }
@@ -462,16 +485,46 @@ export class OpenClawBridge {
         return { kind: "left-open", why: "not-pending" };
       }
 
+      // Armed for the duration of this call only (issue #222): `handle()`'s `*.approval.resolved`
+      // branch aborts it if the SAME id resolves on another OpenClaw surface first, which
+      // `@allw/sdk` surfaces as a rejection. The checks below key off `controller.signal.aborted`
+      // — THIS call's own retraction — rather than the shared `settled` set, so an unrelated
+      // concurrent `driveApproval` call for the same id (e.g. one raised after a backfill prune)
+      // that happens to finish first is never mistaken for a retraction of this one.
+      const controller = new AbortController();
+      this.abortControllers.set(event.id, controller);
       let verdict: BridgeVerdict;
       try {
-        verdict = await this.deps.requestApproval(mapped.request);
+        verdict = await this.deps.requestApproval({ ...mapped.request, signal: controller.signal });
       } catch (err) {
+        if (controller.signal.aborted) {
+          // Resolved elsewhere while in flight (§7.4, §9): the `*.approval.resolved` handler
+          // already recorded the winner and issued the abort() that produced this rejection.
+          // Never submit a second `approval.resolve` for an id already settled.
+          this.deps.logger.info("approval.retracted", {
+            approvalId: event.id,
+            message: err instanceof Error ? err.message : String(err),
+          });
+          return { kind: "ignored" };
+        }
         return await this.resolveDeny(
           event.id,
           kind,
           "transport-error",
           err instanceof Error ? err.message : String(err),
         );
+      } finally {
+        this.abortControllers.delete(event.id);
+      }
+
+      if (controller.signal.aborted) {
+        // A race between the retract and the verdict itself: this request was retracted and
+        // `requestApproval` nonetheless returned a decision (e.g. the retract call failed and the
+        // SDK's own deadline produced an `expired` verdict instead — best-effort cancellation,
+        // `docs/openclaw-integration.md` §7.5). The winner recorded elsewhere still stands; do not
+        // resolve this decision a second time.
+        this.deps.logger.info("approval.retracted", { approvalId: event.id });
+        return { kind: "ignored" };
       }
 
       if (verdict.decision !== "approved") {

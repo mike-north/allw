@@ -495,6 +495,21 @@ gateway's durable document.
   as authoritative, do not retry, and reconcile local state from it. A lost acknowledgement is
   resolved by re-reading with `approval.get`, never by re-submitting a decision.
 
+### 7.5 Integrator-initiated retract on a losing race (issue #222)
+
+`@allw/sdk`'s `ApprovalRequest.signal` (`AbortSignal`, issue #195, `docs/contract.md`
+§Cancellation) lets the bridge tell allw to stop waiting the moment it learns — from the SAME id's
+`*.approval.resolved` broadcast — that another OpenClaw surface already won. `OpenClawBridge` holds
+an `AbortController` per in-flight approval id (armed immediately before the `requestApproval` call
+in `driveApproval`, removed the instant that call settles) and aborts it from `handle()`'s
+`*.approval.resolved` branch. This is **inbox hygiene only**: it clears the stale prompt from
+connected approver devices sooner than the fail-closed deadline would, but it never changes the
+outcome the bridge submits — first-answer-wins (§9) already decided that, and the bridge never
+issues a second `approval.resolve` for an id it already knows is settled, regardless of whether the
+resulting rejection, a stale decision, or nothing at all comes back from the aborted call. Retract
+is best-effort (a failed relay retract just leaves the SDK's own deadline in force); the bridge
+never re-drives on a retract failure.
+
 ---
 
 ## 8. Timeout budgeting: the nesting rule
@@ -699,14 +714,6 @@ Explicitly out of scope for all six slices: the `allow-always` → `PolicyRule` 
 
 ## 13. Open decisions
 
-- **Bridge-side wiring of integrator cancellation is still open.** `@allw/sdk` now has an
-  `ApprovalRequest.signal` (`AbortSignal`) that retracts the pending relay request and rejects
-  `requestApproval` with `RequestRetractedError` (issue #195, `docs/contract.md` §Cancellation) — so
-  when OpenClaw resolves an approval at another surface first, the bridge CAN now tell allw to stop
-  waiting instead of riding out the full timeout. The bridge itself does not call it yet: `handle()`'s
-  `*.approval.resolved` branch would need to hold an `AbortController` per in-flight id (armed when
-  `driveApproval` calls `requestApproval`) and abort it there. Filed as a follow-up so slice 5 lands
-  independently of the SDK/relay mechanism.
 - **Which gateway identity to standardize on.** `<gateway-id>` is operator-asserted today because the
   protocol exposes no stable gateway identity. If OpenClaw later surfaces one (or once work-stream
   attestation lands per [enrollment.md](./enrollment.md)), the asserted label should become a
