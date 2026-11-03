@@ -46,7 +46,8 @@ use allw_core::{
     check_account_id_for_root as core_check_account_id_for_root,
     compute_request_hash as core_compute_request_hash, decrypt_context as core_decrypt_context,
     derive_number_match_challenge as core_derive_number_match_challenge,
-    encrypt_context as core_encrypt_context, evaluate as core_evaluate,
+    display_model as core_display_model, encrypt_context as core_encrypt_context,
+    escape_for_display as core_escape_for_display, evaluate as core_evaluate,
     evaluate_for_actor as core_evaluate_for_actor,
     is_small_order_x25519_public_key as core_is_small_order_x25519_public_key,
     issue_device_cert as core_issue_device_cert, revoked_device_ids as core_revoked_device_ids,
@@ -1360,4 +1361,30 @@ pub fn x25519_small_order_points() -> Result<String, JsError> {
 pub fn is_small_order_x25519_public_key(public_key_b64: &str) -> Result<bool, JsError> {
     let bytes = decode_b64_32(public_key_b64, "public_key_b64")?;
     Ok(core_is_small_order_x25519_public_key(&bytes))
+}
+
+// ── Display safety (#246) ─────────────────────────────────────────────────────────
+
+/// Builds the escaped display model for an approval context — the only form in which approver
+/// surfaces may show the context's untrusted text to a human.
+///
+/// `context_json` is a JSON [`ApprovalContext`](allw_core::ApprovalContext) (the decrypted
+/// plaintext). Returns a JSON [`DisplayModel`](allw_core::DisplayModel): every string escaped with
+/// the core notation (`\x1b`, `\r`, `⟨U+202E⟩`, …) plus `has_hidden_or_control_chars`. Display
+/// only — the request hash is still computed over `context_json` itself.
+///
+/// # Errors
+///
+/// Throws if `context_json` is not a valid `ApprovalContext`.
+#[wasm_bindgen]
+pub fn display_model(context_json: &str) -> Result<String, JsError> {
+    let ctx: ApprovalContext = parse_json(context_json, "ApprovalContext")?;
+    to_json(&core_display_model(&ctx), "DisplayModel")
+}
+
+/// Escapes one untrusted string for display, using the same notation as [`display_model`]. For
+/// untrusted text outside the context (relay-supplied request ids, relay error strings, log lines).
+#[wasm_bindgen]
+pub fn escape_for_display(text: &str) -> String {
+    core_escape_for_display(text)
 }

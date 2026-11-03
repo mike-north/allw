@@ -219,16 +219,16 @@ test("agent_tool_call surface: maps to its own kind, distinct from mcp, with (se
     "the agent_tool_call surface must map to its own kind, not 'mcp'",
   );
   assert.equal(prepared.context.mcp, undefined, "must not also populate the mcp action");
+  // No `params` on the wire ⇒ no `paramsDisplay` on the (core-escaped) view.
   assert.deepEqual(prepared.context.agentToolCall, {
     server: "deploy-plugin",
     tool: "deploy_service",
-    params: undefined,
   });
 
-  assert.equal(actionSummary(prepared.context), "deploy-plugin.deploy_service");
+  assert.equal(actionSummary(prepared.context), "deploy-plugin :: deploy_service");
   assert.match(
     exactPlaintext(prepared.context),
-    /^agent_tool_call: deploy-plugin\.deploy_service/,
+    /^agent_tool_call: deploy-plugin :: deploy_service/,
     "the exact plaintext explicitly shows the (server, tool) identity under its own label",
   );
 });

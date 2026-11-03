@@ -214,11 +214,83 @@ Validation:
 The approver UI must render all material fields that are included in the request hash and relevant to the human
 decision. A summary may help readability, but it is not a substitute for rendering the action substrate.
 
+Rendering must also be **display-safe**: every context string is attacker-influenced, and a control or bidi
+character can make the screen show something other than the bytes the hash binds. A command whose JSON carries
+`ESC [2K` + `CR` erases and repaints its own terminal line, so `rm -rf ~/x; : <ESC>[2K<CR>git status` shows as
+`git status` while the verdict binds the real bytes. In a browser, bidi overrides (U+202E, Trojan Source /
+CVE-2021-42574) reorder text and zero-width characters hide it. How untrusted text reaches the human is therefore a
+trust decision, and it lives in the core:
+
+- `allw_core::display` (`crates/allw-core/src/display.rs`) defines the escaped set: C0 controls, DEL, C1 controls,
+  bidi controls (U+061C, U+200E/F, U+202A–U+202E, U+2066–U+2069), zero-width and invisible characters (U+200B–U+200D,
+  U+2060, U+FEFF), the rest of Unicode `Default_Ignorable_Code_Point`, U+2028/U+2029, U+FFF9–U+FFFB, and U+2800
+  BRAILLE PATTERN BLANK. Notation: `\t`, `\n`, `\r`, `\xHH` for other C0 controls and DEL (ESC → `\x1b`), and
+  `⟨U+XXXX⟩` for everything else.
+- Variation selectors are escaped unless they follow a base their range defines variants for, because each one
+  can carry a hidden byte ("emoji smuggling"): one selector after every bullet or em dash of a message would
+  exfiltrate a secret, and `main` + U+FE0F looks like `main`. Shown as-is only: U+FE0E/U+FE0F after a non-ASCII base
+  listed in Unicode `emoji-variation-sequences.txt` (Emoji 16.0) or as the U+FE0F of an ASCII `0`–`9`/`#`/`*`
+  keycap followed by U+20E3; U+E0100–U+E01EF after a `Unified_Ideograph`; U+180B–U+180D/U+180F after a
+  Mongolian-block character. U+FE00–U+FE0D and every other selector are escaped and set the flag. **Accepted
+  residual:** a shown selector still carries about 1 bit per listed emoji and up to about one byte per CJK ideograph
+  (240 ideographic selectors), so a payload can still ride on a run of emoji or CJK text. Ordinary prose can no
+  longer carry one. This is a deliberate trade-off against warning on every emoji and CJK variant form.
+- `raw` is multi-line content (a heredoc command, a file edit). In its `raw_lines` rendering a line feed is
+  structure and a TAB shows as `→   `, without setting the flag: once ESC and lone CRs are escaped, a TAB or a line
+  feed cannot overwrite or hide anything, and a warning on every Go edit or heredoc commit would teach humans to
+  ignore it. A CR directly before a line feed is structure **only in a file edit** (shown as `␍`, unflagged), where
+  CRLF endings are ordinary content. On every other surface `raw` is executed, and there a CR before LF is data that
+  changes behaviour: bash reads `cd ../scratch` + CR + LF + `rm -rf -- *` as a `cd` to `../scratch` + CR, which
+  fails, and then runs the `rm` in the original directory. So outside file edits that CR is escaped as `\r` and sets
+  the flag. In single-line fields (argv tokens, `bin`, flags, `cwd`, ids, the summary) TAB, LF and CR are escaped and
+  set the flag.
+- The structure markers are not injective: literal `→   ` text displays like a TAB, and a file-edit line ending in a
+  literal `␍` displays like a CRLF ending, and neither sets the flag (unlike `\x1b`, which is always paired with
+  it). This is accepted: neither substitution changes what the content does in a way the human could be misled
+  about, and the hash binds the real bytes.
+- `display_model(context)` returns every string a surface shows (summary, actor id/kind/label, every syntactic
+  substrate field, params as JSON, chain) already escaped, plus `has_hidden_or_control_chars`. It is exported through
+  WASM (`display_model`, `escape_for_display`) and UniFFI (`display_model_json`, `escape_for_display`).
+- Surfaces print only that model and never escape anything themselves. Layout (which field is the headline, argv
+  quoting, the `raw`/`argv` divergence line) stays surface code, but layout _decisions_ such as divergence are taken
+  on the raw bytes, because distinct inputs can escape to the same text (a literal `\x1b` vs a real ESC). When the
+  flag is set the surface shows a warning (CLI: a line under the header, and again as the last line before the
+  prompt; web: a badge on the card). The CLI ends every request block with a one-line escaped `Deciding on:` headline
+  directly above the prompt, so the action and the warning are on screen when the human answers, however long the
+  block is. When `raw` and the hash-bound argv diverge, `Deciding on:` shows the argv form and a "raw and argv
+  differ" warning is the last line before the prompt, so the decision point never shows only the benign half. A
+  multi-line command prints its further lines behind a `│` marker. The CLI also hard-wraps every row that can carry
+  untrusted text to the terminal width (80 columns when stdout is not a TTY), with a `↪` marker on every wrapped row.
+  Spaces are printable and never escaped, so without this a padded field would soft-wrap its tail onto a row of its
+  own, where it could pose as a field label or a forged `✓ VERIFIED` origin row.
+- **The web approver shows less than the CLI.** Its card renders `argv`, `cwd`, `raw`, MCP/agent-tool
+  `server :: tool` and `params`, all from the core model, but not yet `bin`, `flags`, `positionals`, `host`,
+  `env_refs`, `chain`, a file edit's `operation`/`paths`/`diff_summary`/`diff_hash`, or a raw/argv divergence
+  warning, although all are bound into `request_hash`. Until the web parity follow-up lands, the CLI is the complete
+  view.
+- Relay-supplied text outside the context goes through `escape_for_display` too. The CLI approver escapes every
+  `watch` log line (request ids, relay error strings, which could otherwise repaint the request block mid-prompt),
+  every `pair` output line (the relay-issued pairing code and `device_id`), and the fatal error line (which can embed
+  a relay HTTP error body); if the core cannot load, the fatal error text is withheld rather than printed raw. The
+  web approver escapes the verification-failed reason (which can name the relay-supplied envelope id) and the
+  relay-outage banner text; a runtime without the core escape withholds that text.
+- Escaping is display-only. `request_hash` is computed over the original context; the display model is a separate
+  value that is never hashed, signed, or sent.
+
 Validation:
 
 - Approver render tests cover command `argv`, flags, cwd, env refs, MCP server/tool/params, divergent raw/parsed
   forms, risk, actor, expiry, and challenge state.
 - Any new `ActionRecord` syntactic field must either render directly or be explicitly marked non-decision-making.
+- A new syntactic field must also be added to `DisplaySubstrate` so it is escaped before any surface can show it.
+- The shared vector `crates/allw-core/tests/fixtures/display_vector.json` (asserted by the Rust core and through
+  WASM) covers each escaped class, a mixed string, a variation-selector run, a selector after ASCII or after
+  ordinary non-ASCII text (bullet, em dash, NBSP, Cyrillic, a Thai mark, an emoji with no variation sequence), and
+  the allowed emoji, keycap and CJK variation forms. CLI tests assert the `watch` process's stdout/stderr bytes contain no raw
+  ESC/CR for the spoof above and that the warning is the line directly above the prompt, that the `pair` process
+  escapes relay-supplied text, and that Go edits and heredoc commits do not warn while ESC/CR spoofs still do. Web
+  tests assert a U+202E payload, an escaped envelope id and an escaped outage banner reach the DOM, with the warning
+  badge present when flagged.
 
 ### R4. Fail-closed execution
 
@@ -387,6 +459,13 @@ attestation, audit records, hook/SDK fail-closed behavior, or enrollment.
 ### WYSIWYS and Approver UX
 
 - [ ] Every field covered by `request_hash` that matters to the decision is rendered or intentionally explained.
+      (Known gap: the web card omits several hash-bound fields the CLI shows; see R3.)
+- [ ] Every untrusted string reaches the screen through the core display model (`display_model` /
+      `escape_for_display`); no surface prints a raw context, envelope, or relay string or escapes on its own (R3).
+- [ ] Control, bidi, and zero-width characters render as visible escapes, and the surface shows its
+      hidden-character warning whenever `has_hidden_or_control_chars` is set.
+- [ ] Display escaping never feeds `request_hash`; layout decisions (e.g. raw/argv divergence) compare raw bytes,
+      not escaped text.
 - [ ] Parsed and raw command/MCP forms cannot diverge silently.
 - [ ] Expiry, actor identity, risk, reversible status, and challenge requirement are visible before signing.
 - [ ] Unverified actor identity is not presented as verified.
