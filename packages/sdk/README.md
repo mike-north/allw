@@ -70,6 +70,26 @@ unparseable command line (for example an unmatched quote), an empty program, a b
 The relay refuses a request whose encrypted context (`context_ciphertext`) is over **64 KiB**, counted
 in UTF-8 bytes, with HTTP 413 (`docs/relay-api.md` §3). The ciphertext is larger than the plaintext
 context it encrypts, so keep the summary and action detail well under that. An over-size request
-fails closed: nothing is stored or shown to the human, and `requestApproval` rejects with an
-error whose `name` is `"RelayError"` and whose `status` is 413. Treat that rejection, like any other, as deny; never retry it
+fails closed: nothing is stored or shown to the human, and `requestApproval` rejects with a
+`RelayError` whose `status` is 413. Treat that rejection, like any other, as deny; never retry it
 into an approval.
+
+`RelayError` is exported, so you can narrow on it. `requestApproval` rejects with it only when
+the device fetch or the submit gets a non-2xx reply, or a 2xx whose body is malformed. Once the
+request is submitted, a non-2xx or malformed poll reply (for example 401 or 403) resolves to an
+`expired` verdict instead, and a failed retract is ignored. So does a relay that hangs or can't be
+reached. The error's message never quotes the relay's body.
+
+```ts
+import { RelayError } from "@allw/sdk";
+
+try {
+  const verdict = await client.requestApproval(request);
+  // ...compute allow from the verified verdict
+} catch (err) {
+  if (err instanceof RelayError && err.status === 413) {
+    log("allw: the encrypted context is over 64 KiB; shrink the summary or action detail");
+  }
+  return deny(); // every rejection is a deny
+}
+```
