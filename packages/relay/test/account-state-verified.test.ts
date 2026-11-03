@@ -74,7 +74,11 @@ async function bindRoot(accountId: string): Promise<{ code: string; pairing_auth
     body: pairingStartBody(accountId),
   });
   expect(status).toBe(201);
-  return data as { code: string; pairing_auth_token: string };
+  const { code, pairing_auth_token } = data;
+  if (typeof code !== "string" || typeof pairing_auth_token !== "string") {
+    throw new Error("pairing/start returned no code or pairing token");
+  }
+  return { code, pairing_auth_token };
 }
 
 /** Bind the root and enroll one device; returns its device token. */
@@ -86,7 +90,10 @@ async function enrollDevice(accountId: string): Promise<string> {
     headers: { Authorization: `Bearer ${start.pairing_auth_token}` },
   });
   expect(status).toBe(201);
-  return (data as { device_auth_token: string }).device_auth_token;
+  const { device_auth_token } = data;
+  if (typeof device_auth_token !== "string")
+    throw new Error("pairing/complete returned no device token");
+  return device_auth_token;
 }
 
 /** The stored verified rows, read directly from the Durable Object's SQLite. */

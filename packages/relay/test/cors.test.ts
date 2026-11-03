@@ -475,9 +475,10 @@ describe("withCors — a throwing handler still answers with CORS headers", () =
 
 /**
  * Strip `//` and `/* *\/` comments and trailing commas from JSONC, leaving string contents (which
- * hold `http://…` origins) untouched. Enough for the committed `wrangler.jsonc`.
+ * hold `http://…` origins) untouched, so the result parses as JSON. Enough for the committed
+ * `wrangler.jsonc`.
  */
-function parseJsonc(text: string): unknown {
+function stripJsonc(text: string): string {
   let out = "";
   let inString = false;
   for (let i = 0; i < text.length; i++) {
@@ -498,11 +499,11 @@ function parseJsonc(text: string): unknown {
       out += c;
     }
   }
-  return JSON.parse(out.replace(/,(\s*[}\]])/g, "$1"));
+  return out.replace(/,(\s*[}\]])/g, "$1");
 }
 
 describe("committed wrangler.jsonc CORS configuration", () => {
-  const config = parseJsonc(wranglerConfigText) as {
+  const config = JSON.parse(stripJsonc(wranglerConfigText)) as {
     vars?: { CORS_ALLOWED_ORIGINS?: string };
     env?: { production?: { vars?: { CORS_ALLOWED_ORIGINS?: string } } };
   };

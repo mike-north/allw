@@ -8,13 +8,16 @@ declare module "*?raw" {
 }
 
 /**
- * Vite's `import.meta.glob`, as the source guard in `request-deadline.test.ts` uses it: eager,
- * `?raw`, default import, so each matched source file maps to its text. Declared here because the
- * test tsconfig does not load `vite/client` types.
+ * Vite's `import.meta.glob`, in the two forms relay tests use: eager `?raw` default import, so each
+ * matched source file maps to its text (`request-deadline.test.ts`, `lint-coverage.test.ts`), and
+ * lazy, for listing matched paths. Declared here because the test tsconfig does not load
+ * `vite/client` types.
  */
 interface ImportMeta {
   glob(
     pattern: string,
     options: { readonly query: "?raw"; readonly import: "default"; readonly eager: true },
   ): Record<string, string>;
+  /** Lazy form: each matched path maps to a loader that is never called here (#290). */
+  glob(pattern: string): Record<string, () => Promise<unknown>>;
 }

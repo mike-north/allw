@@ -2361,18 +2361,18 @@ describe("AccountRelay — device inbox (HTTP poll)", () => {
     await post(acct, "/requests", envA);
     await post(acct, "/requests", envB);
 
-    const resp = await get<{ envelopes: unknown[] }>(
+    const resp = await get<{ envelopes: Record<string, unknown>[] }>(
       acct,
       `/devices/${device.device_id}/inbox`,
       bearer(token),
     );
     expect(resp.status).toBe(200);
-    const ids = resp.data.envelopes.map((e) => (e as Record<string, unknown>).id);
+    const ids = resp.data.envelopes.map((e) => e.id);
     expect(ids).toContain(rid("req-inbox-a"));
     expect(ids).toContain(rid("req-inbox-b"));
     // Zero-knowledge: only relay-visible envelope fields, never plaintext context
     for (const env of resp.data.envelopes) {
-      const keys = Object.keys(env as Record<string, unknown>);
+      const keys = Object.keys(env);
       expect(keys).not.toContain("action");
       expect(keys).not.toContain("summary");
       expect(keys).not.toContain("actor");
@@ -2399,13 +2399,13 @@ describe("AccountRelay — device inbox (HTTP poll)", () => {
     });
     await wsDevice.next(); // ack
 
-    const resp = await get<{ envelopes: unknown[] }>(
+    const resp = await get<{ envelopes: Record<string, unknown>[] }>(
       acct,
       `/devices/${device.device_id}/inbox`,
       bearer(token),
     );
     expect(resp.status).toBe(200);
-    const ids = resp.data.envelopes.map((e) => (e as Record<string, unknown>).id);
+    const ids = resp.data.envelopes.map((e) => e.id);
     expect(ids).toContain(rid("req-exclude-pending"));
     expect(ids).not.toContain(rid("req-exclude-resolved"));
   });
@@ -2420,13 +2420,13 @@ describe("AccountRelay — device inbox (HTTP poll)", () => {
     // Submit a live request.
     await post(acct, "/requests", makeEnvelope(rid("req-inbox-live")));
 
-    const resp = await get<{ envelopes: unknown[] }>(
+    const resp = await get<{ envelopes: Record<string, unknown>[] }>(
       acct,
       `/devices/${device.device_id}/inbox`,
       bearer(token),
     );
     expect(resp.status).toBe(200);
-    const ids = resp.data.envelopes.map((e) => (e as Record<string, unknown>).id);
+    const ids = resp.data.envelopes.map((e) => e.id);
     expect(ids).not.toContain(rid("req-inbox-already-expired"));
     expect(ids).toContain(rid("req-inbox-live"));
   });

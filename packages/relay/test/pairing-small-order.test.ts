@@ -105,7 +105,7 @@ async function completePairing(
   accountId: string,
   start: PairingStart,
   pubkey: string,
-): Promise<{ status: number; body: unknown }> {
+): Promise<{ status: number; body: Record<string, unknown> }> {
   const resp = await exports.default.fetch(url(accountId, "/pairing/complete"), {
     method: "POST",
     headers: {
@@ -114,7 +114,7 @@ async function completePairing(
     },
     body: JSON.stringify({ code: start.code, pubkey }),
   });
-  return { status: resp.status, body: await resp.json() };
+  return { status: resp.status, body: await resp.json<Record<string, unknown>>() };
 }
 
 async function listDevicePubkeys(accountId: string): Promise<string[]> {
@@ -235,7 +235,9 @@ describe("POST /actors — non-canonical base64url keys", () => {
     const start = await startPairing(accountId);
     const paired = await completePairing(accountId, start, DEVICE_X25519_PUBKEY);
     expect(paired.status).toBe(201);
-    const { device_auth_token: deviceToken } = paired.body as { device_auth_token: string };
+    const deviceToken = paired.body.device_auth_token;
+    if (typeof deviceToken !== "string")
+      throw new Error("pairing/complete returned no device token");
 
     const resp = await exports.default.fetch(url(accountId, "/actors"), {
       method: "POST",

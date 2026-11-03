@@ -12,15 +12,27 @@ checks bracket access to private members against the class, so a renamed or rety
 method without a runtime instance, construct a real `AccountRelay` over a stub state (see
 `relayOverStubState` in `relay-routing.test.ts`).
 
-`pnpm lint` enforces this on every test source (#367), with AST rules in the root `eslint.config.js`
-(`relayPrivateStateRestrictions`):
+`pnpm lint` backs this up with `no-restricted-syntax` rules on every test source (#367), defined in the root
+`eslint/relay-private-state.js`. They're test hygiene, not a sandbox: they make the mistake hard to write by
+accident. That module's comment lists exactly what they check. In short:
 
-- A double cast through `unknown`, `never` or `any` is allowed only to a runtime type tests stub: `WebSocket`,
-  `Env`, `DurableObjectState` or `DurableObjectStorage`. Never to a shape, a union or an intersection.
-  `core.test.ts` alone may also cast to `Record`, to read the WASM glue's exports by name.
-- A lone cast to `unknown` or `never` is forbidden, so a double cast can't be split across a variable.
-- Prototype access is forbidden (`.prototype`, `Object.create`, the prototype getters and setters).
-- `as any` falls to `no-explicit-any`.
+- **Double casts.** A double cast through `unknown`, `never` or `any` may target only a bare `WebSocket`,
+  `Env`, `DurableObjectState` or `DurableObjectStorage`. `core.test.ts` alone may also target `Record`.
+- **Lone and shape casts.** A lone cast to `unknown` or `never` is refused. So is a single cast to an
+  object-literal type or to `Partial`, `Pick`, `Omit`, `Record`, `Required` or `Readonly`, except on a
+  `JSON.parse(…)` result.
+- **Allowed names stay real.** Test code can't redeclare those four names or bind another type to them by
+  import or export.
+- **Reflection.** Prototype access and the reflection that writes to or rewires an object are refused
+  (`Object.create`, `assign`, `defineProperty`, `setPrototypeOf`, `Reflect`, `__proto__`), including through
+  computed keys, destructuring, aliases and `globalThis`.
+- **`as any`** falls to `no-explicit-any`.
 
-`test/private-state-plants.ts` plants one violation of each. Its disable directives must stay in use, so lint
-fails if a rule stops firing.
+Known limits:
+
+- A single cast to a named shape with optional members (`relay as LooseShape`) gets through.
+- So does laundering through a generic helper (`launder<Shape>(relay)`). Review has to catch these.
+
+`test/private-state-plants.ts` plants each violation. Its disable directives must stay in use, so lint fails if
+a rule stops firing. `test/lint-coverage.test.ts` fails if any other file disables `no-restricted-syntax`,
+if any file uses a blanket disable, or if `test/` gains a source in a language the typed lint block skips.
