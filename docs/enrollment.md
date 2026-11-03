@@ -976,12 +976,12 @@ Current relay mechanics cover the registry subset and #89 adds relay-scoped endp
 | `POST /enrollments/{id}/cert`      | Root holder deposits the issued `device_cert` (write-once, opaque to the relay). Not implemented (#199). |
 | `GET /enrollments/{id}/cert`       | Enrollee collects its `device_cert` and verifies it against the pinned root. Not implemented (#199).     |
 | `POST /enrollments/{id}/abort`     | Root holder terminates a ceremony fail-closed and visibly. Not implemented (#199).                       |
-| `GET /devices`                     | Return active device encryption public keys for JWE recipients.                                          |
+| `GET /devices`                     | List active devices (routing only; integrators take JWE recipients from account state, #243).            |
 | `POST /devices/{device_id}/revoke` | Remove an active device and close its live socket.                                                       |
 | `POST /actors`                     | Enroll an actor public key.                                                                              |
 | `GET /actors`                      | List enrolled actor public keys.                                                                         |
 | `POST /account-states`             | Root-authorized: publish account-state docs the relay verifies against the bound root.                   |
-| `GET /account-states`              | Unauthenticated: fetch the relay-verified docs plus their `max_sequence`.                                |
+| `GET /account-states`              | Unauthenticated: fetch the relay-verified docs plus their `max_sequence`; integrators encrypt to these.  |
 
 Endpoint authentication and authorization rules:
 
