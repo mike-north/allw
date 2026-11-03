@@ -545,6 +545,9 @@ attestation, audit records, hook/SDK fail-closed behavior, or enrollment.
       (`docs/relay-api.md` §4, #245).
 - [ ] Network failures, hung reads, refused connections, and malformed relay responses deny or expire, never allow.
 - [ ] Any new endpoint states who may call it and what authentication/authorization is required.
+- [ ] A token-guarded identifier (a request id, a pairing code) answers an unknown identifier exactly as a wrong
+      token (401 / 403, same body); no route says "not found" before its credential check (`docs/relay-api.md` §1,
+      #357).
 - [ ] Relay URLs are accepted only as `https:` (or `http:` on loopback) and are rejected at configuration time,
       before any request is built (web approver `checkRelayUrl`, SDK `assertRelayUrlTransport`, approver CLI
       `assertCliRelayUrl` for `pair --relay`, `watch --relay` and the keyfile's `relay_url`). Every copy of the rule

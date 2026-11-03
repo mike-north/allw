@@ -363,7 +363,8 @@ export class RelayClient {
    * Poll a request's status once (`GET /:acct/requests/:id`).
    *
    * @returns the terminal outcome if the request is `resolved`/`expired`, or `null` while pending.
-   * @throws {RelayError} on a non-2xx response (e.g. 404 unknown request).
+   * @throws {RelayError} on a non-2xx response (e.g. 401/403: a missing or wrong token, which is
+   *   also how the relay answers an unknown request id).
    */
   async poll(requestId: string): Promise<VerdictOutcome | null> {
     const token = this.requestAuthTokens.get(requestId);
@@ -409,7 +410,8 @@ export class RelayClient {
    * so a failure here can only make cancellation a no-op, never fabricate an approval or discard an
    * already-recorded verdict (the relay itself refuses to retract a `resolved` request).
    *
-   * @throws {RelayError} on a non-2xx response (e.g. 404 unknown request, 409 already resolved/expired).
+   * @throws {RelayError} on a non-2xx response (e.g. 401/403: a missing or wrong token, which is
+   *   also how the relay answers an unknown request id; 409 already resolved/expired).
    */
   async retract(requestId: string): Promise<void> {
     const token = this.requestAuthTokens.get(requestId);

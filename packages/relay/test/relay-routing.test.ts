@@ -309,6 +309,19 @@ interface WsMessage {
 interface WsClient {
   /** Resolve the next inbound JSON message (or reject after `timeoutMs`). */
   next(timeoutMs?: number): Promise<WsMessage>;
+  /**
+   * Assert that no message is waiting on this socket, without waiting out a timeout. Sends a frame
+   * the relay always answers (a non-JSON message gets an `error`) and requires that answer to be the
+   * next message. A Durable Object handles one event at a time, and the sends these tests check (a
+   * connect's queue flush, a submit's fan-out) complete inside an earlier event, so any such message
+   * is already ahead of the answer on the socket.
+   *
+   * The guarantee is narrower than a long wait's: it covers only messages sent synchronously by
+   * events that have already completed. A send the relay defers to a timer, or makes after an
+   * `await` that lets the barrier's event run first, can land after the answer and go unseen. So
+   * this relies on the relay's message and connect handlers sending synchronously, as they do now.
+   */
+  expectNothingPending(): Promise<void>;
   send(obj: unknown): void;
   raw: WebSocket;
 }
@@ -356,20 +369,47 @@ async function connectWs(accountId: string, subPath: string): Promise<WsClient> 
 
   ws.accept();
 
+  function next(timeoutMs = 2000): Promise<WsMessage> {
+    const queued = queue.shift();
+    if (queued) return Promise.resolve(queued);
+    return new Promise<WsMessage>((resolve, reject) => {
+      const waiter = (m: WsMessage): void => {
+        clearTimeout(timer);
+        resolve(m);
+      };
+      const timer = setTimeout(() => {
+        // Withdraw the waiter, so a message that arrives after the timeout is queued for the next
+        // read instead of going to this already-rejected promise.
+        const index = waiters.indexOf(waiter);
+        if (index !== -1) waiters.splice(index, 1);
+        reject(new Error("WebSocket message timeout"));
+      }, timeoutMs);
+      waiters.push(waiter);
+    });
+  }
+
   return {
-    next(timeoutMs = 2000): Promise<WsMessage> {
-      const queued = queue.shift();
-      if (queued) return Promise.resolve(queued);
-      return new Promise<WsMessage>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("WebSocket message timeout")), timeoutMs);
-        waiters.push((m) => {
-          clearTimeout(timer);
-          resolve(m);
-        });
-      });
-    },
+    next,
     send(obj: unknown): void {
       ws.send(JSON.stringify(obj));
+    },
+    async expectNothingPending(): Promise<void> {
+      // Created before the await, so a missing answer's stack names the calling test line rather
+      // than next()'s timer.
+      const callSite = new Error(
+        "expectNothingPending: the relay never answered the barrier frame",
+      );
+      ws.send("barrier: not a JSON message");
+      let answer: WsMessage;
+      try {
+        answer = await next();
+      } catch {
+        throw callSite;
+      }
+      expect(answer, "a message was already pending ahead of the barrier's answer").toEqual({
+        type: "error",
+        error: "invalid JSON message",
+      });
     },
     raw: ws,
   };
@@ -378,6 +418,21 @@ async function connectWs(accountId: string, subPath: string): Promise<WsClient> 
 // ---------------------------------------------------------------------------
 // End-to-end: online device
 // ---------------------------------------------------------------------------
+
+describe("WsClient (test helper)", () => {
+  // Regression: a timed-out next() left its waiter queued, so the next message went to the
+  // rejected promise and was lost to every later read.
+  it("a message arriving after a timed-out next() is still read by the next next()", async () => {
+    const acct = testAccount("acct-wsclient-timeout");
+    await enrollDevice(acct);
+    const device = await connectWs(acct, `/devices/${await firstDeviceId(acct)}/connect`);
+
+    await expect(device.next(50)).rejects.toThrow(/timeout/);
+    // The relay answers a non-JSON frame with an error frame; it must reach the next read.
+    device.raw.send("not a JSON message");
+    expect(await device.next()).toEqual({ type: "error", error: "invalid JSON message" });
+  });
+});
 
 describe("AccountRelay — routing (device online)", () => {
   it("E2E: submit → device receives ciphertext → verdict → integrator polls resolved", async () => {
@@ -610,8 +665,8 @@ describe("AccountRelay — routing (device offline)", () => {
     const d2 = await connectWs(acct, `/devices/${deviceId}/connect`);
     const flushed = await d2.next();
     expect(flushed.request_id).toBe(rid("req-mixed-2"));
-    // No further pending request should arrive.
-    await expect(d2.next(500)).rejects.toThrow(/timeout/);
+    // No further pending request arrives.
+    await d2.expectNothingPending();
   });
 });
 
@@ -701,7 +756,7 @@ describe("AccountRelay — cross-device coordination", () => {
 
     expect((await nativeMac.next()).request_id).toBe(rid("req-surface-1"));
     expect((await phone.next()).request_id).toBe(rid("req-surface-1"));
-    await expect(mirroredPhone.next(500)).rejects.toThrow(/timeout/);
+    await mirroredPhone.expectNothingPending();
   });
 
   it("continues same-surface fan-out when the first tagged socket cannot be sent to", async () => {
@@ -768,7 +823,7 @@ describe("AccountRelay — cross-device coordination", () => {
 
     expect((await nativeMac.next()).request_id).toBe(rid("req-surface-queued"));
     expect((await phone.next()).request_id).toBe(rid("req-surface-queued"));
-    await expect(mirroredPhone.next(500)).rejects.toThrow(/timeout/);
+    await mirroredPhone.expectNothingPending();
   });
 
   it("flushes queued requests when only stale sockets exist for the reconnecting surface", async () => {
@@ -1496,9 +1551,9 @@ describe("AccountRelay — routing negative paths", () => {
     expect(second.status).toBe(409);
   });
 
-  it("returns 404 polling an unknown request", async () => {
+  it("answers polling an unknown request as unauthorized, never 'not found' (#357)", async () => {
     const { status } = await get(testAccount("acct-neg-poll"), "/requests/does-not-exist");
-    expect(status).toBe(404);
+    expect(status).toBe(401);
   });
 
   it("returns 404 connecting a WebSocket for an unenrolled device", async () => {
@@ -1537,14 +1592,14 @@ describe("AccountRelay — routing negative paths", () => {
     expect(typeof err.error).toBe("string");
   });
 
-  it("returns 404 opening …/wait for an unknown request", async () => {
+  it("answers opening …/wait for an unknown request as unauthorized (#357)", async () => {
     const resp = await SELF.fetch(
       relayUrl(testAccount("acct-neg-waitunknown"), "/requests/nope/wait"),
       {
         headers: { Upgrade: "websocket" },
       },
     );
-    expect(resp.status).toBe(404);
+    expect(resp.status).toBe(401);
   });
 
   it("rejects a degenerate (non-object) verdict value", async () => {
@@ -1601,7 +1656,7 @@ describe("AccountRelay — fail-closed expiry", () => {
 
     // Connecting must NOT deliver the expired queued request.
     const device = await connectWs(acct, `/devices/${deviceId}/connect`);
-    await expect(device.next(500)).rejects.toThrow(/timeout/);
+    await device.expectNothingPending();
   });
 
   it("lazy-expires on poll: a past-deadline pending request reports terminal 'expired'", async () => {
@@ -1891,13 +1946,13 @@ describe("AccountRelay — retract (issue #195)", () => {
     expect(polled.data.status).toBe("expired");
   });
 
-  it("SECURITY: returns 404 retracting an unknown request", async () => {
+  it("SECURITY: refuses retracting an unknown request as unauthorized (#357)", async () => {
     const { status } = await post(
       testAccount("acct-retract-unknown"),
       "/requests/does-not-exist/retract",
       {},
     );
-    expect(status).toBe(404);
+    expect(status).toBe(401);
   });
 
   it("SECURITY: requires the per-request token, scoped to exactly that request (no cross-request retract)", async () => {

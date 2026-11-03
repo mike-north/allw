@@ -339,7 +339,7 @@ describe("AccountRelay — pairing", () => {
     expect(goodComplete.status).toBe(201);
   });
 
-  it("rejects completing a pairing with an unknown code (404)", async () => {
+  it("rejects completing a pairing with an unknown code as unauthorized, never 'not found' (#357)", async () => {
     // Bind the root first: an unbound account refuses every completion (403) before code lookup.
     await startPairing(testAccount("acct-unknown-code"));
     const { status, data } = await post<{ error: string }>(
@@ -347,8 +347,8 @@ describe("AccountRelay — pairing", () => {
       "/pairing/complete",
       { code: "XXXXXXXX", pubkey: VALID_PUBKEY_1 },
     );
-    expect(status).toBe(404);
-    expect(typeof data.error).toBe("string");
+    expect(status).toBe(401);
+    expect(data.error).toBe("authorization required");
 
     // No device should have been added
     const listResp = await get<{ devices: unknown[] }>(
