@@ -16,6 +16,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { dirname, join } from "node:path";
+import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 
 const fixture = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "poll-only-wait.mjs");
@@ -28,4 +29,17 @@ test("poll-path wait keeps the process alive until the deadline, then resolves e
   });
   assert.equal(result.code, 0, `the process waited and exited cleanly (stderr: ${result.stderr})`);
   assert.match(result.stdout, /^decision: expired$/m);
+});
+
+test("an outcome before the deadline still lets the process exit promptly", async () => {
+  const result = await new Promise((resolve) => {
+    const startedAt = performance.now();
+    execFile(process.execPath, [fixture, "early"], (error, stdout, stderr) => {
+      resolve({ code: error ? error.code : 0, stdout, stderr, ms: performance.now() - startedAt });
+    });
+  });
+  assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+  assert.match(result.stdout, /^decision: expired$/m);
+  // The pending 60 s deadline timer is unref'd, so it does not keep the process alive.
+  assert.ok(result.ms < 10_000, `exited promptly (took ${String(Math.round(result.ms))} ms)`);
 });

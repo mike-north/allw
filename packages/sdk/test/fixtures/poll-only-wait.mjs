@@ -4,6 +4,11 @@
  * that never decides. Correct behavior: the wait keeps the process alive until the fail-closed
  * deadline, then prints `decision: expired` and exits 0.
  *
+ * Modes (`argv[2]`):
+ * - `never` (default): the relay never answers; expect `expired` at the 400 ms deadline.
+ * - `early`: the relay reports a terminal outcome on the first poll while a 60 s deadline is still
+ *   pending; expect the process to exit at once (the deadline timer must not hold it open).
+ *
  * Regression for #254: the bug where every SDK wait timer was `unref`'d, so on the poll path nothing held
  * the event loop between polls and Node exited mid-wait (code 13 under top-level await; code 0 with
  * no output under `void main()`, as the hook CLIs run).
@@ -31,7 +36,9 @@ const device = {
   created_at: 0,
 };
 
-/** A relay double that accepts the request and reports it pending forever. */
+const mode = process.argv[2] ?? "never";
+
+/** A relay double that accepts the request, then reports it pending (or terminal, in `early`). */
 const fetchImpl = async (url, init = {}) => {
   const path = new URL(url).pathname;
   const method = (init.method ?? "GET").toUpperCase();
@@ -43,7 +50,7 @@ const fetchImpl = async (url, init = {}) => {
       202,
     );
   }
-  return json({ request_id: "x", status: "pending" });
+  return json({ request_id: "x", status: mode === "early" ? "expired" : "pending" });
 };
 
 const client = createClient({
@@ -66,6 +73,6 @@ const verdict = await client.requestApproval({
   actor: { id: "machine:test", kind: "script" },
   risk: "low",
   reversible: true,
-  timeoutMs: 400,
+  timeoutMs: mode === "early" ? 60_000 : 400,
 });
 console.log(`decision: ${verdict.decision}`);
