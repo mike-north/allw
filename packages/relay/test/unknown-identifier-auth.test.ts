@@ -137,6 +137,44 @@ describe("request ids: an unknown id answers like a wrong token (#357)", () => {
     owner.webSocket?.close();
   });
 
+  // The WebSocket route also reads `?auth=` (#303), so an unknown id must read it the same way: a
+  // stranger's query token is a 403 for an unknown id exactly as for a known one, never a 401.
+  it("GET /requests/{id}/wait with a ?auth= query token", async () => {
+    const acct = testAccount("acct-oracle-wait-query");
+    const token = await submit(acct, rid("req-oracle-wait-query"));
+    await expectIndistinguishable(
+      (id, t) =>
+        call(acct, "GET", `/requests/${id}/wait${t === undefined ? "" : `?auth=${t}`}`, {
+          websocket: true,
+        }),
+      rid("req-oracle-wait-query"),
+      rid("req-oracle-wait-query-unknown"),
+    );
+    const owner = await SELF.fetch(
+      relayUrl(acct, `/requests/${rid("req-oracle-wait-query")}/wait?auth=${token}`),
+      { headers: { Upgrade: "websocket" } },
+    );
+    expect(owner.status).toBe(101);
+    owner.webSocket?.accept();
+    owner.webSocket?.close();
+  });
+
+  // An HTTP route ignores `?auth=` (#303) for known and unknown ids alike: both are a 401.
+  it("GET /requests/{id} ignores a ?auth= query token for known and unknown ids alike", async () => {
+    const acct = testAccount("acct-oracle-poll-query");
+    const token = await submit(acct, rid("req-oracle-poll-query"));
+    for (const t of [STRANGER_TOKEN, token]) {
+      const known = await call(acct, "GET", `/requests/${rid("req-oracle-poll-query")}?auth=${t}`);
+      const unknown = await call(
+        acct,
+        "GET",
+        `/requests/${rid("req-oracle-poll-query-unknown")}?auth=${t}`,
+      );
+      expect(unknown).toEqual(known);
+      expect(known).toEqual(NO_TOKEN);
+    }
+  });
+
   it("POST /requests/{id}/retract", async () => {
     const acct = testAccount("acct-oracle-retract");
     const token = await submit(acct, rid("req-oracle-retract"));

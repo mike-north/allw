@@ -545,6 +545,9 @@ attestation, audit records, hook/SDK fail-closed behavior, or enrollment.
       (`docs/relay-api.md` §4, #245).
 - [ ] Network failures, hung reads, refused connections, and malformed relay responses deny or expire, never allow.
 - [ ] Any new endpoint states who may call it and what authentication/authorization is required.
+- [ ] Bearer tokens stay out of URLs: HTTP routes read them only from the `Authorization` header. The
+      `?auth=` query form is accepted only on the WebSocket upgrade routes, where browsers cannot set headers
+      (`docs/relay-api.md` §1, #303). A new route never opts into it unless it is a WebSocket upgrade.
 - [ ] A token-guarded identifier (a request id, a pairing code) answers an unknown identifier exactly as a wrong
       token (401 / 403, same body); no route says "not found" before its credential check (`docs/relay-api.md` §1,
       #357).

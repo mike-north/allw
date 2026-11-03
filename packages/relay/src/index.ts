@@ -287,10 +287,30 @@ async function hashAuthToken(token: string): Promise<string> {
   return base64UrlEncode(new Uint8Array(digest));
 }
 
-function bearerToken(request: Request): string | null {
-  const auth = request.headers.get("Authorization") ?? "";
-  const match = /^Bearer ([A-Za-z0-9_-]+)$/.exec(auth);
-  if (match) return match[1] ?? null;
+/**
+ * Where a route accepts its bearer token from.
+ *
+ * - `header`: only `Authorization: Bearer …`. This is every HTTP route.
+ * - `header-or-websocket-query`: also `?auth=<token>`, but only on a WebSocket upgrade request and
+ *   only when no `Authorization` header is present. Browsers cannot set headers on a WebSocket, so
+ *   the two WebSocket routes (`…/connect`, `…/wait`) need the query form.
+ *
+ * A token in a URL leaks where a header does not: access, proxy and CDN logs, browser history,
+ * `Referer`, error reports. So the query form exists only where it is needed (#303).
+ */
+type BearerSource = "header" | "header-or-websocket-query";
+
+/**
+ * The bearer token a request presents for a route accepting `source`, or `null` if none.
+ * An `Authorization` header, when present, is the only credential considered. The query is never
+ * a fallback for a header that is malformed or of another scheme.
+ */
+function bearerToken(request: Request, source: BearerSource): string | null {
+  const auth = request.headers.get("Authorization");
+  if (auth !== null) {
+    return /^Bearer ([A-Za-z0-9_-]+)$/.exec(auth)?.[1] ?? null;
+  }
+  if (source !== "header-or-websocket-query" || !isWebSocketUpgrade(request)) return null;
   const queryToken = new URL(request.url).searchParams.get("auth");
   return queryToken && /^[A-Za-z0-9_-]+$/.test(queryToken) ? queryToken : null;
 }
@@ -1013,8 +1033,9 @@ export class AccountRelay implements DurableObject {
   private async authorizeStoredHash(
     request: Request,
     storedHash: string | null | undefined,
+    source: BearerSource = "header",
   ): Promise<Response | null> {
-    const token = bearerToken(request);
+    const token = bearerToken(request, source);
     if (token === null) return authError(401);
     // A missing hash is a legacy/migration row, not proof of authorization. Fail closed and require
     // re-pairing or re-submission so no endpoint silently falls back to unauthenticated access.
@@ -1029,12 +1050,17 @@ export class AccountRelay implements DurableObject {
    * unauthenticated caller cannot learn whether the identifier exists (#357). No caller can hold a
    * valid token for a row that does not exist, so this never refuses a legitimate request.
    */
-  private async unknownIdentifierAuthFailure(request: Request): Promise<Response> {
-    return (await this.authorizeStoredHash(request, null)) ?? authError(403);
+  private async unknownIdentifierAuthFailure(
+    request: Request,
+    source: BearerSource = "header",
+  ): Promise<Response> {
+    // The same `source` as the route's real check, so a WebSocket route's `?auth=` token is read
+    // for an unknown identifier exactly as for a known one.
+    return (await this.authorizeStoredHash(request, null, source)) ?? authError(403);
   }
 
   private async authorizedDeviceId(request: Request): Promise<string | Response> {
-    const token = bearerToken(request);
+    const token = bearerToken(request, "header");
     if (token === null) return authError(401);
     const tokenHash = await hashAuthToken(token);
     const rows = [
@@ -1711,7 +1737,11 @@ export class AccountRelay implements DurableObject {
     if (!device) {
       return json({ error: "device not enrolled" }, 404);
     }
-    const authFailure = await this.authorizeStoredHash(request, device.auth_token_hash);
+    const authFailure = await this.authorizeStoredHash(
+      request,
+      device.auth_token_hash,
+      "header-or-websocket-query",
+    );
     if (authFailure) return authFailure;
     const surfaceId = parseSurfaceId(request);
     if (surfaceId === null) {
@@ -1900,6 +1930,7 @@ export class AccountRelay implements DurableObject {
   private async authorizeRequestRead(
     requestId: string,
     request: Request,
+    source: BearerSource = "header",
   ): Promise<{ row: RequestRow; status: string } | Response> {
     const rows = [
       ...this.sql.exec<RequestRow>(
@@ -1912,8 +1943,8 @@ export class AccountRelay implements DurableObject {
     // An unknown id answers exactly as a wrong request token does (#357): existence is never
     // revealed before the token is checked. A request swept after its retention window answers its
     // old token the same way.
-    if (!req) return this.unknownIdentifierAuthFailure(request);
-    const authFailure = await this.authorizeStoredHash(request, req.auth_token_hash);
+    if (!req) return this.unknownIdentifierAuthFailure(request, source);
+    const authFailure = await this.authorizeStoredHash(request, req.auth_token_hash, source);
     if (authFailure) return authFailure;
     return {
       row: req,
@@ -2359,7 +2390,11 @@ export class AccountRelay implements DurableObject {
    * will come for either of the latter two).
    */
   private async handleIntegratorWait(requestId: string, request: Request): Promise<Response> {
-    const authorized = await this.authorizeRequestRead(requestId, request);
+    const authorized = await this.authorizeRequestRead(
+      requestId,
+      request,
+      "header-or-websocket-query",
+    );
     if (authorized instanceof Response) return authorized;
     const status = authorized.status;
 
