@@ -72,6 +72,7 @@ export type {
 } from "./relay-config.js";
 export {
   INSECURE_RELAY_URL_REASON,
+  RELAY_URL_EXTRAS_REASON,
   RELAY_URL_QUERY_PARAM,
   RELAY_URL_STORAGE_KEY,
   checkRelayUrl,

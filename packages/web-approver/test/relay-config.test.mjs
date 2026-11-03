@@ -8,18 +8,21 @@
  * one negative test per rejection branch) plus the ignored-override notice for a paired device.
  *
  * @see https://github.com/mike-north/allw/issues/249
+ * @see ../../sdk/test/fixtures/relay-url-vectors.json (shared with the SDK and the site build)
  * @see ../../../docs/web-approver-deploy.md (§Runtime relay configuration, §Relay pinning)
  * @see ../src/relay-config.ts
  * @see ../src/app.ts (the production bootstrap that calls these before mounting the pairing gate)
  */
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test, { describe } from "node:test";
 
 import { JSDOM } from "jsdom";
 
 import {
   INSECURE_RELAY_URL_REASON,
+  RELAY_URL_EXTRAS_REASON,
   RELAY_URL_QUERY_PARAM,
   RELAY_URL_STORAGE_KEY,
   checkRelayUrl,
@@ -106,6 +109,37 @@ describe("checkRelayUrl", () => {
     assert.equal(checked.ok, false);
     assert.match(checked.reason, /Enter a relay URL/);
   });
+});
+
+/** The accept/reject vectors shared with the SDK's `createClient` and the site build. */
+const { vectors } = JSON.parse(
+  readFileSync(new URL("../../sdk/test/fixtures/relay-url-vectors.json", import.meta.url), "utf8"),
+);
+
+describe("checkRelayUrl — shared vectors (#249)", () => {
+  for (const { input, runtime, canonical, why } of vectors) {
+    test(`${runtime}s ${JSON.stringify(input)} (${why})`, () => {
+      const checked = checkRelayUrl(input);
+      if (runtime === "accept") {
+        assert.deepEqual(checked, { ok: true, relayUrl: canonical });
+      } else {
+        assert.equal(checked.ok, false);
+        assert.equal(typeof checked.reason, "string");
+      }
+    });
+  }
+});
+
+describe("checkRelayUrl — userinfo, query, fragment (#249)", () => {
+  for (const input of [
+    "https://relay.example.com@evil.example",
+    "https://relay.example.com?x=1",
+    "https://relay.example.com#",
+  ]) {
+    test(`rejects ${input} with the extras reason`, () => {
+      assert.deepEqual(checkRelayUrl(input), { ok: false, reason: RELAY_URL_EXTRAS_REASON });
+    });
+  }
 });
 
 // ── resolveRelayUrl (pre-pairing candidate) ─────────────────────────────────────────────────────
@@ -354,6 +388,7 @@ describe("mountIgnoredRelayNotice", () => {
       assert.ok(notice, "notice must render");
       assert.equal(notice.getAttribute("role"), "status");
       assert.match(notice.textContent, /paired with https:\/\/relay\.example\.com /);
+      assert.match(notice.textContent, /clear this site's data, then open the new link\./);
       assert.equal(
         notice.querySelector(".relay-pin-notice-origin").textContent,
         "<img src=x onerror=alert(1)>",

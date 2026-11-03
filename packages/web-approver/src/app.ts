@@ -48,7 +48,7 @@
  */
 
 import { createRelayAccountStateResolver } from "./account-state.js";
-import { mountWebApprover } from "./browser.js";
+import { mountWebApprover, type WebApproverMount } from "./browser.js";
 import { mountOnboardingGate } from "./onboarding.js";
 import { createLocalPairingStore, mountPairingGate, type PairedIdentity } from "./pairing.js";
 import {
@@ -61,6 +61,7 @@ import {
 import { createBrowserRuntime } from "./runtime.js";
 import { createLocalAccountStateFloorStore } from "./sequence-floor.js";
 import { createLocalSurfaceIdStore, resolveSurfaceId } from "./surface-id.js";
+import type { WasmModuleSource } from "./wasm.js";
 
 /** The default poll interval for the live inbox once mounted (matches `relay-poll.ts`'s default). */
 const POLL_INTERVAL_MS = 2_000;
@@ -71,6 +72,21 @@ const POLL_INTERVAL_MS = 2_000;
  */
 const WASM_GLUE_URL = new URL("./vendor/allw-wasm/allw_wasm.js", import.meta.url);
 const WASM_BINARY_URL = new URL("./vendor/allw-wasm/allw_wasm_bg.wasm", import.meta.url);
+
+/**
+ * Where {@link bootInbox} gets the WASM core: the glue module and the binary it instantiates.
+ * Production uses {@link VENDORED_WASM}; tests inject the same vendored artifact from disk.
+ */
+export interface InboxWasmSource {
+  readonly loadGlue: () => Promise<unknown>;
+  readonly moduleSource: WasmModuleSource;
+}
+
+/** The vendored WASM copied next to the bundled module by `scripts/build-site.mjs`. */
+const VENDORED_WASM: InboxWasmSource = {
+  loadGlue: () => import(WASM_GLUE_URL.href),
+  moduleSource: WASM_BINARY_URL,
+};
 
 /** A paired identity whose relay is pinned — the only shape {@link bootInbox} accepts. */
 export type PinnedIdentity = PairedIdentity & { readonly relayUrl: string };
@@ -89,7 +105,7 @@ export interface BootEnvironment {
   /** A `location.search`-shaped string. */
   readonly search: string;
   /** Load WASM and mount the live inbox for a paired identity, against its pinned relay. */
-  readonly startInbox: (root: HTMLElement, identity: PinnedIdentity) => Promise<void>;
+  readonly startInbox: (root: HTMLElement, identity: PinnedIdentity) => Promise<unknown>;
 }
 
 /**
@@ -148,17 +164,22 @@ async function resolvePinnedRelayUrl(
 
 /**
  * Load the vendored WASM core and mount the live inbox for a confirmed `identity`, sending every
- * relay call to its pinned `relayUrl`. Any failure here (a stale/missing vendored artifact, a WASM
+ * relay call — inbox poll, `connect` WebSocket, account-state resolution — to its pinned
+ * `relayUrl` and to nothing else. Resolves to the mount, whose `stop()` ends the poll loop. Any failure here (a stale/missing vendored artifact, a WASM
  * instantiation error) is allowed to reject — there is no safe UI to fall back to once pairing has
  * already confirmed a human is present, so a startup failure surfaces as an unhandled rejection
  * an operator can see in devtools rather than a silently blank inbox.
  */
-async function bootInbox(root: HTMLElement, identity: PinnedIdentity): Promise<void> {
+export async function bootInbox(
+  root: HTMLElement,
+  identity: PinnedIdentity,
+  wasm: InboxWasmSource = VENDORED_WASM,
+): Promise<WebApproverMount> {
   const { relayUrl } = identity;
-  const glueModule: unknown = await import(WASM_GLUE_URL.href);
+  const glueModule: unknown = await wasm.loadGlue();
   const runtime = await createBrowserRuntime({
     glueModule,
-    moduleSource: WASM_BINARY_URL,
+    moduleSource: wasm.moduleSource,
     identity,
     resolveAccountStates: createRelayAccountStateResolver({
       relayUrl,
@@ -170,7 +191,7 @@ async function bootInbox(root: HTMLElement, identity: PinnedIdentity): Promise<v
     sequenceFloorStore: createLocalAccountStateFloorStore(),
   });
 
-  await mountWebApprover({
+  return mountWebApprover({
     root,
     runtime,
     relay: {

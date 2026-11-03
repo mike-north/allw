@@ -39,7 +39,7 @@
  * @see docs/contract.md §Invariants #6 (fail-closed)
  */
 
-import { checkRelayUrl } from "./relay-config.js";
+import { checkRelayUrl, relayOrigin } from "./relay-config.js";
 import type { ApproverIdentity } from "./runtime.js";
 
 /**
@@ -346,7 +346,9 @@ function renderPairingScreen(
   if (relayUrl !== undefined) {
     const relayRow = el("div", "pairing-relay");
     relayRow.append(text("span", "Relay", "pairing-relay-label"));
-    relayRow.append(text("code", relayUrl, "pairing-relay-url"));
+    // The origin (punycode, from `URL.origin`), not the raw text: userinfo is already rejected by
+    // `checkRelayUrl`, and the punycode form keeps an IDN lookalike from passing as a familiar host.
+    relayRow.append(text("code", relayOrigin(relayUrl), "pairing-relay-url"));
     relayRow.append(
       text(
         "p",

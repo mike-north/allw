@@ -7,8 +7,9 @@
 #
 # - script-src 'self' 'wasm-unsafe-eval': only same-origin scripts (no inline script — the theme
 #   bootstrap is `theme.js`), plus WebAssembly compilation for the vendored allw core.
-# - connect-src: the page may only fetch / open WebSockets to itself and the configured relays,
-#   so even injected script cannot ship the signing seed to an attacker's origin.
+# - connect-src: fetch / XHR / WebSocket may reach only the page itself and the configured relays.
+#   This blocks exfiltration over those channels; it does NOT stop script that is already running
+#   on this origin from leaking data by navigation, window.open, or WebRTC (docs/threat-model.md).
 # - frame-ancestors 'none': the approver cannot be framed (clickjacking an approve button).
 /*
   Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' __ALLW_RELAY_CONNECT_SRC__; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'

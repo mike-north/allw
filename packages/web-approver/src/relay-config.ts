@@ -45,16 +45,48 @@ export const INSECURE_RELAY_URL_REASON =
   "Relay URLs must use https://. Plain http:// is allowed only for a relay on this machine " +
   "(localhost, 127.0.0.1, or [::1]).";
 
+/**
+ * The actionable reason shown when a relay URL carries userinfo (`user:pw@`), a query (`?`) or a
+ * fragment (`#`). Userinfo lets a link *look* like one host while pointing at another
+ * (`https://relay.example.com@evil.example` is `evil.example`); a query or fragment would corrupt
+ * the request paths appended to the relay URL.
+ */
+export const RELAY_URL_EXTRAS_REASON =
+  "Relay URLs must not include a username, password, query (?) or fragment (#), " +
+  "e.g. https://relay.example.com";
+
 /** Outcome of {@link checkRelayUrl}: the canonical URL, or why the candidate was rejected. */
 export type RelayUrlCheck =
   | { readonly ok: true; readonly relayUrl: string }
   | { readonly ok: false; readonly reason: string };
 
 /**
+ * Whether the raw text carries userinfo, a query, or a fragment — including the *empty* forms
+ * (`https://@host`, `https://host?`, `https://host#`) that `URL` normalizes away. Checked on the
+ * raw text as well as the parsed URL so this rule agrees with the SDK's `assertRelayUrlTransport`,
+ * which appends request paths to the caller's raw string.
+ */
+function hasUrlExtras(raw: string, parsed: URL): boolean {
+  return (
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    parsed.search !== "" ||
+    parsed.hash !== "" ||
+    raw.includes("?") ||
+    raw.includes("#") ||
+    /^[a-z][a-z0-9+.-]*:\/\/[^/?#]*@/i.test(raw)
+  );
+}
+
+/**
  * Validate and canonicalize a candidate relay URL. Accepts an absolute `https:` URL, or an
- * `http:` URL whose host is loopback; rejects everything else with a human-readable reason.
- * Trailing slashes are stripped so the stored value matches the canonical form `relay-poll.ts` /
- * `account-state.ts` already normalize internally.
+ * `http:` URL whose host is loopback, with no userinfo, query, or fragment; rejects everything
+ * else with a human-readable reason. A path is allowed (a relay may be served under a subpath).
+ *
+ * The canonical form is `URL.origin` (lowercased, punycode host, default port dropped) plus the
+ * parsed pathname with trailing slashes stripped — never the caller's raw text — so the value
+ * stored in a pin, compared against a `?relay=` link, and shown to the human is one unambiguous
+ * string. `./pairing.ts` `parseIdentity` requires a stored pin to equal this form.
  */
 export function checkRelayUrl(candidate: string): RelayUrlCheck {
   const trimmed = candidate.trim();
@@ -74,7 +106,8 @@ export function checkRelayUrl(candidate: string): RelayUrlCheck {
     parsed.protocol === "https:" ||
     (parsed.protocol === "http:" && LOOPBACK_HOSTNAMES.has(parsed.hostname));
   if (!secure) return { ok: false, reason: INSECURE_RELAY_URL_REASON };
-  return { ok: true, relayUrl: trimmed.replace(/\/+$/, "") };
+  if (hasUrlExtras(trimmed, parsed)) return { ok: false, reason: RELAY_URL_EXTRAS_REASON };
+  return { ok: true, relayUrl: parsed.origin + parsed.pathname.replace(/\/+$/, "") };
 }
 
 /** Where {@link resolveRelayUrl} reads the query string and persisted value from. */
@@ -220,7 +253,7 @@ export function mountIgnoredRelayNotice(options: IgnoredRelayNoticeOptions): voi
   notice.append(text("code", ignored, "relay-pin-notice-origin"));
   notice.append(
     document.createTextNode(
-      "; nothing was sent there. To use another relay, pair this browser again.",
+      "; nothing was sent there. To use another relay, clear this site's data, then open the new link.",
     ),
   );
   host.replaceChildren(notice);

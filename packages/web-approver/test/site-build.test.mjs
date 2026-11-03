@@ -23,6 +23,7 @@
  * @see ../../../docs/web-approver-deploy.md
  * @see https://developers.cloudflare.com/pages/configuration/headers/
  * @see https://www.w3.org/TR/CSP3/
+ * @see ../../sdk/test/fixtures/relay-url-vectors.json (shared with the SDK and the runtime rule)
  */
 
 import assert from "node:assert/strict";
@@ -291,6 +292,19 @@ describe("relayConnectSources (build-time CSP relay list)", () => {
     );
   });
 
+  for (const wildcard of ["https://*", "https://*.workers.dev", "https://a.com;sandbox"]) {
+    test(`rejects ${wildcard} — CSP syntax must never reach connect-src`, () => {
+      assert.throws(() => relayConnectSources([wildcard]), /must have a plain DNS hostname/);
+    });
+  }
+
+  test("rejects [::1] with a pointer to 127.0.0.1 (no IPv6 host-source in CSP)", () => {
+    assert.throws(
+      () => relayConnectSources(["http://[::1]:8787"]),
+      /IPv6 address.*use a DNS name, or http:\/\/127\.0\.0\.1/,
+    );
+  });
+
   test("rejects plaintext http:// to a remote relay (http://relay.example.com)", () => {
     assert.throws(() => relayConnectSources(["http://relay.example.com"]), /must use https:\/\//);
   });
@@ -352,4 +366,22 @@ describe("buildSite with a self-hosted relay list", { skip: !wasmAvailable }, ()
     );
     assert.equal(existsSync(outDir), false);
   });
+});
+
+/** The accept/reject vectors shared with the SDK's `createClient` and the runtime rule. */
+const { vectors: relayUrlVectors } = JSON.parse(
+  readFileSync(new URL("../../sdk/test/fixtures/relay-url-vectors.json", import.meta.url), "utf8"),
+);
+
+describe("relayConnectSources — shared vectors (#249)", () => {
+  for (const { input, build, canonical, why } of relayUrlVectors) {
+    test(`${build}s ${JSON.stringify(input)} (${why})`, () => {
+      if (build === "accept") {
+        const origin = canonical;
+        assert.deepEqual(relayConnectSources([input]), [origin, origin.replace(/^http/, "ws")]);
+      } else {
+        assert.throws(() => relayConnectSources([input]), /^Error: \[web-approver\] /);
+      }
+    });
+  }
 });

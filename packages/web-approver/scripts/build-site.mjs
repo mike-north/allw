@@ -58,14 +58,28 @@ export const DEFAULT_RELAY_ORIGINS = ["https://allw-relay.mnorth.workers.dev"];
 /** The token in `public/_headers` replaced with the relay `connect-src` sources. */
 const RELAY_CONNECT_SRC_PLACEHOLDER = "__ALLW_RELAY_CONNECT_SRC__";
 
-/** Hosts on which a plaintext `http:` relay is tolerated (mirrors `src/relay-config.ts`). */
-const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
+/**
+ * Hosts on which a plaintext `http:` relay is tolerated (mirrors `src/relay-config.ts`, minus
+ * `[::1]`: an IPv6 literal cannot be written as a CSP host-source — see {@link relayConnectSources}).
+ */
+const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1"]);
+
+/**
+ * A plain DNS name or dotted IPv4 address, as `URL.hostname` reports it (lowercased, punycode).
+ * Nothing else may reach the header: this is what keeps CSP metacharacters — `*`, `;`, `'`,
+ * whitespace — out of `connect-src`, where `https://*` would allow every host and
+ * `https://a.com;sandbox` would start a new directive.
+ */
+const PLAIN_HOSTNAME = /^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
 
 /**
  * Turn the configured relay origins into `connect-src` sources: each origin plus its WebSocket
- * form. Throws on anything that is not an `https:` origin (or `http:` on loopback), or that carries
- * a path, query, or credentials — `connect-src` takes origins, and a typo must not silently widen
- * or break the policy.
+ * form. Throws — failing the build rather than emitting a wider or broken policy — on anything
+ * that is not an `https:` origin (or `http:` on `localhost`/`127.0.0.1`) with a plain hostname and
+ * no path, query, fragment, or credentials. IPv6 literals are rejected because the CSP3
+ * host-source grammar has no form for them (a browser would drop the source and block the relay).
+ *
+ * @see https://www.w3.org/TR/CSP3/#grammardef-host-source
  */
 export function relayConnectSources(relayOrigins) {
   if (relayOrigins.length === 0) {
@@ -79,13 +93,25 @@ export function relayConnectSources(relayOrigins) {
     } catch {
       throw new Error(`[web-approver] relay origin '${candidate}' is not an absolute URL`);
     }
+    if (url.hostname.startsWith("[")) {
+      throw new Error(
+        `[web-approver] relay origin '${candidate}' uses an IPv6 address, which a CSP ` +
+          "connect-src cannot express; use a DNS name, or http://127.0.0.1 for a local relay",
+      );
+    }
+    if (!PLAIN_HOSTNAME.test(url.hostname)) {
+      throw new Error(
+        `[web-approver] relay origin '${candidate}' must have a plain DNS hostname ` +
+          "(no wildcards or other CSP syntax)",
+      );
+    }
     const secure =
       url.protocol === "https:" ||
       (url.protocol === "http:" && LOOPBACK_HOSTNAMES.has(url.hostname));
     if (!secure) {
       throw new Error(
         `[web-approver] relay origin '${candidate}' must use https:// ` +
-          "(http:// is allowed only for localhost, 127.0.0.1, or [::1])",
+          "(http:// is allowed only for localhost or 127.0.0.1)",
       );
     }
     if (
@@ -93,7 +119,8 @@ export function relayConnectSources(relayOrigins) {
       url.search !== "" ||
       url.hash !== "" ||
       url.username !== "" ||
-      url.password !== ""
+      url.password !== "" ||
+      /[?#@]/.test(candidate)
     ) {
       throw new Error(
         `[web-approver] relay origin '${candidate}' must be a bare origin like https://relay.example.com`,

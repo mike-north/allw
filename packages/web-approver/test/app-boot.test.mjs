@@ -24,11 +24,12 @@
  */
 
 import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
 import test, { afterEach, beforeEach, describe } from "node:test";
 
 import { JSDOM } from "jsdom";
 
-import { boot } from "../dist/app.js";
+import { boot, bootInbox } from "../dist/app.js";
 import { INSECURE_RELAY_URL_REASON, RELAY_URL_STORAGE_KEY } from "../dist/index.js";
 
 const PAIRING_KEY = "allw:pairing:v1";
@@ -283,5 +284,69 @@ describe("boot — unpaired device with a ?relay= link (#249)", () => {
     assert.equal(root.querySelector("form.pairing-form"), null, "pairing does not proceed");
     assert.equal(storage.getItem(RELAY_URL_STORAGE_KEY), null);
     assert.deepEqual(networkAttempts, []);
+  });
+});
+
+// ── bootInbox: the production inbox start uses the pinned relay (#249) ──────────────────────────
+
+const vendorDir = new URL("../../sdk/vendor/allw-wasm/", import.meta.url);
+const wasmAvailable = existsSync(new URL("allw_wasm_bg.wasm", vendorDir));
+
+describe("bootInbox — every relay call goes to the pinned relay", { skip: !wasmAvailable }, () => {
+  test("inbox poll and connect WebSocket target only the identity's relayUrl", async () => {
+    // A stale candidate relay in storage must never be consulted once an identity is pinned.
+    const storage = memoryStorage();
+    storage.setItem(RELAY_URL_STORAGE_KEY, EVIL_RELAY);
+    const savedStorage = globalThis.localStorage;
+    globalThis.localStorage = storage;
+    const fetchedUrls = [];
+    // Record the dial and hand back an inert socket (the default spy throws, which would abort
+    // the mount); stop() closes it.
+    globalThis.WebSocket = function RecordingWebSocket(url) {
+      networkAttempts.push(String(url));
+      this.close = () => undefined;
+      this.addEventListener = () => undefined;
+    };
+    globalThis.fetch = async (url) => {
+      fetchedUrls.push(String(url));
+      return new Response("[]", { status: 200, headers: { "content-type": "application/json" } });
+    };
+    try {
+      const { resetWasmForTests } = await import("../dist/index.js");
+      resetWasmForTests();
+      const root = dom.window.document.getElementById("app");
+      const mount = await bootInbox(root, PINNED_IDENTITY, {
+        loadGlue: () => import(new URL("allw_wasm.js", vendorDir).href),
+        moduleSource: new WebAssembly.Module(readFileSync(new URL("allw_wasm_bg.wasm", vendorDir))),
+      });
+      try {
+        assert.ok(root.querySelector(".approver-shell"), "the live inbox is mounted");
+        assert.ok(fetchedUrls.length > 0, "the inbox polls the relay");
+        for (const url of fetchedUrls) {
+          assert.ok(url.startsWith(`${PINNED_RELAY}/`), `fetch went to the pinned relay: ${url}`);
+        }
+        assert.ok(
+          fetchedUrls.includes(
+            `${PINNED_RELAY}/${PINNED_IDENTITY.accountId}/devices/${PINNED_IDENTITY.deviceId}/inbox`,
+          ),
+        );
+        const sockets = networkAttempts.filter((url) => url.startsWith("ws"));
+        assert.ok(sockets.length > 0, "the retract listener dials the relay");
+        for (const url of sockets) {
+          assert.ok(
+            url.startsWith("wss://relay.example.com/"),
+            `WebSocket to pinned relay: ${url}`,
+          );
+        }
+        assert.ok(
+          [...fetchedUrls, ...networkAttempts].every((url) => !url.includes("evil.example")),
+          "nothing reaches the stale candidate relay",
+        );
+      } finally {
+        mount.stop();
+      }
+    } finally {
+      globalThis.localStorage = savedStorage;
+    }
   });
 });
