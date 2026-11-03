@@ -18,8 +18,8 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/build-site.mjs",
-    "typecheck": "node ../../scripts/require-built-deps.mjs && tsc -p tsconfig.json --noEmit",
-    "lint": "node ../../scripts/require-built-deps.mjs && eslint src",
+    "typecheck": "node ../../scripts/require-built-deps.mjs --types && tsc -p tsconfig.json --noEmit",
+    "lint": "node ../../scripts/require-built-deps.mjs --types && eslint src",
     "test": "node ../../scripts/require-built-deps.mjs && tsc -p tsconfig.json && node --test \"test/**/*.test.mjs\""
   },
   "license": "MIT",
