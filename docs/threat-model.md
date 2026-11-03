@@ -262,6 +262,14 @@ trust decision, and it lives in the core:
   residual:** a shown selector still carries about 1 bit per listed emoji and up to about one byte per CJK ideograph
   (240 ideographic selectors), so a payload can still ride on a run of emoji or CJK text. Ordinary prose can no
   longer carry one. This is a deliberate trade-off against warning on every emoji and CJK variant form.
+  A selector after any combining mark (`Mn`/`Me`) is escaped too, whatever the base before the mark.
+- Stacked combining marks are capped (#271). In a run of consecutive `Mn`/`Me` code points (Unicode 16.0
+  `DerivedGeneralCategory`), the first two are shown as-is and the third and later are escaped as `⟨U+XXXX⟩` and set
+  the flag. The run is counted over the input: an escaped character (e.g. U+034F) does not end it. Without the cap, a
+  "zalgo" stack renders as a smear that can bleed over the lines above it, or hide a payload of marks behind one
+  letter. Accented Latin, Vietnamese and most Indic and Arabic text use at most two marks per letter and do not warn.
+  **Accepted false positives:** some Tibetan stacks (`ཧཱུྃ`), Hebrew points plus cantillation, and a few Indic
+  clusters warn; they still render, escaped from the third mark on.
 - `raw` is multi-line content (a heredoc command, a file edit). In its `raw_lines` rendering a line feed is
   structure and a TAB shows as `→   `, without setting the flag: once ESC and lone CRs are escaped, a TAB or a line
   feed cannot overwrite or hide anything, and a warning on every Go edit or heredoc commit would teach humans to
@@ -313,7 +321,8 @@ Validation:
 - The shared vector `crates/allw-core/tests/fixtures/display_vector.json` (asserted by the Rust core and through
   WASM) covers each escaped class, a mixed string, a variation-selector run, a selector after ASCII or after
   ordinary non-ASCII text (bullet, em dash, NBSP, Cyrillic, a Thai mark, an emoji with no variation sequence), and
-  the allowed emoji, keycap and CJK variation forms. CLI tests assert the `watch` process's stdout/stderr bytes contain no raw
+  the allowed emoji, keycap and CJK variation forms, and stacked combining marks (a zalgo run, accented and
+  Vietnamese text that does not warn, a run reset by a new base, a selector after a mark). CLI tests assert the `watch` process's stdout/stderr bytes contain no raw
   ESC/CR for the spoof above and that the warning is the line directly above the prompt, that the `pair` process
   escapes relay-supplied text, and that Go edits and heredoc commits do not warn while ESC/CR spoofs still do. Web
   tests assert a U+202E payload, an escaped envelope id and an escaped outage banner reach the DOM, with the warning
