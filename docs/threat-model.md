@@ -155,7 +155,8 @@ asserted-only signal as cryptographically verified.
 ### R1. Context confidentiality
 
 `ApprovalContext` plaintext must cross the relay boundary only as JWE ciphertext encrypted to enrolled approver
-device keys. Push payloads may carry a wakeup and request id, never action context. See also R7
+device keys. Push payloads may carry a wakeup and request id, never action context; Web Push wakeups carry no
+payload at all (`docs/relay-api.md` §5). See also R7
 (structure-not-data) which further constrains what the plaintext `ApprovalRequest` envelope may reveal.
 
 Validation:
@@ -338,6 +339,9 @@ attestation, audit records, hook/SDK fail-closed behavior, or enrollment.
 - [ ] Any new `ActionRecord` syntactic field is classified: structure fields may appear in the plaintext envelope;
       data fields must land exclusively inside the JWE `context_ciphertext`.
 - [ ] Push/wakeup payloads carry request ids only, never human-shown context.
+- [ ] Any outbound request whose target a client supplies is constrained to an allowlist (SSRF). Web Push
+      subscription endpoints must be `https:` on known push-service hosts, are re-checked before every send, and
+      redirects are not followed (`docs/relay-api.md` §5).
 - [ ] Pending requests expire fail-closed; expired requests cannot later resolve approved.
 - [ ] Network failures, hung reads, refused connections, and malformed relay responses deny or expire, never allow.
 - [ ] Any new endpoint states who may call it and what authentication/authorization is required.

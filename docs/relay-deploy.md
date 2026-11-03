@@ -77,9 +77,9 @@ the repository.
 None are mandatory for a working relay. The relay degrades gracefully when push credentials are
 absent: it falls back to `NoopPushTransport` for every transport, so devices receive requests via
 WebSocket presence and polling rather than push wakeups. This is confirmed in
-`packages/relay/src/index.ts` at `buildPushTransports` (line 1602): all three transports default to
-`NoopPushTransport`/`WebPushStubTransport`, and only switch to live transports when all required
-env vars for that transport are present.
+`packages/relay/src/index.ts` at `buildPushTransports`: all three transports default to
+`NoopPushTransport`, and each switches to its live transport only when all of that transport's
+required env vars are present (for Web Push, a well-formed VAPID keypair and subject).
 
 ### 3b. Optional: Apple Push Notification service (APNs)
 
@@ -119,6 +119,38 @@ node_modules/.bin/wrangler secret put FCM_BEARER_TOKEN --env production
 # Paste the token when prompted.
 ```
 
+### 3d. Optional: Web Push (VAPID) — browser approver wakeups
+
+Required only if you want the web approver to be woken by a push notification when no tab is open.
+The relay authenticates to browser push services with a VAPID keypair (P-256, RFC 8292). The private
+key is a secret; the public key and the contact subject are not.
+
+**[OPERATOR]**
+
+```sh
+# Generate a VAPID keypair (Node 20+, no dependencies). Prints both halves as base64url.
+node -e '
+const { subtle } = globalThis.crypto;
+const b64 = (b) => Buffer.from(b).toString("base64url");
+subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign"]).then(async (k) => {
+  console.log("VAPID_PUBLIC_KEY=" + b64(await subtle.exportKey("raw", k.publicKey)));
+  console.log("VAPID_PRIVATE_KEY=" + (await subtle.exportKey("jwk", k.privateKey)).d);
+});'
+
+# The public key and subject are plain vars. Add them to wrangler.jsonc under env.production:
+#   "vars": { "VAPID_PUBLIC_KEY": "<the printed public key>",
+#             "VAPID_SUBJECT": "mailto:ops@yourcompany.example" }
+# VAPID_SUBJECT is the operator contact push services may use; it must be mailto: or https:.
+
+node_modules/.bin/wrangler secret put VAPID_PRIVATE_KEY --env production
+# Paste the printed private key when prompted. Then discard the local copy.
+```
+
+Verify after deploy: `curl https://<relay>/push/vapid-public-key` returns
+`{"vapid_public_key":"<your public key>"}` (a 404 means one of the three values is missing or
+malformed). **Rotating the keypair invalidates every existing browser subscription**: browsers must
+re-subscribe with the new public key, and old endpoints are pruned as push services reject them.
+
 ### Secrets inventory summary
 
 | Secret / var        | Required | Description                                                                                                                                 |
@@ -128,9 +160,14 @@ node_modules/.bin/wrangler secret put FCM_BEARER_TOKEN --env production
 | `APNS_BEARER_TOKEN` | Optional | APNs token-auth JWT (set via `wrangler secret put`). Short-lived; rotate hourly.                                                            |
 | `FCM_ENDPOINT`      | Optional | FCM HTTP v1 send URL (plain var in `wrangler.jsonc`).                                                                                       |
 | `FCM_BEARER_TOKEN`  | Optional | FCM OAuth 2.0 access token for a service account (set via `wrangler secret put`).                                                           |
+| `VAPID_PUBLIC_KEY`  | Optional | Web Push VAPID public key, base64url uncompressed P-256 point (plain var in `wrangler.jsonc`). Served at `GET /push/vapid-public-key`.      |
+| `VAPID_PRIVATE_KEY` | Optional | Web Push VAPID private key, base64url 32-byte scalar (set via `wrangler secret put`). Long-lived; rotating it invalidates subscriptions.    |
+| `VAPID_SUBJECT`     | Optional | Web Push operator contact, `mailto:` or `https:` URI (plain var in `wrangler.jsonc`).                                                       |
 
 No other secrets are required. The relay derives all per-account auth tokens internally and stores
-only SHA-256 hashes in the Durable Object SQLite database — it holds no static signing key.
+only SHA-256 hashes in the Durable Object SQLite database. Its only static signing key is the
+optional VAPID key, a push-provider transport credential (like the APNs bearer) that never signs
+anything in the approval contract.
 
 ---
 
