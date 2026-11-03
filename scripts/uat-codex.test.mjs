@@ -1,4 +1,12 @@
+/**
+ * Static checks on the human-run Codex UAT helper, which must never run Codex itself.
+ *
+ * @see https://learn.chatgpt.com/docs/config-file/config-reference (approval_policy, approvals_reviewer)
+ * @see https://toml.io/en/v1.0.0
+ * @see ../docs/codex-integration.md
+ */
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 
@@ -97,4 +105,80 @@ test("Generated hooks.json uses self-contained wrapper approach, not unsupported
     /bash.*HOOK_WRAPPER|HOOK_WRAPPER.*bash/,
     'hooks.json "command" must invoke the wrapper via bash',
   );
+});
+
+/** The body of the quoted `<<'TOML'` heredoc that writes the project's `.codex/config.toml`. */
+function extractTomlHeredoc(source) {
+  const match = /cat >"\$PROJECT_DIR\/\.codex\/config\.toml" <<'TOML'\n([\s\S]*?)\nTOML\n/.exec(
+    source,
+  );
+  assert.ok(match, "the script must write .codex/config.toml from a quoted TOML heredoc");
+  return match[1];
+}
+
+/** Parses TOML with Python's standard-library `tomllib` (TOML 1.0), so no parser dependency is added. */
+function parseToml(text) {
+  const result = spawnSync(
+    "python3",
+    ["-I", "-c", "import json, sys, tomllib; print(json.dumps(tomllib.loads(sys.stdin.read())))"],
+    { input: text, encoding: "utf8" },
+  );
+  assert.equal(result.status, 0, `config.toml must parse as TOML: ${result.stderr}`);
+  return JSON.parse(result.stdout);
+}
+
+test("Generated .codex/config.toml parses and sets the fail-closed granular approval policy (#192)", async () => {
+  const script = await readScript();
+  const config = parseToml(extractTomlHeredoc(script));
+
+  // docs/codex-integration.md §Granular approval_policy: each granular key means "this category may
+  // surface"; false auto-rejects. The three categories the PreToolUse hook can't see are false; the
+  // two that only add a Codex-side gate after allw stay true. A human reviews Codex's own prompts.
+  assert.deepEqual(config, {
+    approvals_reviewer: "user",
+    approval_policy: {
+      granular: {
+        sandbox_approval: true,
+        rules: true,
+        mcp_elicitations: false,
+        request_permissions: false,
+        skill_approval: false,
+      },
+    },
+  });
+});
+
+test("UAT project is a git repo with one .rules rule per decision and a printed trust step (#192)", async () => {
+  const script = await readScript();
+  const activeShell = stripHereDocs(script);
+
+  // `codex exec` exits outside a git repository (codex-rs/exec/src/lib.rs), so the project is one.
+  assert.match(activeShell, /^git init -q "\$PROJECT_DIR"$/m);
+
+  // docs/codex-integration.md §execpolicy `.rules`: one prefix_rule per decision, each on its own
+  // command, so each UAT case exercises exactly one rule.
+  const rules = /<<'RULES'\n([\s\S]*?)\nRULES\n/.exec(script)?.[1] ?? "";
+  for (const decision of ["allow", "prompt", "forbidden"]) {
+    assert.match(
+      rules,
+      new RegExp(
+        `pattern = \\["echo", "allw-uat-rules-${decision}"\\],\\n\\s+decision = "${decision}",`,
+      ),
+      `uat.rules must have a ${decision} rule on its own command`,
+    );
+  }
+  assert.match(script, /\.codex\/rules\/uat\.rules/);
+
+  // Codex silently skips an untrusted hook (#348), so the printed instructions must include the
+  // one-time trust step before any case, and a PASS/FAIL line for each new case.
+  assert.match(script, /One-time trust step \(required\)/);
+  for (const line of [
+    ".rules allow: PASS/FAIL",
+    ".rules prompt: PASS/FAIL",
+    ".rules forbidden: PASS/FAIL",
+    "Granular auto-reject: PASS/FAIL",
+    "Permission mode: PASS/FAIL",
+  ]) {
+    assert.ok(script.includes(line), `the #97 template must include "${line}"`);
+  }
 });

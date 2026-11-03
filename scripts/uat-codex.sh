@@ -61,10 +61,13 @@ json_string() {
 }
 
 require_command curl
+require_command git
 require_command node
 require_command pnpm
 
-mkdir -p "$PROJECT_DIR/.codex"
+mkdir -p "$PROJECT_DIR/.codex/rules"
+# Codex exec refuses to run outside a git repository, so the temporary project is one.
+git init -q "$PROJECT_DIR"
 
 printf '==> Building local WASM and workspace packages\n'
 (
@@ -134,12 +137,50 @@ cat >"$PROJECT_DIR/.codex/hooks.json" <<JSON
 }
 JSON
 
+# Codex's own approval posture for the UAT project (docs/codex-integration.md §Granular
+# approval_policy, #192). The allw hook only sees tool calls, so the categories it can't see are
+# auto-rejected here rather than left to surface: each granular key means "may surface", false
+# rejects. A standard table, not the one-line inline form, so any TOML 1.0 parser reads it.
+cat >"$PROJECT_DIR/.codex/config.toml" <<'TOML'
+approvals_reviewer = "user"
+
+[approval_policy.granular]
+sandbox_approval = true      # a second gate after allw; it can only tighten
+rules = true                 # execpolicy `prompt` rules stay interactive
+mcp_elicitations = false     # invisible to the allw hook, so auto-reject
+request_permissions = false  # permission widening the hook can't see, so auto-reject
+skill_approval = false       # auto-reject
+TOML
+
+# execpolicy rules for the .rules interaction cases (#192): one distinct command per decision, so
+# each case exercises exactly one rule. Codex loads <project>/.codex/rules/*.rules in a trusted
+# project.
+cat >"$PROJECT_DIR/.codex/rules/uat.rules" <<'RULES'
+prefix_rule(
+    pattern = ["echo", "allw-uat-rules-allow"],
+    decision = "allow",
+    justification = "allw UAT: an allow rule must not skip the allw hook",
+)
+prefix_rule(
+    pattern = ["echo", "allw-uat-rules-prompt"],
+    decision = "prompt",
+    justification = "allw UAT: records the order of the allw and Codex prompts",
+)
+prefix_rule(
+    pattern = ["echo", "allw-uat-rules-forbidden"],
+    decision = "forbidden",
+    justification = "allw UAT: an allw-approved command is still blocked",
+)
+RULES
+
 cat >"$PROJECT_DIR/README.md" <<EOF
 # allw Codex UAT scratch project
 
-This temporary project contains only project-scoped Codex hook config:
+This temporary project contains only project-scoped Codex config:
 
-- .codex/hooks.json
+- .codex/hooks.json (the allw PreToolUse hook)
+- .codex/config.toml (the fail-closed granular approval_policy)
+- .codex/rules/uat.rules (one allow, one prompt and one forbidden rule)
 - relay: $RELAY_URL
 - account: $ACCOUNT_ID
 
@@ -161,8 +202,16 @@ Temporary Codex project:
 This script will now run allw-approver watch in the foreground so you can
 approve, deny, skip, or let requests time out. Leave this terminal open.
 
-Open a second terminal and run the Codex command yourself. The setup script
+Open a second terminal and run the Codex commands yourself. The setup script
 does not invoke codex.
+
+One-time trust step (required): Codex loads a project's .codex/ config, hooks
+and rules only in a trusted project, and runs a hook only after you approve it.
+codex exec has no prompt for either, so an untrusted allw hook is silently not
+run. Run the interactive TUI once in the project, trust the folder, approve the
+allw PreToolUse hook in the startup hook review, then quit:
+  cd $(printf '%q' "$PROJECT_DIR")
+  codex
 
 Approve case:
   cd $(printf '%q' "$PROJECT_DIR")
@@ -185,6 +234,30 @@ File-edit case:
   cd $(printf '%q' "$PROJECT_DIR")
   codex exec "edit README.md and add a line that says allw-uat-file-edit"
 
+.rules allow case (the gate must still prompt on the second device):
+  cd $(printf '%q' "$PROJECT_DIR")
+  codex exec "run: echo allw-uat-rules-allow"
+
+.rules forbidden case (approve on the second device; Codex must still block it):
+  cd $(printf '%q' "$PROJECT_DIR")
+  codex exec "run: echo allw-uat-rules-forbidden"
+
+.rules prompt case (interactive: codex exec never prompts). Note which prompt
+comes first, the allw one on the second device or Codex's own:
+  cd $(printf '%q' "$PROJECT_DIR")
+  codex
+  then ask: run: echo allw-uat-rules-prompt
+
+Granular auto-reject case (request_permissions = false; nothing may reach a human):
+  cd $(printf '%q' "$PROJECT_DIR")
+  codex
+  then ask: use request_permissions to ask for network access, then fetch https://example.com
+
+Permission-mode case: in the deny case, capture the hook's stdin as well
+(redirect it through tee in the wrapper, as for schema conformance) and note
+permission_mode. Under codex exec it is bypassPermissions, and the hook must
+still have run.
+
 Paste this UAT result template back onto #97:
 
   Approve: PASS/FAIL - command ran only after approval
@@ -192,6 +265,12 @@ Paste this UAT result template back onto #97:
   Timeout: PASS/FAIL - command failed closed after ALLW_TIMEOUT_MS
   Actor identity: PASS/FAIL - inbox showed codex:<hostname>
   File edit: PASS/FAIL - apply_patch was gated with path, summary, and diff hash
+  Schema conformance: PASS/FAIL - deny stdout had only documented fields, no denyReason
+  .rules allow: PASS/FAIL - the allw approval was still required
+  .rules prompt: PASS/FAIL - order: allw first / Codex first; a denial in allw skipped Codex's prompt
+  .rules forbidden: PASS/FAIL - an allw-approved command was still blocked
+  Granular auto-reject: PASS/FAIL - request_permissions was rejected without reaching a human
+  Permission mode: PASS/FAIL - the hook ran under codex exec (permission_mode bypassPermissions)
   Notes:
 
 Press Ctrl-C in this terminal when UAT is complete; cleanup will stop the
