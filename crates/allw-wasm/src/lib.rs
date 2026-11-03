@@ -51,6 +51,7 @@ use allw_core::{
     evaluate_for_actor as core_evaluate_for_actor,
     is_small_order_x25519_public_key as core_is_small_order_x25519_public_key,
     issue_device_cert as core_issue_device_cert, revoked_device_ids as core_revoked_device_ids,
+    seal_context_for_account_state as core_seal_context_for_account_state,
     select_recipients as core_select_recipients, sign_account_state as core_sign_account_state,
     sign_actor_attestation as core_sign_actor_attestation,
     sign_pairing_start_authorization as core_sign_pairing_start_authorization,
@@ -751,6 +752,81 @@ pub fn select_recipients(
         .collect();
     to_json(&wire, "selected recipients")
 }
+
+// ── seal_context_for_account_state ───────────────────────────────────────────────────
+
+/// The JSON shape [`seal_context_for_account_state`] returns.
+#[derive(Serialize)]
+struct WasmSealedContext<'a> {
+    ciphertext: &'a str,
+    sequence: u64,
+}
+
+/// Encrypts an [`ApprovalContext`](allw_core::ApprovalContext) to exactly the devices root-signed
+/// account state selects (core
+/// [`seal_context_for_account_state`](allw_core::seal_context_for_account_state)), returning JSON
+/// `{ "ciphertext": string, "sequence": number }`.
+///
+/// The selected recipient keys never cross into JavaScript: the only way to get a ciphertext here
+/// is through the core's selection rules ([`select_recipients`]). `sequence` is the highest
+/// verified account-state sequence the recipients came from; a caller that persists a floor records
+/// it before sending the ciphertext. Randomness comes from the platform CSPRNG, as for
+/// [`encrypt_context`].
+///
+/// # Errors
+///
+/// Throws, with nothing encrypted, on any [`select_recipients`] error (same inputs, same rules), a
+/// malformed `context_json`, or a selected sequence above JS safe-integer range (it could not be
+/// persisted exactly as a floor).
+#[wasm_bindgen]
+pub fn seal_context_for_account_state(
+    context_json: &str,
+    account_states_json: &str,
+    expected_account_id: &str,
+    account_root_pubkey_b64: &str,
+    now_ms: f64,
+    min_sequence: Option<f64>,
+) -> Result<String, JsError> {
+    let context: ApprovalContext = parse_json(context_json, "ApprovalContext")?;
+    let root = parse_account_root_pubkey(account_root_pubkey_b64)?;
+    let now_ms = ms_to_i64(now_ms, "now_ms")?;
+    if now_ms < 0 {
+        return Err(JsError::new(&format!(
+            "now_ms must be a non-negative Unix millisecond timestamp, got {now_ms}"
+        )));
+    }
+    let min_sequence = sequence_floor_from_f64(min_sequence)?;
+    let account_states = parse_account_states_json(account_states_json)?;
+    let account_state_refs: Vec<&str> = account_states.iter().map(String::as_str).collect();
+
+    let sealed = core_seal_context_for_account_state(
+        &context,
+        &account_state_refs,
+        expected_account_id,
+        &root,
+        now_ms,
+        min_sequence,
+        &mut OsRng,
+    )
+    .map_err(|e| JsError::new(&format!("seal_context_for_account_state failed: {e}")))?;
+    // The floor round-trips through a JS number; refuse a sequence it cannot hold exactly.
+    if sealed.sequence > JS_MAX_SAFE_SEQUENCE {
+        return Err(JsError::new(&format!(
+            "selected account-state sequence {} exceeds JS safe-integer range (2^53-1)",
+            sealed.sequence
+        )));
+    }
+    to_json(
+        &WasmSealedContext {
+            ciphertext: &sealed.ciphertext,
+            sequence: sealed.sequence,
+        },
+        "sealed context",
+    )
+}
+
+/// `Number.MAX_SAFE_INTEGER` as a `u64`: the largest sequence a JS caller can persist exactly.
+const JS_MAX_SAFE_SEQUENCE: u64 = (1 << 53) - 1;
 
 // ── self-certifying account id + pairing-start authorization ────────────────────────
 
