@@ -31,11 +31,11 @@ export const ALARM_RETRY_MS = 10_000;
 /** Runs the work for one purpose. It reschedules itself (via {@link AlarmMultiplexer.schedule}) if more is due later. */
 export type AlarmHandler = (nowMs: number) => Promise<void> | void;
 
-/** A row of `alarm_due`. A type alias, not an interface, so it satisfies `sql.exec`'s row constraint. */
-type AlarmDueRow = {
+/** A row of `alarm_due`. */
+interface AlarmDueRow extends Record<string, string | number | null | ArrayBuffer> {
   purpose: string;
   due_at: number;
-};
+}
 
 /**
  * Multiplexes the Durable Object alarm across named purposes; see the module comment.
@@ -45,6 +45,11 @@ type AlarmDueRow = {
  */
 export class AlarmMultiplexer<Purpose extends string> {
   private readonly storage: DurableObjectStorage;
+  /**
+   * While {@link run} is executing: the purposes scheduled (or cleared) by a handler during this
+   * firing. A due purpose missing from it did not reschedule itself, so its row is removed.
+   */
+  private scheduledDuringRun: Set<string> | undefined;
 
   constructor(storage: DurableObjectStorage) {
     this.storage = storage;
@@ -61,6 +66,7 @@ export class AlarmMultiplexer<Purpose extends string> {
    * to clear it. The alarm is then re-armed to the earliest due time across all purposes.
    */
   async schedule(purpose: Purpose, dueAt: number | null): Promise<void> {
+    this.scheduledDuringRun?.add(purpose);
     if (dueAt === null) {
       this.storage.sql.exec(`DELETE FROM alarm_due WHERE purpose = ?`, purpose);
     } else {
@@ -89,10 +95,11 @@ export class AlarmMultiplexer<Purpose extends string> {
    * The alarm fired: run every purpose due at `nowMs`, plus every purpose in `options.everyFiring`,
    * in the order of `handlers`. Then re-arm.
    *
-   * - A purpose stays scheduled only if its handler set a new due time. Otherwise its row is
-   *   removed once the handler returns.
-   * - A handler that throws is logged and retried after {@link ALARM_RETRY_MS}. The remaining
-   *   purposes still run.
+   * - A due purpose stays scheduled only if its handler called {@link schedule} for it, even with
+   *   the very time it fired for. Otherwise its row is removed once the handler returns.
+   * - A handler that throws is logged and retried within {@link ALARM_RETRY_MS}. A retry never
+   *   pushes a purpose back: if it is already due sooner but still in the future (including a time
+   *   the handler set before throwing), that time is kept. The remaining purposes still run.
    * - A due row for a purpose not in `handlers` (a purpose since retired) is removed.
    */
   async run(
@@ -114,28 +121,35 @@ export class AlarmMultiplexer<Purpose extends string> {
         this.storage.sql.exec(`DELETE FROM alarm_due WHERE purpose = ?`, purpose);
       }
     }
-    for (const [purpose, handler] of Object.entries(handlers) as Array<[Purpose, AlarmHandler]>) {
-      const dueAt = dueAtByPurpose.get(purpose);
-      if (dueAt === undefined && !everyFiring.has(purpose)) continue;
-      try {
-        await handler(nowMs);
-        // Remove a due row only if the handler did not reschedule the purpose.
-        if (dueAt !== undefined) {
+    const scheduled = new Set<string>();
+    this.scheduledDuringRun = scheduled;
+    try {
+      for (const [purpose, handler] of Object.entries(handlers) as [Purpose, AlarmHandler][]) {
+        const dueAt = dueAtByPurpose.get(purpose);
+        if (dueAt === undefined && !everyFiring.has(purpose)) continue;
+        try {
+          await handler(nowMs);
+          // Remove a due row only if the handler did not reschedule the purpose.
+          if (dueAt !== undefined && !scheduled.has(purpose)) {
+            this.storage.sql.exec(`DELETE FROM alarm_due WHERE purpose = ?`, purpose);
+          }
+        } catch (error) {
+          console.warn(`alarm purpose '${purpose}' failed; retrying`, error);
+          // Retry at now + ALARM_RETRY_MS, unless the purpose is already due sooner and still in
+          // the future: a retry never pushes a purpose back. A due time at or before now (the
+          // one this firing ran for) is replaced, or the alarm would refire at once and spin.
           this.storage.sql.exec(
-            `DELETE FROM alarm_due WHERE purpose = ? AND due_at = ?`,
+            `INSERT INTO alarm_due (purpose, due_at) VALUES (?, ?)
+             ON CONFLICT (purpose) DO UPDATE SET due_at =
+               CASE WHEN due_at > ? AND due_at < excluded.due_at THEN due_at ELSE excluded.due_at END`,
             purpose,
-            dueAt,
+            nowMs + ALARM_RETRY_MS,
+            nowMs,
           );
         }
-      } catch (error) {
-        console.warn(`alarm purpose '${purpose}' failed; retrying`, error);
-        this.storage.sql.exec(
-          `INSERT INTO alarm_due (purpose, due_at) VALUES (?, ?)
-           ON CONFLICT (purpose) DO UPDATE SET due_at = excluded.due_at`,
-          purpose,
-          nowMs + ALARM_RETRY_MS,
-        );
       }
+    } finally {
+      this.scheduledDuringRun = undefined;
     }
     await this.rearm();
   }

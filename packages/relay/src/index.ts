@@ -530,9 +530,9 @@ export class AccountRelay implements DurableObject {
     this.pushTransports = buildPushTransports(env);
     this.initSchema();
     this.alarms = new AlarmMultiplexer(ctx.storage);
-    // On reactivation, restore the alarm from persisted pending rows in case the previous
+    // On reactivation, restore every alarm purpose from its persisted rows, in case the previous
     // isolate exited after a write but before the scheduled alarm was durably restored.
-    this.ctx.waitUntil(this.armExpiryAlarm());
+    this.ctx.waitUntil(this.armExpiryAlarm().then(() => this.armTrailingWakeupAlarm()));
   }
 
   // ---------------------------------------------------------------------------

@@ -287,9 +287,9 @@ connection authenticated with that enrolled device's relay bearer token (#89).
 **Fail-closed expiry** (§Invariants #6): once a request is past `expires_at` it can never become approvable. A
 verdict for an expired request is refused (acked `expired`, not stored); the offline-queue flush skips expired
 requests (no dead request is re-pushed); and a read after the deadline **lazy-expires** the row — poll returns the
-terminal `expired` status and `…/wait` is pushed `{ type: "expired", request_id }`. (A proactive `alarm()` sweep
-that retracts expired requests from devices without waiting for a read is tracked in
-[#44](https://github.com/mike-north/allw/issues/44).) Verdicts are accepted **only** from a socket whose device is
+terminal `expired` status and `…/wait` is pushed `{ type: "expired", request_id }`. In addition, the relay's
+Durable Object alarm expires overdue requests proactively, retracting them from connected devices and pushing
+`expired` to waiters without waiting for a read ([#44](https://github.com/mike-north/allw/issues/44)). Verdicts are accepted **only** from a socket whose device is
 still enrolled — a revoked device cannot drive a request to `resolved`. `GET /requests/{id}` no longer treats
 `request_id` alone as sufficient authority; callers must also present the request token returned by
 `POST /requests` (#89).

@@ -141,6 +141,8 @@ describe("AlarmMultiplexer — running", () => {
   });
 
   it("retries a failing purpose later without losing it, and still runs the others", async () => {
+    // The due time it fired for is in the past, so it is replaced rather than kept: keeping it
+    // would refire the alarm at once, in a loop.
     await withMultiplexer("alarms-run-throw", async (mux, storage) => {
       const now = future(0);
       await mux.schedule("first", now);
@@ -161,6 +163,69 @@ describe("AlarmMultiplexer — running", () => {
       expect(await storage.getAlarm()).toBe(now + ALARM_RETRY_MS);
       expect(warn).toHaveBeenCalled();
       warn.mockRestore();
+    });
+  });
+
+  it("never pushes back a failing purpose that was already due sooner (review S2)", async () => {
+    // Expiry is every-firing: it can fail on a firing caused by another purpose while its own
+    // deadline is a few seconds away. The retry must not move that deadline later.
+    await withMultiplexer("alarms-run-throw-sooner", async (mux, storage) => {
+      const now = future(0);
+      const sooner = now + ALARM_RETRY_MS - 7_000;
+      await mux.schedule("first", sooner);
+      await mux.schedule("second", now);
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      await mux.run(
+        now,
+        {
+          first: () => {
+            throw new Error("boom");
+          },
+          second: vi.fn(),
+        },
+        { everyFiring: ["first"] },
+      );
+
+      expect(mux.dueAt("first")).toBe(sooner);
+      expect(await storage.getAlarm()).toBe(sooner);
+      warn.mockRestore();
+    });
+  });
+
+  it("keeps a sooner time the failing handler set for itself before throwing", async () => {
+    await withMultiplexer("alarms-run-resched-then-throw", async (mux) => {
+      const now = future(0);
+      const next = now + 2_000;
+      await mux.schedule("first", now);
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      await mux.run(now, {
+        first: async () => {
+          await mux.schedule("first", next);
+          throw new Error("boom after rescheduling");
+        },
+        second: vi.fn(),
+      });
+
+      expect(mux.dueAt("first")).toBe(next);
+      warn.mockRestore();
+    });
+  });
+
+  it("keeps a purpose whose handler rescheduled it for the very time it fired for (review N1)", async () => {
+    await withMultiplexer("alarms-run-resched-same", async (mux) => {
+      const now = future(0);
+      await mux.schedule("first", now);
+
+      await mux.run(now, {
+        first: async () => {
+          await mux.schedule("first", now);
+        },
+        second: vi.fn(),
+      });
+
+      expect(mux.dueAt("first")).toBe(now);
     });
   });
 

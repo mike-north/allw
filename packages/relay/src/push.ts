@@ -61,7 +61,8 @@ export const MAX_PUSH_TOKENS_PER_ACCOUNT = 32;
  * before the service worker's inbox fetch. A submit skipped by coalescing may land after that
  * fetch, so the relay sends one **trailing** wakeup when the window ends (see `AccountRelay`'s
  * `webpush_trailing_wakeup`). Every request then gets a wakeup sent after it was stored, still at
- * most one push per subscription per window.
+ * most one push per subscription per window (per instance; an evicted object forgets earlier
+ * claims, #319).
  */
 export const WEB_PUSH_COALESCE_MS = 30_000;
 
@@ -281,7 +282,8 @@ export class FcmPushTransport implements PushTransport {
  *
  * State is in memory and every method is synchronous: the Durable Object runs one event at a time,
  * so a check-and-claim cannot interleave with another submit (no TOCTOU). Losing the state when the
- * object is evicted only re-allows one wakeup, and eviction requires the account to go idle.
+ * object is evicted only re-allows one wakeup, and eviction requires the account to go idle
+ * (persisting the last claim is #319).
  */
 export class WakeupCoalescer {
   private readonly windowMs: number;
