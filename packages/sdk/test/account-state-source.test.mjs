@@ -442,6 +442,28 @@ test("source: no published state, a relay error, or a corrupt floor → stage 'l
   }
 });
 
+// Regression: a relay deployed before account-state GET became unauthenticated answers it with
+// 401. The request must still fail closed at load, and the message must name the fix (redeploy the
+// relay) rather than a bare status the operator cannot act on.
+test("source: a relay that answers 401 on /account-states → stage 'load', message says redeploy the relay", async () => {
+  const wasm = await loadWasm();
+  const account = makeAccount(wasm);
+  const dir = tempDir();
+  const relay = makeRelay({ states: [account.stateAt(1)], status: 401 });
+  await assert.rejects(
+    () => sourcedClient(account, relay, dir).requestApproval(sampleRequest()),
+    (err) => {
+      assert.ok(err instanceof RecipientSelectionError, String(err));
+      assert.equal(err.stage, "load");
+      assert.match(err.message, /HTTP 401/);
+      assert.match(err.message, /relay is too old/);
+      assert.match(err.message, /redeploy it from current allw main, see docs\/relay-deploy\.md$/);
+      return true;
+    },
+  );
+  assert.equal(relay.state.submitted, 0, "nothing sent");
+});
+
 test(
   "source: a floor that cannot be written → stage 'accept', nothing sent",
   { skip: process.platform === "win32" || isRoot },

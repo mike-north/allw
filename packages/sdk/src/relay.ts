@@ -280,6 +280,17 @@ export class RelayClient {
    */
   async fetchAccountStates(): Promise<AccountStatesResponse> {
     const resp = await this.timedFetch(`${this.base}/account-states`, { method: "GET" });
+    if (resp.status === 401) {
+      // The endpoint is unauthenticated (account-state documents are public and root-verified), so
+      // a relay that demands authorization for it predates that endpoint. Name the fix (a relay
+      // redeploy), early and short: hook deny reasons keep only the first 256 characters. Still a
+      // throw, so the request fails closed.
+      throw new RelayError(
+        "relay account-state fetch failed (HTTP 401): this relay is too old (it requires auth " +
+          "for GET /account-states); redeploy it from current allw main, see docs/relay-deploy.md",
+        resp.status,
+      );
+    }
     if (!resp.ok) {
       throw new RelayError(
         `relay account-state fetch failed (HTTP ${String(resp.status)})`,

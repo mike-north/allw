@@ -134,6 +134,11 @@ function relayDouble(wasm, approver, decision, forge = (verdict) => verdict, opt
 
     // GET /:acct/account-states — the root-signed states that decide who may read the request.
     if (url.endsWith("/account-states") && method === "GET") {
+      if (options.accountStatesStatus !== undefined) {
+        return new Response(JSON.stringify({ error: "authorization required" }), {
+          status: options.accountStatesStatus,
+        });
+      }
       return json({ account_states: accountStates, max_sequence: accountStates.length });
     }
 
@@ -325,6 +330,28 @@ test("end-to-end (#243, fail-closed): a relay that rolls back below the floor �
   assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
   assert.match(output.hookSpecificOutput.permissionDecisionReason, /sequence floor|below/i);
   assert.equal(rolledBack.state.submitted, 0, "the request is never sent");
+});
+
+// Regression: against a relay deployed before account-state GET became unauthenticated, the hook
+// must still deny, and the reason must tell the operator to redeploy the relay.
+test("end-to-end (#243, fail-closed): a relay too old for account-state GET (401) → deny saying redeploy", async (t) => {
+  const wasm = await loadWasm();
+  const approver = await pairedApprover(wasm);
+  withConfigHome(t);
+  const relay = relayDouble(wasm, approver, "approved", undefined, { accountStatesStatus: 401 });
+
+  const output = await runHook(
+    bashStdin("rm -rf build", "/w"),
+    env(approver, TIMEOUT_MS),
+    overrides(relay.fetchImpl),
+  );
+  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(
+    output.hookSpecificOutput.permissionDecisionReason,
+    /relay is too old .*; redeploy it from current allw main, see docs\/relay-deploy\.md$/,
+    "the whole fix survives the deny-reason length cap",
+  );
+  assert.equal(relay.state.submitted, 0);
 });
 
 test("end-to-end (#243, fail-closed): no published account state → deny naming allw-approver pair", async (t) => {
