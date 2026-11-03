@@ -389,9 +389,13 @@ enrolled devices before root binding existed (#264's pre-binding state): they no
 submit and must move to a new account root, as #264 already requires (their first bind is refused
 with 409, see §3 Pairing).
 
-**Request id.** The envelope `id` must be a canonical UUID — 8-4-4-4-12 hex digits, either case
-(contract §Transport requires UUIDv4 or later) — otherwise **400**. This bounds the id, which is
-part of every retained row.
+**Request id.** The envelope `id` must be a UUID in lowercase canonical form — 8-4-4-4-12
+lowercase hex digits (contract §Transport requires UUIDv4 or later) — otherwise **400**. The relay
+never normalizes an id: an upper- or mixed-case id is refused, not lowered. This bounds the id,
+which is part of every retained row.
+
+**`expires_at`.** Must be an integer (i64 ms) — a fractional value ⇒ **400** — and is then held to
+the horizon below.
 
 **`created_at` sanity bound.** The envelope's `created_at` must be an integer (i64 ms), no later
 than `expires_at`, no further back than the request horizon (`now − MAX_REQUEST_TTL_MS`), and no
@@ -408,7 +412,11 @@ Limits on `POST /{acct}/requests` (#248; constants in `packages/relay/src/consta
 | `context_ciphertext`         | `MAX_CONTEXT_CIPHERTEXT_BYTES` = 64 KiB (UTF-8 bytes of the string) | **413**        |
 | Horizon (`expires_at − now`) | `MAX_REQUEST_TTL_MS`, default **15 min** (Worker var override)      | **400**        |
 
-Each value is inclusive (exactly the limit is accepted). The 15-minute horizon covers the hooks'
+Each value is inclusive (exactly the limit is accepted). The `context_ciphertext` ceiling is the
+one integrators can hit with honest input: it caps the encrypted context, which is larger than the
+plaintext context the SDK encrypts. Over-size fails closed — the relay stores nothing, and the SDK's
+`requestApproval` rejects with a `RelayError` (`name` `"RelayError"`, `status` 413), which a caller must treat as deny. The
+SDK does no pre-check of its own. The 15-minute horizon covers the hooks'
 420 s maximum timeout; an operator who lowers it below that makes hook requests fail closed. A
 pending request older than the horizon (only possible for one stored before the horizon existed) is
 expired by the alarm; like every terminal request it is deleted 7 days after it ends. When a request
