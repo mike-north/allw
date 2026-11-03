@@ -28,12 +28,15 @@ export type CappedBody =
 export async function readBodyCapped(request: Request, maxBytes: number): Promise<CappedBody> {
   const declared = request.headers.get("Content-Length");
   if (declared !== null) {
-    const length = Number(declared);
-    if (!/^\d+$/.test(declared.trim()) || !Number.isSafeInteger(length)) {
+    const digits = declared.trim();
+    if (!/^\d+$/.test(digits)) {
+      // Release the unread body rather than leaving the sender's stream dangling.
+      await request.body?.cancel().catch(() => undefined);
       return { kind: "unreadable" };
     }
-    if (length > maxBytes) {
-      // Release the unread body rather than leaving the sender's stream dangling.
+    // A digit-only length beyond the safe-integer range is still a declared size, and over any cap.
+    const length = Number(digits);
+    if (!Number.isSafeInteger(length) || length > maxBytes) {
       await request.body?.cancel().catch(() => undefined);
       return { kind: "too_large" };
     }

@@ -533,9 +533,12 @@ const deviceTag = (deviceId: string): string => `device:${deviceId}`;
 const surfaceTag = (surfaceId: string): string => `surface:${surfaceId}`;
 const integratorTag = (requestId: string): string => `integrator:${requestId}`;
 
-/** Canonical UUID text form (RFC 9562 §4): 8-4-4-4-12 hex digits, either case. */
-const REQUEST_ID_PATTERN =
-  /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/;
+/**
+ * Canonical UUID text form (RFC 9562 §4, which generators MUST emit in lowercase): 8-4-4-4-12
+ * lowercase hex digits. Only that one spelling is accepted, and ids are never normalized: the id is
+ * inside the envelope the device sees and binds to, so one UUID must have exactly one identity.
+ */
+const REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 // The exact, exhaustive set of ApprovalRequest envelope keys the relay accepts (contract.md
 // §Messages). Anything else is rejected at submit time to keep plaintext out of the relay.
@@ -1678,8 +1681,8 @@ export class AccountRelay implements DurableObject {
    * Stores the request and fans the ciphertext out to every online device. If no device is
    * connected it stays queued and is delivered on the next `…/connect` (see handleDeviceConnect).
    * - 404: the account has no bound root (`unknown account`): no device can have paired.
-   * - 400: not exactly the contract's envelope fields, an `id` that is not a canonical UUID,
-   *        already expired, `expires_at - now` beyond the request horizon (`maxRequestTtlMs`,
+   * - 400: not exactly the contract's envelope fields, an `id` that is not a lowercase canonical
+   *        UUID, an `expires_at` that is not an integer or is already past, `expires_at - now` beyond the request horizon (`maxRequestTtlMs`,
    *        default 15 min), or a `created_at` that is not an integer, is after `expires_at`, is
    *        more than the horizon in the past, or is more than `MAX_CREATED_AT_SKEW_MS` ahead.
    * - 409: a request with this `id` was already submitted.
@@ -1711,10 +1714,11 @@ export class AccountRelay implements DurableObject {
 
     const id = requiredString(envelope, "id");
     if (!id) return json({ error: "'id' is required (string)" }, 400);
-    // Canonical UUID syntax only (contract §Transport: UUIDv4+). Bounds the id's size — it is a
-    // primary key, a WebSocket tag and part of every retained row — and its character set.
+    // Lowercase canonical UUID syntax only (contract §Transport: UUIDv4+). Bounds the id's size —
+    // it is a primary key, a WebSocket tag and part of every retained row — and its character set,
+    // and gives each UUID one spelling (never normalized: the device binds to the id as sent).
     if (!REQUEST_ID_PATTERN.test(id)) {
-      return json({ error: "'id' must be a canonical UUID (8-4-4-4-12 hex)" }, 400);
+      return json({ error: "'id' must be a lowercase canonical UUID (8-4-4-4-12 hex)" }, 400);
     }
     if (requiredNumber(envelope, "v") === null) {
       return json({ error: "'v' is required (number)" }, 400);
@@ -1738,6 +1742,9 @@ export class AccountRelay implements DurableObject {
     }
     const expiresAt = requiredNumber(envelope, "expires_at");
     if (expiresAt === null) return json({ error: "'expires_at' is required (i64 ms)" }, 400);
+    if (!Number.isInteger(expiresAt)) {
+      return json({ error: "'expires_at' must be an integer (i64 ms)" }, 400);
+    }
 
     const now = this.now();
     if (expiresAt <= now) return json({ error: "request already expired" }, 400);

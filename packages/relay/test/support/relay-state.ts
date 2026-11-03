@@ -9,8 +9,7 @@
  *
  * `POST /{acct}/requests` refuses accounts with no bound root (404 "unknown account", #248). Tests
  * that submit without pairing a device bind the account's test root directly — the same row a
- * verified root-signed `pairing/start` writes — instead of spending a pairing (and its rate-limit
- * budget) per account.
+ * verified root-signed `pairing/start` writes — instead of spending a pairing per account.
  *
  * @see ./README.md
  */
