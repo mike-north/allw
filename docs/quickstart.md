@@ -254,13 +254,13 @@ end-to-end-encrypted and cryptographically verified.
 
 ## Troubleshooting
 
-| Symptom                                      | Cause / fix                                                                                                                    |
-| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Symptom                                        | Cause / fix                                                                                                                                                          |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Hook always denies with "no allw config found" | `~/.allw/config.json` (step 4) doesn't exist for the user Claude Code runs as, and no `ALLW_*` overrides are set. Write the file (or set `ALLW_CONFIG` to its path). |
-| Hook denies with "vendored wasm not found"   | You're running an unbuilt checkout, not the installed package. `npm install @allw/hook` (it bundles the WASM via `@allw/sdk`). |
-| No prompt appears in the watch terminal      | The account id / `--relay` printed by `pair` must match `account_id` / `relay_url` in `~/.allw/config.json` (or their `ALLW_*` overrides).                       |
-| Request times out immediately                | Check the relay is running (step 0) and reachable at the configured `relay_url`.                                                         |
-| `git status` runs without prompting          | Only `Bash` and `mcp__*` are gated. Reads/edits/greps pass through by design (v0 conservative matcher).                        |
+| Hook denies with "vendored wasm not found"     | You're running an unbuilt checkout, not the installed package. `npm install @allw/hook` (it bundles the WASM via `@allw/sdk`).                                       |
+| No prompt appears in the watch terminal        | The account id / `--relay` printed by `pair` must match `account_id` / `relay_url` in `~/.allw/config.json` (or their `ALLW_*` overrides).                           |
+| Request times out immediately                  | Check the relay is running (step 0) and reachable at the configured `relay_url`.                                                                                     |
+| `git status` runs without prompting            | Only `Bash` and `mcp__*` are gated. Reads/edits/greps pass through by design (v0 conservative matcher).                                                              |
 
 ---
 

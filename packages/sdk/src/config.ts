@@ -98,11 +98,10 @@ interface FieldSpec {
   readonly envVar: "ALLW_RELAY_URL" | "ALLW_ACCOUNT_ID" | "ALLW_APPROVER_ROOT_KEY";
 }
 
-const FIELDS: readonly FieldSpec[] = [
-  { key: "relay_url", envVar: "ALLW_RELAY_URL" },
-  { key: "account_id", envVar: "ALLW_ACCOUNT_ID" },
-  { key: "approver_root_key", envVar: "ALLW_APPROVER_ROOT_KEY" },
-];
+const RELAY_FIELD: FieldSpec = { key: "relay_url", envVar: "ALLW_RELAY_URL" };
+const ACCOUNT_FIELD: FieldSpec = { key: "account_id", envVar: "ALLW_ACCOUNT_ID" };
+const ROOT_FIELD: FieldSpec = { key: "approver_root_key", envVar: "ALLW_APPROVER_ROOT_KEY" };
+const FIELDS: readonly FieldSpec[] = [RELAY_FIELD, ACCOUNT_FIELD, ROOT_FIELD];
 
 const FILE_KEYS = new Set<string>(["version", ...FIELDS.map((f) => f.key)]);
 
@@ -169,7 +168,7 @@ function readConfigFile(path: string, explicit: boolean): Record<string, string>
   const obj = parsed as Record<string, unknown>;
   if (obj.version !== CLIENT_CONFIG_VERSION) {
     throw new ClientConfigError(
-      `allw: config file ${path} has unsupported version ${JSON.stringify(obj.version) ?? "(missing)"}; ` +
+      `allw: config file ${path} has unsupported version ${obj.version === undefined ? "(missing)" : JSON.stringify(obj.version)}; ` +
         `this @allw/sdk understands only version ${String(CLIENT_CONFIG_VERSION)}. Upgrade @allw/sdk ` +
         `or rewrite the file (fail-closed)`,
       path,
@@ -241,8 +240,6 @@ export function loadClientConfig(options: LoadClientConfigOptions = {}): Integra
     resolved[field.key] = { value: fromFile, fromEnv: false };
   }
 
-  const spec = (key: FieldSpec["key"]): FieldSpec =>
-    FIELDS.find((f) => f.key === key) ?? { key, envVar: "ALLW_RELAY_URL" };
   const relay = resolved.relay_url;
   const account = resolved.account_id;
   const root = resolved.approver_root_key;
@@ -255,7 +252,7 @@ export function loadClientConfig(options: LoadClientConfigOptions = {}): Integra
   } catch (cause) {
     throw new ClientConfigError(
       `${cause instanceof Error ? cause.message : String(cause)} (from ${describeSource(
-        spec("relay_url"),
+        RELAY_FIELD,
         relay.fromEnv,
         path,
       )}; fail-closed)`,
@@ -273,7 +270,7 @@ export function loadClientConfig(options: LoadClientConfigOptions = {}): Integra
   } catch (cause) {
     throw new ClientConfigError(
       `allw: approver_root_key from ${describeSource(
-        spec("approver_root_key"),
+        ROOT_FIELD,
         root.fromEnv,
         path,
       )} is not a base64url-unpadded 32-byte Ed25519 public key (${
@@ -290,11 +287,11 @@ export function loadClientConfig(options: LoadClientConfigOptions = {}): Integra
   } catch (cause) {
     throw new ClientConfigError(
       `allw: account_id from ${describeSource(
-        spec("account_id"),
+        ACCOUNT_FIELD,
         account.fromEnv,
         path,
       )} does not derive from approver_root_key from ${describeSource(
-        spec("approver_root_key"),
+        ROOT_FIELD,
         root.fromEnv,
         path,
       )}. Account ids are self-certifying; use the account id and root key that ` +

@@ -250,7 +250,11 @@ test("malformed JSON is rejected even when env overrides every field", (t) => {
   assertConfigError(
     () =>
       loadClientConfig({
-        env: { ALLW_RELAY_URL: RELAY, ALLW_ACCOUNT_ID: A.accountId, ALLW_APPROVER_ROOT_KEY: A.rootKey },
+        env: {
+          ALLW_RELAY_URL: RELAY,
+          ALLW_ACCOUNT_ID: A.accountId,
+          ALLW_APPROVER_ROOT_KEY: A.rootKey,
+        },
         path,
       }),
     path,

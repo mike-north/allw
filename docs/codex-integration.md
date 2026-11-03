@@ -175,14 +175,14 @@ The matcher intentionally matches the hook's v1 surfaces:
 The hook reads the same allw config as the Claude Code hook — `~/.allw/config.json` through
 `@allw/sdk`'s `loadClientConfig` — with these env vars as overrides:
 
-| Variable                 | Required | Meaning                                                                    |
-| ------------------------ | -------- | -------------------------------------------------------------------------- |
-| `ALLW_CONFIG`            | no       | Config-file path (default `~/.allw/config.json`).                          |
-| `ALLW_RELAY_URL`         | no       | Overrides `relay_url`: base URL of the zero-knowledge relay.               |
-| `ALLW_ACCOUNT_ID`        | no       | Overrides `account_id`: the approver's self-certifying relay account id.   |
-| `ALLW_APPROVER_ROOT_KEY` | no       | Overrides `approver_root_key`: the approver account-root Ed25519 key.      |
-| `ALLW_TIMEOUT_MS`        | no       | Fail-closed approval deadline in ms, capped below hook time.               |
-| `ALLW_FETCH_TIMEOUT_MS`  | no       | Per-relay-fetch timeout in ms, only allowed to lower the cap.              |
+| Variable                 | Required | Meaning                                                                  |
+| ------------------------ | -------- | ------------------------------------------------------------------------ |
+| `ALLW_CONFIG`            | no       | Config-file path (default `~/.allw/config.json`).                        |
+| `ALLW_RELAY_URL`         | no       | Overrides `relay_url`: base URL of the zero-knowledge relay.             |
+| `ALLW_ACCOUNT_ID`        | no       | Overrides `account_id`: the approver's self-certifying relay account id. |
+| `ALLW_APPROVER_ROOT_KEY` | no       | Overrides `approver_root_key`: the approver account-root Ed25519 key.    |
+| `ALLW_TIMEOUT_MS`        | no       | Fail-closed approval deadline in ms, capped below hook time.             |
+| `ALLW_FETCH_TIMEOUT_MS`  | no       | Per-relay-fetch timeout in ms, only allowed to lower the cap.            |
 
 With neither the file nor the overrides, or with an invalid file, every gated call is denied with a
 reason naming both ways to configure.
