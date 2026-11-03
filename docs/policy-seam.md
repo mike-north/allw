@@ -148,6 +148,33 @@ program, so callers must run `argv` without a shell.
 
 Do **not** build capability inference or a schema DB in v1. Just don't foreclose them.
 
+### v1 command risk: classify the program that actually runs
+
+`risk` on a `command` record is a coarse heuristic (the table lives in `crates/allw-core/src/command.rs`). It is
+a hint shown to the human. Policy never reads it. It is classified on the program that **actually runs**, not
+only `argv[0]`, so a prefix can never make a command look less risky than it is (decided 2026-11-02, #268):
+
+- **Leading `NAME=value` assignments are skipped.** The tier is that of the command after them, and at least
+  `medium`: an assignment can change what a program does (`LD_PRELOAD`, `PATH`, `GIT_SSH_COMMAND`).
+  `X=1 rm -rf ~` is `high`, the same as `rm -rf ~`.
+- **A wrapper never lowers risk.** The wrappers are `env`, `sudo`, `doas`, `nice`, `ionice`, `nohup`, `time`,
+  `timeout`, `command`, `exec`, `xargs`, `stdbuf` and `setsid`. A wrapper is at least as risky as anything it
+  may be running. T1 can't tell an option value (`nice -n 10`) from the wrapped program, so every later
+  non-flag word counts. `env rm -rf ~` is `high`. `env` with nothing to run stays `low`.
+- **`sh` / `bash` / `zsh` / `dash` / `ksh` with `-c`** is at least as risky as its command string.
+  - Nesting past 4 levels is `high` rather than analyzed further.
+  - An argv too long to analyze in full (past 256 words) treats its unanalyzed tail as `high` for any wrapper
+    or assignment in front of it.
+- The result is never lower than the `argv[0]`-only tier.
+
+This changes **only `risk`**. `bin`, `argv`, `flags`, `positionals` and `env_refs` keep their T1 meaning, and
+`bin` is still `argv[0]` (`X=1 rm -rf ~` has `bin: "X=1"`). The `bin` question is **open**: `CommandMatcher`
+matches `bin` exactly, so a `{ bin: "ls" }` any-args `allow` rule would start matching
+`LD_PRELOAD=/tmp/evil.so ls` if `bin` became the real program. Changing `bin` therefore needs a matching
+policy-matcher rule for prefixed commands first (see #268).
+
+Shared Rust ↔ WASM vectors for this rule are in `crates/allw-core/tests/fixtures/command_risk_vectors.json`.
+
 ---
 
 ## The rule shape
