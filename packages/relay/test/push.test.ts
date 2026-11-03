@@ -12,6 +12,8 @@ import {
   ApnsPushTransport,
   FcmPushTransport,
   UndeliverablePushTokenError,
+  WEB_PUSH_COALESCE_MS,
+  WakeupCoalescer,
   buildPushWakeupPayload,
   dispatchPushWakeups,
   type PushTransport,
@@ -212,5 +214,48 @@ describe("push fan-out", () => {
         transports: { webpush },
       }),
     ).resolves.toEqual({ delivered: 0, undeliverableTokens: [gone] });
+  });
+});
+
+describe("WakeupCoalescer — at most one wakeup per subscription per window", () => {
+  /** 2023-11-14T22:13:20Z in ms: a fixed clock for every claim. */
+  const T0 = 1_700_000_000_000;
+  const KEY = "dev-a\0https://fcm.googleapis.com/fcm/send/a";
+  const OTHER = "dev-b\0https://fcm.googleapis.com/fcm/send/b";
+
+  it("uses a 30-second window", () => {
+    expect(WEB_PUSH_COALESCE_MS).toBe(30_000);
+  });
+
+  it("coalesces a second claim inside the window, through the boundary, and allows one just past it", () => {
+    const coalescer = new WakeupCoalescer(WEB_PUSH_COALESCE_MS);
+    expect(coalescer.tryClaim(KEY, T0)).toBe(true);
+    coalescer.release(KEY);
+
+    expect(coalescer.tryClaim(KEY, T0 + 1)).toBe(false);
+    expect(coalescer.tryClaim(KEY, T0 + WEB_PUSH_COALESCE_MS - 1)).toBe(false);
+    // The boundary itself is still inside the window.
+    expect(coalescer.tryClaim(KEY, T0 + WEB_PUSH_COALESCE_MS)).toBe(false);
+    // Just past it, the subscription may be woken again, and that claim opens a new window.
+    expect(coalescer.tryClaim(KEY, T0 + WEB_PUSH_COALESCE_MS + 1)).toBe(true);
+    coalescer.release(KEY);
+    expect(coalescer.tryClaim(KEY, T0 + WEB_PUSH_COALESCE_MS + 2)).toBe(false);
+  });
+
+  it("coalesces while a wakeup is still in flight, even past the window", () => {
+    const coalescer = new WakeupCoalescer(WEB_PUSH_COALESCE_MS);
+    expect(coalescer.tryClaim(KEY, T0)).toBe(true);
+
+    const pastWindow = T0 + WEB_PUSH_COALESCE_MS + 1;
+    expect(coalescer.tryClaim(KEY, pastWindow)).toBe(false);
+    coalescer.release(KEY);
+    expect(coalescer.tryClaim(KEY, pastWindow)).toBe(true);
+  });
+
+  it("keeps subscriptions independent", () => {
+    const coalescer = new WakeupCoalescer(WEB_PUSH_COALESCE_MS);
+    expect(coalescer.tryClaim(KEY, T0)).toBe(true);
+    expect(coalescer.tryClaim(OTHER, T0)).toBe(true);
+    expect(coalescer.tryClaim(KEY, T0 + 1)).toBe(false);
   });
 });

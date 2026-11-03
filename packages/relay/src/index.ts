@@ -40,7 +40,8 @@ import {
   MAX_PUSH_TOKENS_PER_ACCOUNT,
   MAX_PUSH_TOKENS_PER_REGISTRATION,
   MAX_PUSH_TOKENS_PER_TRANSPORT,
-  NoopPushTransport,
+  WEB_PUSH_COALESCE_MS,
+  WakeupCoalescer,
   dispatchPushWakeups,
   isPushTransportKind,
   schedulablePushTokens,
@@ -483,6 +484,13 @@ export class AccountRelay implements DurableObject {
   private readonly sql: SqlStorage;
   private readonly ctx: DurableObjectState;
   private readonly pushTransports: PushTransportRegistry;
+  /** Spaces Web Push wakeups per subscription (`WEB_PUSH_COALESCE_MS`); see `schedulePushWakeups`. */
+  private readonly webPushCoalescer = new WakeupCoalescer(WEB_PUSH_COALESCE_MS);
+  /**
+   * Settles once every push fan-out started so far has finished, pruning included. Never rejects.
+   * Only tests read it (to assert on the outcome of background delivery without sleeping).
+   */
+  private pushFanOut: Promise<void> = Promise.resolve();
 
   constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
@@ -1468,47 +1476,74 @@ export class AccountRelay implements DurableObject {
   }
 
   /**
-   * Schedule request-id-at-most push wakeups (Web Push sends no payload at all) to every registered
-   * device push token, and return how many were scheduled. The fan-out runs **off the response
-   * path** under `waitUntil`, so a slow or hung push service can never delay or fail the submit.
+   * Schedule request-id-at-most push wakeups (Web Push sends no payload at all) to registered device
+   * push tokens, and return how many were scheduled. Only tokens whose transport is configured are
+   * scheduled, newest registrations first, up to the account budget. A Web Push wakeup to a
+   * subscription that has one in flight or was woken within `WEB_PUSH_COALESCE_MS` is skipped: submit
+   * needs no caller auth, so this is what bounds push volume per subscription. The check-and-claim
+   * runs synchronously here, before any `await`, so concurrent submits cannot both claim.
+   *
+   * The fan-out runs **off the response path** under `waitUntil`, so a slow or hung push service can
+   * never delay or fail the submit.
    */
   private schedulePushWakeups(accountId: string, requestId: string, expiresAt: number): number {
+    const now = Date.now();
+    const claimedWebPushKeys: string[] = [];
     const tokens = schedulablePushTokens(
       [
         ...this.sql.exec<DevicePushTokenRow>(
           `SELECT device_id, transport, token, created_at FROM device_push_token
-           ORDER BY created_at ASC LIMIT ?`,
+           ORDER BY created_at DESC LIMIT ?`,
           MAX_PUSH_TOKENS_PER_ACCOUNT,
         ),
       ],
       this.pushTransports,
-    );
+    ).filter((token) => {
+      if (token.transport !== "webpush") return true;
+      const key = `${token.device_id}\0${token.token}`;
+      if (!this.webPushCoalescer.tryClaim(key, now)) return false;
+      claimedWebPushKeys.push(key);
+      return true;
+    });
     if (tokens.length > 0) {
-      this.ctx.waitUntil(this.deliverPushWakeups(tokens, accountId, requestId, expiresAt));
+      const fanOut = this.deliverPushWakeups(tokens, accountId, requestId, expiresAt).finally(
+        () => {
+          for (const key of claimedWebPushKeys) this.webPushCoalescer.release(key);
+        },
+      );
+      this.pushFanOut = Promise.all([this.pushFanOut, fanOut]).then(() => undefined);
+      this.ctx.waitUntil(fanOut);
     }
     return tokens.length;
   }
 
-  /** Run one fan-out, then prune the tokens a transport reported permanently undeliverable. */
+  /**
+   * Run one fan-out, then prune the tokens a transport reported permanently undeliverable. Never
+   * rejects: push is best-effort, and devices still receive requests via WebSocket or polling.
+   */
   private async deliverPushWakeups(
     tokens: readonly StoredPushToken[],
     accountId: string,
     requestId: string,
     expiresAt: number,
   ): Promise<void> {
-    const { undeliverableTokens } = await dispatchPushWakeups(tokens, {
-      accountId,
-      requestId,
-      expiresAt,
-      transports: this.pushTransports,
-    });
-    for (const gone of undeliverableTokens) {
-      this.sql.exec(
-        `DELETE FROM device_push_token WHERE device_id = ? AND transport = ? AND token = ?`,
-        gone.device_id,
-        gone.transport,
-        gone.token,
-      );
+    try {
+      const { undeliverableTokens } = await dispatchPushWakeups(tokens, {
+        accountId,
+        requestId,
+        expiresAt,
+        transports: this.pushTransports,
+      });
+      for (const gone of undeliverableTokens) {
+        this.sql.exec(
+          `DELETE FROM device_push_token WHERE device_id = ? AND transport = ? AND token = ?`,
+          gone.device_id,
+          gone.transport,
+          gone.token,
+        );
+      }
+    } catch (error) {
+      console.warn("push fan-out bookkeeping failed", error);
     }
   }
 
@@ -1984,12 +2019,14 @@ export class AccountRelay implements DurableObject {
   }
 }
 
+/**
+ * The push transports this deployment can deliver through: a kind is registered only when its
+ * credentials are configured. Tokens for an unregistered kind stay stored (a later configuration
+ * picks them up) but are neither sent nor counted in `push_wakeups`; devices then rely on WebSocket
+ * presence and polling.
+ */
 function buildPushTransports(env: Env): PushTransportRegistry {
-  const transports: PushTransportRegistry = {
-    apns: new NoopPushTransport("apns"),
-    fcm: new NoopPushTransport("fcm"),
-    webpush: new NoopPushTransport("webpush"),
-  };
+  const transports: PushTransportRegistry = {};
   if (env.APNS_ENDPOINT && env.APNS_TOPIC && env.APNS_BEARER_TOKEN) {
     transports.apns = new ApnsPushTransport({
       endpoint: env.APNS_ENDPOINT,

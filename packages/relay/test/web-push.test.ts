@@ -91,6 +91,7 @@ describe("parseWebPushEndpoint — push-service allowlist", () => {
     ["Mozilla autopush (Firefox)", "https://updates.push.services.mozilla.com/wpush/v2/abc"],
     ["Apple (Safari)", "https://web.push.apple.com/QGx0abc"],
     ["Windows WNS (Edge)", "https://wns2-by3p.notify.windows.com/w/?token=abc"],
+    ["a WNS host with digits and hyphens", "https://db5p-1.notify.windows.com/w/?token=abc"],
   ])("accepts a %s subscription endpoint", (_name, endpoint) => {
     expect(parseWebPushEndpoint(endpoint)?.href).toBe(new URL(endpoint).href);
   });
@@ -106,6 +107,15 @@ describe("parseWebPushEndpoint — push-service allowlist", () => {
     ["an explicit port", "https://fcm.googleapis.com:8443/fcm/send/abc"],
     ["embedded credentials", "https://user:pass@fcm.googleapis.com/fcm/send/abc"],
     ["a non-https scheme", "ftp://fcm.googleapis.com/abc"],
+    ["a trailing-dot host", "https://fcm.googleapis.com./fcm/send/abc"],
+    // A fragment never reaches the wire, so it would let one subscription be stored twice.
+    ["a fragment", "https://fcm.googleapis.com/fcm/send/abc#dup"],
+    ["an empty fragment", "https://fcm.googleapis.com/fcm/send/abc#"],
+    // WNS: exactly one label under notify.windows.com.
+    ["a two-label WNS subdomain", "https://a.b.notify.windows.com/w/"],
+    ["an empty WNS label", "https://..notify.windows.com/w/"],
+    ["a leading-dot WNS host", "https://.notify.windows.com/w/"],
+    ["an IP-like WNS prefix", "https://169.254.169.254.notify.windows.com/w/"],
   ])("rejects %s", (_name, endpoint) => {
     expect(parseWebPushEndpoint(endpoint)).toBeNull();
   });
@@ -212,7 +222,8 @@ describe("WebPushTransport — payload-less VAPID wakeup", () => {
     const sent = new Request(url, init);
     expect((await sent.arrayBuffer()).byteLength).toBe(0);
     const headers = new Headers(init.headers);
-    expect(headers.get("TTL")).toBe("300"); // RFC 8030 §5.2: the request's remaining 5 minutes.
+    // RFC 8030 §5.2: 5 minutes remain, which is exactly the 5-minute TTL bucket.
+    expect(headers.get("TTL")).toBe("300");
     expect(headers.get("Urgency")).toBe("high"); // RFC 8030 §5.3.
     expect(headers.get("Content-Encoding")).toBeNull(); // no RFC 8291 payload to encode.
     expect(headers.get("Authorization")).toMatch(
@@ -282,15 +293,28 @@ describe("WebPushTransport — payload-less VAPID wakeup", () => {
     },
   );
 
-  it("reports a stored endpoint outside the allowlist as undeliverable, without a request", async () => {
+  it("refuses a stored endpoint outside the allowlist as transient (kept, logged), without a request", async () => {
     const { config } = await makeVapid();
     const fetcher = capturingFetcher(201);
     const transport = new WebPushTransport({ vapid: config, fetcher, now: () => NOW_MS });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
-    await expect(
-      transport.sendWakeup(wakeup("https://169.254.169.254/latest/meta-data")),
-    ).rejects.toBeInstanceOf(UndeliverablePushTokenError);
-    expect(fetcher).not.toHaveBeenCalled();
+    try {
+      const failure = await transport
+        .sendWakeup(wakeup("https://169.254.169.254/latest/meta-data"))
+        .then(
+          () => null,
+          (error: unknown) => error,
+        );
+
+      // A relay-side refusal is not the push service saying the subscription is gone: never prune.
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure).not.toBeInstanceOf(UndeliverablePushTokenError);
+      expect(fetcher).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/outside the allowlist/));
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("aborts a hung push service at the timeout, as a transient failure", async () => {
@@ -401,18 +425,36 @@ describe("loadVapidSigningKey — the keypair must actually match", () => {
   });
 });
 
-describe("webPushTtlSeconds", () => {
-  it("rounds the remaining lifetime up to whole seconds", () => {
-    expect(webPushTtlSeconds(NOW_MS + 1500, NOW_MS)).toBe(2);
+describe("webPushTtlSeconds — remaining lifetime rounded up to a coarse bucket", () => {
+  const SECOND = 1000;
+  const MINUTE = 60 * SECOND;
+  const HOUR = 60 * MINUTE;
+  const DAY = 24 * HOUR;
+
+  // Buckets (relay-api.md §5): 60 s, 5 min, 1 h, 1 d, 28 d. Each boundary maps to its own bucket and
+  // one second past it to the next, so the push service never learns the exact deadline.
+  it.each([
+    ["1.5 s", 1500, 60],
+    ["exactly 60 s", MINUTE, 60],
+    ["60 s + 1 s", MINUTE + SECOND, 5 * 60],
+    ["exactly 5 min", 5 * MINUTE, 5 * 60],
+    ["5 min + 1 s", 5 * MINUTE + SECOND, 60 * 60],
+    ["exactly 1 h", HOUR, 60 * 60],
+    ["1 h + 1 s", HOUR + SECOND, 24 * 60 * 60],
+    ["exactly 1 d", DAY, 24 * 60 * 60],
+    ["1 d + 1 s", DAY + SECOND, 28 * 24 * 60 * 60],
+    ["exactly 28 d", 28 * DAY, 28 * 24 * 60 * 60],
+  ])("maps %s remaining to the next bucket up", (_name, remainingMs, ttl) => {
+    expect(webPushTtlSeconds(NOW_MS + remainingMs, NOW_MS)).toBe(ttl);
   });
 
-  it("never goes negative for an already-past deadline", () => {
+  it("is 0 for an already-past deadline", () => {
     expect(webPushTtlSeconds(NOW_MS - 10_000, NOW_MS)).toBe(0);
+    expect(webPushTtlSeconds(NOW_MS, NOW_MS)).toBe(0);
   });
 
-  it("clamps to the 28-day push-service ceiling", () => {
-    const ninetyDays = 90 * 24 * 60 * 60 * 1000;
-    expect(webPushTtlSeconds(NOW_MS + ninetyDays, NOW_MS)).toBe(28 * 24 * 60 * 60);
+  it("caps at the 28-day push-service ceiling", () => {
+    expect(webPushTtlSeconds(NOW_MS + 90 * DAY, NOW_MS)).toBe(28 * 24 * 60 * 60);
   });
 });
 

@@ -44,13 +44,25 @@ const WEB_PUSH_EXACT_HOSTS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Push-service host suffixes matched as strict subdomains. Windows Push Notification Services
- * (Edge on Windows) issues per-region hosts such as `wns2-by3p.notify.windows.com`.
+ * Windows Push Notification Services (Edge on Windows) issues per-region hosts such as
+ * `wns2-by3p.notify.windows.com`: exactly **one** label under `notify.windows.com`. Deeper names,
+ * empty labels, and dotted (IP-like) prefixes are never real subscription hosts and are refused.
  */
-const WEB_PUSH_HOST_SUFFIXES: readonly string[] = [".notify.windows.com"];
+const WNS_HOST_PATTERN = /^[a-z0-9-]+\.notify\.windows\.com$/;
 
-/** Maximum `TTL` sent to a push service: 28 days, the common push-service ceiling. */
-const MAX_WEB_PUSH_TTL_SECONDS = 28 * 24 * 60 * 60;
+/**
+ * `TTL` values the relay sends, in seconds: 1 minute, 5 minutes, 1 hour, 1 day, and 28 days (the
+ * common push-service ceiling). The TTL is visible to the push service, so it is rounded **up** to
+ * one of these buckets rather than sent exactly; the provider learns a request's deadline only to
+ * bucket granularity, never the integrator's precise timeout.
+ */
+const WEB_PUSH_TTL_BUCKETS_SECONDS: readonly number[] = [
+  60,
+  5 * 60,
+  60 * 60,
+  24 * 60 * 60,
+  28 * 24 * 60 * 60,
+];
 
 /** Lifetime of each VAPID JWT. RFC 8292 §2 caps `exp` at 24 hours; one is signed per send. */
 const VAPID_JWT_LIFETIME_SECONDS = 60 * 60;
@@ -64,8 +76,8 @@ const P256_PRIVATE_SCALAR_LENGTH = 32;
  * Parse a Web Push subscription endpoint and admit it only if it targets a known push service.
  *
  * Returns the parsed URL, or `null` when the value is not a URL, is not `https:`, carries
- * credentials or an explicit port, or names a host outside the allowlist. This is the relay's SSRF
- * guard for the only outbound request whose target a client chooses.
+ * credentials, an explicit port, or a fragment, or names a host outside the allowlist. This is the
+ * relay's SSRF guard for the only outbound request whose target a client chooses.
  */
 export function parseWebPushEndpoint(token: string): URL | null {
   let url: URL;
@@ -78,11 +90,11 @@ export function parseWebPushEndpoint(token: string): URL | null {
   // An explicit non-default port or embedded credentials never appear in a genuine subscription
   // endpoint; refusing them keeps the allowlist a statement about hosts on the standard port.
   if (url.port !== "" || url.username !== "" || url.password !== "") return null;
+  // A fragment is never sent on the wire, so `…/X#a` and `…/X#b` would be two stored tokens for one
+  // subscription. Genuine endpoints have none; `href` (not `hash`) also catches an empty `#`.
+  if (url.href.includes("#")) return null;
   const host = url.hostname;
-  if (WEB_PUSH_EXACT_HOSTS.has(host)) return url;
-  for (const suffix of WEB_PUSH_HOST_SUFFIXES) {
-    if (host.length > suffix.length && host.endsWith(suffix)) return url;
-  }
+  if (WEB_PUSH_EXACT_HOSTS.has(host) || WNS_HOST_PATTERN.test(host)) return url;
   return null;
 }
 
@@ -198,7 +210,8 @@ async function validateVapidKeypair(vapid: VapidConfig): Promise<CryptoKey | nul
  * Status handling follows RFC 8030 §§5–7: any 2xx (push services answer 201) is delivered; 404 or
  * 410 means the subscription no longer exists and surfaces as {@link UndeliverablePushTokenError}
  * so the caller prunes the token. Every other outcome is transient and leaves the token in place,
- * including a timeout and a 401/403 (a VAPID mismatch is a relay-side problem, not a dead device).
+ * including a timeout, a 401/403 (a VAPID mismatch is a relay-side problem, not a dead device), and
+ * a stored endpoint the allowlist refuses at send time.
  */
 export class WebPushTransport implements PushTransport {
   readonly kind = "webpush" as const;
@@ -224,12 +237,15 @@ export class WebPushTransport implements PushTransport {
   }
 
   async sendWakeup(wakeup: PushWakeup): Promise<void> {
-    // Re-validate at send time: rows can predate the allowlist (the earlier stub accepted any
-    // string), and a stored value must never steer the relay at an arbitrary host. Such a row can
-    // never be delivered, so it is reported as undeliverable and pruned.
+    // Re-validate at send time: a stored value must never steer the relay at an arbitrary host.
+    // Refusing is a relay-side decision (an older row, or a narrowed allowlist), not the push
+    // service reporting the subscription gone, so it is transient: the row is kept, never pruned.
     const endpoint = parseWebPushEndpoint(wakeup.token);
     if (!endpoint) {
-      throw new UndeliverablePushTokenError("stored Web Push endpoint is not on the allowlist");
+      console.warn(
+        `webpush: refusing a stored endpoint outside the allowlist (device ${wakeup.deviceId}); token kept`,
+      );
+      throw new Error("stored Web Push endpoint is not on the allowlist");
     }
     const signingKey = await loadVapidSigningKey(this.vapid);
     if (!signingKey) throw new Error("VAPID keypair is invalid; Web Push is disabled");
@@ -286,12 +302,17 @@ async function signVapidJwt(
 }
 
 /**
- * `TTL` for a wakeup: the request's remaining lifetime in whole seconds (rounded up), clamped to
- * `[0, 28 days]`. A wakeup that outlives its request is useless; one that expires early drops a push.
+ * `TTL` for a wakeup: the request's remaining lifetime rounded **up** to the next bucket in
+ * {@link WEB_PUSH_TTL_BUCKETS_SECONDS} (anything beyond the largest is capped at 28 days), or `0`
+ * once the deadline has passed. Rounding up never expires a wakeup before its request (which would
+ * drop a push); at worst it outlives the request by less than one bucket step.
  */
 export function webPushTtlSeconds(expiresAtMs: number, nowMs: number): number {
   const remaining = Math.ceil((expiresAtMs - nowMs) / 1000);
-  return Math.min(Math.max(remaining, 0), MAX_WEB_PUSH_TTL_SECONDS);
+  if (remaining <= 0) return 0;
+  const largest =
+    WEB_PUSH_TTL_BUCKETS_SECONDS[WEB_PUSH_TTL_BUCKETS_SECONDS.length - 1] ?? remaining;
+  return WEB_PUSH_TTL_BUCKETS_SECONDS.find((bucket) => remaining <= bucket) ?? largest;
 }
 
 function base64UrlEncodeJson(value: unknown): string {

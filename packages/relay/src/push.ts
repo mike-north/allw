@@ -24,12 +24,11 @@ export interface PushWakeup {
 }
 
 /**
- * Thrown by a transport when a token is **permanently undeliverable**: the push service reports
- * the subscription gone (for Web Push, HTTP 404 or 410), or the stored token can never be a valid
- * target for its transport (e.g. a Web Push endpoint outside the push-service allowlist). It is the
- * only failure that removes a stored token. Every other failure, including timeouts and auth
- * errors, is treated as transient, so a provider outage or relay misconfiguration can never
- * silently unregister a device.
+ * Thrown by a transport when a token is **permanently undeliverable**: the push service itself
+ * reports the subscription gone (for Web Push, HTTP 404 or 410). It is the only failure that removes
+ * a stored token. Every other failure, including timeouts, auth errors, and a stored token the relay
+ * refuses to send to (e.g. a Web Push endpoint outside the current allowlist), is treated as
+ * transient, so a provider outage or relay misconfiguration can never silently unregister a device.
  */
 export class UndeliverablePushTokenError extends Error {
   override readonly name = "UndeliverablePushTokenError";
@@ -52,6 +51,16 @@ export const MAX_PUSH_TOKENS_PER_TRANSPORT = 2;
 /** Most `device_push_token` rows one account may hold across all its devices. */
 export const MAX_PUSH_TOKENS_PER_ACCOUNT = 32;
 
+/**
+ * Minimum spacing between Web Push wakeups to one subscription. Submitting a request needs no caller
+ * auth, so without this every submit would fan out real, VAPID-signed pushes: notification spam on
+ * the user's browser (service workers must show a notification per push) and, because one VAPID key
+ * serves every account, push-service throttling of the whole relay. A Web Push wakeup is payload-less
+ * ("check your inbox"), so one wakeup covers every request submitted while it is pending; coalescing
+ * loses nothing the inbox fetch does not recover.
+ */
+export const WEB_PUSH_COALESCE_MS = 30_000;
+
 /** Most wakeups in flight at once; Workers allow about six open outbound connections. */
 const DEFAULT_PUSH_CONCURRENCY = 4;
 
@@ -60,6 +69,10 @@ export interface PushTransport {
   sendWakeup(wakeup: PushWakeup): Promise<void>;
 }
 
+/**
+ * The transports a relay can actually deliver through. A kind is present only when its credentials
+ * are configured; tokens of an absent kind stay stored but are never scheduled or counted.
+ */
 export type PushTransportRegistry = Partial<Record<PushTransportKind, PushTransport>>;
 
 export type Fetcher = typeof fetch;
@@ -222,15 +235,50 @@ export class FcmPushTransport implements PushTransport {
   }
 }
 
-/** Test/local fallback: keeps the relay operational via polling when credentials are not configured. */
-export class NoopPushTransport implements PushTransport {
-  readonly kind: PushTransportKind;
+/**
+ * Per-subscription wakeup coalescing for one account's Durable Object.
+ *
+ * A key (e.g. `device_id` + token) may be claimed only when it has no wakeup in flight **and** its
+ * last claim is more than `windowMs` old; a claim exactly `windowMs` after the previous one is still
+ * coalesced. The window runs from when a wakeup is dispatched, whatever its outcome, so it bounds
+ * outbound volume per subscription regardless of how fast submits arrive or how the push service
+ * answers.
+ *
+ * State is in memory and every method is synchronous: the Durable Object runs one event at a time,
+ * so a check-and-claim cannot interleave with another submit (no TOCTOU). Losing the state when the
+ * object is evicted only re-allows one wakeup, and eviction requires the account to go idle.
+ */
+export class WakeupCoalescer {
+  private readonly windowMs: number;
+  /** Epoch ms of each key's most recent claim, kept only while it can still coalesce. */
+  private readonly lastClaimedAt = new Map<string, number>();
+  /** Keys whose claimed wakeup has not finished yet. */
+  private readonly inFlight = new Set<string>();
 
-  constructor(kind: PushTransportKind) {
-    this.kind = kind;
+  constructor(windowMs: number) {
+    this.windowMs = windowMs;
   }
 
-  async sendWakeup(_wakeup: PushWakeup): Promise<void> {
-    return Promise.resolve();
+  /** Claim a wakeup for `key` at `nowMs`: `true` (and recorded as in flight) or `false` if coalesced. */
+  tryClaim(key: string, nowMs: number): boolean {
+    this.forgetExpired(nowMs);
+    if (this.inFlight.has(key)) return false;
+    const last = this.lastClaimedAt.get(key);
+    if (last !== undefined && nowMs - last <= this.windowMs) return false;
+    this.lastClaimedAt.set(key, nowMs);
+    this.inFlight.add(key);
+    return true;
+  }
+
+  /** Mark a claimed wakeup finished. The window from its claim still applies. */
+  release(key: string): void {
+    this.inFlight.delete(key);
+  }
+
+  /** Drop claims that can no longer coalesce anything, so memory tracks only recent subscriptions. */
+  private forgetExpired(nowMs: number): void {
+    for (const [key, at] of this.lastClaimedAt) {
+      if (nowMs - at > this.windowMs) this.lastClaimedAt.delete(key);
+    }
   }
 }

@@ -23,7 +23,12 @@
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, it, expect, vi } from "vitest";
 import { AccountRelay } from "../src/index.js";
-import type { PushTransportRegistry } from "../src/push.js";
+import type {
+  PushTransport,
+  PushTransportKind,
+  PushTransportRegistry,
+  PushWakeup,
+} from "../src/push.js";
 import type { SqlStorage } from "@cloudflare/workers-types";
 import { pairingStartBody, testAccount } from "./support/accounts.js";
 
@@ -237,6 +242,17 @@ async function enrollDeviceWithPushToken(
   return (await pairDeviceWithPushToken(accountId, token)).device_id;
 }
 
+/** A transport that records each wakeup it is asked to send and always succeeds. */
+function recordingTransport(kind: PushTransportKind, sent: PushWakeup[]): PushTransport {
+  return {
+    kind,
+    sendWakeup(wakeup) {
+      sent.push(wakeup);
+      return Promise.resolve();
+    },
+  };
+}
+
 async function installPushTransports(
   accountId: string,
   pushTransports: PushTransportRegistry,
@@ -432,6 +448,8 @@ describe("AccountRelay — routing (device offline)", () => {
       },
       bearer(start.data.pairing_auth_token),
     );
+    const wakeups: PushWakeup[] = [];
+    await installPushTransports(acct, { apns: recordingTransport("apns", wakeups) });
 
     const submit = await post<{
       delivered_to: number;
@@ -443,6 +461,24 @@ describe("AccountRelay — routing (device offline)", () => {
     expect(submit.data.status).toBe("pending");
     expect(submit.data.delivered_to).toBe(0);
     expect(submit.data.push_wakeups).toBe(1);
+    await vi.waitFor(() => {
+      expect(wakeups.map((w) => w.requestId)).toEqual(["req-push-wakeup"]);
+    });
+  });
+
+  it("schedules no wakeup for a token whose transport is not configured", async () => {
+    const acct = testAccount("acct-push-unconfigured");
+    // The test Worker has no APNs credentials, so no APNs transport is registered.
+    await enrollDeviceWithPushToken(acct);
+
+    const submit = await post<{ push_wakeups: number }>(
+      acct,
+      "/requests",
+      makeEnvelope("req-push-unconfigured"),
+    );
+
+    expect(submit.status).toBe(202);
+    expect(submit.data.push_wakeups).toBe(0);
   });
 
   it("still delivers over WebSocket when a push transport throws", async () => {
@@ -477,6 +513,7 @@ describe("AccountRelay — routing (device offline)", () => {
   it("stops scheduling push wakeups after the target device is revoked", async () => {
     const acct = testAccount("acct-push-revoke-clears-wakeups");
     const deviceId = await enrollDeviceWithPushToken(acct);
+    await installPushTransports(acct, { apns: recordingTransport("apns", []) });
 
     const beforeRevoke = await post<{ push_wakeups: number }>(
       acct,
