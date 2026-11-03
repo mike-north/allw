@@ -49,11 +49,11 @@
  * @see ../../../docs/enrollment.md §Model (self-certifying account ids)
  */
 
-import { closeSync, constants as fsConstants, fstatSync, openSync, readSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
 import { assertRelayUrlTransport } from "./relay.js";
+import { readUserOwnedFile, UserFileError } from "./user-file.js";
 import { loadWasmSync, type AllwWasm } from "./wasm.js";
 
 /** The only config-file `version` this loader understands. */
@@ -160,15 +160,6 @@ function resolveConfigPath(raw: string, source: string): string {
   return expanded;
 }
 
-/** The `code` of a Node system error, if any. */
-function errorCode(err: unknown): string | undefined {
-  if (typeof err === "object" && err !== null && "code" in err) {
-    const code = err.code;
-    return typeof code === "string" ? code : undefined;
-  }
-  return undefined;
-}
-
 /** A JSON parse error's position only — never Node's quoted snippet of the file's contents. */
 function jsonErrorPosition(err: unknown): string {
   const match = err instanceof Error ? /position (\d+)/.exec(err.message) : null;
@@ -184,122 +175,100 @@ function jsonType(value: unknown): string {
 }
 
 /**
- * Open, check, and read the config file through ONE descriptor (no check/read TOCTOU). Returns
- * `null` only when the file is absent and was not explicitly requested.
- *
- * - Opened `O_NONBLOCK` so a FIFO at the path cannot block the open (a synchronous read of a FIFO
- *   or `/dev/zero` would otherwise hang the hook before any deadline is armed — the host then
- *   proceeds without a decision).
- * - `fstat` must report a regular file: a FIFO, device, socket or directory is rejected.
- * - At most {@link MAX_CLIENT_CONFIG_BYTES} are read.
- * - On POSIX, the file must be owned by the effective uid and not group- or world-writable: it is
- *   the trust anchor at rest (`docs/threat-model.md`).
+ * Open, check, and read the config file through ONE descriptor (no check/read TOCTOU), via the
+ * shared {@link readUserOwnedFile} checks: it is the trust anchor at rest (`docs/threat-model.md`).
+ * Returns `null` only when the file is absent and was not explicitly requested.
  */
 function readConfigText(
   path: string,
   explicit: boolean,
   deps: LoadClientConfigDeps,
 ): string | null {
-  const platform = deps.platform ?? process.platform;
-  // O_NONBLOCK is POSIX-only (undefined on Windows, where FIFOs at a path do not exist).
-  const optional: Partial<typeof fsConstants> = fsConstants;
-  const flags = fsConstants.O_RDONLY | (optional.O_NONBLOCK ?? 0);
-  let fd: number;
+  let text: string | null;
   try {
-    fd = openSync(path, flags);
+    text = readUserOwnedFile(path, MAX_CLIENT_CONFIG_BYTES, {
+      ...(deps.geteuid ? { geteuid: deps.geteuid } : {}),
+      ...(deps.platform ? { platform: deps.platform } : {}),
+    });
   } catch (cause) {
-    const code = errorCode(cause);
-    if (code === "ENOENT" && !explicit) return null;
-    if (code === "ENOENT") {
-      throw new ClientConfigError(
-        `allw: config file ${path} does not exist (named by ${CLIENT_CONFIG_PATH_ENV} or the path ` +
-          `option). Create it, or unset ${CLIENT_CONFIG_PATH_ENV} and set ALLW_RELAY_URL, ` +
-          `ALLW_ACCOUNT_ID and ALLW_APPROVER_ROOT_KEY (fail-closed)`,
-        path,
-        { cause },
-      );
-    }
-    if (code === "EACCES" || code === "EPERM") {
-      throw new ClientConfigError(
-        `allw: config file ${path} is not readable by this user (${code}). Fix its permissions ` +
-          `(chmod 600 ${path}, owned by you) or point ${CLIENT_CONFIG_PATH_ENV} at a readable file ` +
-          `(fail-closed)`,
-        path,
-        { cause },
-      );
-    }
+    if (cause instanceof UserFileError) throw configFileError(path, cause);
+    throw cause;
+  }
+  if (text === null && explicit) {
     throw new ClientConfigError(
-      `allw: config file ${path} is not a readable regular file${
-        code !== undefined ? ` (${code})` : ""
-      }. Point ${CLIENT_CONFIG_PATH_ENV} at a regular file (fail-closed)`,
+      `allw: config file ${path} does not exist (named by ${CLIENT_CONFIG_PATH_ENV} or the path ` +
+        `option). Create it, or unset ${CLIENT_CONFIG_PATH_ENV} and set ALLW_RELAY_URL, ` +
+        `ALLW_ACCOUNT_ID and ALLW_APPROVER_ROOT_KEY (fail-closed)`,
       path,
-      { cause },
     );
   }
-  try {
-    const stat = fstatSync(fd);
-    if (!stat.isFile()) {
-      throw new ClientConfigError(
+  return text;
+}
+
+/** Word a {@link UserFileError} as the config loader's actionable message. */
+function configFileError(path: string, err: UserFileError): ClientConfigError {
+  const problem = err.problem;
+  const options = { cause: err.cause ?? err };
+  switch (problem.kind) {
+    case "unreadable":
+      return new ClientConfigError(
+        `allw: config file ${path} is not readable by this user (${problem.code}). Fix its ` +
+          `permissions (chmod 600 ${path}, owned by you) or point ${CLIENT_CONFIG_PATH_ENV} at a ` +
+          `readable file (fail-closed)`,
+        path,
+        options,
+      );
+    case "open_failed":
+      return new ClientConfigError(
+        `allw: config file ${path} is not a readable regular file${
+          problem.code !== undefined ? ` (${problem.code})` : ""
+        }. Point ${CLIENT_CONFIG_PATH_ENV} at a regular file (fail-closed)`,
+        path,
+        options,
+      );
+    case "not_regular":
+      return new ClientConfigError(
         `allw: config file ${path} is not a readable regular file (a directory, FIFO, device or ` +
           `socket). Point ${CLIENT_CONFIG_PATH_ENV} at a regular file (fail-closed)`,
         path,
+        options,
       );
-    }
-    if (platform !== "win32") {
-      const euid = (deps.geteuid ?? process.geteuid)?.();
-      if (euid !== undefined && stat.uid !== euid) {
-        throw new ClientConfigError(
-          `allw: config file ${path} is owned by uid ${String(stat.uid)}, not by the current user ` +
-            `(uid ${String(euid)}); whoever owns it controls your approval trust anchor. ` +
-            `chown it to yourself (chown $(id -u) ${path}) or write your own (fail-closed)`,
-          path,
-        );
-      }
-      if ((stat.mode & 0o022) !== 0) {
-        throw new ClientConfigError(
-          `allw: config file ${path} is group- or world-writable (mode ${(stat.mode & 0o777)
-            .toString(8)
-            .padStart(3, "0")}); anyone who can write it can redirect approvals. ` +
-            `Run: chmod 600 ${path} (fail-closed)`,
-          path,
-        );
-      }
-    }
-    if (stat.size > MAX_CLIENT_CONFIG_BYTES) {
-      throw new ClientConfigError(
-        `allw: config file ${path} is ${String(stat.size)} bytes, over the ` +
-          `${String(MAX_CLIENT_CONFIG_BYTES)}-byte limit; it should hold only version, relay_url, ` +
-          `account_id and approver_root_key (fail-closed)`,
+    case "wrong_owner":
+      return new ClientConfigError(
+        `allw: config file ${path} is owned by uid ${String(problem.uid)}, not by the current ` +
+          `user (uid ${String(problem.euid)}); whoever owns it controls your approval trust ` +
+          `anchor. chown it to yourself (chown $(id -u) ${path}) or write your own (fail-closed)`,
         path,
+        options,
       );
-    }
-    // Read from the same descriptor, never more than the cap (+1 to detect growth since fstat).
-    const buf = Buffer.alloc(MAX_CLIENT_CONFIG_BYTES + 1);
-    let total = 0;
-    for (;;) {
-      const n = readSync(fd, buf, total, buf.length - total, null);
-      if (n === 0) break;
-      total += n;
-      if (total > MAX_CLIENT_CONFIG_BYTES) {
-        throw new ClientConfigError(
-          `allw: config file ${path} exceeds the ${String(MAX_CLIENT_CONFIG_BYTES)}-byte limit ` +
-            `(fail-closed)`,
-          path,
-        );
-      }
-    }
-    return buf.subarray(0, total).toString("utf8");
-  } catch (cause) {
-    if (cause instanceof ClientConfigError) throw cause;
-    throw new ClientConfigError(
-      `allw: config file ${path} is not a readable regular file (${
-        errorCode(cause) ?? "read failed"
-      }). Point ${CLIENT_CONFIG_PATH_ENV} at a regular file (fail-closed)`,
-      path,
-      { cause },
-    );
-  } finally {
-    closeSync(fd);
+    case "group_or_world_writable":
+      return new ClientConfigError(
+        `allw: config file ${path} is group- or world-writable (mode ${problem.mode
+          .toString(8)
+          .padStart(3, "0")}); anyone who can write it can redirect approvals. ` +
+          `Run: chmod 600 ${path} (fail-closed)`,
+        path,
+        options,
+      );
+    case "too_large":
+      return new ClientConfigError(
+        problem.size !== undefined
+          ? `allw: config file ${path} is ${String(problem.size)} bytes, over the ` +
+              `${String(MAX_CLIENT_CONFIG_BYTES)}-byte limit; it should hold only version, ` +
+              `relay_url, account_id and approver_root_key (fail-closed)`
+          : `allw: config file ${path} exceeds the ${String(MAX_CLIENT_CONFIG_BYTES)}-byte limit ` +
+              `(fail-closed)`,
+        path,
+        options,
+      );
+    case "read_failed":
+      return new ClientConfigError(
+        `allw: config file ${path} is not a readable regular file (${
+          problem.code ?? "read failed"
+        }). Point ${CLIENT_CONFIG_PATH_ENV} at a regular file (fail-closed)`,
+        path,
+        options,
+      );
   }
 }
 

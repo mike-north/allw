@@ -6,7 +6,7 @@
  * non-JSON body built to look like an allw diagnostic must not get that text into the message:
  *
  * - a non-2xx `submit` reports only the HTTP status, never the body's `error` field;
- * - a body that is not JSON (device list, submit success, poll) reports only which call failed and
+ * - a body that is not JSON (account-state fetch, submit success, poll) reports only which call failed and
  *   the status, never the parser's message, which quotes the start of the body.
  *
  * @see ../../../docs/threat-model.md R1 (relay-supplied text in agent-visible errors)
@@ -65,7 +65,11 @@ test("a submit rejected with a hostile error body reports only the HTTP status",
 
 /** Each call that parses a 2xx body, with the message a non-JSON body must produce. */
 const NON_JSON_CALLS = [
-  ["device list", (relay) => relay.fetchDevices(), "relay device list returned a non-JSON body"],
+  [
+    "account-state",
+    (relay) => relay.fetchAccountStates(),
+    "relay account-state fetch returned a non-JSON body",
+  ],
   ["submit", (relay) => relay.submit(ENVELOPE), "relay submit returned a non-JSON body"],
   ["poll", (relay) => relay.poll(ENVELOPE.id), "relay poll returned a non-JSON body"],
 ];
@@ -95,7 +99,7 @@ test("a network failure while reading a body stays a transport error (not a Rela
     );
   const relay = new RelayClient(RELAY_URL, ACCOUNT_ID, fetchImpl);
   await assert.rejects(
-    () => relay.fetchDevices(),
+    () => relay.fetchAccountStates(),
     (err) => {
       assert.equal(err instanceof RelayError, false, `not rewrapped: ${String(err)}`);
       assert.ok(err instanceof TypeError, `still a TypeError: ${String(err)}`);

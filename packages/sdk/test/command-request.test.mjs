@@ -207,6 +207,7 @@ test("a malformed command never submits: requestApproval is never reached", asyn
     relayUrl: "https://relay.allw.test",
     accountId: "acct_cmd_test",
     approverRootKey: "AAAA",
+    accountStates: ["unverified.account.state"],
     fetchImpl: () => {
       fetchCalls += 1;
       return Promise.reject(new Error("must not be called"));

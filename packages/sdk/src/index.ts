@@ -3,7 +3,8 @@
  *
  * `requestApproval` runs the full keystone round-trip over the zero-knowledge relay
  * (`docs/contract.md`): build the human-shown `ApprovalContext`, compute the WYSIWYS
- * `request_hash`, encrypt the context to the approver's devices, submit the opaque envelope, await
+ * `request_hash`, encrypt the context to exactly the devices the approver's root-signed account state
+ * vouches for, submit the opaque envelope, await
  * the signed verdict, and **verify it before returning**. Every security-critical step goes through
  * the audited Rust core via WASM (`./wasm.ts`); this package only orchestrates and shapes JSON.
  *
@@ -19,7 +20,6 @@ import {
   RelayClient,
   RelayTimeoutError,
   type ApprovalRequestEnvelope,
-  type DeviceRecord,
   type FetchImpl,
   type NowImpl,
 } from "./relay.js";
@@ -40,6 +40,17 @@ export {
   loadClientConfig,
 } from "./config.js";
 export type { ConfigEnv, IntegratorConfig, LoadClientConfigOptions } from "./config.js";
+export {
+  defaultStateDir,
+  fileSequenceFloorStore,
+  relayAccountStateSource,
+  SequenceFloorError,
+} from "./account-state-source.js";
+export type {
+  FileSequenceFloorStoreOptions,
+  RelayAccountStateSourceOptions,
+  SequenceFloorStore,
+} from "./account-state-source.js";
 export type {
   CommandActionErrorReason,
   CommandActionFromLineOptions,
@@ -145,6 +156,36 @@ export class RequestRetractedError extends Error {
 }
 
 /**
+ * Where root-signed account state failed to establish who may read a request. Each stage fails
+ * closed before anything is submitted:
+ *
+ * - `"load"`: {@link AccountStateSource.load} threw, or returned something that is not an
+ *   {@link AccountStateSet}.
+ * - `"seal"`: the core refused to select recipients from the loaded set (none verify, the highest
+ *   sequence is below `minSequence`, no active device, too many, a small-order key, …) — nothing
+ *   was encrypted.
+ * - `"accept"`: {@link AccountStateSource.accepted} threw or rejected, so the sequence floor may not
+ *   be persisted; the sealed request is discarded rather than sent.
+ */
+export type RecipientSelectionStage = "load" | "seal" | "accept";
+
+/**
+ * Thrown by `requestApproval` when no request was sent because account state could not establish
+ * its recipients (contract §Invariants #6). A deny-class failure: the caller (e.g. a hook) maps it
+ * to a deny, never to an allow. `cause` carries the underlying error.
+ */
+export class RecipientSelectionError extends Error {
+  constructor(
+    readonly stage: RecipientSelectionStage,
+    message: string,
+    options?: { cause?: unknown },
+  ) {
+    super(`allw: ${message}`, options);
+    this.name = "RecipientSelectionError";
+  }
+}
+
+/**
  * A verified human decision bound to the exact request.
  *
  * **Not authorization.** `decision === "approved"` means the human approved AND the verdict
@@ -199,6 +240,47 @@ export interface AccountStateOptions {
 
 /** Options for re-verifying a returned {@link Verdict}. */
 export type VerdictVerifyOptions = AccountStateOptions;
+
+/** One loaded set of account state for a request (see {@link AccountStateSource}). */
+export interface AccountStateSet {
+  /** Compact root-signed `allw-account-state+jws` documents, as fetched (unverified). */
+  readonly accountStates: readonly string[];
+  /**
+   * The highest account-state sequence this caller has already accepted, if it persists one. The
+   * core refuses a set whose highest verified sequence is below it (a rollback), rather than fall
+   * back to the older state. Omit when nothing has been persisted yet.
+   */
+  readonly minSequence?: number;
+}
+
+/**
+ * A per-request provider of root-signed account state — the trust input that decides who may read
+ * a request (`docs/enrollment.md` §Model, recipient selection rule).
+ *
+ * # Contract
+ * - **Called once per request.** `requestApproval` calls {@link load} once and uses that one set for
+ *   both recipient selection and verdict revocation checks; it never reloads mid-request.
+ * - **`load` returns documents, not trust.** The SDK verifies every document against the client's
+ *   `approverRootKey` in the core; a source may fetch from the relay unauthenticated. A `load` that
+ *   throws, or resolves to anything but an {@link AccountStateSet}, fails the request closed
+ *   ({@link RecipientSelectionError}, stage `"load"`).
+ * - **The source owns floor persistence.** After the core seals the request it reports the
+ *   sequence it selected from through {@link accepted}, and the SDK awaits that **before**
+ *   submitting. If `accepted` throws or rejects, nothing is sent (stage `"accept"`). Persist the
+ *   maximum of the stored floor and `sequence`, and return the same floor from later `load`s as
+ *   `minSequence`.
+ * - **`accepted` must be idempotent and monotonic.** It may be called repeatedly with the same or a
+ *   lower sequence (concurrent requests, retries); it must never lower a stored floor.
+ */
+export interface AccountStateSource {
+  /** Load the account-state documents (and persisted floor) for one request. */
+  load(): Promise<AccountStateSet>;
+  /**
+   * Record that a request was sealed from account state at `sequence`. Optional: a source without
+   * a persisted floor omits it.
+   */
+  accepted?(sequence: number): void | Promise<void>;
+}
 
 /** Root-signed account trust state used by offline verdict/policy verifiers for revocation. */
 export interface AccountState {
@@ -317,11 +399,16 @@ export interface ClientConfig {
    */
   readonly nonceStore?: NonceStore;
   /**
-   * Root-signed account-state JWS documents used to reject verdicts from revoked devices.
-   * The caller owns monotonic persistence: supply all known states, or only call with a state set
-   * already checked against a durably stored highest sequence.
+   * **Required.** The root-signed account state that decides who may read each request: the
+   * request is encrypted only to the devices it vouches for (never to the relay's device list), and
+   * verdicts from devices it revokes are rejected.
+   *
+   * Either a fixed, non-empty list of compact account-state JWS documents (the caller then owns
+   * monotonic persistence: supply every state you know, or one already checked against a durably
+   * stored highest sequence), or an {@link AccountStateSource} the SDK calls once per request.
+   * {@link createClient} throws when it is missing or empty.
    */
-  readonly accountStates?: readonly string[];
+  readonly accountStates: readonly string[] | AccountStateSource;
   /**
    * Optional account namespace the client intended to verify. When set, verdict verification fails
    * closed if the signed verdict's certified account id differs from this value.
@@ -522,52 +609,154 @@ function accountStatesJson(accountStates: readonly string[] | undefined): string
   return JSON.stringify(accountStates ?? []);
 }
 
-/** Parse the WASM `revoked_device_ids` JSON result into a `Set` for O(1) recipient filtering. */
-function parseRevokedDeviceIds(json: string): ReadonlySet<string> {
-  const ids = JSON.parse(json) as unknown;
-  if (!Array.isArray(ids) || !ids.every((id) => typeof id === "string")) {
-    throw new Error("allw: revoked_device_ids returned a non-string-array result");
-  }
-  return new Set(ids);
+/**
+ * The message of an error a source, floor store or the core threw, for a
+ * {@link RecipientSelectionError}'s message. The SDK's own errors there never quote relay text, and
+ * the core escapes and bounds untrusted device ids; integrators still sanitize before showing it to
+ * an agent.
+ */
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** A non-empty array of strings (a well-formed list of compact JWS documents, unverified). */
+function isNonEmptyStringArray(value: unknown): value is readonly string[] {
+  return Array.isArray(value) && value.length > 0 && value.every((doc) => typeof doc === "string");
+}
+
+/** Whether a `ClientConfig.accountStates` value is a provider rather than a fixed list. */
+function isAccountStateSource(value: unknown): value is AccountStateSource {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    typeof (value as { load?: unknown }).load === "function"
+  );
 }
 
 /**
- * Drops any device revoked in the caller's verified account-state set from `devices`, **before**
- * a new request is ever encrypted to it (issue #204 fix 1). Without this, a device revoked after
- * enrollment keeps receiving every new request's plaintext `ApprovalContext` indefinitely — the
- * relay-listed device set is untrusted input and account-state revocation was previously enforced
- * only at verdict-verification time, long after the plaintext had already been sent.
- *
- * The revocation-set parse/verify/resolve logic runs entirely in the audited core via
- * `wasm.revoked_device_ids` (thin-shell: this function only threads JSON through and filters the
- * caller-supplied array by device id).
- *
- * When `config.accountStates` is omitted, this resolves to no known revocations (a no-op filter) —
- * matching the same opt-in semantics as verdict-verification's account-state enforcement.
- *
- * @throws when filtering would leave zero recipients, so a fully-revoked account fails loudly
- * (the hook maps the thrown error to a deny) instead of silently submitting a request nobody can
- * decrypt, or worse, only to devices the account owner already revoked.
+ * Check `ClientConfig.accountStates` at construction: a non-empty document list or a source with a
+ * `load` function. Anything else throws, so a client can never be built without a trust input.
  */
-function filterRevokedDevices(
-  wasm: AllwWasm,
-  devices: readonly DeviceRecord[],
-  accountId: string,
-  approverRootKey: string,
-  accountStates: readonly string[] | undefined,
-): readonly DeviceRecord[] {
-  const revokedIds = parseRevokedDeviceIds(
-    wasm.revoked_device_ids(accountStatesJson(accountStates), accountId, approverRootKey),
+function assertAccountStatesConfigured(value: unknown): void {
+  if (isAccountStateSource(value)) {
+    const accepted = (value as { accepted?: unknown }).accepted;
+    if (accepted !== undefined && typeof accepted !== "function") {
+      throw new TypeError("allw: createClient accountStates.accepted must be a function when set");
+    }
+    return;
+  }
+  if (isNonEmptyStringArray(value)) return;
+  throw new TypeError(
+    "allw: createClient requires accountStates — a non-empty array of root-signed account-state " +
+      "documents or an AccountStateSource; requests are encrypted only to the devices it vouches for",
   );
-  if (revokedIds.size === 0) return devices;
-  const nonRevoked = devices.filter((d) => !revokedIds.has(d.device_id));
-  if (nonRevoked.length === 0) {
-    throw new Error(
-      `allw: approver account '${accountId}' has no non-revoked devices to encrypt to ` +
-        `(${String(devices.length)} enrolled device(s), all revoked per account state)`,
+}
+
+/** A floor is absent or a non-negative safe integer; anything else is a malformed source result. */
+function isSequenceFloor(value: unknown): value is number | undefined {
+  return value === undefined || (Number.isSafeInteger(value) && (value as number) >= 0);
+}
+
+/**
+ * Resolve one request's {@link AccountStateSet}: a fixed list as-is, or one validated `load()` call.
+ * Throws {@link RecipientSelectionError} (stage `"load"`) on any failure.
+ */
+async function loadAccountStateSet(
+  configured: readonly string[] | AccountStateSource,
+): Promise<AccountStateSet> {
+  if (!isAccountStateSource(configured)) return { accountStates: configured };
+  let loaded: unknown;
+  try {
+    loaded = await configured.load();
+  } catch (cause) {
+    throw new RecipientSelectionError("load", `loading account state failed: ${errorText(cause)}`, {
+      cause,
+    });
+  }
+  const set = loaded as Partial<AccountStateSet> | null;
+  if (
+    typeof loaded !== "object" ||
+    set === null ||
+    !isNonEmptyStringArray(set.accountStates) ||
+    !isSequenceFloor(set.minSequence)
+  ) {
+    throw new RecipientSelectionError(
+      "load",
+      "account-state source returned no documents or a malformed result " +
+        "(expected { accountStates: non-empty string[], minSequence?: non-negative safe integer })",
     );
   }
-  return nonRevoked;
+  return set.minSequence === undefined
+    ? { accountStates: set.accountStates }
+    : { accountStates: set.accountStates, minSequence: set.minSequence };
+}
+
+/** The core's sealed-context result (`seal_context_for_account_state`). */
+interface SealedContext {
+  readonly ciphertext: string;
+  readonly sequence: number;
+}
+
+/**
+ * Encrypt the context to exactly the devices the loaded account state vouches for — selection and
+ * encryption both run in the core, so recipient keys never pass through this package. Throws
+ * {@link RecipientSelectionError} (stage `"seal"`) when the core refuses.
+ */
+function sealContext(
+  wasm: AllwWasm,
+  contextJson: string,
+  set: AccountStateSet,
+  accountId: string,
+  approverRootKey: string,
+  nowMs: number,
+): SealedContext {
+  let json: string;
+  try {
+    json = wasm.seal_context_for_account_state(
+      contextJson,
+      JSON.stringify(set.accountStates),
+      accountId,
+      approverRootKey,
+      nowMs,
+      set.minSequence,
+    );
+  } catch (cause) {
+    throw new RecipientSelectionError(
+      "seal",
+      `account state cannot seal this request for account '${accountId}': ${errorText(cause)}`,
+      { cause },
+    );
+  }
+  const sealed = JSON.parse(json) as Partial<SealedContext>;
+  if (typeof sealed.ciphertext !== "string" || !Number.isSafeInteger(sealed.sequence)) {
+    throw new RecipientSelectionError(
+      "seal",
+      "seal_context_for_account_state returned a malformed result",
+    );
+  }
+  return sealed as SealedContext;
+}
+
+/**
+ * Report the sealed sequence to the source and wait for it, so the floor is persisted before the
+ * request leaves the machine. Throws {@link RecipientSelectionError} (stage `"accept"`) on failure.
+ */
+async function acceptSequence(
+  configured: readonly string[] | AccountStateSource,
+  sequence: number,
+): Promise<void> {
+  if (!isAccountStateSource(configured) || configured.accepted === undefined) return;
+  try {
+    await configured.accepted(sequence);
+  } catch (cause) {
+    throw new RecipientSelectionError(
+      "accept",
+      `could not record account-state sequence ${String(sequence)}; not sending the request: ` +
+        errorText(cause),
+      { cause },
+    );
+  }
 }
 
 /** Treat a blank optional account constraint like omission before crossing into WASM. */
@@ -750,17 +939,17 @@ export async function evaluatePolicyWithAccountStates(
 }
 
 /**
- * Classify an error thrown by the pre-deadline relay round-trip (`fetchDevices`/`submit`) as a
+ * Classify an error thrown by the pre-deadline relay round-trip (`submit`) as a
  * **transport** failure that should fail closed to a `Verdict` rather than reject.
  *
  * - {@link RelayTimeoutError} — a hung connect/read we bounded and aborted (the #52 case).
  * - A bare `TypeError` from `fetch` — a connection-level failure (DNS, refused, reset) that never
  *   produced an HTTP response; WHATWG `fetch` rejects with a `TypeError` for these.
  *
- * A {@link RelayError} (a real HTTP status from the relay), the explicit no-devices `Error`, and the
- * explicit all-devices-revoked `Error` (from {@link filterRevokedDevices}) are **not** transport
- * failures — they signal integrator/protocol misconfiguration or a fully-revoked account and keep
- * throwing so the caller (the hook) surfaces a precise deny reason.
+ * A {@link RelayError} (a real HTTP status from the relay) is **not** a transport failure — it
+ * signals integrator/protocol misconfiguration and keeps throwing so the caller (the hook) surfaces
+ * a precise deny reason. Account-state failures never reach this check: they throw
+ * {@link RecipientSelectionError} before anything is submitted.
  */
 function isPreDeadlineTransportFailure(err: unknown): boolean {
   if (err instanceof RelayTimeoutError) return true;
@@ -803,6 +992,7 @@ function armRetractOnAbort(
  * E2EE round-trip and resolves to a verified {@link Verdict} — never a bare "allow".
  */
 export function createClient(config: ClientConfig): Client {
+  assertAccountStatesConfigured(config.accountStates);
   const fetchImpl = config.fetchImpl ?? globalThis.fetch.bind(globalThis);
   const now: NowImpl = config.nowImpl ?? Date.now;
   // An explicitly-present `webSocketFactory` key is authoritative — passing `undefined` disables
@@ -841,42 +1031,28 @@ export function createClient(config: ClientConfig): Client {
       throw new RequestRetractedError(id);
     }
 
-    // 3–4. Fetch devices, filter out revoked ones, encrypt, and submit. These run BEFORE the
-    // await-verdict deadline timer is armed, so a hung relay (TCP-accepted but never responding)
-    // would otherwise wedge the call forever. The per-request fetch timeout (RelayClient) bounds
-    // each fetch; here we additionally ensure a *transport* failure on these calls fails closed to
-    // a `Verdict` (expired) instead of rejecting — the same fail-closed terminal a wait-stage
-    // timeout produces (issue #52, contract §Invariants #6). HTTP-level errors (a relay
-    // `RelayError` with a real status, including a malformed device entry), a no-devices account,
-    // and an all-devices-revoked account still throw, surfacing integrator/protocol misconfiguration
-    // loudly.
-    let contextCiphertext: string;
-    try {
-      const devices = await relay.fetchDevices();
-      if (devices.length === 0) {
-        throw new Error(
-          `allw: approver account '${config.accountId}' has no enrolled devices to encrypt to`,
-        );
-      }
-      // Drop revoked devices from the relay-listed recipient set BEFORE encrypting — the relay is
-      // untrusted, so this must run against the caller's own verified account-state, not the
-      // relay's device registry (issue #204 fix 1). Throws (fail-closed) if every device is
-      // revoked; relay-side eviction (issue #204 fix 2) is a separate, still-open slice.
-      const nonRevokedDevices = filterRevokedDevices(
-        wasm,
-        devices,
-        config.accountId,
-        config.approverRootKey,
-        config.accountStates,
-      );
-      const recipients = nonRevokedDevices.map((d: DeviceRecord) => ({
-        device_id: d.device_id,
-        public_key_b64: d.pubkey,
-      }));
-      // Throws (fail-closed, rethrown below) if any relay-listed device key is a small-order
-      // X25519 point: the core refuses the whole encryption and names the device (#248).
-      contextCiphertext = wasm.encrypt_context(contextJson, JSON.stringify(recipients));
+    // 3. Load this request's account state once (it also drives verdict revocation below), seal the
+    // context to exactly the devices it vouches for, and persist the sequence floor — all BEFORE
+    // anything leaves the machine. Each step throws RecipientSelectionError (deny-class) on failure;
+    // the relay's own device list is never read for keys.
+    const accountStateSet = await loadAccountStateSet(config.accountStates);
+    const sealed = sealContext(
+      wasm,
+      contextJson,
+      accountStateSet,
+      config.accountId,
+      config.approverRootKey,
+      now(),
+    );
+    await acceptSequence(config.accountStates, sealed.sequence);
 
+    // 4. Submit. This runs BEFORE the await-verdict deadline timer is armed, so a hung relay
+    // (TCP-accepted but never responding) would otherwise wedge the call forever. The per-request
+    // fetch timeout (RelayClient) bounds it; here we additionally ensure a *transport* failure fails
+    // closed to a `Verdict` (expired) instead of rejecting — the same fail-closed terminal a
+    // wait-stage timeout produces (issue #52, contract §Invariants #6). An HTTP-level error (a relay
+    // `RelayError` with a real status) still throws, surfacing misconfiguration loudly.
+    try {
       // Build the relay-visible envelope (exactly the contract's key set) and submit it.
       const envelope: ApprovalRequestEnvelope = {
         v: PROTOCOL_VERSION,
@@ -887,7 +1063,7 @@ export function createClient(config: ClientConfig): Client {
         // Using `config.accountId` (not a per-request field) removes the footgun where a request
         // could be POSTed to one account DO while claiming a different approver in the request JSON.
         approver: config.accountId,
-        context_ciphertext: contextCiphertext,
+        context_ciphertext: sealed.ciphertext,
       };
       await relay.submit(envelope);
       // The request now has a `request_auth_token` to retract with — arm cancellation (issue #195).
@@ -899,7 +1075,7 @@ export function createClient(config: ClientConfig): Client {
         // load-bearing fix for #52: the call resolves deterministically instead of hanging forever.
         return makeVerdict(id, "expired", { kind: "timeout" }, "", "", now, nonceStore);
       }
-      // HTTP/protocol error or no-devices ⇒ rethrow (the hook's try/catch maps it to a deny).
+      // HTTP/protocol error ⇒ rethrow (the hook's try/catch maps it to a deny).
       throw err;
     }
 
@@ -942,7 +1118,7 @@ export function createClient(config: ClientConfig): Client {
         config.approverRootKey,
         now(),
         nonceStore,
-        config.accountStates,
+        accountStateSet.accountStates,
         config.expectedAccountId,
       );
       // Unverifiable verdict ⇒ synthesized `denied` (never surface a forged decision as truth).
@@ -969,7 +1145,7 @@ export function createClient(config: ClientConfig): Client {
       contextJson,
       now,
       nonceStore,
-      config.accountStates,
+      accountStateSet.accountStates,
       config.expectedAccountId,
       acceptedNonceB64,
     );

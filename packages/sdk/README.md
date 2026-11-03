@@ -16,7 +16,12 @@ A script about to run a command uses the `command` surface, the same one the age
 
 ```js
 // Gate a command on a human approval from a plain script (issue #231). Usage: node gate-refund.mjs <charge-id>
-import { createClient, commandRequest } from "@allw/sdk";
+import {
+  createClient,
+  commandRequest,
+  fileSequenceFloorStore,
+  relayAccountStateSource,
+} from "@allw/sdk";
 
 const {
   ALLW_RELAY_URL: relayUrl,
@@ -25,7 +30,10 @@ const {
 } = process.env;
 const timeoutMs = Number(process.env.ALLW_TIMEOUT_MS ?? 300_000);
 const argv = ["stripe", "refunds", "create", "--charge", process.argv[2]];
-const client = createClient({ relayUrl, accountId, approverRootKey });
+// Encrypt only to the devices the root-signed account state vouches for; refuse a rollback.
+const floorStore = fileSequenceFloorStore({ accountId });
+const accountStates = relayAccountStateSource({ relayUrl, accountId, floorStore });
+const client = createClient({ relayUrl, accountId, approverRootKey, accountStates });
 const verdict = await client.requestApproval(
   await commandRequest({ argv, summary: `Refund charge ${process.argv[2]}`, timeoutMs }),
 );
@@ -64,3 +72,29 @@ malformed, so nothing is submitted. That covers an empty `argv`, a non-string el
 unparseable command line (for example an unmatched quote), an empty program, a blank `summary` or
 `cwd`, a malformed `actor`, a non-positive or non-integer `timeoutMs`, or `raw` passed to
 `commandRequest`.
+
+## Who can read a request: account state
+
+`createClient` requires `accountStates`. A request is encrypted only to the devices that root-signed
+account state vouches for (`docs/enrollment.md` §Model). The relay's own device list is never used
+for keys, so a relay cannot add a reader. Verdicts from devices that account state revokes are
+rejected.
+
+- **`relayAccountStateSource({ relayUrl, accountId, floorStore })`** is what the hooks use. It fetches
+  `GET /{account}/account-states` for each request; the documents are verified in the core against
+  `approverRootKey`, so the fetch needs no credentials.
+- **`fileSequenceFloorStore({ accountId })`** keeps the highest sequence used so far in
+  `~/.allw/state/<account_id>.floor.json`. A later state below it is refused, which stops a relay
+  from rolling back to a state that still lists a revoked device. Only a missing file means "no
+  floor yet". A file that is corrupt, unreadable, not a regular file, owned by another user, or
+  writable by others makes the request fail closed.
+- A fixed array of compact account-state documents also works. The caller then owns rollback
+  protection.
+- You can write your own `AccountStateSource`. `load()` is called once per request, and that set is
+  used for both encryption and verdict checks. After sealing, the SDK awaits
+  `accepted(sequence)` **before** sending; if it throws, nothing is sent.
+
+When account state can't be loaded, doesn't verify, is below the floor, or names no active device,
+`requestApproval` rejects with a `RecipientSelectionError` (`stage`: `"load"`, `"seal"` or
+`"accept"`) and nothing is sent. Treat that like a denial. Until the account's root holder runs
+`allw-approver pair`, there is no account state, and every request is refused.

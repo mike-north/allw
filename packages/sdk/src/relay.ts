@@ -11,43 +11,16 @@
 /** A `fetch`-compatible function (injectable for tests; defaults to the global `fetch`). */
 export type FetchImpl = typeof fetch;
 
-/** One enrolled approver device as returned by `GET /:acct/devices`. */
-export interface DeviceRecord {
-  readonly device_id: string;
-  /** The device's public key, base64url-unpadded 32 bytes (X25519 for JWE recipients). */
-  readonly pubkey: string;
-  readonly label: string | null;
-  readonly created_at: number;
+/** The relay's `GET /:acct/account-states` body: relay-verified documents plus their sequence. */
+export interface AccountStatesResponse {
+  /** Compact root-signed account-state JWS. The SDK still verifies each one in the core. */
+  readonly account_states: readonly string[];
+  /** The relay-reported highest sequence (`0` when none). Informational; never trusted. */
+  readonly max_sequence: number;
 }
 
-/**
- * The shape a relay-listed `device_id` must have before the SDK uses it. The relay mints device ids
- * as UUIDs; this accepts the base64url alphabet up to 64 characters, so an honest id always passes.
- *
- * The relay is untrusted, and a device id flows into JWE recipient headers, the revocation filter,
- * and error messages that the hooks put in the agent-visible deny reason. Rejecting anything else
- * (newlines, quotes, control characters, unbounded length) keeps relay-chosen text from reaching
- * the agent as if it were an allw diagnostic.
- */
-const DEVICE_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
-
-/**
- * Whether one relay device-list entry carries the fields the SDK routes on: a well-formed
- * `device_id` ({@link DEVICE_ID_PATTERN}) and a string `pubkey`. The key bytes themselves are
- * checked by the core when it encrypts. `label` and `created_at` are informational and unused here,
- * so they are not checked.
- */
-function hasRoutableRecipientFields(
-  value: unknown,
-): value is Pick<DeviceRecord, "device_id" | "pubkey"> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const record = value as Record<string, unknown>;
-  return (
-    typeof record.device_id === "string" &&
-    DEVICE_ID_PATTERN.test(record.device_id) &&
-    typeof record.pubkey === "string"
-  );
-}
+/** The most account-state documents the SDK accepts from one fetch (the core caps selection at 64). */
+const MAX_FETCHED_ACCOUNT_STATES = 64;
 
 /**
  * Read a relay response body as JSON. A body that isn't JSON becomes a {@link RelayError} naming only
@@ -116,7 +89,7 @@ export type ScheduleImpl = (fn: () => void, ms: number) => void;
 
 /**
  * Default per-request relay-fetch timeout (ms). Bounded **well under** the SDK's overall deadline
- * (`DEFAULT_TIMEOUT_MS` = 5 min) so a hung connect/read on the pre-deadline `fetchDevices`/`submit`
+ * (`DEFAULT_TIMEOUT_MS` = 5 min) so a hung connect/read on the pre-deadline `submit`
  * calls — which run *before* the await-verdict deadline timer is even armed — still rejects
  * deterministically and lets `requestApproval` fail closed (issue #52). A poll request is also
  * bounded, so a single hung poll never wedges the loop.
@@ -294,36 +267,49 @@ export class RelayClient {
   }
 
   /**
-   * Fetch the approver's enrolled devices (`GET /:acct/devices`) to use as JWE recipients.
+   * Fetch the account's root-signed account state (`GET /:acct/account-states`). Unauthenticated:
+   * the relay serves only documents it verified against the account's bound root, and the SDK
+   * re-verifies every one in the core before it selects a recipient, so this is untrusted transport
+   * of signed data (`docs/relay-api.md` §Account state).
    *
-   * Every entry must have a well-formed `device_id` and a string `pubkey`. One bad entry fails the
-   * whole call (fail-closed) rather than being dropped, and the error names only its index, never
-   * the relay-supplied text.
+   * The body must be `{ account_states: string[], max_sequence: number }` with at most
+   * {@link MAX_FETCHED_ACCOUNT_STATES} documents; anything else fails the whole call. Error messages
+   * name only the call and status, never relay text.
    *
-   * @throws {RelayError} on a non-2xx response, a malformed body, or a malformed device entry.
+   * @throws {RelayError} on a non-2xx response or a malformed body.
    */
-  async fetchDevices(): Promise<readonly DeviceRecord[]> {
-    const resp = await this.timedFetch(`${this.base}/devices`, { method: "GET" });
+  async fetchAccountStates(): Promise<AccountStatesResponse> {
+    const resp = await this.timedFetch(`${this.base}/account-states`, { method: "GET" });
     if (!resp.ok) {
-      throw new RelayError(`relay device list failed (HTTP ${String(resp.status)})`, resp.status);
-    }
-    const body = await readJsonBody(resp, "device list");
-    if (typeof body !== "object" || body === null || !("devices" in body)) {
-      throw new RelayError("relay device list returned a malformed body", resp.status);
-    }
-    const devices: unknown = body.devices;
-    if (!Array.isArray(devices)) {
-      throw new RelayError("relay device list 'devices' is not an array", resp.status);
-    }
-    const malformed = devices.findIndex((d) => !hasRoutableRecipientFields(d));
-    if (malformed !== -1) {
       throw new RelayError(
-        `relay device list entry ${String(malformed)} is malformed (device_id must match ` +
-          `${DEVICE_ID_PATTERN.source} and pubkey must be a string)`,
+        `relay account-state fetch failed (HTTP ${String(resp.status)})`,
         resp.status,
       );
     }
-    return devices as readonly DeviceRecord[];
+    const body = await readJsonBody(resp, "account-state fetch");
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      throw new RelayError("relay account-state fetch returned a malformed body", resp.status);
+    }
+    const { account_states: states, max_sequence: maxSequence } = body as Record<string, unknown>;
+    if (
+      !Array.isArray(states) ||
+      states.length > MAX_FETCHED_ACCOUNT_STATES ||
+      !states.every((doc) => typeof doc === "string")
+    ) {
+      throw new RelayError(
+        `relay account-state fetch 'account_states' is not an array of at most ` +
+          `${String(MAX_FETCHED_ACCOUNT_STATES)} strings`,
+        resp.status,
+      );
+    }
+    if (typeof maxSequence !== "number" || !Number.isSafeInteger(maxSequence) || maxSequence < 0) {
+      throw new RelayError(
+        "relay account-state fetch 'max_sequence' is not a non-negative safe integer",
+        resp.status,
+      );
+    }
+    const accountStates: readonly string[] = states;
+    return { account_states: accountStates, max_sequence: maxSequence };
   }
 
   /**
