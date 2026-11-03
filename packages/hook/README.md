@@ -57,19 +57,18 @@ Wire the hook into your user-level `~/.claude/settings.json` (or a project's `.c
 for a demo) as a `PreToolUse` hook. Install it outside any tree the agent works in, so the agent
 can't edit the gate: see
 [Install the hook where the agent can't write it](../../docs/claude-code-integration.md#install-the-hook-where-the-agent-cant-write-it).
-The matcher `^(Bash|Edit|MultiEdit|Write)$|^mcp__` is a regular expression anchored to whole tool
-names: it sends exactly `Bash` (shell commands), `Edit`/`MultiEdit`/`Write` (direct file edits) and
-every `mcp__…` tool to `allw`, and nothing else (not `NotebookEdit`). The `deny` rules turn off
-`Monitor`, `PowerShell` and `NotebookEdit`, which run shell commands or edit files without passing
-through `allw` ([#298](https://github.com/mike-north/allw/issues/298)). `Monitor` also follows your
-`Bash` permission rules, so a `Bash` allow rule would run it with no prompt at all:
+The matcher is a regular expression anchored to whole tool names: it sends exactly the shell tools
+`Bash`, `PowerShell` and `Monitor`, the file-edit tools `Edit`/`MultiEdit`/`Write`/`NotebookEdit`,
+and every `mcp__…` tool to `allw`, and nothing else. Keep `Monitor` in it whenever `Bash` is:
+`Monitor` follows your `Bash` permission rules, so a `Bash` allow rule would otherwise let it run
+commands with no prompt at all:
 
 ```json
 {
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "^(Bash|Edit|MultiEdit|Write)$|^mcp__",
+        "matcher": "^(Bash|PowerShell|Monitor|Edit|MultiEdit|Write|NotebookEdit)$|^mcp__",
         "hooks": [
           {
             "type": "command",
@@ -80,9 +79,6 @@ through `allw` ([#298](https://github.com/mike-north/allw/issues/298)). `Monitor
         ]
       }
     ]
-  },
-  "permissions": {
-    "deny": ["Monitor", "PowerShell", "NotebookEdit"]
   }
 }
 ```
@@ -196,14 +192,17 @@ Deliberately conservative, so the human is only interrupted for actions that act
 effects:
 
 - **`Bash`** — a shell command (`tool_input.command`).
+- **`Monitor`** with a `command` — gated exactly like `Bash` (it runs the command in the background
+  under your `Bash` permission rules). A `Monitor` WebSocket watch (`tool_input.ws`) runs no command
+  and gets no decision; any other `Monitor` input is denied.
+- **`PowerShell`** — a PowerShell line (`tool_input.command`), shown to the human as
+  `PowerShell: <command>`; its risk is never below `medium`.
 - **`Edit` / `Write` / `MultiEdit`** — direct file edits (`tool_input.file_path` plus edit
   payload).
+- **`NotebookEdit`** — a notebook cell edit (`tool_input.notebook_path` plus the cell change).
 - **`mcp__<server>__<tool>`** — any MCP tool call (`tool_input` is the raw params object).
 - **everything else** (`Read`, `Glob`, `Grep`, `WebFetch`, …) — **not gated**; allw makes no
   decision for it, without bothering the human (and without needing any `allw` config).
-- **Not gated yet, so the install block turns them off:** `Monitor` and `PowerShell` (both run shell
-  commands; `Monitor` follows your `Bash` permission rules) and `NotebookEdit` (edits notebook
-  files). Gating them is [#298](https://github.com/mike-north/allw/issues/298).
 
 Widening the matcher only ever adds gating: a tool allw doesn't gate gets no decision, never an
 `allow`.
