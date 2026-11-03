@@ -368,6 +368,11 @@ test("v1 context checks (#296): a non-null reserved field or a hidden risk downg
       `the refusal must name ${named}`,
     );
   }
+  // A context that raises the shown risk above the record's still opens.
+  const raised = await runtime.prepare(
+    makeEnvelope(encryptTo(JSON.stringify({ ...CONTEXT, risk: "critical" }))),
+  );
+  assert.equal(raised.context.risk.level, "critical");
 });
 
 test("missing ciphertext: a malformed envelope is rejected before any crypto", async () => {

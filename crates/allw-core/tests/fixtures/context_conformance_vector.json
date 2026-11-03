@@ -29,7 +29,7 @@
       "expected": "accepted"
     },
     {
-      "class": "explicit null capabilities and scope",
+      "class": "explicit null capabilities and scope (on the wire null reads as absent, so the opened context omits both)",
       "set": { "action.capabilities": null, "action.scope": null },
       "expected": "accepted"
     },
