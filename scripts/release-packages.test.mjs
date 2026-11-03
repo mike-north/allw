@@ -212,11 +212,21 @@ test("compareVersions orders releases above their prereleases", () => {
   assert.ok(compareVersions("1.2.3", "1.2.3-rc.1") > 0);
 });
 
-/** A packed release dir with one tarball of the given bytes. */
-function releaseDir(bytes = "tarball-bytes") {
+/**
+ * A packed release dir with one tarball of the given bytes, and a manifest recording `integrity`
+ * (by default, those bytes' real sha512, as `packAll` writes it).
+ */
+function releaseDir(bytes = "tarball-bytes", { integrity } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "allw-release-dir-"));
   writeFileSync(join(dir, "allw-sdk-0.2.0.tgz"), bytes);
-  const entries = [{ name: "@allw/sdk", version: "0.2.0", file: "allw-sdk-0.2.0.tgz" }];
+  const entries = [
+    {
+      name: "@allw/sdk",
+      version: "0.2.0",
+      file: "allw-sdk-0.2.0.tgz",
+      integrity: integrity ?? `sha512-${createHash("sha512").update(bytes).digest("base64")}`,
+    },
+  ];
   writeFileSync(join(dir, "release-manifest.json"), JSON.stringify(entries));
   return { dir, entry: entries[0] };
 }
@@ -332,7 +342,16 @@ test("publishAll stages, records the approval commands, and never calls plain `n
     assert.equal(stageCalls.length, 1);
     assert.deepEqual(stageCalls[0].slice(0, 2), ["stage", "publish"]);
     assert.equal(staged[0].stageId, id);
-    assert.match(readFileSync(summary, "utf8"), new RegExp(`npm stage approve ${id}`));
+    const text = readFileSync(summary, "utf8");
+    assert.match(text, new RegExp(`npm stage approve ${id}`));
+    // The summary is not evidence: it records the integrity and sends the maintainer to the
+    // independent check before any approval.
+    assert.ok(text.includes(staged[0].integrity), "summary lists the tarball's sha512");
+    assert.match(text, /node scripts\/verify-staged-release\.mjs 0\.2\.0 --run /);
+    assert.ok(
+      text.indexOf("verify-staged-release") < text.indexOf("npm stage approve"),
+      "verify comes before approve",
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -352,6 +371,28 @@ test("publishAll plans everything before staging anything, so one mismatch stage
     assert.deepEqual(stageCalls, []);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("publishAll refuses a tarball whose bytes differ from release-manifest.json", () => {
+  for (const integrity of ["sha512-b3RoZXI=", null]) {
+    const { dir } = releaseDir("tarball-bytes", { integrity: integrity ?? undefined });
+    const stageCalls = [];
+    try {
+      if (integrity === null) {
+        const manifest = join(dir, "release-manifest.json");
+        const entries = JSON.parse(readFileSync(manifest, "utf8"));
+        delete entries[0].integrity;
+        writeFileSync(manifest, JSON.stringify(entries));
+      }
+      assert.throws(
+        () => publishAll(dir, { runNpm: fakeView({}), runStage: (a) => stageCalls.push(a) }),
+        integrity ? /does not match release-manifest\.json/ : /no sha512 integrity/,
+      );
+      assert.deepEqual(stageCalls, []);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
 });
 
@@ -403,8 +444,10 @@ test("release.yml only stages, via OIDC from the trusted identity, with no token
   assert.doesNotMatch(workflow, /NPM_TOKEN|NODE_AUTH_TOKEN|_authToken|secrets\./);
   assert.doesNotMatch(workflow, /npm publish/);
 
-  // `npm stage` needs npm >= 11.15.0.
-  assert.match(stageJob, /npm install -g npm@\^11\.15\.0/);
+  // `npm stage` needs npm >= 11.15.0, and the token-holding job pins an exact version.
+  const pinned = /npm install -g npm@(\d+)\.(\d+)\.(\d+)$/m.exec(stageJob);
+  assert.ok(pinned, "the stage job installs an exactly pinned npm");
+  assert.ok(Number(pinned[1]) > 11 || (Number(pinned[1]) === 11 && Number(pinned[2]) >= 15));
   assert.match(stageJob, /release-packages\.mjs publish dist-release$/m);
 
   // The smoke test runs on exactly the tarballs that are staged: pack first, then smoke them.

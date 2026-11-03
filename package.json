@@ -13,7 +13,7 @@
     "test:recursive-scripts": "node --test scripts/recursive-scripts.test.mjs",
     "test:uat-codex": "node --test scripts/uat-codex.test.mjs",
     "test:uat-openclaw": "node --test scripts/uat-openclaw.test.mjs",
-    "test:release": "node --test scripts/release-packages.test.mjs scripts/npm-bootstrap-trusted-publishing.test.mjs",
+    "test:release": "node --test scripts/release-packages.test.mjs scripts/npm-bootstrap-trusted-publishing.test.mjs scripts/verify-staged-release.test.mjs",
     "smoke:packaged-install": "node scripts/smoke-packaged-install.mjs",
     "typecheck": "pnpm -r typecheck",
     "lint": "pnpm -r lint",

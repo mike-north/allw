@@ -223,8 +223,11 @@ function run(cmd, args, opts = {}) {
 
 /**
  * `pnpm pack` every released package into `outDir`, in release order, and write
- * `outDir/release-manifest.json` (`[{ name, version, file }]`) for the smoke test and the stage step.
- * `pnpm pack` is what rewrites `workspace:*` dependencies to the exact sibling version.
+ * `outDir/release-manifest.json` (`[{ name, version, file, integrity }]`) for the smoke test, the
+ * stage step and the maintainer's pre-approval check (`scripts/verify-staged-release.mjs`).
+ * `integrity` is the SRI sha512 of the tarball's exact bytes, the same value npm records as
+ * `dist.integrity`, so a staged or published version can be compared byte-for-byte with what this
+ * run built. `pnpm pack` is what rewrites `workspace:*` dependencies to the exact sibling version.
  */
 export function packAll(outDir, { root = REPO_ROOT, packages = PUBLISHED_PACKAGES } = {}) {
   const dest = resolve(outDir);
@@ -237,12 +240,14 @@ export function packAll(outDir, { root = REPO_ROOT, packages = PUBLISHED_PACKAGE
     if (produced.length !== 1) {
       throw new Error(`expected exactly one tarball for ${pkg.name}, got ${produced.length}`);
     }
+    const integrity = tarballIntegrity(join(dest, produced[0]));
     entries.push({
       name: pkg.name,
       version: readManifest(pkg.dir, root).version,
       file: produced[0],
+      integrity,
     });
-    console.log(`packed ${pkg.name} → ${produced[0]}`);
+    console.log(`packed ${pkg.name} → ${produced[0]} (${integrity})`);
   }
   writeFileSync(join(dest, "release-manifest.json"), `${JSON.stringify(entries, null, 2)}\n`);
   return entries;
@@ -253,9 +258,36 @@ export function readReleaseManifest(outDir) {
   return JSON.parse(readFileSync(join(resolve(outDir), "release-manifest.json"), "utf8"));
 }
 
+/**
+ * Read the release manifest and check that every tarball in `outDir` still has the integrity
+ * `packAll` recorded for it. Throws on a missing or different integrity, so bytes swapped between
+ * pack and stage are never staged.
+ */
+export function readVerifiedReleaseManifest(outDir) {
+  const dir = resolve(outDir);
+  const entries = readReleaseManifest(dir);
+  for (const entry of entries) {
+    if (typeof entry.integrity !== "string" || !entry.integrity.startsWith("sha512-")) {
+      throw new Error(`release-manifest.json has no sha512 integrity for ${entry.name}`);
+    }
+    const actual = tarballIntegrity(join(dir, entry.file));
+    if (actual !== entry.integrity) {
+      throw new Error(
+        `${entry.file} does not match release-manifest.json (manifest ${entry.integrity}, file ${actual})`,
+      );
+    }
+  }
+  return entries;
+}
+
 /** The npm `dist.integrity` (SRI sha512) of a tarball's exact bytes. */
 export function tarballIntegrity(file) {
-  return `sha512-${createHash("sha512").update(readFileSync(file)).digest("base64")}`;
+  return integrityOf(readFileSync(file));
+}
+
+/** The SRI sha512 (`sha512-<base64>`) of `bytes`. */
+export function integrityOf(bytes) {
+  return `sha512-${createHash("sha512").update(bytes).digest("base64")}`;
 }
 
 const is404 = (res) => /E404/.test(`${res.stdout}\n${res.stderr}`);
@@ -347,7 +379,7 @@ export function publishAll(
   { dryRun = false, runNpm = defaultNpm, runStage = defaultStageNpm, summaryFile } = {},
 ) {
   const dir = resolve(outDir);
-  const entries = readReleaseManifest(dir);
+  const entries = readVerifiedReleaseManifest(dir);
   const plan = entries.map((entry) => ({ ...entry, action: planEntry(entry, { dir, runNpm }) }));
   const staged = [];
   for (const entry of plan) {
@@ -376,18 +408,31 @@ export function publishAll(
   return staged;
 }
 
-/** The maintainer's approval steps for a set of staged releases, in dependency order. */
+/**
+ * The maintainer's approval steps for a set of staged releases, in dependency order. This text is
+ * written by the run itself, so it is a convenience, not evidence: a hostile run can write the same
+ * summary. The maintainer verifies with `scripts/verify-staged-release.mjs` before approving.
+ */
 export function approvalInstructions(staged) {
+  const version = staged[0]?.version ?? "<version>";
   return [
     "## Staged on npm: waiting for maintainer approval",
     "",
-    "Nothing is public yet. Inspect, then approve **in this order** (each asks for npm 2FA):",
+    "Nothing is public yet. This summary is written by the run, so it proves nothing on its own.",
+    "",
+    "| Package | Version | Stage id | Tarball integrity (sha512) |",
+    "| --- | --- | --- | --- |",
+    ...staged.map(
+      ({ name, version: v, stageId, integrity }) =>
+        `| \`${name}\` | ${v} | \`${stageId}\` | \`${integrity}\` |`,
+    ),
+    "",
+    "From a checkout of `main`, verify every stage against this run, then approve **in this order**",
+    "(each asks for npm 2FA):",
     "",
     "```sh",
-    ...staged.flatMap(({ name, version, stageId }) => [
-      `npm stage view ${stageId}       # ${name}@${version}`,
-      `npm stage approve ${stageId}`,
-    ]),
+    `node scripts/verify-staged-release.mjs ${version} --run <this run's id>`,
+    ...staged.map(({ name, stageId }) => `npm stage approve ${stageId}   # ${name}`),
     "```",
     "",
     "To abandon a release instead: `npm stage reject <stage-id>` for each.",

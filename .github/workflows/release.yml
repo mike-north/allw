@@ -106,13 +106,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
-      # `npm stage` (and trusted publishing with it) needs npm >= 11.15.0.
-      - run: npm install -g npm@^11.15.0
+      # `npm stage` (and trusted publishing with it) needs npm >= 11.15.0. Pinned exactly: this job
+      # holds the OIDC token, so a new npm release must not reach it without a reviewed bump.
+      - run: npm install -g npm@11.21.1
       - uses: actions/download-artifact@v4
         with:
           name: npm-tarballs
           path: dist-release
-      # In dependency order. A version already on the registry is skipped only if its registry
-      # integrity equals the local tarball's; any mismatch fails the job. The stage ids and the
-      # approval commands are written to the job summary.
+      # In dependency order. Each tarball must still match the sha512 that `pack` recorded in
+      # release-manifest.json. A version already on the registry is skipped only if its registry
+      # integrity equals the local tarball's; any mismatch fails the job. The stage ids and
+      # integrities go to the job summary. The summary is not evidence: the maintainer runs
+      # scripts/verify-staged-release.mjs before approving.
       - run: node scripts/release-packages.mjs publish dist-release
