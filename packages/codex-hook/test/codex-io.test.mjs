@@ -152,3 +152,13 @@ test("denyOutput never produces an empty permissionDecisionReason, even with an 
   assert.ok(output.hookSpecificOutput.permissionDecisionReason.length > 0);
   assertConformsToPreToolUseOutputContract(output);
 });
+
+test("(#372) a blank or whitespace-only cwd parses as absent", () => {
+  for (const cwd of ["", "   ", "\t\n"]) {
+    const result = parseCodexHookInput(
+      JSON.stringify({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: {}, cwd }),
+    );
+    assert.ok(result.ok);
+    assert.equal("cwd" in result.input, false, JSON.stringify(cwd));
+  }
+});

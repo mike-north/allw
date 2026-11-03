@@ -435,8 +435,10 @@ function reduceFileEdit(toolName: string, toolInput: unknown): FileEditReduction
  * - `pass-through`: a `Monitor` WebSocket watch, which runs no command.
  * - `build-error`: the `tool_input` has the wrong shape; deny (`reason` is a constant).
  *
- * The Claude Code hook builds the request for a `command` through `@allw/sdk`'s `commandRequest`
- * (#269); {@link gateToolCall} builds it through the core directly, for the codex-hook.
+ * Both hooks build the request for a `command` through `@allw/sdk`'s `commandRequest` (#269,
+ * #372), which also refuses a blank command or program. {@link gateToolCall} still builds a core
+ * record for one directly, for a caller that uses it on its own, and refuses the same commands with
+ * the same reason.
  */
 export type PosixCommandCall =
   | { readonly kind: "command"; readonly command: string; readonly summary: string }
@@ -485,8 +487,64 @@ export function posixCommandCall(toolName: string, toolInput: unknown): PosixCom
 }
 
 /**
+ * True if `err` is `@allw/sdk`'s `CommandActionError`. Checked by its name and `reason` field, not
+ * `instanceof`: a published install can hold two copies of the SDK (the codex-hook's and this
+ * package's), and an error from one copy is not an instance of the other's class.
+ */
+function isCommandActionError(err: unknown): err is Error & { readonly reason: string } {
+  return (
+    err instanceof Error &&
+    err.name === "CommandActionError" &&
+    typeof (err as { reason?: unknown }).reason === "string"
+  );
+}
+
+/**
+ * The deny reason for a command whose request could not be built: the SDK refused it (a
+ * `CommandActionError`), the core refused it, or anything else failed while building it. Both hooks
+ * and {@link gateToolCall} use this, so the same command is denied with the same reason everywhere
+ * (#372).
+ *
+ * For invalid shell syntax the SDK wraps the core's own error, which names the problem; quoting that
+ * keeps the reason the same as before #269. Otherwise the SDK's message is used, without its
+ * `allw: ` prefix (the reason already carries one). Either way the text goes through the core escape
+ * and cap before the agent reads it.
+ */
+export function commandBuildFailureReason(wasm: HookWasm, err: unknown): string {
+  const quoted = isCommandActionError(err)
+    ? err.cause instanceof Error
+      ? err.cause
+      : err.message.replace(/^allw: /u, "")
+    : err;
+  return `allw: could not build an ActionRecord for the command (fail-closed deny): ${agentSafeErrorText(
+    wasm,
+    quoted,
+  )}`;
+}
+
+/**
+ * Why a core `command` record has no program to show the human, worded exactly as `@allw/sdk`'s
+ * `commandActionFromLine` words its refusal, or `null` when it has one. A blank or whitespace-only
+ * line has no `argv` at all; `'' rm …` has an empty first word. This reads the core's record; it does
+ * not re-tokenize. A record that cannot be read is refused too (fail-closed).
+ */
+function noProgramRefusal(actionRecord: string): string | null {
+  let argv: unknown;
+  try {
+    argv = (JSON.parse(actionRecord) as { syntactic?: { argv?: unknown } }).syntactic?.argv;
+  } catch {
+    return "the core returned an unreadable command record";
+  }
+  if (!Array.isArray(argv) || argv.length === 0) return "commandLine contains no command";
+  if (argv[0] === "") return "commandLine's first word (the program) must be non-empty";
+  return null;
+}
+
+/**
  * Build a `command` record for a POSIX shell command (Bash, or Monitor's `command`) through the core.
- * A core error (invalid shell syntax) is a `build-error`, so the caller denies.
+ * A core error (invalid shell syntax), or a record with no program (a blank command, or an empty
+ * first word), is a `build-error`, so the caller denies, exactly as the hooks' `commandRequest` path
+ * does.
  */
 function gatePosixCommand(
   wasm: HookWasm,
@@ -500,15 +558,13 @@ function gatePosixCommand(
       cwd === undefined
         ? wasm.action_from_command(command)
         : wasm.action_from_command(command, cwd);
+    const refusal = noProgramRefusal(actionRecord);
+    if (refusal !== null) {
+      return { kind: "build-error", reason: commandBuildFailureReason(wasm, refusal) };
+    }
     return { kind: "gated", actionRecord, summary };
   } catch (err) {
-    return {
-      kind: "build-error",
-      reason: `allw: could not build an ActionRecord for the command (fail-closed deny): ${agentSafeErrorText(
-        wasm,
-        err,
-      )}`,
-    };
+    return { kind: "build-error", reason: commandBuildFailureReason(wasm, err) };
   }
 }
 
