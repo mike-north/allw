@@ -43,9 +43,12 @@
 //!   than once is a recipient only if *every* entry for it is active and unexpired with the same
 //!   key, so a duplicate entry that is not active, has expired, or carries another key excludes it.
 //! - **Malformed device entries fail the call.** An empty `device_id` anywhere in a
-//!   highest-sequence document ([`RecipientSelectionError::EmptyDeviceId`]), or an all-zero
-//!   encryption key on a selected recipient ([`RecipientSelectionError::InvalidEncryptionKey`]),
-//!   means the root signed something no real enrollment produces; the caller must not guess.
+//!   highest-sequence document ([`RecipientSelectionError::EmptyDeviceId`]), or a small-order
+//!   X25519 encryption key on a selected recipient
+//!   ([`RecipientSelectionError::InvalidEncryptionKey`], per
+//!   [`crate::is_small_order_x25519_public_key`]), means the root signed something no real
+//!   enrollment produces; the caller must not guess. A small-order key would make the request
+//!   readable by anyone, so it fails the whole call rather than dropping that one device.
 //! - **Never an empty list.** No document, no remaining recipient, or more than [`MAX_RECIPIENTS`]
 //!   is an error — the caller must not encrypt (and so must not send) in any of those cases.
 //!
@@ -56,6 +59,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::crypto::{
     verify_account_state, AccountState, AccountStateError, AccountStateRevocationKind,
 };
+use crate::jwe::is_small_order_x25519_public_key;
 
 /// The `AccountState` device status that makes a device a recipient. Any other value (for
 /// example `"revoked"` or `"pending"`) is not.
@@ -98,7 +102,7 @@ pub enum RecipientSelectionError {
     BelowSequenceFloor { highest: u64, min_sequence: u64 },
     /// A highest-sequence document lists a device with an empty `device_id`.
     EmptyDeviceId,
-    /// A selected recipient's encryption key is unusable (all zero bytes).
+    /// A selected recipient's encryption key is a small-order X25519 point (readable by anyone).
     InvalidEncryptionKey { device_id: String },
     /// The highest-sequence state leaves no active, unrevoked, unexpired device.
     NoActiveRecipients,
@@ -129,7 +133,7 @@ impl std::fmt::Display for RecipientSelectionError {
             }
             Self::InvalidEncryptionKey { device_id } => write!(
                 f,
-                "account state gives device {device_id:?} an invalid (all-zero) encryption key"
+                "account state gives device {device_id:?} a small-order encryption key"
             ),
             Self::NoActiveRecipients => {
                 write!(
@@ -215,6 +219,33 @@ pub fn select_recipients(
     now_ms: i64,
     min_sequence: Option<u64>,
 ) -> Result<Vec<Recipient>, RecipientSelectionError> {
+    select_recipient_set(
+        account_states,
+        expected_account_id,
+        account_root,
+        now_ms,
+        min_sequence,
+    )
+    .map(|set| set.recipients)
+}
+
+/// A selected recipient set together with the account-state `sequence` it was selected from.
+///
+/// The sequence is what a caller that persists a floor records once it has used this set; it is
+/// crate-internal because only [`crate::sealing`] needs it alongside the recipients.
+pub(crate) struct RecipientSet {
+    pub(crate) recipients: Vec<Recipient>,
+    pub(crate) sequence: u64,
+}
+
+/// [`select_recipients`], also reporting the highest verified sequence the selection used.
+pub(crate) fn select_recipient_set(
+    account_states: &[&str],
+    expected_account_id: &str,
+    account_root: &crate::PublicKey,
+    now_ms: i64,
+    min_sequence: Option<u64>,
+) -> Result<RecipientSet, RecipientSelectionError> {
     if account_states.is_empty() {
         return Err(RecipientSelectionError::NoAccountState);
     }
@@ -270,9 +301,10 @@ pub fn select_recipients(
         })
         .collect();
 
-    // The full small-order denylist belongs to the core's encryption-key validation; this only
-    // rejects the all-zero key, which no X25519 key generation ever yields.
-    if let Some(bad) = recipients.iter().find(|r| r.encryption_pubkey == [0u8; 32]) {
+    if let Some(bad) = recipients
+        .iter()
+        .find(|r| is_small_order_x25519_public_key(&r.encryption_pubkey))
+    {
         return Err(RecipientSelectionError::InvalidEncryptionKey {
             device_id: bad.device_id.clone(),
         });
@@ -285,7 +317,10 @@ pub fn select_recipients(
             count: recipients.len(),
         });
     }
-    Ok(recipients)
+    Ok(RecipientSet {
+        recipients,
+        sequence: highest,
+    })
 }
 
 #[cfg(test)]
@@ -842,30 +877,38 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_recipient_with_an_all_zero_encryption_key() {
-        let doc = signed(&state(
-            1,
-            vec![
-                device("dev-a", KEY_A, "active"),
-                device("dev-z", [0u8; 32], "active"),
-            ],
-            vec![],
-        ));
-        assert_eq!(
-            select(&[doc]),
-            Err(RecipientSelectionError::InvalidEncryptionKey {
-                device_id: "dev-z".to_string()
-            })
-        );
+    fn rejects_a_recipient_with_a_small_order_encryption_key() {
+        // Every denylisted point, and its bit-255-set twin (X25519 masks bit 255, RFC 7748 §5).
+        for point in crate::jwe::X25519_SMALL_ORDER_POINTS {
+            let mut high = point;
+            high[31] |= 0x80;
+            for key in [point, high] {
+                let doc = signed(&state(
+                    1,
+                    vec![
+                        device("dev-a", KEY_A, "active"),
+                        device("dev-z", key, "active"),
+                    ],
+                    vec![],
+                ));
+                assert_eq!(
+                    select(&[doc]),
+                    Err(RecipientSelectionError::InvalidEncryptionKey {
+                        device_id: "dev-z".to_string()
+                    }),
+                    "{key:02x?}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn an_all_zero_key_on_a_device_that_is_not_a_recipient_is_ignored() {
+    fn a_small_order_key_on_a_device_that_is_not_a_recipient_is_ignored() {
         let doc = signed(&state(
             1,
             vec![
                 device("dev-a", KEY_A, "active"),
-                device("dev-z", [0u8; 32], "revoked"),
+                device("dev-z", crate::jwe::X25519_SMALL_ORDER_POINTS[0], "revoked"),
             ],
             vec![],
         ));

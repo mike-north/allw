@@ -35,6 +35,7 @@ pub mod jwe;
 pub mod mcp;
 pub mod policy;
 pub mod recipients;
+pub mod sealing;
 
 pub use account::{
     account_id_for_root, check_account_id_for_root, sign_pairing_start_authorization,
@@ -89,3 +90,4 @@ pub use recipients::{
     select_recipients, Recipient, RecipientSelectionError, DEVICE_STATUS_ACTIVE,
     MAX_ACCOUNT_STATES, MAX_RECIPIENTS,
 };
+pub use sealing::{seal_context_for_account_state, SealContextError, SealedContext};
