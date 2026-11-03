@@ -57,7 +57,8 @@
 //!   differently (`\u`, `\c`, an unknown escape, a byte that isn't UTF-8) makes it at least `High`.
 //!   The decoded name still applies, so `$'\u0064\u0064'` is `Critical`.
 //! - Command and process substitutions (`$(…)`, backticks, `<(…)`, `>(…)`) are classified as
-//!   command lines.
+//!   command lines. Inside one, a `#` comment runs to the end of its line, so a `)` or quote in it
+//!   doesn't end the substitution.
 //! - Heredocs (`<<`, `<<-`) are recognized:
 //!   - the delimiter is read as bash reads it: an empty quoted delimiter (`<<''`) ends the body at
 //!     the first empty line, a backslash-newline is removed, and inside double quotes `\"`, `\\`,
@@ -83,15 +84,17 @@
 //! - whether `#` starts a comment;
 //! - whether `$'…'` is an ANSI-C string (bash) or not (dash, `shlex`);
 //! - whether `((` opens an arithmetic command or two subshells;
-//! - whether a heredoc inside `$(…)` is read before the closing `)` (bash ≥ 4, zsh) or the first
-//!   `)` closes the substitution (bash 3.2, dash);
+//! - whether a heredoc inside `$(…)` is read before the closing `)` (bash ≥ 4, zsh, dash, ksh)
+//!   or the first `)` closes the substitution (bash 3.2);
 //! - whether a body line `EOF)` ends a heredoc inside `$(…)` and closes the substitution
 //!   (bash 5).
 //!
 //! Each alternate reading runs only when the line holds the syntax it is about, at every nesting
 //! level (a nested `dash -c` string gets dash's reading), charged to the shared budget. An
-//! alternate adds the commands its shell would run; the bash reading alone sets the open-quote
-//! floor. zsh-only syntax gets fail-upward handling only: its precommand words, and `&!` / `&|`
+//! alternate reading's substitutions keep the open-quote floor, with one exception: a
+//! substitution the bash 3.2 reading never closes runs to the end of the input, and bash 3.2
+//! stops at its open quote with nothing later to run, so that open quote alone doesn't raise the
+//! tier. zsh-only syntax gets fail-upward handling only: its precommand words, and `&!` / `&|`
 //! as operators.
 //!
 //! # Bounds (all fail upward)
@@ -636,7 +639,8 @@ struct Reading {
     /// (bash, zsh, ksh). Otherwise it is two subshells.
     arithmetic_commands: bool,
     /// A heredoc inside `$(…)` is read as a heredoc, so a `)` in its body doesn't close the
-    /// substitution (bash ≥ 4, zsh). Otherwise the first unquoted `)` closes it (bash 3.2, dash).
+    /// substitution (bash ≥ 4, zsh, dash, ksh). Otherwise the first unquoted `)` closes it
+    /// (bash 3.2).
     heredocs_in_substitutions: bool,
     /// Inside `$(…)`, a body line that starts with the delimiter followed by `)` ends the heredoc,
     /// and that `)` closes the substitution (bash 5 accepts `EOF)` with a warning). Off in bash 4
@@ -666,11 +670,13 @@ enum Source {
     /// still classified, so an open quote alone doesn't raise the tier. This keeps ordinary
     /// commit and PR bodies (`it's`, `don't`) at the tier of the command that consumes them.
     HeredocBody,
-    /// A substitution as an alternate [`Reading`] delimits it. The bash reading already applies
-    /// its own floors; an alternate only adds the commands its shell would run, and that shell
-    /// stops at an open quote. (bash 3.2 reads `"$(cat <<'EOF'`⏎`it's`⏎`EOF`⏎`)"` as an
-    /// unterminated quote and runs nothing.)
-    AlternateSubstitution,
+    /// A substitution that the bash 3.2 reading (`heredocs_in_substitutions` off) never closes,
+    /// so it runs to the end of the input. bash 3.2 stops at the open quote and has no later
+    /// command to run, and the bash reading applies its own floors. (bash 3.2 reads
+    /// `"$(cat <<'EOF'`⏎`it's`⏎`EOF`⏎`)"` as an unterminated quote and runs nothing.) A
+    /// substitution any other alternate delimits, or one bash 3.2 closes, is a
+    /// [`Source::CommandLine`].
+    UnclosedBash32Substitution,
 }
 
 /// A heredoc whose body begins at the next unquoted newline.
@@ -680,16 +686,48 @@ struct PendingHeredoc {
     quoted: bool,
 }
 
+/// A command substitution, process substitution or backtick, as one reading delimits it.
+#[derive(Clone, Copy)]
+struct Substitution<'a> {
+    /// The text between the delimiters, or to the end of the input when it never closes.
+    body: &'a str,
+    /// The reading found its closing `)` or backtick.
+    closed: bool,
+}
+
+impl<'a> Substitution<'a> {
+    fn closed(body: &'a str) -> Self {
+        Substitution { body, closed: true }
+    }
+
+    fn unclosed(body: &'a str) -> Self {
+        Substitution {
+            body,
+            closed: false,
+        }
+    }
+
+    /// How an open quote at the end of this substitution counts in `reading`. See
+    /// [`Source::UnclosedBash32Substitution`].
+    fn source(&self, reading: Reading) -> Source {
+        if !reading.heredocs_in_substitutions && !self.closed {
+            Source::UnclosedBash32Substitution
+        } else {
+            Source::CommandLine
+        }
+    }
+}
+
 /// What a shell does with a command line, as far as risk needs to know.
 #[derive(Default)]
 struct ShellLine<'a> {
     /// The text of each simple command between control operators, still quoted as written.
     segments: Vec<&'a str>,
-    /// Bodies of command and process substitutions, each a command line of its own.
-    substitutions: Vec<&'a str>,
+    /// Command and process substitutions, each body a command line of its own.
+    substitutions: Vec<Substitution<'a>>,
     /// Substitutions inside unquoted heredoc bodies. They are also inside [`ShellLine::heredocs`],
     /// so the lexical pre-pass doesn't descend into them twice.
-    body_substitutions: Vec<&'a str>,
+    body_substitutions: Vec<Substitution<'a>>,
     /// Heredoc bodies. Each is always also classified as a script, whatever reads it.
     heredocs: Vec<&'a str>,
     /// Any operator, substitution or redirection: shell syntax beyond plain words.
@@ -753,7 +791,9 @@ fn skip_ansi_c_string(b: &[u8], start: usize) -> Option<usize> {
 
 /// Index of the `)` closing a `(` whose body starts at `start`, honoring quotes and backslashes,
 /// or `None` if it is never closed. With [`Reading::heredocs_in_substitutions`], a heredoc
-/// inside is read as one, so a `)` in its body doesn't close the substitution.
+/// inside is read as one, so a `)` in its body doesn't close the substitution. With
+/// [`Reading::honor_comments`], a comment runs to the end of its line, so neither a `)` nor a
+/// quote in it counts.
 fn find_closing_paren(b: &[u8], start: usize, reading: Reading) -> Option<usize> {
     let mut depth = 1usize;
     let mut in_double = false;
@@ -761,6 +801,14 @@ fn find_closing_paren(b: &[u8], start: usize, reading: Reading) -> Option<usize>
     let mut i = start;
     while i < b.len() {
         match b[i] {
+            b'#' if reading.honor_comments
+                && !in_double
+                && (i == start || is_word_break(b[i - 1])) =>
+            {
+                // Stop at the newline, which still ends any pending heredoc's operator line.
+                i = find_byte(b, i, b'\n').unwrap_or(b.len());
+                continue;
+            }
             b'\\' => {
                 i += 2;
                 continue;
@@ -1006,7 +1054,11 @@ fn heredoc_end_before_paren(b: &[u8], pos: usize, heredoc: &PendingHeredoc) -> O
 
 /// The command substitutions in an unquoted heredoc body. Quotes are literal there; only `$(…)`,
 /// backticks and backslash escapes are special.
-fn heredoc_substitutions<'a>(body: &'a str, reading: Reading, out: &mut Vec<&'a str>) -> bool {
+fn heredoc_substitutions<'a>(
+    body: &'a str,
+    reading: Reading,
+    out: &mut Vec<Substitution<'a>>,
+) -> bool {
     let b = body.as_bytes();
     let mut unterminated = false;
     let mut i = 0;
@@ -1015,22 +1067,22 @@ fn heredoc_substitutions<'a>(body: &'a str, reading: Reading, out: &mut Vec<&'a 
             b'\\' => i += 2,
             b'$' if b.get(i + 1) == Some(&b'(') => match find_closing_paren(b, i + 2, reading) {
                 Some(end) => {
-                    out.push(&body[i + 2..end]);
+                    out.push(Substitution::closed(&body[i + 2..end]));
                     i = end + 1;
                 }
                 None => {
-                    out.push(&body[i + 2..]);
+                    out.push(Substitution::unclosed(&body[i + 2..]));
                     unterminated = true;
                     i = b.len();
                 }
             },
             b'`' => match find_closing_backtick(b, i + 1) {
                 Some(end) => {
-                    out.push(&body[i + 1..end]);
+                    out.push(Substitution::closed(&body[i + 1..end]));
                     i = end + 1;
                 }
                 None => {
-                    out.push(&body[i + 1..]);
+                    out.push(Substitution::unclosed(&body[i + 1..]));
                     unterminated = true;
                     i = b.len();
                 }
@@ -1107,11 +1159,13 @@ fn scan_shell_line(text: &str, reading: Reading) -> ShellLine<'_> {
                 line.has_shell_syntax = true;
                 match find_closing_backtick(b, i + 1) {
                     Some(end) => {
-                        line.substitutions.push(&text[i + 1..end]);
+                        line.substitutions
+                            .push(Substitution::closed(&text[i + 1..end]));
                         i = end + 1;
                     }
                     None => {
-                        line.substitutions.push(&text[i + 1..]);
+                        line.substitutions
+                            .push(Substitution::unclosed(&text[i + 1..]));
                         line.unterminated = true;
                         i = b.len();
                     }
@@ -1122,11 +1176,13 @@ fn scan_shell_line(text: &str, reading: Reading) -> ShellLine<'_> {
                 line.has_shell_syntax = true;
                 match find_closing_paren(b, i + 2, reading) {
                     Some(end) => {
-                        line.substitutions.push(&text[i + 2..end]);
+                        line.substitutions
+                            .push(Substitution::closed(&text[i + 2..end]));
                         i = end + 1;
                     }
                     None => {
-                        line.substitutions.push(&text[i + 2..]);
+                        line.substitutions
+                            .push(Substitution::unclosed(&text[i + 2..]));
                         line.unterminated = true;
                         i = b.len();
                     }
@@ -1644,13 +1700,11 @@ fn reading_risk(
     for segment in &line.segments {
         tier = raise_opt(tier, segment_risk(segment, depth, reading, budget));
     }
-    let substitution_source = if reading == Reading::BASH {
-        Source::CommandLine
-    } else {
-        Source::AlternateSubstitution
-    };
-    for body in line.substitutions.iter().chain(&line.body_substitutions) {
-        tier = raise_opt(tier, script_risk(body, substitution_source, depth, budget));
+    for sub in line.substitutions.iter().chain(&line.body_substitutions) {
+        tier = raise_opt(
+            tier,
+            script_risk(sub.body, sub.source(reading), depth, budget),
+        );
     }
     // A heredoc body is always also read as a script (deliberate fail-upward rule): whatever
     // consumes it may be a shell, directly or through a compound command, `eval` or a wrapper.
@@ -1782,7 +1836,8 @@ fn note_line_programs(text: &str, depth: usize, budget: &mut Budget) {
         return;
     }
     // Substitutions inside heredoc bodies are reached through the bodies themselves.
-    for nested in line.substitutions.iter().chain(&line.heredocs) {
+    let substitutions = line.substitutions.iter().map(|sub| sub.body);
+    for nested in substitutions.chain(line.heredocs.iter().copied()) {
         note_line_programs(nested, depth + 1, budget);
     }
 }
