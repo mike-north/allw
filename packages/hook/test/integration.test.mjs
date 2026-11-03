@@ -227,23 +227,31 @@ test("end-to-end: a WASM-signed approved verdict yields no decision (never allow
   );
 });
 
-test("end-to-end (fail-closed): a WASM-signed denied verdict makes the hook emit deny", async () => {
-  const wasm = await loadWasm();
-  const approver = await pairedApprover(wasm);
-  const { fetchImpl } = relayDouble(wasm, approver, "denied");
+// Each genuinely signed non-approval is reported with its signed decision (#311): the decision now
+// comes from the core's structured `not_approved` error, never the outer verdict.
+for (const decision of ["denied", "expired", "aborted"]) {
+  test(`end-to-end (fail-closed): a WASM-signed ${decision} verdict makes the hook emit deny`, async () => {
+    const wasm = await loadWasm();
+    const approver = await pairedApprover(wasm);
+    const { fetchImpl } = relayDouble(wasm, approver, decision);
 
-  const output = await runHook(
-    bashStdin("rm -rf build", "/workspace/project"),
-    env(approver, TIMEOUT_MS),
-    overrides(fetchImpl),
-  );
+    const output = await runHook(
+      bashStdin("rm -rf build", "/workspace/project"),
+      env(approver, TIMEOUT_MS),
+      overrides(fetchImpl),
+    );
 
-  assert.equal(
-    output.hookSpecificOutput.permissionDecision,
-    "deny",
-    "a verified human 'no' keeps the tool call blocked (fail-closed)",
-  );
-});
+    assert.equal(
+      output.hookSpecificOutput.permissionDecision,
+      "deny",
+      "a verified human 'no' keeps the tool call blocked (fail-closed)",
+    );
+    assert.match(
+      output.hookSpecificOutput.permissionDecisionReason,
+      new RegExp(`\\(verdict: ${decision}\\)$`),
+    );
+  });
+}
 
 test("end-to-end (fail-closed): missing config (no ALLW_RELAY_URL) → deny without dialing the relay", async () => {
   const wasm = await loadWasm();
