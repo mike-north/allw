@@ -378,7 +378,12 @@ function optionalPushTokens(body: Record<string, unknown>): IncomingPushToken[] 
     if (typeof transport !== "string" || !isPushTransportKind(transport)) return null;
     if (typeof rawToken !== "string" || rawToken.length < 1 || rawToken.length > 4096) return null;
     let token = rawToken;
-    if (transport === "apns" && !/^[0-9a-fA-F]{64}$/.test(token)) return null;
+    if (transport === "apns") {
+      if (!/^[0-9a-fA-F]{64}$/.test(token)) return null;
+      // Hex is case-insensitive: store one canonical spelling, so one device token spelled two ways
+      // is one row (and one wakeup), and re-sending it in another case is a no-op (#304).
+      token = token.toLowerCase();
+    }
     if (transport === "fcm" && !/^[A-Za-z0-9:_-]{1,4096}$/.test(token)) return null;
     if (transport === "webpush") {
       // SECURITY (SSRF): a webpush token is the subscription endpoint the relay will POST to.
@@ -673,6 +678,22 @@ export class AccountRelay implements DurableObject {
         expires_at
       )
       WHERE status = 'resolved' AND terminal_at IS NULL;
+    `);
+    // APNs tokens are stored lowercase (#304). Rows stored before that may be in any case: keep one
+    // row per device and token ignoring case (two spellings would collide once lowercased), then
+    // lowercase what is left. Idempotent; on an already-canonical table both statements change
+    // nothing.
+    this.sql.exec(`
+      DELETE FROM device_push_token
+      WHERE transport = 'apns'
+        AND rowid NOT IN (
+          SELECT MIN(rowid) FROM device_push_token
+          WHERE transport = 'apns'
+          GROUP BY device_id, lower(token)
+        );
+
+      UPDATE device_push_token SET token = lower(token)
+      WHERE transport = 'apns' AND token <> lower(token);
     `);
     // Pending requests by deadline. Every submit and trailing wakeup reads the latest pending
     // deadline (latestPendingRequest), and the expiry alarm the earliest (armExpiryAlarm). Partial,

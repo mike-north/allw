@@ -187,14 +187,17 @@ Every rejection leaves the account unchanged (no root bound, no code issued, not
 }
 ```
 
-→ **201** `{ device_id: string, device_auth_token: string }`. APNs `token` = 64-char hex. A `webpush`
-`token` is the browser subscription's `endpoint` URL, which must be `https:` on a push-service host
-allowlist (§5); it is stored in normalized form (`URL.href`), so two spellings of one subscription are
-one token. **Budgets:** at most **4** `push_tokens` entries per registration and **2** distinct tokens
-per transport (duplicates collapse first); over budget is a **400**, never a silent truncation. An
-account holds at most **32** push tokens across all devices; a registration that would exceed that is
-a **409** and the pairing code is not consumed (retry without tokens, or free some). Errors: 403 when
-no root is bound to the account (a code on an unbound account predates root binding and is never
+→ **201** `{ device_id: string, device_auth_token: string }`. APNs `token` = 64-char hex, in either
+case; hex is case-insensitive, so it is stored lowercase and two spellings of one device token are one
+token (#304). Rows stored before that are lowercased in place, keeping one row per device token. An
+`fcm` token is an opaque, case-sensitive string and is stored as sent. A `webpush` `token` is the
+browser subscription's `endpoint` URL, which must be `https:` on a push-service host allowlist (§5);
+it is stored in normalized form (`URL.href`), so two spellings of one subscription are one token.
+**Budgets:** at most **4** `push_tokens` entries per registration and **2** distinct tokens per
+transport (duplicates collapse first); over budget is a **400**, never a silent truncation. An account
+holds at most **32** push tokens across all devices; a registration that would exceed that is a
+**409** and the pairing code is not consumed (retry without tokens, or free some). Errors: 403 when no
+root is bound to the account (a code on an unbound account predates root binding and is never
 honored), 400 (bad body/pubkey/push_token/unexpected key/over budget), 401/403 (token), 404 (code
 unknown), 409 (code already used, or account push-token budget full), 410 (code expired). Atomic — no
 half-enrollment.
