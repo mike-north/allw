@@ -250,10 +250,12 @@ test("PowerShell: a statement hidden from POSIX quoting is its own argv token on
   // PowerShell runs the Remove-Item: inside "…" its escape is the backtick and `\` is literal.
   const line = String.raw`echo "a\" ; Remove-Item -Recurse -Force C:\Users ; echo \"b"`;
   const prepared = await preparePowerShell(line);
-  const [, argvLine, rawLine] = exactPlaintext(prepared.context).split("\n");
-  assert.match(argvLine, /^argv: echo .* ';' Remove-Item -Recurse -Force /);
-  assert.equal(rawLine, `raw: ${line}`);
+  const lines = exactPlaintext(prepared.context).split("\n");
+  const argvLine = lines.find((l) => l.startsWith("argv: "));
+  assert.match(argvLine ?? "", /^argv: echo .* ';' Remove-Item -Recurse -Force /);
+  assert.ok(lines.includes(`raw: ${line}`));
   assert.equal(actionSummary(prepared.context), line);
+  assert.equal(prepared.context.divergentArgv, undefined, "argv is raw's whitespace split");
 });
 
 test("PowerShell: a Windows path keeps its backslashes on the card (#316 B1)", async () => {
@@ -263,6 +265,7 @@ test("PowerShell: a Windows path keeps its backslashes on the card (#316 B1)", a
   assert.ok(text.includes(String.raw`argv: Remove-Item 'C:\Users\me\proj\build' -Recurse`), text);
   assert.ok(text.includes(`raw: ${line}`));
   assert.ok(!text.includes("C:Usersmeprojbuild"));
+  assert.equal(prepared.context.divergentArgv, undefined, "quoting a path is not a divergence");
 });
 
 // ── Negative: already-expired request fails closed in prepare ────────────────────────────────
