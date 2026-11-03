@@ -122,8 +122,11 @@ interface CommandParts {
  *
  * Applied to the raw substrate it yields the comparison value for divergence detection; applied to
  * the escaped display substrate it yields the printed line.
+ *
+ * The web approver applies the same rule (`packages/web-approver/src/command-line.ts`); both are
+ * tested against one shared fixture (`packages/web-approver/test/fixtures/raw-argv-divergence.json`).
  */
-function reconstructCommand(parts: CommandParts): string | undefined {
+export function reconstructCommand(parts: CommandParts): string | undefined {
   const tokens = commandTokens(parts);
   return tokens === undefined ? undefined : renderArgv(tokens);
 }
@@ -166,7 +169,7 @@ function isWhitespaceSplitOf(tokens: readonly string[], raw: string): boolean {
  * tokens are exactly `raw`'s whitespace split (display quoting alone, such as a quoted `C:\Users`
  * path, is not a different command).
  */
-function rawDivergesFromArgv(action: ActionRecord): boolean {
+export function rawDivergesFromArgv(action: ActionRecord): boolean {
   const syntactic = action.syntactic;
   if (!isRecord(syntactic)) return false;
   const raw = readString(syntactic, "raw");
