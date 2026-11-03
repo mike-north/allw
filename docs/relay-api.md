@@ -187,14 +187,17 @@ Every rejection leaves the account unchanged (no root bound, no code issued, not
 }
 ```
 
-→ **201** `{ device_id: string, device_auth_token: string }`. APNs `token` = 64-char hex. A `webpush`
-`token` is the browser subscription's `endpoint` URL, which must be `https:` on a push-service host
-allowlist (§5); it is stored in normalized form (`URL.href`), so two spellings of one subscription are
-one token. **Budgets:** at most **4** `push_tokens` entries per registration and **2** distinct tokens
-per transport (duplicates collapse first); over budget is a **400**, never a silent truncation. An
-account holds at most **32** push tokens across all devices; a registration that would exceed that is
-a **409** and the pairing code is not consumed (retry without tokens, or free some). Errors: 403 when
-no root is bound to the account (a code on an unbound account predates root binding and is never
+→ **201** `{ device_id: string, device_auth_token: string }`. APNs `token` = 64-char hex, in either
+case; hex is case-insensitive, so it is stored lowercase and two spellings of one device token are one
+token (#304). Rows stored before that are lowercased in place, keeping one row per device token. An
+`fcm` token is an opaque, case-sensitive string and is stored as sent. A `webpush` `token` is the
+browser subscription's `endpoint` URL, which must be `https:` on a push-service host allowlist (§5);
+it is stored in normalized form (`URL.href`), so two spellings of one subscription are one token.
+**Budgets:** at most **4** `push_tokens` entries per registration and **2** distinct tokens per
+transport (duplicates collapse first); over budget is a **400**, never a silent truncation. An account
+holds at most **32** push tokens across all devices; a registration that would exceed that is a
+**409** and the pairing code is not consumed (retry without tokens, or free some). Errors: 403 when no
+root is bound to the account (a code on an unbound account predates root binding and is never
 honored), 400 (bad body/pubkey/push_token/unexpected key/over budget), 401/403 (token), 404 (code
 unknown), 409 (code already used, or account push-token budget full), 410 (code expired). Atomic — no
 half-enrollment.
@@ -288,19 +291,20 @@ pending only, `expires_at > now`, oldest first. (404 if device not enrolled.)
 **`POST /{acct}/devices/{device_id}/revoke`** — Bearer the device's own token (self-revoke only;
 cross-device ⇒ 403). → **200** `{ revoked: true }`. Closes the live socket (1008). 404 if not enrolled.
 
-**`PUT /{acct}/devices/{device_id}/push-tokens`** — Bearer the device's own token (self only).
-Body `{ "push_tokens": [{ "transport": "apns" | "fcm" | "webpush", "token": "string" }] }` (required;
-`[]` clears). **Replaces** the device's push-token set, so it covers add, rotate, and clear after
-pairing. → **200** `{ push_tokens: [{ transport, token }] }`, the stored set (normalized, duplicates
-collapsed). Validation and per-registration budgets are exactly those of `push_tokens` in
-`pairing/complete` (§Pairing): 400 for a malformed body, a missing `push_tokens`, an unsupported
-transport, an invalid or over-long token, or over budget. The account budget (32) counts every other
-device's tokens plus this set (the device's own current tokens don't count, so a full account can
-still rotate); a set that grows past it is a **409** and nothing changes. A set that stays the same
-size or shrinks is never refused, so a device can always clear its tokens. The replace is one transaction and only
-touches tokens that change, so repeating a body is a no-op. Auth, in the revoke order: 401 (no
-bearer), 403 (not a device token, including a revoked device's own), 404 (device not enrolled or
-revoked), 403 (another device's token). Revoking a device deletes its push tokens.
+**`PUT /{acct}/devices/{device_id}/push-tokens`** — Bearer the device's own token (self only). Body `{
+"push_tokens": [{ "transport": "apns" | "fcm" | "webpush", "token": "string" }] }` (required; `[]`
+clears). **Replaces** the device's push-token set, so it covers add, rotate, and clear after pairing.
+→ **200** `{ push_tokens: [{ transport, token }] }`, the stored set (normalized: APNs tokens
+lowercased, Web Push endpoints as `URL.href`; duplicates collapsed). Validation and per-registration
+budgets are exactly those of `push_tokens` in `pairing/complete` (§Pairing): 400 for a malformed body,
+a missing `push_tokens`, an unsupported transport, an invalid or over-long token, or over budget. The
+account budget (32) counts every other device's tokens plus this set (the device's own current tokens
+don't count, so a full account can still rotate); a set that grows past it is a **409** and nothing
+changes. A set that stays the same size or shrinks is never refused, so a device can always clear its
+tokens. The replace is one transaction and only touches tokens that change, so repeating a body is a
+no-op. Auth, in the revoke order: 401 (no bearer), 403 (not a device token, including a revoked
+device's own), 404 (device not enrolled or revoked), 403 (another device's token). Revoking a device
+deletes its push tokens.
 
 **`GET /{acct}/devices`** — no auth. → **200**
 `{ devices: [{ device_id, pubkey, label|null, created_at }] }`. No secrets / no push tokens.
