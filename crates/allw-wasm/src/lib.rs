@@ -49,7 +49,8 @@ use allw_core::{
     display_model as core_display_model, encrypt_context as core_encrypt_context,
     escape_for_display as core_escape_for_display, evaluate as core_evaluate,
     evaluate_for_actor as core_evaluate_for_actor, issue_device_cert as core_issue_device_cert,
-    revoked_device_ids as core_revoked_device_ids, sign_account_state as core_sign_account_state,
+    revoked_device_ids as core_revoked_device_ids, select_recipients as core_select_recipients,
+    sign_account_state as core_sign_account_state,
     sign_actor_attestation as core_sign_actor_attestation,
     sign_pairing_start_authorization as core_sign_pairing_start_authorization,
     sign_policy_rule as core_sign_policy_rule, sign_verdict as core_sign_verdict,
@@ -672,6 +673,85 @@ pub fn revoked_device_ids(
     // Sort for a deterministic wire result (a `HashSet` has no defined iteration order).
     ids.sort_unstable();
     to_json(&ids, "revoked device ids")
+}
+
+/// One recipient chosen by [`select_recipients`]: the device id and its X25519 encryption public
+/// key (base64url-unpadded, 32 bytes), as the account root signed them in account state.
+#[derive(Serialize)]
+struct WasmSelectedRecipient<'a> {
+    device_id: &'a str,
+    encryption_pubkey: String,
+}
+
+/// Converts an optional JS sequence floor to the core's `u64`. `undefined`/`null` arrive as `None`
+/// (no floor persisted yet); anything else must be a non-negative integer in JS safe-integer range,
+/// so a floor can never be rounded down into accepting an older state.
+fn sequence_floor_from_f64(min_sequence: Option<f64>) -> Result<Option<u64>, JsError> {
+    let Some(n) = min_sequence else {
+        return Ok(None);
+    };
+    if !n.is_finite() || n.fract() != 0.0 || n < 0.0 || n > JS_MAX_SAFE_INTEGER {
+        return Err(JsError::new(&format!(
+            "min_sequence must be a non-negative safe integer, got {n}"
+        )));
+    }
+    Ok(Some(n as u64))
+}
+
+/// Selects the devices an `ApprovalContext` may be encrypted to from root-signed account state
+/// (core [`select_recipients`](allw_core::select_recipients)), returned as a JSON array of
+/// `{ "device_id": string, "encryption_pubkey": string }` sorted by `device_id`.
+///
+/// - `account_states_json`: a JSON array of compact `allw-account-state+jws` documents. Only the
+///   highest-sequence documents count; recipients are their `active`, unrevoked devices whose
+///   signed `cert_expires_at` is after `now_ms`, narrowed to the devices every same-sequence
+///   sibling agrees on.
+/// - `now_ms`: the current Unix time in integer milliseconds (never negative).
+/// - `min_sequence`: the caller's persisted sequence floor, or `undefined`/`null` for none.
+///
+/// # Errors
+///
+/// Throws — never returns an empty array — when `account_root_pubkey_b64` is not a valid Ed25519
+/// key, `now_ms` or `min_sequence` is out of range, the array is malformed, empty or longer than
+/// `MAX_ACCOUNT_STATES` (64), any document fails verification, the highest sequence is below
+/// `min_sequence`, a device entry is malformed, no recipient remains, or more than
+/// `MAX_RECIPIENTS` (16) remain.
+#[wasm_bindgen]
+pub fn select_recipients(
+    account_states_json: &str,
+    expected_account_id: &str,
+    account_root_pubkey_b64: &str,
+    now_ms: f64,
+    min_sequence: Option<f64>,
+) -> Result<String, JsError> {
+    let root = parse_account_root_pubkey(account_root_pubkey_b64)?;
+    let now_ms = ms_to_i64(now_ms, "now_ms")?;
+    // A Unix-ms clock is never negative; a negative one would read every expiry as in the future.
+    if now_ms < 0 {
+        return Err(JsError::new(&format!(
+            "now_ms must be a non-negative Unix millisecond timestamp, got {now_ms}"
+        )));
+    }
+    let min_sequence = sequence_floor_from_f64(min_sequence)?;
+    let account_states = parse_account_states_json(account_states_json)?;
+    let account_state_refs: Vec<&str> = account_states.iter().map(String::as_str).collect();
+
+    let recipients = core_select_recipients(
+        &account_state_refs,
+        expected_account_id,
+        &root,
+        now_ms,
+        min_sequence,
+    )
+    .map_err(|e| JsError::new(&format!("select_recipients failed: {e}")))?;
+    let wire: Vec<WasmSelectedRecipient<'_>> = recipients
+        .iter()
+        .map(|r| WasmSelectedRecipient {
+            device_id: &r.device_id,
+            encryption_pubkey: URL_SAFE_NO_PAD.encode(r.encryption_pubkey),
+        })
+        .collect();
+    to_json(&wire, "selected recipients")
 }
 
 // ── self-certifying account id + pairing-start authorization ────────────────────────

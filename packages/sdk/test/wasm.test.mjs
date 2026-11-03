@@ -2292,3 +2292,139 @@ test("verify_pairing_start_authorization accepts the vector and rejects misuse",
     /does not derive/,
   );
 });
+
+// ── Recipient selection from root-signed account state (#243) ───────────────────────
+// @see crates/allw-core/src/recipients.rs (the selection rules)
+// @see docs/enrollment.md §Model (registry vs. signed account state)
+
+test("select_recipients reproduces the Rust recipient vector", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  const selected = JSON.parse(
+    wasm.select_recipients(
+      v.recipient_account_states_json,
+      v.expected_account_id_for_root,
+      v.approver_root_pubkey_b64,
+      v.recipient_now_ms,
+      v.recipient_min_sequence,
+    ),
+  );
+  assert.deepEqual(selected, JSON.parse(v.expected_recipients_json));
+  // Spec (rules in recipients.rs): only dev-a, dev-d and dev-g survive — the stale sequence-1
+  // dev-old, the revoked dev-b, the non-active dev-c, the sibling-conflicted dev-e and dev-f
+  // (cert expires exactly at now_ms) are all excluded.
+  assert.deepEqual(
+    selected.map((r) => r.device_id),
+    ["dev-a", "dev-d", "dev-g"],
+  );
+});
+
+test("select_recipients honors the signed cert expiry at now_ms", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  const at = (nowMs) =>
+    JSON.parse(
+      wasm.select_recipients(
+        v.recipient_account_states_json,
+        v.expected_account_id_for_root,
+        v.approver_root_pubkey_b64,
+        nowMs,
+        undefined,
+      ),
+    ).map((r) => r.device_id);
+  // Spec: a device is excluded once cert_expires_at <= now_ms. In the vector dev-f expires at
+  // recipient_now_ms and dev-g one millisecond later.
+  assert.deepEqual(at(v.recipient_now_ms - 1), ["dev-a", "dev-d", "dev-f", "dev-g"]);
+  assert.deepEqual(at(v.recipient_now_ms), ["dev-a", "dev-d", "dev-g"]);
+  assert.deepEqual(at(v.recipient_now_ms + 1), ["dev-a", "dev-d"]);
+});
+
+test("select_recipients throws — never returns [] — when no recipient set is allowed", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  const select = (states, accountId, root, nowMs = v.recipient_now_ms, floor = undefined) =>
+    wasm.select_recipients(states, accountId, root, nowMs, floor);
+  // No account state at all.
+  assert.throws(
+    () => select("[]", v.expected_account_id_for_root, v.approver_root_pubkey_b64),
+    /no account-state document/,
+  );
+  // More documents than the core accepts (MAX_ACCOUNT_STATES = 64).
+  const one = JSON.parse(v.recipient_account_states_json)[0];
+  assert.throws(
+    () =>
+      select(
+        JSON.stringify(Array(65).fill(one)),
+        v.expected_account_id_for_root,
+        v.approver_root_pubkey_b64,
+      ),
+    /65 account-state documents supplied, more than the maximum 64/,
+  );
+  // State for a different account id than the caller expects.
+  assert.throws(
+    () => select(v.recipient_account_states_json, "acc_wasm_vector_01", v.approver_root_pubkey_b64),
+    /account_id does not match/,
+  );
+  // State checked against a root that did not sign it.
+  const otherRoot = wasm.ed25519_public_key(Buffer.alloc(32, 0x33).toString("base64url"));
+  assert.throws(
+    () => select(v.recipient_account_states_json, v.expected_account_id_for_root, otherRoot),
+    /did not verify/,
+  );
+  // A persisted floor above the highest supplied sequence: a rollback, never a fallback.
+  assert.throws(
+    () =>
+      select(
+        v.recipient_account_states_json,
+        v.expected_account_id_for_root,
+        v.approver_root_pubkey_b64,
+        v.recipient_now_ms,
+        v.recipient_min_sequence + 1,
+      ),
+    /highest account-state sequence 2 is below the required floor 3/,
+  );
+  // Malformed inputs.
+  assert.throws(
+    () => select("not json", v.expected_account_id_for_root, v.approver_root_pubkey_b64),
+    /account state JWS array/,
+  );
+  assert.throws(
+    () => select(v.recipient_account_states_json, v.expected_account_id_for_root, "x"),
+    /account_root_pubkey_b64/,
+  );
+  assert.throws(
+    () =>
+      select(
+        v.recipient_account_states_json,
+        v.expected_account_id_for_root,
+        v.approver_root_pubkey_b64,
+        1.5,
+      ),
+    /now_ms must be a finite integer/,
+  );
+  // Regression: a negative clock was accepted, reading every cert expiry as in the future.
+  assert.throws(
+    () =>
+      select(
+        v.recipient_account_states_json,
+        v.expected_account_id_for_root,
+        v.approver_root_pubkey_b64,
+        -1,
+      ),
+    /now_ms must be a non-negative Unix millisecond timestamp/,
+  );
+  for (const floor of [-1, 1.5, Number.NaN, 2 ** 53]) {
+    assert.throws(
+      () =>
+        select(
+          v.recipient_account_states_json,
+          v.expected_account_id_for_root,
+          v.approver_root_pubkey_b64,
+          v.recipient_now_ms,
+          floor,
+        ),
+      /min_sequence must be a non-negative safe integer/,
+      `floor ${floor}`,
+    );
+  }
+});

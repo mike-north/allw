@@ -34,6 +34,7 @@ pub mod hash;
 pub mod jwe;
 pub mod mcp;
 pub mod policy;
+pub mod recipients;
 
 pub use account::{
     account_id_for_root, check_account_id_for_root, sign_pairing_start_authorization,
@@ -82,4 +83,8 @@ pub use policy::{
     ParamMatcher, PolicyEffect, PolicyEvaluation, PolicyPredicate, PolicyProvenance, PolicyRule,
     PolicyRuleBuildError, PolicyRuleError, PolicyRuleScope, PolicyTier, UnsignedPolicyRule,
     VerifiedPolicyRule,
+};
+pub use recipients::{
+    select_recipients, Recipient, RecipientSelectionError, DEVICE_STATUS_ACTIVE,
+    MAX_ACCOUNT_STATES, MAX_RECIPIENTS,
 };
