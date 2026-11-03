@@ -5,6 +5,56 @@ How the public `@allw/*` packages get to npm. Releases are published **only from
 short-lived OIDC token from GitHub Actions and exchanges it with npm. There is no `NPM_TOKEN` secret,
 and every version carries a provenance attestation that links it to the workflow run that built it.
 
+## First-time setup, ~10 minutes
+
+Do this once. It reserves the package names and connects npm to the release workflow. It publishes no
+real code and doesn't start a release.
+
+```sh
+# 1. In a browser, signed in to npmjs.com, create the free npm org "allw":
+#      https://www.npmjs.com/org/create   (organization name: allw; plan: free / unlimited public)
+
+# 2. Get npm 11.15+ (needed for `npm trust`) and log in. Your npm account must have 2FA turned on.
+npm install -g npm@^11.15.0
+npm login
+
+# 3. Get a checkout of this repo (use main once the release tooling has merged).
+git clone --branch infra/npm-trusted-publishing https://github.com/mike-north/allw.git
+cd allw
+pnpm install
+
+# 4. Preview the plan (no changes), then run it for real.
+node scripts/npm-bootstrap-trusted-publishing.mjs --dry-run
+node scripts/npm-bootstrap-trusted-publishing.mjs
+```
+
+The real run prompts you at these points, in this order. Answer `y` to each. Answering `N` (or just
+pressing Enter) skips that step only, and you can re-run the script later.
+
+1. **`Publish 5 release-package placeholder(s) now? [y/N]`** publishes empty placeholders for
+   `@allw/sdk`, `@allw/hook`, `@allw/approver`, `@allw/codex-hook` and `@allw/openclaw-bridge`. npm
+   then asks for 2FA on each publish, either a one-time code or a browser approval.
+2. **`Configure 5 trusted publisher(s) now? [y/N]`** attaches the release workflow to those
+   packages. npm asks for 2FA again.
+3. **`Publish 5 unscoped name-claim placeholder(s) now? [y/N]`** claims `allw`, `allw-hook`,
+   `allw-approver`, `allw-codex-hook` and `allw-openclaw-bridge` against squatting. npm asks for 2FA on
+   each publish.
+
+If npm needs 2FA just to read a package's trust settings, the script shows them and asks
+**`Does the output above show repository mike-north/allw, file release.yml, environment npm-publish?`**
+Answer `y` if they match.
+
+The run ends with a summary table and a **Still to do** list. A successful run shows every
+`@allw/*` row as `configured (this run)` and every unscoped row as `placeholder published`.
+Re-running it is safe: anything already done is skipped. If it stops at a precondition, such as not
+being logged in or a missing org, the error message says exactly what to fix.
+
+**The first real release is on hold, and that's fine.** npm expires a trusted-publisher config that
+hasn't completed a publish within 48 hours, so the configs created today will lapse. Right before the
+first real release, recreate them with
+`node scripts/npm-bootstrap-trusted-publishing.mjs --refresh-trust`, then push the release tag within
+48 hours (see [Cutting a release](#cutting-a-release)).
+
 ## What gets published
 
 | Package                 | Notes                                            |
@@ -19,7 +69,15 @@ They are published in this order, which is dependency order. `@allw/relay`, `@al
 the examples are private: they are deployed or run from source, never published. The list, its order
 and the trusted identity (repo `mike-north/allw`, workflow `release.yml`, environment `npm-publish`)
 are defined in one place, [`scripts/release-packages.mjs`](../scripts/release-packages.mjs). The
-release workflow and the bootstrap below both read it, so they cannot drift apart.
+release workflow and the bootstrap both read it, so they cannot drift apart.
+
+**Claimed, never released.** That module's `CLAIM_ONLY_NAMES` holds the unscoped names `allw`,
+`allw-hook`, `allw-approver`, `allw-codex-hook` and `allw-openclaw-bridge`. `npx <bin>`, run outside a
+project that has the scoped package installed, fetches a registry package named after the bin, so
+whoever owns `allw-hook` controls what `npx allw-hook` runs. Each of these names holds a permanent
+inert placeholder whose import and bin throw an error that points at the real `@allw/*` package. None
+of them gets a trusted publisher, and the release workflow never publishes them. A test enforces that
+every bin a published package declares is in this list.
 
 ## Versioning: lockstep
 
@@ -38,14 +96,24 @@ bump below, and publishing stays in `release.yml`.
    node scripts/release-packages.mjs verify v0.2.0   # lockstep, public, repo URL, dependency order
    ```
 
-2. After it merges and CI is green on `main`, tag that commit and push the tag:
+2. Unless the trusted-publisher configs were created in the last 48 hours, recreate them now, because
+   they expire if no publish has used them yet:
+
+   ```sh
+   node scripts/npm-bootstrap-trusted-publishing.mjs --refresh-trust
+   ```
+
+   This step is only needed until the first release succeeds. After that, the configs are validated
+   and no longer expire.
+
+3. After the PR merges and CI is green on `main`, tag that commit and push the tag:
 
    ```sh
    git tag v0.2.0 <merge-commit-on-main>
    git push https://github.com/mike-north/allw.git v0.2.0
    ```
 
-3. [`.github/workflows/release.yml`](../.github/workflows/release.yml) then runs in two jobs:
+4. [`.github/workflows/release.yml`](../.github/workflows/release.yml) then runs in two jobs:
    - **build** (read-only token): refuses tags that are not on `main`, checks the tag against every
      manifest, builds the WASM and the packages, runs the release-script tests and the
      [packaged-install smoke](../scripts/smoke-packaged-install.mjs) (pack, then a clean `npm install`,
@@ -59,59 +127,45 @@ To rehearse a release, run the workflow manually (**Actions → Release → Run 
 The rehearsal does everything except publish, and runs `npm publish --dry-run` instead. If you
 dispatch it on a `v*` tag, it publishes, which is how to retry a failed release.
 
-## One-time setup (bootstrap)
+## What the bootstrap does
 
-npm can only attach a trusted publisher to a package that **already exists**, and the `@allw/*`
-packages have never been published. Run this once:
+[`scripts/npm-bootstrap-trusted-publishing.mjs`](../scripts/npm-bootstrap-trusted-publishing.mjs)
+reads registry state before every step and asks before every write.
 
-1. **Create the npm org `allw`** if `@allw` isn't owned yet: <https://www.npmjs.com/org/create>
-   (free plan, public packages). There is no CLI for creating an org. The bootstrap checks for the org
-   and stops with this instruction if it's missing.
-2. **Log in and enable 2FA**. `npm trust` requires 2FA:
+1. **Preconditions.** It checks that npm is at least 11.15.0, that you're logged in (`npm whoami`),
+   that the `@allw` org exists and you're a member, and that the release manifests are consistent.
+   It warns if 2FA looks disabled.
+2. **Release-package placeholders.** npm can only attach a trusted publisher to a package that
+   already exists. For each `@allw/*` package that doesn't, the bootstrap publishes an empty
+   placeholder: version `0.0.0-bootstrap.0`, dist-tag `bootstrap`, no code, and importing it throws
+   an error that points at the real release. This and the name claims below are the only publishes
+   that ever happen from a laptop. Real code ships only from CI, with provenance.
+3. **Trusted publishers.** It runs `npm trust github` on each `@allw/*` package (workflow
+   `release.yml`, repo `mike-north/allw`, environment `npm-publish`, allowed action `npm publish`).
+   If a different config is already attached, it offers to revoke and replace it, and
+   `--refresh-trust` replaces all of them. If the CLI call fails, it prints the npmjs.com page and
+   the exact field values to enter by hand.
+4. **Name claims.** For each name in `CLAIM_ONLY_NAMES` that is free, it publishes the inert claim
+   placeholder. If someone else already owns one of those names, it reports that in the checklist
+   and does not try to publish over it.
+5. **Checklist.** It prints what's done and what's left, including the optional hardening below.
 
-   ```sh
-   npm install -g npm@^11.15.0   # `npm trust` first shipped in 11.15.0
-   npm login
-   ```
+## Recommended hardening
 
-3. **Run the bootstrap.** Do a dry run first:
-
-   ```sh
-   node scripts/npm-bootstrap-trusted-publishing.mjs --dry-run
-   node scripts/npm-bootstrap-trusted-publishing.mjs
-   ```
-
-   For each package, the bootstrap:
-   - publishes an **empty name-reservation placeholder** if the package doesn't exist yet.
-     It is version `0.0.0-bootstrap.0` under dist-tag `bootstrap`, has no code, and importing it
-     throws an error that points at the real releases. The bootstrap lists these and asks before
-     publishing them. This is the only publish that ever happens from a laptop, and it ships no real
-     code: the first real version comes from CI, with provenance.
-   - attaches the trusted publisher with `npm trust github` (workflow `release.yml`, repo
-     `mike-north/allw`, environment `npm-publish`, allowed action `npm publish`). If a different
-     trust config is already attached, it offers to revoke and replace it. If the CLI call fails, it prints the npmjs.com page and the exact field values to
-     enter by hand.
-   - prints a checklist of what's done and what's left.
-
-   It is idempotent. Every step reads registry state first, so re-running it does nothing once
-   everything is configured.
-
-4. **Cut the first release within 48 hours.** npm expires a trusted-publisher config that hasn't
-   completed a publish within 48 hours. If it expires, re-run the bootstrap to recreate it.
-5. **Recommended hardening**:
-   - In the repo's settings, under [Environments](https://github.com/mike-north/allw/settings/environments),
-     give `npm-publish` a required reviewer and allow deployments only from `v*` tags. Every release
-     then waits for a human approval.
-   - After the first CI release, set each package's npm _Settings → Publishing access_ to **Require
-     two-factor authentication and disallow tokens**. Trusted publishing keeps working because it
-     doesn't use tokens.
-   - Deprecate the placeholders. The bootstrap prints the `npm deprecate` commands.
+- In the repo's settings, under [Environments](https://github.com/mike-north/allw/settings/environments),
+  give `npm-publish` a required reviewer and allow deployments only from `v*` tags. Every release then
+  waits for a human approval.
+- After the first CI release, set each `@allw/*` package's npm _Settings → Publishing access_ to
+  **Require two-factor authentication and disallow tokens**. Trusted publishing keeps working because
+  it doesn't use tokens.
+- After the first CI release, deprecate the `@allw/*` placeholders. The bootstrap prints the
+  `npm deprecate` commands. The unscoped claim placeholders stay as they are.
 
 npm also offers [staged publishing](https://docs.npmjs.com/staged-publishing), where CI uploads with
 `npm stage publish` and a maintainer approves the release with 2FA. We don't use it: the protected
-`npm-publish` environment already puts a human gate in front of every release. To switch, re-run the
-bootstrap after changing `--allow-publish` to `--allow-stage-publish` in its `trustGithubArgs`, and
-change the publish step to `npm stage publish`.
+`npm-publish` environment already puts a human gate in front of every release. To switch, change
+`--allow-publish` to `--allow-stage-publish` in the bootstrap's `trustGithubArgs`, run it with
+`--refresh-trust`, and change the publish step to `npm stage publish`.
 
 ## What can't be automated
 
@@ -125,6 +179,6 @@ change the publish step to `npm stage publish`.
 ## Changing the trusted identity
 
 Renaming `release.yml`, changing the `npm-publish` environment, or moving the repo changes the
-identity npm trusts. Update the constants in `scripts/release-packages.mjs`, then re-run the bootstrap.
-It detects the mismatched configs and offers to replace them, and the new configs need a publish
-within 48 hours.
+identity npm trusts. Update the constants in `scripts/release-packages.mjs`, then re-run the
+bootstrap. It detects the mismatched configs and offers to replace them. Replacement configs also need
+a publish within 48 hours, or they expire.
