@@ -60,7 +60,7 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   (`CORS_ALLOWED_ORIGINS`, `docs/relay-deploy.md` §2; the hosted relay allows
   `https://allw-web-approver.pages.dev`). The policy covers every route, account and relay-level
   (`/.well-known/allw/…`, e.g. the VAPID public key) alike. Preflights (`OPTIONS` with `Access-Control-Request-Method`)
-  from an allowed origin get **204** with `Access-Control-Allow-Methods: GET, POST`,
+  from an allowed origin get **204** with `Access-Control-Allow-Methods: GET, POST, PUT`,
   `Access-Control-Allow-Headers: Authorization, Content-Type` and `Access-Control-Max-Age: 600`.
   Responses to an allowed origin echo it in `Access-Control-Allow-Origin`. A disallowed origin,
   method or header gets a **403** preflight with no CORS headers. Every response except a WebSocket
@@ -108,6 +108,13 @@ SUBMIT VERDICT   ⚠ WebSocket ONLY — there is no HTTP verdict endpoint
   → { type:"verdict", request_id, verdict }   (verdict = JWS signed by the device key)
   ← { type:"ack", request_id, status:"resolved" | "already_resolved" | "expired" | "retracted" }
 
+SUBSCRIBE / ROTATE PUSH  (any time after pairing; e.g. a browser's Web Push subscription)
+  PUT /{acct}/devices/{device_id}/push-tokens   (Bearer device_auth_token; self only)
+     body: { push_tokens: [{ transport, token }] }   ← REPLACES this device's set; [] clears
+                                        → { push_tokens }   (the stored set)
+     Re-send whenever the platform token or subscription changes (rotation, re-subscribe after a
+     VAPID key rotation, permission revoked → []). Repeating the same body is a no-op.
+
 REFRESH TRUST  (periodically, to verify actor attestation / feed AccountStateResolver)
   GET /{acct}/account-states            (no auth — public, relay-verified, root-signed)
      → { account_states: [ <compact JWS> … ], max_sequence }
@@ -115,14 +122,14 @@ REFRESH TRUST  (periodically, to verify actor attestation / feed AccountStateRes
 
 **Mapping to the `AllwIOSApprover` package seams:**
 
-| Need                                     | Endpoint                             | Package seam                                                                                                                                                                                                                                                        |
-| ---------------------------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Pair + store creds                       | `pairing/start` + `pairing/complete` | persist via `NativeCredentialStore` (`device_id`, `device_auth_token`, account-root pubkey)                                                                                                                                                                         |
-| Obtain the `device_cert`                 | `enrollments/{id}/csr` + `…/cert`    | **specified, not implemented (#199).** Scan the enrollment QR, generate keys on-device, deposit the MAC'd CSR, poll for the cert, verify against the pinned root, persist via `NativeCredentialStore` — no cert ⇒ no inbox                                          |
-| Register APNs token                      | `push_tokens` in `pairing/complete`  | `PushTokenRegistering` / `HexApnsTokenRegistrar` `send` closure posts it here                                                                                                                                                                                       |
-| Poll inbox                               | `GET …/inbox`                        | `RelayInboxFetching` / `UrlSessionRelayInboxClient.fetchPendingEnvelopes()`                                                                                                                                                                                         |
-| Live push + **verdict submit + retract** | `…/connect` WebSocket                | **NOT in the package yet — the app builds this WS client.** Feed `{type:"request"}` into `ApprovalInboxStore.sync`; on resolve, send the `SignedVerdict.signedVerdictJson` as `{type:"verdict"}`; on `{type:"retract"}` clear via `PushInboxCoordinator.didResolve` |
-| Verify origins (VERIFIED badge)          | `GET …/account-states`               | the `AccountStateResolver` feed (#155); verify root sig on device, keep a highest-sequence floor                                                                                                                                                                    |
+| Need                                     | Endpoint                                                       | Package seam                                                                                                                                                                                                                                                        |
+| ---------------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pair + store creds                       | `pairing/start` + `pairing/complete`                           | persist via `NativeCredentialStore` (`device_id`, `device_auth_token`, account-root pubkey)                                                                                                                                                                         |
+| Obtain the `device_cert`                 | `enrollments/{id}/csr` + `…/cert`                              | **specified, not implemented (#199).** Scan the enrollment QR, generate keys on-device, deposit the MAC'd CSR, poll for the cert, verify against the pinned root, persist via `NativeCredentialStore` — no cert ⇒ no inbox                                          |
+| Register APNs token                      | `push_tokens` in `pairing/complete`, later `PUT …/push-tokens` | `PushTokenRegistering` / `HexApnsTokenRegistrar` `send` closure posts it here                                                                                                                                                                                       |
+| Poll inbox                               | `GET …/inbox`                                                  | `RelayInboxFetching` / `UrlSessionRelayInboxClient.fetchPendingEnvelopes()`                                                                                                                                                                                         |
+| Live push + **verdict submit + retract** | `…/connect` WebSocket                                          | **NOT in the package yet — the app builds this WS client.** Feed `{type:"request"}` into `ApprovalInboxStore.sync`; on resolve, send the `SignedVerdict.signedVerdictJson` as `{type:"verdict"}`; on `{type:"retract"}` clear via `PushInboxCoordinator.didResolve` |
+| Verify origins (VERIFIED badge)          | `GET …/account-states`                                         | the `AccountStateResolver` feed (#155); verify root sig on device, keep a highest-sequence floor                                                                                                                                                                    |
 
 > ⚠ **Build note for the Xcode agent:** the package fetches the inbox but does **not** implement the
 > `/connect` WebSocket or verdict submission. The app must implement the WS client (URLSessionWebSocketTask):
@@ -280,6 +287,20 @@ pending only, `expires_at > now`, oldest first. (404 if device not enrolled.)
 
 **`POST /{acct}/devices/{device_id}/revoke`** — Bearer the device's own token (self-revoke only;
 cross-device ⇒ 403). → **200** `{ revoked: true }`. Closes the live socket (1008). 404 if not enrolled.
+
+**`PUT /{acct}/devices/{device_id}/push-tokens`** — Bearer the device's own token (self only).
+Body `{ "push_tokens": [{ "transport": "apns" | "fcm" | "webpush", "token": "string" }] }` (required;
+`[]` clears). **Replaces** the device's push-token set, so it covers add, rotate, and clear after
+pairing. → **200** `{ push_tokens: [{ transport, token }] }`, the stored set (normalized, duplicates
+collapsed). Validation and per-registration budgets are exactly those of `push_tokens` in
+`pairing/complete` (§Pairing): 400 for a malformed body, a missing `push_tokens`, an unsupported
+transport, an invalid or over-long token, or over budget. The account budget (32) counts every other
+device's tokens plus this set (the device's own current tokens don't count, so a full account can
+still rotate); a set that grows past it is a **409** and nothing changes. A set that stays the same
+size or shrinks is never refused, so a device can always clear its tokens. The replace is one transaction and only
+touches tokens that change, so repeating a body is a no-op. Auth, in the revoke order: 401 (no
+bearer), 403 (not a device token, including a revoked device's own), 404 (device not enrolled or
+revoked), 403 (another device's token). Revoking a device deletes its push tokens.
 
 **`GET /{acct}/devices`** — no auth. → **200**
 `{ devices: [{ device_id, pubkey, label|null, created_at }] }`. No secrets / no push tokens.
