@@ -476,8 +476,14 @@ describe("WebPushTransport — a push-service rejection is logged with its reaso
       JSON.stringify({ error: "x" }),
       JSON.stringify({ reason: 42 }),
       JSON.stringify(["BadJwtToken"]),
-      // A reason echoing the endpoint would put the capability in the log; it is dropped.
+      // A reason echoing the endpoint's path token (an identifier-shaped bearer capability) would
+      // put the capability in the log; it is dropped because it occurs in the endpoint.
+      JSON.stringify({ reason: APPLE_PATH.slice(1) }),
+      // So is any piece of the token, and the full endpoint.
+      JSON.stringify({ reason: APPLE_PATH.slice(1, 20) }),
       JSON.stringify({ reason: APPLE_ENDPOINT }),
+      // Longer than any documented reason: a token-sized identifier is not logged either.
+      JSON.stringify({ reason: "A".repeat(33) }),
       JSON.stringify({ reason: "Bad reason\nwith a forged log line" }),
     ]) {
       const { warnings } = await warningsFor(() => new Response(body, { status: 403 }));
@@ -487,6 +493,58 @@ describe("WebPushTransport — a push-service rejection is logged with its reaso
       ]);
     }
   });
+
+  it("logs a reason up to 32 characters, such as Apple's longest", async () => {
+    for (const reason of ["TooManyProviderTokenUpdates", "B".repeat(32)]) {
+      const { warnings } = await warningsFor(
+        () => new Response(JSON.stringify({ reason }), { status: 429 }),
+      );
+
+      expect(warnings).toEqual([
+        `push: webpush push service web.push.apple.com rejected a wakeup with HTTP 429 (reason ${reason}); token kept`,
+      ]);
+    }
+  });
+
+  it.each([
+    [400, "rejection", Error],
+    [201, "success", null],
+  ] as const)(
+    "does not wait for a body cancel that never settles (HTTP %i, %s)",
+    async (status, _kind, expected) => {
+      const { config } = await makeVapid();
+      const cancelled = vi.fn(() => new Promise<void>(() => undefined));
+      const fetcher = vi.fn<typeof fetch>(
+        async () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(new TextEncoder().encode('{"reason":"BadJwtToken"}'));
+              },
+              cancel: cancelled,
+            }),
+            { status },
+          ),
+      );
+      const transport = new WebPushTransport({ vapid: config, fetcher, now: () => NOW_MS });
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        const outcome = await Promise.race([
+          transport.sendWakeup(wakeup(APPLE_ENDPOINT)).then(
+            () => null,
+            (error: unknown) => error,
+          ),
+          new Promise((resolve) => setTimeout(() => resolve("hung"), 3_000)),
+        ]);
+
+        if (expected === null) expect(outcome).toBeNull();
+        else expect(outcome).toBeInstanceOf(expected);
+        expect(cancelled).toHaveBeenCalledTimes(1);
+      } finally {
+        warn.mockRestore();
+      }
+    },
+  );
 
   it("reads only a bounded prefix of an endless body, then releases it", async () => {
     const cancelled = vi.fn();
