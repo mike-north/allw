@@ -96,5 +96,7 @@ rejected.
 
 When account state can't be loaded, doesn't verify, is below the floor, or names no active device,
 `requestApproval` rejects with a `RecipientSelectionError` (`stage`: `"load"`, `"seal"` or
-`"accept"`) and nothing is sent. Treat that like a denial. Until the account's root holder runs
+`"accept"`) and nothing is sent. Treat that like a denial. If you call
+`relayAccountStateSource(...).load()` yourself, a fetch that hangs past `fetchTimeoutMs` rejects with
+`RelayTimeoutError`, exported from `@allw/sdk` so you can check it with `instanceof`. Until the account's root holder runs
 `allw-approver pair`, there is no account state, and every request is refused.

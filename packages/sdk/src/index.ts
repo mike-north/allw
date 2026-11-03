@@ -52,6 +52,11 @@ export type {
   RelayAccountStateSourceOptions,
   SequenceFloorStore,
 } from "./account-state-source.js";
+/**
+ * Public because `relayAccountStateSource().load()` rejects with it when the account-state fetch
+ * hangs past its timeout, so a caller of `load()` can narrow that case with `instanceof`.
+ */
+export { RelayTimeoutError };
 export type {
   CommandActionErrorReason,
   CommandActionFromLineOptions,
