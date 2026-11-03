@@ -1,0 +1,44 @@
+# Install a Rust toolchain for a CI job: by default exactly the one pinned in rust-toolchain.toml
+# (channel, components and targets), never a floating `stable`, so a new Rust release cannot turn
+# CI red on its own. Jobs that deliberately test another toolchain (the MSRV check, the latest-
+# stable canary) name it with `toolchain`, and then run cargo as `cargo +<toolchain> …`.
+#
+# This is the one place the install command lives, so the jobs that use it can't drift apart.
+name: Install Rust toolchain
+description: Install the Rust toolchain pinned in rust-toolchain.toml, or a named one, and print its version.
+inputs:
+  toolchain:
+    description: >-
+      A toolchain to install instead of the rust-toolchain.toml pin (for example `stable` or
+      `1.85.0`). Empty means the pin.
+    required: false
+    default: ""
+  components:
+    description: Comma-separated components for a named toolchain (ignored for the pin, which lists its own).
+    required: false
+    default: ""
+  targets:
+    description: Comma-separated targets for a named toolchain (ignored for the pin, which lists its own).
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        TOOLCHAIN: ${{ inputs.toolchain }}
+        COMPONENTS: ${{ inputs.components }}
+        TARGETS: ${{ inputs.targets }}
+      run: |
+        set -euo pipefail
+        if [ -z "$TOOLCHAIN" ]; then
+          # With no arguments, rustup installs the toolchain rust-toolchain.toml names.
+          rustup toolchain install
+          rustc --version
+        else
+          args=(--profile minimal)
+          if [ -n "$COMPONENTS" ]; then args+=(--component "$COMPONENTS"); fi
+          if [ -n "$TARGETS" ]; then args+=(--target "$TARGETS"); fi
+          rustup toolchain install "$TOOLCHAIN" "${args[@]}"
+          rustc +"$TOOLCHAIN" --version
+        fi
