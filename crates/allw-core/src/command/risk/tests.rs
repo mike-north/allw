@@ -1001,17 +1001,18 @@ fn a_visible_first_program_survives_budget_exhaustion() {
     }
 }
 
-/// Alternate readings run only at the top level, so the reviewer's 8 KB bomb no longer spends
-/// the 4 MiB budget.
+/// Alternate readings run at every nesting level (review round 3, R3-1), so readings can
+/// multiply with depth. The shared budget bounds that: the reviewer's 8 KB readings bomb
+/// exhausts it and is High, and the work actually done stays a small multiple of the budget.
 #[test]
-fn alternate_readings_do_not_multiply_with_nesting() {
-    let line = format!(
-        "sh -c {}",
-        shlex::try_quote(&readings_bomb(4000)).expect("quotable")
-    );
-    let (_, budget) = analyze_with_budget(&line, MAX_RISK_WORK);
-    assert!(!budget.exhausted);
-    assert!(budget.used < 64 * line.len(), "used {}", budget.used);
+fn nested_alternate_readings_are_bounded_by_the_budget() {
+    for bomb in [readings_bomb(4000), readings_bomb(40_000)] {
+        let line = format!("sh -c {}", shlex::try_quote(&bomb).expect("quotable"));
+        let (risk, budget, scanned) = scanned_while(&line);
+        assert_eq!(risk, Risk::High);
+        assert!(budget.used <= MAX_RISK_WORK);
+        assert!(scanned < 8 * MAX_RISK_WORK, "scanned {scanned}");
+    }
 }
 
 /// Regression (R2-2): inside a double-quoted delimiter bash removes `\⏎`, so the delimiter is
@@ -1082,4 +1083,127 @@ fn rm_flag_split_is_charged_by_bytes() {
     let scanned = SCANNED.with(std::cell::Cell::get);
     assert!(matches!(risk, Risk::High | Risk::Critical), "{risk:?}");
     assert!(scanned < 3 * MAX_RISK_WORK, "copied {scanned} bytes");
+}
+
+// ── Review of #284 (round 3 findings): each repro is a regression test ───────
+
+/// dash runs the `dd` in these; bash reads `$'\''` as one ANSI-C string, and `((…))` as
+/// arithmetic.
+const DASH_ANSI_C: &str = "echo $'\\' ; dd if=/dev/zero of=/dev/sda ; echo \\'''";
+const DASH_ARITH: &str = "((: ; dd if=/dev/zero of=/dev/sda))";
+
+fn quoted(text: &str) -> String {
+    shlex::try_quote(text).expect("quotable").into_owned()
+}
+
+/// Regression (R3-1): alternate readings ran only at the top level, so a nested `dash -c`
+/// string was read the bash way only and dash's `dd` was missed (Medium). They run at every
+/// level again.
+#[test]
+fn nested_lines_get_every_reading() {
+    let one_line = format!("echo $'\\'\n{DD}\necho \\''");
+    let mut lines = vec![format!("dash -c {}", quoted(&one_line))];
+    for text in [DASH_ANSI_C, DASH_ARITH] {
+        for shell in ["dash", "sh", "ash", "bash"] {
+            lines.push(format!("{shell} -c {}", quoted(text)));
+        }
+        lines.push(format!("eval {}", quoted(text)));
+        lines.push(format!("echo \"$({text})\""));
+        lines.push(format!("dash <<'EOF'\n{text}\nEOF"));
+        lines.push(format!("dash <<< {}", quoted(text)));
+    }
+    for line in &lines {
+        assert_eq!(line_risk(line), Risk::Critical, "{line:?}");
+    }
+}
+
+/// The reviewer's unquoted-heredoc doubling bomb.
+fn heredoc_bomb(n: usize) -> String {
+    let mut s = "x ".repeat(n);
+    for _ in 0..4 {
+        s = format!("cat <<EOF\n$({s})\nEOF\n");
+    }
+    s
+}
+
+/// Regression (R3-2): the pre-pass didn't descend into substitutions, so a `$(dd)` or `` `dd` ``
+/// that runs first was lost when later padding exhausted the budget (High). The pre-pass now
+/// notes command words inside substitutions, backticks and heredoc bodies.
+#[test]
+fn a_first_running_substitution_survives_budget_exhaustion() {
+    let bomb = quoted(&heredoc_bomb(100_000));
+    for line in [
+        format!("echo $({DD}) ; sh -c {bomb}"),
+        format!("echo `{DD}` ; sh -c {bomb}"),
+        format!("echo $({DD}) ; :{}", " rm".repeat(200_000)),
+        format!("echo $({DD}) ; echo {}", "x ".repeat(2_200_000)),
+        format!("echo $(echo $({DD})) ; :{}", " rm".repeat(200_000)),
+        format!("bash <<'EOF'\n{DD}\nEOF\n:{}", " rm".repeat(200_000)),
+    ] {
+        let (risk, budget) = analyze_with_budget(&line, MAX_RISK_WORK);
+        assert!(budget.exhausted, "{} bytes did not exhaust", line.len());
+        assert_eq!(risk, Risk::Critical, "{} bytes", line.len());
+    }
+}
+
+/// The pre-pass stays linear for each nesting level: the doubling bomb is scanned in a small
+/// multiple of its length.
+#[test]
+fn the_pre_pass_is_linear_per_level() {
+    let line = heredoc_bomb(200_000);
+    SCANNED.with(|c| c.set(0));
+    let mut budget = Budget::new(MAX_RISK_WORK);
+    note_visible_programs(Some(&line), &[], &mut budget);
+    let scanned = SCANNED.with(std::cell::Cell::get);
+    assert!(
+        scanned < 4 * (MAX_SHELL_NESTING + 1) * line.len(),
+        "scanned {scanned} for {} bytes",
+        line.len()
+    );
+}
+
+/// Regression (R3-3): bash 5 ends a heredoc inside `$(…)` at a body line `EOF)`, and the `)`
+/// closes the substitution. That is now one more reading.
+#[test]
+fn bash5_ends_a_substitution_heredoc_at_delimiter_paren() {
+    assert_eq!(
+        line_risk(&format!("echo \"$(cat <<EOF\nit's\nEOF)\"\n{DD} # '")),
+        Risk::Critical
+    );
+    assert_eq!(
+        line_risk(&format!("x=$(cat <<-EOF\n\tit's\n\tEOF)\n{DD} # '")),
+        Risk::Critical
+    );
+}
+
+/// Decision (R3-4): an open quote inside a heredoc body doesn't raise the tier on its own, so
+/// ordinary commit and PR bodies keep the tier of the command that consumes them.
+#[test]
+fn open_quote_in_a_heredoc_body_does_not_raise_the_tier() {
+    assert_all(
+        &[
+            "git commit -m \"$(cat <<'EOF'\nFix the parser's bug\nEOF\n)\"",
+            "gh pr create --body \"$(cat <<'EOF'\n## Summary\n- we don't touch rm -rf paths\nEOF\n)\"",
+            "cat > notes.md <<'EOF'\nIt's done. Don't panic.\nEOF",
+            "git commit -m \"$(cat <<'EOF'\nQuote the \\\"title\nEOF\n)\"",
+        ],
+        Risk::Medium,
+    );
+    // Everything before the open quote is still classified.
+    assert_all(
+        &[
+            &format!("git commit -m \"$(cat <<'EOF'\n{DD}\nit's done\nEOF\n)\""),
+            &format!("bash -s \"$(cat <<'EOF'\n{DD}\nit's\nEOF\n)\""),
+        ],
+        Risk::Critical,
+    );
+    // Outside a heredoc body an open quote still makes the line High.
+    assert_all(
+        &[
+            "sh -c 'echo \"unterminated'",
+            "bash <<< \"it's\"",
+            "sh -c 'echo \"$(echo it)'",
+        ],
+        Risk::High,
+    );
 }

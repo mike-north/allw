@@ -498,6 +498,66 @@
       "risk": "medium",
       "bin": "cat",
       "why": "negative: a harmless heredoc body keeps the line's own tier"
+    },
+    {
+      "command": "dash -c 'echo $'\"'\"'\\'\"'\"'\ndd if=/dev/zero of=/dev/sda\necho \\'\"'\"''\"'\"''",
+      "risk": "critical",
+      "bin": "dash",
+      "why": "dash has no $'…', so the middle line runs dd (alternate readings run at every nesting level)"
+    },
+    {
+      "command": "dash -c 'echo $'\"'\"'\\'\"'\"' ; dd if=/dev/zero of=/dev/sda ; echo \\'\"'\"''\"'\"''\"'\"''",
+      "risk": "critical",
+      "bin": "dash",
+      "why": "dash reads $'\\' as $ plus a single-quoted backslash, so dd runs"
+    },
+    {
+      "command": "sh -c '((: ; dd if=/dev/zero of=/dev/sda))'",
+      "risk": "critical",
+      "bin": "sh",
+      "why": "dash (sh on Debian/Ubuntu) reads (( as two subshells, so dd runs"
+    },
+    {
+      "command": "eval 'echo $'\"'\"'\\'\"'\"' ; dd if=/dev/zero of=/dev/sda ; echo \\'\"'\"''\"'\"''\"'\"''",
+      "risk": "critical",
+      "bin": "eval",
+      "why": "the eval argument gets the non-ANSI-C reading too"
+    },
+    {
+      "command": "echo \"$(((: ; dd if=/dev/zero of=/dev/sda)))\"",
+      "risk": "critical",
+      "bin": "echo",
+      "why": "a substitution gets the two-subshell reading of (( too"
+    },
+    {
+      "command": "dash <<'EOF'\n((: ; dd if=/dev/zero of=/dev/sda))\nEOF",
+      "risk": "critical",
+      "bin": "dash",
+      "why": "a heredoc body gets the two-subshell reading of (( too"
+    },
+    {
+      "command": "echo \"$(cat <<EOF\nit's\nEOF)\"\ndd if=/dev/zero of=/dev/sda # '",
+      "risk": "critical",
+      "bin": "echo",
+      "why": "bash 5 ends a heredoc inside $( ) at a line EOF), so dd runs after it"
+    },
+    {
+      "command": "git commit -m \"$(cat <<'EOF'\nFix the parser's bug\nEOF\n)\"",
+      "risk": "medium",
+      "bin": "git",
+      "why": "negative: an open quote inside a heredoc body doesn't raise the tier on its own"
+    },
+    {
+      "command": "gh pr create --body \"$(cat <<'EOF'\n## Summary\n- we don't touch rm -rf paths\nEOF\n)\"",
+      "risk": "medium",
+      "bin": "gh",
+      "why": "negative: the body's open quote stops a shell before rm, so it never runs"
+    },
+    {
+      "command": "git commit -m \"$(cat <<'EOF'\ndd if=/dev/zero of=/dev/sda\nit's done\nEOF\n)\"",
+      "risk": "critical",
+      "bin": "git",
+      "why": "what precedes the open quote in a heredoc body is still read as a script: dd"
     }
   ]
 }

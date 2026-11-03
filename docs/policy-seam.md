@@ -214,6 +214,11 @@ a program it runs.
     fail-upward rule. Which consumers run their input (a shell, a wrapper, `{ bash; }`, `( bash )`, `eval`,
     an `if` / `while` compound) is a moving target. Reading every body as a script means a new consumer can't
     hide one, and over-reading a `cat <<EOF` body only raises the tier.
+  - **An open quote inside a heredoc body doesn't raise the tier on its own.** A shell fed the body stops at
+    that syntax error before running anything after the open quote, and everything before it is still
+    classified. So ordinary commit and PR bodies (`git commit -m "$(cat <<'EOF'`… `it's` …) keep the tier of the
+    command that consumes them (`medium`), while a `dd` before the quote is still `critical`. Elsewhere (a
+    command line, a `-c` string, a substitution) an open quote still makes the line `high`.
   - `((…))` at a command position (including `for ((…))`) is arithmetic, so a `<<` inside it is a shift.
   - Any operator, substitution or redirection makes the line at least `medium`. A line ending inside an open
     quote or substitution is `high`, because the shell runs what comes before the syntax error.
@@ -223,18 +228,22 @@ a program it runs.
     - `$'…'` as an ANSI-C string or not;
     - `((` as an arithmetic command or two subshells;
     - a heredoc inside `$(…)` read before the closing `)` (bash ≥ 4, zsh) or the first `)` closing it (bash 3.2,
-      dash).
+      dash);
+    - a body line `EOF)` ending a heredoc inside `$(…)` and closing the substitution (bash 5).
 
-    These alternate readings run only at the top level, so they don't multiply with nesting.
+    These alternate readings run at every nesting level, so a nested `sh -c` string also gets dash's reading
+    (`sh` is dash on Debian and Ubuntu). They are charged to the shared budget, which bounds their cost. An
+    alternate reading adds the commands its shell would run; only the bash reading sets the open-quote floor.
 
 - **Bounds.** Each bound fails upward to `high`:
   - nesting of `-c`, `eval` and substitutions past 4 levels;
   - argv words past the 256th, which count as a `high` candidate;
   - one shared work budget per record (bytes scanned, split or copied, plus words classified), so
     classification time stays linear and bounded inside the synchronous hook. Running out of it never lowers a
-    tier already found. An unbudgeted linear pre-pass first records every program word visible at the top
-    level (each argv word and each segment's command word), so those keep their tier on exhaustion. Only text
-    never reached falls back to `high`.
+    tier already found. An unbudgeted pre-pass first records every visible program word (each argv word,
+    and each segment's command word, descending into substitutions, backticks and heredoc bodies down to the
+    nesting limit), so those keep their tier on exhaustion: a `$(dd …)` that runs first stays `critical`
+    however much padding follows it. Only text never reached falls back to `high`.
 
 **Known T1 limits.** For these the tier can still understate what runs (decision B: curated list plus documented
 limits, no name-sniffing of later words):
