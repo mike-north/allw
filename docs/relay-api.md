@@ -43,14 +43,6 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   §3). The router claims the whole `/.well-known` segment before account routing, so it never reaches an
   account; a leading `.` is outside the base64url alphabet account ids use, so it cannot collide with one.
   Every relay-level route, present or future, lives there.
-- **Exact paths.** An account route answers only on its exact path, compared segment by segment as sent
-  (not percent-decoded): the same number of segments, every literal equal, and every `{param}` non-empty
-  (#302). Anything else is **404** `{ "error": "not found" }`, whatever the method: an extra segment
-  (`…/revoke/extra`), a trailing slash (`/devices/`), an empty segment (`/devices//revoke`) or a missing
-  one. A path that is exactly a route's, reached with a method the route doesn't serve, is **405**
-  `{ "error": "method not allowed" }`. Dropping or adding a segment can still land exactly on _another_
-  route: `/requests/r1` is `GET /requests/{request_id}`, and `/requests/extra` is the same route with
-  `request_id = extra`. The route table is `packages/relay/src/routes.ts`.
 - **Auth.** `Authorization: Bearer <token>` (token = base64url, `^[A-Za-z0-9_-]+$`, ~43 chars). For
   **WebSocket** upgrades (which can't easily set headers), pass `?auth=<token>` as a query param.
   The relay stores only `SHA-256(token)`; the plaintext is returned **once** at issuance — cache it.
@@ -78,6 +70,14 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   send no `Origin` and are unaffected.
 - **Errors** are plain bodies with the status code; `400` covers malformed JSON / bad fields /
   unexpected envelope keys (zero-knowledge guard).
+- **Exact paths.** An account route answers only on its exact path, compared segment by segment as sent
+  (not percent-decoded): the same number of segments, every literal equal, and every `{param}` non-empty
+  (#302). Anything else is **404** `{ "error": "not found" }`, whatever the method: an extra segment
+  (`…/revoke/extra`), a trailing slash (`/devices/`), an empty segment (`/devices//revoke`) or a missing
+  one. A path that is exactly a route's, reached with a method the route doesn't serve, is **405**
+  `{ "error": "method not allowed" }`. Dropping or adding a segment can still land exactly on _another_
+  route: `/requests/r1` is `GET /requests/{request_id}`, and `/requests/extra` is the same route with
+  `request_id = extra`. The route table is `packages/relay/src/routes.ts`.
 
 ---
 
