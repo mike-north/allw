@@ -75,11 +75,11 @@ the repository.
 ### 3a. Mandatory secrets
 
 None are mandatory for a working relay. The relay degrades gracefully when push credentials are
-absent: it falls back to `NoopPushTransport` for every transport, so devices receive requests via
-WebSocket presence and polling rather than push wakeups. This is confirmed in
-`packages/relay/src/index.ts` at `buildPushTransports`: all three transports default to
-`NoopPushTransport`, and each switches to its live transport only when all of that transport's
-required env vars are present (for Web Push, a well-formed VAPID keypair and subject).
+absent: a transport without credentials is simply not registered, so its tokens stay stored but are
+never sent (nor counted in a submit's `push_wakeups`), and devices receive requests via WebSocket
+presence and polling rather than push wakeups. This is confirmed in `packages/relay/src/index.ts` at
+`buildPushTransports`: each transport is registered only when all of its required env vars are
+present (for Web Push, a well-formed VAPID keypair and subject).
 
 ### 3b. Optional: Apple Push Notification service (APNs)
 

@@ -350,29 +350,38 @@ then fetches the full envelope via the socket or `/inbox`.
 are sent afterwards (at most 4 in flight, each push-service request bounded by a 5 s timeout), so a
 slow, hung, or failing push service can never delay or fail a submit. Consequently `push_wakeups` in
 the submit response is the number of wakeups **scheduled** (tokens with a configured transport, up to
-the 32-token account budget), not the number delivered.
+the 32-token account budget, newest registrations first, minus coalesced Web Push wakeups), not the
+number delivered.
 
 **Web Push** (RFC 8030, browser approvers):
 
 - **Token format.** The `webpush` token is the `PushSubscription.endpoint` URL. It must be `https:`,
-  carry no credentials or explicit port, and name a known push-service host: `fcm.googleapis.com`
-  (Chrome), `updates.push.services.mozilla.com` (Firefox), `web.push.apple.com` (Safari), or a
-  subdomain of `notify.windows.com` (Edge/WNS). Anything else is a **400** at registration. The relay
+  carry no credentials, explicit port, or fragment, and name a known push-service host:
+  `fcm.googleapis.com` (Chrome), `updates.push.services.mozilla.com` (Firefox), `web.push.apple.com`
+  (Safari), or a single-label subdomain of `notify.windows.com` such as `wns2-by3p.notify.windows.com`
+  (Edge/WNS). Anything else is a **400** at registration. The relay
   POSTs to this URL, so the allowlist is its SSRF guard; it is re-checked before every send, and
   redirects are not followed.
 - **Payload-less wakeup.** The push request has an **empty body** — not even the request id — with
-  `TTL` set to the request's remaining lifetime in seconds (capped at 28 days), `Urgency: high`, and
+  `TTL` set to the request's remaining lifetime rounded **up** to one of 60 s, 5 min, 1 h, 1 d, or
+  28 days (so the push service learns the deadline only coarsely), `Urgency: high`, and
   VAPID auth `Authorization: vapid t=<ES256 JWT>, k=<vapid_public_key>` (RFC 8292; the JWT's `aud`
   is the endpoint's origin, `exp` one hour out, `sub` the operator contact). The subscription's
   `p256dh`/`auth` keys are not needed and not sent to the relay. On a `push` event the service worker
   fetches pending envelopes itself via `GET /{acct}/devices/{device_id}/inbox`.
+- **Coalescing.** At most one wakeup per subscription (device id + endpoint) is sent per
+  **30 s** (`WEB_PUSH_COALESCE_MS`): a submit that finds a wakeup to that subscription in flight, or
+  sent within the window, skips it. The wakeup carries nothing request-specific, and the service
+  worker's inbox fetch returns every pending request, so nothing is lost. This bounds push volume per
+  subscription however fast unauthenticated submits arrive (#248).
 - **VAPID public key.** Clients subscribe with the key from `GET /.well-known/allw/vapid-public-key`
   (§3).
 - **Pruning.** When the push service answers **404 or 410** (the subscription is gone), the relay
-  deletes that token row. A stored row that fails the endpoint allowlist (e.g. one registered before
-  validation existed) is deleted without ever being requested. Every other failure (401/403, other
-  4xx, 5xx, 3xx, a timeout, a network error) leaves the token in place; in particular an auth error
-  is a relay-side VAPID problem, not a dead device, and never unregisters anyone.
+  deletes that token row. That is the only pruning. Every other failure (401/403, other 4xx, 5xx, 3xx,
+  a timeout, a network error) leaves the token in place; in particular an auth error is a relay-side
+  VAPID problem, not a dead device, and never unregisters anyone. A stored row that fails the endpoint
+  allowlist at send time (e.g. one registered before validation existed, or after the allowlist
+  narrows) is refused, logged, and kept, never requested.
 - **Enablement.** Web Push is active only when the relay has a complete VAPID configuration whose
   keypair actually matches (`docs/relay-deploy.md` §3d); otherwise `webpush` tokens are stored but no
   wakeup is sent, and the public-key endpoint is 404.
