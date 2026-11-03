@@ -1,5 +1,5 @@
 {
-  "description": "Shared Rust/WASM vector for the PowerShell command builder (#298). Every expected value is written by hand from the rules in crates/allw-core/src/powershell.rs (argv is always a whitespace split of raw; risk floor Medium; High when raw contains ; | & a line break, a backtick, ( {, [scriptblock] or .invoke, a nested-execution command word (iex, Invoke-Expression, Invoke-Command, icm, Start-Process, start, saps, Start-Job, sajb, powershell, pwsh, cmd), an -EncodedCommand parameter or prefix (or -ec), or dot-sourcing (a leading . word, or . directly followed by a quote or $); raw verbatim); never regenerate it from program output.",
+  "description": "Shared Rust/WASM vector for the PowerShell command builder (#298). Every expected value is written by hand from the rules in crates/allw-core/src/powershell.rs (argv is always a whitespace split of raw; risk floor Medium; High when raw contains ; | & a line break, a backtick, ( {, [scriptblock] or .invoke, a nested-execution command word (iex, Invoke-Expression, Invoke-Command, icm, Start-Process, start, saps, Start-Job, sajb, powershell, pwsh, cmd), an -EncodedCommand parameter or prefix (or -ec), led by - / or a U+2013/U+2014/U+2015 dash and possibly inside one layer of quotes, a command named like PowerShell itself (a name starting pwsh or powershell, after any path and quotes), or dot-sourcing (a leading . word, or . directly followed by a quote or $); raw verbatim); never regenerate it from program output.",
   "cases": [
     {
       "class": "low-risk program raised to the Medium floor",
@@ -243,6 +243,78 @@
       "risk": "high",
       "bin": ".\"x.ps1\"",
       "argv": [".\"x.ps1\""]
+    },
+    {
+      "class": "#328: -enc with an en dash (U+2013) on a pwsh-* binary",
+      "command": "pwsh-preview –enc SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "pwsh-preview",
+      "argv": ["pwsh-preview", "–enc", "SQBFAFgA"]
+    },
+    {
+      "class": "#328: -EncodedCommand with an em dash (U+2014)",
+      "command": "pwsh-preview —EncodedCommand SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "pwsh-preview",
+      "argv": ["pwsh-preview", "—EncodedCommand", "SQBFAFgA"]
+    },
+    {
+      "class": "#328: -enc with a horizontal bar (U+2015)",
+      "command": "pwsh-preview ―enc SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "pwsh-preview",
+      "argv": ["pwsh-preview", "―enc", "SQBFAFgA"]
+    },
+    {
+      "class": "#328: single-quoted -enc",
+      "command": "pwsh-preview '-enc' SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "pwsh-preview",
+      "argv": ["pwsh-preview", "'-enc'", "SQBFAFgA"]
+    },
+    {
+      "class": "#328: double-quoted -enc",
+      "command": "pwsh-preview \"-enc\" SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "pwsh-preview",
+      "argv": ["pwsh-preview", "\"-enc\"", "SQBFAFgA"]
+    },
+    {
+      "class": "#328: renamed binary with an en-dash -enc (only the parameter check applies)",
+      "command": "C:\\tools\\p.exe –enc SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "C:\\tools\\p.exe",
+      "argv": ["C:\\tools\\p.exe", "–enc", "SQBFAFgA"]
+    },
+    {
+      "class": "#328: renamed binary with a quoted -enc (only the parameter check applies)",
+      "command": "C:\\tools\\p.exe '-enc' SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "C:\\tools\\p.exe",
+      "argv": ["C:\\tools\\p.exe", "'-enc'", "SQBFAFgA"]
+    },
+    {
+      "class": "#328: a pwsh-* binary with no other trigger is a nested shell",
+      "command": "pwsh-preview -File x.ps1",
+      "cwd": null,
+      "risk": "high",
+      "bin": "pwsh-preview",
+      "argv": ["pwsh-preview", "-File", "x.ps1"]
+    },
+    {
+      "class": "#328 near miss: an en dash on a parameter that isn't -EncodedCommand stays Medium",
+      "command": "Get-ChildItem –Exclude x",
+      "cwd": null,
+      "risk": "medium",
+      "bin": "Get-ChildItem",
+      "argv": ["Get-ChildItem", "–Exclude", "x"]
     }
   ]
 }
