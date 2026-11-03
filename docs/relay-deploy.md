@@ -216,25 +216,27 @@ Verify the deployed relay works by running the pairing + approval flow against i
 ```sh
 # In the repo root (ensure @allw/approver is installed):
 RELAY_URL="https://relay.example.com"   # Replace with your deployed URL
-ACCOUNT_ID="smoke-test-$(date +%s)"     # Unique account id for this smoke test
+KEYFILE="/tmp/allw-smoke-$(date +%s).json"
 
+# Use a throwaway keyfile so the smoke test gets a fresh account root (and so a fresh account id,
+# which is derived from the root).
 npx allw-approver pair \
   --relay "$RELAY_URL" \
-  --account "$ACCOUNT_ID" \
+  --keyfile "$KEYFILE" \
   --label "smoke-test-device"
 ```
 
-Copy the printed account-root public key, then start watching:
+Copy the printed account id and account-root public key, then start watching:
 
 ```sh
-npx allw-approver watch
+npx allw-approver watch --keyfile "$KEYFILE"
 ```
 
 In a third terminal, wire the hook and run a test request. Set the env vars printed during pairing:
 
 ```sh
 export ALLW_RELAY_URL="$RELAY_URL"
-export ALLW_ACCOUNT_ID="$ACCOUNT_ID"
+export ALLW_ACCOUNT_ID="<ACCOUNT_ID_FROM_PAIR_OUTPUT>"
 export ALLW_APPROVER_ROOT_KEY="<ROOT_KEY_FROM_PAIR_OUTPUT>"
 
 # Trigger a request (simulating the Claude Code hook):

@@ -118,21 +118,22 @@ relay:
 ```sh
 npx allw-approver pair \
   --relay <RELAY_URL> \
-  --account my-account \
   --label "my-laptop"
 ```
 
 - `<RELAY_URL>` is from step 0 — `https://allw-relay.mnorth.workers.dev` by default, or your own
   URL if you chose to self-host.
-- `--account` is any id you choose; it routes requests to this device.
+- The **account id is derived from the account-root key** in your keyfile (a 43-character
+  base64url string) — you don't choose it. Only the holder of that key can add devices to the
+  account. `--account <id>` is optional and only checks that you got the id you expected.
 
 This generates a local keyfile (`~/.allw/approver-keyfile.json`, mode `0600`), registers the device,
 mints a device certificate, and prints two things you need for the hook:
 
-- the **account id** (what you passed to `--account`), and
+- the **account id** (derived from the account root), and
 - the **account-root public key** (base64url) — the integrator's trust anchor.
 
-Copy the account-root public key from the output.
+Copy both values from the output.
 
 > v0 stand-in: keys are software-held in the keyfile (→ [#23](https://github.com/mike-north/allw/issues/23)).
 
@@ -227,7 +228,7 @@ end-to-end-encrypted and cryptographically verified.
 | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | Hook always denies with "ALLW\_… is not set" | The hook env vars (step 4) aren't visible to Claude Code's shell. Export them where Claude Code launches.                      |
 | Hook denies with "vendored wasm not found"   | You're running an unbuilt checkout, not the installed package. `npm install @allw/hook` (it bundles the WASM via `@allw/sdk`). |
-| No prompt appears in the watch terminal      | The `--account` / `--relay` in the approver must match the hook's `ALLW_ACCOUNT_ID` / `ALLW_RELAY_URL`.                        |
+| No prompt appears in the watch terminal      | The account id / `--relay` printed by `pair` must match the hook's `ALLW_ACCOUNT_ID` / `ALLW_RELAY_URL`.                       |
 | Request times out immediately                | Check the relay is running (step 0) and reachable at `ALLW_RELAY_URL`.                                                         |
 | `git status` runs without prompting          | Only `Bash` and `mcp__*` are gated. Reads/edits/greps pass through by design (v0 conservative matcher).                        |
 

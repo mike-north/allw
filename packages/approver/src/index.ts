@@ -53,6 +53,7 @@ export {
   deviceConnectWsUrl,
   pairingComplete,
   pairingStart,
+  type PairingStartAuthorization,
   type PairingStartResult,
 } from "./lib/relay-client.js";
 

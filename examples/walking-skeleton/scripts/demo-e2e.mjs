@@ -44,7 +44,8 @@ const RELAY_DIR = join(REPO_ROOT, "packages", "relay");
 const APPROVER_BIN = join(REPO_ROOT, "packages", "approver", "dist", "cli.js");
 const HOOK_BIN = join(REPO_ROOT, "packages", "hook", "dist", "cli.js");
 
-const ACCOUNT_ID = "demo-walking-skeleton";
+// Any id answers `GET /{acct}/devices`; the paired account id itself is derived from the root (#242).
+const READINESS_PROBE_ACCOUNT = "demo-readiness-probe";
 const DESTRUCTIVE_COMMAND = "git push --force origin main";
 const PROJECT_CWD = "/workspace/project";
 
@@ -91,7 +92,7 @@ async function startRelay(port) {
   const base = `http://127.0.0.1:${port}`;
   for (let i = 0; i < 60; i++) {
     try {
-      const resp = await fetch(`${base}/${ACCOUNT_ID}/devices`);
+      const resp = await fetch(`${base}/${READINESS_PROBE_ACCOUNT}/devices`);
       if (resp.ok) {
         await resp.body?.cancel();
         return { child, base };
@@ -105,7 +106,10 @@ async function startRelay(port) {
   throw new Error("relay (wrangler dev) did not become ready in 60s");
 }
 
-/** Run the real `allw-approver pair` CLI and capture the printed account-root pubkey. */
+/**
+ * Run the real `allw-approver pair` CLI and capture the printed (root-derived) account id and
+ * account-root pubkey — the two values an integrator is configured with.
+ */
 async function pairApprover(relayBase, keyfilePath) {
   const out = await runCapture(
     process.execPath,
@@ -114,8 +118,6 @@ async function pairApprover(relayBase, keyfilePath) {
       "pair",
       "--relay",
       relayBase,
-      "--account",
-      ACCOUNT_ID,
       "--keyfile",
       keyfilePath,
       "--label",
@@ -124,10 +126,11 @@ async function pairApprover(relayBase, keyfilePath) {
     {},
   );
   process.stderr.write(out.stdout.replace(/^/gm, "[pair] "));
-  const match = /account-root pubkey:\s*([A-Za-z0-9_-]+)/.exec(out.stdout);
-  if (!match)
-    throw new Error(`could not parse account-root pubkey from pair output:\n${out.stdout}`);
-  return match[1];
+  const rootMatch = /account-root pubkey:\s*([A-Za-z0-9_-]+)/.exec(out.stdout);
+  const idMatch = /account id:\s*([A-Za-z0-9_-]+)/.exec(out.stdout);
+  if (!rootMatch || !idMatch)
+    throw new Error(`could not parse account id / root pubkey from pair output:\n${out.stdout}`);
+  return { accountRootKey: rootMatch[1], accountId: idMatch[1] };
 }
 
 /** Run a command to completion, capturing stdout/stderr. Rejects on non-zero exit. */
@@ -212,8 +215,10 @@ async function main() {
     relay = await startRelay(opts.port);
 
     // 1. Pair a real software approver against the live relay; capture the trust anchor.
-    const accountRootKey = await pairApprover(relay.base, keyfilePath);
-    process.stderr.write(`[demo] paired; account-root pubkey ${accountRootKey}\n`);
+    const { accountRootKey, accountId } = await pairApprover(relay.base, keyfilePath);
+    process.stderr.write(
+      `[demo] paired; account ${accountId}, account-root pubkey ${accountRootKey}\n`,
+    );
 
     // 2. Start the real approver watch loop in auto-decision mode (a child process, over a live WS).
     //    It blocks until its socket closes; we leave it running while the hook round-trips.
@@ -230,7 +235,7 @@ async function main() {
     // 3. Drive the gated command through the real hook bin and read the decision.
     const env = {
       ALLW_RELAY_URL: relay.base,
-      ALLW_ACCOUNT_ID: ACCOUNT_ID,
+      ALLW_ACCOUNT_ID: accountId,
       ALLW_APPROVER_ROOT_KEY: accountRootKey,
       ALLW_TIMEOUT_MS: String(timeoutMs),
     };
