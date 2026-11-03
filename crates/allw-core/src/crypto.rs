@@ -1091,6 +1091,8 @@ pub fn derive_number_match_challenge(request_hash: &[u8; 32]) -> String {
 /// Fail-closed: **any** failure returns `Err` (`docs/contract.md` §Invariants #6). The steps
 /// map one-to-one onto the `docs/contract.md` §Verification checklist:
 ///
+/// 0. **Note bound** (input hygiene, before any crypto). An outer `note` longer than
+///    [`MAX_NOTE_BYTES`] bytes of UTF-8 is rejected ([`VerifyError::NoteTooLong`]).
 /// 1. **Device cert → root** (checklist #1). Requires `verdict.device_cert`
 ///    ([`VerifyError::MissingDeviceCert`]); verifies its JWS against `approver_root`
 ///    ([`VerifyError::CertSignatureInvalid`]); checks `typ`, the signed header `kid` and
