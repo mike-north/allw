@@ -74,6 +74,7 @@ use allw_core::{
     verify_policy_rule_with_account_states_for_account as core_verify_policy_rule_with_account_states_for_account,
     verify_verdict as core_verify_verdict,
     verify_verdict_for_account as core_verify_verdict_for_account,
+    verify_verdict_provenance as core_verify_verdict_provenance,
     verify_verdict_with_account_states as core_verify_verdict_with_account_states,
     verify_verdict_with_account_states_for_account as core_verify_verdict_with_account_states_for_account,
     AccountState, ActionRecord, Actor, ApprovalContext, ApprovalRequest, Approver, CommandContext,
@@ -513,6 +514,83 @@ pub fn verify_verdict_with_account_states(
             note: verified.note,
         },
         "VerifyResult",
+    )
+    .map_err(JsValue::from)
+}
+
+// ── verify_verdict_provenance ─────────────────────────────────────────────────────────
+
+/// The successful result of [`verify_verdict_provenance`]: who signed the verdict. **Not** a
+/// verified human decision — see the core
+/// [`VerdictProvenance`](allw_core::VerdictProvenance).
+#[derive(Serialize)]
+struct ProvenanceResult {
+    /// The certified device that signed the verdict.
+    device_id: String,
+    /// The signed decision time, Unix ms. The device certificate was unexpired at it.
+    decided_at: i64,
+}
+
+/// Checks a verdict's provenance without the plaintext: signed for `request_id`, with a
+/// `decided_at` inside `[created_at, expires_at]` (the request envelope's window), by a device of
+/// `account_id` certified by the account root, and not revoked in `account_states_json`. The
+/// relay's gate before it records a verdict (see the core
+/// [`verify_verdict_provenance`](allw_core::verify_verdict_provenance) for the exact checks).
+///
+/// - `account_states_json` — a JSON array of compact `allw-account-state+jws` strings; `[]` skips
+///   the revocation check. Every document must verify against the root, or the check fails closed.
+///
+/// Returns `{ device_id, decided_at }` JSON. This is **not** approval: the request hash, replay
+/// and decision are unchecked; only [`verify_verdict`] yields a verified decision.
+///
+/// # Errors
+///
+/// Throws on any failed check (the message is the core [`VerifyError`] `Display`, for diagnostics
+/// only), on invalid `verdict_json` / `account_states_json`, on a root key that is not a 32-byte
+/// base64url Ed25519 key, or on a `created_at` / `expires_at` that is not an integer in range.
+#[wasm_bindgen]
+pub fn verify_verdict_provenance(
+    verdict_json: &str,
+    request_id: &str,
+    created_at: f64,
+    expires_at: f64,
+    account_id: &str,
+    account_root_pubkey_b64: &str,
+    account_states_json: &str,
+) -> Result<String, JsValue> {
+    let verdict: Verdict = parse_json(verdict_json, "Verdict")?;
+    let root_bytes = decode_b64_32(account_root_pubkey_b64, "account_root_pubkey_b64")?;
+    let root = PublicKey::from_bytes(&root_bytes).map_err(|e| {
+        JsError::new(&format!(
+            "account_root_pubkey_b64 is not a valid Ed25519 key: {e}"
+        ))
+    })?;
+    let created_at = ms_to_i64(created_at, "created_at")?;
+    let expires_at = ms_to_i64(expires_at, "expires_at")?;
+    let account_states = parse_account_states_json(account_states_json)?;
+    let account_state_refs: Vec<&str> = account_states.iter().map(String::as_str).collect();
+
+    let provenance = core_verify_verdict_provenance(
+        &verdict,
+        request_id,
+        created_at,
+        expires_at,
+        account_id,
+        &root,
+        &account_state_refs,
+    )
+    .map_err(|e| {
+        JsValue::from(JsError::new(&format!(
+            "verify_verdict_provenance failed: {e}"
+        )))
+    })?;
+
+    to_json(
+        &ProvenanceResult {
+            device_id: provenance.device_id,
+            decided_at: provenance.decided_at,
+        },
+        "ProvenanceResult",
     )
     .map_err(JsValue::from)
 }

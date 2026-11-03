@@ -2609,3 +2609,50 @@ test("verify_verdict reports a verified non-approval only as the structured sign
   // The approved vector verdict still verifies (no throw).
   assert.equal(JSON.parse(verifiers[0][1](v.verdict_json)).approved, true);
 });
+
+test("verify_verdict_provenance gives the Rust vector's answer for every case (#245)", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  const verify = (verdictJson, requestId, overrides = {}) =>
+    wasm.verify_verdict_provenance(
+      verdictJson,
+      requestId,
+      overrides.createdAt ?? v.provenance_created_at,
+      overrides.expiresAt ?? v.provenance_expires_at,
+      overrides.accountId ?? v.provenance_account_id,
+      overrides.root ?? v.approver_root_pubkey_b64,
+      overrides.states ?? "[]",
+    );
+
+  assert.equal(v.provenance_cases.length, 10);
+  for (const c of v.provenance_cases) {
+    const check = () => verify(c.verdict_json, c.request_id, { states: c.account_states_json });
+    if (c.expected_device_id === null) {
+      assert.equal(typeof c.expected_error, "string", `${c.name}: the vector names the error`);
+      // The specific reason, not just the generic prefix: a case rejected for the wrong reason
+      // (say, a window case failing on its certificate) must not pass.
+      assert.throws(
+        check,
+        (err) => err.message === `verify_verdict_provenance failed: ${c.expected_error}`,
+        `${c.name}: rejected with "${c.expected_error}"`,
+      );
+    } else {
+      assert.equal(c.expected_error, null, `${c.name}: no error expected`);
+      const got = JSON.parse(check());
+      assert.equal(got.device_id, c.expected_device_id, `${c.name}: the signing device`);
+      assert.equal(typeof got.decided_at, "number", `${c.name}: decided_at`);
+    }
+  }
+
+  // Junk input never passes: a non-object verdict, a verdict for another account, a bad root, a
+  // window that is not an integer millisecond count.
+  const genuine = v.provenance_cases.find((c) => c.name === "genuine");
+  assert.ok(genuine, "the vector carries the genuine provenance case");
+  assert.throws(() => verify("42", genuine.request_id));
+  assert.throws(() =>
+    verify(genuine.verdict_json, genuine.request_id, { accountId: "acc_someone_else" }),
+  );
+  assert.throws(() => verify(genuine.verdict_json, genuine.request_id, { root: "not-a-key" }));
+  assert.throws(() => verify(genuine.verdict_json, genuine.request_id, { createdAt: Number.NaN }));
+  assert.throws(() => verify(genuine.verdict_json, genuine.request_id, { expiresAt: 1.5 }));
+});

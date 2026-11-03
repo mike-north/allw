@@ -40,11 +40,13 @@ import {
 import { withCors, type CorsEnv } from "./cors.js";
 import {
   CoreUnavailableError,
+  accountIdForRoot,
   checkAccountIdForRoot,
   ensureCore,
   isSmallOrderX25519PublicKey,
   verifyAccountState,
   verifyPairingStartAuthorization,
+  verifyVerdictProvenance,
 } from "./core.js";
 import { parseMaxRequestTtlMs, readJsonObjectCapped, utf8ByteLength } from "./limits.js";
 import {
@@ -2323,9 +2325,10 @@ export class AccountRelay implements DurableObject {
 
   /**
    * Hibernation message handler. The only inbound message that mutates state is a device verdict:
-   * `{ type: "verdict", request_id, verdict }`. On a fresh verdict the relay stores it, marks the
-   * request resolved, retracts it from the other devices, and pushes it to any waiting integrator.
-   * A verdict for an already-resolved request is ignored (dedupe / cross-device race).
+   * `{ type: "verdict", request_id, verdict }`. On a fresh verdict whose provenance verifies (#245)
+   * the relay stores it, marks the request resolved, retracts it from the other devices, and pushes
+   * it to any waiting integrator. A verdict for an already-resolved request is ignored (dedupe /
+   * cross-device race).
    */
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     const text = typeof message === "string" ? message : new TextDecoder().decode(message);
@@ -2367,12 +2370,17 @@ export class AccountRelay implements DurableObject {
   /**
    * Process a device verdict message. Idempotent: a second verdict for the same request (whether a
    * cross-device race or a retry) is acknowledged but does not overwrite the recorded decision.
+   *
+   * Only a verdict with valid provenance is recorded (#245): signed for this request by the
+   * socket's own device, certified by the bound account root and not revoked. Any other verdict
+   * gets an `error` frame and changes nothing, so the request stays answerable. Provenance is not a
+   * decision: the integrator still verifies the verdict in full and decides what it means.
    */
   private onDeviceVerdict(ws: WebSocket, msg: Record<string, unknown>): void {
     // SECURITY: only a device presence socket may submit a verdict. An integrator `…/wait` socket
     // (or any other non-device client) carries no `device:<id>` tag — it must NEVER be able to
-    // resolve a request by sending a forged verdict payload. Authenticity of the verdict body is
-    // additionally guaranteed by its JWS signature, verified downstream by the integrator.
+    // resolve a request by sending a forged verdict payload. The verdict body's provenance is checked
+    // below; the integrator still verifies it in full.
     const deviceId = this.deviceIdForSocket(ws);
     if (deviceId === null) {
       trySendJson(ws, { type: "error", error: "verdicts are only accepted from device sockets" });
@@ -2382,8 +2390,8 @@ export class AccountRelay implements DurableObject {
     // SECURITY (fail-closed): re-confirm the device is still enrolled. The socket tag proves which
     // device opened the connection, but a revoke may have removed the enrollment while a hibernation
     // socket survived the best-effort close — a de-enrolled device must not be able to drive a
-    // request to `resolved`. (The integrator's JWS verification is the real backstop; this keeps the
-    // relay's own state honest.)
+    // request to `resolved`. (The provenance check below also refuses a device revoked in the verified
+    // account state; this covers a de-enrollment the account state does not yet record.)
     const stillEnrolled = [
       ...this.sql.exec<DeviceRow>(`SELECT device_id FROM device WHERE device_id = ?`, deviceId),
     ];
@@ -2402,8 +2410,8 @@ export class AccountRelay implements DurableObject {
       trySendJson(ws, { type: "error", error: "'request_id' is required (string)" });
       return;
     }
-    // Require a JSON-object verdict (the contract Verdict shape). We never parse the JWS inside it,
-    // but a degenerate scalar (42, "x") could never be verified downstream — reject it outright.
+    // Require a JSON-object verdict (the contract Verdict shape): a degenerate scalar (42, "x") can
+    // never be a verdict, so it is refused before the provenance check.
     if (!isPlainObject(msg.verdict)) {
       trySendJson(ws, { type: "error", error: "'verdict' must be a JSON object" });
       return;
@@ -2411,7 +2419,7 @@ export class AccountRelay implements DurableObject {
 
     const reqRows = [
       ...this.sql.exec<RequestRow>(
-        `SELECT request_id, status, expires_at FROM request WHERE request_id = ?`,
+        `SELECT request_id, envelope, status, expires_at FROM request WHERE request_id = ?`,
         requestId,
       ),
     ];
@@ -2442,8 +2450,55 @@ export class AccountRelay implements DurableObject {
       return;
     }
 
-    // SECURITY: the verdict is a JWS-signed decision, stored opaquely solely to route it back.
+    // The socket's device must be the device that answered: one device's token never carries
+    // another device's verdict, even a genuine one. The outer `approver.device_id` is checked here,
+    // before any crypto, so a mismatched verdict costs no signature work; the provenance check
+    // next ties it to the signature (`kid`) and the signed claims.
+    // Only a string `device_id` is compared: a malformed approver falls through to the provenance
+    // check and gets its error, not a claim about another device.
+    const approver = msg.verdict.approver;
+    if (
+      isPlainObject(approver) &&
+      typeof approver.device_id === "string" &&
+      approver.device_id !== deviceId
+    ) {
+      trySendJson(ws, {
+        type: "error",
+        request_id: requestId,
+        error: "verdict is signed by another device",
+      });
+      return;
+    }
+
+    // SECURITY (#245): only a verdict with valid provenance may become final. Any device could
+    // otherwise resolve every request instantly with junk, retracting the prompt from the human's
+    // other devices, so the relay, not the integrator, would decide which verdict counts. The core
+    // checks, without the plaintext, that the verdict was signed for this request, at a time inside
+    // the request's window, by a device the bound account root certified and has not revoked. A
+    // failed check records nothing, retracts nothing, and leaves the request pending for another
+    // device's verdict.
     const verdictJson = JSON.stringify(msg.verdict);
+    const signer = this.verdictSigner(verdictJson, requestId, req);
+    if (signer === null) {
+      trySendJson(ws, {
+        type: "error",
+        request_id: requestId,
+        error: "verdict failed provenance verification",
+      });
+      return;
+    }
+    // Defense in depth: the certified signer must be the socket's device too (the outer
+    // `approver.device_id` was compared above; the core ties it to the signed `kid`).
+    if (signer !== deviceId) {
+      trySendJson(ws, {
+        type: "error",
+        request_id: requestId,
+        error: "verdict is signed by another device",
+      });
+      return;
+    }
+
+    // The verdict is stored opaquely solely to route it back; its meaning is the integrator's call.
     try {
       this.sql.exec(
         `INSERT INTO verdict (request_id, verdict, device_id, received_at) VALUES (?, ?, ?, ?)`,
@@ -2484,6 +2539,41 @@ export class AccountRelay implements DurableObject {
     }
 
     trySendJson(ws, { type: "ack", request_id: requestId, status: "resolved" });
+  }
+
+  /**
+   * The device that signed `verdictJson` for `req`, or `null` when its provenance does not verify
+   * against the request's window, the bound account root and the relay's verified account states
+   * (#245). Fails closed: no bound root, an envelope without an integer `created_at`, a core that
+   * cannot load, or any failed check is `null`.
+   *
+   * The window is the envelope's `created_at` and `expires_at`: the same values the integrator's
+   * `verify_verdict` step 5 checks `decided_at` against. (The row's `created_at` column is the
+   * relay's receive time, so it is not used here: a device clock slightly behind the relay's would
+   * otherwise be refused for a verdict the integrator accepts.)
+   */
+  private verdictSigner(
+    verdictJson: string,
+    requestId: string,
+    req: Pick<RequestRow, "envelope" | "expires_at">,
+  ): string | null {
+    const root = this.boundRootPubkey();
+    if (root === null) return null;
+    try {
+      const envelope = JSON.parse(req.envelope) as unknown;
+      if (!isPlainObject(envelope) || typeof envelope.created_at !== "number") return null;
+      return verifyVerdictProvenance(
+        verdictJson,
+        requestId,
+        envelope.created_at,
+        req.expires_at,
+        accountIdForRoot(root),
+        root,
+        this.verifiedAccountStates().states,
+      ).device_id;
+    } catch {
+      return null;
+    }
   }
 
   /**
