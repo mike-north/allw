@@ -64,3 +64,12 @@ malformed, so nothing is submitted. That covers an empty `argv`, a non-string el
 unparseable command line (for example an unmatched quote), an empty program, a blank `summary` or
 `cwd`, a malformed `actor`, a non-positive or non-integer `timeoutMs`, or `raw` passed to
 `commandRequest`.
+
+## Request size limit
+
+The relay refuses a request whose encrypted context (`context_ciphertext`) is over **64 KiB**, counted
+in UTF-8 bytes, with HTTP 413 (`docs/relay-api.md` §3). The ciphertext is larger than the plaintext
+context it encrypts, so keep the summary and action detail well under that. An over-size request
+fails closed: nothing is stored or shown to the human, and `requestApproval` rejects with an
+error whose `name` is `"RelayError"` and whose `status` is 413. Treat that rejection, like any other, as deny; never retry it
+into an approval.

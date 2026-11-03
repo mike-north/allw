@@ -150,13 +150,27 @@ export function signAccountState(signer: TestAccount, options: AccountStateOptio
   return glue.sign_account_state(json, signer.rootSeed);
 }
 
+/**
+ * A deterministic, canonical UUIDv4-shaped request id for a readable test name. `POST /requests`
+ * accepts only canonical UUID ids (#248, contract §Transport), so tests keep human-readable names
+ * and submit `testRequestId(name)`; the same name always yields the same id.
+ */
+export function testRequestId(name: string): string {
+  const h = createHash("sha256").update(`allw-relay-test-request/${name}`).digest("hex");
+  const variant = ((parseInt(h.charAt(16), 16) & 0x3) | 0x8).toString(16);
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-${variant}${h.slice(17, 20)}-${h.slice(20, 32)}`;
+}
+
 /** Test device certificates are issued at this fixed time (Unix ms), with no expiry by default. */
 export const TEST_CERT_ISSUED_AT = 1_700_000_000_000;
 /**
- * The fixed `decided_at` of test verdicts (Unix ms, after {@link TEST_CERT_ISSUED_AT}). The relay
- * judges the certificate's expiry at `decided_at`, not its own clock, so fixtures stay deterministic.
+ * The fixed `decided_at` of test verdicts (Unix ms, 2099-12-31T23:55Z, after
+ * {@link TEST_CERT_ISSUED_AT}). The relay judges the certificate's expiry at `decided_at`, not its
+ * own clock, so fixtures stay deterministic. It sits inside the request window the relay tests
+ * submit (#248): created a minute before their pinned relay clock, which is five minutes before the
+ * 2100-01-01Z expiry, and the relay accepts a decision only inside `[created_at, expires_at]`.
  */
-export const TEST_DECIDED_AT = 1_700_000_500_000;
+export const TEST_DECIDED_AT = 4_102_444_500_000;
 
 /** Options for a device-signed verdict. */
 export interface VerdictOptions {
