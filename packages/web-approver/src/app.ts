@@ -134,8 +134,10 @@ export interface BootEnvironment {
   /**
    * Load the core's display escape (#246) for the re-pair screen (#286), which shows a stored relay
    * string before the inbox (and so before the runtime) loads. Production initializes the vendored
-   * WASM core, which is memoized and reused by the inbox. When omitted, or when it rejects, the
-   * re-pair screen withholds the pin text rather than print it unescaped.
+   * WASM core, which is memoized and reused by the inbox. The ignored-relay notice (#307) gets its
+   * escape from the same seam. When omitted, when it rejects, or when it does not resolve within
+   * {@link DISPLAY_ESCAPE_LOAD_TIMEOUT_MS} (#308), the re-pair screen withholds the pin text and
+   * the notice withholds the ignored link's name rather than print either unescaped.
    */
   readonly loadDisplayEscape?: () => Promise<DisplayEscape>;
   /**
@@ -273,13 +275,46 @@ function confirmRelayRepair(
   });
 }
 
-/** The core display escape from `env`, or `null` when it is not provided or fails to load. */
+/**
+ * How long boot waits for the core's display escape before it shows untrusted text withheld
+ * (#308): the re-pair screen's stored pin (#286) and the ignored-relay notice's link (#307).
+ *
+ * The core is a ~1 MB WASM fetch. Without a bound, a stalled fetch (a slow or captive network)
+ * left the re-pair screen blank with no explanation. Five seconds is long enough for a normal
+ * connection and short enough that a human isn't left looking at an empty page. Missing it only
+ * withholds that text: the re-pair confirm and the notice are shown either way, and a core that
+ * arrives later still serves the inbox (`initWasm` is memoized) without changing what was shown.
+ */
+export const DISPLAY_ESCAPE_LOAD_TIMEOUT_MS = 5_000;
+
+/**
+ * The core display escape from `env`, or `null` when it is not provided, fails to load, or does
+ * not load within {@link DISPLAY_ESCAPE_LOAD_TIMEOUT_MS}. Never rejects.
+ */
 async function loadDisplayEscape(env: BootEnvironment): Promise<DisplayEscape | null> {
-  if (env.loadDisplayEscape === undefined) return null;
+  const load = env.loadDisplayEscape;
+  if (load === undefined) return null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<null>((resolve) => {
+    timer = setTimeout(() => {
+      resolve(null);
+    }, DISPLAY_ESCAPE_LOAD_TIMEOUT_MS);
+  });
+  const loaded = (async () => {
+    try {
+      return await load();
+    } catch {
+      return null;
+    }
+  })();
   try {
-    return await env.loadDisplayEscape();
-  } catch {
-    return null;
+    // A core that settles in the same macrotask as the deadline loses the race: `loaded` is two
+    // microtask hops behind the deadline's direct `resolve(null)`. That is fail-safe and intended:
+    // the text is withheld, not printed raw, and the screen is rendered once either way. Don't
+    // "fix" the tie in the core's favour.
+    return await Promise.race([loaded, deadline]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
