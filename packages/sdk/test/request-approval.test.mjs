@@ -999,6 +999,40 @@ test("(f') genuine signed non-approvals report the signed decision (#311)", asyn
   }
 });
 
+/**
+ * The structured non-approval is read from own properties only (#311 review). If something in the
+ * integrator's process pollutes `Error.prototype` with `kind`/`decision`, an unverifiable verdict
+ * must still be a synthesized `denied`, not the polluter's choice reported as verified.
+ */
+test("(f'') a polluted Error.prototype does not make a forged verdict a verified non-approval (#311)", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const req = sampleRequest();
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: {
+      poll: (env) => {
+        if (!env) return null;
+        const verdict = signVerdict(wasm, approver, req, env, { decision: "denied" });
+        verdict.decision = "approved";
+        verdict.v = NOT_APPROVED_MARKER;
+        return verdict;
+      },
+    },
+  });
+
+  Error.prototype.kind = "not_approved";
+  Error.prototype.decision = "aborted";
+  try {
+    const verdict = await pollClient(approver, relay).requestApproval(req);
+    assert.equal(verdict.decision, "denied", "an inherited kind/decision is ignored");
+    assert.equal(await verdict.verify(approver.accountRootPub), false);
+  } finally {
+    delete Error.prototype.kind;
+    delete Error.prototype.decision;
+  }
+});
+
 test("(d) no enrolled devices → requestApproval rejects (cannot encrypt)", async () => {
   const wasm = await loadWasm();
   const approver = makeApprover(wasm);

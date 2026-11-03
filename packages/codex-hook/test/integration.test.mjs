@@ -196,22 +196,36 @@ test("end-to-end: a WASM-signed approved verdict makes Codex hook emit nothing (
   assertConformsToPreToolUseOutputContract(output);
 });
 
-test("end-to-end: a WASM-signed denied verdict makes Codex emit a schema-conformant deny (category=no-approval)", async () => {
-  const wasm = await loadWasm();
-  const approver = await pairedApprover(wasm);
-  const { fetchImpl } = relayDouble(wasm, approver, "denied");
+// Each genuinely signed non-approval maps to its Codex deny category (#311): the decision now comes
+// from the core's structured `not_approved` error, so this pins the mapping end to end.
+for (const [decision, category] of [
+  ["denied", "no-approval"],
+  ["expired", "timeout"],
+  ["aborted", "aborted"],
+]) {
+  test(`end-to-end: a WASM-signed ${decision} verdict makes Codex emit a schema-conformant deny (category=${category})`, async () => {
+    const wasm = await loadWasm();
+    const approver = await pairedApprover(wasm);
+    const { fetchImpl } = relayDouble(wasm, approver, decision);
 
-  const output = await runCodexHook(
-    codexBashStdin("rm -rf build", "/workspace/project"),
-    env(approver, TIMEOUT_MS),
-    overrides(fetchImpl),
-  );
+    const output = await runCodexHook(
+      codexBashStdin("rm -rf build", "/workspace/project"),
+      env(approver, TIMEOUT_MS),
+      overrides(fetchImpl),
+    );
 
-  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
-  assert.match(output.hookSpecificOutput.permissionDecisionReason, /verdict: denied/);
-  assert.match(output.hookSpecificOutput.permissionDecisionReason, /^allw\[no-approval\]: /);
-  assertConformsToPreToolUseOutputContract(output);
-});
+    assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+    assert.match(
+      output.hookSpecificOutput.permissionDecisionReason,
+      new RegExp(`verdict: ${decision}`),
+    );
+    assert.ok(
+      output.hookSpecificOutput.permissionDecisionReason.startsWith(`allw[${category}]: `),
+      output.hookSpecificOutput.permissionDecisionReason,
+    );
+    assertConformsToPreToolUseOutputContract(output);
+  });
+}
 
 test("end-to-end: no approver response makes Codex emit a schema-conformant fail-closed deny (category=timeout)", async () => {
   const wasm = await loadWasm();
