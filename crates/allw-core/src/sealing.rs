@@ -326,6 +326,15 @@ mod tests {
     }
 
     #[test]
+    fn reports_the_selected_sequence_not_the_callers_floor() {
+        // A floor below the highest sequence must not leak into the result: the caller persists
+        // this value, so reporting the floor would let a later rollback to 3 or 4 through.
+        let docs = [signed(5, vec![device("phone", &PHONE_SEED)], &[])];
+        assert_eq!(seal(&docs, Some(2)).map(|s| s.sequence), Ok(5));
+        assert_eq!(seal(&docs, None).map(|s| s.sequence), Ok(5));
+    }
+
+    #[test]
     fn nothing_is_sealed_when_selection_fails() {
         assert_eq!(
             seal(&[], None),

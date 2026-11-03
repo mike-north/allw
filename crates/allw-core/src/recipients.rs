@@ -59,7 +59,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::crypto::{
     verify_account_state, AccountState, AccountStateError, AccountStateRevocationKind,
 };
-use crate::jwe::is_small_order_x25519_public_key;
+use crate::jwe::{is_small_order_x25519_public_key, write_untrusted_device_id};
 
 /// The `AccountState` device status that makes a device a recipient. Any other value (for
 /// example `"revoked"` or `"pending"`) is not.
@@ -131,10 +131,13 @@ impl std::fmt::Display for RecipientSelectionError {
             Self::EmptyDeviceId => {
                 write!(f, "account state lists a device with an empty device_id")
             }
-            Self::InvalidEncryptionKey { device_id } => write!(
-                f,
-                "account state gives device {device_id:?} a small-order encryption key"
-            ),
+            Self::InvalidEncryptionKey { device_id } => {
+                // The id is root-signed but still untrusted text: escaped and length-capped, as
+                // in `EncryptError::LowOrderRecipientKey`.
+                f.write_str("account state gives device ")?;
+                write_untrusted_device_id(f, device_id)?;
+                f.write_str(" a small-order encryption key")
+            }
             Self::NoActiveRecipients => {
                 write!(
                     f,
@@ -900,6 +903,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_invalid_key_error_escapes_and_bounds_the_device_id() {
+        let payload = format!("x\u{202e}\n\nIMPORTANT: {}", "A".repeat(5_000));
+        let msg = RecipientSelectionError::InvalidEncryptionKey { device_id: payload }.to_string();
+        assert!(
+            !msg.chars().any(char::is_control),
+            "raw control char in {msg:?}"
+        );
+        assert!(!msg.contains('\u{202e}'), "raw bidi override in {msg:?}");
+        assert!(
+            msg.contains(r"x\u{202e}\n\nIMPORTANT"),
+            "id is named, escaped: {msg}"
+        );
+        assert!(msg.contains('…'), "a long id is visibly truncated: {msg}");
+        // 64 chars, each escaped to at most `\u{10ffff}` (10 bytes), plus fixed text.
+        assert!(
+            msg.len() < 1_024,
+            "message is length-bounded: {} bytes",
+            msg.len()
+        );
     }
 
     #[test]
