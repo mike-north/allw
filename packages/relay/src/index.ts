@@ -489,7 +489,8 @@ const surfaceTag = (surfaceId: string): string => `surface:${surfaceId}`;
 const integratorTag = (requestId: string): string => `integrator:${requestId}`;
 
 /** Canonical UUID text form (RFC 9562 §4): 8-4-4-4-12 hex digits, either case. */
-const REQUEST_ID_PATTERN = /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/;
+const REQUEST_ID_PATTERN =
+  /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/;
 
 // The exact, exhaustive set of ApprovalRequest envelope keys the relay accepts (contract.md
 // §Messages). Anything else is rejected at submit time to keep plaintext out of the relay.
