@@ -12,6 +12,13 @@
  *   `eslint.config.js` matches `test/**\/*.ts` only, so `test/` must hold no `.js`, `.mjs`, `.cjs`,
  *   `.jsx`, `.mts`, `.cts` or `.tsx` file.
  *
+ * Known limit: comments are found by a regex over the source text, not by a tokenizer. The
+ * TypeScript scanner would be exact, but loading `typescript` crashes the workerd test runtime.
+ * The regex doesn't skip string, template or regex literals, so a `//` or `/*` inside one is read
+ * as the start of a comment. That can hide a real directive after it: a string such as
+ * `"src/*.ts"` opens a fake block comment that runs to the next `*\/`, and `"http://…"` opens
+ * a fake line comment that eats the rest of its line. The "known limits" cases below pin this.
+ *
  * @see https://eslint.org/docs/latest/use/configure/rules#disabling-rules (directive comment forms)
  */
 
@@ -31,8 +38,9 @@ const ESLINT = "eslint";
 
 /**
  * Every comment in a source, whole: a `/* … *\/` block (which may span lines) or a `//` line
- * comment. A `//` or `/*` inside a string literal can be misread as a comment start; that can only
- * add a false finding, never hide a directive that starts its own comment.
+ * comment. Not string-aware: a `//` or `/*` inside a string, template or regex literal starts a
+ * match, which can hide a directive after it on the same line or up to the next `*\/` (see the
+ * module comment).
  */
 const COMMENT = /\/\*([\s\S]*?)\*\/|\/\/([^\n]*)/g;
 
@@ -127,5 +135,19 @@ describe("relay test sources stay under the private-state lint rules", () => {
     ]);
     expect(guardOptOuts(PLANTS_PATH, disableGuarded)).toEqual([]);
     expect(guardOptOuts("./planted.test.ts", disableOther)).toEqual([]);
+  });
+
+  describe("known limits: a comment opener inside a string hides a directive after it", () => {
+    const disableGuarded = directive("-disable-next-line", `${GUARDED_RULE} -- hidden`);
+
+    it("a glob string's /* swallows a later directive, up to the next */", () => {
+      const source = `const glob = "src/*.ts";\n${disableGuarded}\nconst x = 1; /* end */`;
+      expect(guardOptOuts("./planted.test.ts", source)).toEqual([]);
+    });
+
+    it("a URL string's // swallows a directive later on the same line", () => {
+      const source = `const u = "http://x"; /* ${ESLINT}-disable-next-line ${GUARDED_RULE} */`;
+      expect(guardOptOuts("./planted.test.ts", source)).toEqual([]);
+    });
   });
 });

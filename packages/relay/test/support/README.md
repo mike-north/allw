@@ -41,4 +41,7 @@ Review has to catch these. `eslint/relay-private-state.js` lists them in full.
 
 `test/private-state-plants.ts` plants each violation. Its disable directives must stay in use, so lint fails if
 a rule stops firing. `test/lint-coverage.test.ts` fails if any other file disables `no-restricted-syntax`,
-if any file uses a blanket disable, or if `test/` gains a source in a language the typed lint block skips.
+if any file uses a blanket disable, or if `test/` gains a source in a language the typed lint block skips. It
+finds comments with a regex, not a tokenizer, because `typescript` can't load in the workerd test runtime. So a
+`//` or `/*` inside a string (`"http://…"`, `"src/*.ts"`) can hide a directive after it; review has to
+catch that too.
