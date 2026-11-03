@@ -172,9 +172,38 @@ surface and presses Approve / Deny, and the recording itself is the artifact. To
    `{"permissionDecision":"deny"}` JSON (deny). Let the prompt sit to demonstrate the **timeout** (set `ALLW_TIMEOUT_MS=4000` to
    keep it short).
 
-> In a real Claude Code session the hook is wired via `.claude/settings.json` (matcher `Bash|Edit|MultiEdit|Write|mcp__.*`)
-> and Claude Code itself supplies the stdin — see [`packages/hook/README.md`](../../packages/hook/README.md).
-> Terminal C reproduces that stdin by hand so the recording does not depend on a live agent session.
+In a real Claude Code session the hook is wired via `.claude/settings.json` and Claude Code itself
+supplies the stdin; Terminal C reproduces that stdin by hand so the recording does not depend on a
+live agent session. For this checkout:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^(Bash|Edit|MultiEdit|Write)$|^mcp__",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /absolute/path/to/packages/hook/dist/cli.js",
+            "timeout": 480,
+            "onFailure": "block"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "deny": ["Monitor", "PowerShell", "NotebookEdit"]
+  }
+}
+```
+
+> `"onFailure": "block"` makes Claude Code block the call when the hook can't start, crashes or times
+> out. It needs Claude Code v2.1.295 or later; older versions ignore the key without warning, so
+> check `claude --version`. The `deny` rules turn off tools allw doesn't gate yet
+> ([#298](https://github.com/mike-north/allw/issues/298)). See
+> [`packages/hook/README.md`](../../packages/hook/README.md) for what each field does.
 
 ## Decisions
 

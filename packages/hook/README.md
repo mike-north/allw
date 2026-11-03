@@ -34,16 +34,20 @@ the account-root public key.
 Wire the hook into your user-level `~/.claude/settings.json` (or a project's `.claude/settings.json`
 for a demo) as a `PreToolUse` hook. Install it outside any tree the agent works in, so the agent
 can't edit the gate: see
-[Install the hook where the agent can't write it](../../docs/claude-code-integration.md#install-the-hook-where-the-agent-cant-write-it). The
-matcher selects which tools `allw` gates — `Bash` for shell commands, `Edit`/`Write`/`MultiEdit`
-for direct file edits, and `mcp__.*` for any MCP tool call:
+[Install the hook where the agent can't write it](../../docs/claude-code-integration.md#install-the-hook-where-the-agent-cant-write-it).
+The matcher `^(Bash|Edit|MultiEdit|Write)$|^mcp__` is a regular expression anchored to whole tool
+names: it sends exactly `Bash` (shell commands), `Edit`/`MultiEdit`/`Write` (direct file edits) and
+every `mcp__…` tool to `allw`, and nothing else (not `NotebookEdit`). The `deny` rules turn off
+`Monitor`, `PowerShell` and `NotebookEdit`, which run shell commands or edit files without passing
+through `allw` ([#298](https://github.com/mike-north/allw/issues/298)). `Monitor` also follows your
+`Bash` permission rules, so a `Bash` allow rule would run it with no prompt at all:
 
 ```json
 {
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|Edit|MultiEdit|Write|mcp__.*",
+        "matcher": "^(Bash|Edit|MultiEdit|Write)$|^mcp__",
         "hooks": [
           {
             "type": "command",
@@ -54,6 +58,9 @@ for direct file edits, and `mcp__.*` for any MCP tool call:
         ]
       }
     ]
+  },
+  "permissions": {
+    "deny": ["Monitor", "PowerShell", "NotebookEdit"]
   }
 }
 ```
@@ -155,7 +162,10 @@ can therefore still get Claude Code's own prompt at the desk; to make the phone 
 
 Because empty stdout means "no objection", the hook also has an **exit backstop**: if the process
 reaches exit before it has decided (for example, the event loop drained while an approval was
-pending), it prints a `deny` instead of nothing.
+pending, an uncaught exception, or a stray `process.exit`), or receives `SIGTERM`, `SIGINT` or
+`SIGHUP` while waiting, it prints one `deny` and exits 0 instead of exiting with nothing. A
+`SIGKILL`, a native crash or Claude Code's own timeout can't be answered from inside the process;
+`"onFailure": "block"` makes Claude Code block the call in those cases.
 
 ## What is gated (v0)
 
@@ -168,6 +178,9 @@ effects:
 - **`mcp__<server>__<tool>`** — any MCP tool call (`tool_input` is the raw params object).
 - **everything else** (`Read`, `Glob`, `Grep`, `WebFetch`, …) — **not gated**; allw makes no
   decision for it, without bothering the human (and without needing any `allw` config).
+- **Not gated yet, so the install block turns them off:** `Monitor` and `PowerShell` (both run shell
+  commands; `Monitor` follows your `Bash` permission rules) and `NotebookEdit` (edits notebook
+  files). Gating them is [#298](https://github.com/mike-north/allw/issues/298).
 
 Widening the matcher only ever adds gating: a tool allw doesn't gate gets no decision, never an
 `allow`.

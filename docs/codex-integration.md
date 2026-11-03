@@ -205,15 +205,18 @@ decision; "allw does not block" is empty stdout and exit 0, never a bare
 | relay/network/approval error             | `deny`                   | `allw[transport-error]: …`        |
 | malformed hook stdin                     | `deny`                   | `allw[input-parse-error]: …`      |
 | non-gated tool                           | _(empty stdout, exit 0)_ | —                                 |
-| process reached exit before deciding     | `deny`                   | `allw[premature-exit]: …`         |
+| process exited or was signalled first    | `deny`                   | `allw[premature-exit]: …`         |
 
 **Exit backstop.** Because empty stdout + exit 0 is how allw says "no objection", a process that
 exits _before_ deciding must not read as one. The hook installs a backstop shared with
 `@allw/hook` (`packages/hook/src/lib/decision-output.ts`): if the process reaches Node's
-`beforeExit` or `exit` without having written its decision (for example, the event loop drained
-while an approval was pending, the shape of [#254](https://github.com/mike-north/allw/issues/254)),
-it prints the `premature-exit` deny above and exits 0
-([#265](https://github.com/mike-north/allw/issues/265)). Both hooks write decisions through that one
+`beforeExit` or `exit` without having written its decision (the event loop drained while an
+approval was pending, the shape of [#254](https://github.com/mike-north/allw/issues/254); an uncaught
+exception; a stray `process.exit(n)`), or receives `SIGTERM`, `SIGINT` or `SIGHUP` while waiting, it
+prints the `premature-exit` deny above once and exits 0
+([#265](https://github.com/mike-north/allw/issues/265)). A `SIGKILL`, a native crash or a Codex
+timeout can't be answered from inside the process, and Codex has no setting to block the call in
+those cases (see [If the hook can't start](#if-the-hook-cant-start)). Both hooks write decisions through that one
 deny-only writer, so the Claude Code hook uses the same encoding (no decision, or `deny`).
 
 A `deny`'s `hookSpecificOutput` contains only `hookEventName`, `permissionDecision`, and

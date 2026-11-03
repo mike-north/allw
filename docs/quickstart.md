@@ -194,8 +194,10 @@ export ALLW_APPROVER_ROOT_KEY="<ACCOUNT_ROOT_PUBLIC_KEY_FROM_STEP_2>"
 ```
 
 Then register the hook in your project's (or user's) `.claude/settings.json` as a **PreToolUse**
-hook. The matcher `Bash|Edit|MultiEdit|Write|mcp__.*` gates shell commands, direct file edits and
-any MCP tool call. (Beyond a demo, install the hook outside the project and register it in
+hook. The matcher `^(Bash|Edit|MultiEdit|Write)$|^mcp__` sends exactly the `Bash`, `Edit`,
+`MultiEdit` and `Write` tools, plus every MCP tool (`mcp__…`), to allw. The `deny` rules turn off
+`Monitor`, `PowerShell` and `NotebookEdit`: they run shell commands or edit files, and allw doesn't
+gate them yet ([#298](https://github.com/mike-north/allw/issues/298)). (Beyond a demo, install the hook outside the project and register it in
 `~/.claude/settings.json`, so the agent can't edit the gate:
 [Install the hook where the agent can't write it](./claude-code-integration.md#install-the-hook-where-the-agent-cant-write-it).)
 
@@ -204,7 +206,7 @@ any MCP tool call. (Beyond a demo, install the hook outside the project and regi
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|Edit|MultiEdit|Write|mcp__.*",
+        "matcher": "^(Bash|Edit|MultiEdit|Write)$|^mcp__",
         "hooks": [
           {
             "type": "command",
@@ -215,6 +217,9 @@ any MCP tool call. (Beyond a demo, install the hook outside the project and regi
         ]
       }
     ]
+  },
+  "permissions": {
+    "deny": ["Monitor", "PowerShell", "NotebookEdit"]
   }
 }
 ```
@@ -246,9 +251,8 @@ code other than 0 or 2, or times out, Claude Code
 [blocks the tool call](https://code.claude.com/docs/en/hooks#block-the-action-when-a-hook-fails)
 instead. It needs **Claude Code v2.1.295 or later**. On older versions Claude Code ignores the key
 without warning, so a hook that can't start still lets the call through. Check `claude --version`.
-`@allw/hook`
-exits 0 on every decision it makes, deny included, so the setting only changes what happens when
-the hook never gets to decide.
+`@allw/hook` exits 0 on every decision it makes, deny included, so the setting only changes what
+happens when the hook never gets to decide.
 
 Codex has no equivalent setting: a Codex hook that can't start is reported and the tool call goes
 ahead. See [`docs/codex-integration.md`](./codex-integration.md#if-the-hook-cant-start).
