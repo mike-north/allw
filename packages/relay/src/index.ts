@@ -41,6 +41,7 @@ import {
   MAX_PUSH_TOKENS_PER_REGISTRATION,
   MAX_PUSH_TOKENS_PER_TRANSPORT,
   WEB_PUSH_COALESCE_MS,
+  diffPushTokenSet,
   WakeupCoalescer,
   dispatchPushWakeups,
   isPushTransportKind,
@@ -687,6 +688,17 @@ export class AccountRelay implements DurableObject {
       return this.handleDeviceRevoke(path1, request);
     }
 
+    // PUT /devices/{device_id}/push-tokens — the device replaces its own push-token set.
+    if (
+      method === "PUT" &&
+      path0 === "devices" &&
+      path1 !== "" &&
+      path2 === "push-tokens" &&
+      (subSegments[3] ?? "") === ""
+    ) {
+      return this.handleDevicePushTokens(path1, request);
+    }
+
     // GET /devices/{device_id}/inbox — authenticated device polls its pending envelopes.
     if (method === "GET" && path0 === "devices" && path1 !== "" && path2 === "inbox") {
       return this.handleDeviceInbox(path1, request);
@@ -735,6 +747,10 @@ export class AccountRelay implements DurableObject {
         path2 === "revoke" &&
         (subSegments[3] ?? "") === "") ||
       (path0 === "devices" && path1 !== "" && path2 === "inbox" && (subSegments[3] ?? "") === "") ||
+      (path0 === "devices" &&
+        path1 !== "" &&
+        path2 === "push-tokens" &&
+        (subSegments[3] ?? "") === "") ||
       (path0 === "devices" &&
         path1 !== "" &&
         path2 === "connect" &&
@@ -1241,6 +1257,87 @@ export class AccountRelay implements DurableObject {
       }
     }
     return json({ revoked: true });
+  }
+
+  /**
+   * PUT /devices/{device_id}/push-tokens
+   * Body: { push_tokens: Array<{ transport: "apns" | "fcm" | "webpush", token: string }> }
+   * Response: 200 { push_tokens: [...] } — the device's stored set after the replace.
+   *
+   * Replaces the calling device's push-token set, so a paired device can add, rotate, or clear
+   * (`[]`) its tokens, e.g. a browser that subscribes to Web Push only after pairing. Validation
+   * is `optionalPushTokens`, shared with `/pairing/complete`, so the two cannot drift. Self only,
+   * in the revoke handler's order:
+   * - 401: no bearer; 403: the bearer is no device's token (including a revoked device's own)
+   * - 404: `{device_id}` is not enrolled (or was revoked)
+   * - 403: the bearer belongs to another device
+   * - 400: invalid JSON, `push_tokens` missing, or invalid / over-budget per registration
+   * - 409: the account push-token budget would be exceeded (the device's own rows don't count)
+   *
+   * The replace is a diff applied in one transaction: unchanged tokens keep their row (and
+   * `created_at`), so repeating the same body is a no-op.
+   */
+  private async handleDevicePushTokens(deviceId: string, request: Request): Promise<Response> {
+    const authorizedDevice = await this.authorizedDeviceId(request);
+    if (authorizedDevice instanceof Response) return authorizedDevice;
+    const body = await parseJsonBody(request);
+    // Everything below is synchronous, so the device checks, budget, and writes are one atomic step.
+    const enrolled = [
+      ...this.sql.exec<DeviceRow>(`SELECT device_id FROM device WHERE device_id = ?`, deviceId),
+    ];
+    if (enrolled.length === 0) return json({ error: "device not found" }, 404);
+    if (authorizedDevice !== deviceId) return authError(403);
+
+    if (!body) return json({ error: "invalid JSON body" }, 400);
+    if (body.push_tokens === undefined) {
+      return json({ error: "'push_tokens' is required (array; [] clears)" }, 400);
+    }
+    const desired = optionalPushTokens(body);
+    if (desired === null) {
+      return json({ error: "'push_tokens' must contain supported transport/token pairs" }, 400);
+    }
+
+    const otherDevicesRow = [
+      ...this.sql.exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM device_push_token WHERE device_id != ?`,
+        deviceId,
+      ),
+    ][0];
+    if ((otherDevicesRow?.n ?? 0) + desired.length > MAX_PUSH_TOKENS_PER_ACCOUNT) {
+      return json({ error: "account push-token limit reached" }, 409);
+    }
+
+    const current = [
+      ...this.sql.exec<DevicePushTokenRow>(
+        `SELECT device_id, transport, token, created_at FROM device_push_token WHERE device_id = ?`,
+        deviceId,
+      ),
+    ];
+    const { remove, add } = diffPushTokenSet(current, desired);
+    const now = Date.now();
+    this.ctx.storage.transactionSync(() => {
+      for (const gone of remove) {
+        this.sql.exec(
+          `DELETE FROM device_push_token WHERE device_id = ? AND transport = ? AND token = ?`,
+          deviceId,
+          gone.transport,
+          gone.token,
+        );
+      }
+      for (const entry of add) {
+        this.sql.exec(
+          `INSERT INTO device_push_token (device_id, transport, token, created_at)
+           VALUES (?, ?, ?, ?)`,
+          deviceId,
+          entry.transport,
+          entry.token,
+          now,
+        );
+      }
+    });
+    return json({
+      push_tokens: desired.map(({ transport, token }) => ({ transport, token })),
+    });
   }
 
   // ---------------------------------------------------------------------------
