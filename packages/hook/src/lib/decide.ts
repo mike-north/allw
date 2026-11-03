@@ -36,11 +36,11 @@
  * @see ../../../sdk/src/index.ts (requestApproval is itself fail-closed: approved ⇒ verified)
  */
 
-import { CommandActionError, type commandRequest } from "@allw/sdk";
+import type { commandRequest } from "@allw/sdk";
 
 import type { HookWasm } from "./wasm.js";
 import { agentSafeErrorText, agentSafeText } from "./agent-text.js";
-import { gateToolCall, posixCommandCall } from "./gating.js";
+import { commandBuildFailureReason, gateToolCall, posixCommandCall } from "./gating.js";
 import {
   denyOutput,
   noDecisionOutput,
@@ -140,7 +140,7 @@ function hookActor(hostname: string): HookApprovalRequest["actor"] {
  * record is built, so it replaces `commandRequest`'s conservative `false` afterwards; the key order
  * is unchanged, so the request is the one the hook built by hand before #269.
  *
- * @throws {@link CommandActionError} (as a rejection) when the SDK refuses the command: invalid
+ * @throws `CommandActionError` (as a rejection) when the SDK refuses the command: invalid
  * shell syntax, or a blank command or program. (It also refuses a blank `cwd`, which the stdin
  * parser has already turned into an absent one.) The caller denies.
  */
@@ -160,29 +160,6 @@ async function commandApprovalRequest(
     ...(config.timeoutMs !== undefined ? { timeoutMs: config.timeoutMs } : {}),
   });
   return { ...req, reversible: reversibleForRisk(req.risk) };
-}
-
-/**
- * The deny reason for a command whose request could not be built: the SDK refused it (a
- * `CommandActionError`) or anything else failed while building it. Both hooks use this, so the same
- * command is denied with the same reason in each (#372).
- *
- * For invalid shell syntax the SDK wraps the core's own error, which names the problem; quoting that
- * keeps the reason the same as before #269. Otherwise the SDK's message is used, without its
- * `allw: ` prefix (the reason already carries one). Either way the text goes through the core escape
- * and cap before the agent reads it.
- */
-export function commandBuildFailureReason(wasm: HookWasm, err: unknown): string {
-  const quoted =
-    err instanceof CommandActionError
-      ? err.cause instanceof Error
-        ? err.cause
-        : err.message.replace(/^allw: /u, "")
-      : err;
-  return `allw: could not build an ActionRecord for the command (fail-closed deny): ${agentSafeErrorText(
-    wasm,
-    quoted,
-  )}`;
 }
 
 /**

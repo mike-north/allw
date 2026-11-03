@@ -6,7 +6,9 @@
  * All `ActionRecord` construction goes through the audited Rust core via WASM, and the approval
  * round-trip goes through `@allw/sdk` (whose `requestApproval` is itself fail-closed).
  *
- * This module re-exports the programmatic surface (used by the CLI entrypoint and the tests). The
+ * This module re-exports the programmatic surface. The CLI entrypoint and the tests use it, and so
+ * does `@allw/codex-hook`, which shares the gating, the command-request path, the agent-text escape,
+ * config loading, the WASM loader and the decision backstop rather than keeping copies. The
  * executable lives at `./cli.ts` (the `bin`).
  *
  * @see ./cli.ts (the `node` entrypoint / `bin`)
@@ -27,7 +29,6 @@ export {
   MAX_ERROR_TEXT_CHARS,
   agentSafeErrorText,
   agentSafeText,
-  commandBuildFailureReason,
   decide,
   type ApprovalVerdict,
   type CommandRequestFn,
@@ -50,6 +51,7 @@ export {
 } from "./lib/hook-io.js";
 
 export {
+  commandBuildFailureReason,
   gateToolCall,
   isGatedTool,
   parseMcpToolName,
