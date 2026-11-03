@@ -264,6 +264,7 @@ highest verified sequence.
 | 400    | body is not JSON; `account_states` missing, empty, over 16, or not all compact JWS; `max_sequence` not a non-negative safe integer or not equal to the highest verified; a verified `sequence` above 2^53-1 |
 | 403    | any document fails verification: another signer, wrong `account_id`/`kid`, a `current_root` other than the bound root, wrong `typ`, unsupported `v`, or junk                                                |
 | 409    | no root is bound yet; or the highest verified sequence is not strictly above the stored one (an idempotent republish of the current document is a 409 too)                                                  |
+| 500    | the relay's verification core failed to initialize (logged; no document is judged)                                                                                                                          |
 
 **`GET /{acct}/account-states`** (no auth — the documents are public and root-signed; integrators hold
 no device token) → **200** `{ account_states: [ "<compact JWS>" … ], max_sequence: number }`: only

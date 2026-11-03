@@ -1115,11 +1115,19 @@ export class AccountRelay implements DurableObject {
    *        `typ`, unsupported version, junk)
    * - 409: no root is bound yet (start a root-signed pairing first), or the highest verified
    *        sequence is not strictly above the stored one
+   * - 500: the relay's core wasm failed to initialize (logged; no document is judged)
    *
    * On success the stored documents are replaced by the submitted documents at the highest verified
    * sequence. See `docs/relay-api.md` §3 Account state.
    */
   private async handleAccountStatePublish(request: Request, accountId: string): Promise<Response> {
+    // A broken core must not surface as a 403 that blames the caller's documents.
+    try {
+      ensureCore();
+    } catch (err) {
+      return coreUnavailable(err);
+    }
+
     const body = await parseJsonBody(request);
     if (!body) return json({ error: "invalid JSON body" }, 400);
 

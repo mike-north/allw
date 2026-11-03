@@ -137,9 +137,15 @@ export function signAccountState(signer: TestAccount, options: AccountStateOptio
       revoked_at: 1_700_000_000_000,
     })),
   };
-  const json = JSON.stringify(claims).replace(
-    '"__SEQUENCE__"',
-    typeof options.sequence === "string" ? options.sequence : String(options.sequence),
-  );
+  const sequence =
+    typeof options.sequence === "string" ? options.sequence : String(options.sequence);
+  // Spliced into the JSON verbatim, so fail here — not inside the core's JSON parser — on anything
+  // that is not a plain non-negative decimal integer.
+  if (!/^(0|[1-9][0-9]*)$/.test(sequence)) {
+    throw new Error(
+      `signAccountState: sequence must be a non-negative decimal integer, got ${sequence}`,
+    );
+  }
+  const json = JSON.stringify(claims).replace('"__SEQUENCE__"', sequence);
   return glue.sign_account_state(json, signer.rootSeed);
 }
