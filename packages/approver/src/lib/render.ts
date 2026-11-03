@@ -122,8 +122,11 @@ interface CommandParts {
  *
  * Applied to the raw substrate it yields the comparison value for divergence detection; applied to
  * the escaped display substrate it yields the printed line.
+ *
+ * The web approver applies the same rule (`packages/web-approver/src/command-line.ts`); both are
+ * tested against one shared fixture (`packages/web-approver/test/fixtures/raw-argv-divergence.json`).
  */
-function reconstructCommand(parts: CommandParts): string | undefined {
+export function reconstructCommand(parts: CommandParts): string | undefined {
   const { argv, bin } = parts;
   if (argv !== undefined && argv.length > 0) {
     const tokens = bin !== undefined && argv[0] !== bin ? [bin, ...argv] : argv;
@@ -142,7 +145,7 @@ function reconstructCommand(parts: CommandParts): string | undefined {
  * Compared on the **raw** bytes (never on escaped text, where distinct inputs can render alike), so
  * the decision is exact. Returns false when there is no `raw` or no command form.
  */
-function rawDivergesFromArgv(action: ActionRecord): boolean {
+export function rawDivergesFromArgv(action: ActionRecord): boolean {
   const syntactic = action.syntactic;
   if (!isRecord(syntactic)) return false;
   const raw = readString(syntactic, "raw");

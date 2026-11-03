@@ -37,6 +37,8 @@ import {
   HIDDEN_CHARS_WARNING,
   RAW_ARGV_DIVERGENCE_WARNING,
   WRAP_MARKER,
+  rawDivergesFromArgv,
+  reconstructCommand,
   renderRequest,
 } from "../dist/lib/render.js";
 import { runWatch } from "../dist/commands/watch.js";
@@ -631,4 +633,47 @@ test("list items (paths, env refs, chain) are quoted so one item cannot pose as 
   assert.ok(rendered.includes("  Paths:      'a, /etc/passwd'"));
   assert.ok(rendered.includes("  Env refs:   HOME, 'A B'"));
   assert.ok(rendered.includes("  Chain:      'gate-a, gate-b'"));
+});
+
+test("raw/argv divergence matches the shared CLI/web fixture", () => {
+  // One fixture for both approvers, so they decide divergence and reconstruct the command alike.
+  const fixture = JSON.parse(
+    readFileSync(
+      join(here, "..", "..", "web-approver", "test", "fixtures", "raw-argv-divergence.json"),
+      "utf8",
+    ),
+  );
+  for (const c of fixture.cases) {
+    assert.equal(
+      rawDivergesFromArgv({ syntactic: c.syntactic }),
+      c.diverges,
+      `${c.name}: diverges`,
+    );
+    assert.equal(reconstructCommand(c.syntactic) ?? null, c.reconstructed, `${c.name}: line`);
+  }
+});
+
+test("the Action and Deciding on lines match the shared CLI/web headline fixture", async () => {
+  // One fixture for both approvers, so a record that mixes substrates heads the same way on each.
+  const fixture = JSON.parse(
+    readFileSync(
+      join(here, "..", "..", "web-approver", "test", "fixtures", "action-headline.json"),
+      "utf8",
+    ),
+  );
+  assert.equal(fixture.cases.length, 12);
+  for (const [i, c] of fixture.cases.entries()) {
+    const ctx = context({
+      action: {
+        record_schema_version: 1,
+        surface: c.surface,
+        syntactic: c.syntactic,
+        risk: "high",
+      },
+    });
+    const { rendered } = await render(ctx, `req-headline-${String(i)}`);
+    const lines = unwrap(rendered).split("\n");
+    assert.ok(lines.includes(`  Action:     ${c.headline}`), `${c.name}: Action line`);
+    assert.ok(lines.includes(`  Deciding on: ${c.heading}`), `${c.name}: Deciding on line`);
+  }
 });

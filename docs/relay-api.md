@@ -426,17 +426,54 @@ number delivered.
   POSTs to this URL, so the allowlist is its SSRF guard; it is re-checked before every send, and
   redirects are not followed.
 - **Payload-less wakeup.** The push request has an **empty body** — not even the request id — with
-  `TTL` set to the request's remaining lifetime rounded **up** to one of 60 s, 5 min, 1 h, 1 d, or
-  28 days (so the push service learns the deadline only coarsely), `Urgency: high`, and
+  `TTL` set to the remaining lifetime of the account's **longest-lived pending request** (not just
+  the one that triggered it), rounded **up** to one of 60 s, 5 min, 1 h, 1 d, or 28 days (so the
+  push service learns that deadline only coarsely), `Urgency: high`, and
   VAPID auth `Authorization: vapid t=<ES256 JWT>, k=<vapid_public_key>` (RFC 8292; the JWT's `aud`
   is the endpoint's origin, `exp` one hour out, `sub` the operator contact). The subscription's
   `p256dh`/`auth` keys are not needed and not sent to the relay. On a `push` event the service worker
   fetches pending envelopes itself via `GET /{acct}/devices/{device_id}/inbox`.
+  The TTL covers every pending request because one wakeup leads to an inbox fetch that returns all
+  of them. With `Topic` (below), a later wakeup also replaces a queued earlier one along with its
+  TTL (RFC 8030 §5.4), so a short-lived request must not cut short the wakeup a longer-lived one
+  still needs (#261).
+- **`Topic` (collapsing queued wakeups).** Where the push service documents support for it, each
+  wakeup carries the fixed RFC 8030 §5.4 header `Topic: allw-wakeup`, the same for every account
+  and subscription. A browser that is offline while several requests arrive then has one queued
+  wakeup instead of one per request, and loses nothing, since one inbox fetch returns every pending
+  request. `Topic` is sent per push-service host:
+
+  | Push service (host)                                    | `Topic` sent | Why                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+  | ------------------------------------------------------ | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+  | Mozilla autopush (`updates.push.services.mozilla.com`) | Yes          | Documented: a newer message with the same topic replaces an unread one; at most 32 characters of `[A-Za-z0-9_-]` ([autopush HTTP API](https://autopush.readthedocs.io/en/latest/http.html)).                                                                                                                                                                                                                                          |
+  | Apple (`web.push.apple.com`)                           | **No**       | Since about September 2026 Apple answers any request carrying `Topic` with `400 {"reason":"BadWebPushTopic"}`, whatever the value. Apple has published nothing on this; it is reported independently by many projects, e.g. [1](https://github.com/swimmesberger/Elarion/pull/166), [2](https://github.com/saiday/kukuroo/pull/9), [3](https://github.com/docchi-app/which/pull/69). Sending it would fail every Safari / iOS wakeup. |
+  | FCM (`fcm.googleapis.com`)                             | No           | We found no documentation of `Topic` support for Web Push. Not sent until verified.                                                                                                                                                                                                                                                                                                                                                   |
+  | WNS (`*.notify.windows.com`)                           | No           | Microsoft documents only its own `X-WNS-*` headers. Not sent until verified.                                                                                                                                                                                                                                                                                                                                                          |
+
+  A host is added only with evidence that it accepts and honours `Topic`, never by probing
+  production. On iOS / iPadOS, where every push must show a notification, repeated notifications
+  are collapsed on the device instead: the web approver's service worker shows them under one
+  fixed notification `tag` (#237).
+
 - **Coalescing.** At most one wakeup per subscription (device id + endpoint) is sent per
   **30 s** (`WEB_PUSH_COALESCE_MS`): a submit that finds a wakeup to that subscription in flight, or
-  sent within the window, skips it. The wakeup carries nothing request-specific, and the service
-  worker's inbox fetch returns every pending request, so nothing is lost. This bounds push volume per
-  subscription however fast unauthenticated submits arrive (#248).
+  sent within the window, skips it. This bounds push volume per subscription however fast
+  unauthenticated submits arrive (#248). The bound holds **per instance**: the last-claim times are
+  kept in memory, so a Durable Object that was evicted forgets earlier claims and can send one more
+  wakeup inside the window (#319).
+- **Trailing wakeup.** A skipped submit may have landed after the service worker already fetched
+  its inbox for the earlier wakeup, so the skip alone could leave that request with no push at all
+  (#313). The relay therefore records the subscription and sends it **one** more wakeup when its
+  window ends, however many submits were skipped. The trailing wakeup is held to the same
+  one-per-window bound (per instance; an evicted object forgets earlier claims, #319), so it still
+  respects an in-flight wakeup. Its own due time is stored, so it is never sent less than one window
+  after the claim it trails, even across eviction. It is dropped when no request
+  is pending by then or the subscription is gone. A submit that is woken normally after the window
+  covers everything stored before it, so it clears any trailing wakeup owed. Like every
+  wakeup, its `TTL` covers the longest-lived pending request.
+  Because the window starts at dispatch, every request gets a wakeup sent after it was stored,
+  within about 30 s. The owed wakeups are stored durably and sent from the account's alarm, so they
+  survive the Durable Object hibernating or being evicted.
 - **VAPID public key.** Clients subscribe with the key from `GET /.well-known/allw/vapid-public-key`
   (§3).
 - **Pruning.** When the push service answers **404 or 410** (the subscription is gone), the relay
