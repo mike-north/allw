@@ -360,6 +360,84 @@
       "risk": "high",
       "bin": "tee",
       "why": "an output process substitution runs rm -rf ~"
+    },
+    {
+      "command": "dd>/dev/null",
+      "risk": "critical",
+      "bin": "dd>/dev/null",
+      "why": "bash reads > as a metacharacter: the command word is dd"
+    },
+    {
+      "command": "dd</dev/null",
+      "risk": "critical",
+      "bin": "dd</dev/null",
+      "why": "an adjacent input redirection: the command word is dd"
+    },
+    {
+      "command": "dd&>/dev/null",
+      "risk": "critical",
+      "bin": "dd&>/dev/null",
+      "why": "an adjacent &> redirection: the command word is dd"
+    },
+    {
+      "command": "bash -c 'dd</dev/null'",
+      "risk": "critical",
+      "bin": "bash",
+      "why": "the -c string's command word is dd"
+    },
+    {
+      "command": "cat <<''\nit's\n\ndd # '\n",
+      "risk": "critical",
+      "bin": "cat",
+      "why": "an empty quoted delimiter ends the body at the first empty line; dd runs after it"
+    },
+    {
+      "command": "cat <<E\\\nOF\nit's\nEOF\ndd # '\n",
+      "risk": "critical",
+      "bin": "cat",
+      "why": "a backslash-newline in the delimiter is removed (delimiter EOF); dd runs after the body"
+    },
+    {
+      "command": "cat <<$'EOF'\nx\nEOF",
+      "risk": "high",
+      "bin": "cat",
+      "why": "a delimiter T1 can't read for sure fails upward"
+    },
+    {
+      "command": "$'dd\\0ignored' if=/dev/zero of=/dev/sda",
+      "risk": "critical",
+      "bin": "$dd\\0ignored",
+      "why": "bash ends the word at the decoded NUL: dd"
+    },
+    {
+      "command": "$'\\u0064\\u0064' if=/dev/zero of=/dev/sda",
+      "risk": "critical",
+      "bin": "$\\u0064\\u0064",
+      "why": "bash 4.2+ decodes \\u escapes: dd"
+    },
+    {
+      "command": "$'\\u006c\\u0073'",
+      "risk": "high",
+      "bin": "$\\u006c\\u0073",
+      "why": "an escape bash may decode differently is at least High, even for ls"
+    },
+    {
+      "command": "env bash <<'EOF'\necho hi;dd if=/dev/zero of=/dev/sda\nEOF",
+      "risk": "critical",
+      "bin": "env",
+      "why": "a heredoc fed to a shell behind a curated wrapper is a script"
+    },
+    {
+      "command": "bash <<< \"dd if=/dev/zero of=/dev/sda\"",
+      "risk": "critical",
+      "bin": "bash",
+      "why": "a here-string fed to a shell is a script"
+    },
+    {
+      "command": "cat <<< \"dd if=/dev/zero of=/dev/sda\"",
+      "risk": "medium",
+      "bin": "cat",
+      "why": "negative: a here-string fed to a non-shell is data"
     }
   ]
 }

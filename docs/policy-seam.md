@@ -201,12 +201,17 @@ a program it runs.
   - Segments are split at unquoted control operators (`&&`, `||`, `;`, `|`, `&`, `(`, `)`, newline, a lone
     `{` / `}`, zsh `&!` / `&|`). Each segment is classified.
   - Words before the command word are skipped: keywords (`if`, `do`, `!`, `time [-p]`, …), redirections
-    (`2>/dev/null`, `> f`) and the zsh precommands (`noglob`, `nocorrect`, `-`, `repeat N`).
+    (`2>/dev/null`, `> f`, and attached ones: `dd>/dev/null` runs `dd`) and the zsh precommands (`noglob`,
+    `nocorrect`, `-`, `repeat N`).
   - A command word T1 can't know (`$x`, `$(…)`, a backtick, a glob, a `{a,b}` list) is `high`. bash `$'…'` /
-    `$"…"` strings are decoded first.
+    `$"…"` strings are decoded first. A decoded NUL ends the word, as in bash. A decoding bash may do
+    differently (`\u`, `\c`, an unknown escape) makes it at least `high`.
   - Substitutions (`$(…)`, backticks, `<(…)`, `>(…)`) are classified.
   - Heredoc bodies are data: a quoted delimiter makes the body literal, and an unquoted one runs only its
-    substitutions. A heredoc fed to a shell is classified as a script.
+    substitutions. Delimiters are read as bash reads them (`<<''`, backslash-newline). One T1 can't read for
+    sure makes the line `high`.
+  - A heredoc or here-string fed to a shell is classified as a script. The shell may come directly or behind
+    a curated wrapper (`env bash <<'EOF'`).
   - Any operator, substitution or redirection makes the line at least `medium`. A line ending inside an open
     quote or substitution is `high`, because the shell runs what comes before the syntax error.
   - bash grammar is authoritative. The two ambiguous readings are both analyzed and the higher tier wins: `#`
@@ -215,7 +220,7 @@ a program it runs.
   - nesting of `-c`, `eval` and substitutions past 4 levels;
   - argv words past the 256th, which count as a `high` candidate;
   - one shared work budget per record (bytes scanned plus words classified), so classification time stays
-    linear and bounded inside the synchronous hook.
+    linear and bounded inside the synchronous hook. Running out of it never lowers a tier already found.
 
 **Known T1 limits.** For these the tier can still understate what runs (decision B: curated list plus documented
 limits, no name-sniffing of later words):
