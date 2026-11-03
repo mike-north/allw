@@ -1,7 +1,7 @@
 export type { AllwWasm, WasmModuleSource } from "./wasm.js";
 export { initWasm, initWasmSync, resetWasmForTests } from "./wasm.js";
 
-export type { PairingStore, PairingGateOptions } from "./pairing.js";
+export type { PairedIdentity, PairingStore, PairingGateOptions } from "./pairing.js";
 export { createLocalPairingStore, mountPairingGate } from "./pairing.js";
 
 export type { OnboardingWalkthroughOptions, OnboardingGateOptions } from "./onboarding.js";
@@ -63,12 +63,24 @@ export { createRetractListener } from "./retract-listener.js";
 
 export { mountAuditHistory } from "./audit-history.js";
 
-export type { RelayUrlSource, RelayConfigGateOptions } from "./relay-config.js";
+export type {
+  IgnoredRelayNoticeOptions,
+  RelayConfigGateOptions,
+  RelayUrlCheck,
+  RelayUrlResolution,
+  RelayUrlSource,
+} from "./relay-config.js";
 export {
+  INSECURE_RELAY_URL_REASON,
   RELAY_URL_QUERY_PARAM,
   RELAY_URL_STORAGE_KEY,
-  resolveRelayUrl,
+  checkRelayUrl,
+  describeIgnoredRelayOverride,
+  mountIgnoredRelayNotice,
   mountRelayConfigGate,
+  readStoredRelayUrl,
+  relayOrigin,
+  resolveRelayUrl,
 } from "./relay-config.js";
 
 export type ApprovalDecision = "approved" | "denied";

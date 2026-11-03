@@ -26,16 +26,18 @@ This produces `packages/web-approver/dist-site/`:
 
 ```
 dist-site/
-  index.html                    # copied from public/index.html
+  index.html                    # copied from public/index.html (no inline script — see §3.1)
+  theme.js                      # copied from public/theme.js (light/dark theme bootstrap)
   tokens.css                    # copied from public/tokens.css (vendored design/web-approver/inbox/tokens.css)
   styles.css                    # copied from public/styles.css
+  _headers                      # rendered from public/_headers: CSP + security headers (§3.1)
   app.js (+ app.js.map)         # esbuild bundle of src/app.ts
   vendor/allw-wasm/allw_wasm.js
   vendor/allw-wasm/allw_wasm_bg.wasm
 ```
 
 `dist-site/` is a **flat directory of static files with no server-side dependency and no
-Cloudflare-specific runtime API** — it is hostable on Cloudflare Pages, Netlify, GitHub Pages,
+Cloudflare-specific runtime API** (`_headers` is a host configuration file, not runtime code — §3.1) — it is hostable on Cloudflare Pages, Netlify, GitHub Pages,
 S3+CloudFront, or a plain `npx serve dist-site` for local testing. Cloudflare Pages is the natural
 choice alongside the Workers-based relay, but nothing in the bundle requires it.
 
@@ -64,12 +66,40 @@ the hosted `allw-relay` Worker — **without a rebuild**. `src/app.ts` resolves 
 priority order (`src/relay-config.ts`):
 
 1. a `?relay=` query-string parameter, e.g.
-   `https://approvals.example.com/?relay=https://relay.example.com` — validated (must be an
-   absolute `http(s)` URL) and persisted to `localStorage` under `allw:relay-url:v1` so a
-   subsequent visit (or a home-screen bookmark without the query string) keeps working;
+   `https://approvals.example.com/?relay=https://relay.example.com` — validated (see _HTTPS only_
+   below) and persisted to `localStorage` under `allw:relay-url:v1` so a subsequent visit (or a
+   home-screen bookmark without the query string) keeps working;
 2. a previously-persisted `localStorage` value;
 3. neither present → a minimal one-field config prompt is rendered before the pairing gate, so
    first-time visitors without a `?relay=` link can still type in a relay URL by hand.
+
+That order applies **only before pairing**. Once a browser is paired, its relay is pinned (below).
+
+**HTTPS only.** A relay URL is accepted only if it is `https:`, or `http:` on a loopback host
+(`localhost`, `127.0.0.1`, `[::1]`) for local development against `wrangler dev`. Anything else —
+including `http://relay.example.com` — is rejected at configuration time and the config prompt
+shows why, so bearer tokens and ciphertext never travel unencrypted. The SDK's `createClient`
+enforces the same rule (issue #249).
+
+### Relay pinning
+
+Pairing **pins** the relay: the relay URL is stored inside the paired identity (`allw:pairing:v1`,
+field `relayUrl`) and every relay call the browser makes afterwards — inbox polling, the `connect`
+WebSocket, account-state resolution — goes to that pinned relay.
+
+- **Before pairing**, the pairing screen shows the relay the browser is about to pin, so a relay
+  pre-filled by a `?relay=` link is visible before the human commits. Nothing is sent to it until
+  pairing completes.
+- **After pairing**, a `?relay=` link that differs from the pinned relay is **ignored**: it is not
+  persisted and nothing is sent to it, and a notice at the top of the page names the ignored origin.
+  This closes the phishing path where `…/?relay=https://evil.example` would re-point a paired device
+  and hand its `deviceAuthToken` to the attacker's relay.
+- **To change relays**, pair the browser again. "Use another device" on the returning-device screen
+  re-pairs against the currently pinned relay; to pin a different relay, clear the site's data for
+  the approver origin and open it with the new `?relay=` link.
+- **Browsers paired before pinning existed** are bound once, on their next visit, to the relay URL
+  they had already persisted (`allw:relay-url:v1`) — never to a `?relay=` link on that visit. If
+  none is persisted, the config prompt asks for it.
 
 **[OPERATOR]** To hand a user a working link, share the deployed bundle's URL with `?relay=`
 appended, e.g.:
@@ -95,7 +125,51 @@ The first run prompts for Cloudflare authentication (or reuses `wrangler login` 
 `https://allw-web-approver.pages.dev`.
 
 No environment variables, secrets, or build configuration are required on the Pages side — the
-bundle is fully static and reads its relay URL at runtime (§2 above).
+bundle is fully static and reads its relay URL at runtime (§2 above). Pages applies the
+`dist-site/_headers` file automatically (§3.1).
+
+### 3.1 Response headers and the Content-Security-Policy
+
+`public/_headers` is a
+[Cloudflare Pages headers file](https://developers.cloudflare.com/pages/configuration/headers/).
+`scripts/build-site.mjs` renders it into `dist-site/_headers`, which sets for every path:
+
+| Header                    | Value                                                                                                                                                                          |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `Content-Security-Policy` | `default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' <relay origins>; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'` |
+| `X-Content-Type-Options`  | `nosniff`                                                                                                                                                                      |
+| `Referrer-Policy`         | `no-referrer`                                                                                                                                                                  |
+| `X-Frame-Options`         | `DENY` (legacy companion to `frame-ancestors 'none'`)                                                                                                                          |
+
+Why each part matters: the page holds the device's signing seed in browser storage, so any script
+running on the approver origin could forge approvals. `script-src 'self'` with no `'unsafe-inline'`
+means only the shipped files run (the theme bootstrap is the external `theme.js`, not an inline
+script); `'wasm-unsafe-eval'` allows compiling the vendored allw WASM core and nothing else;
+`connect-src` limits fetches and WebSockets to the page itself and the listed relays, so even
+injected script cannot send the seed elsewhere; `frame-ancestors 'none'` stops the approver being
+framed to clickjack an Approve button.
+
+**[OPERATOR] The relay list is set at build time.** `connect-src` must name every relay the deployed
+site will talk to — a relay missing from it is blocked by the browser, even if it is pinned. The
+build reads the list from `ALLW_RELAY_ORIGINS` (origins separated by spaces or commas) and emits
+each origin in both its `https:` and `wss:` forms. Unset, it defaults to the hosted relay
+`https://allw-relay.mnorth.workers.dev`. Self-hosters set their own:
+
+```sh
+ALLW_RELAY_ORIGINS="https://relay.example.com" pnpm --filter @allw/web-approver build
+# local development against wrangler dev:
+ALLW_RELAY_ORIGINS="http://127.0.0.1:8787" pnpm --filter @allw/web-approver build
+```
+
+The build fails, rather than emitting a weaker policy, if an origin is not `https:` (or `http:` on
+loopback), carries a path/query/credentials, or makes a header line exceed Cloudflare's 2,000
+character limit.
+
+**[OPERATOR] Verify after every deploy:**
+
+```sh
+curl -sI https://allw-web-approver.pages.dev/ | grep -iE 'content-security-policy|x-content-type-options|referrer-policy'
+```
 
 > **Live deployment.** The hosted web approver is live at
 > [https://allw-web-approver.pages.dev](https://allw-web-approver.pages.dev). Point it at the hosted
@@ -105,7 +179,9 @@ bundle is fully static and reads its relay URL at runtime (§2 above).
 
 ### Alternative: any static host
 
-Since `dist-site/` has no Cloudflare-specific runtime dependency, any static host works instead:
+Since `dist-site/` has no Cloudflare-specific runtime dependency, any static host works instead.
+Netlify reads the same `_headers` format; on any other host, configure the §3.1 headers in the
+host or CDN yourself — without them the site still works but loses its CSP protections:
 
 ```sh
 # Netlify
@@ -147,7 +223,8 @@ The pairing form (`src/pairing.ts`) collects all 7 fields `ApproverIdentity` req
 `deviceId`, `deviceEncryptionSeed`, `deviceSigningSeed`, `deviceCert`, `accountRootPubkey`, and
 `deviceAuthToken` (the relay bearer token from `docs/relay-api.md` §Pairing — distinct from
 `deviceCert`, which chains verdict signatures to the account root rather than authorizing relay
-HTTP calls). A friendlier pairing UX (QR code / deep link that pre-fills these fields instead of
+HTTP calls). The stored identity also records the pinned `relayUrl` (§2, _Relay pinning_); that
+comes from the relay configuration shown on the pairing screen, not from a form field. A friendlier pairing UX (QR code / deep link that pre-fills these fields instead of
 manual entry) is tracked separately and out of scope for this bundling/deploy issue.
 
 ---
@@ -161,5 +238,10 @@ manual entry) is tracked separately and out of scope for this bundling/deploy is
 | `.wasm` served with correct content-type and instantiates over real HTTP      | Verified (`test/site-build.test.mjs`)                                |
 | Relay URL resolved at runtime (query param / storage / config prompt)         | Verified (`test/relay-config.test.mjs`)                              |
 | No literal relay URL embedded in the bundled `app.js`                         | Verified (`test/site-build.test.mjs`)                                |
+| `_headers` ships with the CSP directives; `index.html` has no inline script   | Verified (`test/site-build.test.mjs`)                                |
+| Relay pinned at pairing; a differing `?relay=` is ignored with a notice       | Verified (`test/app-boot.test.mjs`)                                  |
+| HTTPS-only relay URLs (http only on loopback)                                 | Verified (`test/relay-config.test.mjs`, SDK `relay-url-transport`)   |
+| CSP does not break WASM load or relay fetch/WebSocket in a real browser       | Verified locally in Chrome against `wrangler dev` (issue #249 PR)    |
+| CSP header present on the live Pages deployment (`curl -sI`)                  | **Not run** — post-deploy operator step (§3.1)                       |
 | Actual deploy to Cloudflare Pages (or any host)                               | **Not run** — human operator step (§3)                               |
 | Mobile-browser smoke test against a live deployed relay                       | **Not run** — human operator step (§4); requires a real device/relay |

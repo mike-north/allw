@@ -599,3 +599,95 @@ describe("createLocalPairingStore", () => {
     assert.equal(store.load(), null, "identity with empty string field must return null");
   });
 });
+
+// ── Relay pinning in the stored identity (#249) ──────────────────────────
+
+describe("createLocalPairingStore — pinned relay (#249)", () => {
+  test("round-trips an identity pinned to an https relay", () => {
+    const storage = memoryStorage();
+    const store = createLocalPairingStore(storage);
+    store.save({ ...VALID_IDENTITY, relayUrl: "https://relay.example.com" });
+    assert.equal(store.load().relayUrl, "https://relay.example.com");
+  });
+
+  test("a stored pin to a plaintext http:// remote relay is treated as corrupt (fail-closed)", () => {
+    const storage = memoryStorage();
+    storage.setItem(
+      "allw:pairing:v1",
+      JSON.stringify({ ...VALID_IDENTITY, relayUrl: "http://relay.example.com" }),
+    );
+    assert.equal(createLocalPairingStore(storage).load(), null);
+  });
+
+  test("a stored pin that is not canonical (trailing slash) is treated as corrupt", () => {
+    const storage = memoryStorage();
+    storage.setItem(
+      "allw:pairing:v1",
+      JSON.stringify({ ...VALID_IDENTITY, relayUrl: "https://relay.example.com/" }),
+    );
+    assert.equal(createLocalPairingStore(storage).load(), null);
+  });
+
+  test("a stored pin that is not a string is treated as corrupt", () => {
+    const storage = memoryStorage();
+    storage.setItem("allw:pairing:v1", JSON.stringify({ ...VALID_IDENTITY, relayUrl: 42 }));
+    assert.equal(createLocalPairingStore(storage).load(), null);
+  });
+});
+
+describe("mountPairingGate — relay shown and pinned at pairing (#249)", () => {
+  test("shows the relay before submit and pins it into the stored identity", () => {
+    const { root, restore } = installDom();
+    try {
+      const storage = memoryStorage();
+      const store = createLocalPairingStore(storage);
+      const pairings = [];
+      mountPairingGate({
+        root,
+        pairingStore: store,
+        relayUrl: "https://relay.example.com",
+        onPaired: (identity) => pairings.push(identity),
+      });
+
+      assert.equal(
+        root.querySelector(".pairing-relay-url").textContent,
+        "https://relay.example.com",
+        "the relay must be shown before the human commits",
+      );
+      assert.equal(pairings.length, 0);
+
+      submitPairingForm(root, VALID_IDENTITY);
+
+      assert.equal(pairings.length, 1);
+      assert.equal(pairings[0].relayUrl, "https://relay.example.com");
+      assert.equal(store.load().relayUrl, "https://relay.example.com");
+    } finally {
+      restore();
+    }
+  });
+
+  test("a returning device keeps its pinned relay even if the gate is given another", () => {
+    const { root, restore } = installDom();
+    try {
+      const storage = memoryStorage();
+      storage.setItem(
+        "allw:pairing:v1",
+        JSON.stringify({ ...VALID_IDENTITY, relayUrl: "https://relay.example.com" }),
+      );
+      const pairings = [];
+      mountPairingGate({
+        root,
+        pairingStore: createLocalPairingStore(storage),
+        relayUrl: "https://evil.example",
+        onPaired: (identity) => pairings.push(identity),
+      });
+      const unlock = [...root.querySelectorAll("button")].find(
+        (b) => b.textContent === "Unlock inbox",
+      );
+      unlock.click();
+      assert.equal(pairings[0].relayUrl, "https://relay.example.com");
+    } finally {
+      restore();
+    }
+  });
+});
