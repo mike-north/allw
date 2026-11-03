@@ -22,6 +22,8 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { MAX_ESCAPED_DIAGNOSTIC_CHARS, escapeToPrintableAscii } from "./printable-ascii.js";
+
 /**
  * The subset of the `allw-wasm` FFI the SDK calls. Every function takes and returns JSON strings
  * (or base64url strings) and **throws** on any error (malformed input, failed verification) —
@@ -227,17 +229,10 @@ const VENDOR_FILES = ["allw_wasm.js", "allw_wasm_bg.wasm"] as const;
 export const MAX_WASM_LOAD_CAUSE_CHARS = 200;
 
 /**
- * A load failure's cause as one bounded line of printable ASCII. The display-escaping core is the
- * thing that failed to load, so it can't be used here. Instead:
- *
- * - every UTF-16 unit outside printable ASCII (newlines, ESC, bidi controls, any non-ASCII text)
- *   becomes a `\uXXXX` escape, and so does a backslash (`\u005c`), so a literal `\u001b` in the
- *   cause reads differently from an escaped ESC;
- * - the result is clipped to at most {@link MAX_WASM_LOAD_CAUSE_CHARS} characters, on an escape
- *   boundary (never inside a `\uXXXX`), with `...` appended when cut.
- *
- * So a cause can't move the cursor or spoof lines in a terminal or a hook's deny reason, and the
- * whole result is printable ASCII.
+ * A load failure's cause as one bounded line of printable ASCII ({@link escapeToPrintableAscii},
+ * clipped to {@link MAX_WASM_LOAD_CAUSE_CHARS}). The display-escaping core is the thing that failed
+ * to load, so it can't be used here. A cause can't move the cursor or spoof lines in a terminal or
+ * a hook's deny reason.
  */
 function describeLoadCause(cause: unknown): string {
   let text: string;
@@ -249,17 +244,7 @@ function describeLoadCause(cause: unknown): string {
   } catch {
     text = "a cause that could not be described";
   }
-  let out = "";
-  for (let i = 0; i < text.length; i += 1) {
-    const unit = text.charCodeAt(i);
-    const token =
-      unit >= 0x20 && unit <= 0x7e && unit !== 0x5c
-        ? text.charAt(i)
-        : `\\u${unit.toString(16).padStart(4, "0")}`;
-    if (out.length + token.length > MAX_WASM_LOAD_CAUSE_CHARS) return `${out}...`;
-    out += token;
-  }
-  return out;
+  return escapeToPrintableAscii(text, MAX_WASM_LOAD_CAUSE_CHARS);
 }
 
 /**
@@ -278,16 +263,19 @@ export function wasmLoadError(
   fileExists: (path: string) => boolean = existsSync,
 ): Error {
   const missing = VENDOR_FILES.filter((file) => !fileExists(join(dir, file)));
+  // The vendor dir comes from the install location, which can hold any characters; it is quoted
+  // escaped and bounded like the cause (#358).
+  const shownDir = escapeToPrintableAscii(dir, MAX_ESCAPED_DIAGNOSTIC_CHARS);
   if (missing.length > 0) {
     return new Error(
-      `allw: failed to load the vendored WASM core from ${dir}: ${missing.join(" and ")} ` +
+      `allw: failed to load the vendored WASM core from ${shownDir}: ${missing.join(" and ")} ` +
         `${missing.length === 1 ? "is" : "are"} missing. Run \`pnpm run build:wasm\` from the ` +
         `repo root first (or reinstall @allw/sdk if it came from npm).`,
       { cause },
     );
   }
   return new Error(
-    `allw: failed to load the vendored WASM core from ${dir} (${describeLoadCause(cause)}). ` +
+    `allw: failed to load the vendored WASM core from ${shownDir} (${describeLoadCause(cause)}). ` +
       `The vendored files are present, so rebuilding may not help; reinstall @allw/sdk or ` +
       `rebuild the core (\`pnpm run build:wasm\`) if the files are damaged.`,
     { cause },

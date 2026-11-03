@@ -33,7 +33,12 @@ import { realpathSync } from "node:fs";
 import { hostname as osHostname } from "node:os";
 import { pathToFileURL } from "node:url";
 
-import { createClient, type ClientConfig } from "@allw/sdk";
+import {
+  MAX_ESCAPED_DIAGNOSTIC_CHARS,
+  createClient,
+  escapeToPrintableAscii,
+  type ClientConfig,
+} from "@allw/sdk";
 
 import { readConfig } from "./lib/config.js";
 import { decide, type RequestApprovalFn } from "./lib/decide.js";
@@ -169,11 +174,14 @@ async function main(): Promise<void> {
     const raw = await readStdin();
     output = await runHook(raw, process.env);
   } catch (err) {
-    // Defense in depth: an unexpected internal failure must still produce a parseable deny.
+    // Defense in depth: an unexpected internal failure must still produce a parseable deny. Its
+    // message is unknown text, possibly from before the WASM core loaded, so it is quoted escaped
+    // and bounded (#358).
     output = denyOutput(
-      `allw: hook failed unexpectedly (fail-closed deny): ${
-        err instanceof Error ? err.message : String(err)
-      }`,
+      `allw: hook failed unexpectedly (fail-closed deny): ${escapeToPrintableAscii(
+        err instanceof Error ? err.message : String(err),
+        MAX_ESCAPED_DIAGNOSTIC_CHARS,
+      )}`,
     );
   }
   decision.finalize(output);

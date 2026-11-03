@@ -20,6 +20,8 @@
  * @see https://learn.chatgpt.com/docs/hooks
  */
 
+import { MAX_ESCAPED_DIAGNOSTIC_CHARS, escapeToPrintableAscii } from "@allw/sdk";
+
 /** The Codex hook event this package implements. */
 export const HOOK_EVENT_NAME = "PreToolUse" as const;
 
@@ -158,8 +160,10 @@ export function parseCodexHookInput(raw: string): ParseResult {
   if (eventName !== HOOK_EVENT_NAME) {
     return {
       ok: false,
-      reason: `allw: unexpected Codex hook_event_name '${String(
-        eventName,
+      // Stdin is untrusted and this runs before the WASM core loads: quote it escaped and bounded.
+      reason: `allw: unexpected Codex hook_event_name '${escapeToPrintableAscii(
+        String(eventName),
+        MAX_ESCAPED_DIAGNOSTIC_CHARS,
       )}' (expected '${HOOK_EVENT_NAME}'; fail-closed deny)`,
       denyReason: "input-parse-error",
     };

@@ -15,7 +15,12 @@ import { hostname as osHostname } from "node:os";
 import { appendFileSync, realpathSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { createClient, type ClientConfig } from "@allw/sdk";
+import {
+  MAX_ESCAPED_DIAGNOSTIC_CHARS,
+  createClient,
+  escapeToPrintableAscii,
+  type ClientConfig,
+} from "@allw/sdk";
 import { installDecisionBackstop, isGatedTool, loadWasm, readConfig } from "@allw/hook";
 
 import { decide, type RequestApprovalFn } from "./lib/decide.js";
@@ -146,10 +151,13 @@ async function main(): Promise<void> {
   try {
     output = await runCodexHook(await readStdin(), process.env);
   } catch (err) {
+    // An unexpected failure's message is unknown text, possibly from before the WASM core loaded,
+    // so it is quoted escaped and bounded (#358).
     output = denyOutput(
-      `allw: Codex hook failed unexpectedly (fail-closed deny): ${
-        err instanceof Error ? err.message : String(err)
-      }`,
+      `allw: Codex hook failed unexpectedly (fail-closed deny): ${escapeToPrintableAscii(
+        err instanceof Error ? err.message : String(err),
+        MAX_ESCAPED_DIAGNOSTIC_CHARS,
+      )}`,
       "transport-error",
     );
   }

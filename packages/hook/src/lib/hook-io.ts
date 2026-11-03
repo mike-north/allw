@@ -45,6 +45,8 @@
  * @see https://code.claude.com/docs/en/hooks (PreToolUse JSON schema, decision values, exit codes)
  */
 
+import { MAX_ESCAPED_DIAGNOSTIC_CHARS, escapeToPrintableAscii } from "@allw/sdk";
+
 /** The hook event we implement. Claude Code stamps this on both the input and our output. */
 export const HOOK_EVENT_NAME = "PreToolUse" as const;
 
@@ -136,8 +138,10 @@ export function parseHookInput(raw: string): ParseResult {
   if (eventName !== HOOK_EVENT_NAME) {
     return {
       ok: false,
-      reason: `allw: unexpected hook_event_name '${String(
-        eventName,
+      // Stdin is untrusted and this runs before the WASM core loads: quote it escaped and bounded.
+      reason: `allw: unexpected hook_event_name '${escapeToPrintableAscii(
+        String(eventName),
+        MAX_ESCAPED_DIAGNOSTIC_CHARS,
       )}' (expected '${HOOK_EVENT_NAME}'; fail-closed deny)`,
     };
   }
