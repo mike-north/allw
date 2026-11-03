@@ -1,0 +1,17 @@
+# Response headers for the hosted web approver (Cloudflare Pages `_headers` format, issue #249).
+# https://developers.cloudflare.com/pages/configuration/headers/
+#
+# `scripts/build-site.mjs` copies this file into `dist-site/` and replaces the relay placeholder
+# in `connect-src` with the build's relay origins (default: the hosted relay, in both its https:
+# and wss: forms; override with ALLW_RELAY_ORIGINS — see docs/web-approver-deploy.md).
+#
+# - script-src 'self' 'wasm-unsafe-eval': only same-origin scripts (no inline script — the theme
+#   bootstrap is `theme.js`), plus WebAssembly compilation for the vendored allw core.
+# - connect-src: the page may only fetch / open WebSockets to itself and the configured relays,
+#   so even injected script cannot ship the signing seed to an attacker's origin.
+# - frame-ancestors 'none': the approver cannot be framed (clickjacking an approve button).
+/*
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' __ALLW_RELAY_CONNECT_SRC__; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
+  X-Frame-Options: DENY

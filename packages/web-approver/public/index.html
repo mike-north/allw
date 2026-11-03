@@ -5,37 +5,17 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>allw approvals</title>
     <!--
-      Theme selection (issue #162): `.theme-light` above is the no-JS/pre-paint default so the
-      page never renders unstyled. This inline script (no external dependency, so it runs before
-      the stylesheets below are even requested) upgrades to `.theme-dark` when the OS/browser
-      reports a dark preference, and keeps following live changes to that preference. It is pure
-      presentation wiring — it does not touch `#app` or any approver runtime state.
+      Theme selection (issue #162) lives in `theme.js`, an external file rather than an inline
+      script, so the Content-Security-Policy in `_headers` can forbid inline script outright
+      (issue #249). It is a classic blocking script so it runs before the stylesheets load.
     -->
-    <script>
-      (function () {
-        var media =
-          typeof window.matchMedia === "function"
-            ? window.matchMedia("(prefers-color-scheme: dark)")
-            : null;
-        function applyTheme(prefersDark) {
-          var root = document.documentElement;
-          root.classList.toggle("theme-dark", prefersDark);
-          root.classList.toggle("theme-light", !prefersDark);
-        }
-        if (media) {
-          applyTheme(media.matches);
-          if (typeof media.addEventListener === "function") {
-            media.addEventListener("change", function (event) {
-              applyTheme(event.matches);
-            });
-          }
-        }
-      })();
-    </script>
+    <script src="./theme.js"></script>
     <link rel="stylesheet" href="./tokens.css" />
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
+    <!-- Notices that must outlive screen changes in #app, e.g. an ignored ?relay= link (#249). -->
+    <div id="notices"></div>
     <div id="app"></div>
     <!--
       `scripts/build-site.mjs` copies this file into `dist-site/`, bundles `src/app.ts` (the

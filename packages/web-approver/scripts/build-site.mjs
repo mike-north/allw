@@ -4,12 +4,22 @@
  * Bundles `src/app.ts` (the production bootstrap — `../src/app.ts`) into `dist-site/app.js` with
  * esbuild, copies the vendored `allw-wasm` browser artifact next to it (so `app.ts`'s
  * `import.meta.url`-relative asset URLs resolve on any static host, at any subpath), and copies
- * the static `public/` shell (`index.html`, `tokens.css`, `styles.css`) alongside. `tokens.css` is
+ * the static `public/` shell (`index.html`, `theme.js`, `tokens.css`, `styles.css`, `_headers`) alongside. `tokens.css` is
  * the vendored `design/web-approver/inbox/tokens.css` (issue #162) that `styles.css`'s `var(--…)`
  * declarations and `index.html`'s `theme-light`/`theme-dark` class resolve against — it must ship
  * next to `styles.css` or those custom properties are undefined on the deployed site. The result
  * is a flat directory of plain static files — no server-side runtime, no Cloudflare-specific API —
  * hostable on Cloudflare Pages or any static host (`docs/web-approver-deploy.md`).
+ *
+ * # Response headers (`_headers`, issue #249)
+ * `public/_headers` is a Cloudflare Pages headers file carrying the site's Content-Security-Policy
+ * and related headers. Its `connect-src` names the relays the page may talk to, which is a
+ * deployment choice, so the template holds a placeholder that {@link buildSite} fills from the
+ * build's relay origins: `relayOrigins` when passed, else the `ALLW_RELAY_ORIGINS` environment
+ * variable (whitespace- or comma-separated), else {@link DEFAULT_RELAY_ORIGINS}. Each origin is
+ * emitted in its `https:` and `wss:` forms (or `http:`/`ws:` for a loopback dev relay). A relay
+ * origin that fails the web approver's transport rule fails the build rather than widening the
+ * policy, and so does a header line past Cloudflare's 2,000-character limit.
  *
  * # Why esbuild (not Vite)
  * The repo's existing tooling taste is plain `tsc` plus small `scripts/*.mjs` (e.g.
@@ -34,7 +44,7 @@
  */
 
 import { build } from "esbuild";
-import { cpSync, existsSync, mkdirSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -42,12 +52,111 @@ const packageDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const vendorDir = join(packageDir, "..", "sdk", "vendor", "allw-wasm");
 const defaultOutDir = join(packageDir, "dist-site");
 
+/** The relay the hosted web approver talks to unless the build is told otherwise. */
+export const DEFAULT_RELAY_ORIGINS = ["https://allw-relay.mnorth.workers.dev"];
+
+/** The token in `public/_headers` replaced with the relay `connect-src` sources. */
+const RELAY_CONNECT_SRC_PLACEHOLDER = "__ALLW_RELAY_CONNECT_SRC__";
+
+/** Hosts on which a plaintext `http:` relay is tolerated (mirrors `src/relay-config.ts`). */
+const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+/**
+ * Turn the configured relay origins into `connect-src` sources: each origin plus its WebSocket
+ * form. Throws on anything that is not an `https:` origin (or `http:` on loopback), or that carries
+ * a path, query, or credentials — `connect-src` takes origins, and a typo must not silently widen
+ * or break the policy.
+ */
+export function relayConnectSources(relayOrigins) {
+  if (relayOrigins.length === 0) {
+    throw new Error("[web-approver] at least one relay origin is required for connect-src");
+  }
+  const sources = [];
+  for (const candidate of relayOrigins) {
+    let url;
+    try {
+      url = new URL(candidate);
+    } catch {
+      throw new Error(`[web-approver] relay origin '${candidate}' is not an absolute URL`);
+    }
+    const secure =
+      url.protocol === "https:" ||
+      (url.protocol === "http:" && LOOPBACK_HOSTNAMES.has(url.hostname));
+    if (!secure) {
+      throw new Error(
+        `[web-approver] relay origin '${candidate}' must use https:// ` +
+          "(http:// is allowed only for localhost, 127.0.0.1, or [::1])",
+      );
+    }
+    if (
+      (url.pathname !== "/" && url.pathname !== "") ||
+      url.search !== "" ||
+      url.hash !== "" ||
+      url.username !== "" ||
+      url.password !== ""
+    ) {
+      throw new Error(
+        `[web-approver] relay origin '${candidate}' must be a bare origin like https://relay.example.com`,
+      );
+    }
+    const wsOrigin = url.origin.replace(/^http/, "ws");
+    sources.push(url.origin, wsOrigin);
+  }
+  return [...new Set(sources)];
+}
+
+/** The relay origins from `ALLW_RELAY_ORIGINS`, or `null` when it is unset/blank. */
+function relayOriginsFromEnv() {
+  const raw = process.env.ALLW_RELAY_ORIGINS;
+  if (raw === undefined) return null;
+  const origins = raw.split(/[\s,]+/).filter((origin) => origin.length > 0);
+  return origins.length > 0 ? origins : null;
+}
+
+/** Cloudflare Pages ignores `_headers` lines longer than this (its documented per-line limit). */
+const MAX_HEADERS_LINE_LENGTH = 2000;
+
+/**
+ * Render `public/_headers` with the relay `connect-src` sources substituted. Throws if a line
+ * would exceed Cloudflare's per-line limit — a long relay list must fail the build, not ship a
+ * policy the host silently drops.
+ */
+export function renderHeaders(template, relayOrigins) {
+  if (!template.includes(RELAY_CONNECT_SRC_PLACEHOLDER)) {
+    throw new Error(`[web-approver] public/_headers is missing ${RELAY_CONNECT_SRC_PLACEHOLDER}`);
+  }
+  const rendered = template.replaceAll(
+    RELAY_CONNECT_SRC_PLACEHOLDER,
+    relayConnectSources(relayOrigins).join(" "),
+  );
+  for (const line of rendered.split("\n")) {
+    if (line.length > MAX_HEADERS_LINE_LENGTH) {
+      throw new Error(
+        `[web-approver] a _headers line is ${String(line.length)} characters; Cloudflare Pages ` +
+          `allows ${String(MAX_HEADERS_LINE_LENGTH)} — shorten the relay list`,
+      );
+    }
+  }
+  return rendered;
+}
+
 /**
  * Build the static site into `outDir` (defaults to `dist-site/` next to this package). Returns
  * `{ built: false, outDir }` (a no-op) when the vendored WASM has not been built yet, or
- * `{ built: true, outDir }` once the bundle + copied assets are written.
+ * `{ built: true, outDir }` once the bundle + copied assets are written. `relayOrigins` sets the
+ * CSP `connect-src` relays (see the module doc); it defaults to `ALLW_RELAY_ORIGINS`, then
+ * {@link DEFAULT_RELAY_ORIGINS}.
  */
-export async function buildSite({ outDir = defaultOutDir } = {}) {
+export async function buildSite({
+  outDir = defaultOutDir,
+  relayOrigins = relayOriginsFromEnv() ?? DEFAULT_RELAY_ORIGINS,
+} = {}) {
+  // Validate the relay list before touching the output directory, so a bad value fails fast.
+  const headers = renderHeaders(
+    readFileSync(join(packageDir, "public", "_headers"), "utf8"),
+    relayOrigins,
+  );
+
   const wasmBinary = join(vendorDir, "allw_wasm_bg.wasm");
   const wasmGlue = join(vendorDir, "allw_wasm.js");
 
@@ -82,6 +191,8 @@ export async function buildSite({ outDir = defaultOutDir } = {}) {
   cpSync(join(packageDir, "public", "index.html"), join(outDir, "index.html"));
   cpSync(join(packageDir, "public", "tokens.css"), join(outDir, "tokens.css"));
   cpSync(join(packageDir, "public", "styles.css"), join(outDir, "styles.css"));
+  cpSync(join(packageDir, "public", "theme.js"), join(outDir, "theme.js"));
+  writeFileSync(join(outDir, "_headers"), headers);
 
   console.log(`[web-approver] site bundle written to ${outDir}`);
   return { built: true, outDir };
