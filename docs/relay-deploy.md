@@ -125,6 +125,14 @@ node_modules/.bin/wrangler secret put APNS_BEARER_TOKEN --env production
 # secret periodically until automatic token refresh is implemented.
 ```
 
+**Match `APNS_ENDPOINT` to the app build.** A development build registers sandbox tokens, and a
+TestFlight or App Store build registers production tokens. APNs answers a token sent to the other
+environment with `400 BadDeviceToken`. The relay deliberately does **not** prune on that answer,
+since a wrong `APNS_ENDPOINT` would otherwise unregister every device. It keeps the tokens and logs
+`push: apns push service <host> rejected a wakeup with HTTP 400; token kept` in `wrangler tail`. If
+every APNs wakeup logs that line, check the endpoint. Only `410` (the token is no longer active)
+prunes an APNs token (`docs/relay-api.md` §5).
+
 ### 3c. Optional: Firebase Cloud Messaging (FCM) — Android push wakeups
 
 Required only if you want push wakeups to Android devices.
@@ -193,12 +201,13 @@ stop arriving while other browsers still get them, check that no `Topic` is bein
 push: webpush push service web.push.apple.com rejected a wakeup with HTTP 400 (reason BadWebPushTopic); token kept
 ```
 
-The relay logs one such warning for every push-service answer that is a 4xx other than 404/410, on
-any transport: the transport, the push-service host, the status and, for Web Push, the `reason` from
-a JSON body when it is an identifier of at most 32 characters that does not occur in the
-subscription endpoint. It never logs the token, the endpoint path, credentials or request ids. 5xx
-answers and timeouts are not logged. A 400 is treated as transient, so the tokens stay registered
-and recover once the header is gone.
+The relay logs one such warning for every 4xx a push service answers that does not prune the token,
+on any transport (for Web Push, a 4xx other than 404/410; APNs and FCM in `docs/relay-api.md` §5):
+the transport, the push-service host, the status and, for Web Push, the `reason` from a JSON body
+when it is an identifier of at most 32 characters that does not occur in the subscription endpoint.
+It never logs the token, the endpoint path, credentials or request ids. 5xx answers and timeouts are
+not logged. A 400 is treated as transient, so the tokens stay registered and recover once the header
+is gone.
 
 The warning is per answer, not deduplicated. While a push service throttles the relay (429) or
 refuses its payload size (413), expect one line for each push it refuses; on APNs and FCM, which are

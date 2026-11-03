@@ -22,6 +22,8 @@ import { describe, expect, it, vi } from "vitest";
 import type { SqlStorage } from "@cloudflare/workers-types";
 import { AccountRelay, type Env } from "../src/index.js";
 import {
+  ApnsPushTransport,
+  FcmPushTransport,
   WEB_PUSH_COALESCE_MS,
   WEB_PUSH_TRAILING_RETRY_MS,
   WakeupCoalescer,
@@ -309,6 +311,108 @@ describe("pairing — push-token budgets (reject, never truncate)", () => {
 
     expect(paired.status).toBe(201);
     expect(await readPushTokens(acct)).toEqual([{ token: FCM_ENDPOINT }]);
+  });
+});
+
+/**
+ * @see https://developer.apple.com/documentation/usernotifications/handling-notification-responses-from-apns
+ * @see https://firebase.google.com/docs/reference/fcm/rest/v1/ErrorCode
+ */
+describe("submit — APNs and FCM tokens are pruned only on an unregistered answer (#260)", () => {
+  const APNS_TOKEN = "c".repeat(64);
+  const FCM_TOKEN = "fcm-registration-token";
+  const FCM_UNREGISTERED = JSON.stringify({
+    error: { code: 404, status: "NOT_FOUND", details: [{ errorCode: "UNREGISTERED" }] },
+  });
+
+  /** Pair one device with an APNs and an FCM token, answered by `apnsAnswer` / `fcmAnswer`. */
+  async function setUp(
+    name: string,
+    apnsAnswer: () => Response,
+    fcmAnswer: () => Response,
+  ): Promise<string> {
+    const acct = testAccount(name);
+    const paired = await pairWithPushTokens(acct, [
+      { transport: "apns", token: APNS_TOKEN },
+      { transport: "fcm", token: FCM_TOKEN },
+    ]);
+    expect(paired.status).toBe(201);
+    await installPushTransports(acct, {
+      apns: new ApnsPushTransport({
+        endpoint: "https://api.push.apple.test",
+        topic: "com.example.allw",
+        bearerToken: "apns-bearer",
+        fetcher: async () => apnsAnswer(),
+      }),
+      fcm: new FcmPushTransport({
+        endpoint: "https://fcm.googleapis.test/v1/projects/allw/messages:send",
+        bearerToken: "fcm-bearer",
+        fetcher: async () => fcmAnswer(),
+      }),
+    });
+    return acct;
+  }
+
+  /** Submit one request; it is accepted whatever the push services answer. */
+  async function submitAndSettle(acct: string, requestId: string): Promise<void> {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const submit = await post<{ status: string; push_wakeups: number }>(
+        acct,
+        "/requests",
+        envelope(requestId),
+      );
+      expect(submit.status).toBe(202);
+      expect(submit.data.status).toBe("pending");
+      await pushFanOutSettled(acct);
+    } finally {
+      warn.mockRestore();
+    }
+  }
+
+  it("deletes the APNs token APNs answered 410 for, keeping the FCM one", async () => {
+    const acct = await setUp(
+      "acct-native-prune-apns-410",
+      () => new Response(JSON.stringify({ reason: "Unregistered" }), { status: 410 }),
+      () => new Response(null, { status: 200 }),
+    );
+
+    await submitAndSettle(acct, "req-native-prune-apns");
+
+    expect(await readPushTokens(acct)).toEqual([{ token: FCM_TOKEN }]);
+  });
+
+  it("deletes the FCM token FCM answered 404 UNREGISTERED for, keeping the APNs one", async () => {
+    const acct = await setUp(
+      "acct-native-prune-fcm-404",
+      () => new Response(null, { status: 200 }),
+      () => new Response(FCM_UNREGISTERED, { status: 404 }),
+    );
+
+    await submitAndSettle(acct, "req-native-prune-fcm");
+
+    expect(await readPushTokens(acct)).toEqual([{ token: APNS_TOKEN }]);
+  });
+
+  it.each([
+    ["APNs 400 BadDeviceToken", 400, JSON.stringify({ reason: "BadDeviceToken" })],
+    ["a 404 without UNREGISTERED", 404, JSON.stringify({ error: { code: 404 } })],
+    ["429", 429, FCM_UNREGISTERED],
+    ["500", 500, FCM_UNREGISTERED],
+    ["503", 503, FCM_UNREGISTERED],
+  ])("keeps both tokens when both push services answer %s", async (_name, status, body) => {
+    const acct = await setUp(
+      `acct-native-keep-${String(status)}-${_name.replace(/[^a-z0-9]+/gi, "-")}`,
+      () => new Response(body, { status }),
+      () => new Response(body, { status }),
+    );
+
+    await submitAndSettle(acct, `req-native-keep-${String(status)}`);
+
+    expect(await readPushTokens(acct)).toEqual(
+      expect.arrayContaining([{ token: APNS_TOKEN }, { token: FCM_TOKEN }]),
+    );
+    expect(await readPushTokens(acct)).toHaveLength(2);
   });
 });
 
