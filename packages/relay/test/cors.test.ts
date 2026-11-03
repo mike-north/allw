@@ -8,13 +8,15 @@
  */
 
 import { SELF, env } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import worker from "../src/index.js";
 import {
   DEFAULT_CORS_ALLOWED_ORIGINS,
   isCorsOriginAllowed,
   parseCorsAllowedOrigins,
+  withCors,
 } from "../src/cors.js";
+import wranglerConfigText from "../wrangler.jsonc?raw";
 import { pairingStartBody, testAccount } from "./support/accounts.js";
 
 const HOSTED_APPROVER = "https://allw-web-approver.pages.dev";
@@ -101,6 +103,20 @@ describe("CORS preflight", () => {
       expectNoCorsGrant(resp);
     },
   );
+
+  it("rejects a preflight that carries no Origin, still varying on Origin", async () => {
+    const resp = await SELF.fetch(url("acct-cors-preflight-no-origin", "/devices/dev-x/inbox"), {
+      method: "OPTIONS",
+      headers: {
+        "Access-Control-Request-Method": "GET",
+        "Access-Control-Request-Headers": "authorization",
+      },
+    });
+
+    expect(resp.status).toBe(403);
+    expectNoCorsGrant(resp);
+    expect(resp.headers.get("Vary")).toBe("Origin");
+  });
 
   it("rejects a preflight requesting a header the relay does not read", async () => {
     const resp = await preflight(HOSTED_APPROVER, "GET", "authorization, x-forwarded-for");
@@ -352,6 +368,98 @@ describe("CORS on relay-level routes (/.well-known/allw/…)", () => {
   });
 });
 
+describe("withCors — a throwing handler still answers with CORS headers", () => {
+  const throwing = (): Promise<Response> => Promise.reject(new Error("durable object reset"));
+
+  it("returns a 500 with ACAO and Vary for an allowed origin", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const resp = await withCors(
+        new Request("https://relay.allw.test/acct/devices", {
+          headers: { Origin: HOSTED_APPROVER },
+        }),
+        {},
+        throwing,
+      );
+
+      expect(resp.status).toBe(500);
+      expect(await resp.json()).toEqual({ error: "internal error" });
+      expect(resp.headers.get("Access-Control-Allow-Origin")).toBe(HOSTED_APPROVER);
+      expect(resp.headers.get("Vary")).toBe("Origin");
+      expect(error).toHaveBeenCalled();
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it("returns a 500 with Vary but no ACAO for a disallowed origin", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const resp = await withCors(
+        new Request("https://relay.allw.test/acct/devices", {
+          headers: { Origin: "https://evil.example" },
+        }),
+        {},
+        throwing,
+      );
+
+      expect(resp.status).toBe(500);
+      expectNoCorsGrant(resp);
+      expect(resp.headers.get("Vary")).toBe("Origin");
+    } finally {
+      error.mockRestore();
+    }
+  });
+});
+
+/**
+ * Strip `//` and `/* *\/` comments and trailing commas from JSONC, leaving string contents (which
+ * hold `http://…` origins) untouched. Enough for the committed `wrangler.jsonc`.
+ */
+function parseJsonc(text: string): unknown {
+  let out = "";
+  let inString = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i] ?? "";
+    if (inString) {
+      out += c;
+      if (c === "\\") out += text[++i] ?? "";
+      else if (c === '"') inString = false;
+    } else if (c === '"') {
+      inString = true;
+      out += c;
+    } else if (c === "/" && text[i + 1] === "/") {
+      while (i < text.length && text[i] !== "\n") i++;
+      out += "\n";
+    } else if (c === "/" && text[i + 1] === "*") {
+      i = text.indexOf("*/", i + 2) + 1;
+    } else {
+      out += c;
+    }
+  }
+  return JSON.parse(out.replace(/,(\s*[}\]])/g, "$1"));
+}
+
+describe("committed wrangler.jsonc CORS configuration", () => {
+  const config = parseJsonc(wranglerConfigText) as {
+    vars?: { CORS_ALLOWED_ORIGINS?: string };
+    env?: { production?: { vars?: { CORS_ALLOWED_ORIGINS?: string } } };
+  };
+
+  it("allows exactly the hosted web approver in production (no loopback)", () => {
+    expect(config.env?.production?.vars?.CORS_ALLOWED_ORIGINS).toBe(HOSTED_APPROVER);
+  });
+
+  it("admits loopback only in the top-level dev config", () => {
+    const dev = parseCorsAllowedOrigins(config.vars?.CORS_ALLOWED_ORIGINS);
+    const prod = parseCorsAllowedOrigins(config.env?.production?.vars?.CORS_ALLOWED_ORIGINS);
+
+    expect(isCorsOriginAllowed("http://localhost:5173", dev)).toBe(true);
+    expect(isCorsOriginAllowed("http://localhost:5173", prod)).toBe(false);
+    expect(isCorsOriginAllowed("http://127.0.0.1:5173", prod)).toBe(false);
+  });
+});
+
 describe("parseCorsAllowedOrigins / isCorsOriginAllowed", () => {
   it("defaults to the hosted web approver alone when the var is unset", () => {
     const rules = parseCorsAllowedOrigins(undefined);
@@ -367,9 +475,39 @@ describe("parseCorsAllowedOrigins / isCorsOriginAllowed", () => {
   });
 
   it.each([
+    ["an uppercase host", "https://Approver.Example.com", "https://approver.example.com"],
+    ["the default https port", "https://approver.example.com:443", "https://approver.example.com"],
+    ["the default http port", "http://approver.example.com:80", "http://approver.example.com"],
+    ["a Unicode IDN host", "https://bücher.example", "https://xn--bcher-kva.example"],
+  ])("normalizes an exact entry with %s to the origin a browser sends", (_name, entry, origin) => {
+    const rules = parseCorsAllowedOrigins(entry);
+
+    expect(rules).toEqual([{ kind: "exact", origin }]);
+    expect(isCorsOriginAllowed(origin, rules)).toBe(true);
+  });
+
+  it("logs each dropped entry once, not on every request", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      // A value no other test parses, so the per-value memo starts cold.
+      const value = "https://ok.example,https://dropped.example/app,https://*.wild.example";
+      parseCorsAllowedOrigins(value);
+      parseCorsAllowedOrigins(value);
+
+      expect(warn).toHaveBeenCalledTimes(2);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("https://dropped.example/app"));
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("https://*.wild.example"));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it.each([
     ["the opaque null origin", "null"],
     ["an entry with a path", "https://approver.example.com/app"],
     ["an entry with a trailing slash", "https://approver.example.com/"],
+    ["an entry with a query", "https://approver.example.com?x=1"],
+    ["an entry with a fragment", "https://approver.example.com#x"],
     ["a non-http scheme", "ftp://approver.example.com"],
     ["embedded credentials", "https://user:pw@approver.example.com"],
     ["a wildcard host", "https://*.example.com"],

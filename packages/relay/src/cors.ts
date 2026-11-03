@@ -15,9 +15,12 @@
  *   capability the page holds explicitly, never an ambient cookie, so allowing an origin grants it
  *   nothing the bearer token does not.
  * - **Preflight** admits only the methods the relay routes (`GET`, `POST`) and the request headers it
- *   reads (`Authorization`, `Content-Type`). Anything else is refused.
+ *   reads (`Authorization`, `Content-Type`). Anything else is refused. Preflight is route-independent
+ *   by design: it is answered per origin, method and header without consulting the router, and the
+ *   actual request is still routed (and 404/405'd) normally, with CORS headers.
  * - **`Vary: Origin`** goes on every response the wrapper handles, because the CORS headers depend
- *   on the request's `Origin`.
+ *   on the request's `Origin`. That includes the 500 the wrapper returns when the handler throws, so
+ *   a browser sees the real error instead of a misleading CORS failure.
  *
  * CORS is a browser read-permission mechanism, not access control. Non-browser clients (the CLI,
  * SDK, hook, native apps) send no `Origin` and are unaffected, and a request from a disallowed
@@ -43,8 +46,9 @@ const PREFLIGHT_MAX_AGE_SECONDS = 600;
 export interface CorsEnv {
   /**
    * Comma-separated origins, e.g. `https://approver.example.com,http://localhost:*`. Each entry is
-   * an exact origin (scheme, host and optional port, with no path). A port of `*` matches any port,
-   * which is meant for loopback dev servers. An empty value allows no origin.
+   * an exact origin (scheme, host and optional port, with no path), normalized to its serialized
+   * form (`URL.origin`: lowercase host, punycode for IDN, default port dropped). A port of `*`
+   * matches any port, which is meant for loopback dev servers. An empty value allows no origin.
    */
   readonly CORS_ALLOWED_ORIGINS?: string;
 }
@@ -55,30 +59,52 @@ export type OriginRule =
   | { readonly kind: "any-port"; readonly scheme: string; readonly hostname: string };
 
 /**
- * Parse the allowlist. Malformed entries are dropped, never widened: an entry with a path, query,
- * credentials, a non-http(s) scheme, a wildcard host, or the opaque `null` origin matches nothing.
+ * Parsed allowlists, memoized per configured value for the isolate's lifetime. The var is fixed for
+ * a deployment, so each value is parsed (and its dropped entries reported) once, not per request.
+ */
+const parsedAllowlists = new Map<string, readonly OriginRule[]>();
+
+/**
+ * Parse the allowlist. An exact entry is normalized to `URL.origin`, so `https://Approver.example`,
+ * `https://approver.example:443` and a Unicode IDN host match the origin a browser actually sends.
+ * Malformed entries are dropped, never widened, and each dropped entry is logged once
+ * (`console.warn`, visible in `wrangler tail`): an entry with a path or trailing slash, a query or
+ * fragment, credentials, a non-http(s) scheme, a wildcard host, or the opaque `null` origin.
  */
 export function parseCorsAllowedOrigins(value: string | undefined): readonly OriginRule[] {
   const raw = value ?? DEFAULT_CORS_ALLOWED_ORIGINS;
+  const cached = parsedAllowlists.get(raw);
+  if (cached) return cached;
   const rules: OriginRule[] = [];
   for (const entry of raw.split(",")) {
     const trimmed = entry.trim();
     if (trimmed === "") continue;
-    const anyPort = /^(https?):\/\/([^/:@?#*]+):\*$/.exec(trimmed);
-    if (anyPort) {
-      const [, scheme = "", hostname = ""] = anyPort;
-      const probe = parseOrigin(`${scheme}://${hostname}`);
-      if (probe) rules.push({ kind: "any-port", scheme: `${scheme}:`, hostname: probe.hostname });
-      continue;
+    const rule = parseOriginRule(trimmed);
+    if (rule) {
+      rules.push(rule);
+    } else {
+      console.warn(`CORS_ALLOWED_ORIGINS: ignoring malformed entry ${JSON.stringify(trimmed)}`);
     }
-    // `*` is only meaningful as a port; a wildcard host or a bare `*` is never a valid entry.
-    if (trimmed.includes("*")) continue;
-    const exact = parseOrigin(trimmed);
-    // Only an entry that is already a bare origin is accepted: `https://a.example/` (trailing slash)
-    // or anything with a path is rejected rather than silently trimmed.
-    if (exact?.origin === trimmed) rules.push({ kind: "exact", origin: exact.origin });
   }
+  parsedAllowlists.set(raw, rules);
   return rules;
+}
+
+function parseOriginRule(entry: string): OriginRule | null {
+  const anyPort = /^(https?):\/\/([^/:@?#*]+):\*$/.exec(entry);
+  if (anyPort) {
+    const [, scheme = "", hostname = ""] = anyPort;
+    const probe = parseOrigin(`${scheme}://${hostname}`);
+    return probe ? { kind: "any-port", scheme: `${scheme}:`, hostname: probe.hostname } : null;
+  }
+  // `*` is only meaningful as a port; a wildcard host or a bare `*` is never a valid entry.
+  if (entry.includes("*")) return null;
+  // A path, a trailing slash, a query or a fragment means the entry is not an origin; it is
+  // rejected rather than silently trimmed, since the operator may have pasted the wrong value.
+  if (entry.endsWith("/") || entry.includes("?") || entry.includes("#")) return null;
+  const exact = parseOrigin(entry);
+  if (exact?.pathname !== "/") return null;
+  return { kind: "exact", origin: exact.origin };
 }
 
 /** Whether a request `Origin` header value is on the allowlist. */
@@ -108,7 +134,15 @@ export async function withCors(
 
   if (isPreflight(request)) return preflightResponse(request, allowedOrigin);
 
-  const response = await handler(request);
+  let response: Response;
+  try {
+    response = await handler(request);
+  } catch (error) {
+    // An uncaught throw (or a rejected Durable Object fetch) would otherwise surface as a runtime
+    // 500 with no CORS headers, which a browser reports as a CORS failure. Answer it ourselves.
+    console.error("relay request failed", error);
+    response = Response.json({ error: "internal error" }, { status: 500 });
+  }
   // A 101 carries the WebSocket and must be returned as-is; WebSockets are not subject to CORS.
   if (response.status === 101) return response;
   // Handler and Durable Object responses can have immutable headers; copy before decorating.
