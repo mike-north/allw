@@ -327,6 +327,12 @@ describe("WakeupCoalescer — at most one wakeup per subscription per window", (
     });
   });
 
+  it("refuses to parse a coalescing key with no separator", () => {
+    expect(() => parseWebPushCoalesceKey("dev-a-https://fcm.googleapis.com/fcm/send/a")).toThrow(
+      "not a Web Push coalescing key",
+    );
+  });
+
   it("keeps subscriptions independent", () => {
     const coalescer = new WakeupCoalescer(WEB_PUSH_COALESCE_MS);
     expect(coalescer.tryClaim(KEY, T0)).toBe(true);

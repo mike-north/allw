@@ -284,10 +284,13 @@ export function webPushCoalesceKey(deviceId: string, token: string): string {
 
 /**
  * The device id and endpoint a {@link webPushCoalesceKey} was built from. Neither contains a NUL:
- * device ids are relay-generated, and an endpoint is a validated URL.
+ * device ids are relay-generated, and an endpoint is a validated URL. Throws on a key with no
+ * separator: every key is built by {@link webPushCoalesceKey}, so one without it is a bug, and
+ * guessing would read or update the wrong subscription's claim.
  */
 export function parseWebPushCoalesceKey(key: string): { deviceId: string; token: string } {
   const split = key.indexOf("\0");
+  if (split < 0) throw new Error("not a Web Push coalescing key");
   return { deviceId: key.slice(0, split), token: key.slice(split + 1) };
 }
 
