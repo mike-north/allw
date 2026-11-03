@@ -91,6 +91,14 @@ interface WasmGlue extends AllwWasm {
 let cached: AllwWasm | undefined;
 
 /**
+ * The browser initialization in flight, if any. The generated glue guards only against an
+ * already-finished init, so two overlapping `default()` calls would each instantiate the module,
+ * and the second would swap the glue's exports out from under handles made with the first. Every
+ * caller that arrives while an init is running shares this one.
+ */
+let pending: Promise<AllwWasm> | undefined;
+
+/**
  * Validate at runtime that a dynamically-imported glue module actually exposes the FFI subset the
  * runtime depends on. The vendored glue is gitignored and untyped at this seam, so a missing build
  * (or a drifted artifact) must fail loudly here rather than as an opaque `undefined is not a
@@ -123,7 +131,9 @@ function assertGlueShape(glue: Partial<WasmGlue>): asserts glue is WasmGlue {
  * Pass the URL the bundler/host serves `allw_wasm_bg.wasm` from (e.g. an asset URL), a `Response`,
  * or a pre-compiled `WebAssembly.Module`. The `glue` is the dynamically-imported `--target web`
  * module (`@allw/sdk/vendor/allw-wasm/allw_wasm.js`); it is injected so this package never hard-codes
- * a vendor path the browser cannot resolve. Idempotent: repeated calls return the same instance.
+ * a vendor path the browser cannot resolve. Idempotent: repeated calls return the same instance,
+ * including calls made while the first is still instantiating. A failed init is not memoized, so a
+ * later call retries.
  *
  * @throws if the glue is missing the FFI subset, or instantiation fails.
  */
@@ -132,6 +142,20 @@ export async function initWasm(
   moduleSource: WasmModuleSource | Promise<WasmModuleSource>,
 ): Promise<AllwWasm> {
   if (cached) return cached;
+  // Cleared in `.finally`, which always runs after this assignment, even when the init fails
+  // synchronously (a glue missing the FFI subset); a `finally` inside the async body would run
+  // first and leave the rejected promise memoized.
+  pending ??= instantiate(glueModule, moduleSource).finally(() => {
+    pending = undefined;
+  });
+  return pending;
+}
+
+/** One browser initialization of `glueModule`, memoized in `cached` on success. */
+async function instantiate(
+  glueModule: unknown,
+  moduleSource: WasmModuleSource | Promise<WasmModuleSource>,
+): Promise<AllwWasm> {
   const glue = glueModule as Partial<WasmGlue>;
   assertGlueShape(glue);
   await glue.default(moduleSource);
@@ -158,4 +182,5 @@ export function initWasmSync(glueModule: unknown, module: WebAssembly.Module): A
 /** Reset the memoized core. Test-only seam so independent suites can re-init a fresh instance. */
 export function resetWasmForTests(): void {
   cached = undefined;
+  pending = undefined;
 }
