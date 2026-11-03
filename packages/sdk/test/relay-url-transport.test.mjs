@@ -1,6 +1,7 @@
 /**
  * Tests for the SDK's relay-URL transport rule (issue #249): `createClient` accepts a relay URL
- * only if it is `https:`, or `http:` on a loopback host (`localhost`, `127.0.0.1`, `[::1]`).
+ * only if it is `https:`, or `http:` on a loopback host (`localhost`, `127.0.0.1`; not `[::1]`, which
+ * the web approver's CSP cannot express).
  * Anything else is rejected at configuration time — before any request is built — so bearer
  * tokens and approval ciphertext never travel over plaintext HTTP to a remote host, where an
  * on-path attacker could do anything a malicious relay can.
@@ -37,7 +38,7 @@ function clientFor(relayUrl) {
 describe("createClient relay-URL transport rule (#249)", () => {
   test("rejects plaintext http:// to a remote relay host with an actionable error", () => {
     assert.throws(() => clientFor("http://relay.example.com"), {
-      message: /must use https:\/\/.*localhost, 127\.0\.0\.1, or \[::1\]/,
+      message: /must use https:\/\/.*localhost or 127\.0\.0\.1/,
     });
   });
 
@@ -63,7 +64,13 @@ describe("createClient relay-URL transport rule (#249)", () => {
     assert.doesNotThrow(() => clientFor("https://relay.example.com"));
   });
 
-  for (const loopback of ["http://localhost:8787", "http://127.0.0.1:8787", "http://[::1]:8787"]) {
+  test("rejects http://[::1] and points to 127.0.0.1", () => {
+    assert.throws(() => clientFor("http://[::1]:8787"), {
+      message: /use 127\.0\.0\.1 rather than \[::1\]/,
+    });
+  });
+
+  for (const loopback of ["http://localhost:8787", "http://127.0.0.1:8787"]) {
     test(`accepts plaintext http:// on loopback (${loopback}) for local development`, () => {
       assert.doesNotThrow(() => clientFor(loopback));
     });
