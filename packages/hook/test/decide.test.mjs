@@ -377,3 +377,144 @@ test("the ApprovalRequest carries the command ActionRecord + actor + risk-derive
   assert.equal(req.action.risk, "low");
   assert.equal(req.reversible, true, "low/medium risk → reversible hint true");
 });
+
+/**
+ * The record the core builds for a command line, in the SDK's camelCase shape: top-level keys
+ * translated, `syntactic` passed through unchanged (docs/policy-seam.md §ActionRecord). This is the
+ * reference the hook's command requests are held to (#269), so it reads the core directly rather
+ * than going through the SDK under test.
+ */
+function coreCommandAction(wasm, command, cwd) {
+  const core = JSON.parse(
+    cwd === undefined ? wasm.action_from_command(command) : wasm.action_from_command(command, cwd),
+  );
+  return {
+    recordSchemaVersion: core.record_schema_version,
+    surface: core.surface,
+    syntactic: core.syntactic,
+    risk: core.risk,
+  };
+}
+
+/** A PreToolUse input for a shell tool (`Bash` or `Monitor`) running `command`. */
+function shellInput(toolName, command, cwd) {
+  return {
+    hookEventName: "PreToolUse",
+    toolName,
+    toolInput: { command },
+    ...(cwd !== undefined ? { cwd } : {}),
+  };
+}
+
+const COMMAND_DENY_PREFIX =
+  "allw: could not build an ActionRecord for the command (fail-closed deny): ";
+
+test("(#269) a command request built through the SDK is byte-identical to the core's record", async () => {
+  const wasm = await loadWasm();
+  const cases = [
+    {
+      toolName: "Bash",
+      command: "git push --force origin main",
+      cwd: "/repo",
+      summary: "Run command: git push --force origin main",
+    },
+    // No cwd from Claude Code: the record stays unbound (not bound to the hook's own directory).
+    { toolName: "Bash", command: "ls -la", cwd: undefined, summary: "Run command: ls -la" },
+    {
+      toolName: "Bash",
+      command: "FOO=1 make deploy --token $DEPLOY_TOKEN",
+      cwd: "/srv/app",
+      summary: "Run command: FOO=1 make deploy --token $DEPLOY_TOKEN",
+    },
+    {
+      toolName: "Monitor",
+      command: "tail -f /var/log/app.log",
+      cwd: "/srv",
+      summary: "Run command (Monitor): tail -f /var/log/app.log",
+    },
+    // A multi-line command: the summary collapses whitespace runs; the record keeps the raw text.
+    {
+      toolName: "Bash",
+      command: "printf 'a\\n'\n  && rm -rf build",
+      cwd: "/w",
+      summary: "Run command: printf 'a\\n' && rm -rf build",
+    },
+  ];
+  for (const config of [CONFIG, { ...CONFIG, timeoutMs: 30_000 }]) {
+    for (const c of cases) {
+      const approver = recording("approved");
+      const output = await decide(
+        shellInput(c.toolName, c.command, c.cwd),
+        { wasm, config, requestApproval: approver.fn },
+        HOSTNAME,
+      );
+      assert.equal(output, null);
+      assert.equal(approver.calls.length, 1, `${c.toolName}: ${c.command}`);
+      const action = coreCommandAction(wasm, c.command, c.cwd);
+      // The request the hook built by hand before #269, field for field and key for key: the core's
+      // record, the hook's actor, risk stated once (from the record), reversible from that risk,
+      // and the configured timeout only when set.
+      const expected = {
+        action,
+        summary: c.summary,
+        actor: { id: `machine:${HOSTNAME}`, kind: "claude-code" },
+        risk: action.risk,
+        reversible: action.risk === "low" || action.risk === "medium",
+        ...(config.timeoutMs !== undefined ? { timeoutMs: config.timeoutMs } : {}),
+      };
+      assert.equal(
+        JSON.stringify(approver.calls[0]),
+        JSON.stringify(expected),
+        `${c.toolName}: ${c.command}`,
+      );
+    }
+  }
+});
+
+test("(#269) a command the SDK refuses (blank, no program, blank cwd) → deny, approver NOT called", async () => {
+  const wasm = await loadWasm();
+  // The core alone builds a record for each of these; the SDK's commandRequest refuses them, so
+  // the human is never asked to approve an empty command or an empty working directory.
+  const cases = [
+    ["Bash", "", "/repo"],
+    ["Bash", "   ", "/repo"],
+    ["Bash", "'' rm -rf build", "/repo"],
+    ["Bash", "ls", ""],
+    ["Monitor", "", "/repo"],
+  ];
+  for (const [toolName, command, cwd] of cases) {
+    const approver = recording("approved");
+    const output = await decide(
+      shellInput(toolName, command, cwd),
+      { wasm, config: CONFIG, requestApproval: approver.fn },
+      HOSTNAME,
+    );
+    const label = `${toolName} ${JSON.stringify(command)} in ${JSON.stringify(cwd)}`;
+    assert.equal(decisionOf(output), "deny", label);
+    assert.equal(approver.calls.length, 0, label);
+    const reason = output.hookSpecificOutput.permissionDecisionReason;
+    assert.ok(reason.startsWith(COMMAND_DENY_PREFIX), reason);
+    assert.ok(!reason.slice(COMMAND_DENY_PREFIX.length).startsWith("allw:"), reason);
+  }
+});
+
+test("(#269) malformed shell → deny quoting the core's own error, as before", async () => {
+  const wasm = await loadWasm();
+  const command = 'echo "unterminated';
+  let coreError;
+  try {
+    wasm.action_from_command(command, "/repo");
+  } catch (err) {
+    coreError = err;
+  }
+  assert.ok(coreError instanceof Error, "the core refuses the unmatched quote");
+  const output = await decide(
+    shellInput("Bash", command, "/repo"),
+    { wasm, config: CONFIG, requestApproval: resolvesTo("approved") },
+    HOSTNAME,
+  );
+  assert.equal(
+    output.hookSpecificOutput.permissionDecisionReason,
+    `${COMMAND_DENY_PREFIX}${agentSafeErrorText(wasm, coreError)}`,
+  );
+});
