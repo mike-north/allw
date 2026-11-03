@@ -16,6 +16,7 @@
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import { pairingStartBody, testAccount } from "./support/accounts.js";
+import { DEVICE_X25519_PUBKEY } from "./support/keys.js";
 import { AccountRelay } from "../src/index.js";
 
 // ---------------------------------------------------------------------------
@@ -26,10 +27,10 @@ import { AccountRelay } from "../src/index.js";
  * Valid 32-byte Ed25519/X25519 public keys encoded as base64url-unpadded (43 chars each).
  * These are deterministic test vectors — not real key material.
  *
- * VALID_PUBKEY_1: 32 × 0x00 (all zero bytes)
- * VALID_PUBKEY_2: 32 × 0xFF (all 0xFF bytes)
+ * VALID_PUBKEY_1: a full-order X25519 key (RFC 7748 §6.1), since pairing rejects small-order keys
+ * VALID_PUBKEY_2: 32 × 0xFF (all 0xFF bytes; not small-order once bit 255 is masked)
  */
-const VALID_PUBKEY_1 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"; // 32 × 0x00, base64url-unpadded
+const VALID_PUBKEY_1 = DEVICE_X25519_PUBKEY;
 const VALID_PUBKEY_2 = "__________________________________________8"; // 32 × 0xFF, base64url-unpadded
 const VALID_APNS_TOKEN = "a".repeat(64);
 const VALID_FCM_TOKEN = "fcm-token_123:abc";

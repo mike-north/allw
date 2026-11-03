@@ -47,6 +47,10 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   **WebSocket** upgrades (which can't easily set headers), pass `?auth=<token>` as a query param.
   The relay stores only `SHA-256(token)`; the plaintext is returned **once** at issuance — cache it.
   Missing token ⇒ **401**; wrong/expired/cross-scope token ⇒ **403**.
+- **Public keys.** Every key field the relay accepts (`root_pubkey`, a device or actor `pubkey`) is
+  the **canonical** base64url-unpadded encoding of 32 bytes: 43 characters, with the 2 unused low bits
+  of the last one zero, so re-encoding the bytes gives back the same string. Anything else is a **400**,
+  never stored. A stray-bit key such as `…AAAB` decodes leniently, but the core rejects it.
 - **Token scopes** (three implemented; `enrollment_auth_token` is specified only):
 
   | Token                   | Issued by                     | Used for                                                            | Lifetime                  |
@@ -70,6 +74,14 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   send no `Origin` and are unaffected.
 - **Errors** are plain bodies with the status code; `400` covers malformed JSON / bad fields /
   unexpected envelope keys (zero-knowledge guard).
+- **Exact paths.** An account route answers only on its exact path, compared segment by segment as the URL
+  parser yields them (percent-encoding preserved, `.` and `..` segments resolved): the same number of segments, every literal equal, and every `{param}` non-empty
+  (#302). Anything else is **404** `{ "error": "not found" }`, whatever the method: an extra segment
+  (`…/revoke/extra`), a trailing slash (`/devices/`), an empty segment (`/devices//revoke`) or a missing
+  one. A path that is exactly a route's, reached with a method the route doesn't serve, is **405**
+  `{ "error": "method not allowed" }`. Dropping or adding a segment can still land exactly on _another_
+  route: `/requests/r1` is `GET /requests/{request_id}`, and `/requests/extra` is the same route with
+  `request_id = extra`. The route table is `packages/relay/src/routes.ts`.
 
 ---
 
@@ -196,11 +208,29 @@ it is stored in normalized form (`URL.href`), so two spellings of one subscripti
 **Budgets:** at most **4** `push_tokens` entries per registration and **2** distinct tokens per
 transport (duplicates collapse first); over budget is a **400**, never a silent truncation. An account
 holds at most **32** push tokens across all devices; a registration that would exceed that is a
-**409** and the pairing code is not consumed (retry without tokens, or free some). Errors: 403 when no
-root is bound to the account (a code on an unbound account predates root binding and is never
-honored), 400 (bad body/pubkey/push_token/unexpected key/over budget), 401/403 (token), 404 (code
-unknown), 409 (code already used, or account push-token budget full), 410 (code expired). Atomic — no
-half-enrollment.
+**409** and the pairing code is not consumed (retry without tokens, or free some).
+
+**Small-order keys:** `pubkey` is the device's X25519 encryption key, so a small-order point is a **400**
+`{ "error": "'pubkey' is a small-order X25519 key, which can never be an encryption target" }`. The
+pairing code is not consumed (#248). Every ECDH with such a key gives a publicly known shared secret, so
+`encrypt_context` would refuse every request to the account. The list is the core's
+(`X25519_SMALL_ORDER_POINTS`, libsodium's `has_small_order` seven points, matched with bit 255 masked),
+called through the relay's WASM binding, not a copy.
+
+Errors:
+
+- 403 when no root is bound to the account (a code on an unbound account predates root binding and is
+  never honored);
+- 400 (bad body, a pubkey that isn't the canonical encoding of 32 bytes (§1), small-order pubkey,
+  push_token, unexpected key, or over budget);
+- 401/403 (token);
+- 404 (code unknown);
+- 409 (code already used, or account push-token budget full);
+- 410 (code expired);
+- 500 only when the relay's verification core failed to initialize (logged). A key the core rejects
+  is the 400 above, never a 500.
+
+Atomic — no half-enrollment.
 
 ### Relay-level (`/.well-known/allw/`, not per-account)
 
@@ -578,9 +608,9 @@ approver:{account_id,device_id}, sig:<compact JWS>, note?, challenge_response?, 
 
 6. **Pairing & `device_cert` (read carefully — the relay is a single-key surface).**
    - `POST /pairing/complete` registers **exactly one `pubkey` = the device X25519 _encryption_ key**
-     (used by integrators to JWE-encrypt to the device). The Ed25519 **signing** key is **not** sent to
-     the relay — by design, so the relay is never the carrier of the verdict-key binding. It is certified
-     out of band instead (`enrollment.md` §Pairing Flow step 3 documents this single-key surface).
+     (used by integrators to JWE-encrypt to the device). A small-order key is refused (400, §3 Pairing).
+     The Ed25519 **signing** key is **not** sent to the relay — by design, so the relay is never the
+     carrier of the verdict-key binding. It is certified out of band instead (`enrollment.md` §Pairing Flow step 3 documents this single-key surface).
    - The device also needs a **`device_cert`** — an account-root-signed JWS binding its Ed25519 signing
      pubkey (`issue_device_cert`). **The relay does NOT issue or validate it.** Verdicts without a valid
      `device_cert` are denied by integrators (`enrollment.md` §Device Certificate Validation).
