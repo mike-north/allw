@@ -228,7 +228,11 @@ is the remaining product acceptance proof that Codex itself invokes the hook and
 
 The matcher intentionally matches the hook's v1 surfaces:
 
-- `Bash` commands are converted to command `ActionRecord`s through the WASM core. Codex reports
+- `Bash` commands are converted to command `ActionRecord`s through `@allw/sdk`'s `commandRequest`,
+  which builds them with the WASM core, exactly as the Claude Code hook does
+  ([#372](https://github.com/mike-north/allw/issues/372)). A blank or whitespace-only command, or one
+  whose program is an empty word (`'' rm -rf x`), is denied (`allw[build-error]`) without asking. A
+  blank `cwd` counts as unknown, so the record is bound to no directory. Codex reports
   **every** shell exec to `PreToolUse` as `Bash`, including `shell`, `exec_command` and unified exec
   (each handler's `pre_tool_use_payload` names it `HookToolName::bash()` in `codex-rs/core`, checked
   2026-11-03). So Codex has no separately named exec tool to match, unlike Claude Code's `Monitor` and

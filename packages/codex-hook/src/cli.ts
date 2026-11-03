@@ -17,6 +17,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   MAX_ESCAPED_DIAGNOSTIC_CHARS,
+  commandRequest,
   createClient,
   escapeToPrintableAscii,
   type ClientConfig,
@@ -114,7 +115,7 @@ export async function runCodexHook(
   const requestApproval: RequestApprovalFn = (req) =>
     client.requestApproval(req as Parameters<typeof client.requestApproval>[0]);
 
-  return decide(parsed.input, { wasm, config, requestApproval }, osHostname());
+  return decide(parsed.input, { wasm, config, commandRequest, requestApproval }, osHostname());
 }
 
 /**
