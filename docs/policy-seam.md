@@ -158,6 +158,8 @@ PowerShell: for example `$env:PATH` records `env` in `env_refs`. `raw` is author
    three tiers match against.
 2. **Stamp `record_schema_version`.**
 3. **Reserve the optional `capabilities` / `scope` fields** so the semantic tier layers on with no wire break.
+   They **MUST be null in v1**: a device refuses a context that sets either one to any non-null value, because the
+   hash binds them but no approver shows them ([contract.md](./contract.md) §Device-side context checks, #296).
 4. **Reserve a `policy` block in `AuditRecord`:** `{ decision: allow|deny|escalate, rule_id?, tier, schema_version }`.
    v1 always writes `escalate`; the field exists so history is policy-analyzable later.
 5. **Enforce the structure/data split** when constructing `ApprovalRequest` envelopes: surface + tool/bin name
