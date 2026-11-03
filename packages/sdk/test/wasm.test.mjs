@@ -2609,3 +2609,57 @@ test("verify_verdict reports a verified non-approval only as the structured sign
   // The approved vector verdict still verifies (no throw).
   assert.equal(JSON.parse(verifiers[0][1](v.verdict_json)).approved, true);
 });
+
+test("verify_verdict_provenance gives the Rust vector's answer for every case (#245)", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+
+  assert.equal(v.provenance_cases.length, 7);
+  for (const c of v.provenance_cases) {
+    const check = () =>
+      wasm.verify_verdict_provenance(
+        c.verdict_json,
+        c.request_id,
+        v.provenance_account_id,
+        v.approver_root_pubkey_b64,
+        c.account_states_json,
+      );
+    if (c.expected_device_id === null) {
+      assert.throws(check, /verify_verdict_provenance failed/, `${c.name}: rejected`);
+    } else {
+      const got = JSON.parse(check());
+      assert.equal(got.device_id, c.expected_device_id, `${c.name}: the signing device`);
+      assert.equal(typeof got.decided_at, "number", `${c.name}: decided_at`);
+    }
+  }
+
+  // Junk input never passes: a non-object verdict, a verdict for another account, a bad root.
+  const genuine = v.provenance_cases.find((c) => c.name === "genuine");
+  assert.throws(() =>
+    wasm.verify_verdict_provenance(
+      "42",
+      genuine.request_id,
+      v.provenance_account_id,
+      v.approver_root_pubkey_b64,
+      "[]",
+    ),
+  );
+  assert.throws(() =>
+    wasm.verify_verdict_provenance(
+      genuine.verdict_json,
+      genuine.request_id,
+      "acc_someone_else",
+      v.approver_root_pubkey_b64,
+      "[]",
+    ),
+  );
+  assert.throws(() =>
+    wasm.verify_verdict_provenance(
+      genuine.verdict_json,
+      genuine.request_id,
+      v.provenance_account_id,
+      "not-a-key",
+      "[]",
+    ),
+  );
+});
