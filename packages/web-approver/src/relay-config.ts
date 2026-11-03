@@ -91,9 +91,9 @@ function hasUrlExtras(raw: string, parsed: URL): boolean {
  * parsed pathname with trailing slashes stripped — never the caller's raw text — so the value
  * stored in a pin, compared against a `?relay=` link, and shown to the human is one unambiguous
  * string. `./pairing.ts` `parseIdentity` requires a stored pin to equal this form, so **changing the
- * canonical form requires migrating stored pins** — otherwise an existing pin loads as corrupt, the
- * browser is treated as unpaired, and the pairing gate's `store.clear()` silently discards the
- * device identity.
+ * canonical form or narrowing what this function accepts requires migrating stored pins**.
+ * Otherwise an existing pin loads as corrupt, the browser is treated as unpaired, and the pairing
+ * gate's `store.clear()` silently discards the device identity.
  */
 export function checkRelayUrl(candidate: string): RelayUrlCheck {
   const trimmed = candidate.trim();

@@ -108,6 +108,11 @@ WebSocket, account-state resolution — goes to that pinned relay.
 - **Browsers paired before pinning existed** are bound once, on their next visit, to the relay URL
   they had already persisted (`allw:relay-url:v1`) — never to a `?relay=` link on that visit. If
   none is persisted, the config prompt asks for it.
+- **A pin that a later build no longer accepts** makes the stored identity load as corrupt
+  (fail-closed). The browser boots as unpaired and must re-pair, which replaces the stored identity.
+  For example, browsers pinned to `http://[::1]:…` before `[::1]` was dropped must re-pair against
+  `http://127.0.0.1:…`. Builds that narrow the relay rule or change its canonical form must ship a
+  migration for stored pins.
 
 **[OPERATOR]** To hand a user a working link, share the deployed bundle's URL with `?relay=`
 appended, e.g.:

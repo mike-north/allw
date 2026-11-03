@@ -1,5 +1,5 @@
 {
-  "$comment": "Shared accept/reject vectors for the relay-URL transport rule (issue #249). Loaded by the SDK (assertRelayUrlTransport), the web approver (checkRelayUrl) and the web-approver site build (relayConnectSources). `runtime` is the verdict of the SDK and web-approver runtime rule; `canonical` is the web approver's canonical form when runtime accepts; `build` is the verdict of the CSP connect-src relay list, which additionally requires a bare origin. Expected values are written from the rule in docs/web-approver-deploy.md §2 and §3.1, not captured from the implementation.",
+  "$comment": "Shared accept/reject vectors for the relay-URL transport rule (issue #249). Loaded by the SDK (assertRelayUrlTransport), the web approver (checkRelayUrl) and the web-approver site build (relayConnectSources). `runtime` is the verdict of the SDK and web-approver runtime rule; `canonical` is the web approver's canonical form when runtime accepts; `build` is the verdict of the CSP connect-src relay list, which additionally requires a bare origin (no path) and a plain DNS hostname or IPv4 address, so it rejects IPv6 literals and other non-plain hostnames. Expected values are written from the rule in docs/web-approver-deploy.md §2 and §3.1, not captured from the implementation.",
   "vectors": [
     {
       "input": "https://relay.example.com",
