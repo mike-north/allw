@@ -2428,3 +2428,76 @@ test("select_recipients throws — never returns [] — when no recipient set is
     );
   }
 });
+
+/**
+ * A verified non-approval is reported structurally, never through the message (#311). For each
+ * genuinely signed non-approval in the shared vector, both verify functions throw an `Error` whose
+ * own `kind` is `"not_approved"` and whose `decision` is the signed decision. For each forged case
+ * (outer `decision` rewritten, the old message marker echoed through other fields), the throw has
+ * no `kind` or `decision`, even when its message contains the marker.
+ *
+ * @see crates/allw-core/tests/wasm_vector.rs (`fixture_not_approved_cases_follow_the_signed_claims`)
+ */
+test("verify_verdict reports a verified non-approval only as the structured signed decision", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  const verifiers = [
+    [
+      "verify_verdict",
+      (verdictJson) =>
+        wasm.verify_verdict(
+          verdictJson,
+          v.request_json,
+          v.context_json,
+          v.approver_root_pubkey_b64,
+          v.now_ms,
+        ),
+    ],
+    [
+      "verify_verdict_with_account_states",
+      (verdictJson) =>
+        wasm.verify_verdict_with_account_states(
+          verdictJson,
+          v.request_json,
+          v.context_json,
+          v.approver_root_pubkey_b64,
+          v.now_ms,
+          "[]",
+        ),
+    ],
+  ];
+  const thrown = (verify, verdictJson) => {
+    try {
+      verify(verdictJson);
+    } catch (err) {
+      return err;
+    }
+    assert.fail("verification must throw");
+  };
+
+  assert.equal(v.not_approved_verdicts.length, 3);
+  assert.equal(v.forged_not_approved_verdicts.length, 7);
+  for (const [name, verify] of verifiers) {
+    for (const c of v.not_approved_verdicts) {
+      const err = thrown(verify, c.verdict_json);
+      assert.ok(err instanceof Error, `${name} / ${c.name}: an Error`);
+      assert.equal(err.kind, "not_approved", `${name} / ${c.name}: kind`);
+      assert.equal(err.decision, c.signed_decision, `${name} / ${c.name}: the signed decision`);
+    }
+    for (const c of v.forged_not_approved_verdicts) {
+      const err = thrown(verify, c.verdict_json);
+      assert.ok(err instanceof Error, `${name} / ${c.name}: an Error`);
+      assert.equal(err.kind, undefined, `${name} / ${c.name}: unclassified`);
+      assert.equal(err.decision, undefined, `${name} / ${c.name}: no decision`);
+      if (c.message_echoes_marker) {
+        assert.ok(
+          err.message.includes("verified human decision was not 'approved'"),
+          `${name} / ${c.name}: the message echoes the marker (a message classifier is fooled)`,
+        );
+      }
+    }
+  }
+
+  // The approved vector verdict still verifies (no throw).
+  assert.equal(JSON.parse(verifiers[0][1](v.verdict_json)).approved, true);
+});
