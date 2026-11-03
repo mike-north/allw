@@ -233,7 +233,9 @@ onto the Claude Code decision.
 ## Development
 
 ```sh
+pnpm run build:wasm                    # once, from the repo root
+pnpm --filter "@allw/hook..." build    # this package and its workspace deps
 pnpm --filter @allw/hook typecheck
 pnpm --filter @allw/hook lint
-pnpm --filter @allw/hook test    # requires `pnpm run build:wasm` + the dist build first
+pnpm --filter @allw/hook test
 ```
