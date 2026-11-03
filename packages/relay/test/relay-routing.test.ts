@@ -373,11 +373,18 @@ async function connectWs(accountId: string, subPath: string): Promise<WsClient> 
     const queued = queue.shift();
     if (queued) return Promise.resolve(queued);
     return new Promise<WsMessage>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("WebSocket message timeout")), timeoutMs);
-      waiters.push((m) => {
+      const waiter = (m: WsMessage): void => {
         clearTimeout(timer);
         resolve(m);
-      });
+      };
+      const timer = setTimeout(() => {
+        // Withdraw the waiter, so a message that arrives after the timeout is queued for the next
+        // read instead of going to this already-rejected promise.
+        const index = waiters.indexOf(waiter);
+        if (index !== -1) waiters.splice(index, 1);
+        reject(new Error("WebSocket message timeout"));
+      }, timeoutMs);
+      waiters.push(waiter);
     });
   }
 
@@ -411,6 +418,21 @@ async function connectWs(accountId: string, subPath: string): Promise<WsClient> 
 // ---------------------------------------------------------------------------
 // End-to-end: online device
 // ---------------------------------------------------------------------------
+
+describe("WsClient (test helper)", () => {
+  // Regression: a timed-out next() left its waiter queued, so the next message went to the
+  // rejected promise and was lost to every later read.
+  it("a message arriving after a timed-out next() is still read by the next next()", async () => {
+    const acct = testAccount("acct-wsclient-timeout");
+    await enrollDevice(acct);
+    const device = await connectWs(acct, `/devices/${await firstDeviceId(acct)}/connect`);
+
+    await expect(device.next(50)).rejects.toThrow(/timeout/);
+    // The relay answers a non-JSON frame with an error frame; it must reach the next read.
+    device.raw.send("not a JSON message");
+    expect(await device.next()).toEqual({ type: "error", error: "invalid JSON message" });
+  });
+});
 
 describe("AccountRelay — routing (device online)", () => {
   it("E2E: submit → device receives ciphertext → verdict → integrator polls resolved", async () => {
