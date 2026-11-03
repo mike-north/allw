@@ -29,6 +29,7 @@
  * @see https://code.claude.com/docs/en/hooks (tool_name / tool_input; mcp__server__tool naming)
  */
 
+import { agentSafeErrorText, agentSafeText } from "./agent-text.js";
 import type { HookWasm } from "./wasm.js";
 
 /** The `mcp__<server>__<tool>` prefix Claude Code uses for every MCP tool name. */
@@ -62,6 +63,11 @@ const CLAUDE_FILE_EDIT_TOOLS = new Set(["Edit", "MultiEdit", "Write", "NotebookE
  * - `pass-through`: not a gated tool, or a call that runs nothing (a `Monitor` WebSocket watch);
  *   allw makes no decision (`reason` explains why).
  * - `build-error`: gated, but the `ActionRecord` could not be built; deny (`reason` explains why).
+ *
+ * A `reason` is safe to hand the agent as is: every third-party segment it quotes (a tool or server
+ * name, tool input, a core error) has been through the core escape (#364). The `summary` is raw: it
+ * goes to the approver, which applies its own display escape, and a deny reason that quotes it must
+ * escape it first.
  */
 export type GateOutcome =
   | {
@@ -442,9 +448,10 @@ function gatePosixCommand(
   } catch (err) {
     return {
       kind: "build-error",
-      reason: `allw: could not build an ActionRecord for the command (fail-closed deny): ${
-        err instanceof Error ? err.message : String(err)
-      }`,
+      reason: `allw: could not build an ActionRecord for the command (fail-closed deny): ${agentSafeErrorText(
+        wasm,
+        err,
+      )}`,
     };
   }
 }
@@ -513,9 +520,10 @@ export function gateToolCall(
     } catch (err) {
       return {
         kind: "build-error",
-        reason: `allw: could not build an ActionRecord for the PowerShell command (fail-closed deny): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
+        reason: `allw: could not build an ActionRecord for the PowerShell command (fail-closed deny): ${agentSafeErrorText(
+          wasm,
+          err,
+        )}`,
       };
     }
   }
@@ -525,7 +533,8 @@ export function gateToolCall(
     if ("error" in fileEdit) {
       return {
         kind: "build-error",
-        reason: `allw: ${fileEdit.error} (fail-closed deny)`,
+        // The error can quote tool input (a key or an edit mode), so it is escaped (#364).
+        reason: `allw: ${agentSafeText(wasm, fileEdit.error)} (fail-closed deny)`,
       };
     }
 
@@ -544,9 +553,10 @@ export function gateToolCall(
     } catch (err) {
       return {
         kind: "build-error",
-        reason: `allw: could not build an ActionRecord for the file edit (fail-closed deny): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
+        reason: `allw: could not build an ActionRecord for the file edit (fail-closed deny): ${agentSafeErrorText(
+          wasm,
+          err,
+        )}`,
       };
     }
   }
@@ -559,7 +569,8 @@ export function gateToolCall(
       // we cannot build a record for it, so we DENY rather than pass through (fail-closed).
       return {
         kind: "build-error",
-        reason: `allw: MCP tool name '${toolName}' is not a well-formed 'mcp__<server>__<tool>' (fail-closed deny)`,
+        // The name comes from a third-party MCP server, so it is escaped (#364).
+        reason: `allw: MCP tool name '${agentSafeText(wasm, toolName)}' is not a well-formed 'mcp__<server>__<tool>' (fail-closed deny)`,
       };
     }
     // The MCP tool params are the raw `tool_input` object; serialize verbatim for the core.
@@ -574,9 +585,10 @@ export function gateToolCall(
     } catch (err) {
       return {
         kind: "build-error",
-        reason: `allw: could not build an ActionRecord for the MCP tool call (fail-closed deny): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
+        reason: `allw: could not build an ActionRecord for the MCP tool call (fail-closed deny): ${agentSafeErrorText(
+          wasm,
+          err,
+        )}`,
       };
     }
   }
@@ -584,6 +596,6 @@ export function gateToolCall(
   // A genuinely non-Bash, non-MCP, non-file-edit tool (Read/Grep/…) is not gated.
   return {
     kind: "pass-through",
-    reason: `allw: tool '${toolName}' is not gated by allw; passing through`,
+    reason: `allw: tool '${agentSafeText(wasm, toolName)}' is not gated by allw; passing through`,
   };
 }

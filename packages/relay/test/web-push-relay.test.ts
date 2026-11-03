@@ -24,9 +24,10 @@ import { AccountRelay, type Env } from "../src/index.js";
 import {
   ApnsPushTransport,
   FcmPushTransport,
-  WEB_PUSH_COALESCE_MS,
-  WEB_PUSH_TRAILING_RETRY_MS,
+  PUSH_COALESCE_MS,
+  PUSH_TRAILING_RETRY_MS,
   WakeupCoalescer,
+  pushCoalesceKey,
   type PushTransport,
   type PushTransportRegistry,
 } from "../src/push.js";
@@ -658,7 +659,7 @@ describe("submit — Web Push wakeups are coalesced per subscription", () => {
     }
 
     // The first submit wakes both subscriptions; every later one finds a wakeup in flight or
-    // within WEB_PUSH_COALESCE_MS and schedules nothing.
+    // within PUSH_COALESCE_MS and schedules nothing.
     expect(wakeups).toEqual([2, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     await pushFanOutSettled(acct);
     expect(fetcher).toHaveBeenCalledTimes(2);
@@ -687,7 +688,7 @@ describe("submit — Web Push wakeups are coalesced per subscription", () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
-  it("does not coalesce APNs wakeups, which carry the request id", async () => {
+  it("coalesces APNs wakeups per token like Web Push, each token on its own window", async () => {
     const acct = testAccount("acct-webpush-coalesce-apns");
     await pairWithPushTokens(acct, [
       { transport: "webpush", token: FCM_ENDPOINT },
@@ -720,8 +721,9 @@ describe("submit — Web Push wakeups are coalesced per subscription", () => {
     await pushFanOutSettled(acct);
 
     expect(first.data.push_wakeups).toBe(2);
-    expect(second.data.push_wakeups).toBe(1);
-    expect(apnsRequestIds).toEqual([rid("req-coalesce-apns-1"), rid("req-coalesce-apns-2")]);
+    expect(second.data.push_wakeups).toBe(0);
+    // The second submit is owed a trailing wakeup instead (test/native-push-coalescing.test.ts).
+    expect(apnsRequestIds).toEqual([rid("req-coalesce-apns-1")]);
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 });
@@ -734,7 +736,7 @@ describe("submit — Web Push wakeups are coalesced per subscription", () => {
 type RelayInternals = {
   sql: SqlStorage;
   ctx: DurableObjectState;
-  webPushCoalescer: WakeupCoalescer;
+  pushCoalescer: WakeupCoalescer;
   pushTransports: PushTransportRegistry;
   pushFanOut: Promise<void>;
   alarm(): Promise<void>;
@@ -853,8 +855,8 @@ describe("submit — a coalesced submit gets a trailing wakeup when the window e
     // The owed wakeup is due just past the window of the first claim, and the alarm is set for it.
     const [row] = await readTrailingRows(acct);
     expect(row?.token).toBe(FCM_ENDPOINT);
-    expect(row?.due_at).toBeGreaterThanOrEqual(before + WEB_PUSH_COALESCE_MS + 1);
-    expect(row?.due_at).toBeLessThanOrEqual(RELAY_NOW + WEB_PUSH_COALESCE_MS + 1);
+    expect(row?.due_at).toBeGreaterThanOrEqual(before + PUSH_COALESCE_MS + 1);
+    expect(row?.due_at).toBeLessThanOrEqual(RELAY_NOW + PUSH_COALESCE_MS + 1);
     const scheduled = await readAlarmSchedule(acct);
     expect(scheduled.purposes["webpush-trailing-wakeup"]).toBe(row?.due_at);
 
@@ -970,7 +972,7 @@ describe("submit — a coalesced submit gets a trailing wakeup when the window e
 
     expect(fetcher).toHaveBeenCalledTimes(1);
     const [row] = await readTrailingRows(acct);
-    expect(row?.due_at).toBeGreaterThanOrEqual(fired + WEB_PUSH_TRAILING_RETRY_MS);
+    expect(row?.due_at).toBeGreaterThanOrEqual(fired + PUSH_TRAILING_RETRY_MS);
     expect((await readAlarmSchedule(acct)).purposes["webpush-trailing-wakeup"]).toBe(row?.due_at);
   });
 
@@ -990,16 +992,19 @@ describe("submit — a coalesced submit gets a trailing wakeup when the window e
     await runInDurableObject(relayStub(acct), async (instance: AccountRelay) => {
       const relay = instance as unknown as RelayInternals;
       // Claimed long ago and never released: in flight, with its window long over.
-      const stuck = new WakeupCoalescer(WEB_PUSH_COALESCE_MS);
-      stuck.tryClaim(`${String(deviceId)}\0${FCM_ENDPOINT}`, 1);
-      relay.webPushCoalescer = stuck;
+      const stuck = new WakeupCoalescer(PUSH_COALESCE_MS);
+      stuck.tryClaim(
+        pushCoalesceKey({ device_id: String(deviceId), transport: "webpush", token: FCM_ENDPOINT }),
+        1,
+      );
+      relay.pushCoalescer = stuck;
       makeTrailingWakeupsDue(relay);
       await relay.alarm();
     });
 
     expect(fetcher).toHaveBeenCalledTimes(1);
     const [row] = await readTrailingRows(acct);
-    expect(row?.due_at).toBeGreaterThanOrEqual(fired + WEB_PUSH_TRAILING_RETRY_MS);
+    expect(row?.due_at).toBeGreaterThanOrEqual(fired + PUSH_TRAILING_RETRY_MS);
   });
 
   it("clears the owed wakeup when a later submit claims a fresh one after the window", async () => {
@@ -1222,8 +1227,8 @@ describe("submit — a future-dated stored claim blocks for one window at most (
     const before = RELAY_NOW;
     expect(await submitRequest(acct, envelope(rid("req-future-claim-1")))).toBe(0);
     const [row] = await readTrailingRows(acct);
-    expect(row?.due_at).toBeGreaterThanOrEqual(before + WEB_PUSH_COALESCE_MS + 1);
-    expect(row?.due_at).toBeLessThanOrEqual(RELAY_NOW + WEB_PUSH_COALESCE_MS + 1);
+    expect(row?.due_at).toBeGreaterThanOrEqual(before + PUSH_COALESCE_MS + 1);
+    expect(row?.due_at).toBeLessThanOrEqual(RELAY_NOW + PUSH_COALESCE_MS + 1);
 
     // At the window's end the trailing wakeup goes out: the future claim no longer blocks it.
     await runInDurableObject(relayStub(acct), async (instance: AccountRelay) => {
@@ -1232,7 +1237,7 @@ describe("submit — a future-dated stored claim blocks for one window at most (
       // Exactly one window passes; the claim is not aged past it.
       relay.sql.exec(
         `UPDATE device_push_token SET last_wakeup_at = last_wakeup_at - ?`,
-        WEB_PUSH_COALESCE_MS + 1,
+        PUSH_COALESCE_MS + 1,
       );
       await relay.alarm();
       await relay.pushFanOut;
@@ -1263,7 +1268,7 @@ describe("submit — an owed trailing wakeup is cleared only by an accepted wake
 
     // The owed wakeup is kept, and is not due inside the new window.
     const [row] = await readTrailingRows(acct);
-    expect(row?.due_at).toBeGreaterThanOrEqual(claimed + WEB_PUSH_COALESCE_MS + 1);
+    expect(row?.due_at).toBeGreaterThanOrEqual(claimed + PUSH_COALESCE_MS + 1);
 
     status = 201;
     await endWindowAndRunAlarm(acct);

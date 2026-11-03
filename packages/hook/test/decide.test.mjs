@@ -17,7 +17,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { MAX_ERROR_TEXT_CHARS, agentSafeErrorText, decide } from "../dist/lib/decide.js";
+import {
+  MAX_ERROR_TEXT_CHARS,
+  agentSafeErrorText,
+  agentSafeText,
+  decide,
+} from "../dist/lib/decide.js";
 import { loadWasm } from "../dist/lib/wasm.js";
 
 const HOSTNAME = "test-host";
@@ -170,6 +175,44 @@ test("(#274 review) relay text in a thrown error is escaped and capped in the de
   const shown = Array.from(reason.slice(DENY_PREFIX.length));
   assert.equal(shown.length, MAX_ERROR_TEXT_CHARS + 1, "capped, plus the … marker");
   assert.equal(shown.at(-1), "…");
+});
+
+test("(#364) agentSafeText escapes and caps any text the same way, and withholds on failure", async () => {
+  const wasm = await loadWasm();
+  assert.equal(
+    agentSafeText(wasm, `srv\u001b[2J\nX${String.fromCharCode(0x202e)}`),
+    String.raw`srv\x1b[2J\nX⟨U+202E⟩`,
+  );
+  const capped = Array.from(agentSafeText(wasm, "y".repeat(MAX_ERROR_TEXT_CHARS + 10)));
+  assert.equal(capped.length, MAX_ERROR_TEXT_CHARS + 1, "capped, plus the … marker");
+  const broken = {
+    escape_for_display() {
+      throw new Error("core unavailable");
+    },
+  };
+  assert.equal(
+    agentSafeText(broken, "srv"),
+    "details withheld (the display-escaping core is unavailable)",
+  );
+});
+
+test("(#368) agentSafeText never cuts an escape token in half at the cap", async () => {
+  const wasm = await loadWasm();
+  const rlo = String.fromCharCode(0x202e);
+  // 251 + "⟨U+202E⟩" (8) = 259 > 256: a plain cut would end "⟨U+20", which reads as U+0020.
+  assert.equal(agentSafeText(wasm, `${"a".repeat(251)}${rlo}`), `${"a".repeat(251)}…`);
+  // 253 + "\x1b" (4) = 257: a plain cut would end "\x1".
+  assert.equal(agentSafeText(wasm, `${"a".repeat(253)}\u001b`), `${"a".repeat(253)}…`);
+  // Sweep every offset: after removing whole tokens, no "⟨" or "\" is left dangling.
+  const whole = /⟨U\+[0-9A-F]{4,6}⟩|\\x[0-9a-f]{2}|\\[ntr]/gu;
+  for (let pad = 230; pad <= 262; pad += 1) {
+    for (const hidden of [rlo, "\u001b", "\n", String.fromCodePoint(0xe0001)]) {
+      const out = agentSafeText(wasm, `${"a".repeat(pad)}${hidden.repeat(4)}`);
+      assert.ok(Array.from(out).length <= MAX_ERROR_TEXT_CHARS + 1, out);
+      const rest = out.replace(whole, "");
+      assert.ok(!rest.includes("⟨") && !rest.includes("\\"), `a cut token in: ${out.slice(-24)}`);
+    }
+  }
 });
 
 test("agentSafeErrorText withholds the text when the core escape throws", () => {

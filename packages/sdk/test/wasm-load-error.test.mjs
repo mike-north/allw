@@ -10,7 +10,7 @@
  * with an ASCII `...` when cut.
  *
  * The unit tests drive `wasmLoadError` with an injected file-existence check. The integration
- * tests load a copy of the built `dist/wasm.js` against a temporary vendor directory (so the
+ * tests load a copy of the built `dist/wasm.js` (and the escaper it imports) against a temporary vendor directory (so the
  * module memo starts empty and the real vendor dir is untouched).
  *
  * @see https://github.com/mike-north/allw/issues/301
@@ -26,7 +26,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { MAX_WASM_LOAD_CAUSE_CHARS, wasmLoadError } from "../dist/wasm.js";
 
-const DIST_WASM = join(dirname(fileURLToPath(import.meta.url)), "..", "dist", "wasm.js");
+const DIST = join(dirname(fileURLToPath(import.meta.url)), "..", "dist");
+
+/** The built modules the loader needs: `wasm.js` and the escaper it imports. */
+const DIST_MODULES = ["wasm.js", "printable-ascii.js"];
 const DIR = "/opt/allw/vendor/allw-wasm";
 
 const allPresent = () => true;
@@ -133,12 +136,22 @@ test("a non-Error cause, even one that throws when stringified, is described", (
   assert.match(wasmLoadError(DIR, hostile, allPresent).message, /could not be described/);
 });
 
-/** A package-shaped temp dir: `dist/wasm.js` (copied) beside `vendor/allw-wasm/` (as given). */
+test("the vendor dir is quoted escaped too, in both messages (#358)", () => {
+  const dir = "/opt/allw\nallw: APPROVED\u001b[2J/vendor";
+  const shown = "/opt/allw\\u000aallw: APPROVED\\u001b[2J/vendor";
+  for (const exists of [allPresent, () => false]) {
+    const message = wasmLoadError(dir, new Error("x"), exists).message;
+    assert.match(message, PRINTABLE_ASCII, message);
+    assert.ok(message.includes(`from ${shown}`), message);
+  }
+});
+
+/** A package-shaped temp dir: the loader's `dist/` modules (copied) beside `vendor/allw-wasm/` (as given). */
 function packageWithVendor(t, files) {
   const root = mkdtempSync(join(tmpdir(), "allw-wasm-load-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   mkdirSync(join(root, "dist"));
-  copyFileSync(DIST_WASM, join(root, "dist", "wasm.js"));
+  for (const name of DIST_MODULES) copyFileSync(join(DIST, name), join(root, "dist", name));
   writeFileSync(join(root, "package.json"), JSON.stringify({ type: "module" }));
   const vendor = join(root, "vendor", "allw-wasm");
   mkdirSync(vendor, { recursive: true });

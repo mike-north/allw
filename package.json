@@ -10,6 +10,7 @@
   "scripts": {
     "build": "pnpm -r build",
     "build:wasm": "wasm-pack build crates/allw-wasm --target web --out-dir ../../packages/sdk/vendor/allw-wasm --release && node scripts/postbuild-wasm.mjs",
+    "test:no-bidi-controls": "node --test scripts/no-bidi-controls.test.mjs",
     "test:recursive-scripts": "node --test scripts/recursive-scripts.test.mjs",
     "test:uat-codex": "node --test scripts/uat-codex.test.mjs",
     "test:uat-openclaw": "node --test scripts/uat-openclaw.test.mjs",
@@ -17,7 +18,7 @@
     "smoke:packaged-install": "node scripts/smoke-packaged-install.mjs",
     "typecheck": "pnpm -r typecheck",
     "lint": "pnpm -r lint",
-    "test": "pnpm run test:recursive-scripts && pnpm run test:uat-codex && pnpm run test:uat-openclaw && pnpm run test:release && pnpm -r test"
+    "test": "pnpm run test:no-bidi-controls && pnpm run test:recursive-scripts && pnpm run test:uat-codex && pnpm run test:uat-openclaw && pnpm run test:release && pnpm -r test"
   },
   "pnpm": {
     "onlyBuiltDependencies": [

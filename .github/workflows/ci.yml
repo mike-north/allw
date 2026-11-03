@@ -94,8 +94,9 @@ jobs:
       # above because several package tests load the generated WASM glue or compiled workspace deps.
       - run: pnpm -r test
       # Repo-level script guards live outside any package, so `pnpm -r test` does not reach them:
-      # the recursive-script contract and the operator-run UAT helpers (which must never require a
-      # live agent runtime to exist).
+      # the no-raw-bidi-controls source scan, the recursive-script contract and the operator-run
+      # UAT helpers (which must never require a live agent runtime to exist).
+      - run: pnpm run test:no-bidi-controls
       - run: pnpm run test:recursive-scripts
       - run: pnpm run test:uat-codex
       - run: pnpm run test:uat-openclaw

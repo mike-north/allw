@@ -161,26 +161,29 @@ export const MAX_PUSH_TOKENS_PER_TRANSPORT = 2;
 export const MAX_PUSH_TOKENS_PER_ACCOUNT = 32;
 
 /**
- * Minimum spacing between Web Push wakeups to one subscription. Submitting a request needs no caller
- * auth, so without this every submit would fan out real, VAPID-signed pushes: notification spam on
- * the user's browser (service workers must show a notification per push) and, because one VAPID key
- * serves every account, push-service throttling of the whole relay.
+ * Minimum spacing between wakeups to one push token (device + transport + token), for every
+ * transport. Submitting a request needs no caller auth, so without this every submit would fan out
+ * a real push to every registered token: notification spam on the user's devices (service workers
+ * must show a notification per push), and push-service throttling of the whole relay, whose one
+ * VAPID key and one APNs/FCM credential serve every account. With at most
+ * {@link MAX_PUSH_TOKENS_PER_ACCOUNT} tokens, an account gets at most that many wakeups per window
+ * (#248).
  *
- * A Web Push wakeup is payload-less ("check your inbox"), but it covers only requests stored
- * before the service worker's inbox fetch. A submit skipped by coalescing may land after that
- * fetch, so the relay sends one **trailing** wakeup when the window ends (see `AccountRelay`'s
- * `webpush_trailing_wakeup`). Every request then gets a wakeup sent after it was stored, still at
- * most one push per subscription per window. The relay keeps last claims in SQLite, so the bound
+ * A wakeup covers only requests stored before the device's resulting inbox fetch. A submit skipped
+ * by coalescing may land after that fetch, so the relay sends that token one **trailing** wakeup
+ * when the window ends (see `AccountRelay`'s `webpush_trailing_wakeup`, which keeps its original
+ * name but holds every transport). Every request then gets a wakeup sent after it was stored,
+ * still at most one push per token per window. The relay keeps last claims in SQLite, so the bound
  * holds across Durable Object eviction (#319).
  */
-export const WEB_PUSH_COALESCE_MS = 30_000;
+export const PUSH_COALESCE_MS = 30_000;
 
 /**
- * How long a due trailing wakeup waits before trying again when its subscription is still blocked
- * by a wakeup in flight. A fan-out can outlast the coalescing window: each send has a 5 s timeout,
- * and at most 4 run at once.
+ * How long a due trailing wakeup waits before trying again when its token is still blocked by a
+ * wakeup in flight. A fan-out can outlast the coalescing window: each send has a 5 s timeout, and
+ * at most 4 run at once.
  */
-export const WEB_PUSH_TRAILING_RETRY_MS = 1_000;
+export const PUSH_TRAILING_RETRY_MS = 1_000;
 
 /** Most wakeups in flight at once; Workers allow about six open outbound connections. */
 const DEFAULT_PUSH_CONCURRENCY = 4;
@@ -438,21 +441,24 @@ export class FcmPushTransport implements PushTransport {
   }
 }
 
-/** The coalescing key of one Web Push subscription: its device plus endpoint. */
-export function webPushCoalesceKey(deviceId: string, token: string): string {
-  return `${deviceId}\0${token}`;
+/** The coalescing key of one push token: its transport, device and token (one `device_push_token` row). */
+export function pushCoalesceKey(token: StoredPushToken): string {
+  return `${token.transport}\0${token.device_id}\0${token.token}`;
 }
 
 /**
- * The device id and endpoint a {@link webPushCoalesceKey} was built from. Neither contains a NUL:
- * device ids are relay-generated, and an endpoint is a validated URL. Throws on a key with no
- * separator: every key is built by {@link webPushCoalesceKey}, so one without it is a bug, and
- * guessing would read or update the wrong subscription's claim.
+ * The push token a {@link pushCoalesceKey} was built from. None of its parts contains a NUL: the
+ * transport is one of {@link PushTransportKind}, device ids are relay-generated, and tokens are
+ * validated at registration (hex, an FCM token's alphabet, or a URL). Throws on a key that is not
+ * one: every key is built by {@link pushCoalesceKey}, so another is a bug, and guessing would read
+ * or update the wrong token's claim.
  */
-export function parseWebPushCoalesceKey(key: string): { deviceId: string; token: string } {
-  const split = key.indexOf("\0");
-  if (split < 0) throw new Error("not a Web Push coalescing key");
-  return { deviceId: key.slice(0, split), token: key.slice(split + 1) };
+export function parsePushCoalesceKey(key: string): StoredPushToken {
+  const first = key.indexOf("\0");
+  const second = first < 0 ? -1 : key.indexOf("\0", first + 1);
+  const transport = key.slice(0, first);
+  if (second < 0 || !isPushTransportKind(transport)) throw new Error("not a push coalescing key");
+  return { transport, device_id: key.slice(first + 1, second), token: key.slice(second + 1) };
 }
 
 /**
