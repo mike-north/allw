@@ -8,14 +8,16 @@
  *
  * | Variable                 | File key            | Meaning                                                      |
  * | ------------------------ | ------------------- | ------------------------------------------------------------ |
- * | `ALLW_CONFIG`            | —                   | Config-file path (default `~/.allw/config.json`).            |
+ * | `ALLW_CONFIG`            | —                   | Config-file path (absolute; default `~/.allw/config.json`).  |
  * | `ALLW_RELAY_URL`         | `relay_url`         | Base URL of the zero-knowledge relay.                        |
  * | `ALLW_ACCOUNT_ID`        | `account_id`        | The approver's self-certifying relay account id.             |
  * | `ALLW_APPROVER_ROOT_KEY` | `approver_root_key` | The approver account-root Ed25519 public key (base64url).    |
  * | `ALLW_TIMEOUT_MS`        | —                   | Fail-closed deadline in ms (default 300000 = 5 min, capped). |
  * | `ALLW_FETCH_TIMEOUT_MS`  | —                   | Per-relay-fetch timeout in ms (default/max 30000).           |
  *
- * **Fail-closed:** no file and no env, a malformed/unknown-version/incomplete file, a malformed root
+ * **Fail-closed:** no file and no env, a relative `ALLW_CONFIG`, a file that is not a regular file,
+ * is oversize, is not owned by the user or is group/world-writable, a
+ * malformed/unknown-version/incomplete file, a malformed root
  * key, an account id that does not derive from the root key, or a bad timeout all yield a parse
  * error the caller turns into a `deny` with an actionable reason (naming the file path and the env
  * var to fix) — the hook never proceeds on partial config. There is one loader for every surface;

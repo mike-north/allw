@@ -18,9 +18,11 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { execFileSync, spawnSync } from "node:child_process";
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   CLIENT_CONFIG_VERSION,
@@ -28,7 +30,13 @@ import {
   defaultClientConfigPath,
   loadClientConfig,
 } from "../dist/index.js";
+import { MAX_CLIENT_CONFIG_BYTES, loadClientConfigWith } from "../dist/config.js";
 import { loadWasm, loadWasmSync } from "../dist/wasm.js";
+
+const POSIX = process.platform !== "win32";
+const distIndex = pathToFileURL(
+  join(dirname(fileURLToPath(import.meta.url)), "..", "dist", "index.js"),
+).href;
 
 const wasm = await loadWasm();
 
@@ -228,21 +236,184 @@ test("an explicitly named file that does not exist → error", (t) => {
   );
 });
 
-test("an unreadable config path (a directory) → error", (t) => {
+test("a directory at the config path → error (not a regular file)", (t) => {
   const path = join(tempDir(t), "config.json");
   mkdirSync(path);
   assertConfigError(() => loadClientConfig({ env: {}, path }), path, [
-    /could not be read/,
+    /is not a readable regular file/,
     /ALLW_CONFIG/,
+  ]);
+  assert.throws(
+    () => loadClientConfig({ env: {}, path }),
+    (err) => {
+      assert.doesNotMatch(err.message, /permissions/, "no permissions hint unless EACCES");
+      return true;
+    },
+  );
+});
+
+/**
+ * Run the loader against `configPath` in a child process with a hard timeout, so a blocking read
+ * shows up as a timed-out child instead of hanging the test runner.
+ */
+function loadInChild(configPath) {
+  const script =
+    `import(${JSON.stringify(distIndex)}).then((m) => {` +
+    `  try { m.loadClientConfig({ env: { ALLW_CONFIG: ${JSON.stringify(configPath)} } });` +
+    `        process.stdout.write("LOADED"); }` +
+    `  catch (e) { process.stdout.write(e.name + ": " + e.message); }` +
+    `});`;
+  return spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+}
+
+test("a FIFO at ALLW_CONFIG → error, without blocking", { skip: !POSIX }, (t) => {
+  const path = join(tempDir(t), "config.json");
+  execFileSync("mkfifo", ["-m", "600", path]);
+  const child = loadInChild(path);
+  assert.equal(
+    child.error,
+    undefined,
+    `the loader must not block on a FIFO (${String(child.error)})`,
+  );
+  assert.match(child.stdout, /^ClientConfigError: /);
+  assert.match(child.stdout, /is not a readable regular file/);
+  assert.ok(child.stdout.includes(path));
+});
+
+test(
+  "a character device (/dev/zero) at ALLW_CONFIG → error, without blocking",
+  {
+    skip: !POSIX,
+  },
+  () => {
+    const child = loadInChild("/dev/zero");
+    assert.equal(
+      child.error,
+      undefined,
+      `the loader must not read /dev/zero (${String(child.error)})`,
+    );
+    assert.match(child.stdout, /^ClientConfigError: /);
+    assert.match(child.stdout, /\/dev\/zero/);
+  },
+);
+
+test("an oversize config file → error", (t) => {
+  const path = writeConfig(t, " ".repeat(MAX_CLIENT_CONFIG_BYTES + 1));
+  assertConfigError(() => loadClientConfig({ env: {}, path }), path, [
+    new RegExp(`${String(MAX_CLIENT_CONFIG_BYTES)}-byte limit`),
   ]);
 });
 
-test("malformed JSON → error", (t) => {
+test("a config file at exactly the size cap is read", (t) => {
+  const body = JSON.stringify(VALID_FILE);
+  const path = writeConfig(t, body + " ".repeat(MAX_CLIENT_CONFIG_BYTES - body.length));
+  assert.equal(loadClientConfig({ env: {}, path }).accountId, A.accountId);
+});
+
+// ── path rules: absolute only (a relative path would resolve against the agent's cwd) ──────────
+
+test("a relative ALLW_CONFIG → error (must be an absolute path)", () => {
+  assert.throws(
+    () => loadClientConfig({ env: { ALLW_CONFIG: ".allw/config.json" } }),
+    (err) => {
+      assert.ok(err instanceof ClientConfigError);
+      assert.match(err.message, /ALLW_CONFIG '\.allw\/config\.json' must be an absolute path/);
+      return true;
+    },
+  );
+});
+
+test("a relative path option → error (must be an absolute path)", () => {
+  assert.throws(
+    () => loadClientConfig({ env: {}, path: "config.json" }),
+    (err) => {
+      assert.ok(err instanceof ClientConfigError);
+      assert.match(err.message, /path option 'config\.json' must be an absolute path/);
+      return true;
+    },
+  );
+});
+
+test("a leading ~/ in ALLW_CONFIG expands to the home directory", (t) => {
+  const home = tempDir(t);
+  withHome(t, home);
+  mkdirSync(join(home, ".allw"), { mode: 0o700 });
+  writeFileSync(join(home, "alt.json"), JSON.stringify(VALID_FILE), { mode: 0o600 });
+  assert.equal(homedir(), home);
+  assert.equal(loadClientConfig({ env: { ALLW_CONFIG: "~/alt.json" } }).accountId, A.accountId);
+});
+
+// ── POSIX ownership / mode: the trust anchor at rest must be yours and not writable by others ───
+
+test("a group-writable config file → error naming chmod 600", { skip: !POSIX }, (t) => {
+  const path = writeConfig(t, VALID_FILE);
+  chmodSync(path, 0o620);
+  assertConfigError(() => loadClientConfig({ env: {}, path }), path, [
+    /group- or world-writable \(mode 620\)/,
+    new RegExp(`chmod 600 ${path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
+  ]);
+});
+
+test("a world-writable config file → error naming chmod 600", { skip: !POSIX }, (t) => {
+  const path = writeConfig(t, VALID_FILE);
+  chmodSync(path, 0o606);
+  assertConfigError(() => loadClientConfig({ env: {}, path }), path, [
+    /group- or world-writable \(mode 606\)/,
+    /chmod 600/,
+  ]);
+});
+
+test("a group-readable (not writable) config file is accepted", { skip: !POSIX }, (t) => {
+  const path = writeConfig(t, VALID_FILE);
+  chmodSync(path, 0o640);
+  assert.equal(loadClientConfig({ env: {}, path }).accountId, A.accountId);
+});
+
+test("a config file not owned by the effective uid → error naming chown", { skip: !POSIX }, (t) => {
+  const path = writeConfig(t, VALID_FILE);
+  const notMe = (process.geteuid?.() ?? 0) + 4242;
+  assertConfigError(() => loadClientConfigWith({ env: {}, path }, { geteuid: () => notMe }), path, [
+    /not by the current user/,
+    /chown/,
+  ]);
+});
+
+test("the ownership/mode check is skipped on win32", (t) => {
+  const path = writeConfig(t, VALID_FILE);
+  if (POSIX) chmodSync(path, 0o666);
+  const config = loadClientConfigWith(
+    { env: {}, path },
+    { platform: "win32", geteuid: () => 4242 },
+  );
+  assert.equal(config.accountId, A.accountId);
+});
+
+test("malformed JSON → error reporting the position", (t) => {
   const path = writeConfig(t, "{ not json");
   assertConfigError(() => loadClientConfig({ env: {}, path }), path, [
-    /not valid JSON/,
+    /not valid JSON \(at position 2\)/,
     /ALLW_APPROVER_ROOT_KEY/,
   ]);
+});
+
+test("malformed JSON never echoes the file's contents (Node's quoted snippet is stripped)", (t) => {
+  // This parse error's Node message quotes the whole input and carries no position.
+  const secretish = "SECRET-SEED-abcdef";
+  const path = writeConfig(t, `{ "x": ${secretish} }`);
+  assertConfigError(() => loadClientConfig({ env: {}, path }), path, [
+    /not valid JSON \(at an unknown position\)/,
+  ]);
+  assert.throws(
+    () => loadClientConfig({ env: {}, path }),
+    (err) => {
+      assert.ok(!err.message.includes("SECRET"), `contents leaked: ${err.message}`);
+      assert.ok(err.cause instanceof SyntaxError, "the parse error is kept only as { cause }");
+      return true;
+    },
+  );
 });
 
 test("malformed JSON is rejected even when env overrides every field", (t) => {
@@ -267,19 +438,35 @@ test("a JSON non-object → error", (t) => {
   assertConfigError(() => loadClientConfig({ env: {}, path }), path, [/must be a JSON object/]);
 });
 
-test("an unknown version → error", (t) => {
+test("an unknown version → error reporting only its JSON type", (t) => {
   const path = writeConfig(t, { ...VALID_FILE, version: 2 });
   assertConfigError(() => loadClientConfig({ env: {}, path }), path, [
-    /unsupported version 2/,
+    /unsupported version \(got number\)/,
     /only version 1/,
   ]);
+});
+
+test("a string version → error that does not echo the value", (t) => {
+  const path = writeConfig(t, { ...VALID_FILE, version: "hunter2-secret" });
+  assertConfigError(() => loadClientConfig({ env: {}, path }), path, [
+    /unsupported version \(got string\)/,
+  ]);
+  assert.throws(
+    () => loadClientConfig({ env: {}, path }),
+    (err) => {
+      assert.ok(!err.message.includes("hunter2-secret"));
+      return true;
+    },
+  );
 });
 
 test("a missing version → error", (t) => {
   const { version, ...rest } = VALID_FILE;
   void version;
   const path = writeConfig(t, rest);
-  assertConfigError(() => loadClientConfig({ env: {}, path }), path, [/unsupported version/]);
+  assertConfigError(() => loadClientConfig({ env: {}, path }), path, [
+    /unsupported version \(got missing\)/,
+  ]);
 });
 
 for (const [key, envVar] of [
@@ -355,6 +542,24 @@ test("an account_id that does not derive from approver_root_key → error", (t) 
   ]);
 });
 
+test("half-set env: env root B over a file with account A → error naming env var and file key", (t) => {
+  const path = writeConfig(t, VALID_FILE);
+  assertConfigError(
+    () => loadClientConfig({ env: { ALLW_APPROVER_ROOT_KEY: B.rootKey }, path }),
+    path,
+    [
+      /account_id from 'account_id' in .* does not derive from approver_root_key from env var ALLW_APPROVER_ROOT_KEY/,
+    ],
+  );
+});
+
+test("half-set env: env account B over a file with root A → error naming env var and file key", (t) => {
+  const path = writeConfig(t, VALID_FILE);
+  assertConfigError(() => loadClientConfig({ env: { ALLW_ACCOUNT_ID: B.accountId }, path }), path, [
+    /account_id from env var ALLW_ACCOUNT_ID does not derive from approver_root_key from 'approver_root_key' in /,
+  ]);
+});
+
 test("a legacy free-form account_id → error", (t) => {
   const path = writeConfig(t, { ...VALID_FILE, account_id: "my-account" });
   assertConfigError(() => loadClientConfig({ env: {}, path }), path, [/does not derive/]);
@@ -370,7 +575,7 @@ test("the derivation check is the core's (an injected core that rejects is honor
       throw new Error("check_account_id_for_root failed: mismatch");
     },
   };
-  assertConfigError(() => loadClientConfig({ env: {}, path, wasm: fake }), path, [
+  assertConfigError(() => loadClientConfigWith({ env: {}, path }, { wasm: fake }), path, [
     /does not derive/,
   ]);
   assert.equal(checked, 1);

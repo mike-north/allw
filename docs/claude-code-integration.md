@@ -141,19 +141,19 @@ The hook reads the relay coordinates and trust anchor from the shared integrator
 `packages/hook/src/lib/config.ts` wraps it). The env vars below override the file per field (env
 wins); the timeouts are env-only:
 
-| Variable                 | Required | Meaning                                                                                                                                  |
-| ------------------------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `ALLW_CONFIG`            | no       | Config-file path (default `~/.allw/config.json`); when set, the file must exist.                                                         |
-| `ALLW_RELAY_URL`         | no       | Overrides `relay_url`: base URL of the zero-knowledge relay.                                                                             |
-| `ALLW_ACCOUNT_ID`        | no       | Overrides `account_id`: the approver's self-certifying relay account id (must derive from the root key).                                 |
-| `ALLW_APPROVER_ROOT_KEY` | no       | Overrides `approver_root_key`: the approver account-root Ed25519 public key (base64url-unpadded).                                        |
-| `ALLW_TIMEOUT_MS`        | no       | Fail-closed approval deadline in ms (default `300000` = 5 min; must be **strictly below `420000`**, rejected — fail-closed — otherwise). |
-| `ALLW_FETCH_TIMEOUT_MS`  | no       | Per-relay-fetch timeout in ms (default/max `30000`); may only lower the SDK's per-fetch timeout, never raise it.                         |
+| Variable                 | Required | Meaning                                                                                                                                                                                                                                            |
+| ------------------------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ALLW_CONFIG`            | no       | Config-file path (default `~/.allw/config.json`); when set, the file must exist and the path must be an **absolute** path (a leading `~/` is expanded; a relative path is rejected, since it would resolve against the agent's working directory). |
+| `ALLW_RELAY_URL`         | no       | Overrides `relay_url`: base URL of the zero-knowledge relay.                                                                                                                                                                                       |
+| `ALLW_ACCOUNT_ID`        | no       | Overrides `account_id`: the approver's self-certifying relay account id (must derive from the root key).                                                                                                                                           |
+| `ALLW_APPROVER_ROOT_KEY` | no       | Overrides `approver_root_key`: the approver account-root Ed25519 public key (base64url-unpadded).                                                                                                                                                  |
+| `ALLW_TIMEOUT_MS`        | no       | Fail-closed approval deadline in ms (default `300000` = 5 min; must be **strictly below `420000`**, rejected — fail-closed — otherwise).                                                                                                           |
+| `ALLW_FETCH_TIMEOUT_MS`  | no       | Per-relay-fetch timeout in ms (default/max `30000`); may only lower the SDK's per-fetch timeout, never raise it.                                                                                                                                   |
 
 Same shape as `docs/codex-integration.md`'s "Decision Mapping" table — both hooks read the
 identical file and `ALLW_*` overrides, because `readConfig` is one shared function
 (`packages/hook/src/lib/config.ts`, imported by `@allw/codex-hook`). No file and no env, an invalid
-file (malformed JSON, unknown `version`, missing or unknown key), a malformed root key, an account
+file (not a regular file, over 64 KiB, not owned by you or group/world-writable, malformed JSON, unknown `version`, missing or unknown key), a malformed root key, an account
 id that does not derive from the root key, or an `ALLW_TIMEOUT_MS`/`ALLW_FETCH_TIMEOUT_MS` outside
 its bound, is a fail-closed `deny` at config-read time — see
 [Fail-Closed Analysis](#fail-closed-analysis).

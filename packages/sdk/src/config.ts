@@ -20,10 +20,16 @@
  *
  * # Fail-closed (`docs/contract.md` §Invariants #6)
  * The loader never returns a partial config. It throws a {@link ClientConfigError} — whose message
- * names the file path and the env var(s) to fix — when:
+ * names the file path and the env var(s) to fix, and never echoes the file's contents — when:
  *
  * - there is no file and the env does not supply every field;
- * - an explicitly named file (`ALLW_CONFIG` / `path`) does not exist or cannot be read;
+ * - `ALLW_CONFIG` / `path` is not absolute (after expanding a leading `~/`) — a relative path would
+ *   resolve against the agent's working directory, letting a cloned repo supply the trust anchor;
+ * - an explicitly named file (`ALLW_CONFIG` / `path`) does not exist;
+ * - the path is not a readable regular file (a FIFO, device, socket or directory is rejected via
+ *   `fstat` on the opened descriptor, so it can never block the read), or exceeds
+ *   {@link MAX_CLIENT_CONFIG_BYTES};
+ * - on POSIX, the file is not owned by the effective uid, or is group- or world-writable;
  * - the file exists but is malformed JSON, is not an object, has an unknown `version`, is missing a
  *   key, has an unknown key, or has a non-string / empty value — even when the env would override
  *   every field (a corrupted trust-anchor file is never silently skipped);
@@ -43,9 +49,9 @@
  * @see ../../../docs/enrollment.md §Model (self-certifying account ids)
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { closeSync, constants as fsConstants, fstatSync, openSync, readSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 
 import { assertRelayUrlTransport } from "./relay.js";
 import { loadWasmSync, type AllwWasm } from "./wasm.js";
@@ -76,11 +82,28 @@ export interface LoadClientConfigOptions {
   /**
    * The config-file path. Takes precedence over `ALLW_CONFIG`; when either is given the file must
    * exist. Defaults to `~/.allw/config.json`, which may be absent if the env supplies every field.
+   * Must be absolute after a leading `~/` is expanded — a relative path would resolve against the
+   * agent's working directory (e.g. a cloned repo), letting it supply the trust anchor.
    */
   readonly path?: string;
-  /** Override the WASM core (tests). Defaults to {@link loadWasmSync}. */
-  readonly wasm?: Pick<AllwWasm, "account_id_for_root" | "check_account_id_for_root">;
 }
+
+/**
+ * Test seams for {@link loadClientConfigWith}. Not re-exported from the package entry point.
+ *
+ * @internal
+ */
+export interface LoadClientConfigDeps {
+  /** Override the WASM core. Defaults to {@link loadWasmSync}. */
+  readonly wasm?: Pick<AllwWasm, "account_id_for_root" | "check_account_id_for_root">;
+  /** Override the effective uid used for the ownership check (POSIX). */
+  readonly geteuid?: () => number;
+  /** Override the platform (the ownership/mode check is skipped on `win32`). */
+  readonly platform?: NodeJS.Platform;
+}
+
+/** The largest config file the loader reads (bytes). The real file is a few hundred bytes. */
+export const MAX_CLIENT_CONFIG_BYTES = 64 * 1024;
 
 /** A fail-closed config error. `path` is the config-file location the loader consulted. */
 export class ClientConfigError extends Error {
@@ -122,36 +145,181 @@ function describeSource(field: FieldSpec, fromEnv: boolean, path: string): strin
 }
 
 /**
- * Read and validate the config file at `path`. Returns `null` only when the file is absent and was
- * not explicitly requested.
+ * Expand a leading `~/` and require an absolute path. A relative `ALLW_CONFIG` would resolve against
+ * the agent's cwd — a cloned repo could then supply the trust anchor.
  */
-function readConfigFile(path: string, explicit: boolean): Record<string, string> | null {
-  if (!existsSync(path)) {
-    if (!explicit) return null;
+function resolveConfigPath(raw: string, source: string): string {
+  const expanded = raw === "~" || raw.startsWith("~/") ? join(homedir(), raw.slice(1)) : raw;
+  if (!isAbsolute(expanded)) {
     throw new ClientConfigError(
-      `allw: config file ${path} does not exist (named by ${CLIENT_CONFIG_PATH_ENV} or the path ` +
-        `option). Create it, or unset ${CLIENT_CONFIG_PATH_ENV} and set ALLW_RELAY_URL, ALLW_ACCOUNT_ID ` +
-        `and ALLW_APPROVER_ROOT_KEY (fail-closed)`,
-      path,
+      `allw: ${source} '${raw}' must be an absolute path (a leading ~/ is expanded); a relative ` +
+        `path would resolve against the agent's working directory (fail-closed)`,
+      expanded,
     );
   }
-  let text: string;
+  return expanded;
+}
+
+/** The `code` of a Node system error, if any. */
+function errorCode(err: unknown): string | undefined {
+  if (typeof err === "object" && err !== null && "code" in err) {
+    const code = err.code;
+    return typeof code === "string" ? code : undefined;
+  }
+  return undefined;
+}
+
+/** A JSON parse error's position only — never Node's quoted snippet of the file's contents. */
+function jsonErrorPosition(err: unknown): string {
+  const match = err instanceof Error ? /position (\d+)/.exec(err.message) : null;
+  return match?.[1] !== undefined ? `at position ${match[1]}` : "at an unknown position";
+}
+
+/** The JSON type name of a value (never the value itself — it might be something secret). */
+function jsonType(value: unknown): string {
+  if (value === undefined) return "missing";
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  return typeof value;
+}
+
+/**
+ * Open, check, and read the config file through ONE descriptor (no check/read TOCTOU). Returns
+ * `null` only when the file is absent and was not explicitly requested.
+ *
+ * - Opened `O_NONBLOCK` so a FIFO at the path cannot block the open (a synchronous read of a FIFO
+ *   or `/dev/zero` would otherwise hang the hook before any deadline is armed — the host then
+ *   proceeds without a decision).
+ * - `fstat` must report a regular file: a FIFO, device, socket or directory is rejected.
+ * - At most {@link MAX_CLIENT_CONFIG_BYTES} are read.
+ * - On POSIX, the file must be owned by the effective uid and not group- or world-writable: it is
+ *   the trust anchor at rest (`docs/threat-model.md`).
+ */
+function readConfigText(
+  path: string,
+  explicit: boolean,
+  deps: LoadClientConfigDeps,
+): string | null {
+  const platform = deps.platform ?? process.platform;
+  // O_NONBLOCK is POSIX-only (undefined on Windows, where FIFOs at a path do not exist).
+  const optional: Partial<typeof fsConstants> = fsConstants;
+  const flags = fsConstants.O_RDONLY | (optional.O_NONBLOCK ?? 0);
+  let fd: number;
   try {
-    text = readFileSync(path, "utf8");
+    fd = openSync(path, flags);
   } catch (cause) {
+    const code = errorCode(cause);
+    if (code === "ENOENT" && !explicit) return null;
+    if (code === "ENOENT") {
+      throw new ClientConfigError(
+        `allw: config file ${path} does not exist (named by ${CLIENT_CONFIG_PATH_ENV} or the path ` +
+          `option). Create it, or unset ${CLIENT_CONFIG_PATH_ENV} and set ALLW_RELAY_URL, ` +
+          `ALLW_ACCOUNT_ID and ALLW_APPROVER_ROOT_KEY (fail-closed)`,
+        path,
+        { cause },
+      );
+    }
+    if (code === "EACCES" || code === "EPERM") {
+      throw new ClientConfigError(
+        `allw: config file ${path} is not readable by this user (${code}). Fix its permissions ` +
+          `(chmod 600 ${path}, owned by you) or point ${CLIENT_CONFIG_PATH_ENV} at a readable file ` +
+          `(fail-closed)`,
+        path,
+        { cause },
+      );
+    }
     throw new ClientConfigError(
-      `allw: config file ${path} could not be read: ${String(cause)}. Fix its permissions, or point ` +
-        `${CLIENT_CONFIG_PATH_ENV} at a readable file (fail-closed)`,
+      `allw: config file ${path} is not a readable regular file${
+        code !== undefined ? ` (${code})` : ""
+      }. Point ${CLIENT_CONFIG_PATH_ENV} at a regular file (fail-closed)`,
       path,
       { cause },
     );
   }
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) {
+      throw new ClientConfigError(
+        `allw: config file ${path} is not a readable regular file (a directory, FIFO, device or ` +
+          `socket). Point ${CLIENT_CONFIG_PATH_ENV} at a regular file (fail-closed)`,
+        path,
+      );
+    }
+    if (platform !== "win32") {
+      const euid = (deps.geteuid ?? process.geteuid)?.();
+      if (euid !== undefined && stat.uid !== euid) {
+        throw new ClientConfigError(
+          `allw: config file ${path} is owned by uid ${String(stat.uid)}, not by the current user ` +
+            `(uid ${String(euid)}); whoever owns it controls your approval trust anchor. ` +
+            `chown it to yourself (chown $(id -u) ${path}) or write your own (fail-closed)`,
+          path,
+        );
+      }
+      if ((stat.mode & 0o022) !== 0) {
+        throw new ClientConfigError(
+          `allw: config file ${path} is group- or world-writable (mode ${(stat.mode & 0o777)
+            .toString(8)
+            .padStart(3, "0")}); anyone who can write it can redirect approvals. ` +
+            `Run: chmod 600 ${path} (fail-closed)`,
+          path,
+        );
+      }
+    }
+    if (stat.size > MAX_CLIENT_CONFIG_BYTES) {
+      throw new ClientConfigError(
+        `allw: config file ${path} is ${String(stat.size)} bytes, over the ` +
+          `${String(MAX_CLIENT_CONFIG_BYTES)}-byte limit; it should hold only version, relay_url, ` +
+          `account_id and approver_root_key (fail-closed)`,
+        path,
+      );
+    }
+    // Read from the same descriptor, never more than the cap (+1 to detect growth since fstat).
+    const buf = Buffer.alloc(MAX_CLIENT_CONFIG_BYTES + 1);
+    let total = 0;
+    for (;;) {
+      const n = readSync(fd, buf, total, buf.length - total, null);
+      if (n === 0) break;
+      total += n;
+      if (total > MAX_CLIENT_CONFIG_BYTES) {
+        throw new ClientConfigError(
+          `allw: config file ${path} exceeds the ${String(MAX_CLIENT_CONFIG_BYTES)}-byte limit ` +
+            `(fail-closed)`,
+          path,
+        );
+      }
+    }
+    return buf.subarray(0, total).toString("utf8");
+  } catch (cause) {
+    if (cause instanceof ClientConfigError) throw cause;
+    throw new ClientConfigError(
+      `allw: config file ${path} is not a readable regular file (${
+        errorCode(cause) ?? "read failed"
+      }). Point ${CLIENT_CONFIG_PATH_ENV} at a regular file (fail-closed)`,
+      path,
+      { cause },
+    );
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Read and validate the config file at `path`. Returns `null` only when the file is absent and was
+ * not explicitly requested.
+ */
+function readConfigFile(
+  path: string,
+  explicit: boolean,
+  deps: LoadClientConfigDeps,
+): Record<string, string> | null {
+  const text = readConfigText(path, explicit, deps);
+  if (text === null) return null;
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch (cause) {
     throw new ClientConfigError(
-      `allw: config file ${path} is not valid JSON (${String(cause)}). Fix or delete it; ` +
+      `allw: config file ${path} is not valid JSON (${jsonErrorPosition(cause)}). Fix or delete it; ` +
         `the env vars ALLW_RELAY_URL, ALLW_ACCOUNT_ID and ALLW_APPROVER_ROOT_KEY override its ` +
         `fields but never a corrupt file (fail-closed)`,
       path,
@@ -168,7 +336,7 @@ function readConfigFile(path: string, explicit: boolean): Record<string, string>
   const obj = parsed as Record<string, unknown>;
   if (obj.version !== CLIENT_CONFIG_VERSION) {
     throw new ClientConfigError(
-      `allw: config file ${path} has unsupported version ${obj.version === undefined ? "(missing)" : JSON.stringify(obj.version)}; ` +
+      `allw: config file ${path} has an unsupported version (got ${jsonType(obj.version)}); ` +
         `this @allw/sdk understands only version ${String(CLIENT_CONFIG_VERSION)}. Upgrade @allw/sdk ` +
         `or rewrite the file (fail-closed)`,
       path,
@@ -208,16 +376,35 @@ function readConfigFile(path: string, explicit: boolean): Record<string, string>
 /**
  * Load the integrator config: per-field env overrides over the config file, validated fail-closed.
  *
- * @throws {ClientConfigError} on any missing, malformed, or inconsistent input — never a partial
- *   config. The message names the file path and the env var(s) involved.
+ * @throws {ClientConfigError} on any missing, malformed, unsafe, or inconsistent input — never a
+ *   partial config — and when the WASM core needed for validation cannot be loaded. This is the
+ *   only error type it throws. The message names the file path and the env var(s) involved and
+ *   never echoes the file's contents.
  */
 export function loadClientConfig(options: LoadClientConfigOptions = {}): IntegratorConfig {
+  return loadClientConfigWith(options, {});
+}
+
+/**
+ * {@link loadClientConfig} with test seams. Not re-exported from the package entry point.
+ *
+ * @internal
+ */
+export function loadClientConfigWith(
+  options: LoadClientConfigOptions,
+  deps: LoadClientConfigDeps,
+): IntegratorConfig {
   const env = options.env ?? process.env;
   const envPath = envValue(env, CLIENT_CONFIG_PATH_ENV);
   const explicit = options.path !== undefined || envPath !== null;
-  const path = options.path ?? envPath ?? defaultClientConfigPath();
+  const path =
+    options.path !== undefined
+      ? resolveConfigPath(options.path, "the path option")
+      : envPath !== null
+        ? resolveConfigPath(envPath, CLIENT_CONFIG_PATH_ENV)
+        : defaultClientConfigPath();
 
-  const file = readConfigFile(path, explicit);
+  const file = readConfigFile(path, explicit, deps);
 
   const resolved: Record<string, { value: string; fromEnv: boolean }> = {};
   for (const field of FIELDS) {
@@ -261,7 +448,17 @@ export function loadClientConfig(options: LoadClientConfigOptions = {}): Integra
     );
   }
 
-  const wasm = options.wasm ?? loadWasmSync();
+  let wasm: NonNullable<LoadClientConfigDeps["wasm"]>;
+  try {
+    wasm = deps.wasm ?? loadWasmSync();
+  } catch (cause) {
+    throw new ClientConfigError(
+      `allw: cannot validate ${path} — ${cause instanceof Error ? cause.message : String(cause)} ` +
+        `(fail-closed)`,
+      path,
+      { cause },
+    );
+  }
 
   // The core decodes and validates the root key (base64url-unpadded, exactly 32 bytes, a valid
   // Ed25519 point). Deriving the id doubles as that validation.

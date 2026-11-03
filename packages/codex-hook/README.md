@@ -30,7 +30,7 @@ Claude Code hook uses, `~/.allw/config.json` (`0600`; see `docs/quickstart.md` Â
 ```
 
 `ALLW_RELAY_URL`, `ALLW_ACCOUNT_ID`, and `ALLW_APPROVER_ROOT_KEY` override the file per field;
-`ALLW_CONFIG` moves it.
+`ALLW_CONFIG` moves it (an absolute path; a leading `~/` is expanded).
 
 Add the hook to `~/.codex/hooks.json` or a trusted project `.codex/hooks.json`:
 

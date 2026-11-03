@@ -32,16 +32,18 @@ The hook reads the relay coordinates and the approver trust anchor through the s
 ```
 
 Keep it `0600` in a `0700` `~/.allw`: it holds no secrets, but `approver_root_key` is your trust
-anchor — whoever can rewrite it can redirect approvals.
+anchor — whoever can rewrite it can redirect approvals. On POSIX the loader enforces this on read:
+a file not owned by you, or group- or world-writable, is rejected (fix with `chmod 600`), as is
+anything that is not a regular file (a FIFO, device, directory) or is over 64 KiB.
 
-| Variable                 | Required | Meaning                                                                                                                                                                 |
-| ------------------------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ALLW_CONFIG`            | no       | Config-file path (default `~/.allw/config.json`). When set, the file must exist.                                                                                        |
-| `ALLW_RELAY_URL`         | no       | Overrides `relay_url`: base URL of the zero-knowledge relay.                                                                                                            |
-| `ALLW_ACCOUNT_ID`        | no       | Overrides `account_id`: the approver's self-certifying relay account id (must derive from the root key).                                                                |
-| `ALLW_APPROVER_ROOT_KEY` | no       | Overrides `approver_root_key`: the approver account-root Ed25519 public key (base64url-unpadded, 32 bytes).                                                             |
-| `ALLW_TIMEOUT_MS`        | no       | Fail-closed deadline in ms (default `300000` = 5 minutes; must be **below `420000`** — see [the timeout-ordering invariant](#the-timeout-ordering-invariant-issue-52)). |
-| `ALLW_FETCH_TIMEOUT_MS`  | no       | Per-relay-fetch timeout in ms (default/max `30000`); may lower the SDK default for faster fail-closed decisions, but may not raise it.                                  |
+| Variable                 | Required | Meaning                                                                                                                                                                                                                                            |
+| ------------------------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ALLW_CONFIG`            | no       | Config-file path (default `~/.allw/config.json`). When set, the file must exist and the path must be an **absolute** path (a leading `~/` is expanded; a relative path is rejected, since it would resolve against the agent's working directory). |
+| `ALLW_RELAY_URL`         | no       | Overrides `relay_url`: base URL of the zero-knowledge relay.                                                                                                                                                                                       |
+| `ALLW_ACCOUNT_ID`        | no       | Overrides `account_id`: the approver's self-certifying relay account id (must derive from the root key).                                                                                                                                           |
+| `ALLW_APPROVER_ROOT_KEY` | no       | Overrides `approver_root_key`: the approver account-root Ed25519 public key (base64url-unpadded, 32 bytes).                                                                                                                                        |
+| `ALLW_TIMEOUT_MS`        | no       | Fail-closed deadline in ms (default `300000` = 5 minutes; must be **below `420000`** — see [the timeout-ordering invariant](#the-timeout-ordering-invariant-issue-52)).                                                                            |
+| `ALLW_FETCH_TIMEOUT_MS`  | no       | Per-relay-fetch timeout in ms (default/max `30000`); may lower the SDK default for faster fail-closed decisions, but may not raise it.                                                                                                             |
 
 Each of `relay_url`, `account_id`, `approver_root_key` must come from the file or its env override.
 With neither, or with a malformed/unknown-version/incomplete file, a malformed root key, or an
