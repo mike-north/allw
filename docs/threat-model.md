@@ -576,6 +576,9 @@ attestation, audit records, hook/SDK fail-closed behavior, or enrollment.
 - [ ] Audit records contain the verdict artifact, request hash, actor, action, policy result, and previous hash.
 - [ ] New config has fail-closed validation and cannot weaken timeout-ordering or verification guarantees.
 - [ ] Integrator trust-anchor config (`~/.allw/config.json` + `ALLW_*` overrides) is read only through `loadClientConfig`; it never holds secrets, and the account-id/root-key consistency check goes through the core.
+- [ ] The config path is absolute however it is reached (`ALLW_CONFIG`, the path option, or the `HOME`-based default), and
+      loader errors, which the hooks hand the agent as deny reasons, never echo file content: no values, no key
+      names, no rejected `relay_url` (#301).
 
 ## Review Evidence To Include In PRs
 
