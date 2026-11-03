@@ -99,6 +99,7 @@ const SEAL_PHONE_SEED: [u8; 32] = [0x51; 32];
 const SEAL_LAPTOP_SEED: [u8; 32] = [0x52; 32];
 const SEAL_REVOKED_SEED: [u8; 32] = [0x53; 32];
 const SEAL_INJECTED_SEED: [u8; 32] = [0x5E; 32];
+const SEAL_EXPIRED_SEED: [u8; 32] = [0x54; 32];
 /// The seal set's current sequence (and the floor the vector seals with).
 const SEAL_SEQUENCE: u64 = 3;
 
@@ -181,7 +182,7 @@ struct WasmVector {
     /// JSON array of root-signed account-state JWS for sealing (see [`seal_account_states`]).
     seal_account_states_json: String,
     /// JSON object `{ device_id: x25519_seed_b64 }` for every device in the seal set, including the
-    /// revoked `old` and the never-vouched `injected` (listed only in the stale sequence).
+    /// revoked `old`, the `expired` one and the never-vouched `injected` (stale sequence only).
     seal_x25519_seeds_json: String,
     /// JSON array of the device ids the seal must encrypt to, written from the rules.
     seal_expected_recipient_ids_json: String,
@@ -368,7 +369,8 @@ fn x25519_device(id: &str, seed: &[u8; 32]) -> AccountStateDevice {
 
 /// The seal vector's account-state set:
 /// - sequence 2 (stale): lists `injected`, which must get no recipient entry;
-/// - sequence 3: `phone` and `laptop` active; `old` active but revoked (no entry).
+/// - sequence 3: `phone` and `laptop` active; `old` active but revoked, and `expired` whose cert
+///   expires at [`RECIPIENT_NOW_MS`] (neither gets an entry).
 fn seal_account_states(root: &SigningKeyPair) -> Vec<String> {
     let account_id = account_id_for_root(&root.public_key());
     let state = |sequence: u64, devices: Vec<AccountStateDevice>, revoked: &[&str]| AccountState {
@@ -403,6 +405,10 @@ fn seal_account_states(root: &SigningKeyPair) -> Vec<String> {
             x25519_device("phone", &SEAL_PHONE_SEED),
             x25519_device("laptop", &SEAL_LAPTOP_SEED),
             x25519_device("old", &SEAL_REVOKED_SEED),
+            AccountStateDevice {
+                cert_expires_at: Some(RECIPIENT_NOW_MS),
+                ..x25519_device("expired", &SEAL_EXPIRED_SEED)
+            },
         ],
         &["old"],
     );
@@ -418,6 +424,7 @@ fn seal_x25519_seeds_json() -> String {
         ("laptop", SEAL_LAPTOP_SEED),
         ("old", SEAL_REVOKED_SEED),
         ("injected", SEAL_INJECTED_SEED),
+        ("expired", SEAL_EXPIRED_SEED),
     ]
     .iter()
     .map(|(id, seed)| ((*id).to_string(), URL_SAFE_NO_PAD.encode(seed).into()))
@@ -532,8 +539,8 @@ fn build_vector() -> WasmVector {
         seal_account_states_json: serde_json::to_string(&seal_account_states(&root))
             .expect("account states serialize"),
         seal_x25519_seeds_json: seal_x25519_seeds_json(),
-        // Spec (recipients.rs rules): the stale `injected` and the revoked `old` are excluded;
-        // recipients are sorted by device id.
+        // Spec (recipients.rs rules): the stale `injected`, the revoked `old` and the `expired`
+        // device are excluded; recipients are sorted by device id.
         seal_expected_recipient_ids_json: r#"["laptop","phone"]"#.to_string(),
         seal_sequence: SEAL_SEQUENCE,
     }
@@ -738,7 +745,8 @@ fn fixture_recipients_follow_the_selection_rules() {
 }
 
 /// Sealing the fixture's seal set encrypts to exactly `laptop` and `phone`, each of which can open
-/// it; the revoked `old` and the never-vouched `injected` get no recipient entry. The node test
+/// it; the revoked `old`, the `expired` device and the never-vouched `injected` get no recipient
+/// entry, and the reported sequence is the selected one whatever floor is passed. The node test
 /// runs the same check through the WASM export.
 #[test]
 fn fixture_seal_encrypts_only_to_vouched_devices() {
@@ -789,11 +797,35 @@ fn fixture_seal_encrypts_only_to_vouched_devices() {
             "{id} must open the sealed context"
         );
     }
-    for id in ["old", "injected"] {
+    // RFC 7516 §7.2.1: exactly one `recipients[]` entry per selected device, nothing else.
+    let jwe: serde_json::Value = serde_json::from_str(&sealed.ciphertext).expect("JWE is JSON");
+    let kids: Vec<&str> = jwe["recipients"]
+        .as_array()
+        .expect("General JWE has a recipients array")
+        .iter()
+        .map(|r| r["header"]["kid"].as_str().expect("kid"))
+        .collect();
+    assert_eq!(kids, expected);
+    for id in ["old", "injected", "expired"] {
         assert_eq!(
             decrypt_context(&sealed.ciphertext, id, &key(id)),
             Err(JweError::NoRecipientForDevice),
             "{id} must get no recipient entry"
         );
+    }
+
+    // The sequence is the selected one, never the caller's floor: same with a lower floor or none.
+    for floor in [Some(1), None] {
+        let resealed = seal_context_for_account_state(
+            &context,
+            &refs,
+            &committed.expected_account_id_for_root,
+            &root,
+            committed.recipient_now_ms,
+            floor,
+            &mut ChaCha20Rng::from_seed([0x42; 32]),
+        )
+        .expect("a lower floor still seals");
+        assert_eq!(resealed.sequence, SEAL_SEQUENCE, "floor {floor:?}");
     }
 }

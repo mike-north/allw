@@ -2465,14 +2465,34 @@ test("seal_context_for_account_state encrypts only to the vouched devices in the
       `${id} opens the sealed context`,
     );
   }
-  // The revoked device and a key the root never vouched for (listed only in a stale sequence)
-  // get no recipient entry.
-  for (const id of ["old", "injected"]) {
+  // The revoked device, the expired one, and a key the root never vouched for (listed only in a
+  // stale sequence) get no recipient entry.
+  for (const id of ["old", "injected", "expired"]) {
     assert.throws(
       () => wasm.decrypt_context(sealed.ciphertext, id, seeds[id]),
       /no recipient header kid matches/,
       id,
     );
+  }
+});
+
+test("seal_context_for_account_state reports the selected sequence, not the caller's floor", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  // Spec (sealing.rs): `sequence` is the highest verified sequence the recipients came from; the
+  // caller persists it as its floor, so returning the floor itself would let a rollback through.
+  for (const floor of [1, undefined]) {
+    const sealed = JSON.parse(
+      wasm.seal_context_for_account_state(
+        v.context_json,
+        v.seal_account_states_json,
+        v.expected_account_id_for_root,
+        v.approver_root_pubkey_b64,
+        v.recipient_now_ms,
+        floor,
+      ),
+    );
+    assert.equal(sealed.sequence, 3, `floor ${String(floor)}`);
   }
 });
 
