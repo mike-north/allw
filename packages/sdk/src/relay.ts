@@ -20,6 +20,52 @@ export interface DeviceRecord {
   readonly created_at: number;
 }
 
+/**
+ * The shape a relay-listed `device_id` must have before the SDK uses it. The relay mints device ids
+ * as UUIDs; this accepts the base64url alphabet up to 64 characters, so an honest id always passes.
+ *
+ * The relay is untrusted, and a device id flows into JWE recipient headers, the revocation filter,
+ * and error messages that the hooks put in the agent-visible deny reason. Rejecting anything else
+ * (newlines, quotes, control characters, unbounded length) keeps relay-chosen text from reaching
+ * the agent as if it were an allw diagnostic.
+ */
+const DEVICE_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
+/**
+ * Whether one relay device-list entry carries the fields the SDK routes on: a well-formed
+ * `device_id` ({@link DEVICE_ID_PATTERN}) and a string `pubkey`. The key bytes themselves are
+ * checked by the core when it encrypts. `label` and `created_at` are informational and unused here,
+ * so they are not checked.
+ */
+function hasRoutableRecipientFields(
+  value: unknown,
+): value is Pick<DeviceRecord, "device_id" | "pubkey"> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.device_id === "string" &&
+    DEVICE_ID_PATTERN.test(record.device_id) &&
+    typeof record.pubkey === "string"
+  );
+}
+
+/**
+ * Read a relay response body as JSON. A body that isn't JSON becomes a {@link RelayError} naming only
+ * the call and the status: the parser's own message quotes the start of the body, and relay text
+ * must not reach the agent through the hooks' deny reason. Other failures (a network error while
+ * reading the body) are rethrown unchanged, so they stay transport failures.
+ */
+async function readJsonBody(resp: Response, call: string): Promise<unknown> {
+  try {
+    return (await resp.json()) as unknown;
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      throw new RelayError(`relay ${call} returned a non-JSON body`, resp.status);
+    }
+    throw err;
+  }
+}
+
 /** The relay-visible `ApprovalRequest` envelope — exactly the contract's key set, nothing more. */
 export interface ApprovalRequestEnvelope {
   readonly v: number;
@@ -250,20 +296,32 @@ export class RelayClient {
   /**
    * Fetch the approver's enrolled devices (`GET /:acct/devices`) to use as JWE recipients.
    *
-   * @throws {RelayError} on a non-2xx response or a malformed body.
+   * Every entry must have a well-formed `device_id` and a string `pubkey`. One bad entry fails the
+   * whole call (fail-closed) rather than being dropped, and the error names only its index, never
+   * the relay-supplied text.
+   *
+   * @throws {RelayError} on a non-2xx response, a malformed body, or a malformed device entry.
    */
   async fetchDevices(): Promise<readonly DeviceRecord[]> {
     const resp = await this.timedFetch(`${this.base}/devices`, { method: "GET" });
     if (!resp.ok) {
       throw new RelayError(`relay device list failed (HTTP ${String(resp.status)})`, resp.status);
     }
-    const body: unknown = await resp.json();
+    const body = await readJsonBody(resp, "device list");
     if (typeof body !== "object" || body === null || !("devices" in body)) {
       throw new RelayError("relay device list returned a malformed body", resp.status);
     }
     const devices: unknown = body.devices;
     if (!Array.isArray(devices)) {
       throw new RelayError("relay device list 'devices' is not an array", resp.status);
+    }
+    const malformed = devices.findIndex((d) => !hasRoutableRecipientFields(d));
+    if (malformed !== -1) {
+      throw new RelayError(
+        `relay device list entry ${String(malformed)} is malformed (device_id must match ` +
+          `${DEVICE_ID_PATTERN.source} and pubkey must be a string)`,
+        resp.status,
+      );
     }
     return devices as readonly DeviceRecord[];
   }
@@ -272,7 +330,11 @@ export class RelayClient {
    * Submit an `ApprovalRequest` envelope (`POST /:acct/requests`). The relay stores it opaquely and
    * fans the ciphertext out to online devices.
    *
-   * @throws {RelayError} on a non-2xx response (e.g. 400 malformed envelope, 409 duplicate id).
+   * The relay's error body is not included in the message, only the status: the relay is untrusted,
+   * and the message can reach the agent through the hooks' deny reason.
+   *
+   * @throws {RelayError} on a non-2xx response (e.g. 400 malformed envelope, 409 duplicate id), or a
+   *   success body that is not JSON or carries no auth token.
    */
   async submit(envelope: ApprovalRequestEnvelope): Promise<void> {
     const resp = await this.timedFetch(`${this.base}/requests`, {
@@ -281,21 +343,9 @@ export class RelayClient {
       body: JSON.stringify(envelope),
     });
     if (!resp.ok) {
-      let detail = "";
-      try {
-        const body: unknown = await resp.json();
-        if (typeof body === "object" && body !== null && "error" in body) {
-          detail = `: ${String(body.error)}`;
-        }
-      } catch {
-        // Non-JSON error body — the status alone is the signal.
-      }
-      throw new RelayError(
-        `relay submit failed (HTTP ${String(resp.status)})${detail}`,
-        resp.status,
-      );
+      throw new RelayError(`relay submit failed (HTTP ${String(resp.status)})`, resp.status);
     }
-    const body: unknown = await resp.json();
+    const body = await readJsonBody(resp, "submit");
     if (
       typeof body !== "object" ||
       body === null ||
@@ -324,7 +374,7 @@ export class RelayClient {
     if (!resp.ok) {
       throw new RelayError(`relay poll failed (HTTP ${String(resp.status)})`, resp.status);
     }
-    const body: unknown = await resp.json();
+    const body = await readJsonBody(resp, "poll");
     if (typeof body !== "object" || body === null || !("status" in body)) {
       throw new RelayError("relay poll returned a malformed body", resp.status);
     }

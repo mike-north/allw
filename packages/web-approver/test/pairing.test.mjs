@@ -25,12 +25,19 @@
  */
 
 import assert from "node:assert/strict";
-import test, { describe } from "node:test";
+import test, { before, describe } from "node:test";
 
 import { JSDOM } from "jsdom";
 
-import { mountPairingGate, createLocalPairingStore } from "../dist/index.js";
+import {
+  INSECURE_RELAY_URL_REASON,
+  WITHHELD_PIN_TEXT,
+  createLocalPairingStore,
+  mountPairingGate,
+} from "../dist/index.js";
 import { mountWebApprover } from "../dist/browser.js";
+
+import { loadTestWasm } from "./wasm-helper.mjs";
 
 // ── Fixed clock (never Date.now() in test data) ───────────────────────────
 
@@ -38,6 +45,10 @@ const NOW = Date.parse("2026-06-12T16:00:00.000Z");
 const SOON = NOW + 60_000;
 
 // ── Fixture helpers ───────────────────────────────────────────────────────
+
+/** `PairingStore.load()` results with no payload. */
+const ABSENT = { status: "absent" };
+const CORRUPT = { status: "corrupt" };
 
 /** A minimal valid `ApproverIdentity` (fixed seeds, not real cryptographic material). */
 const VALID_IDENTITY = {
@@ -255,7 +266,7 @@ describe("mountPairingGate — returning device", () => {
       resetBtn.click();
 
       // After reset, the stored identity is cleared and the pairing form is shown.
-      assert.equal(store.load(), null, "store must be cleared after reset");
+      assert.deepEqual(store.load(), ABSENT, "store must be cleared after reset");
       assert.ok(root.querySelector("form.pairing-form"), "pairing form must be shown after reset");
       assert.equal(pairings.length, 0, "onPaired must NOT fire on reset");
     } finally {
@@ -332,8 +343,8 @@ describe("mountPairingGate — pairing ceremony", () => {
       assert.deepEqual(pairings[0], VALID_IDENTITY, "onPaired receives the submitted identity");
 
       // The identity must be persisted so returning visits show the returning screen.
-      const loaded = store.load();
-      assert.ok(loaded !== null, "identity must be persisted after pairing");
+      const { status, identity: loaded } = store.load();
+      assert.equal(status, "paired", "identity must be persisted after pairing");
       assert.equal(loaded.accountId, VALID_IDENTITY.accountId);
       assert.equal(loaded.deviceId, VALID_IDENTITY.deviceId);
     } finally {
@@ -550,53 +561,51 @@ describe("mountWebApprover — pairingStore inbox gating", () => {
 // ── createLocalPairingStore ───────────────────────────────────────────────
 
 describe("createLocalPairingStore", () => {
-  test("load returns null when nothing is stored", () => {
+  test("load reports absent when nothing is stored", () => {
     const store = createLocalPairingStore(memoryStorage());
-    assert.equal(store.load(), null);
+    assert.deepEqual(store.load(), ABSENT);
   });
 
   test("save + load round-trips a valid identity", () => {
     const store = createLocalPairingStore(memoryStorage());
     store.save(VALID_IDENTITY);
-    const loaded = store.load();
-    assert.ok(loaded !== null, "saved identity must be loadable");
-    assert.deepEqual(loaded, VALID_IDENTITY);
+    assert.deepEqual(store.load(), { status: "paired", identity: VALID_IDENTITY });
   });
 
   test("clear removes the stored identity", () => {
     const store = createLocalPairingStore(memoryStorage());
     store.save(VALID_IDENTITY);
     store.clear();
-    assert.equal(store.load(), null, "cleared store must return null");
+    assert.deepEqual(store.load(), ABSENT, "cleared store must report absent");
   });
 
-  test("load returns null for corrupt stored JSON", () => {
+  test("load reports corrupt for unparseable stored JSON", () => {
     const storage = memoryStorage();
     storage.setItem("allw:pairing:v1", "NOT-VALID-JSON{{{{");
     const store = createLocalPairingStore(storage);
-    assert.equal(store.load(), null, "corrupt JSON must return null (fail-closed)");
+    assert.deepEqual(store.load(), CORRUPT, "corrupt JSON must not load (fail-closed)");
   });
 
-  test("load returns null when stored object is missing required fields", () => {
+  test("load reports corrupt when the stored object is missing required fields", () => {
     const storage = memoryStorage();
     storage.setItem("allw:pairing:v1", JSON.stringify({ accountId: "only-one" }));
     const store = createLocalPairingStore(storage);
-    assert.equal(store.load(), null, "partial identity must return null (fail-closed)");
+    assert.deepEqual(store.load(), CORRUPT, "partial identity must not load (fail-closed)");
   });
 
-  test("load returns null for a stored array (not an object)", () => {
+  test("load reports corrupt for a stored array (not an object)", () => {
     const storage = memoryStorage();
     storage.setItem("allw:pairing:v1", JSON.stringify([]));
     const store = createLocalPairingStore(storage);
-    assert.equal(store.load(), null, "array value must return null (fail-closed)");
+    assert.deepEqual(store.load(), CORRUPT, "array value must not load (fail-closed)");
   });
 
-  test("load returns null for an identity with an empty-string field", () => {
+  test("load reports corrupt for an identity with an empty-string field", () => {
     const storage = memoryStorage();
     const withEmptyField = { ...VALID_IDENTITY, deviceId: "" };
     storage.setItem("allw:pairing:v1", JSON.stringify(withEmptyField));
     const store = createLocalPairingStore(storage);
-    assert.equal(store.load(), null, "identity with empty string field must return null");
+    assert.deepEqual(store.load(), CORRUPT, "identity with empty string field must not load");
   });
 });
 
@@ -607,31 +616,99 @@ describe("createLocalPairingStore — pinned relay (#249)", () => {
     const storage = memoryStorage();
     const store = createLocalPairingStore(storage);
     store.save({ ...VALID_IDENTITY, relayUrl: "https://relay.example.com" });
-    assert.equal(store.load().relayUrl, "https://relay.example.com");
+    assert.equal(store.load().identity.relayUrl, "https://relay.example.com");
   });
 
-  test("a stored pin to a plaintext http:// remote relay is treated as corrupt (fail-closed)", () => {
+  test("a stored pin to a plaintext http:// remote relay is rejected, never loaded (fail-closed)", () => {
     const storage = memoryStorage();
     storage.setItem(
       "allw:pairing:v1",
       JSON.stringify({ ...VALID_IDENTITY, relayUrl: "http://relay.example.com" }),
     );
-    assert.equal(createLocalPairingStore(storage).load(), null);
+    const stored = storage.getItem("allw:pairing:v1");
+    assert.deepEqual(createLocalPairingStore(storage).load(), {
+      status: "relay-pin-rejected",
+      pinnedRelayUrl: "http://relay.example.com",
+      reason: INSECURE_RELAY_URL_REASON,
+      snapshot: stored,
+    });
   });
 
-  test("a stored pin that is not canonical (trailing slash) is treated as corrupt", () => {
+  test("a stored pin to http://[::1] (accepted by older builds) is rejected, never loaded (#286)", () => {
+    const storage = memoryStorage();
+    storage.setItem(
+      "allw:pairing:v1",
+      JSON.stringify({ ...VALID_IDENTITY, relayUrl: "http://[::1]:8787" }),
+    );
+    const loaded = createLocalPairingStore(storage).load();
+    assert.equal(loaded.status, "relay-pin-rejected");
+    assert.equal(loaded.pinnedRelayUrl, "http://[::1]:8787");
+    assert.equal(loaded.identity, undefined, "a rejected pin never exposes the identity");
+  });
+
+  test("a stored pin that is not canonical (trailing slash) is rejected and names the canonical form", () => {
     const storage = memoryStorage();
     storage.setItem(
       "allw:pairing:v1",
       JSON.stringify({ ...VALID_IDENTITY, relayUrl: "https://relay.example.com/" }),
     );
-    assert.equal(createLocalPairingStore(storage).load(), null);
+    const loaded = createLocalPairingStore(storage).load();
+    assert.equal(loaded.status, "relay-pin-rejected");
+    // The reason is fixed text: it is shown unescaped, so it never embeds the (untrusted) pin.
+    assert.equal(
+      loaded.reason,
+      "This version stores relay URLs in canonical form, and this pin is not in that form.",
+    );
   });
 
-  test("a stored pin that is not a string is treated as corrupt", () => {
+  for (const [label, pin] of [
+    ["an empty pin", ""],
+    ["an unparseable pin", "not a url"],
+  ]) {
+    test(`${label} is rejected with a reason that doesn't prompt for input (N1)`, () => {
+      const storage = memoryStorage();
+      storage.setItem("allw:pairing:v1", JSON.stringify({ ...VALID_IDENTITY, relayUrl: pin }));
+      const loaded = createLocalPairingStore(storage).load();
+      assert.equal(loaded.status, "relay-pin-rejected");
+      assert.equal(loaded.reason, "The stored relay is not a valid URL.");
+    });
+  }
+
+  test("clearIfUnchanged clears only the exact value that was loaded", () => {
+    const storage = memoryStorage();
+    const store = createLocalPairingStore(storage);
+    storage.setItem(
+      "allw:pairing:v1",
+      JSON.stringify({ ...VALID_IDENTITY, relayUrl: "http://[::1]:8787" }),
+    );
+    const { snapshot } = store.load();
+
+    store.save({ ...VALID_IDENTITY, deviceId: "dev-newer", relayUrl: "http://127.0.0.1:8787" });
+    assert.equal(store.clearIfUnchanged(snapshot), false, "a newer value is never cleared");
+    assert.equal(store.load().identity.deviceId, "dev-newer");
+
+    storage.setItem(
+      "allw:pairing:v1",
+      JSON.stringify({ ...VALID_IDENTITY, relayUrl: "http://[::1]:8787" }),
+    );
+    assert.equal(store.clearIfUnchanged(store.load().snapshot), true);
+    assert.deepEqual(store.load(), ABSENT);
+  });
+
+  test("a stored pin that is not a string is corrupt (not a re-pair state)", () => {
     const storage = memoryStorage();
     storage.setItem("allw:pairing:v1", JSON.stringify({ ...VALID_IDENTITY, relayUrl: 42 }));
-    assert.equal(createLocalPairingStore(storage).load(), null);
+    assert.deepEqual(createLocalPairingStore(storage).load(), CORRUPT);
+  });
+
+  test("a rejected pin with a missing identity field is corrupt, not a re-pair state", () => {
+    const storage = memoryStorage();
+    const { deviceAuthToken: _omitted, ...partial } = VALID_IDENTITY;
+    storage.setItem(
+      "allw:pairing:v1",
+      JSON.stringify({ ...partial, relayUrl: "http://[::1]:8787" }),
+    );
+    assert.deepEqual(createLocalPairingStore(storage).load(), CORRUPT);
   });
 });
 
@@ -660,7 +737,7 @@ describe("mountPairingGate — relay shown and pinned at pairing (#249)", () => 
 
       assert.equal(pairings.length, 1);
       assert.equal(pairings[0].relayUrl, "https://relay.example.com");
-      assert.equal(store.load().relayUrl, "https://relay.example.com");
+      assert.equal(store.load().identity.relayUrl, "https://relay.example.com");
     } finally {
       restore();
     }
@@ -686,6 +763,210 @@ describe("mountPairingGate — relay shown and pinned at pairing (#249)", () => 
       );
       unlock.click();
       assert.equal(pairings[0].relayUrl, "https://relay.example.com");
+    } finally {
+      restore();
+    }
+  });
+});
+
+// ── Re-pair required: a stored pin this build rejects (#286) ─────────────
+
+describe("mountPairingGate — stored pin this build rejects (#286)", () => {
+  const PAIRING_KEY = "allw:pairing:v1";
+
+  /**
+   * The core's `escape_for_display` (#246), loaded from the vendored WASM. The re-pair screen
+   * renders a stored pin only through it; `null` until `before` loads it.
+   */
+  let coreEscape = null;
+  before(async () => {
+    const wasm = await loadTestWasm();
+    coreEscape = (text) => wasm.escape_for_display(text);
+  });
+
+  /**
+   * Mount the gate over a stored identity. `escapeForDisplay` defaults to the real core escape;
+   * pass `null` to model a core that did not load.
+   */
+  function mountWithStored(storedIdentity, { escapeForDisplay = coreEscape } = {}) {
+    const { dom, root, restore } = installDom();
+    const storage = memoryStorage();
+    const storedRaw = JSON.stringify(storedIdentity);
+    storage.setItem(PAIRING_KEY, storedRaw);
+    const pairings = [];
+    mountPairingGate({
+      root,
+      pairingStore: createLocalPairingStore(storage),
+      relayUrl: "http://127.0.0.1:8787",
+      ...(escapeForDisplay === null ? {} : { escapeForDisplay }),
+      onPaired: (identity) => pairings.push(identity),
+    });
+    return { dom, root, restore, storage, storedRaw, pairings };
+  }
+
+  test("shows the re-pair state naming the pinned relay and why, and keeps the identity", () => {
+    const { root, restore, storage, storedRaw, pairings } = mountWithStored({
+      ...VALID_IDENTITY,
+      relayUrl: "http://[::1]:8787",
+    });
+    try {
+      assert.equal(root.querySelector(".pairing-kicker").textContent, "Re-pair required");
+      assert.equal(root.querySelector(".pairing-relay-url").textContent, "http://[::1]:8787");
+      assert.match(root.querySelector(".pairing-relay-note").textContent, /127\.0\.0\.1/);
+      assert.equal(root.querySelector("form.pairing-form"), null, "no pairing form yet");
+      assert.equal(storage.getItem(PAIRING_KEY), storedRaw, "nothing is cleared before confirm");
+      assert.equal(pairings.length, 0, "a rejected pin never reaches the inbox");
+    } finally {
+      restore();
+    }
+  });
+
+  test("clears the identity only when the human confirms, then shows the pairing form", () => {
+    const { root, restore, storage, pairings } = mountWithStored({
+      ...VALID_IDENTITY,
+      relayUrl: "http://[::1]:8787",
+    });
+    try {
+      const confirm = [...root.querySelectorAll("button")].find(
+        (b) => b.textContent === "Forget this pairing and pair again",
+      );
+      assert.ok(confirm, "the confirm action is shown");
+      confirm.click();
+
+      assert.equal(storage.getItem(PAIRING_KEY), null, "cleared on confirm");
+      assert.ok(root.querySelector("form.pairing-form"), "the pairing form follows");
+      assert.equal(root.querySelector(".pairing-relay-url").textContent, "http://127.0.0.1:8787");
+      assert.equal(pairings.length, 0);
+    } finally {
+      restore();
+    }
+  });
+
+  test("renders a hostile pin through the core escape (bidi override and ESC never reach the DOM)", () => {
+    const { root, restore } = mountWithStored({
+      ...VALID_IDENTITY,
+      relayUrl: "http://evil\u202Eexample.com\u001B",
+    });
+    try {
+      const shown = root.querySelector(".pairing-relay-url").textContent;
+      // The core's display model (crates/allw-core/src/display.rs): format/bidi controls become
+      // ⟨U+XXXX⟩ and C0 controls become backslash escapes.
+      assert.equal(shown, "http://evil⟨U+202E⟩example.com\\x1b");
+      assert.ok(!root.textContent.includes("\u202E"), "no raw bidi override anywhere on screen");
+      assert.ok(!root.textContent.includes("\u001B"), "no raw ESC anywhere on screen");
+    } finally {
+      restore();
+    }
+  });
+
+  test("without the core escape the pin is withheld, and the confirm still works", () => {
+    const { root, restore, storage } = mountWithStored(
+      { ...VALID_IDENTITY, relayUrl: "http://evil\u202Eexample.com" },
+      { escapeForDisplay: null },
+    );
+    try {
+      assert.equal(root.querySelector(".pairing-kicker").textContent, "Re-pair required");
+      assert.equal(root.querySelector(".pairing-relay-url").textContent, WITHHELD_PIN_TEXT);
+      assert.ok(!root.textContent.includes("evil"), "no part of the pin is printed");
+      const confirm = [...root.querySelectorAll("button")].find(
+        (b) => b.textContent === "Forget this pairing and pair again",
+      );
+      assert.ok(confirm, "the confirm is offered even with the pin withheld");
+      confirm.click();
+      assert.equal(storage.getItem(PAIRING_KEY), null, "cleared on confirm");
+      assert.ok(root.querySelector("form.pairing-form"), "the pairing form follows");
+    } finally {
+      restore();
+    }
+  });
+
+  test("an escape that throws withholds the pin rather than printing it raw", () => {
+    const { root, restore } = mountWithStored(
+      { ...VALID_IDENTITY, relayUrl: "http://[::1]:8787" },
+      {
+        escapeForDisplay: () => {
+          throw new Error("core trapped");
+        },
+      },
+    );
+    try {
+      assert.equal(root.querySelector(".pairing-relay-url").textContent, WITHHELD_PIN_TEXT);
+    } finally {
+      restore();
+    }
+  });
+
+  test("an empty pin is shown as (empty), with a reason that doesn't prompt for input (N1)", () => {
+    const { root, restore } = mountWithStored({ ...VALID_IDENTITY, relayUrl: "" });
+    try {
+      assert.equal(root.querySelector(".pairing-relay-url").textContent, "(empty)");
+      assert.equal(
+        root.querySelector(".pairing-relay-note").textContent,
+        "The stored relay is not a valid URL.",
+      );
+    } finally {
+      restore();
+    }
+  });
+
+  test("a stale tab's confirm never clears a newer identity another tab saved (B1 regression)", () => {
+    const { root: rootA, restore } = installDom();
+    try {
+      const storage = memoryStorage();
+      storage.setItem(
+        PAIRING_KEY,
+        JSON.stringify({ ...VALID_IDENTITY, relayUrl: "http://[::1]:8787" }),
+      );
+      const rootB = rootA.ownerDocument.createElement("div");
+      rootA.ownerDocument.body.append(rootB);
+      const confirmIn = (root) =>
+        [...root.querySelectorAll("button")]
+          .find((b) => b.textContent === "Forget this pairing and pair again")
+          .click();
+      const pairingsA = [];
+      const pairingsB = [];
+      // Two tabs load the same rejected identity and both show the re-pair screen.
+      for (const [root, pairings] of [
+        [rootA, pairingsA],
+        [rootB, pairingsB],
+      ]) {
+        mountPairingGate({
+          root,
+          pairingStore: createLocalPairingStore(storage),
+          relayUrl: "http://127.0.0.1:8787",
+          onPaired: (identity) => pairings.push(identity),
+        });
+      }
+
+      // Tab B confirms and re-pairs: a new identity is saved.
+      confirmIn(rootB);
+      const newer = { ...VALID_IDENTITY, deviceId: "dev-newer" };
+      submitPairingForm(rootB, newer);
+      assert.equal(pairingsB.length, 1);
+      const savedByB = storage.getItem(PAIRING_KEY);
+      assert.equal(JSON.parse(savedByB).deviceId, "dev-newer");
+
+      // Later, the stale tab A confirms forgetting the [::1] pairing it still shows.
+      confirmIn(rootA);
+
+      assert.equal(storage.getItem(PAIRING_KEY), savedByB, "the newer identity survives");
+      assert.equal(
+        rootA.querySelector(".pairing-kicker").textContent,
+        "Already paired",
+        "tab A routes to the identity that is stored now",
+      );
+      assert.equal(pairingsA.length, 0);
+    } finally {
+      restore();
+    }
+  });
+
+  test("a corrupt identity keeps today's behaviour: cleared and routed to pairing", () => {
+    const { deviceAuthToken: _omitted, ...partial } = VALID_IDENTITY;
+    const { root, restore, storage } = mountWithStored({ ...partial, relayUrl: "http://[::1]" });
+    try {
+      assert.ok(root.querySelector("form.pairing-form"), "straight to the pairing form");
+      assert.equal(storage.getItem(PAIRING_KEY), null);
     } finally {
       restore();
     }

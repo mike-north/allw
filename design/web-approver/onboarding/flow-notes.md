@@ -37,6 +37,10 @@ human re-auth before the inbox unlocks, while avoiding a password reset mental m
 Behavior notes:
 
 - If the keyfile/local browser key is missing, route back to pairing.
+- If the stored identity is pinned to a relay this build rejects, show re-pair-required (the pinned
+  relay, escaped by the core's display model or withheld if the core does not load, and why). Clear the identity only when the human confirms, and only if it
+  is still the one shown; then pair again against the relay this browser already used, ignoring any
+  `?relay=` link.
 - If account-state verification fails, keep the device visible but mark origin trust as unverified.
 - Re-auth should protect signing and decryption, not recreate the account.
 

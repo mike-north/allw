@@ -418,7 +418,7 @@ export async function runWatch(
   // verified origin is driven only by account state the configured account root signed. Relay fetch
   // failures are caught by `handleRequest` and downgrade the render to ⚠ UNVERIFIED.
   const resolveAccountStates: AccountStateResolver = () =>
-    fetchAccountStatesWithMetadata(relayUrl, accountId, deviceAuthToken);
+    fetchAccountStatesWithMetadata(relayUrl, accountId);
   const recordAccountStateSequence = (sequence: number): void => {
     if (sequence <= (keyfile.account_state_highest_sequence ?? 0)) return;
     keyfile = { ...keyfile, account_state_highest_sequence: sequence };
