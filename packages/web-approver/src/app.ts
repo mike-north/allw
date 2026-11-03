@@ -50,7 +50,12 @@
 import { createRelayAccountStateResolver } from "./account-state.js";
 import { mountWebApprover, type WebApproverMount } from "./browser.js";
 import { mountOnboardingGate } from "./onboarding.js";
-import { createLocalPairingStore, mountPairingGate, type PairedIdentity } from "./pairing.js";
+import {
+  createLocalPairingStore,
+  mountPairingGate,
+  type PairedIdentity,
+  type PairingStore,
+} from "./pairing.js";
 import {
   describeIgnoredRelayOverride,
   mountIgnoredRelayNotice,
@@ -59,7 +64,12 @@ import {
   resolveRelayUrl,
 } from "./relay-config.js";
 import { createIndexedDbPushCredentialStore } from "./push-credentials.js";
-import { browserPushEnvironment, mountNotificationControls } from "./push-subscribe.js";
+import {
+  browserForgetNotificationsDeps,
+  browserPushEnvironment,
+  forgetNotifications,
+  mountNotificationControls,
+} from "./push-subscribe.js";
 import { createBrowserRuntime } from "./runtime.js";
 import { createLocalAccountStateFloorStore } from "./sequence-floor.js";
 import { createLocalSurfaceIdStore, resolveSurfaceId } from "./surface-id.js";
@@ -113,6 +123,35 @@ export interface BootEnvironment {
    * `startInbox`, and never awaited: notifications can't delay or block the inbox. Omit to skip.
    */
   readonly startNotifications?: (identity: PinnedIdentity) => void;
+  /**
+   * Undo notifications for a forgotten pairing (#237): clear the service worker's credential
+   * mirror, then best-effort clear the relay's push tokens and the browser's subscription. Called
+   * whenever the pairing store is cleared, and at boot when there is no usable identity, so the
+   * mirrored bearer token never outlives the identity it came from. Never awaited.
+   */
+  readonly forgetNotifications?: () => Promise<void>;
+}
+
+/**
+ * `store`, except that clearing it also runs `forget` (not awaited). Every path that forgets the
+ * pairing ("Use another device", a corrupt identity) goes through `clear`, so none of them can
+ * leave a notification credential behind.
+ */
+function clearingNotifications(
+  store: PairingStore,
+  forget: (() => Promise<void>) | undefined,
+): PairingStore {
+  if (forget === undefined) return store;
+  return {
+    load: () => store.load(),
+    save: (identity) => {
+      store.save(identity);
+    },
+    clear: () => {
+      store.clear();
+      void forget();
+    },
+  };
 }
 
 /**
@@ -221,8 +260,13 @@ export async function bootInbox(
  */
 export async function boot(env: BootEnvironment): Promise<void> {
   const { root, storage } = env;
-  const pairingStore = createLocalPairingStore(storage);
+  const pairingStore = clearingNotifications(
+    createLocalPairingStore(storage),
+    env.forgetNotifications,
+  );
   const stored = pairingStore.load();
+  // No usable identity: whatever a previous pairing mirrored for notifications is stale.
+  if (stored === null) void env.forgetNotifications?.();
 
   let relayUrl: string;
   if (stored !== null) {
@@ -289,6 +333,13 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
     search: window.location.search,
     startInbox: bootInbox,
     startNotifications: startBrowserNotifications,
+    forgetNotifications: () =>
+      forgetNotifications(
+        browserForgetNotificationsDeps(
+          window,
+          createIndexedDbPushCredentialStore(window.indexedDB),
+        ),
+      ),
   });
 }
 

@@ -20,7 +20,10 @@
  * # Storage tradeoff
  * The bearer token in IndexedDB has the same exposure as the full identity in `localStorage`: any
  * script running on the approver origin can read it (`docs/threat-model.md`). Mirroring it adds no
- * new reader; it is written only once the human enables notifications.
+ * new reader; it is written only once the human enables notifications. It must also never outlive
+ * the pairing: whenever the paired identity is forgotten, the mirror is cleared with it
+ * (`forgetNotifications` in `./push-subscribe.ts`), so a forgotten device's token is not left
+ * behind for the service worker to keep using.
  *
  * @see ./sw-handlers.ts (the service worker's reader)
  * @see ./push-subscribe.ts (the page-side writer)
@@ -58,6 +61,11 @@ export interface PushCredentialStore {
   readRegistration(): Promise<PushRegistration | null>;
   /** Replace the last registration. */
   writeRegistration(registration: PushRegistration): Promise<void>;
+  /**
+   * Delete both records. Called when this browser's pairing is forgotten, so the bearer token
+   * leaves the origin together with the identity it belongs to.
+   */
+  clear(): Promise<void>;
 }
 
 /**
@@ -181,6 +189,17 @@ export function createIndexedDbPushCredentialStore(factory: IDBFactory): PushCre
     }
   }
 
+  async function clearAll(): Promise<void> {
+    const db = await openDatabase(factory);
+    try {
+      await requestResult(
+        db.transaction(OBJECT_STORE, "readwrite").objectStore(OBJECT_STORE).clear(),
+      );
+    } finally {
+      db.close();
+    }
+  }
+
   return {
     async readCredentials() {
       return parsePushCredentials(await read(CREDENTIALS_KEY));
@@ -199,5 +218,6 @@ export function createIndexedDbPushCredentialStore(factory: IDBFactory): PushCre
         endpoint: registration.endpoint,
       });
     },
+    clear: clearAll,
   };
 }

@@ -100,7 +100,7 @@ export async function fetchVapidPublicKey(
   return { ok: true, key };
 }
 
-/** Outcome of {@link registerPushEndpoint}. */
+/** Outcome of {@link registerPushEndpoint} and {@link clearPushTokens}. */
 export type RegisterResult =
   | { readonly ok: true }
   | { readonly ok: false; readonly status: number | null; readonly detail: string };
@@ -115,15 +115,38 @@ function normalizedEndpoint(value: string): string | null {
 }
 
 /**
- * Register `endpoint` as this device's only `webpush` token. Succeeds only on `200` with the
- * endpoint present in the stored set the relay returns, so a relay that silently dropped it is a
- * visible failure, not "notifications on".
+ * What a non-200 answer from `PUT …/push-tokens` means, for the human. The relay's statuses
+ * (`docs/relay-api.md` §3): 401/403 when the device's own bearer token is refused (for example after
+ * the device was revoked), 409 when the account's push-token budget is full, 400 for a body the
+ * relay rejects.
  */
-export async function registerPushEndpoint(
+function describePushTokensStatus(status: number): string {
+  switch (status) {
+    case 401:
+    case 403:
+      return `the relay refused this device's credentials (${String(status)}); it may have been revoked`;
+    case 409:
+      return "this account already has the most push registrations the relay allows (409); revoke a device you no longer use, then try again";
+    default:
+      return `the relay answered ${String(status)}`;
+  }
+}
+
+/** Outcome of {@link putPushTokens}: the stored set the relay returned, or why it failed. */
+type PutPushTokensResult =
+  | { readonly ok: true; readonly stored: readonly unknown[] }
+  | { readonly ok: false; readonly status: number | null; readonly detail: string };
+
+/**
+ * Replace this device's push tokens with `tokens` (`PUT /{acct}/devices/{device_id}/push-tokens`,
+ * authenticated with the device's own bearer token). `[]` clears the set. Resolves to the stored
+ * set from a `200` answer; never throws.
+ */
+async function putPushTokens(
   credentials: PushCredentials,
-  endpoint: string,
+  tokens: readonly { readonly transport: "webpush"; readonly token: string }[],
   fetchImpl: PushFetch,
-): Promise<RegisterResult> {
+): Promise<PutPushTokensResult> {
   const url = pushTokensUrl(credentials.relayUrl, credentials.accountId, credentials.deviceId);
   let response: Response;
   try {
@@ -133,7 +156,7 @@ export async function registerPushEndpoint(
         authorization: `Bearer ${credentials.deviceAuthToken}`,
         "content-type": "application/json",
       },
-      body: JSON.stringify({ push_tokens: [{ transport: "webpush", token: endpoint }] }),
+      body: JSON.stringify({ push_tokens: tokens }),
     });
   } catch (error) {
     return { ok: false, status: null, detail: `could not reach the relay (${String(error)})` };
@@ -142,7 +165,7 @@ export async function registerPushEndpoint(
     return {
       ok: false,
       status: response.status,
-      detail: `the relay answered ${String(response.status)}`,
+      detail: describePushTokensStatus(response.status),
     };
   }
   let body: unknown;
@@ -155,21 +178,57 @@ export async function registerPushEndpoint(
     typeof body === "object" && body !== null
       ? (body as Record<string, unknown>).push_tokens
       : undefined;
+  if (!Array.isArray(stored)) {
+    return { ok: false, status: 200, detail: "the relay's response had no push_tokens list" };
+  }
+  return { ok: true, stored };
+}
+
+/**
+ * Register `endpoint` as this device's only `webpush` token. Succeeds only on `200` with the
+ * endpoint present in the stored set the relay returns, so a relay that silently dropped it is a
+ * visible failure, not "notifications on".
+ */
+export async function registerPushEndpoint(
+  credentials: PushCredentials,
+  endpoint: string,
+  fetchImpl: PushFetch,
+): Promise<RegisterResult> {
+  const result = await putPushTokens(
+    credentials,
+    [{ transport: "webpush", token: endpoint }],
+    fetchImpl,
+  );
+  if (!result.ok) return result;
   const wanted = normalizedEndpoint(endpoint);
-  const registered =
-    Array.isArray(stored) &&
-    stored.some((entry: unknown) => {
-      if (typeof entry !== "object" || entry === null) return false;
-      const { transport, token } = entry as Record<string, unknown>;
-      return (
-        transport === "webpush" &&
-        typeof token === "string" &&
-        wanted !== null &&
-        normalizedEndpoint(token) === wanted
-      );
-    });
+  const registered = result.stored.some((entry: unknown) => {
+    if (typeof entry !== "object" || entry === null) return false;
+    const { transport, token } = entry as Record<string, unknown>;
+    return (
+      transport === "webpush" &&
+      typeof token === "string" &&
+      wanted !== null &&
+      normalizedEndpoint(token) === wanted
+    );
+  });
   if (!registered) {
     return { ok: false, status: 200, detail: "the relay did not store this subscription" };
+  }
+  return { ok: true };
+}
+
+/**
+ * Clear every push token this device registered, so the relay stops sending it wakeups. Succeeds
+ * only on `200` with an empty stored set.
+ */
+export async function clearPushTokens(
+  credentials: PushCredentials,
+  fetchImpl: PushFetch,
+): Promise<RegisterResult> {
+  const result = await putPushTokens(credentials, [], fetchImpl);
+  if (!result.ok) return result;
+  if (result.stored.length !== 0) {
+    return { ok: false, status: 200, detail: "the relay still lists push tokens for this device" };
   }
   return { ok: true };
 }

@@ -34,7 +34,12 @@ import {
   type PushCredentials,
   type PushRegistration,
 } from "./push-credentials.js";
-import { fetchVapidPublicKey, registerPushEndpoint, type PushFetch } from "./push-relay.js";
+import {
+  clearPushTokens,
+  fetchVapidPublicKey,
+  registerPushEndpoint,
+  type PushFetch,
+} from "./push-relay.js";
 
 /** A push subscription (the part of `PushSubscription` used here). */
 export interface PushSubscriptionLike {
@@ -334,6 +339,66 @@ export function mountNotificationControls(
   show({ kind: "checking" });
   const ready = onLoad();
   return { state: () => current, enable, ready };
+}
+
+/** What {@link forgetNotifications} needs, injectable for tests. */
+export interface ForgetNotificationsDeps {
+  readonly store: PushCredentialStore;
+  readonly fetchImpl: PushFetch;
+  /**
+   * This origin's current push subscription, without registering a service worker; `null` when
+   * the Push API is unavailable.
+   */
+  readonly getSubscription: (() => Promise<PushSubscriptionLike | null>) | null;
+}
+
+/**
+ * Undo notifications for a pairing that is being forgotten ("Use another device", re-pair, a
+ * corrupt or absent identity at boot). The mirrored bearer token must not outlive the identity it
+ * belongs to, so the mirror is cleared **first**, before anything that can fail. Then, best effort,
+ * the browser's subscription is dropped so no further pushes arrive. Both are local and quick, and
+ * finish before the network step, so a slow relay can't make this undo a subscription the human
+ * creates after re-pairing. Last, the relay is told to drop this device's push tokens, using the
+ * token read just before the clear. Never throws.
+ */
+export async function forgetNotifications(deps: ForgetNotificationsDeps): Promise<void> {
+  let credentials: PushCredentials | null = null;
+  try {
+    credentials = await deps.store.readCredentials();
+  } catch {
+    // Unreadable: clear below regardless.
+  }
+  try {
+    await deps.store.clear();
+  } catch {
+    // IndexedDB unavailable: nothing was mirrored, or nothing more can be done here.
+  }
+  try {
+    const subscription = deps.getSubscription === null ? null : await deps.getSubscription();
+    await subscription?.unsubscribe();
+  } catch {
+    // Best effort: the service worker shows only its generic notification without credentials.
+  }
+  if (credentials !== null) await clearPushTokens(credentials, deps.fetchImpl);
+}
+
+/** The production {@link ForgetNotificationsDeps}, read from `window`. */
+export function browserForgetNotificationsDeps(
+  win: Window & typeof globalThis,
+  store: PushCredentialStore,
+): ForgetNotificationsDeps {
+  const nav = win.navigator;
+  const pushSupported = "serviceWorker" in nav && "PushManager" in win;
+  return {
+    store,
+    fetchImpl: (input, init) => win.fetch(input, init),
+    getSubscription: pushSupported
+      ? async () => {
+          const registration = await nav.serviceWorker.getRegistration("./");
+          return registration === undefined ? null : registration.pushManager.getSubscription();
+        }
+      : null,
+  };
 }
 
 /** The production {@link PushEnvironment}, read from `window`. */

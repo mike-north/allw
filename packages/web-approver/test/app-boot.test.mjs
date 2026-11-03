@@ -111,6 +111,8 @@ async function bootWith({ search, storage }) {
   const noticeHost = document.getElementById("notices");
   const inboxStarts = [];
   const notificationStarts = [];
+  /** How many times boot asked to forget notifications (clear the credential mirror). */
+  const forgets = { count: 0 };
   await boot({
     root,
     noticeHost,
@@ -122,8 +124,11 @@ async function bootWith({ search, storage }) {
     startNotifications: (identity) => {
       notificationStarts.push(identity);
     },
+    forgetNotifications: async () => {
+      forgets.count += 1;
+    },
   });
-  return { root, noticeHost, inboxStarts, notificationStarts };
+  return { root, noticeHost, inboxStarts, notificationStarts, forgets };
 }
 
 function click(root, label) {
@@ -171,6 +176,33 @@ describe("boot — notification controls (#237)", () => {
     submitPairingForm(root, LEGACY_IDENTITY);
     assert.equal(notificationStarts.length, 1);
     assert.equal(notificationStarts[0].relayUrl, "https://relay.selfhost.example");
+  });
+
+  test("a paired browser keeps its notification credentials", async () => {
+    const storage = memoryStorage();
+    storage.setItem(PAIRING_KEY, JSON.stringify(PINNED_IDENTITY));
+    const { root, forgets } = await bootWith({ search: "", storage });
+    click(root, "Unlock inbox");
+    assert.equal(forgets.count, 0);
+  });
+
+  test("a browser with no usable identity forgets any mirrored credentials at boot", async () => {
+    const storage = memoryStorage();
+    storage.setItem(ONBOARDING_KEY, "1");
+    storage.setItem(PAIRING_KEY, "{not json");
+    storage.setItem(RELAY_URL_STORAGE_KEY, PINNED_RELAY);
+    const { forgets } = await bootWith({ search: "", storage });
+    assert.ok(forgets.count >= 1, "a corrupt identity's notification credentials are forgotten");
+  });
+
+  test("'Use another device' forgets the notification credentials with the pairing", async () => {
+    const storage = memoryStorage();
+    storage.setItem(PAIRING_KEY, JSON.stringify(PINNED_IDENTITY));
+    const { root, forgets } = await bootWith({ search: "", storage });
+    assert.equal(forgets.count, 0);
+    click(root, "Use another device");
+    assert.equal(storage.getItem(PAIRING_KEY), null);
+    assert.equal(forgets.count, 1);
   });
 });
 

@@ -12,7 +12,9 @@
  *   - the subscription uses `userVisibleOnly: true` and the relay's VAPID key;
  *   - the endpoint is registered with `PUT /{acct}/devices/{device_id}/push-tokens`, body
  *     `{ push_tokens: [{ transport: "webpush", token }] }`, Bearer device token (#236);
- *   - only relay URL, account id, device id and device token are mirrored, never seeds.
+ *   - only relay URL, account id, device id and device token are mirrored, never seeds;
+ *   - forgetting the pairing clears the mirror, drops the subscription, and clears the device's
+ *     relay push tokens with `{ push_tokens: [] }` (#236: an empty array clears).
  *
  * @see https://github.com/mike-north/allw/issues/237
  * @see https://github.com/mike-north/allw/issues/236
@@ -33,12 +35,14 @@ import {
   pushCredentialsFrom,
 } from "../dist/push-credentials.js";
 import {
+  clearPushTokens,
   decodeBase64Url,
   fetchPendingCount,
   fetchVapidPublicKey,
   registerPushEndpoint,
 } from "../dist/push-relay.js";
 import {
+  forgetNotifications,
   isAppleMobile,
   mountNotificationControls,
   pushAvailability,
@@ -127,6 +131,11 @@ function memoryPushStore({ credentials = null, registration = null } = {}) {
     async writeRegistration(value) {
       writes.push(["registration", value]);
       state.registration = value;
+    },
+    async clear() {
+      writes.push(["clear"]);
+      state.credentials = null;
+      state.registration = null;
     },
   };
 }
@@ -486,6 +495,57 @@ describe("relay calls (#237)", () => {
     });
   }
 
+  test("a 409 says the account's push-registration budget is full (#236: 409, nothing changes)", async () => {
+    const result = await registerPushEndpoint(
+      CREDENTIALS,
+      ENDPOINT,
+      fakeFetch(() => json(409, { error: "account push-token limit reached" })).impl,
+    );
+    assert.equal(result.ok, false);
+    assert.match(result.detail, /most push registrations the relay allows \(409\)/);
+    assert.match(result.detail, /revoke a device you no longer use/);
+  });
+
+  for (const status of [401, 403]) {
+    test(`a ${String(status)} says the relay refused this device's credentials`, async () => {
+      const result = await registerPushEndpoint(
+        CREDENTIALS,
+        ENDPOINT,
+        fakeFetch(() => json(status, { error: "unauthorized" })).impl,
+      );
+      assert.match(result.detail, /refused this device's credentials/);
+    });
+  }
+
+  test("clearPushTokens PUTs an empty token set with the device's bearer token (#236: [] clears)", async () => {
+    const { impl, calls } = fakeFetch(() => json(200, { push_tokens: [] }));
+    const result = await clearPushTokens(CREDENTIALS, impl);
+    assert.deepEqual(result, { ok: true });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, PUSH_TOKENS_URL);
+    assert.equal(calls[0].init.method, "PUT");
+    assert.equal(calls[0].init.headers.authorization, `Bearer ${CREDENTIALS.deviceAuthToken}`);
+    assert.deepEqual(JSON.parse(calls[0].init.body), { push_tokens: [] });
+  });
+
+  test("clearPushTokens fails when the relay still lists tokens", async () => {
+    const result = await clearPushTokens(
+      CREDENTIALS,
+      fakeFetch(() => json(200, { push_tokens: [{ transport: "webpush", token: ENDPOINT }] })).impl,
+    );
+    assert.equal(result.ok, false);
+  });
+
+  test("clearPushTokens reports a non-200 or a network error as a failure, never a throw", async () => {
+    const refused = await clearPushTokens(CREDENTIALS, fakeFetch(() => json(401, {})).impl);
+    assert.deepEqual({ ok: refused.ok, status: refused.status }, { ok: false, status: 401 });
+    const offline = await clearPushTokens(
+      CREDENTIALS,
+      fakeFetch(() => new TypeError("Failed to fetch")).impl,
+    );
+    assert.deepEqual({ ok: offline.ok, status: offline.status }, { ok: false, status: null });
+  });
+
   test("registerPushEndpoint reports a network error as a failure, never a throw", async () => {
     const result = await registerPushEndpoint(
       CREDENTIALS,
@@ -547,6 +607,93 @@ describe("credential mirror — only the four relay fields, never seeds (#237)",
     assert.deepEqual(parsePushRegistration({ ...registration }), registration);
     assert.equal(parsePushRegistration({ ...registration, endpoint: "" }), null);
     assert.equal(parsePushRegistration({ ...registration, extra: "x" }), null);
+  });
+});
+
+// ── Forgetting a pairing ────────────────────────────────────────────────────────────────────────
+
+/**
+ * A pairing that is forgotten ("Use another device", re-pair, a corrupt or absent identity) must
+ * not leave its bearer token behind in the service worker's mirror, where the worker would keep
+ * using it on every push.
+ */
+describe("forgetNotifications — the mirror never outlives the pairing (#237)", () => {
+  /** A subscription that records when it was dropped, into the shared `events` log. */
+  function recordingSubscription(events) {
+    return {
+      endpoint: ENDPOINT,
+      async unsubscribe() {
+        events.push("unsubscribe");
+        return true;
+      },
+    };
+  }
+
+  test("clears the mirror first, drops the subscription, then clears the relay's tokens", async () => {
+    const events = [];
+    const store = memoryPushStore({
+      credentials: CREDENTIALS,
+      registration: { ...pick(CREDENTIALS), endpoint: ENDPOINT },
+    });
+    const originalClear = store.clear;
+    store.clear = async () => {
+      events.push("clear");
+      await originalClear();
+    };
+    const { impl, calls } = fakeFetch((url, init) => {
+      events.push(`${init.method} ${url}`);
+      return json(200, { push_tokens: [] });
+    });
+
+    await forgetNotifications({
+      store,
+      fetchImpl: impl,
+      getSubscription: async () => recordingSubscription(events),
+    });
+
+    assert.equal(store.state.credentials, null, "the bearer token is gone from the mirror");
+    assert.equal(store.state.registration, null);
+    // Local steps finish before the network one, so a slow relay can't undo a later subscription.
+    assert.deepEqual(events, ["clear", "unsubscribe", `PUT ${PUSH_TOKENS_URL}`]);
+    assert.equal(calls[0].init.headers.authorization, `Bearer ${CREDENTIALS.deviceAuthToken}`);
+    assert.deepEqual(JSON.parse(calls[0].init.body), { push_tokens: [] });
+  });
+
+  test("with nothing mirrored, it still clears and unsubscribes, and makes no relay call", async () => {
+    const events = [];
+    const store = memoryPushStore();
+    const { impl, calls } = fakeFetch(() => json(200, { push_tokens: [] }));
+    await forgetNotifications({
+      store,
+      fetchImpl: impl,
+      getSubscription: async () => recordingSubscription(events),
+    });
+    assert.deepEqual(store.writes, [["clear"]]);
+    assert.deepEqual(events, ["unsubscribe"]);
+    assert.equal(calls.length, 0);
+  });
+
+  test("an unreachable relay or a failing subscription never throws, and the mirror is cleared", async () => {
+    const store = memoryPushStore({ credentials: CREDENTIALS });
+    await forgetNotifications({
+      store,
+      fetchImpl: fakeFetch(() => new TypeError("Failed to fetch")).impl,
+      getSubscription: async () => {
+        throw new Error("push service unavailable");
+      },
+    });
+    assert.equal(store.state.credentials, null);
+  });
+
+  test("an unreadable mirror is still cleared", async () => {
+    const store = memoryPushStore({ credentials: CREDENTIALS });
+    store.readCredentials = async () => {
+      throw new Error("IndexedDB read failed");
+    };
+    const { impl, calls } = fakeFetch(() => json(200, { push_tokens: [] }));
+    await forgetNotifications({ store, fetchImpl: impl, getSubscription: null });
+    assert.equal(store.state.credentials, null);
+    assert.equal(calls.length, 0, "no token was read, so none is sent");
   });
 });
 

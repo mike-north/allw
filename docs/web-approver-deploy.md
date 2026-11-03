@@ -289,6 +289,21 @@ device id and `device_auth_token`. The device seeds, device cert and account roo
 mirrored. The token there has the same exposure as the identity in `localStorage`: any script
 running on the approver origin can read both (`docs/threat-model.md`).
 
+**Forgetting a pairing.** The mirror never outlives the pairing. Whenever the identity is forgotten
+(**Use another device**, a corrupt identity) and on any load with no usable identity, the page:
+
+1. reads the mirrored credentials into memory, then deletes both IndexedDB records, so the service
+   worker has no token to use;
+2. drops the browser's push subscription;
+3. asks the relay to clear this device's push tokens (`PUT …/push-tokens` with
+   `{ "push_tokens": [] }`, using the token read in step 1).
+
+Steps 2 and 3 are **best effort**. If the relay call fails (offline, or the token was already
+revoked), the relay keeps the endpoint until the device is revoked, or until the push service
+answers 404/410 for the dropped subscription and the relay prunes it (`docs/relay-api.md` §5).
+Until then, a wakeup can still reach a subscription that wasn't dropped. The worker, which has no
+credentials, then shows only "Open allw approvals to check for approval requests."
+
 **Files.** `scripts/build-site.mjs` bundles the worker to `sw.js` at the site root (a worker's scope
 can't be wider than its directory), and ships `manifest.webmanifest` (name, `start_url`,
 `display: "standalone"`, icons) plus `icons/`. `index.html` links the manifest and an
