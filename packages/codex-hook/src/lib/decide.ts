@@ -8,7 +8,13 @@
  * core through `@allw/hook` helpers.
  */
 
-import { agentSafeErrorText, gateToolCall, type HookConfig, type HookWasm } from "@allw/hook";
+import {
+  agentSafeErrorText,
+  agentSafeText,
+  gateToolCall,
+  type HookConfig,
+  type HookWasm,
+} from "@allw/hook";
 
 import {
   denyOutput,
@@ -160,8 +166,10 @@ export async function decide(
       : verdict.decision === "expired"
         ? "timeout"
         : "aborted";
+  // The summary quotes the tool call, which can come from a third party, so it goes through the
+  // core escape before the agent reads it (#364). The approver still gets the raw summary.
   return denyOutput(
-    `allw: ${gate.summary} — not approved (verdict: ${verdict.decision})`,
+    `allw: ${agentSafeText(deps.wasm, gate.summary)} — not approved (verdict: ${verdict.decision})`,
     verdictDenyReason,
   );
 }
