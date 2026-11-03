@@ -332,8 +332,10 @@ trust decision, and it lives in the core:
   `watch` log line (request ids, relay error strings, which could otherwise repaint the request block mid-prompt),
   every `pair` output line (the relay-issued pairing code and `device_id`), and the fatal error line (which can embed
   a relay HTTP error body); if the core cannot load, the fatal error text is withheld rather than printed raw. The
-  web approver escapes the verification-failed reason (which can name the relay-supplied envelope id) and the
-  relay-outage banner text; a runtime without the core escape withholds that text.
+  web approver escapes the verification-failed reason (which can name the relay-supplied envelope id), the
+  relay-outage banner text, the ignored `?relay=` link in the relay-pin notice (#307), and the rejected pin on the
+  re-pair screen (#297); a runtime without the core escape withholds that text, and the notice and re-pair screen
+  withhold theirs when the core cannot load.
 - Escaping is display-only. `request_hash` is computed over the original context; the display model is a separate
   value that is never hashed, signed, or sent.
 

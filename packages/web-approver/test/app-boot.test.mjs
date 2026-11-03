@@ -35,8 +35,10 @@ import { JSDOM } from "jsdom";
 import { boot, bootInbox } from "../dist/app.js";
 import {
   INSECURE_RELAY_URL_REASON,
+  PENDING_IGNORED_RELAY_TEXT,
   RELAY_URL_STORAGE_KEY,
   WITHHELD_PIN_TEXT,
+  WITHHELD_UNTRUSTED_TEXT,
 } from "../dist/index.js";
 
 import { loadTestWasm } from "./wasm-helper.mjs";
@@ -157,6 +159,19 @@ async function bootWith({
     loadDisplayEscape,
   });
   return { root, noticeHost, inboxStarts, notificationStarts, forgets };
+}
+
+/**
+ * Wait until the ignored-relay notice's name satisfies `done`. Boot renders the notice at once and
+ * fills the name in when the core escape settles (#307), without awaiting it.
+ */
+async function waitForNoticeName(noticeHost, done) {
+  for (let tick = 0; tick < 500; tick++) {
+    const name = noticeHost.querySelector(".relay-pin-notice-origin")?.textContent;
+    if (name !== undefined && done(name)) return name;
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  assert.fail("the notice's name was never filled in");
 }
 
 function click(root, label) {
@@ -318,6 +333,50 @@ describe("boot — notification controls (#237)", () => {
 });
 
 describe("boot — paired device with a ?relay= link to another origin (#249)", () => {
+  /**
+   * #307: the ignored link is attacker-chosen. Through the real boot path, it reaches the DOM only
+   * as the core's escape (RLO and ZWSP as `⟨U+XXXX⟩`, ESC as `\x1b`, per
+   * `crates/allw-core/src/display.rs`), or not at all.
+   */
+  test("a spoofing ?relay= value is shown only core-escaped (#307)", async () => {
+    const storage = memoryStorage();
+    storage.setItem(PAIRING_KEY, JSON.stringify(PINNED_IDENTITY));
+    storage.setItem(RELAY_URL_STORAGE_KEY, PINNED_RELAY);
+    const { noticeHost } = await bootWith({
+      search: relayQuery("evil\u202Etxt.exe\u001B[31m\u200Bok"),
+      storage,
+    });
+    assert.ok(noticeHost.querySelector(".relay-pin-notice"), "the notice appears");
+    const name = await waitForNoticeName(noticeHost, (n) => n !== PENDING_IGNORED_RELAY_TEXT);
+    assert.equal(name, "evil⟨U+202E⟩txt.exe\\x1b[31m⟨U+200B⟩ok");
+    for (const raw of ["\u202E", "\u001B", "\u200B"]) {
+      assert.ok(!noticeHost.innerHTML.includes(raw));
+    }
+  });
+
+  test("when the core fails to load, the link is withheld and the notice still appears (#307)", async () => {
+    const storage = memoryStorage();
+    storage.setItem(PAIRING_KEY, JSON.stringify(PINNED_IDENTITY));
+    storage.setItem(RELAY_URL_STORAGE_KEY, PINNED_RELAY);
+    const { root, noticeHost } = await bootWith({
+      search: relayQuery("evil\u202Etxt.exe"),
+      storage,
+      loadDisplayEscape: async () => {
+        throw new Error("wasm fetch failed");
+      },
+    });
+    const notice = noticeHost.querySelector(".relay-pin-notice");
+    assert.match(notice.textContent, /^Relay link ignored\./);
+    const name = await waitForNoticeName(noticeHost, (n) => n !== PENDING_IGNORED_RELAY_TEXT);
+    assert.equal(name, WITHHELD_UNTRUSTED_TEXT);
+    assert.ok(!noticeHost.innerHTML.includes("evil"));
+    assert.equal(
+      root.querySelector(".pairing-kicker").textContent,
+      "Already paired",
+      "boot goes on",
+    );
+  });
+
   test("nothing reaches the other origin, the stored identity is unchanged, and a notice names it", async () => {
     const storage = memoryStorage();
     const storedRaw = JSON.stringify(PINNED_IDENTITY);
@@ -332,6 +391,8 @@ describe("boot — paired device with a ?relay= link to another origin (#249)", 
     // The notice names the ignored origin, and lives outside #app so it survives screen changes.
     const notice = noticeHost.querySelector(".relay-pin-notice");
     assert.ok(notice, "a visible notice must name the ignored relay");
+    // The name is filled in once the core escape loads (#307); an origin has nothing to escape.
+    await waitForNoticeName(noticeHost, (name) => name !== PENDING_IGNORED_RELAY_TEXT);
     assert.equal(notice.querySelector(".relay-pin-notice-origin").textContent, EVIL_RELAY);
 
     click(root, "Unlock inbox");
