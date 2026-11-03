@@ -682,7 +682,11 @@ export class AccountRelay implements DurableObject {
       .map((column) => column.name);
     if (keyColumns.includes("transport")) return;
     this.ctx.storage.transactionSync(() => {
+      // Any column a future ALTER adds to webpush_trailing_wakeup must also be added to this CREATE
+      // and to both column lists of the INSERT … SELECT below, or the rebuild drops it.
       this.sql.exec(`
+        -- A scratch table left by an earlier failed rebuild must not fail every start.
+        DROP TABLE IF EXISTS webpush_trailing_wakeup_rekeyed;
         CREATE TABLE webpush_trailing_wakeup_rekeyed (
           account_id              TEXT    NOT NULL,
           device_id               TEXT    NOT NULL,
@@ -693,6 +697,7 @@ export class AccountRelay implements DurableObject {
           last_skipped_request_id TEXT,
           PRIMARY KEY (device_id, transport, token)
         );
+        -- Keep both column lists in step with the CREATE above (see the comment on the CREATE).
         INSERT INTO webpush_trailing_wakeup_rekeyed
           (account_id, device_id, token, due_at, last_skipped_at, transport, last_skipped_request_id)
         SELECT account_id, device_id, token, due_at, last_skipped_at, transport, last_skipped_request_id

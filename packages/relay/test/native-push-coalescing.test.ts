@@ -447,6 +447,33 @@ describe("trailing-wakeup schema migration (#248)", () => {
     expect(await trailingKey(acct)).toEqual(["device_id", "transport", "token"]);
   });
 
+  it("a scratch table left by an interrupted rebuild does not block the next one", async () => {
+    const acct = await account("leftover-scratch", {}, []);
+    await inRelay(acct, (relay) => {
+      relay.sql.exec(`DROP TABLE webpush_trailing_wakeup`);
+      relay.sql.exec(`CREATE TABLE webpush_trailing_wakeup (
+        account_id TEXT NOT NULL,
+        device_id  TEXT NOT NULL,
+        token      TEXT NOT NULL,
+        due_at     INTEGER NOT NULL,
+        PRIMARY KEY (device_id, token)
+      )`);
+      relay.sql.exec(
+        `INSERT INTO webpush_trailing_wakeup (account_id, device_id, token, due_at) VALUES (?, ?, ?, ?)`,
+        acct,
+        "dev-1",
+        WEBPUSH_ENDPOINT,
+        WINDOW_END,
+      );
+      relay.sql.exec(`CREATE TABLE webpush_trailing_wakeup_rekeyed (junk TEXT)`);
+      relay.initSchema();
+    });
+    expect(await trailingKey(acct)).toEqual(["device_id", "transport", "token"]);
+    expect((await trailingRows(acct)).map((r) => [r.transport, r.token])).toEqual([
+      ["webpush", WEBPUSH_ENDPOINT],
+    ]);
+  });
+
   it("a web-push wakeup owed before the migration survives it and still fires", async () => {
     const fetcher = vi.fn<typeof fetch>(async () => new Response(null, { status: 201 }));
     const webpush = new WebPushTransport({ vapid: await makeVapid(), fetcher, now: () => T0 });
