@@ -49,6 +49,15 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
 
 - **Errors** are plain bodies with the status code; `400` covers malformed JSON / bad fields /
   unexpected envelope keys (zero-knowledge guard).
+- **Abuse limits (#248).** `413` = body or `context_ciphertext` too large; `429` = rate-limited or
+  the account's pending-request cap is reached (`Retry-After: 60` on the rate-limit 429); `503` =
+  the rate limiter is unavailable or unconfigured (fail-closed). Treat all of them as "not
+  submitted" — an integrator fails closed (deny), never retries into an approval.
+- **Rate limiting.** The unauthenticated routes — `POST /pairing/start`, `POST /pairing/complete`,
+  `POST /requests` — pass through a Cloudflare rate-limiting binding keyed by **account id + client
+  IP** before reaching the account's Durable Object. Pairing and requests have separate budgets
+  (defaults: 10 and 60 per 60 s; set in `packages/relay/wrangler.jsonc`, see `docs/relay-deploy.md`).
+  Over the limit ⇒ **429**; binding missing or failing ⇒ **503**.
 
 ---
 
@@ -260,6 +269,23 @@ account-root signature on device**; reject rollbacks below your highest-verified
 `created_at`, `expires_at`, `approver`, `context_ciphertext`, `action_structure?`,
 `privacy_preference?`-reserved; any other key ⇒ 400; `expires_at ≤ now` ⇒ 400). → **202**
 `{ request_id, status:"pending", delivered_to, push_wakeups, request_auth_token }`. 409 on dup `id`.
+
+Limits on `POST /{acct}/requests` (#248; constants in `packages/relay/src/constants.ts`):
+
+| Limit                         | Value                                                               | Over the limit |
+| ----------------------------- | ------------------------------------------------------------------- | -------------- |
+| Request body                  | `MAX_REQUEST_BODY_BYTES` = 128 KiB, checked **before** JSON parsing | **413**        |
+| `context_ciphertext`          | `MAX_CONTEXT_CIPHERTEXT_BYTES` = 64 KiB (UTF-8 bytes of the string) | **413**        |
+| Horizon (`expires_at − now`)  | `MAX_REQUEST_TTL_MS`, default **15 min** (Worker var override)      | **400**        |
+| Live pending requests/account | `MAX_PENDING_REQUESTS_PER_ACCOUNT` = 64                             | **429**        |
+| Submits per account + IP      | `RATE_LIMIT_REQUESTS` binding (default 60 / 60 s)                   | **429**        |
+
+Each value is inclusive (exactly the limit is accepted). The 15-minute horizon covers the hooks'
+420 s maximum timeout; an operator who lowers it below that makes hook requests fail closed. Only
+**live** pending requests count toward the pending cap: resolved, expired and retracted requests,
+and pending ones already past `expires_at`, do not. A pending request older than the horizon (only
+possible for one stored before the horizon existed) also stops counting and is expired by the alarm;
+like every terminal request it is deleted 7 days after it ends.
 **`GET /{acct}/requests/{id}`** and **`GET /{acct}/requests/{id}/wait`** (WS) — Bearer
 `request_auth_token`; poll/await `{ status, verdict? }`. `status` is `pending`, terminal `expired`,
 terminal `retracted` (see below), or `resolved` (+ `verdict`).

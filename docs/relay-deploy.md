@@ -129,8 +129,33 @@ node_modules/.bin/wrangler secret put FCM_BEARER_TOKEN --env production
 | `FCM_ENDPOINT`      | Optional | FCM HTTP v1 send URL (plain var in `wrangler.jsonc`).                                                                                       |
 | `FCM_BEARER_TOKEN`  | Optional | FCM OAuth 2.0 access token for a service account (set via `wrangler secret put`).                                                           |
 
+| `MAX_REQUEST_TTL_MS` | Optional | Request horizon in ms (plain var). Default `900000` (15 min). A submit whose `expires_at` is further out gets 400. Must stay above the hooks' 420 s timeout, or hook requests fail closed. Invalid values are logged and ignored. |
+
 No other secrets are required. The relay derives all per-account auth tokens internally and stores
 only SHA-256 hashes in the Durable Object SQLite database — it holds no static signing key.
+
+---
+
+### 3d. Rate limiting (unauthenticated routes)
+
+The relay's unauthenticated routes are rate-limited with the
+[Workers rate-limiting binding](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/),
+keyed by account id + client IP (`CF-Connecting-IP`). Two bindings are declared under `"ratelimits"`
+in `packages/relay/wrangler.jsonc`, at the top level **and** under `env.production` (named
+environments do not inherit them):
+
+| Binding               | Routes                                             | Default     |
+| --------------------- | -------------------------------------------------- | ----------- |
+| `RATE_LIMIT_PAIRING`  | `POST /{acct}/pairing/start`, `…/pairing/complete` | 10 per 60 s |
+| `RATE_LIMIT_REQUESTS` | `POST /{acct}/requests`                            | 60 per 60 s |
+
+Tune `simple.limit` (and `period`, which must be `10` or `60`) per environment; keep the binding
+names. Each `namespace_id` must be unique within your Cloudflare account. **If a binding is missing
+the routes it covers fail closed with 503**, so a deploy that drops the block takes pairing and
+submission offline rather than running unlimited. Workers rate limiting is per Cloudflare location
+and eventually consistent, so treat it as flood damping; the hard storage bounds are the per-request
+size caps, the request horizon (`MAX_REQUEST_TTL_MS`, above) and the per-account pending cap
+(`docs/relay-api.md` §3 Integrator endpoints).
 
 ---
 
