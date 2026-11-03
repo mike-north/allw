@@ -168,7 +168,10 @@ The PM keeps this scheme current; if a label is missing or ambiguous, ask rather
     complicated work to **Sonnet** (subagent `model: "sonnet"`, or `--model sonnet` on a launched
     agent). That covers docs, test additions, CI/lint/format fixes, rebases and conflict
     resolution, small non-security features, and reviews of non-security PRs.
-31. **Keep Opus for the work where depth pays.** That means anything touching a security boundary
-    (crypto, verdict signing/verification, account binding, fail-closed paths), design-heavy or
-    cross-module changes, and the adversarial review of any of those. When unsure whether a task
-    touches a security boundary, treat it as if it does.
+31. **Keep Opus for building where depth pays.** That means implementing anything that touches a
+    security boundary (crypto, verdict signing/verification, account binding, fail-closed paths)
+    and design-heavy or cross-module changes. When unsure whether a task touches a security
+    boundary, treat it as if it does.
+32. **Use Fable for security review and bug finding** (subagent `model: "fable"`, or
+    `--model fable`). That covers adversarial reviews of security-boundary PRs, security audits,
+    and hunting for correctness bugs in a diff or module.
