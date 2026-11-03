@@ -272,7 +272,8 @@ collapsed). Validation and per-registration budgets are exactly those of `push_t
 `pairing/complete` (§Pairing): 400 for a malformed body, a missing `push_tokens`, an unsupported
 transport, an invalid or over-long token, or over budget. The account budget (32) counts every other
 device's tokens plus this set (the device's own current tokens don't count, so a full account can
-still rotate); over it is a **409** and nothing changes. The replace is one transaction and only
+still rotate); a set that grows past it is a **409** and nothing changes. A set that stays the same
+size or shrinks is never refused, so a device can always clear its tokens. The replace is one transaction and only
 touches tokens that change, so repeating a body is a no-op. Auth, in the revoke order: 401 (no
 bearer), 403 (not a device token, including a revoked device's own), 404 (device not enrolled or
 revoked), 403 (another device's token). Revoking a device deletes its push tokens.

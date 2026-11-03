@@ -156,7 +156,7 @@ with the new public key. The relay does **not** prune the old endpoints: a push 
 with an auth error (401/403), which the relay deliberately treats as transient, so a misconfigured
 relay can never unregister every device. Stale endpoints stay registered until each device
 replaces its push tokens with its new subscription (`PUT /{acct}/devices/{device_id}/push-tokens`,
-`docs/relay-api.md` §3), which the web approver does when it re-subscribes.
+`docs/relay-api.md` §3), which a web approver should do when it re-subscribes (client flow: #237).
 
 ### Secrets inventory summary
 
