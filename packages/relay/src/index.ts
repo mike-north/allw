@@ -674,6 +674,14 @@ export class AccountRelay implements DurableObject {
       )
       WHERE status = 'resolved' AND terminal_at IS NULL;
     `);
+    // Pending requests by deadline. Every submit and trailing wakeup reads the latest pending
+    // deadline (latestPendingRequest), and the expiry alarm the earliest (armExpiryAlarm). Partial,
+    // so terminal rows awaiting the retention sweep cost nothing. Idempotent, like the
+    // migrations above; it runs after them, so the columns it names always exist.
+    this.sql.exec(
+      `CREATE INDEX IF NOT EXISTS request_pending_by_expiry
+       ON request (expires_at) WHERE status = 'pending'`,
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -1674,7 +1682,8 @@ export class AccountRelay implements DurableObject {
   /**
    * Schedule push wakeups to registered device push tokens: at most a request id (Web Push sends no
    * payload at all). Only tokens whose transport is configured are scheduled, newest registrations
-   * first, up to the account budget.
+   * first, up to the account budget. Each wakeup carries the latest deadline among the account's
+   * pending requests (see `PushWakeup.expiresAt`), never just this request's.
    *
    * Web Push coalescing: if a subscription has a wakeup in flight, or was woken within
    * `WEB_PUSH_COALESCE_MS`, it is skipped. Submit needs no caller auth, so this is what bounds push
@@ -1733,7 +1742,9 @@ export class AccountRelay implements DurableObject {
       claimedWebPushKeys.push(key);
       return true;
     });
-    this.startPushFanOut(tokens, claimedWebPushKeys, accountId, requestId, expiresAt);
+    // The just-stored request is pending, so the latest pending deadline is never before its own.
+    const wakeupExpiresAt = Math.max(expiresAt, this.latestPendingRequest(now)?.expires_at ?? 0);
+    this.startPushFanOut(tokens, claimedWebPushKeys, accountId, requestId, wakeupExpiresAt);
     return { scheduled: tokens.length, coalesced };
   }
 
@@ -1754,6 +1765,24 @@ export class AccountRelay implements DurableObject {
     });
     this.pushFanOut = Promise.all([this.pushFanOut, fanOut]).then(() => undefined);
     this.ctx.waitUntil(fanOut);
+  }
+
+  /**
+   * The pending, unexpired request with the latest deadline, or `undefined` if none. Its deadline
+   * is how long any wakeup stays useful: a wakeup leads to an inbox fetch that returns every pending
+   * request.
+   */
+  private latestPendingRequest(
+    now: number,
+  ): { request_id: string; expires_at: number } | undefined {
+    return [
+      ...this.sql.exec<{ request_id: string; expires_at: number }>(
+        `SELECT request_id, expires_at FROM request
+         WHERE status = 'pending' AND expires_at > ?
+         ORDER BY expires_at DESC LIMIT 1`,
+        now,
+      ),
+    ][0];
   }
 
   /** Point the `webpush-trailing-wakeup` alarm purpose at the earliest owed trailing wakeup, if any. */
@@ -1794,14 +1823,7 @@ export class AccountRelay implements DurableObject {
            AND p.token = webpush_trailing_wakeup.token
        )`,
     );
-    const latest = [
-      ...this.sql.exec<{ request_id: string; expires_at: number }>(
-        `SELECT request_id, expires_at FROM request
-         WHERE status = 'pending' AND expires_at > ?
-         ORDER BY expires_at DESC LIMIT 1`,
-        now,
-      ),
-    ][0];
+    const latest = this.latestPendingRequest(now);
     if (latest === undefined) {
       this.sql.exec(`DELETE FROM webpush_trailing_wakeup WHERE due_at <= ?`, now);
       await this.armTrailingWakeupAlarm();

@@ -18,7 +18,12 @@ export interface PushWakeup {
   readonly accountId: string;
   readonly deviceId: string;
   readonly requestId: string;
-  /** The request's deadline (epoch ms). Transports use it to bound how long a wakeup is held. */
+  /**
+   * How long the wakeup stays useful (epoch ms): the latest deadline among the account's pending
+   * requests, not just this one's. A wakeup makes the device fetch every pending request, and with
+   * an RFC 8030 `Topic` a later wakeup replaces an earlier queued one, along with its `TTL`.
+   * Transports use it to bound how long a wakeup is held.
+   */
   readonly expiresAt: number;
   readonly token: string;
 }
