@@ -110,42 +110,48 @@ export function installDecisionBackstop<T extends object>(
   backstopDeny: () => T,
 ): DecisionBackstop<T> {
   let decided = false;
+  /** The exit code once the backstop has spoken: 0 if its deny is on stdout, 1 if writing it failed. */
+  let backstopExitCode = 0;
 
-  const emitBackstopDeny = (): void => {
-    if (decided) return;
+  /**
+   * Write the backstop deny unless a decision is already out, and return the exit code the process
+   * must end with. Exit 0 only when the deny was actually written: if stdout is gone, exit 0 would
+   * leave empty stdout plus exit 0, which the host reads as "no objection". Exit 1 instead, a hook
+   * failure that `"onFailure": "block"` turns into a blocked call.
+   */
+  const emitBackstopDeny = (): number => {
+    if (decided) return backstopExitCode;
     decided = true;
     try {
       writeDecision(backstopDeny());
     } catch {
-      // Nothing more can be done if stdout itself is gone; the host sees a hook error.
+      backstopExitCode = 1;
     }
+    return backstopExitCode;
   };
 
   // The event loop drained while `main()` was still waiting (a promise that will never settle and
   // holds no refs). Deny, then exit explicitly so the process does not linger.
   process.once("beforeExit", () => {
     if (decided) return;
-    emitBackstopDeny();
-    process.exit(0);
+    process.exit(emitBackstopDeny());
   });
 
   // Any other exit that skipped `finalize` (an explicit `process.exit` elsewhere, an uncaught
   // exception). Only synchronous work is possible here. Exit 0 so the host reads the deny JSON as a
-  // decision rather than a hook error.
+  // decision rather than a hook error, or 1 if the deny could not be written.
   process.once("exit", () => {
     if (decided) return;
-    emitBackstopDeny();
-    process.exitCode = 0;
+    process.exitCode = emitBackstopDeny();
   });
 
   // A polite stop while the hook waits (another process's `kill`, Ctrl-C, a closed terminal). Without
   // a handler Node dies by the signal with empty stdout, which the host reads as a hook error and
-  // lets the call go ahead. Deny once, then exit 0 so the host reads the deny as the decision. If the
-  // decision was already finalized, just exit: it is on stdout.
+  // lets the call go ahead. Deny once, then exit 0 so the host reads the deny as the decision (1 if
+  // the deny could not be written). If the decision was already finalized, it is on stdout: exit 0.
   for (const signal of BACKSTOP_SIGNALS) {
     process.once(signal, () => {
-      emitBackstopDeny();
-      process.exit(0);
+      process.exit(emitBackstopDeny());
     });
   }
 

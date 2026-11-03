@@ -163,7 +163,8 @@ can therefore still get Claude Code's own prompt at the desk; to make the phone 
 Because empty stdout means "no objection", the hook also has an **exit backstop**: if the process
 reaches exit before it has decided (for example, the event loop drained while an approval was
 pending, an uncaught exception, or a stray `process.exit`), or receives `SIGTERM`, `SIGINT` or
-`SIGHUP` while waiting, it prints one `deny` and exits 0 instead of exiting with nothing. A
+`SIGHUP` while waiting, it prints one `deny` and exits 0 instead of exiting with nothing (or exits
+1 if the deny can't be written, so it never reads as "no objection"). A
 `SIGKILL`, a native crash or Claude Code's own timeout can't be answered from inside the process;
 `"onFailure": "block"` makes Claude Code block the call in those cases.
 

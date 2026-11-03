@@ -23,6 +23,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { closeSync, mkdtempSync, openSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -37,13 +39,14 @@ const STALLED_FETCH = join(here, "support", "stalled-fetch.mjs");
 
 /**
  * Run the hook bin (optionally with node flags first); resolves `{ code, signal, stdout, stderr }`.
- * With `signalOnPending`, that signal is sent once the bin reports it is waiting on the relay.
+ * With `signalOnPending`, that signal is sent once the bin reports it is waiting on the relay. With
+ * `stdoutFd`, the child's stdout is that file descriptor instead of a pipe (`stdout` is then "").
  */
-function runCli(stdin, env, nodeArgs = [], { signalOnPending } = {}) {
+function runCli(stdin, env, nodeArgs = [], { signalOnPending, stdoutFd } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [...nodeArgs, CLI], {
       env: { PATH: process.env.PATH, ...env },
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: ["pipe", stdoutFd ?? "pipe", "pipe"],
     });
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
@@ -51,7 +54,7 @@ function runCli(stdin, env, nodeArgs = [], { signalOnPending } = {}) {
     }, 20_000);
     let stdout = "";
     let stderr = "";
-    child.stdout.on("data", (d) => (stdout += d));
+    child.stdout?.on("data", (d) => (stdout += d));
     let signalled = false;
     child.stderr.on("data", (d) => {
       stderr += d;
@@ -183,3 +186,42 @@ test("backstop: a stray process.exit(1) while waiting prints one deny and exits 
   ]);
   assertSingleBackstopDeny(result);
 });
+
+/**
+ * A stdout the hook can't write to: a file opened read-only, so every write fails with `EBADF`. The
+ * descriptor is closed and the file removed when the test ends.
+ */
+function unwritableStdout(t) {
+  const dir = mkdtempSync(join(tmpdir(), "allw-unwritable-stdout-"));
+  const file = join(dir, "stdout");
+  writeFileSync(file, "");
+  const fd = openSync(file, "r");
+  t.after(() => {
+    closeSync(fd);
+    rmSync(dir, { recursive: true, force: true });
+  });
+  return fd;
+}
+
+// Regression (Copilot review on #294): when the backstop deny itself can't be written, the hook must
+// not exit 0. Empty stdout plus exit 0 is "no objection"; a non-zero exit is a hook failure, which
+// `"onFailure": "block"` turns into a blocked call.
+for (const [label, extraEnv, nodeArgs, opts] of [
+  ["the event loop drains", {}, ["--import", NEVER_SETTLING_FETCH], {}],
+  ["a stray process.exit(1)", { ALLW_TEST_AFTER_FETCH: "exit1" }, ["--import", STALLED_FETCH], {}],
+  ["SIGTERM arrives", {}, ["--import", STALLED_FETCH], { signalOnPending: "SIGTERM" }],
+]) {
+  test(`backstop: if the deny can't be written when ${label}, the hook exits non-zero, never 0`, async (t) => {
+    const { code, signal, stderr } = await runCli(
+      BASH_STDIN,
+      await stalledEnv(extraEnv),
+      nodeArgs,
+      {
+        ...opts,
+        stdoutFd: unwritableStdout(t),
+      },
+    );
+    assert.equal(signal, null, `stderr: ${stderr}`);
+    assert.notEqual(code, 0, "an unwritten deny must read as a hook failure, not as no objection");
+  });
+}
