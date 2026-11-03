@@ -607,6 +607,8 @@ export async function bootstrap({
       }
       if (!proceed) {
         row.trust = "skipped (declined)";
+        // A declined revoke leaves a config that may publish directly: not a success.
+        if (revoke.length > 0) failed = true;
         continue;
       }
       if (i > 0) await sleep(2000); // npm docs: pace bulk trust calls to avoid rate limiting

@@ -458,6 +458,19 @@ test("declining the confirmations writes nothing", async () => {
   assert.match(out, /skipped \(declined\)/);
 });
 
+// Regression: declining the revoke of a direct-publish config used to exit 0, so the run read as a
+// success while a config that can publish without approval was still attached.
+test("declining to revoke a direct-publish config exits non-zero", async () => {
+  const registry = configuredRegistry();
+  registry["@allw/sdk"].trust = [
+    { ...EXPECTED_TRUST, id: "direct", permissions: ["createPackage"] },
+  ];
+  const fake = fakeNpm({ registry });
+  const { exitCode } = await run(fake, { answer: false });
+  assert.equal(exitCode, 1);
+  assert.deepEqual(fake.writes(), []);
+});
+
 test("a failed `npm trust` falls back to exact npmjs.com instructions and exits non-zero", async () => {
   const registry = configuredRegistry();
   registry["@allw/sdk"].trust = [];

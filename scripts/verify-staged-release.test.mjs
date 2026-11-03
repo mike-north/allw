@@ -31,6 +31,7 @@ const VERSION = "0.2.0";
 const TAG = `v${VERSION}`;
 const SHA = "a".repeat(40);
 const RUN_ID = 4242;
+const MAIN_SHA = "d".repeat(40);
 const PACKAGES = [
   { name: "@allw/sdk", dir: "packages/sdk" },
   { name: "@allw/hook", dir: "packages/hook" },
@@ -112,6 +113,10 @@ function fakeWorld({
   onMain = true,
   stages = null,
   published = null,
+  mainSha = MAIN_SHA,
+  head = MAIN_SHA,
+  dirty = "",
+  npmOtp = null,
 } = {}) {
   const calls = [];
   const stageMap =
@@ -156,12 +161,32 @@ function fakeWorld({
       writeFileSync(join(dir, "release-manifest.json"), JSON.stringify(entries));
       return ok();
     }
+    if (cmd === "git" && args[0] === "status") return ok(dirty);
+    if (cmd === "git" && args[0] === "rev-parse") return ok(`${head}\n`);
+    if (cmd === "git" && args[0] === "ls-remote" && args.includes("refs/heads/main")) {
+      return ok(`${mainSha}\trefs/heads/main\n`);
+    }
     if (cmd === "git" && args[0] === "ls-remote") {
       return ok(tagCommit ? `${tagCommit}\trefs/tags/${TAG}\n` : "");
     }
     if (cmd === "git" && args[0] === "fetch") return ok();
-    if (cmd === "git" && args[0] === "merge-base")
+    if (cmd === "git" && args[0] === "merge-base") {
+      // Always against the exact main SHA from ls-remote, never a moving FETCH_HEAD.
+      assert.equal(args.at(-1), mainSha);
+      if (onMain === "missing") {
+        return { status: 128, stdout: "", stderr: `fatal: Not a valid commit name ${args[2]}` };
+      }
+      if (onMain === "error") return { status: 128, stdout: "", stderr: "fatal: disk on fire" };
       return { status: onMain ? 0 : 1, stdout: "", stderr: "" };
+    }
+    // Auth-and-writes 2FA: npm's stage reads fail with EOTP unless given --otp.
+    if (cmd === "npm" && args[0] === "stage" && npmOtp && !args.includes(`--otp=${npmOtp}`)) {
+      return {
+        status: 1,
+        stdout: "",
+        stderr: "npm error code EOTP\nnpm error This operation requires a one-time password.",
+      };
+    }
     if (cmd === "npm" && args[0] === "stage" && args[1] === "list") {
       const list = (stageMap[args[2]] ?? []).map(({ id, version, status }) => ({
         id,
@@ -219,6 +244,7 @@ async function verify(world, opts = {}) {
     version: VERSION,
     exec: world.exec,
     fetchJson: world.fetchJson,
+    askOtp: async () => null,
     log: (l) => lines.push(l),
     packages: PACKAGES,
     ...opts,
@@ -465,4 +491,51 @@ test("helpers: stage status, DSSE decoding, SRI to hex, provenance checks, argv"
   assert.throws(() => parseArgs(["--run", "abc", "0.2.0"]), /numeric run id/);
   assert.throws(() => parseArgs([]), /missing/);
   assert.throws(() => parseArgs(["0.2.0", "--bogus"]), /unknown argument/);
+});
+
+// The verifier's code and constants come from the local checkout. It must refuse to run from one
+// that is modified or isn't GitHub's current main, before it reads anything else.
+test("refuses to run from a dirty checkout, or one that isn't GitHub's main", async () => {
+  const dirty = fakeWorld({ dirty: " M scripts/release-packages.mjs\n" });
+  await assert.rejects(verify(dirty), /local changes/);
+  assert.ok(!dirty.calls.some(([cmd]) => cmd === "gh" || cmd === "npm"), "stops before any check");
+
+  const behind = fakeWorld({ head: "e".repeat(40) });
+  await assert.rejects(verify(behind), /not GitHub's main/);
+  assert.ok(!behind.calls.some(([cmd]) => cmd === "gh" || cmd === "npm"));
+});
+
+// npm 11.21's stage list/view/download don't prompt for 2FA, so on auth-and-writes accounts they
+// fail with EOTP. The verifier must ask for a code, retry with --otp, and reuse the code.
+test("stage reads that fail with EOTP are retried with a one-time password", async () => {
+  const world = fakeWorld({ npmOtp: "246810" });
+  const asks = [];
+  const { ok, problems } = await verify(world, {
+    askOtp: async (what) => {
+      asks.push(what);
+      return "246810";
+    },
+  });
+  assert.deepEqual(problems, []);
+  assert.equal(ok, true);
+  assert.equal(asks.length, 1, "asks once, then reuses the code");
+  const stageCalls = world.calls.filter(([cmd, sub]) => cmd === "npm" && sub === "stage");
+  assert.ok(stageCalls.some((c) => c.includes("--otp=246810")));
+});
+
+test("stage reads that need a one-time password fail closed without one", async () => {
+  const world = fakeWorld({ npmOtp: "246810" });
+  await assert.rejects(verify(world), /needs a one-time password, and none was given/);
+  assert.ok(
+    !world.calls.some(
+      ([cmd, sub, verb]) => cmd === "npm" && sub === "stage" && verb === "download",
+    ),
+  );
+});
+
+test("merge-base exit 128: a commit missing from main's history is not on main; other errors throw", async () => {
+  const missing = await verify(fakeWorld({ onMain: "missing" }));
+  assert.equal(missing.ok, false);
+  assert.ok(missing.problems.some((p) => /NOT on main/.test(p)));
+  await assert.rejects(verify(fakeWorld({ onMain: "error" })), /git merge-base failed/);
 });

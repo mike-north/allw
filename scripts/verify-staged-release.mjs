@@ -17,6 +17,9 @@
  *
  * It establishes, and exits non-zero unless every check holds:
  *
+ *   0. **Its own trust root.** The checkout is clean (`git status --porcelain` is empty) and
+ *      `HEAD` is exactly GitHub's current `main`. The verifier's code and the release constants
+ *      it imports are then main's, not something edited locally.
  *   1. **The run.** A successful `release.yml` run for tag `v<x.y.z>` (the one named by `--run`,
  *      or the only successful one), whose commit is the commit the tag points at on GitHub.
  *   2. **The commit is on `main`.** That commit is an ancestor of GitHub's `main`, so the workflow
@@ -39,6 +42,10 @@
  * of check 4 is what binds the stage to the run. Then run `--published` right after approving,
  * which reads the published attestation and checks it the same way. See docs/releasing.md.
  *
+ * npm's stage reads don't prompt for 2FA. On accounts with auth-and-writes 2FA they fail with
+ * EOTP, so the verifier asks for a one-time password and retries with `--otp`. Without one, it
+ * fails closed.
+ *
  * Every external call (`gh`, `git`, `npm`, HTTP) goes through an injected runner, so tests drive
  * it without a registry, GitHub or network.
  *
@@ -53,6 +60,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -182,6 +190,17 @@ function defaultExec(cmd, args, opts = {}) {
   return { status: res.status ?? 1, stdout: res.stdout ?? "", stderr: res.stderr ?? "" };
 }
 
+/** Ask for an npm one-time password on the terminal; `null` when there is no terminal. */
+async function defaultAskOtp(what) {
+  if (!process.stdin.isTTY) return null;
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return (await rl.question(`npm one-time password (2FA code) to ${what}: `)).trim();
+  } finally {
+    rl.close();
+  }
+}
+
 async function defaultFetchJson(url) {
   const res = await fetch(url);
   if (!res.ok) throw new VerifyError(`GET ${url} → HTTP ${String(res.status)}`);
@@ -195,6 +214,41 @@ function must(exec, cmd, args, opts) {
     throw new VerifyError(`${cmd} ${args.join(" ")} failed:\n${res.stderr.trim()}`);
   }
   return res.stdout;
+}
+
+const needsOtp = (res) => /EOTP|one-time pass/i.test(`${res.stdout}\n${res.stderr}`);
+
+/** A one-time password as authenticator apps show it. */
+const OTP_PATTERN = /^\d{6,8}$/;
+
+/**
+ * An `npm` runner for reads that may need 2FA. npm's `stage list`, `stage view` and `stage
+ * download` don't prompt for a one-time password themselves. On an account with auth-and-writes
+ * 2FA they fail with EOTP. So on EOTP this asks for a code, retries with `--otp`, and reuses the
+ * code for later reads until npm rejects it. Without a code it throws (fail closed).
+ */
+export function npmReader(exec, askOtp) {
+  const cache = { otp: null };
+  return async (args, opts) => {
+    let res = exec("npm", args, opts);
+    if (res.status !== 0 && needsOtp(res) && cache.otp) {
+      res = exec("npm", [...args, `--otp=${cache.otp}`], opts);
+    }
+    for (let attempt = 0; res.status !== 0 && needsOtp(res) && attempt < 2; attempt++) {
+      const otp = String((await askOtp(`run npm ${args.slice(0, 2).join(" ")}`)) ?? "").trim();
+      if (!OTP_PATTERN.test(otp)) {
+        throw new VerifyError(
+          `npm ${args.join(" ")} needs a one-time password, and none was given`,
+        );
+      }
+      cache.otp = otp;
+      res = exec("npm", [...args, `--otp=${otp}`], opts);
+    }
+    if (res.status !== 0) {
+      throw new VerifyError(`npm ${args.join(" ")} failed:\n${res.stderr.trim()}`);
+    }
+    return res.stdout;
+  };
 }
 
 const RUN_FIELDS = "databaseId,headSha,headBranch,event,status,conclusion,url";
@@ -277,14 +331,57 @@ export function remoteTagCommit(exec, tag) {
   return refs.get(`refs/tags/${tag}^{}`) ?? refs.get(`refs/tags/${tag}`) ?? null;
 }
 
-/** Whether `commit` is an ancestor of GitHub's `main` (fetched fresh). Unknown → throws. */
-export function isOnRemoteMain(exec, commit) {
-  must(exec, "git", ["fetch", "--quiet", "--no-tags", REMOTE_URL, "main"]);
-  const res = exec("git", ["merge-base", "--is-ancestor", commit, "FETCH_HEAD"]);
+/** The commit GitHub's `main` points at right now, read over HTTPS. */
+export function remoteMainCommit(exec) {
+  const out = must(exec, "git", ["ls-remote", REMOTE_URL, "refs/heads/main"]);
+  const sha = out
+    .split("\n")
+    .find((l) => /\srefs\/heads\/main$/.test(l))
+    ?.split(/\s+/)[0];
+  if (!/^[0-9a-f]{40}$/.test(sha ?? "")) {
+    throw new VerifyError(`could not read GitHub's main from ${REMOTE_URL}`);
+  }
+  return sha;
+}
+
+/**
+ * The verifier's own trust root. Its code, and the release constants it imports, come from this
+ * checkout, which an agent or anyone else with local access could edit. So it runs only from an
+ * unmodified checkout of exactly GitHub's current `main`: `git status --porcelain` must be empty and
+ * `HEAD` must equal the `main` SHA that `git ls-remote` reports. Returns that SHA. Throws otherwise.
+ */
+export function checkTrustRoot(exec) {
+  const dirty = must(exec, "git", ["status", "--porcelain"]).trim();
+  if (dirty !== "") {
+    throw new VerifyError(
+      `this checkout has local changes, so the verifier itself can't be trusted:\n${dirty}\n` +
+        `Fix: run it from a clean checkout of main.`,
+    );
+  }
+  const head = must(exec, "git", ["rev-parse", "HEAD"]).trim();
+  const main = remoteMainCommit(exec);
+  if (head !== main) {
+    throw new VerifyError(
+      `this checkout is at ${head}, not GitHub's main (${main}).\n` +
+        `Fix: git fetch ${REMOTE_URL} main && git checkout --detach FETCH_HEAD, then re-run.`,
+    );
+  }
+  return main;
+}
+
+/**
+ * Whether `commit` is an ancestor of `mainSha`, the exact `main` commit read with `ls-remote`.
+ * Comparing against that SHA, rather than a moving FETCH_HEAD, means a concurrent fetch can't
+ * change the answer. A commit missing from main's history isn't on main. Anything else throws.
+ */
+export function isAncestorOfMain(exec, commit, mainSha) {
+  must(exec, "git", ["fetch", "--quiet", "--no-tags", REMOTE_URL, mainSha]);
+  const res = exec("git", ["merge-base", "--is-ancestor", commit, mainSha]);
   if (res.status === 0) return true;
   if (res.status === 1) return false;
   // 128: the commit isn't in the fetched history at all, so it isn't on main either.
-  if (/not a valid commit|bad object|unknown revision/i.test(res.stderr)) return false;
+  if (/not a valid commit|bad object|unknown revision|no such commit/i.test(res.stderr))
+    return false;
   throw new VerifyError(`git merge-base failed:\n${res.stderr.trim()}`);
 }
 
@@ -300,6 +397,7 @@ export async function verifyRelease({
   provenanceAfterApproval = false,
   exec = defaultExec,
   fetchJson = defaultFetchJson,
+  askOtp = defaultAskOtp,
   log = (line) => console.log(line),
   packages = PUBLISHED_PACKAGES,
 } = {}) {
@@ -319,6 +417,11 @@ export async function verifyRelease({
     `Verifying ${published ? "the published" : "the staged"} release ${tag} of ${TRUSTED_REPOSITORY}`,
   );
 
+  // 0. The verifier's own code is main's, unmodified.
+  const mainSha = checkTrustRoot(exec);
+  pass(`running from a clean checkout of GitHub's main (${mainSha})`);
+  const npmRead = npmReader(exec, askOtp);
+
   // 1–2. The run, the tag and main.
   const run = resolveRun(exec, { tag, runId });
   pass(
@@ -330,7 +433,7 @@ export async function verifyRelease({
   } else {
     pass(`${tag} on GitHub points at the run's commit`);
   }
-  if (isOnRemoteMain(exec, run.headSha)) pass(`${run.headSha} is on main`);
+  if (isAncestorOfMain(exec, run.headSha, mainSha)) pass(`${run.headSha} is on main`);
   else fail(`${run.headSha} is NOT on main: this run's workflow and code were not reviewed`);
 
   // 3. The run's own tarballs and their recorded integrity.
@@ -369,20 +472,20 @@ export async function verifyRelease({
       let found = [];
       if (published) {
         const integrity = parseJson(
-          must(exec, "npm", ["view", `${entry.name}@${version}`, "dist.integrity", "--json"]),
+          await npmRead(["view", `${entry.name}@${version}`, "dist.integrity", "--json"]),
           "npm view dist.integrity",
         );
         if (integrity === entry.integrity) pass("published integrity equals the run's tarball");
         else fail(`published integrity ${String(integrity)} is not the run's ${entry.integrity}`);
         const attestations = parseJson(
-          must(exec, "npm", ["view", `${entry.name}@${version}`, "dist.attestations", "--json"]),
+          await npmRead(["view", `${entry.name}@${version}`, "dist.attestations", "--json"]),
           "npm view dist.attestations",
         );
         if (typeof attestations?.url === "string")
           found = findStatements(await fetchJson(attestations.url));
       } else {
         const listed = parseJson(
-          must(exec, "npm", ["stage", "list", entry.name, "--json"]),
+          await npmRead(["stage", "list", entry.name, "--json"]),
           "npm stage list",
         );
         const open = (Array.isArray(listed) ? listed : []).filter(isOpenStage);
@@ -403,7 +506,7 @@ export async function verifyRelease({
         }
         const stageId = String(mine[0].id);
         const item = parseJson(
-          must(exec, "npm", ["stage", "view", stageId, "--json"]),
+          await npmRead(["stage", "view", stageId, "--json"]),
           "npm stage view",
         );
         if (item.packageName !== entry.name || item.version !== version) {
@@ -414,7 +517,7 @@ export async function verifyRelease({
           fail(`stage ${stageId} would set dist-tag ${String(item.tag)}, not ${RELEASE_DIST_TAG}`);
         }
         const downloadDir = mkdtempSync(join(work, "stage-"));
-        must(exec, "npm", ["stage", "download", stageId], { cwd: downloadDir });
+        await npmRead(["stage", "download", stageId], { cwd: downloadDir });
         const tarball = readdirSync(downloadDir).find((f) => f.endsWith(".tgz"));
         if (!tarball) throw new VerifyError(`npm stage download ${stageId} wrote no tarball`);
         const stagedIntegrity = integrityOf(readFileSync(join(downloadDir, tarball)));
