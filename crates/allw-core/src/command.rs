@@ -92,8 +92,26 @@
 //! | `Low`      | `ls`, `cat`, `echo`, `pwd`, `whoami`, `date`, `env`, `printenv`, `which`     |
 //! | `Medium`   | everything else                                                               |
 //!
-//! Matching is case-sensitive on `bin` (exact match after basename extraction) and flag
-//! presence checks use a set membership test on the `flags` list.
+//! Matching is case-sensitive on the program name (exact match after basename extraction) and
+//! flag presence checks use a set membership test on the program's flags.
+//!
+//! ## The program that actually runs (#268)
+//!
+//! The table is applied to the program that actually runs, not only to `argv[0]`. The result is
+//! never lower than `argv[0]`'s own tier:
+//!
+//! | Prefix                                            | Tier                                              |
+//! |---------------------------------------------------|---------------------------------------------------|
+//! | leading `NAME=value` assignments                  | the command after them, and at least `Medium`     |
+//! | a wrapper (`env`, `sudo`, `nice`, `xargs`, …)     | at least the highest tier among later non-flag words |
+//! | `sh` / `bash` / `zsh` / `dash` / `ksh` with `-c`  | at least the tier of the command string           |
+//!
+//! Analysis is bounded: `sh -c` nesting past 4 levels is `High`, and words past the 256th are not
+//! analyzed but count as a `High` candidate for any wrapper or assignment before them.
+//!
+//! Only `risk` follows the real program. `bin` / `argv` / `flags` / `positionals` / `env_refs`
+//! stay `argv[0]`-based, so policy matching (which keys on `bin`) is unchanged; see
+//! `docs/policy-seam.md` §v1 command risk.
 
 use crate::contract::{ActionRecord, Risk, Surface, SyntacticSubstrate};
 use std::collections::HashSet;
@@ -209,7 +227,10 @@ fn build_record(argv: Vec<String>, ctx: &CommandContext, raw: Option<String>) ->
 
     let host = extract_host(&bin, &positionals);
 
-    let risk = classify_risk(&bin, &flags, &positionals);
+    // Risk is classified on the program that actually runs (skipping leading assignments and
+    // looking through wrappers); `bin` / `flags` / `positionals` above stay `argv[0]`-based so
+    // policy matching is unchanged (`classify_effective_risk`).
+    let risk = classify_effective_risk(&argv, 0);
 
     let bin_opt = if argv.is_empty() {
         None
@@ -476,6 +497,155 @@ fn combined_short_flags(token: &str) -> &str {
         return "";
     }
     token.strip_prefix('-').unwrap_or_default()
+}
+
+// ── Effective-program risk ───────────────────────────────────────────────────
+
+/// Wrapper programs whose job is to run another command given later in their argv. A wrapped
+/// command's risk is never hidden by the wrapper: the record's risk is at least that of every
+/// command the wrapper could be running.
+const WRAPPERS: &[&str] = &[
+    "env", "sudo", "doas", "nice", "ionice", "nohup", "time", "timeout", "command", "exec",
+    "xargs", "stdbuf", "setsid",
+];
+
+/// Shells whose `-c` flag takes a command string (`sh -c '<command>'`).
+const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh"];
+
+/// How many nested `sh -c` levels are analyzed. Deeper nesting is classified [`Risk::High`]
+/// rather than analyzed further, so the classifier is bounded and never under-reports it.
+const MAX_SHELL_NESTING: usize = 4;
+
+/// How many argv positions are analyzed as possible program starts. Bounds the work on very long
+/// argvs. Positions past it are not analyzed; instead, a wrapper or assignment that could be
+/// running one of them is classified at least [`Risk::High`], so padding an argv cannot push the
+/// real program out of view.
+const MAX_PROGRAM_CANDIDATES: usize = 256;
+
+/// Numeric order of the risk tiers (`Low` < `Medium` < `High` < `Critical`).
+fn risk_rank(risk: Risk) -> u8 {
+    match risk {
+        Risk::Low => 0,
+        Risk::Medium => 1,
+        Risk::High => 2,
+        Risk::Critical => 3,
+    }
+}
+
+/// The higher of two risk tiers.
+fn max_risk(a: Risk, b: Risk) -> Risk {
+    if risk_rank(b) > risk_rank(a) {
+        b
+    } else {
+        a
+    }
+}
+
+/// Is `token` a shell variable assignment (`NAME=value`, `NAME` a valid identifier)?
+///
+/// Tokens are already unquoted by the tokenizer, so a quoted `'FOO=1'` also counts. Treating it as
+/// an assignment only affects risk (it is never lowered by doing so).
+fn is_assignment(token: &str) -> bool {
+    let Some((name, _value)) = token.split_once('=') else {
+        return false;
+    };
+    let mut bytes = name.bytes();
+    bytes.next().is_some_and(is_ident_start) && bytes.all(is_ident_cont)
+}
+
+/// Classify `argv[j..]` as a command on its own, using the same v1 table as [`classify_risk`].
+///
+/// Only `rm` / `git` / `chmod` rules read flags or positionals, so the split is done only for
+/// those programs.
+fn direct_risk(argv: &[String], j: usize) -> Risk {
+    let program = argv[j].as_str();
+    match basename(program) {
+        "rm" | "git" | "chmod" => {
+            let (flags, positionals) = split_flags_and_positionals(&argv[j..]);
+            classify_risk(program, &flags, &positionals)
+        }
+        _ => classify_risk(program, &[], &[]),
+    }
+}
+
+/// Risk of the command a shell runs via `-c`. Every positional is treated as a possible command
+/// string (option values such as `-o pipefail` cannot be told apart at T1), and the highest risk
+/// wins. An unparseable or empty string contributes nothing, so the shell's own tier stands.
+fn shell_string_risk(argv: &[String], j: usize, depth: usize) -> Option<Risk> {
+    let (flags, positionals) = split_flags_and_positionals(&argv[j..]);
+    let has_c = flags
+        .iter()
+        .any(|f| f == "-c" || combined_short_flags(f).contains('c'));
+    if !has_c {
+        return None;
+    }
+    if depth >= MAX_SHELL_NESTING {
+        return Some(Risk::High);
+    }
+    positionals
+        .iter()
+        .filter_map(|text| shlex::split(text))
+        .filter(|inner| !inner.is_empty())
+        .map(|inner| classify_effective_risk(&inner, depth + 1))
+        .reduce(max_risk)
+}
+
+/// Classify the risk of the program that actually runs, not just `argv[0]`.
+///
+/// - Leading `NAME=value` assignments are skipped: the tier is that of the command after them,
+///   and at least [`Risk::Medium`] (an assignment can change what a program does, e.g.
+///   `LD_PRELOAD`, `PATH`, `GIT_SSH_COMMAND`).
+/// - A [`WRAPPERS`] program is at least as risky as any command it may be wrapping: the highest
+///   tier among the non-flag positions after it. Option values (`nice -n 10`) cannot be told
+///   apart from the wrapped program at T1, so every later position is a candidate.
+/// - A [`SHELLS`] program with `-c` is at least as risky as the command string it runs.
+///
+/// The result is never lower than [`classify_risk`] on `argv[0]` alone. It only ever affects
+/// `risk`; `bin` / `flags` / `positionals` stay `argv[0]`-based (see `docs/policy-seam.md`).
+fn classify_effective_risk(argv: &[String], depth: usize) -> Risk {
+    let n = argv.len();
+    if n == 0 {
+        return classify_risk("", &[], &[]);
+    }
+    let analyzed = n.min(MAX_PROGRAM_CANDIDATES);
+    // Positions past `analyzed` are unseen: anything that could be running one of them is treated
+    // as running a High command (see `MAX_PROGRAM_CANDIDATES`).
+    let unseen = (n > analyzed).then_some(Risk::High);
+    // risk[j]: the tier of `argv[j..]` read as a command.
+    let mut risk = vec![Risk::Low; analyzed];
+    // The highest `risk[k]` for k > j where `argv[k]` is not a flag (a possible wrapped program).
+    let mut later_max: Option<Risk> = unseen;
+    for j in (0..analyzed).rev() {
+        let token = argv[j].as_str();
+        let direct = direct_risk(argv, j);
+        let tier = if is_assignment(token) {
+            let after = if j + 1 < analyzed {
+                risk[j + 1]
+            } else {
+                unseen.unwrap_or(Risk::Medium)
+            };
+            max_risk(max_risk(Risk::Medium, direct), after)
+        } else {
+            let base = basename(token);
+            let mut tier = direct;
+            if WRAPPERS.contains(&base) {
+                if let Some(wrapped) = later_max {
+                    tier = max_risk(tier, wrapped);
+                }
+            }
+            if SHELLS.contains(&base) {
+                if let Some(inner) = shell_string_risk(argv, j, depth) {
+                    tier = max_risk(tier, inner);
+                }
+            }
+            tier
+        };
+        risk[j] = tier;
+        if !token.starts_with('-') {
+            later_max = Some(later_max.map_or(tier, |m| max_risk(m, tier)));
+        }
+    }
+    risk[0]
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1080,5 +1250,176 @@ mod tests {
             Risk::High,
             "risk heuristic must use basename of bin path"
         );
+    }
+
+    // ── Risk of the program that actually runs (#268) ────────────────────────
+    //
+    // Expected tiers are derived by hand from the module-doc risk table: a prefix (assignment,
+    // wrapper, `sh -c`) never makes a command look less risky than the program it runs. The
+    // shared Rust ↔ WASM table is `tests/fixtures/command_risk_vectors.json`.
+
+    fn risk_of(cmd: &str) -> Risk {
+        action_from_command(cmd, &ctx_no_cwd()).unwrap().risk
+    }
+
+    /// Regression (#268): a leading `NAME=value` hid the program, so `X=1 rm -rf ~` was Medium.
+    #[test]
+    fn risk_268_assignment_prefix_does_not_hide_program() {
+        assert_eq!(risk_of("X=1 rm -rf ~"), Risk::High);
+        assert_eq!(risk_of("FOO=1 git push --force origin main"), Risk::High);
+        assert_eq!(
+            risk_of("A=1 B=2 dd if=/dev/zero of=/dev/sda"),
+            Risk::Critical
+        );
+    }
+
+    /// An assignment can change what a program does (`LD_PRELOAD`, `PATH`), so an assignment in
+    /// front of a Low program is Medium, not Low.
+    #[test]
+    fn risk_268_assignment_before_low_program_is_medium() {
+        assert_eq!(risk_of("X=1 ls"), Risk::Medium);
+        assert_eq!(risk_of("FOO=bar"), Risk::Medium);
+    }
+
+    /// Negative: a token that is not a valid `NAME=value` assignment is not skipped.
+    #[test]
+    fn risk_268_invalid_assignment_name_is_not_skipped() {
+        assert_eq!(risk_of("1FOO=1 rm -rf ~"), Risk::Medium);
+        assert_eq!(risk_of("=1 rm -rf ~"), Risk::Medium);
+    }
+
+    /// Regression (#268): `env rm -rf ~` was Low because `env` is on the read-only list.
+    #[test]
+    fn risk_268_wrapper_never_lowers_wrapped_risk() {
+        for cmd in [
+            "env rm -rf ~",
+            "env FOO=1 rm -rf ~",
+            "/usr/bin/env rm -rf ~",
+            "command rm -rf ~",
+            "nice rm -rf ~",
+            "nice -n 10 rm -rf ~",
+            "exec rm -rf ~",
+            "time rm -rf ~",
+            "nohup rm -rf ~",
+            "timeout 5 git push -f origin main",
+            "xargs rm -rf",
+        ] {
+            assert_eq!(risk_of(cmd), Risk::High, "`{cmd}` wraps a High command");
+        }
+        assert_eq!(risk_of("sudo dd if=/dev/zero of=/dev/sda"), Risk::Critical);
+    }
+
+    /// A wrapper with nothing to run keeps its own tier.
+    #[test]
+    fn risk_268_wrapper_alone_keeps_own_tier() {
+        assert_eq!(risk_of("env"), Risk::Low);
+        assert_eq!(risk_of("env -i"), Risk::Low);
+        assert_eq!(risk_of("nice ls"), Risk::Medium);
+    }
+
+    /// Regression (#268): `sh -c '<cmd>'` hid the command string.
+    #[test]
+    fn risk_268_shell_dash_c_classifies_command_string() {
+        assert_eq!(risk_of("sh -c 'rm -rf ~'"), Risk::High);
+        assert_eq!(risk_of("bash -c 'git push --force'"), Risk::High);
+        assert_eq!(
+            risk_of("bash -lc 'dd if=/dev/zero of=/dev/sda'"),
+            Risk::Critical
+        );
+    }
+
+    /// Negative: a shell without `-c` runs a script file, not a string; an unparseable `-c` string
+    /// contributes nothing. Both keep the shell's own tier.
+    #[test]
+    fn risk_268_shell_without_c_or_with_unparseable_string_keeps_own_tier() {
+        assert_eq!(risk_of("bash script.sh"), Risk::Medium);
+        assert_eq!(risk_of("sh -c 'echo \"unterminated'"), Risk::Medium);
+    }
+
+    /// Build an argv of `levels` nested `sh -c` wrappers around `innermost`.
+    fn nested_sh(levels: usize, innermost: &str) -> Vec<String> {
+        let mut argv: Vec<String> = shlex::split(innermost).unwrap();
+        for _ in 0..levels {
+            let inner = shlex::try_join(argv.iter().map(String::as_str)).unwrap();
+            argv = vec!["sh".to_string(), "-c".to_string(), inner];
+        }
+        argv
+    }
+
+    /// `sh -c` nesting is analyzed up to `MAX_SHELL_NESTING` levels; the innermost program's tier
+    /// is reached at the limit.
+    #[test]
+    fn risk_268_nested_shells_up_to_limit_are_analyzed() {
+        let argv = nested_sh(MAX_SHELL_NESTING, "dd if=/dev/zero of=/dev/sda");
+        let r = action_from_argv(&argv, None, &ctx_no_cwd());
+        assert_eq!(r.risk, Risk::Critical);
+        let argv = nested_sh(MAX_SHELL_NESTING, "echo hi");
+        let r = action_from_argv(&argv, None, &ctx_no_cwd());
+        assert_eq!(r.risk, Risk::Medium, "sh is Medium; echo inside is Low");
+    }
+
+    /// Nesting past the limit is not analyzed and is High, so depth cannot hide a command.
+    #[test]
+    fn risk_268_nested_shells_past_limit_are_high() {
+        let argv = nested_sh(MAX_SHELL_NESTING + 1, "echo hi");
+        let r = action_from_argv(&argv, None, &ctx_no_cwd());
+        assert_eq!(r.risk, Risk::High);
+    }
+
+    /// Padding a wrapper's argv past `MAX_PROGRAM_CANDIDATES` cannot push the real program out of
+    /// view: the unseen tail counts as a High candidate for the wrapper.
+    #[test]
+    fn risk_268_padding_past_candidate_limit_does_not_hide_program() {
+        let mut argv = vec!["env".to_string()];
+        argv.extend(std::iter::repeat_n(
+            "echo".to_string(),
+            MAX_PROGRAM_CANDIDATES,
+        ));
+        argv.extend(["rm", "-rf", "~"].map(String::from));
+        let r = action_from_argv(&argv, None, &ctx_no_cwd());
+        assert_eq!(r.risk, Risk::High);
+
+        let mut argv = vec!["X=1".to_string(); MAX_PROGRAM_CANDIDATES];
+        argv.extend(["rm", "-rf", "~"].map(String::from));
+        let r = action_from_argv(&argv, None, &ctx_no_cwd());
+        assert_eq!(r.risk, Risk::High);
+    }
+
+    /// Negative: a long argv for a program that is not a wrapper is not raised by truncation.
+    #[test]
+    fn risk_268_long_non_wrapper_argv_is_not_raised() {
+        let mut argv = vec!["ls".to_string()];
+        argv.extend((0..MAX_PROGRAM_CANDIDATES + 10).map(|i| format!("file{i}")));
+        let r = action_from_argv(&argv, None, &ctx_no_cwd());
+        assert_eq!(r.risk, Risk::Low);
+    }
+
+    /// #268 changes only `risk`: `bin` is still `argv[0]` and the syntactic fields keep their
+    /// documented T1 meaning (module doc §Flag/§Positional classification), so policy matching
+    /// cannot shift.
+    #[test]
+    fn risk_268_syntactic_fields_unchanged() {
+        let r = action_from_command("FOO=1 git push --force origin main", &ctx_no_cwd()).unwrap();
+        assert_eq!(bin(&r), "FOO=1");
+        assert_eq!(
+            argv(&r),
+            ["FOO=1", "git", "push", "--force", "origin", "main"]
+        );
+        assert_eq!(flags(&r), ["--force"]);
+        assert_eq!(positionals(&r), ["git", "push", "origin", "main"]);
+        assert_eq!(r.syntactic.env_refs, None);
+        assert_eq!(r.syntactic.host, None);
+
+        let r = action_from_command("env X=$HOME rm -rf ~", &ctx_no_cwd()).unwrap();
+        assert_eq!(bin(&r), "env");
+        assert_eq!(argv(&r), ["env", "X=$HOME", "rm", "-rf", "~"]);
+        assert_eq!(flags(&r), ["-rf"]);
+        assert_eq!(positionals(&r), ["X=$HOME", "rm", "~"]);
+        assert_eq!(r.syntactic.env_refs, Some(vec!["HOME".to_string()]));
+
+        let r = action_from_command("sh -c 'ssh user@example.com'", &ctx_no_cwd()).unwrap();
+        assert_eq!(bin(&r), "sh");
+        assert_eq!(positionals(&r), ["ssh user@example.com"]);
+        assert_eq!(r.syntactic.host, None, "host stays argv[0]-based");
     }
 }
