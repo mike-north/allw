@@ -220,7 +220,7 @@ a real network and a live relay), so it is a manual post-deploy check:
 
 1. Deploy the relay (`docs/relay-deploy.md`) and note its URL.
 2. Deploy the web approver bundle (§3 above) and note its URL.
-3. Pair a device against the relay (e.g. `npx allw-approver pair --relay <RELAY_URL> --label
+3. Pair a device against the relay (e.g. `npx --no-install allw-approver pair --relay <RELAY_URL> --label
 web-phone`; the account id is derived from the keyfile's account root), noting the printed account id, `device_id`, `device_auth_token`, seeds,
    and device cert — the pairing form on the phone (§5 below) collects these same 7 fields.
 4. On a phone, open `<WEB_APPROVER_URL>/?relay=<RELAY_URL>` in the browser.

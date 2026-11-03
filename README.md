@@ -35,13 +35,19 @@ npm install @allw/hook @allw/approver
 
 # 2. Pair a second device (a second terminal). Prints your account id + account-root public key
 #    (the account id is derived from the account-root key — you don't choose it):
-npx allw-approver pair --relay https://allw-relay.mnorth.workers.dev --label my-laptop
+npx --no-install allw-approver pair --relay https://allw-relay.mnorth.workers.dev --label my-laptop
 
 # 3. Watch for requests on that device (leave running — this is your "phone" for now):
-npx allw-approver watch
+npx --no-install allw-approver watch
 ```
 
-Then point the Claude Code **PreToolUse** hook at `npx allw-hook` with the relay URL, account id, and
+> **⚠ Demo only.** The CLI approver keeps the account root and signing keys on the machine it runs on,
+> so the agent you are gating can read them and approve its own requests. For real use, pair the
+> [hosted web approver](https://allw-web-approver.pages.dev) from a machine the agent can't read
+> (quickstart §2).
+
+Then point the Claude Code **PreToolUse** hook at `npx --no-install allw-hook` (never plain `npx`,
+which can download and run a registry package of that name) with the relay URL, account id, and
 account-root key as env vars, ask Claude Code to run `git status`, and approve it from the watch
 terminal. The exact hook config block and env vars are in
 **[docs/quickstart.md](./docs/quickstart.md)** (steps 4–5).
