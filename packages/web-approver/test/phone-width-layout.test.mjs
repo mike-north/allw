@@ -17,7 +17,9 @@
  * the same bar: nothing past the viewport and every tail laid out inside it.
  *
  * It needs a Chrome or Chromium binary (`CHROME_PATH`, the macOS app, or one on `PATH`; GitHub's
- * Ubuntu runners ship `google-chrome`). Without one it skips and says so.
+ * Ubuntu runners ship `google-chrome`). Without one it skips and says so. With one, a launch that
+ * produces no measurements (a hang or a crash) is retried once and then fails, with each run's
+ * exit status, signal, timing and stderr; it never skips or passes without measurements.
  *
  * @see ../../../docs/threat-model.md R3 (WYSIWYS completeness)
  * @see https://drafts.csswg.org/css-text-3/#overflow-wrap-property
@@ -163,31 +165,93 @@ function harnessHtml(appHtml, markers) {
   );
 }
 
-/** Run the harness in headless Chrome and return the measurements. */
-function measureInChrome(chrome, html) {
+/**
+ * How long one headless-Chrome run may take. A warm launch measures in well under 5 s, but the first
+ * launch on a fresh CI runner (font caches, profile creation) has a long tail: past 50 s once, and
+ * past the former 60 s deadline once, when Chrome was stopped and exited 0 with no output.
+ */
+const CHROME_RUN_DEADLINE_MS = 120_000;
+
+/**
+ * How many times to launch Chrome before giving up. A retry happens only when a run produced **no**
+ * measurements (Chrome hung or crashed before writing them). Measurements that did arrive are
+ * always returned and asserted on, never retried, so a layout failure can't be retried away, and
+ * running out of attempts fails the test rather than skipping it.
+ */
+const CHROME_ATTEMPTS = 2;
+
+/** One line describing a Chrome run that produced no measurements, for the failure message. */
+function describeRun(run, elapsedMs) {
+  const stderrTail = (run.stderr ?? "").trim().split("\n").slice(-5).join(" | ");
+  return [
+    `status ${String(run.status)}`,
+    `signal ${String(run.signal)}`,
+    run.error ? `error ${run.error.code ?? run.error.message}` : "no spawn error",
+    `after ${String(Math.round(elapsedMs))} ms`,
+    `stderr: ${stderrTail === "" ? "(empty)" : stderrTail}`,
+  ].join(", ");
+}
+
+/**
+ * Run the harness in headless Chrome and return the measurements. `diagnostic` reports a retried
+ * run, so a flaky launch stays visible in the test output even when the retry succeeds.
+ */
+function measureInChrome(chrome, html, diagnostic) {
   const dir = mkdtempSync(join(tmpdir(), "allw-phone-layout-"));
   try {
     const file = join(dir, "harness.html");
     writeFileSync(file, html);
-    const run = spawnSync(
-      chrome,
-      [
-        "--headless=new",
-        "--disable-gpu",
-        "--no-sandbox",
-        "--no-first-run",
-        `--user-data-dir=${join(dir, "profile")}`,
-        "--virtual-time-budget=5000",
-        "--dump-dom",
-        pathToFileURL(file).href,
-      ],
-      { encoding: "utf8", timeout: 60_000, maxBuffer: 64 * 1024 * 1024 },
+    const failures = [];
+    for (let attempt = 1; attempt <= CHROME_ATTEMPTS; attempt += 1) {
+      const started = performance.now();
+      const run = spawnSync(
+        chrome,
+        [
+          "--headless=new",
+          "--disable-gpu",
+          "--no-sandbox",
+          "--no-first-run",
+          "--no-default-browser-check",
+          // CI containers have a small /dev/shm, a known cause of headless Chrome stalls.
+          "--disable-dev-shm-usage",
+          "--disable-extensions",
+          "--disable-background-networking",
+          "--disable-component-update",
+          "--disable-sync",
+          "--mute-audio",
+          // A fresh profile for every attempt, so a half-written one can't affect a retry.
+          `--user-data-dir=${join(dir, `profile-${String(attempt)}`)}`,
+          "--virtual-time-budget=5000",
+          "--dump-dom",
+          pathToFileURL(file).href,
+        ],
+        {
+          encoding: "utf8",
+          // On timeout Chrome gets SIGTERM, shuts down its child processes, and the run reports
+          // `error ETIMEDOUT`.
+          timeout: CHROME_RUN_DEADLINE_MS,
+          maxBuffer: 64 * 1024 * 1024,
+        },
+      );
+      const match = /<pre id="result">([^<]*)<\/pre>/.exec(run.stdout ?? "");
+      if (match?.[1]) {
+        if (failures.length > 0) {
+          diagnostic(
+            `Chrome produced measurements on attempt ${String(attempt)}; ${failures.join("; ")}`,
+          );
+        }
+        // `--dump-dom` HTML-escapes text content.
+        const json = match[1]
+          .replaceAll("&quot;", '"')
+          .replaceAll("&lt;", "<")
+          .replaceAll("&gt;", ">");
+        return JSON.parse(json.replaceAll("&amp;", "&"));
+      }
+      failures.push(`attempt ${String(attempt)}: ${describeRun(run, performance.now() - started)}`);
+    }
+    assert.fail(
+      `Chrome produced no measurements in ${String(CHROME_ATTEMPTS)} runs: ${failures.join("; ")}`,
     );
-    const match = /<pre id="result">([^<]*)<\/pre>/.exec(run.stdout ?? "");
-    assert.ok(match?.[1], `Chrome produced no measurements (status ${String(run.status)})`);
-    // `--dump-dom` HTML-escapes text content.
-    const json = match[1].replaceAll("&quot;", '"').replaceAll("&lt;", "<").replaceAll("&gt;", ">");
-    return JSON.parse(json.replaceAll("&amp;", "&"));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -232,9 +296,11 @@ const chrome = findChrome();
 test(
   `at ${String(VIEWPORT_WIDTH)} px nothing hash-bound is clipped or pushed off-screen`,
   { skip: chrome === undefined ? "no Chrome/Chromium binary found (set CHROME_PATH)" : false },
-  async () => {
+  async (t) => {
     const root = await mountWith(CONTEXTS);
-    const m = measureInChrome(chrome, harnessHtml(root.outerHTML, MARKERS));
+    const m = measureInChrome(chrome, harnessHtml(root.outerHTML, MARKERS), (msg) => {
+      t.diagnostic(msg);
+    });
 
     assertNothingOffScreen(m, MARKERS);
 
@@ -266,13 +332,15 @@ const AUDIT_CONTEXTS = [
 test(
   `at ${String(VIEWPORT_WIDTH)} px the audit receipt keeps every hash-bound tail on-screen`,
   { skip: chrome === undefined ? "no Chrome/Chromium binary found (set CHROME_PATH)" : false },
-  async () => {
+  async (t) => {
     const root = await mountAuditWith(AUDIT_CONTEXTS);
     assert.ok(
       root.querySelector(".audit-context-summary"),
       "the receipt shows the context summary",
     );
-    const m = measureInChrome(chrome, harnessHtml(root.outerHTML, AUDIT_MARKERS));
+    const m = measureInChrome(chrome, harnessHtml(root.outerHTML, AUDIT_MARKERS), (msg) => {
+      t.diagnostic(msg);
+    });
     assertNothingOffScreen(m, AUDIT_MARKERS);
   },
 );
