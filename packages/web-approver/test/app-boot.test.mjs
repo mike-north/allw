@@ -16,8 +16,9 @@
  *   - an identity stored before pinning existed is bound to the already-persisted relay, never to
  *     a `?relay=` link;
  *   - unpaired + `?relay=http://relay.example.com` → rejected with the https-only reason;
- *   - an identity pinned to a relay the current rule rejects (`http://[::1]`) → boots unpaired and
- *     must re-pair (current behaviour, pinned).
+ *   - an identity pinned to a relay the current rule rejects (`http://[::1]`) → a re-pair-required
+ *     screen first; the identity is cleared only on confirmation (#286). A corrupt identity is
+ *     still discarded by the pairing gate.
  *
  * @see https://github.com/mike-north/allw/issues/249
  * @see ../src/app.ts
@@ -241,31 +242,60 @@ describe("boot — identity stored before relay pinning existed", () => {
 });
 
 /**
- * Pins the current behaviour for a stored pin that a later build no longer accepts. Builds before
- * `[::1]` was dropped from the loopback set could pin `http://[::1]:…`. Under the narrowed rule that
- * pin fails `checkRelayUrl`, so `parseIdentity` treats the whole identity as corrupt (fail-closed)
- * and the browser boots as unpaired. Such browsers must re-pair (docs/web-approver-deploy.md §2,
- * Relay pinning). These tests record what happens to the stored identity today. Replacing the silent
- * clear with a visible "re-pair required" state is a tracked follow-up, and it will change them.
+ * A stored identity pinned to a relay this build rejects (#286). For example, builds before
+ * `[::1]` was dropped from the loopback set could pin `http://[::1]:…`. The identity is a distinct
+ * re-pair-required state: boot shows it before resolving or asking for any relay, nothing is
+ * cleared until the human confirms, and no relay is contacted. One test per path: a valid pin loads
+ * normally, a rejected pin shows the re-pair state, and a corrupt identity keeps today's behaviour.
+ *
+ * @see https://github.com/mike-north/allw/issues/286
  */
-describe("boot — identity pinned to a relay the current rule no longer accepts ([::1])", () => {
+describe("boot — stored identity pinned to a relay this build rejects (#286)", () => {
   const V6_PINNED_IDENTITY = { ...PINNED_IDENTITY, relayUrl: "http://[::1]:8787" };
+  const LOOPBACK_CANDIDATE = "http://127.0.0.1:8787";
+  const confirmLabel = "Forget this pairing and pair again";
 
-  test("with a persisted candidate relay, boots unpaired and the pairing gate clears the identity", async () => {
+  test("a valid pin loads normally: returning-device screen, inbox on the pinned relay", async () => {
     const storage = memoryStorage();
     storage.setItem(ONBOARDING_KEY, "1");
-    storage.setItem(PAIRING_KEY, JSON.stringify(V6_PINNED_IDENTITY));
-    storage.setItem(RELAY_URL_STORAGE_KEY, "http://127.0.0.1:8787");
+    storage.setItem(PAIRING_KEY, JSON.stringify(PINNED_IDENTITY));
+    storage.setItem(RELAY_URL_STORAGE_KEY, LOOPBACK_CANDIDATE);
 
     const { root, inboxStarts } = await bootWith({ search: "", storage });
 
-    assert.ok(root.querySelector("form.pairing-form"), "the device is shown the pairing form");
-    assert.equal(storage.getItem(PAIRING_KEY), null, "the stored identity is cleared");
-    assert.equal(inboxStarts.length, 0, "the [::1]-pinned identity never reaches the inbox");
+    assert.equal(root.querySelector(".pairing-kicker").textContent, "Already paired");
+    click(root, "Unlock inbox");
+    assert.equal(inboxStarts[0].relayUrl, PINNED_RELAY);
     assert.deepEqual(networkAttempts, []);
   });
 
-  test("with no persisted candidate relay, asks for one and the identity is not yet cleared", async () => {
+  test("a rejected pin shows the re-pair state first and keeps the identity until confirmed", async () => {
+    const storage = memoryStorage();
+    storage.setItem(ONBOARDING_KEY, "1");
+    const storedRaw = JSON.stringify(V6_PINNED_IDENTITY);
+    storage.setItem(PAIRING_KEY, storedRaw);
+    storage.setItem(RELAY_URL_STORAGE_KEY, LOOPBACK_CANDIDATE);
+
+    const bootPromise = bootWith({ search: relayQuery(EVIL_RELAY), storage });
+    const root = dom.window.document.getElementById("app");
+
+    assert.equal(root.querySelector(".pairing-kicker").textContent, "Re-pair required");
+    assert.equal(root.querySelector(".pairing-relay-url").textContent, "http://[::1]:8787");
+    assert.equal(root.querySelector("form.pairing-form"), null);
+    assert.equal(root.querySelector("form.relay-config-form"), null);
+    assert.equal(storage.getItem(PAIRING_KEY), storedRaw, "the identity is still stored");
+    assert.deepEqual(networkAttempts, []);
+
+    click(root, confirmLabel);
+    const { inboxStarts } = await bootPromise;
+
+    assert.equal(storage.getItem(PAIRING_KEY), null, "cleared only after confirmation");
+    assert.ok(root.querySelector("form.pairing-form"), "then the browser pairs as new");
+    assert.equal(inboxStarts.length, 0, "the rejected identity never reaches the inbox");
+    assert.deepEqual(networkAttempts, []);
+  });
+
+  test("a rejected pin with no candidate relay still explains first, then asks for a relay", async () => {
     const storage = memoryStorage();
     storage.setItem(ONBOARDING_KEY, "1");
     const storedRaw = JSON.stringify(V6_PINNED_IDENTITY);
@@ -274,9 +304,30 @@ describe("boot — identity pinned to a relay the current rule no longer accepts
     void bootWith({ search: "", storage });
     const root = dom.window.document.getElementById("app");
 
-    assert.ok(root.querySelector("form.relay-config-form"), "the relay prompt is shown");
-    assert.equal(root.querySelector("form.pairing-form"), null);
+    assert.equal(root.querySelector(".pairing-kicker").textContent, "Re-pair required");
+    assert.equal(root.querySelector("form.relay-config-form"), null, "no relay prompt yet");
     assert.equal(storage.getItem(PAIRING_KEY), storedRaw);
+
+    click(root, confirmLabel);
+    await Promise.resolve();
+
+    assert.equal(storage.getItem(PAIRING_KEY), null);
+    assert.ok(root.querySelector("form.relay-config-form"), "now the relay prompt is shown");
+    assert.deepEqual(networkAttempts, []);
+  });
+
+  test("a corrupt identity keeps today's behaviour: boots unpaired and is cleared by the gate", async () => {
+    const storage = memoryStorage();
+    storage.setItem(ONBOARDING_KEY, "1");
+    const { deviceAuthToken: _omitted, ...partial } = V6_PINNED_IDENTITY;
+    storage.setItem(PAIRING_KEY, JSON.stringify(partial));
+    storage.setItem(RELAY_URL_STORAGE_KEY, LOOPBACK_CANDIDATE);
+
+    const { root, inboxStarts } = await bootWith({ search: "", storage });
+
+    assert.ok(root.querySelector("form.pairing-form"), "straight to the pairing form");
+    assert.equal(storage.getItem(PAIRING_KEY), null, "the corrupt value is discarded");
+    assert.equal(inboxStarts.length, 0);
     assert.deepEqual(networkAttempts, []);
   });
 });

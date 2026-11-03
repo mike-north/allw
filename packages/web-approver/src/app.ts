@@ -26,6 +26,9 @@
  *   had already persisted — never to the link — or, if none, to one the human types.
  * - **Unpaired** — a `?relay=` link may pre-fill the candidate relay; the pairing screen shows it
  *   before the human commits, and pairing pins it.
+ * - **Re-pair required** (#286) — the stored identity is pinned to a relay this build rejects. Before
+ *   any relay is resolved or asked for, a screen names that relay and why; the identity is cleared
+ *   only when the human confirms, and the browser then continues as unpaired.
  *
  * Every relay call after pairing ({@link bootInbox}) reads the identity's pinned `relayUrl`.
  *
@@ -50,7 +53,14 @@
 import { createRelayAccountStateResolver } from "./account-state.js";
 import { mountWebApprover, type WebApproverMount } from "./browser.js";
 import { mountOnboardingGate } from "./onboarding.js";
-import { createLocalPairingStore, mountPairingGate, type PairedIdentity } from "./pairing.js";
+import {
+  createLocalPairingStore,
+  mountPairingGate,
+  mountRelayRepairGate,
+  type PairedIdentity,
+  type PairingStore,
+  type RejectedRelayPin,
+} from "./pairing.js";
 import {
   describeIgnoredRelayOverride,
   mountIgnoredRelayNotice,
@@ -163,6 +173,20 @@ async function resolvePinnedRelayUrl(
 }
 
 /**
+ * Show the re-pair-required state (#286) and resolve once the human has confirmed and the stored
+ * identity has been cleared. Never resolves if the human leaves instead, so nothing is cleared.
+ */
+function confirmRelayRepair(
+  root: HTMLElement,
+  pairingStore: PairingStore,
+  rejected: RejectedRelayPin,
+): Promise<void> {
+  return new Promise((resolve) => {
+    mountRelayRepairGate({ root, pairingStore, rejected, onCleared: resolve });
+  });
+}
+
+/**
  * Load the vendored WASM core and mount the live inbox for a confirmed `identity`, sending every
  * relay call — inbox poll, `connect` WebSocket, account-state resolution — to its pinned
  * `relayUrl` and to nothing else. Resolves to the mount, whose `stop()` ends the poll loop. Any failure here (a stale/missing vendored artifact, a WASM
@@ -208,14 +232,20 @@ export async function bootInbox(
 }
 
 /**
- * The full boot sequence: relay URL (pinned if paired, candidate otherwise) → first-run
+ * The full boot sequence: re-pair confirmation if the stored pin is rejected (#286) → relay URL
+ * (pinned if paired, candidate otherwise) → first-run
  * onboarding walkthrough (pre-enrollment only, #151) → pairing gate → (on success) WASM + live
  * inbox against the pinned relay.
  */
 export async function boot(env: BootEnvironment): Promise<void> {
   const { root, storage } = env;
   const pairingStore = createLocalPairingStore(storage);
-  const stored = pairingStore.load();
+  let loaded = pairingStore.load();
+  if (loaded.status === "relay-pin-rejected") {
+    await confirmRelayRepair(root, pairingStore, loaded);
+    loaded = pairingStore.load();
+  }
+  const stored = loaded.status === "paired" ? loaded.identity : null;
 
   let relayUrl: string;
   if (stored !== null) {

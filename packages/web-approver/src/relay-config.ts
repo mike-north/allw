@@ -90,10 +90,11 @@ function hasUrlExtras(raw: string, parsed: URL): boolean {
  * The canonical form is `URL.origin` (lowercased, punycode host, default port dropped) plus the
  * parsed pathname with trailing slashes stripped — never the caller's raw text — so the value
  * stored in a pin, compared against a `?relay=` link, and shown to the human is one unambiguous
- * string. `./pairing.ts` `parseIdentity` requires a stored pin to equal this form, so **changing the
- * canonical form or narrowing what this function accepts requires migrating stored pins**.
- * Otherwise an existing pin loads as corrupt, the browser is treated as unpaired, and the pairing
- * gate's `store.clear()` silently discards the device identity.
+ * string. `./pairing.ts` requires a stored pin to equal this form, so **changing the canonical form
+ * or narrowing what this function accepts** puts every affected browser into the re-pair-required
+ * state (#286): its identity is unusable and the human must confirm re-pairing. A change that does
+ * so should ship a migration for stored pins, or say in its release notes that those devices must
+ * re-pair.
  */
 export function checkRelayUrl(candidate: string): RelayUrlCheck {
   const trimmed = candidate.trim();

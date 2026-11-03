@@ -1,8 +1,20 @@
 export type { AllwWasm, WasmModuleSource } from "./wasm.js";
 export { initWasm, initWasmSync, resetWasmForTests } from "./wasm.js";
 
-export type { PairedIdentity, PairingStore, PairingGateOptions } from "./pairing.js";
-export { createLocalPairingStore, mountPairingGate } from "./pairing.js";
+export type {
+  PairedIdentity,
+  PairingStore,
+  PairingGateOptions,
+  RejectedRelayPin,
+  RelayRepairGateOptions,
+  StoredPairing,
+} from "./pairing.js";
+export {
+  createLocalPairingStore,
+  mountPairingGate,
+  mountRelayRepairGate,
+  visiblyEscape,
+} from "./pairing.js";
 
 export type { OnboardingWalkthroughOptions, OnboardingGateOptions } from "./onboarding.js";
 export {

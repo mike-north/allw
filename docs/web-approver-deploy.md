@@ -108,11 +108,18 @@ WebSocket, account-state resolution — goes to that pinned relay.
 - **Browsers paired before pinning existed** are bound once, on their next visit, to the relay URL
   they had already persisted (`allw:relay-url:v1`) — never to a `?relay=` link on that visit. If
   none is persisted, the config prompt asks for it.
-- **A pin that a later build no longer accepts** makes the stored identity load as corrupt
-  (fail-closed). The browser boots as unpaired and must re-pair, which replaces the stored identity.
-  For example, browsers pinned to `http://[::1]:…` before `[::1]` was dropped must re-pair against
-  `http://127.0.0.1:…`. Builds that narrow the relay rule or change its canonical form must ship a
-  migration for stored pins.
+- **A pin that a later build no longer accepts** (a rejected or non-canonical relay URL in an
+  otherwise valid identity) puts the browser in a **re-pair-required** state. The identity is
+  unusable (fail-closed: nothing is sent to that relay), but it is not discarded silently. Before
+  any relay is resolved or asked for, a screen shows the pinned relay, with every non-printable or
+  non-ASCII character shown as `⟨U+XXXX⟩`, and says why it is rejected. The stored identity is
+  cleared only when the human chooses **Forget this pairing and pair again**; the browser then
+  pairs as new. Closing the page leaves it in storage. For example, browsers pinned to
+  `http://[::1]:…` before `[::1]` was dropped land here and re-pair against `http://127.0.0.1:…`.
+  Builds that narrow the relay rule or change its canonical form should ship a migration for stored
+  pins, or say in their release notes that affected devices must re-pair. An identity that is
+  corrupt in any other way (unparseable, a missing field, a non-string pin) is still discarded and
+  the browser routed to pairing.
 
 **[OPERATOR]** To hand a user a working link, share the deployed bundle's URL with `?relay=`
 appended, e.g.:

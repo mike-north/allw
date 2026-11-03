@@ -5,11 +5,17 @@
  * `mountPairingGate`, which renders the appropriate pre-inbox screen and hands control to the inbox
  * only after a valid, persisted {@link ApproverIdentity} is confirmed.
  *
- * # Three pre-inbox routes (design/web-approver/onboarding/flow-notes.md)
+ * # Pre-inbox routes (design/web-approver/onboarding/flow-notes.md)
  *
  * 1. **Returning device** — `localStorage` already has a stored identity; a lightweight re-auth
  *    confirmation unlocks the inbox (the local key was already established at pairing). If the
  *    stored identity cannot be parsed it is discarded and the user is routed to pairing.
+ *
+ * 1a. **Re-pair required** (#286) — the stored identity is intact, but the relay it is pinned to is
+ *    one this build no longer accepts (a later build narrowed `checkRelayUrl` or changed its
+ *    canonical form). The identity is unusable, but it is **not** discarded silently: a screen
+ *    names the pinned relay and why it is rejected, and the identity is cleared only when the
+ *    human confirms re-pairing.
  *
  * 2. **Device pairing** — no stored identity; user enters the CLI-issued pairing code plus the
  *    relay-returned device credentials. The gate validates the submitted fields (non-empty, required
@@ -82,29 +88,81 @@ const REQUIRED_IDENTITY_FIELDS: readonly (keyof ApproverIdentity)[] = [
 ];
 
 /**
- * Narrow a parsed JSON value to a {@link PairedIdentity}. Returns `null` on any structural failure,
- * including a present-but-invalid pinned `relayUrl` (a tampered or insecure pin is treated as a
- * corrupt identity — fail-closed — never silently dropped, which would un-pin the device).
+ * What the pairing store currently holds, classified the way the gate routes on it.
  *
- * The pin must equal `checkRelayUrl`'s canonical form exactly. Changing that canonical form, or
- * narrowing what `checkRelayUrl` accepts, therefore requires migrating stored pins in the same
- * change. Otherwise every affected pin loads as corrupt and the pairing gate clears the stored
- * identity, so devices silently lose it.
+ * - `absent` — nothing is stored: a new device.
+ * - `paired` — a usable identity. Its pin, if present, is a relay this build accepts, in canonical
+ *   form.
+ * - `relay-pin-rejected` — every identity field is valid, but the pinned relay is one this build
+ *   does not accept as stored (#286). The identity is unusable (fail-closed: nothing is sent to
+ *   that relay), but it is a distinct state from `corrupt` so the gate can tell the human why and
+ *   ask before clearing it. `pinnedRelayUrl` is the stored text, unvalidated: render it only with
+ *   {@link visiblyEscape}.
+ * - `corrupt` — anything else: unparseable JSON, a missing or empty field, a non-string pin.
  */
-function parseIdentity(value: unknown): PairedIdentity | null {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+export type StoredPairing =
+  | { readonly status: "absent" }
+  | { readonly status: "paired"; readonly identity: PairedIdentity }
+  | {
+      readonly status: "relay-pin-rejected";
+      readonly pinnedRelayUrl: string;
+      readonly reason: string;
+    }
+  | { readonly status: "corrupt" };
+
+/**
+ * Classify a parsed JSON value as a stored identity (any {@link StoredPairing} but `absent`).
+ *
+ * The pin must equal `checkRelayUrl`'s canonical form exactly; a string pin that does not is
+ * `relay-pin-rejected`, never silently dropped (which would un-pin the device) and never accepted.
+ * Changing that canonical form, or narrowing what `checkRelayUrl` accepts, therefore puts every
+ * affected device into the re-pair-required state. A change that does so should ship a migration
+ * for stored pins in the same change, or say in its release notes that those devices must re-pair.
+ */
+function classifyIdentity(value: unknown): Exclude<StoredPairing, { status: "absent" }> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return { status: "corrupt" };
+  }
   const record = value as Record<string, unknown>;
   for (const field of REQUIRED_IDENTITY_FIELDS) {
     const fieldValue = record[field];
-    if (typeof fieldValue !== "string" || fieldValue.length === 0) return null;
+    if (typeof fieldValue !== "string" || fieldValue.length === 0) return { status: "corrupt" };
   }
   const relayUrl = record.relayUrl;
   if (relayUrl !== undefined) {
-    if (typeof relayUrl !== "string") return null;
+    if (typeof relayUrl !== "string") return { status: "corrupt" };
     const checked = checkRelayUrl(relayUrl);
-    if (!checked.ok || checked.relayUrl !== relayUrl) return null;
+    if (!checked.ok) {
+      return { status: "relay-pin-rejected", pinnedRelayUrl: relayUrl, reason: checked.reason };
+    }
+    if (checked.relayUrl !== relayUrl) {
+      return {
+        status: "relay-pin-rejected",
+        pinnedRelayUrl: relayUrl,
+        reason: `This version stores relay URLs in canonical form (${checked.relayUrl}), and this pin is not in that form.`,
+      };
+    }
   }
-  return record as unknown as PairedIdentity;
+  return { status: "paired", identity: record as unknown as PairedIdentity };
+}
+
+/**
+ * Render arbitrary stored text so every character is visible: printable ASCII (U+0020–U+007E) is
+ * kept, and every other code point (control characters, bidi overrides, zero-width and non-ASCII
+ * look-alikes, and the `⟨` / `⟩` brackets themselves) becomes `⟨U+XXXX⟩`. This is the notation the
+ * core's display model (#246) uses. Used for a rejected relay pin, which is unvalidated stored
+ * text that could otherwise reorder or disguise itself on screen.
+ */
+export function visiblyEscape(value: string): string {
+  let out = "";
+  for (const char of value) {
+    const codePoint = char.codePointAt(0) ?? 0;
+    out +=
+      codePoint >= 0x20 && codePoint <= 0x7e
+        ? char
+        : `⟨U+${codePoint.toString(16).toUpperCase().padStart(4, "0")}⟩`;
+  }
+  return out;
 }
 
 /**
@@ -121,8 +179,12 @@ function parseIdentity(value: unknown): PairedIdentity | null {
  * implementation backed by IndexedDB + the WebCrypto non-extractable key API.
  */
 export interface PairingStore {
-  /** Load the persisted identity. Returns `null` when not yet paired or the stored value is corrupt. */
-  load(): PairedIdentity | null;
+  /**
+   * Read and classify the persisted identity ({@link StoredPairing}). Only a `paired` result may
+   * reach the inbox; a store that cannot tell `relay-pin-rejected` from `corrupt` may report
+   * `corrupt`, which keeps today's discard-and-re-pair behaviour.
+   */
+  load(): StoredPairing;
   /** Persist a new identity (replaces any existing stored value). */
   save(identity: PairedIdentity): void;
   /** Remove the stored identity (used for "sign out" / reset flows). */
@@ -136,14 +198,17 @@ export interface PairingStore {
 export function createLocalPairingStore(storage?: Storage): PairingStore {
   const store: Storage = storage ?? localStorage;
   return {
-    load() {
+    load(): StoredPairing {
+      let raw: string | null;
+      let parsed: unknown;
       try {
-        const raw = store.getItem(STORAGE_KEY);
-        if (raw === null) return null;
-        return parseIdentity(JSON.parse(raw));
+        raw = store.getItem(STORAGE_KEY);
+        if (raw === null) return { status: "absent" };
+        parsed = JSON.parse(raw);
       } catch {
-        return null;
+        return { status: "corrupt" };
       }
+      return classifyIdentity(parsed);
     },
     save(identity: PairedIdentity) {
       store.setItem(STORAGE_KEY, JSON.stringify(identity));
@@ -163,8 +228,7 @@ function validatePairingFields(fields: Record<string, string>): string | null {
       return `Missing required field: ${field}`;
     }
   }
-  const identity = parseIdentity(fields);
-  if (identity === null) {
+  if (classifyIdentity(fields).status !== "paired") {
     return "All fields must be non-empty strings";
   }
   return null;
@@ -426,19 +490,110 @@ function renderPairingScreen(
       return;
     }
 
-    const identity = parseIdentity(fields);
-    if (identity === null) {
+    const classified = classifyIdentity(fields);
+    if (classified.status !== "paired") {
       // Should be unreachable after validation but guarded for defensive fail-closed.
       renderPairingScreen(root, relayUrl, onPaired, "Invalid credential format — please re-enter.");
       return;
     }
 
-    onPaired(identity);
+    onPaired(classified.identity);
   });
 
   screen.append(form);
   shell.append(screen);
   root.append(shell);
+}
+
+/** A stored identity whose pinned relay this build rejects (#286). */
+export type RejectedRelayPin = Extract<StoredPairing, { status: "relay-pin-rejected" }>;
+
+/**
+ * Render the re-pair-required screen (#286): the stored identity is intact but pinned to a relay
+ * this build rejects. It names the pinned relay (visibly escaped) and why it is rejected, and says
+ * that nothing is removed until the human continues. The only action is `onConfirm`.
+ */
+function renderRelayRepairScreen(
+  root: HTMLElement,
+  rejected: RejectedRelayPin,
+  onConfirm: () => void,
+): void {
+  root.replaceChildren();
+
+  const shell = el("div", "pairing-shell");
+
+  const header = el("header", "pairing-header");
+  header.append(text("h1", "allw approvals", "pairing-wordmark"));
+  shell.append(header);
+
+  const screen = el("section", "pairing-screen");
+  screen.setAttribute("aria-labelledby", "pairing-title");
+
+  const kicker = el("div", "pairing-kicker");
+  kicker.textContent = "Re-pair required";
+  screen.append(kicker);
+
+  const headline = text("h2", "Pair this browser again.", "pairing-headline");
+  headline.id = "pairing-title";
+  screen.append(headline);
+  screen.append(
+    text(
+      "p",
+      "This browser is paired against a relay that this version of the approver no longer supports, so it can't use that pairing. Nothing has been sent to that relay.",
+      "pairing-subcopy",
+    ),
+  );
+
+  const relayBox = el("div", "pairing-relay");
+  relayBox.append(text("span", "Pinned relay (no longer supported)", "pairing-relay-label"));
+  relayBox.append(text("code", visiblyEscape(rejected.pinnedRelayUrl), "pairing-relay-url"));
+  relayBox.append(text("p", rejected.reason, "pairing-relay-note"));
+  screen.append(relayBox);
+
+  screen.append(
+    text(
+      "p",
+      "Pairing again removes this browser's stored device identity (its keys and relay token) and replaces it with a new one. Nothing is removed until you continue; to keep it for now, close this page.",
+      "pairing-subcopy",
+    ),
+  );
+
+  const actions = el("div", "pairing-actions");
+  const confirmBtn = el("button", "pairing-btn pairing-btn--primary");
+  confirmBtn.type = "button";
+  confirmBtn.textContent = "Forget this pairing and pair again";
+  confirmBtn.addEventListener("click", onConfirm);
+  actions.append(confirmBtn);
+  screen.append(actions);
+
+  shell.append(screen);
+  root.append(shell);
+}
+
+/** Options for {@link mountRelayRepairGate}. */
+export interface RelayRepairGateOptions {
+  /** The DOM element to render the re-pair-required screen into. */
+  readonly root: HTMLElement;
+  /** The store holding the rejected identity; cleared only on the human's confirmation. */
+  readonly pairingStore: PairingStore;
+  /** The rejected pin, as {@link PairingStore.load} reported it. */
+  readonly rejected: RejectedRelayPin;
+  /** Called once, after the human confirmed and the stored identity was cleared. */
+  readonly onCleared: () => void;
+}
+
+/**
+ * Show the re-pair-required state for an identity whose pinned relay this build rejects (#286),
+ * and clear the stored identity only when the human confirms. Until then the identity stays in
+ * storage untouched and no relay is contacted. The production boot (`./app.ts`) mounts this before
+ * asking for a relay, and {@link mountPairingGate} routes to it for the same stored state.
+ */
+export function mountRelayRepairGate(options: RelayRepairGateOptions): void {
+  const { root, pairingStore, rejected, onCleared } = options;
+  renderRelayRepairScreen(root, rejected, () => {
+    pairingStore.clear();
+    onCleared();
+  });
 }
 
 // ── Gate entry point ──────────────────────────────────────────────────────────────────────────────
@@ -478,6 +633,9 @@ export interface PairingGateOptions {
  *
  * - **Returning device** (stored identity found and parseable): renders the re-auth screen.
  *   The human clicks "Unlock inbox" → `onPaired` fires with the stored identity.
+ * - **Re-pair required** (stored identity pinned to a relay this build rejects, #286): renders
+ *   {@link mountRelayRepairGate}. The identity is cleared only when the human confirms, and then
+ *   the pairing form is shown.
  * - **New / reset device** (no stored identity or corrupt stored value): renders the pairing form.
  *   The human submits valid credentials → the identity is persisted and `onPaired` fires.
  *
@@ -500,23 +658,36 @@ export function mountPairingGate(options: PairingGateOptions): void {
     });
   }
 
-  const stored = store.load();
-  if (stored !== null) {
-    renderReturningScreen(
-      root,
-      stored,
-      () => {
-        // Re-confirm the stored identity is still valid before routing to inbox.
-        const current = store.load();
-        if (current === null) {
-          goToPairing();
-          return;
-        }
-        onPaired(current);
-      },
-      goToPairing,
-    );
-  } else {
-    goToPairing();
+  function route(stored: StoredPairing): void {
+    switch (stored.status) {
+      case "paired":
+        renderReturningScreen(
+          root,
+          stored.identity,
+          () => {
+            // Re-check the stored identity before routing to the inbox; if it changed (e.g.
+            // another tab), route on what is stored now.
+            const current = store.load();
+            if (current.status === "paired") onPaired(current.identity);
+            else route(current);
+          },
+          goToPairing,
+        );
+        return;
+      case "relay-pin-rejected":
+        mountRelayRepairGate({
+          root,
+          pairingStore: store,
+          rejected: stored,
+          onCleared: goToPairing,
+        });
+        return;
+      case "absent":
+      case "corrupt":
+        goToPairing();
+        return;
+    }
   }
+
+  route(store.load());
 }
