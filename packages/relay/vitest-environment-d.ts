@@ -15,4 +15,5 @@ declare global {
   }
 }
 
+// Aliased: inside `namespace Cloudflare`, `Env` names `Cloudflare.Env` itself, so `extends Env` would add nothing.
 type RelayEnv = Env;
