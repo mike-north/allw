@@ -29,11 +29,12 @@
 //!     `Start-Process` (`start`, `saps`), `Start-Job` (`sajb`), or a nested shell (`powershell`,
 //!     `pwsh`, `cmd`);
 //!   - an encoded command: a `-EncodedCommand` parameter or any prefix of it (`-e`, `-enc`, …), or
-//!     `-ec`, whose payload the human can't read. The parameter may start with any dash PowerShell
-//!     accepts (`-`, `/`, U+2013, U+2014, U+2015) and may be quoted (`'-enc'`, `"-enc"`), since
-//!     PowerShell strips the quotes before a native program sees the argument;
+//!     `-ec`, whose payload the human can't read. The parameter may start with one or two of the
+//!     dashes PowerShell accepts (`-`, `/`, U+2013, U+2014, U+2015; pwsh drops a doubled dash), and
+//!     quotes anywhere in it are ignored (`'-enc'`, `-"enc"`, `-e''nc`), since PowerShell removes
+//!     them before a native program sees the argument;
 //!   - a command named like PowerShell itself (`pwsh-preview`, `powershell_ise`, a path ending in
-//!     one), a nested shell the whole-word check above can't see;
+//!     one, `p''wsh` with its quotes removed), a nested shell the whole-word check above can't see;
 //!   - dot-sourcing, which runs a script in the current scope: `.` as the command, or a command
 //!     word that is `.` directly followed by a quoted or variable path (`.'x.ps1'`, `."x.ps1"`,
 //!     `.$script`).
@@ -144,10 +145,10 @@ fn has_compound_construct(raw: &str, argv: &[String]) -> bool {
             .is_some_and(|bin| is_powershell_executable(bin))
 }
 
-/// Whether the command word names a PowerShell executable: its last path segment, with one layer of
-/// quotes removed, starts with `pwsh` or `powershell` (case-insensitively).
+/// Whether the command word names a PowerShell executable: its last path segment, with every quote
+/// character removed, starts with `pwsh` or `powershell` (case-insensitively).
 fn is_powershell_executable(bin: &str) -> bool {
-    let unquoted = strip_one_quote_layer(bin);
+    let unquoted = without_quotes(bin);
     let name = unquoted
         .rsplit(['\\', '/'])
         .next()
@@ -158,12 +159,20 @@ fn is_powershell_executable(bin: &str) -> bool {
         .any(|prefix| name.starts_with(prefix))
 }
 
-/// `token` with at most one leading and one trailing quote character removed. The two needn't
-/// match: stripping more than PowerShell would only ever expose a parameter name, which fails
-/// upward.
-fn strip_one_quote_layer(token: &str) -> &str {
-    let token = token.strip_prefix(QUOTE_CHARS).unwrap_or(token);
-    token.strip_suffix(QUOTE_CHARS).unwrap_or(token)
+/// `token` with every quote character ([`QUOTE_CHARS`]) deleted, wherever it is. PowerShell removes
+/// the quotes from a bareword argument or command name (`-"enc"` → `-enc`, `p''wsh` → `pwsh`).
+/// Deleting more than PowerShell would only ever expose a trigger, which fails upward. Only the
+/// checks read this copy; `raw` and argv keep the quotes.
+fn without_quotes(token: &str) -> String {
+    token.chars().filter(|c| !QUOTE_CHARS.contains(c)).collect()
+}
+
+/// The quoted segment a token starts with, without its quotes: `"-e"SQB…` → `-e`. In argument mode
+/// PowerShell may split such a token after the quoted part, so the segment can reach the program as
+/// an argument of its own. `None` when the token doesn't start with a quote.
+fn leading_quoted_segment(token: &str) -> Option<&str> {
+    let rest = token.strip_prefix(QUOTE_CHARS)?;
+    Some(rest.split(QUOTE_CHARS).next().unwrap_or_default())
 }
 
 /// Whether the command word dot-sources a script: `.` on its own, or `.` directly followed by a
@@ -175,13 +184,22 @@ fn is_dot_source(bin: &str) -> bool {
             .is_some_and(|rest| rest.starts_with(['\'', '"', '$']))
 }
 
-/// Whether `token` names PowerShell's `-EncodedCommand` parameter: after at most one layer of
-/// quotes, a parameter dash (see [`PARAMETER_DASHES`]), then a non-empty prefix of `encodedcommand`
-/// or the `ec` alias, case-insensitively, optionally followed by `:value`.
+/// Whether `token` names PowerShell's `-EncodedCommand` parameter: with its quotes removed (or just
+/// the quoted segment it starts with), one or two parameter dashes (see [`PARAMETER_DASHES`]), then
+/// a non-empty prefix of `encodedcommand` or the `ec` alias, case-insensitively, optionally followed
+/// by `:value`.
 fn is_encoded_command_parameter(token: &str) -> bool {
-    let Some(name) = strip_one_quote_layer(token).strip_prefix(PARAMETER_DASHES) else {
+    names_encoded_command(&without_quotes(token))
+        || leading_quoted_segment(token).is_some_and(names_encoded_command)
+}
+
+/// [`is_encoded_command_parameter`] for a token that has no quotes left. pwsh strips a second dash
+/// only when it repeats the first, but any pair counts here: the extra matches fail upward.
+fn names_encoded_command(token: &str) -> bool {
+    let Some(name) = token.strip_prefix(PARAMETER_DASHES) else {
         return false;
     };
+    let name = name.strip_prefix(PARAMETER_DASHES).unwrap_or(name);
     let name = name
         .split(':')
         .next()
@@ -413,6 +431,22 @@ mod tests {
             "C:\\tools\\p.exe \"-enc\" SQBFAFgA",
             "C:\\tools\\p.exe \u{201C}-enc\u{201D} SQBFAFgA",
             "C:\\tools\\p.exe '\u{2013}e' SQBFAFgA",
+            // Curly single quotes (U+2018 … U+2019, U+201A … U+201B).
+            "C:\\tools\\p.exe \u{2018}-enc\u{2019} SQBFAFgA",
+            "C:\\tools\\p.exe \u{201A}-enc\u{201B} SQBFAFgA",
+            // Regression (#336 review R1): pwsh drops a doubled dash, and any pair counts here.
+            "C:\\tools\\p.exe --enc SQBFAFgA",
+            "C:\\tools\\p.exe \u{2013}\u{2013}enc SQBFAFgA",
+            "C:\\tools\\p.exe \u{2014}\u{2014}e SQBFAFgA",
+            "C:\\tools\\p.exe -\u{2013}enc SQBFAFgA",
+            "C:\\tools\\p.exe '--enc' SQBFAFgA",
+            // Regression (#336 review R2): quotes inside the token, and a token that starts with a
+            // quoted parameter.
+            "C:\\tools\\p.exe -\"enc\" SQBFAFgA",
+            "C:\\tools\\p.exe -e\"nc\" SQBFAFgA",
+            "C:\\tools\\p.exe -e''nc SQBFAFgA",
+            "C:\\tools\\p.exe -e\u{2018}\u{2019}nc SQBFAFgA",
+            "C:\\tools\\p.exe \"-e\"SQBFAFgA",
         ] {
             // Guard against a line passing for the wrong reason (e.g. a `{` from an unexpanded escape).
             assert!(
@@ -435,6 +469,10 @@ mod tests {
             r"/snap/bin/pwsh-preview -File x.ps1",
             r"'C:\tools\pwsh-preview' -File x.ps1",
             "'pwsh-preview' -File x.ps1",
+            // Regression (#336 review R2): quote insertion in the name still runs pwsh.
+            "p''wsh -File x.ps1",
+            "pw\"\"sh -File x.ps1",
+            "power\u{2018}\u{2019}shell -File x.ps1",
         ] {
             assert!(
                 !has_compound_marker(line),
@@ -464,6 +502,13 @@ mod tests {
             // A Unicode dash or quotes don't turn a different parameter into -EncodedCommand.
             "Get-ChildItem \u{2013}Exclude x",
             "Get-ChildItem '-Exclude' x",
+            "Get-ChildItem --Exclude x",
+            "Get-ChildItem -E''xclude x",
+            "Set-Content -Encoding utf8 x",
+            "Set-Content \u{2013}\u{2013}Encoding utf8 x",
+            // A doubled dash with nothing after it, and quotes that leave only a dash.
+            "Write-Output -- x",
+            "Write-Output '-' x",
             // A program whose name only contains `pwsh` later on.
             r"C:\tools\mypwsh.exe -File x.ps1",
         ] {
