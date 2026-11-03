@@ -9,6 +9,7 @@ use allw_core::{
     action_from_argv as core_action_from_argv, action_from_command as core_action_from_command,
     compute_request_hash as core_compute_request_hash, decrypt_context as core_decrypt_context,
     derive_number_match_challenge as core_derive_number_match_challenge,
+    display_model as core_display_model, escape_for_display as core_escape_for_display,
     issue_device_cert as core_issue_device_cert, sign_verdict as core_sign_verdict,
     verify_actor_attestation_with_account_states as core_verify_actor_attestation,
     verify_verdict as core_verify_verdict, ApprovalContext, ApprovalRequest, Approver,
@@ -457,6 +458,21 @@ pub fn verify_verdict_json(
         },
         "VerifiedVerdict",
     )
+}
+
+/// Build the escaped display model (JSON [`DisplayModel`](allw_core::DisplayModel)) for a JSON
+/// [`ApprovalContext`] — the form in which a native approver shows untrusted context text. Same
+/// output as the WASM `display_model`; see `allw_core::display` for the notation.
+#[uniffi::export]
+pub fn display_model_json(context_json: String) -> Result<String, AllwFfiError> {
+    let context: ApprovalContext = parse_json(&context_json, "ApprovalContext")?;
+    to_json(&core_display_model(&context), "DisplayModel")
+}
+
+/// Escape one untrusted string for display (same notation as [`display_model_json`]).
+#[uniffi::export]
+pub fn escape_for_display(text: String) -> String {
+    core_escape_for_display(&text)
 }
 
 #[cfg(test)]

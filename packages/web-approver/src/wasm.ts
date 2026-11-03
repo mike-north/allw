@@ -41,6 +41,13 @@ export interface AllwWasm {
   /** Derive the four-digit number-match challenge for a base64url request hash. */
   derive_number_match_challenge(request_hash_b64: string): string;
   /**
+   * Build the escaped display model (JSON `DisplayModel`) for an ApprovalContext JSON — the only
+   * form in which untrusted context text may reach the DOM (#246). Throws on malformed input.
+   */
+  display_model(context_json: string): string;
+  /** Escape one untrusted string for display with the core notation (`\x1b`, `⟨U+202E⟩`, …). */
+  escape_for_display(text: string): string;
+  /**
    * Verify an actor attestation (verified request origin, #16), resolving the actor's verifying key
    * from **root-signed account state** — never from a relay-supplied registry. Returns a JSON
    * `{ verified: true, actor_id, actor_kind, origin }` on success and **throws** on any failure.
