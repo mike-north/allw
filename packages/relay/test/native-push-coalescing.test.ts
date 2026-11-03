@@ -196,6 +196,95 @@ describe("APNs/FCM wakeups are bounded per window, with one trailing wakeup (#24
     });
   }
 
+  it("a trailing wakeup never carries a skipped request that has ended; it falls back to one still pending", async () => {
+    // Review probe P1: the latest skipped submit expires before the window ends, while an earlier
+    // skipped one is still pending.
+    const apns = recorder("apns");
+    const acct = await account("ended-skip", { apns }, [
+      { device_id: "dev-1", transport: "apns", token: APNS_TOKEN },
+    ]);
+    expect(await submitAt(acct, T0, "ended-lead", 14 * 60_000)).toBe(1);
+    expect(await submitAt(acct, T0 + 5_000, "ended-skip-1", 10 * 60_000)).toBe(0);
+    expect(await submitAt(acct, T0 + 20_000, "ended-skip-2", 5_000)).toBe(0);
+    expect((await trailingRows(acct)).map((r) => r.last_skipped_request_id)).toEqual([
+      rid("ended-skip-2"),
+    ]);
+
+    await alarmAt(acct, WINDOW_END);
+
+    // skip-2 expired at T0 + 25 s. The wakeup carries the longest-lived pending request instead.
+    expect(apns.sent.map((w) => w.requestId)).toEqual([rid("ended-lead"), rid("ended-lead")]);
+  });
+
+  it("a skipped request resolved before the window ends is not carried either", async () => {
+    const fcm = recorder("fcm");
+    const acct = await account("resolved-skip", { fcm }, [
+      { device_id: "dev-1", transport: "fcm", token: FCM_TOKEN },
+    ]);
+    expect(await submitAt(acct, T0, "resolved-lead", 14 * 60_000)).toBe(1);
+    expect(await submitAt(acct, T0 + 5_000, "resolved-skip")).toBe(0);
+    await inRelay(acct, (relay) => {
+      relay.sql.exec(
+        `UPDATE request SET status = 'resolved', terminal_at = ? WHERE request_id = ?`,
+        T0 + 6_000,
+        rid("resolved-skip"),
+      );
+    });
+
+    await alarmAt(acct, WINDOW_END);
+
+    expect(fcm.sent.map((w) => w.requestId)).toEqual([rid("resolved-lead"), rid("resolved-lead")]);
+  });
+
+  it("one string registered under two transports owes each transport its own trailing wakeup", async () => {
+    // Review probe P2: a 64-hex string is a valid APNs token and a valid FCM token. Before the owed
+    // rows were keyed by transport, the two collapsed into one row and APNs lost its wakeup.
+    const apns = recorder("apns");
+    const fcm = recorder("fcm");
+    const acct = await account("same-string", { apns, fcm }, [
+      { device_id: "dev-1", transport: "apns", token: APNS_TOKEN },
+      { device_id: "dev-1", transport: "fcm", token: APNS_TOKEN },
+    ]);
+    expect(await submitAt(acct, T0, "same-lead")).toBe(2);
+    expect(await submitAt(acct, T0 + 5_000, "same-skip")).toBe(0);
+    expect((await trailingRows(acct)).map((r) => r.transport).sort()).toEqual(["apns", "fcm"]);
+
+    await alarmAt(acct, WINDOW_END);
+
+    expect(apns.sent.map((w) => w.requestId)).toEqual([rid("same-lead"), rid("same-skip")]);
+    expect(fcm.sent.map((w) => w.requestId)).toEqual([rid("same-lead"), rid("same-skip")]);
+    expect(await trailingRows(acct)).toEqual([]);
+  });
+
+  it("claiming one transport's owed wakeup leaves the other transport's for the same string owed", async () => {
+    const apns = recorder("apns");
+    const fcm = recorder("fcm");
+    const acct = await account("same-string-blocked", { apns, fcm }, [
+      { device_id: "dev-1", transport: "apns", token: APNS_TOKEN },
+      { device_id: "dev-1", transport: "fcm", token: APNS_TOKEN },
+    ]);
+    expect(await submitAt(acct, T0, "blocked-lead")).toBe(2);
+    expect(await submitAt(acct, T0 + 5_000, "blocked-skip")).toBe(0);
+    // FCM was woken again just before the window ended (its claim is fresh); APNs was not.
+    await inRelay(acct, (relay) => {
+      relay.sql.exec(
+        `UPDATE device_push_token SET last_wakeup_at = ? WHERE transport = 'fcm'`,
+        WINDOW_END - 1,
+      );
+    });
+
+    await alarmAt(acct, WINDOW_END);
+    expect(apns.sent).toHaveLength(2);
+    expect(fcm.sent).toHaveLength(1);
+    // FCM's row is still owed, moved to its next claimable time.
+    const [owed] = await trailingRows(acct);
+    expect(owed?.transport).toBe("fcm");
+
+    await alarmAt(acct, WINDOW_END + PUSH_COALESCE_MS);
+    expect(fcm.sent.map((w) => w.requestId)).toEqual([rid("blocked-lead"), rid("blocked-skip")]);
+    expect(await trailingRows(acct)).toEqual([]);
+  });
+
   it("bounds an account to 32 tokens × 1 wakeup per window, however many submits arrive", async () => {
     const apns = recorder("apns");
     const fcm = recorder("fcm");
@@ -340,6 +429,24 @@ describe("trailing-wakeup schema migration (#248)", () => {
     return { publicKey: b64url(raw), privateKey: jwk.d ?? "", subject: "mailto:ops@allw.example" };
   }
 
+  function trailingKey(acct: string): Promise<string[]> {
+    return inRelay(acct, (relay) =>
+      [
+        ...relay.sql.exec<{ name: string; pk: number }>(
+          `PRAGMA table_info(webpush_trailing_wakeup)`,
+        ),
+      ]
+        .filter((column) => column.pk > 0)
+        .sort((a, b) => a.pk - b.pk)
+        .map((column) => column.name),
+    );
+  }
+
+  it("a fresh table is keyed by device, transport and token", async () => {
+    const acct = await account("fresh-key", {}, []);
+    expect(await trailingKey(acct)).toEqual(["device_id", "transport", "token"]);
+  });
+
   it("a web-push wakeup owed before the migration survives it and still fires", async () => {
     const fetcher = vi.fn<typeof fetch>(async () => new Response(null, { status: 201 }));
     const webpush = new WebPushTransport({ vapid: await makeVapid(), fetcher, now: () => T0 });
@@ -372,7 +479,12 @@ describe("trailing-wakeup schema migration (#248)", () => {
         WINDOW_END,
       );
       relay.initSchema();
+      // Idempotent: a second start changes nothing.
+      relay.initSchema();
     });
+
+    // The old (device_id, token) key was rebuilt with transport, keeping the owed row.
+    expect(await trailingKey(acct)).toEqual(["device_id", "transport", "token"]);
 
     expect(await trailingRows(acct)).toEqual([
       {

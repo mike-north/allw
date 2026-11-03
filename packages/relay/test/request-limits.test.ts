@@ -433,6 +433,7 @@ describe("POST /requests expires_at horizon", () => {
     const ctx = {
       storage: {
         sql: { exec: () => [] },
+        transactionSync: (fn: () => unknown) => fn(),
         deleteAlarm: () => Promise.resolve(),
         setAlarm: () => Promise.resolve(),
       },

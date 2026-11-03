@@ -669,6 +669,40 @@ export class AccountRelay implements DurableObject {
   // Schema initialisation (idempotent)
   // ---------------------------------------------------------------------------
 
+  /**
+   * Rebuild `webpush_trailing_wakeup` with `transport` in its primary key, if it was created with
+   * the older `(device_id, token)` key. Every owed row is copied, so no wakeup is lost. Runs after
+   * the column migrations (so `transport` exists) in one transaction; a no-op once rekeyed.
+   */
+  private rekeyTrailingWakeupsByTransport(): void {
+    const keyColumns = [
+      ...this.sql.exec<{ name: string; pk: number }>(`PRAGMA table_info(webpush_trailing_wakeup)`),
+    ]
+      .filter((column) => column.pk > 0)
+      .map((column) => column.name);
+    if (keyColumns.includes("transport")) return;
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec(`
+        CREATE TABLE webpush_trailing_wakeup_rekeyed (
+          account_id              TEXT    NOT NULL,
+          device_id               TEXT    NOT NULL,
+          token                   TEXT    NOT NULL,
+          due_at                  INTEGER NOT NULL,
+          last_skipped_at         INTEGER NOT NULL DEFAULT 0,
+          transport               TEXT    NOT NULL DEFAULT 'webpush',
+          last_skipped_request_id TEXT,
+          PRIMARY KEY (device_id, transport, token)
+        );
+        INSERT INTO webpush_trailing_wakeup_rekeyed
+          (account_id, device_id, token, due_at, last_skipped_at, transport, last_skipped_request_id)
+        SELECT account_id, device_id, token, due_at, last_skipped_at, transport, last_skipped_request_id
+        FROM webpush_trailing_wakeup;
+        DROP TABLE webpush_trailing_wakeup;
+        ALTER TABLE webpush_trailing_wakeup_rekeyed RENAME TO webpush_trailing_wakeup;
+      `);
+    });
+  }
+
   private initSchema(): void {
     // SECURITY: These tables store ONLY public keys + routing/lifecycle metadata.
     // Private keys and plaintext context MUST NEVER appear here (zero-knowledge invariant).
@@ -698,8 +732,10 @@ export class AccountRelay implements DurableObject {
       -- this DO's own account, kept for the wakeup payload.
       -- The table predates APNs/FCM coalescing (#248) and keeps its name: hosted Durable Objects
       -- hold owed rows, and a rename would need a data migration that could drop one on deploy.
-      -- transport is the token's transport ('webpush' for rows owed before it was recorded). The
-      -- key stays (device_id, token): the transports' token formats are disjoint in practice.
+      -- transport is the token's transport ('webpush' for rows owed before it was recorded), and is
+      -- part of the key: one string can be a valid token for two transports (a 64-hex string passes
+      -- both the APNs and the FCM pattern), and each owes its own wakeup. Tables created with the
+      -- older (device_id, token) key are rebuilt below.
       -- last_skipped_at is the latest skipped submit: a later wakeup accepted by the push service
       -- clears the row only if it was claimed after that submit (it then covers it).
       -- last_skipped_request_id is that submit's request id, carried by an APNs/FCM trailing
@@ -712,7 +748,7 @@ export class AccountRelay implements DurableObject {
         last_skipped_at         INTEGER NOT NULL DEFAULT 0,
         transport               TEXT    NOT NULL DEFAULT 'webpush',
         last_skipped_request_id TEXT,
-        PRIMARY KEY (device_id, token)
+        PRIMARY KEY (device_id, transport, token)
       );
 
       CREATE TABLE IF NOT EXISTS actor (
@@ -810,6 +846,7 @@ export class AccountRelay implements DurableObject {
         // Fresh schemas already have the column; older local DO state is migrated above.
       }
     }
+    this.rekeyTrailingWakeupsByTransport();
     this.sql.exec(`
       UPDATE request
       SET terminal_at = expires_at
@@ -1925,7 +1962,7 @@ export class AccountRelay implements DurableObject {
              (account_id, device_id, transport, token, due_at, last_skipped_at,
               last_skipped_request_id)
            VALUES (?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT (device_id, token)
+           ON CONFLICT (device_id, transport, token)
            DO UPDATE SET
              last_skipped_request_id = CASE
                WHEN excluded.last_skipped_at >= last_skipped_at THEN excluded.last_skipped_request_id
@@ -1945,9 +1982,11 @@ export class AccountRelay implements DurableObject {
       // An owed trailing wakeup stays until this wakeup is accepted (see clearCoveredTrailingWakeups),
       // so a failed push still gets its retry. It cannot be due inside the new window.
       this.sql.exec(
-        `UPDATE webpush_trailing_wakeup SET due_at = MAX(due_at, ?) WHERE device_id = ? AND token = ?`,
+        `UPDATE webpush_trailing_wakeup SET due_at = MAX(due_at, ?)
+         WHERE device_id = ? AND transport = ? AND token = ?`,
         this.pushCoalescer.nextClaimableAt(key, now),
         token.device_id,
+        token.transport,
         token.token,
       );
       claimedKeys.push(key);
@@ -2003,6 +2042,19 @@ export class AccountRelay implements DurableObject {
     ][0];
   }
 
+  /** `requestId` if it names a pending, unexpired request at `now`; otherwise `fallback`. */
+  private pendingRequestIdOr(requestId: string | null, now: number, fallback: string): string {
+    if (requestId === null) return fallback;
+    const live = [
+      ...this.sql.exec(
+        `SELECT 1 FROM request WHERE request_id = ? AND status = 'pending' AND expires_at > ?`,
+        requestId,
+        now,
+      ),
+    ];
+    return live.length > 0 ? requestId : fallback;
+  }
+
   /** Point the `webpush-trailing-wakeup` alarm purpose at the earliest owed trailing wakeup, if any. */
   private async armTrailingWakeupAlarm(): Promise<void> {
     const next = [
@@ -2026,8 +2078,10 @@ export class AccountRelay implements DurableObject {
    *   claimable time, at least {@link PUSH_TRAILING_RETRY_MS} away.
    * - Rows are dropped without sending when there is nothing left to fetch (no pending, unexpired
    *   request), when the token is no longer registered, or when its transport is not configured.
-   * - An APNs/FCM trailing wakeup carries the latest skipped submit's request id (the longest-lived
-   *   pending request's, for a row owed before that id was recorded). Web Push sends no payload.
+   * - An APNs/FCM trailing wakeup carries the latest skipped submit's request id while that request
+   *   is still pending and unexpired, else the longest-lived pending request's (also for a row owed
+   *   before that id was recorded). The id is advisory: on any wakeup the device fetches its whole
+   *   inbox. Web Push sends no payload.
    * - The wakeup's deadline is that of the longest-lived pending request, so it lasts as long as
    *   anything it covers.
    */
@@ -2072,14 +2126,15 @@ export class AccountRelay implements DurableObject {
       const key = pushCoalesceKey(token);
       if (this.pushCoalescer.tryClaim(key, now)) {
         this.sql.exec(
-          `DELETE FROM webpush_trailing_wakeup WHERE device_id = ? AND token = ?`,
+          `DELETE FROM webpush_trailing_wakeup WHERE device_id = ? AND transport = ? AND token = ?`,
           row.device_id,
+          row.transport,
           row.token,
         );
         const requestId =
           row.transport === "webpush"
             ? latest.request_id
-            : (row.last_skipped_request_id ?? latest.request_id);
+            : this.pendingRequestIdOr(row.last_skipped_request_id, now, latest.request_id);
         const batch = batches.get(requestId) ?? { tokens: [], claimedKeys: [] };
         batch.tokens.push(token);
         batch.claimedKeys.push(key);
@@ -2088,9 +2143,11 @@ export class AccountRelay implements DurableObject {
       } else {
         const claimableAt = this.pushCoalescer.nextClaimableAt(key, now);
         this.sql.exec(
-          `UPDATE webpush_trailing_wakeup SET due_at = ? WHERE device_id = ? AND token = ?`,
+          `UPDATE webpush_trailing_wakeup SET due_at = ?
+           WHERE device_id = ? AND transport = ? AND token = ?`,
           Math.max(claimableAt, now + PUSH_TRAILING_RETRY_MS),
           row.device_id,
+          row.transport,
           row.token,
         );
       }
