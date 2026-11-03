@@ -386,4 +386,5 @@ app when tapped.
 | Notification text has no request data; every push shows one (incl. empty)     | Verified (`test/push.test.mjs`)                                      |
 | Subscribe flow, re-registration, denied/unsupported/failed states, iOS branch | Verified (`test/push.test.mjs`, injected browser APIs)               |
 | Manifest, icons and root-scope `sw.js` bundled                                | Verified (`test/site-build.test.mjs`)                                |
+| Subscribe, push → notification, forget, in a real browser against a relay     | Verified locally in Chrome against `wrangler dev` (issue #237 PR)    |
 | A notification received on a real iPhone installed to the Home Screen         | **Not run** — human operator step (§6); requires a device and relay  |
