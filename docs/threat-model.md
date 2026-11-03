@@ -202,9 +202,13 @@ Validation:
   `EncryptError::LowOrderRecipientKey` naming the device instead of panicking, and refuses the whole
   encryption rather than dropping that recipient. The SDK rethrows it, so the hook denies. The core also
   exports its denylist (`X25519_SMALL_ORDER_POINTS`, libsodium's `has_small_order` list, matched with bit 255
-  masked) through WASM, so device-key registration can reject the same keys up front. A shared vector
-  (`crates/allw-core/tests/fixtures/x25519_small_order.json`) asserts the denylist and encryption agree in
-  Rust and through WASM (#248).
+  masked) through WASM. The relay's `POST /pairing/complete` uses it to refuse such a device key with a 400
+  before the pairing code is consumed, so the key never enters the device registry (`docs/relay-api.md` §3
+  Pairing). A shared vector (`crates/allw-core/tests/fixtures/x25519_small_order.json`) asserts that the
+  denylist and encryption agree in Rust and through WASM. The relay's tests drive every vector point, and
+  its bit-255 variant, through pairing (#248).
+  - Encryption still refuses such a key, so it fails closed whichever way the key arrives: a hostile
+    relay that skips the check, a device enrolled before it, or a key from verified account state.
 - Relay-chosen text (device ids, error bodies, any response body) can reach SDK error messages, and the hooks
   put those messages in the deny reason the agent reads. A hostile relay could therefore pose as an allw
   diagnostic (prompt injection). The defence is layered:

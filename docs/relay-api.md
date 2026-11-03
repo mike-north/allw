@@ -196,11 +196,27 @@ it is stored in normalized form (`URL.href`), so two spellings of one subscripti
 **Budgets:** at most **4** `push_tokens` entries per registration and **2** distinct tokens per
 transport (duplicates collapse first); over budget is a **400**, never a silent truncation. An account
 holds at most **32** push tokens across all devices; a registration that would exceed that is a
-**409** and the pairing code is not consumed (retry without tokens, or free some). Errors: 403 when no
-root is bound to the account (a code on an unbound account predates root binding and is never
-honored), 400 (bad body/pubkey/push_token/unexpected key/over budget), 401/403 (token), 404 (code
-unknown), 409 (code already used, or account push-token budget full), 410 (code expired). Atomic — no
-half-enrollment.
+**409** and the pairing code is not consumed (retry without tokens, or free some).
+
+**Small-order keys:** `pubkey` is the device's X25519 encryption key, so a small-order point is a **400**
+`{ "error": "'pubkey' is a small-order X25519 key, which can never be an encryption target" }`. The
+pairing code is not consumed (#248). Every ECDH with such a key gives a publicly known shared secret, so
+`encrypt_context` would refuse every request to the account. The list is the core's
+(`X25519_SMALL_ORDER_POINTS`, libsodium's `has_small_order` seven points, matched with bit 255 masked),
+called through the relay's WASM binding, not a copy.
+
+Errors:
+
+- 403 when no root is bound to the account (a code on an unbound account predates root binding and is
+  never honored);
+- 400 (bad body, pubkey shape, small-order pubkey, push_token, unexpected key, or over budget);
+- 401/403 (token);
+- 404 (code unknown);
+- 409 (code already used, or account push-token budget full);
+- 410 (code expired);
+- 500 (the relay's verification core failed to initialize).
+
+Atomic — no half-enrollment.
 
 ### Relay-level (`/.well-known/allw/`, not per-account)
 
@@ -578,9 +594,9 @@ approver:{account_id,device_id}, sig:<compact JWS>, note?, challenge_response?, 
 
 6. **Pairing & `device_cert` (read carefully — the relay is a single-key surface).**
    - `POST /pairing/complete` registers **exactly one `pubkey` = the device X25519 _encryption_ key**
-     (used by integrators to JWE-encrypt to the device). The Ed25519 **signing** key is **not** sent to
-     the relay — by design, so the relay is never the carrier of the verdict-key binding. It is certified
-     out of band instead (`enrollment.md` §Pairing Flow step 3 documents this single-key surface).
+     (used by integrators to JWE-encrypt to the device). A small-order key is refused (400, §3 Pairing).
+     The Ed25519 **signing** key is **not** sent to the relay — by design, so the relay is never the
+     carrier of the verdict-key binding. It is certified out of band instead (`enrollment.md` §Pairing Flow step 3 documents this single-key surface).
    - The device also needs a **`device_cert`** — an account-root-signed JWS binding its Ed25519 signing
      pubkey (`issue_device_cert`). **The relay does NOT issue or validate it.** Verdicts without a valid
      `device_cert` are denied by integrators (`enrollment.md` §Device Certificate Validation).
