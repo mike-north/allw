@@ -85,11 +85,26 @@ function frameToOutcome(frame: Record<string, unknown>): VerdictOutcome | null {
   return null;
 }
 
-const DEFAULT_SCHEDULE = (fn: () => void, ms: number): void => {
+/**
+ * Default scheduler for the **deadline backstop**. The timer is `unref`'d so a still-pending
+ * deadline does not keep a node process alive after the verdict has already won the race (no-op in
+ * browsers/workers, where `unref` is absent). While the wait is still in progress, the open
+ * WebSocket or the ref'd poll sleep ({@link DEFAULT_POLL_SCHEDULE}) holds the process instead.
+ */
+const DEFAULT_DEADLINE_SCHEDULE = (fn: () => void, ms: number): void => {
   const timer = setTimeout(fn, ms);
-  // Don't let a still-pending deadline/poll timer keep a node process alive once the verdict has
-  // already resolved the race (no-op in browsers/workers, where `unref` is absent).
   (timer as { unref?: () => void }).unref?.();
+};
+
+/**
+ * Default scheduler for the **poll sleep**. Deliberately *not* `unref`'d: on the poll path it is the
+ * only thing holding the event loop between polls. If it were unref'd, node would exit mid-wait
+ * with no verdict at all (code 13 under top-level await; code 0 with no output under `void main()`,
+ * which a hook host would read as "no decision"). The loop is bounded: it returns at the first poll
+ * at or past the deadline.
+ */
+const DEFAULT_POLL_SCHEDULE = (fn: () => void, ms: number): void => {
+  setTimeout(fn, ms);
 };
 
 /**
@@ -99,7 +114,8 @@ const DEFAULT_SCHEDULE = (fn: () => void, ms: number): void => {
  * verdict (the timeout path → `expired`), never an approval.
  */
 export async function awaitVerdict(requestId: string, deps: WaitDeps): Promise<VerdictOutcome> {
-  const schedule = deps.schedule ?? DEFAULT_SCHEDULE;
+  const schedule = deps.schedule ?? DEFAULT_DEADLINE_SCHEDULE;
+  const pollSchedule = deps.schedule ?? DEFAULT_POLL_SCHEDULE;
 
   // The deadline timer is the fail-closed backstop shared by both strategies.
   const deadlinePromise = new Promise<VerdictOutcome>((resolve) => {
@@ -123,7 +139,7 @@ export async function awaitVerdict(requestId: string, deps: WaitDeps): Promise<V
     }
   }
 
-  return Promise.race([pollUntilTerminal(requestId, deps, schedule), deadlinePromise]);
+  return Promise.race([pollUntilTerminal(requestId, deps, pollSchedule), deadlinePromise]);
 }
 
 /**
