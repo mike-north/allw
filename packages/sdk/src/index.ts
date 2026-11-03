@@ -26,6 +26,19 @@ import {
 import { awaitVerdict, type WebSocketFactory } from "./wait.js";
 import { loadWasm, type AllwWasm } from "./wasm.js";
 
+export {
+  CommandActionError,
+  commandAction,
+  commandActionFromLine,
+  commandRequest,
+} from "./command-request.js";
+export type {
+  CommandActionErrorReason,
+  CommandActionFromLineOptions,
+  CommandActionOptions,
+  CommandRequestInput,
+} from "./command-request.js";
+
 /**
  * A verdict decision. `requestApproval` *resolves* to `approved` (verified), `denied` (a verified
  * human "no" or a fail-closed synthesis), or `expired` (timeout / past deadline). `aborted` is part
