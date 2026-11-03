@@ -14,7 +14,6 @@
 
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { SqlStorage } from "@cloudflare/workers-types";
 import type { AccountRelay } from "../src/index.js";
 import { DEADLINE_SQL, deadlineOf } from "../src/request-deadline.js";
 import { testAccount } from "./support/accounts.js";
@@ -59,7 +58,7 @@ describe("DEADLINE_SQL", () => {
   it("computes deadlineOf's value in SQLite for every case", async () => {
     const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(testAccount("deadline-sql")));
     const fromSql = await runInDurableObject(stub, (instance: AccountRelay) => {
-      const { sql } = instance as unknown as { sql: SqlStorage };
+      const sql = instance["sql"];
       return CASES.map(
         ({ row }) =>
           [

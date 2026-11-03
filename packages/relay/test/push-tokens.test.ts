@@ -11,9 +11,7 @@
 
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import type { SqlStorage } from "@cloudflare/workers-types";
 import { AccountRelay, type Env } from "../src/index.js";
-import type { PushTransportRegistry } from "../src/push.js";
 import { WebPushTransport, type VapidConfig } from "../src/web-push.js";
 import { pairingStartBody, testAccount, testRequestId } from "./support/accounts.js";
 import { pinRelayClock } from "./support/relay-state.js";
@@ -109,7 +107,7 @@ function accountStub(accountId: string) {
 
 async function readRows(accountId: string, deviceId?: string): Promise<StoredRow[]> {
   return runInDurableObject(accountStub(accountId), (instance: AccountRelay) => {
-    const { sql } = instance as unknown as { sql: SqlStorage };
+    const sql = instance["sql"];
     const rows =
       deviceId === undefined
         ? sql.exec<StoredRow>(
@@ -130,7 +128,7 @@ async function seedRows(
   rows: ReadonlyArray<{ device_id: string; transport: string; token: string; created_at?: number }>,
 ): Promise<void> {
   await runInDurableObject(accountStub(accountId), (instance: AccountRelay) => {
-    const { sql } = instance as unknown as { sql: SqlStorage };
+    const sql = instance["sql"];
     for (const row of rows) {
       sql.exec(
         `INSERT INTO device_push_token (device_id, transport, token, created_at) VALUES (?, ?, ?, ?)`,
@@ -305,7 +303,7 @@ describe("PUT /devices/{id}/push-tokens — replace the device's own set", () =>
     );
     const fetcher = vi.fn<typeof fetch>(async () => new Response(null, { status: 201 }));
     await runInDurableObject(accountStub(acct), async (instance: AccountRelay) => {
-      (instance as unknown as { pushTransports: PushTransportRegistry }).pushTransports = {
+      instance["pushTransports"] = {
         webpush: new WebPushTransport({ vapid: await makeVapid(), fetcher }),
       };
     });
@@ -320,10 +318,7 @@ describe("PUT /devices/{id}/push-tokens — replace the device's own set", () =>
       approver: "acct-approver-routing-id",
       context_ciphertext: "eyJhbGciOiJFQ0RILUVTK0EyNTZLVyJ9.FAKE.JWE",
     });
-    await runInDurableObject(
-      accountStub(acct),
-      (instance: AccountRelay) => (instance as unknown as { pushFanOut: Promise<void> }).pushFanOut,
-    );
+    await runInDurableObject(accountStub(acct), (instance: AccountRelay) => instance["pushFanOut"]);
 
     expect(submit.data.push_wakeups).toBe(1);
     expect(fetcher.mock.calls.map(([input]) => String(input))).toEqual([ROTATED_FCM_ENDPOINT]);

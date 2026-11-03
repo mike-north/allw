@@ -16,7 +16,6 @@
 
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import type { SqlStorage } from "@cloudflare/workers-types";
 import type { AccountRelay } from "../src/index.js";
 import {
   MAX_PUSH_TOKENS_PER_ACCOUNT,
@@ -39,14 +38,6 @@ const APNS_TOKEN = "a".repeat(64);
 const FCM_TOKEN = "fcm-registration-token-1";
 const WEBPUSH_ENDPOINT = "https://fcm.googleapis.com/fcm/send/c3Vic2NyaXB0aW9uLWE";
 
-type RelayInternals = {
-  sql: SqlStorage;
-  pushTransports: PushTransportRegistry;
-  pushFanOut: Promise<void>;
-  initSchema(): void;
-  alarm(): Promise<void>;
-};
-
 type TrailingRow = {
   device_id: string;
   transport: string;
@@ -59,10 +50,8 @@ function stub(accountId: string): DurableObjectStub {
   return env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
 }
 
-function inRelay<T>(accountId: string, fn: (relay: RelayInternals) => T | Promise<T>): Promise<T> {
-  return runInDurableObject(stub(accountId), (instance: AccountRelay) =>
-    fn(instance as unknown as RelayInternals),
-  );
+function inRelay<T>(accountId: string, fn: (relay: AccountRelay) => T | Promise<T>): Promise<T> {
+  return runInDurableObject(stub(accountId), (instance: AccountRelay) => fn(instance));
 }
 
 /** A recording transport: every wakeup it is handed, in order, for the given kind. */
@@ -88,9 +77,9 @@ async function account(
   await bindAccountRoot(acct);
   await pinRelayClock(acct, T0);
   await inRelay(acct, (relay) => {
-    relay.pushTransports = transports;
+    relay["pushTransports"] = transports;
     tokens.forEach((t, i) => {
-      relay.sql.exec(
+      relay["sql"].exec(
         `INSERT INTO device_push_token (device_id, transport, token, created_at) VALUES (?, ?, ?, ?)`,
         t.device_id,
         t.transport,
@@ -132,7 +121,7 @@ async function submitAt(
 }
 
 function fanOutSettled(acct: string): Promise<void> {
-  return inRelay(acct, (relay) => relay.pushFanOut);
+  return inRelay(acct, (relay) => relay["pushFanOut"]);
 }
 
 /** Fire the relay's alarm at relay time `at` and wait for any fan-out it starts. */
@@ -140,13 +129,13 @@ async function alarmAt(acct: string, at: number): Promise<void> {
   await pinRelayClock(acct, at);
   await inRelay(acct, async (relay) => {
     await relay.alarm();
-    await relay.pushFanOut;
+    await relay["pushFanOut"];
   });
 }
 
 function trailingRows(acct: string): Promise<TrailingRow[]> {
   return inRelay(acct, (relay) => [
-    ...relay.sql.exec<TrailingRow>(
+    ...relay["sql"].exec<TrailingRow>(
       `SELECT device_id, transport, token, due_at, last_skipped_request_id
        FROM webpush_trailing_wakeup ORDER BY device_id ASC, token ASC`,
     ),
@@ -224,7 +213,7 @@ describe("APNs/FCM wakeups are bounded per window, with one trailing wakeup (#24
     expect(await submitAt(acct, T0, "resolved-lead", 14 * 60_000)).toBe(1);
     expect(await submitAt(acct, T0 + 5_000, "resolved-skip")).toBe(0);
     await inRelay(acct, (relay) => {
-      relay.sql.exec(
+      relay["sql"].exec(
         `UPDATE request SET status = 'resolved', terminal_at = ? WHERE request_id = ?`,
         T0 + 6_000,
         rid("resolved-skip"),
@@ -267,7 +256,7 @@ describe("APNs/FCM wakeups are bounded per window, with one trailing wakeup (#24
     expect(await submitAt(acct, T0 + 5_000, "blocked-skip")).toBe(0);
     // FCM was woken again just before the window ended (its claim is fresh); APNs was not.
     await inRelay(acct, (relay) => {
-      relay.sql.exec(
+      relay["sql"].exec(
         `UPDATE device_push_token SET last_wakeup_at = ? WHERE transport = 'fcm'`,
         WINDOW_END - 1,
       );
@@ -401,8 +390,8 @@ describe("APNs/FCM wakeups are bounded per window, with one trailing wakeup (#24
 
     // APNs credentials are removed from the relay; the FCM token is unregistered.
     await inRelay(acct, (relay) => {
-      relay.pushTransports = { fcm };
-      relay.sql.exec(`DELETE FROM device_push_token WHERE transport = 'fcm'`);
+      relay["pushTransports"] = { fcm };
+      relay["sql"].exec(`DELETE FROM device_push_token WHERE transport = 'fcm'`);
     });
     await alarmAt(acct, WINDOW_END);
 
@@ -432,7 +421,7 @@ describe("trailing-wakeup schema migration (#248)", () => {
   function trailingKey(acct: string): Promise<string[]> {
     return inRelay(acct, (relay) =>
       [
-        ...relay.sql.exec<{ name: string; pk: number }>(
+        ...relay["sql"].exec<{ name: string; pk: number }>(
           `PRAGMA table_info(webpush_trailing_wakeup)`,
         ),
       ]
@@ -450,23 +439,23 @@ describe("trailing-wakeup schema migration (#248)", () => {
   it("a scratch table left by an interrupted rebuild does not block the next one", async () => {
     const acct = await account("leftover-scratch", {}, []);
     await inRelay(acct, (relay) => {
-      relay.sql.exec(`DROP TABLE webpush_trailing_wakeup`);
-      relay.sql.exec(`CREATE TABLE webpush_trailing_wakeup (
+      relay["sql"].exec(`DROP TABLE webpush_trailing_wakeup`);
+      relay["sql"].exec(`CREATE TABLE webpush_trailing_wakeup (
         account_id TEXT NOT NULL,
         device_id  TEXT NOT NULL,
         token      TEXT NOT NULL,
         due_at     INTEGER NOT NULL,
         PRIMARY KEY (device_id, token)
       )`);
-      relay.sql.exec(
+      relay["sql"].exec(
         `INSERT INTO webpush_trailing_wakeup (account_id, device_id, token, due_at) VALUES (?, ?, ?, ?)`,
         acct,
         "dev-1",
         WEBPUSH_ENDPOINT,
         WINDOW_END,
       );
-      relay.sql.exec(`CREATE TABLE webpush_trailing_wakeup_rekeyed (junk TEXT)`);
-      relay.initSchema();
+      relay["sql"].exec(`CREATE TABLE webpush_trailing_wakeup_rekeyed (junk TEXT)`);
+      relay["initSchema"]();
     });
     expect(await trailingKey(acct)).toEqual(["device_id", "transport", "token"]);
     expect((await trailingRows(acct)).map((r) => [r.transport, r.token])).toEqual([
@@ -486,28 +475,28 @@ describe("trailing-wakeup schema migration (#248)", () => {
     // Rebuild the table in its pre-migration shape (no transport, no skipped request id, no
     // last_skipped_at) holding one owed web-push wakeup, as an older relay left it.
     await inRelay(acct, (relay) => {
-      relay.sql.exec(`DROP TABLE webpush_trailing_wakeup`);
-      relay.sql.exec(`CREATE TABLE webpush_trailing_wakeup (
+      relay["sql"].exec(`DROP TABLE webpush_trailing_wakeup`);
+      relay["sql"].exec(`CREATE TABLE webpush_trailing_wakeup (
         account_id TEXT NOT NULL,
         device_id  TEXT NOT NULL,
         token      TEXT NOT NULL,
         due_at     INTEGER NOT NULL,
         PRIMARY KEY (device_id, token)
       )`);
-      relay.sql.exec(
+      relay["sql"].exec(
         `INSERT INTO webpush_trailing_wakeup (account_id, device_id, token, due_at) VALUES (?, ?, ?, ?)`,
         acct,
         "dev-1",
         WEBPUSH_ENDPOINT,
         WINDOW_END,
       );
-      relay.sql.exec(
+      relay["sql"].exec(
         `INSERT OR REPLACE INTO alarm_due (purpose, due_at) VALUES ('webpush-trailing-wakeup', ?)`,
         WINDOW_END,
       );
-      relay.initSchema();
+      relay["initSchema"]();
       // Idempotent: a second start changes nothing.
-      relay.initSchema();
+      relay["initSchema"]();
     });
 
     // The old (device_id, token) key was rebuilt with transport, keeping the owed row.

@@ -22,7 +22,6 @@
 
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, it, expect, vi } from "vitest";
-import type { SqlStorage } from "@cloudflare/workers-types";
 import { AccountRelay, type Env } from "../src/index.js";
 import {
   DEFAULT_MAX_REQUEST_TTL_MS,
@@ -108,10 +107,9 @@ interface SeedRow {
 }
 
 async function seedRequests(accountId: string, rows: readonly SeedRow[]): Promise<void> {
-  await runInDurableObject(stubFor(accountId), (instance: AccountRelay) => {
-    const relay = instance as unknown as { sql: SqlStorage };
+  await runInDurableObject(stubFor(accountId), (relay: AccountRelay) => {
     for (const row of rows) {
-      relay.sql.exec(
+      relay["sql"].exec(
         `INSERT INTO request
          (request_id, envelope, created_at, expires_at, status, terminal_at, auth_token_hash)
          VALUES (?, ?, ?, ?, ?, ?, 'seeded-hash')`,
@@ -127,10 +125,9 @@ async function seedRequests(accountId: string, rows: readonly SeedRow[]): Promis
 }
 
 async function requestStatuses(accountId: string): Promise<Record<string, string>> {
-  return runInDurableObject(stubFor(accountId), (instance: AccountRelay) => {
-    const relay = instance as unknown as { sql: SqlStorage };
+  return runInDurableObject(stubFor(accountId), (relay: AccountRelay) => {
     const out: Record<string, string> = {};
-    for (const row of relay.sql.exec<{ request_id: string; status: string }>(
+    for (const row of relay["sql"].exec<{ request_id: string; status: string }>(
       `SELECT request_id, status FROM request`,
     )) {
       out[row.request_id] = row.status;
@@ -140,10 +137,9 @@ async function requestStatuses(accountId: string): Promise<Record<string, string
 }
 
 async function storedEnvelopes(accountId: string): Promise<Record<string, string>> {
-  return runInDurableObject(stubFor(accountId), (instance: AccountRelay) => {
-    const relay = instance as unknown as { sql: SqlStorage };
+  return runInDurableObject(stubFor(accountId), (relay: AccountRelay) => {
     const out: Record<string, string> = {};
-    for (const row of relay.sql.exec<{ request_id: string; envelope: string }>(
+    for (const row of relay["sql"].exec<{ request_id: string; envelope: string }>(
       `SELECT request_id, envelope FROM request`,
     )) {
       out[row.request_id] = row.envelope;
@@ -156,8 +152,7 @@ async function runAlarmAt(accountId: string, now: number): Promise<number | null
   await pinRelayClock(accountId, now);
   return runInDurableObject(stubFor(accountId), async (instance: AccountRelay) => {
     await instance.alarm();
-    const relay = instance as unknown as { ctx: DurableObjectState };
-    return relay.ctx.storage.getAlarm();
+    return instance["ctx"].storage.getAlarm();
   });
 }
 
@@ -418,7 +413,7 @@ describe("POST /requests expires_at horizon", () => {
     const acct = await freshAccount("ttl-config");
     const configured = parseMaxRequestTtlMs("600000");
     await runInDurableObject(stubFor(acct), (instance: AccountRelay) => {
-      (instance as unknown as { maxRequestTtlMs: number }).maxRequestTtlMs = configured;
+      instance["maxRequestTtlMs"] = configured;
     });
     expect(
       (await submit(acct, envelope(rid("req-cfg-at"), { expires_at: NOW + configured }))).status,
@@ -441,13 +436,11 @@ describe("POST /requests expires_at horizon", () => {
       waitUntil: () => undefined,
     } as unknown as DurableObjectState;
     const relay = new AccountRelay(ctx, { ...env, MAX_REQUEST_TTL_MS: "123456" } as Env);
-    expect((relay as unknown as { maxRequestTtlMs: number }).maxRequestTtlMs).toBe(123_456);
+    expect(relay["maxRequestTtlMs"]).toBe(123_456);
     // The var unset (omitted, not `undefined`: `exactOptionalPropertyTypes`) falls back to the default.
     const { MAX_REQUEST_TTL_MS: _unset, ...envWithoutTtl } = { ...env } as Env;
     const fallback = new AccountRelay(ctx, envWithoutTtl);
-    expect((fallback as unknown as { maxRequestTtlMs: number }).maxRequestTtlMs).toBe(
-      DEFAULT_MAX_REQUEST_TTL_MS,
-    );
+    expect(fallback["maxRequestTtlMs"]).toBe(DEFAULT_MAX_REQUEST_TTL_MS);
   });
 
   it("parseMaxRequestTtlMs: unset uses the default; invalid values fall back to it", () => {
@@ -532,7 +525,7 @@ describe("POST /requests created_at bound", () => {
     const acct = await freshAccount("created-config");
     const configured = parseMaxRequestTtlMs("600000");
     await runInDurableObject(stubFor(acct), (instance: AccountRelay) => {
-      (instance as unknown as { maxRequestTtlMs: number }).maxRequestTtlMs = configured;
+      instance["maxRequestTtlMs"] = configured;
     });
     const at = envelope(rid("req-created-cfg-at"), { created_at: NOW - configured });
     expect((await submit(acct, at)).status).toBe(202);
@@ -603,7 +596,7 @@ describe("alarm expires over-horizon pending rows so the sweep removes them", ()
       (await submit(acct, envelope(rid("req-arm"), { expires_at: NOW + 60_000 }))).status,
     ).toBe(202);
     const alarm = await runInDurableObject(stubFor(acct), (instance: AccountRelay) =>
-      (instance as unknown as { ctx: DurableObjectState }).ctx.storage.getAlarm(),
+      instance["ctx"].storage.getAlarm(),
     );
     expect(alarm).toBe(NOW + 60_000);
   });
@@ -736,9 +729,7 @@ describe("pairing body size caps", () => {
     expect((await postRaw(acct, "/pairing/start", body)).status).toBe(413);
     const bound = await runInDurableObject(
       stubFor(acct),
-      (instance: AccountRelay) =>
-        [...(instance as unknown as { sql: SqlStorage }).sql.exec(`SELECT 1 FROM account_meta`)]
-          .length,
+      (instance: AccountRelay) => [...instance["sql"].exec(`SELECT 1 FROM account_meta`)].length,
     );
     expect(bound).toBe(0);
   });
