@@ -9,6 +9,12 @@
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccountRelay"] }],
 
+  // Browser origins allowed to read relay responses (CORS). Local dev also admits loopback web
+  // approvers on any port. See docs/relay-deploy.md §2 and packages/relay/src/cors.ts.
+  "vars": {
+    "CORS_ALLOWED_ORIGINS": "https://allw-web-approver.pages.dev,http://localhost:*,http://127.0.0.1:*"
+  },
+
   // ---------------------------------------------------------------------------
   // Production environment
   //
@@ -44,6 +50,13 @@
       // Do NOT change the tag after the production DO is live — it is a one-way migration marker.
       // To add future schema changes, append a new migration entry with a new tag, e.g. "v2".
       "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccountRelay"] }],
+
+      // Browser origins allowed to read relay responses (CORS): the hosted web approver. Vars are
+      // not inherited from the top level. If you serve your own web approver, list its origin here
+      // (comma-separated); add further plain vars (APNS_*, VAPID_*) to this same block.
+      "vars": {
+        "CORS_ALLOWED_ORIGINS": "https://allw-web-approver.pages.dev"
+      },
 
       // Production resource limits: a per-request CPU cap ("limits": { "cpu_ms": 30 })
       // requires the Workers Paid plan — Cloudflare rejects it on Free (error 100328).

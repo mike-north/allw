@@ -75,6 +75,16 @@ priority order (`src/relay-config.ts`):
 
 That order applies **only before pairing**. Once a browser is paired, its relay is pinned (below).
 
+**[OPERATOR] The relay must allow the approver's origin (CORS).** Every relay call the approver
+makes is cross-origin, so the relay it talks to must list the origin the bundle is served from
+(e.g. `https://approvals.example.com`) in its `CORS_ALLOWED_ORIGINS` var (`docs/relay-deploy.md`
+§2). A relay that does not list it answers every preflight with a 403, the browser withholds every
+response, and the approver never gets past pairing. This is the relay-side mirror of the CSP
+`connect-src` list (§3.1), which must in turn name the relay. The hosted relay
+(`allw-relay.mnorth.workers.dev`) admits **only** the hosted approver origin
+(`https://allw-web-approver.pages.dev`), so a self-hosted approver needs a relay its operator
+controls.
+
 **HTTPS only.** A relay URL is accepted only if it is `https:`, or `http:` on a loopback host
 (`localhost` or `127.0.0.1`) for local development against `wrangler dev`, and it carries no
 username, password, query (`?`) or fragment (`#`) — userinfo lets a link look like one host while
@@ -115,11 +125,14 @@ WebSocket, account-state resolution — goes to that pinned relay.
   migration for stored pins.
 
 **[OPERATOR]** To hand a user a working link, share the deployed bundle's URL with `?relay=`
-appended, e.g.:
+appended, pointing at a relay that allows the bundle's origin (above), e.g. a self-hosted pair:
 
 ```
-https://approvals.example.com/?relay=https://allw-relay.mnorth.workers.dev
+https://approvals.example.com/?relay=https://relay.example.com
 ```
+
+The hosted approver and hosted relay pair up the same way:
+`https://allw-web-approver.pages.dev/?relay=https://allw-relay.mnorth.workers.dev`.
 
 ---
 
@@ -173,7 +186,9 @@ hardware-backed key custody (#244).
 site will talk to — a relay missing from it is blocked by the browser, even if it is pinned. The
 build reads the list from `ALLW_RELAY_ORIGINS` (origins separated by spaces or commas) and emits
 each origin in both its `https:` and `wss:` forms. Unset, it defaults to the hosted relay
-`https://allw-relay.mnorth.workers.dev`. Self-hosters set their own:
+`https://allw-relay.mnorth.workers.dev`. The relay side must match: each listed relay must allow the
+approver's origin in its `CORS_ALLOWED_ORIGINS` (§2, `docs/relay-deploy.md` §2). Self-hosters set
+their own:
 
 ```sh
 ALLW_RELAY_ORIGINS="https://relay.example.com" pnpm --filter @allw/web-approver build
