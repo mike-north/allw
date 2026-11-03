@@ -141,8 +141,9 @@ Windows paths' backslashes). Every non-whitespace byte of `raw` stays visible in
 knows no PowerShell commands, risk is at least `medium`, and at least `high` when `raw` contains a construct that runs more
 than one command, runs one T1 can't read, or builds one at run time (uncertain ⇒ upward): `;`, `|`, `&`, a line break,
 a backtick, `(` or `{`, `[scriptblock]` or `.Invoke`, a command word that runs other code (`iex`, `Invoke-Expression`,
-`Invoke-Command`, `Start-Process`, `Start-Job`, `powershell`, `pwsh`, `cmd`), an `-EncodedCommand` parameter or any
-prefix of it (or `-ec`), or a leading `.` (dot-sourcing). There is no PowerShell field on the
+`Invoke-Command` / `icm`, `Start-Process` / `start` / `saps`, `Start-Job` / `sajb`, `powershell`, `pwsh`, `cmd`), an
+`-EncodedCommand` parameter or any prefix of it (or `-ec`), or dot-sourcing (a leading `.` word, or `.` directly
+followed by a quoted or variable path such as `.'x.ps1'`). There is no PowerShell field on the
 record and no schema change: surfaces label the line for the human in the summary (`PowerShell: <command>`). The
 other substrate fields come from the command builder's T1 scans of the tokens and `raw`, so they can disagree with
 PowerShell: for example `$env:PATH` records `env` in `env_refs`. `raw` is authoritative.

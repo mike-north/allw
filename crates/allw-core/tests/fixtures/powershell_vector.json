@@ -1,5 +1,5 @@
 {
-  "description": "Shared Rust/WASM vector for the PowerShell command builder (#298). Every expected value is written by hand from the rules in crates/allw-core/src/powershell.rs (argv is always a whitespace split of raw; risk floor Medium; High when raw contains ; | & a line break, a backtick, ( {, [scriptblock] or .invoke, a nested-execution command word (iex, Invoke-Expression, Invoke-Command, Start-Process, Start-Job, powershell, pwsh, cmd), an -EncodedCommand parameter or prefix (or -ec), or a leading . (dot-source); raw verbatim); never regenerate it from program output.",
+  "description": "Shared Rust/WASM vector for the PowerShell command builder (#298). Every expected value is written by hand from the rules in crates/allw-core/src/powershell.rs (argv is always a whitespace split of raw; risk floor Medium; High when raw contains ; | & a line break, a backtick, ( {, [scriptblock] or .invoke, a nested-execution command word (iex, Invoke-Expression, Invoke-Command, icm, Start-Process, start, saps, Start-Job, sajb, powershell, pwsh, cmd), an -EncodedCommand parameter or prefix (or -ec), or dot-sourcing (a leading . word, or . directly followed by a quote or $); raw verbatim); never regenerate it from program output.",
   "cases": [
     {
       "class": "low-risk program raised to the Medium floor",
@@ -195,6 +195,54 @@
       "risk": "medium",
       "bin": "Get-ChildItem",
       "argv": ["Get-ChildItem", "-Exclude", "x"]
+    },
+    {
+      "class": "round 3: start (alias of Start-Process)",
+      "command": "start notepad.exe",
+      "cwd": null,
+      "risk": "high",
+      "bin": "start",
+      "argv": ["start", "notepad.exe"]
+    },
+    {
+      "class": "round 3: saps (alias of Start-Process)",
+      "command": "saps notepad.exe",
+      "cwd": null,
+      "risk": "high",
+      "bin": "saps",
+      "argv": ["saps", "notepad.exe"]
+    },
+    {
+      "class": "round 3: icm (alias of Invoke-Command)",
+      "command": "icm -FilePath x.ps1",
+      "cwd": null,
+      "risk": "high",
+      "bin": "icm",
+      "argv": ["icm", "-FilePath", "x.ps1"]
+    },
+    {
+      "class": "round 3: sajb (alias of Start-Job)",
+      "command": "sajb -FilePath x.ps1",
+      "cwd": null,
+      "risk": "high",
+      "bin": "sajb",
+      "argv": ["sajb", "-FilePath", "x.ps1"]
+    },
+    {
+      "class": "round 3: dot-source of a single-quoted path",
+      "command": ".'x.ps1'",
+      "cwd": null,
+      "risk": "high",
+      "bin": ".'x.ps1'",
+      "argv": [".'x.ps1'"]
+    },
+    {
+      "class": "round 3: dot-source of a double-quoted path",
+      "command": ".\"x.ps1\"",
+      "cwd": null,
+      "risk": "high",
+      "bin": ".\"x.ps1\"",
+      "argv": [".\"x.ps1\""]
     }
   ]
 }

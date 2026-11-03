@@ -25,11 +25,14 @@
 //!   - a parenthesis or brace: grouping, subexpressions (`(`, `$(`, `@(`), method calls such as
 //!     `.Invoke()` or `[scriptblock]::Create(…)`, and script blocks (`{`);
 //!   - a scriptblock factory or invoker (`[scriptblock]`, `.Invoke…`);
-//!   - a command that runs other code: `iex` / `Invoke-Expression`, `Invoke-Command`,
-//!     `Start-Process`, `Start-Job`, or a nested shell (`powershell`, `pwsh`, `cmd`);
+//!   - a command that runs other code: `iex` / `Invoke-Expression`, `Invoke-Command` (`icm`),
+//!     `Start-Process` (`start`, `saps`), `Start-Job` (`sajb`), or a nested shell (`powershell`,
+//!     `pwsh`, `cmd`);
 //!   - an encoded command: a `-EncodedCommand` parameter or any prefix of it (`-e`, `-enc`, …), or
 //!     `-ec`, whose payload the human can't read;
-//!   - dot-sourcing (`.` as the command), which runs a script in the current scope.
+//!   - dot-sourcing, which runs a script in the current scope: `.` as the command, or a command
+//!     word that is `.` directly followed by a quoted or variable path (`.'x.ps1'`, `."x.ps1"`,
+//!     `.$script`).
 //!
 //!   The triggers are deliberately broad; a false positive (`Get-Item (Join-Path a b)` is `High`) is
 //!   the intended direction. Above the floor, the command builder's own risk for the argv applies.
@@ -67,12 +70,16 @@ const SCRIPTBLOCK_MARKERS: [&str; 2] = ["[scriptblock]", ".invoke"];
 
 /// Command names that run other code: a string as PowerShell, a script block, another process or a
 /// nested shell (ASCII, lower case; matched case-insensitively as whole command words).
-const NESTED_EXECUTION_COMMANDS: [&str; 8] = [
+const NESTED_EXECUTION_COMMANDS: [&str; 12] = [
     "iex",
     "invoke-expression",
     "invoke-command",
+    "icm",
     "start-process",
+    "start",
+    "saps",
     "start-job",
+    "sajb",
     "powershell",
     "pwsh",
     "cmd",
@@ -111,7 +118,16 @@ fn has_compound_construct(raw: &str, argv: &[String]) -> bool {
             .iter()
             .any(|name| contains_command_word(raw, name))
         || argv.iter().any(|token| is_encoded_command_parameter(token))
-        || argv.first().is_some_and(|bin| bin == ".")
+        || argv.first().is_some_and(|bin| is_dot_source(bin))
+}
+
+/// Whether the command word dot-sources a script: `.` on its own, or `.` directly followed by a
+/// quoted or variable path (`.'x.ps1'`, `."x.ps1"`, `.$script`).
+fn is_dot_source(bin: &str) -> bool {
+    bin == "."
+        || bin
+            .strip_prefix('.')
+            .is_some_and(|rest| rest.starts_with(['\'', '"', '$']))
 }
 
 /// Whether `token` names PowerShell's `-EncodedCommand` parameter: `-` or `/`, then a non-empty
@@ -295,9 +311,41 @@ mod tests {
             r"cmd /c del C:\x",
             // Dot-sourcing runs a script in the current scope.
             r". .\payload.ps1",
+            // Regression (#316 review round 3, R3-2): aliases, and dot-sourcing a quoted path.
+            "start evil.exe",
+            "saps evil.exe",
+            "icm -FilePath x.ps1 -ComputerName h",
+            "sajb -FilePath x.ps1",
+            r".'C:\x.ps1'",
+            r#"."C:\x.ps1""#,
+            ".$script",
         ] {
             let record = action_from_powershell_command(line, &CommandContext::default());
             assert_eq!(record.risk, Risk::High, "{line:?} must be High");
+        }
+    }
+
+    #[test]
+    fn each_trigger_raises_risk_on_its_own() {
+        // Regression (#316 review round 3, R3-3): each line hits exactly one trigger, so removing that
+        // trigger fails here even when other tests also hit it alongside a second one.
+        for (line, trigger) in [
+            ("Start-Process notepad", "start-process"),
+            ("pwsh -File x.ps1", "pwsh"),
+            ("Write-Output /enc x", "the `/` parameter prefix"),
+            ("$sb.InvokeReturnAsIs", "SCRIPTBLOCK_MARKERS (.invoke)"),
+            (
+                "[scriptblock]::Create",
+                "SCRIPTBLOCK_MARKERS ([scriptblock])",
+            ),
+            ("start notepad", "start"),
+            ("saps notepad", "saps"),
+            ("icm -FilePath x.ps1", "icm"),
+            ("sajb -FilePath x.ps1", "sajb"),
+            (".'x.ps1'", "dot-source of a quoted path"),
+        ] {
+            let record = action_from_powershell_command(line, &CommandContext::default());
+            assert_eq!(record.risk, Risk::High, "{line:?} must be High ({trigger})");
         }
     }
 
@@ -314,6 +362,9 @@ mod tests {
             r"Get-Item .\x.txt",
             "Get-Command",
             "Get-Item cmdlets.txt",
+            // Words that only start with an alias, and a relative path that isn't dot-sourced.
+            "Write-Output started",
+            "Get-Item .x.ps1",
         ] {
             let record = action_from_powershell_command(line, &CommandContext::default());
             assert_eq!(record.risk, Risk::Medium, "{line:?} has no trigger");
