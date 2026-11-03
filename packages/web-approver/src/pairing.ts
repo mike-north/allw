@@ -97,7 +97,8 @@ const REQUIRED_IDENTITY_FIELDS: readonly (keyof ApproverIdentity)[] = [
  *   does not accept as stored (#286). The identity is unusable (fail-closed: nothing is sent to
  *   that relay), but it is a distinct state from `corrupt` so the gate can tell the human why and
  *   ask before clearing it. `pinnedRelayUrl` is the stored text, unvalidated: render it only with
- *   {@link visiblyEscape}.
+ *   {@link visiblyEscape}. `snapshot` identifies exactly what was stored, so the clear the human
+ *   confirms can be limited to that value ({@link PairingStore.clearIfUnchanged}).
  * - `corrupt` — anything else: unparseable JSON, a missing or empty field, a non-string pin.
  */
 export type StoredPairing =
@@ -107,8 +108,40 @@ export type StoredPairing =
       readonly status: "relay-pin-rejected";
       readonly pinnedRelayUrl: string;
       readonly reason: string;
+      readonly snapshot: StoredSnapshot;
     }
   | { readonly status: "corrupt" };
+
+declare const storedSnapshotBrand: unique symbol;
+
+/**
+ * An opaque token for exactly what a {@link PairingStore} held when it was loaded (for the
+ * `localStorage` store, the raw stored string). Only the store that issued it can interpret it.
+ */
+export type StoredSnapshot = string & { readonly [storedSnapshotBrand]: "StoredSnapshot" };
+
+/** A classification before the store attaches its snapshot. */
+type ClassifiedIdentity =
+  | { readonly status: "paired"; readonly identity: PairedIdentity }
+  | {
+      readonly status: "relay-pin-rejected";
+      readonly pinnedRelayUrl: string;
+      readonly reason: string;
+    }
+  | { readonly status: "corrupt" };
+
+/** The reason shown for a stored pin that is empty or not a URL at all. */
+const INVALID_PIN_REASON = "The stored relay is not a valid URL.";
+
+/** Whether `value` parses as an absolute URL (after the same trim `checkRelayUrl` applies). */
+function isParseableUrl(value: string): boolean {
+  try {
+    new URL(value.trim());
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Classify a parsed JSON value as a stored identity (any {@link StoredPairing} but `absent`).
@@ -119,7 +152,7 @@ export type StoredPairing =
  * affected device into the re-pair-required state. A change that does so should ship a migration
  * for stored pins in the same change, or say in its release notes that those devices must re-pair.
  */
-function classifyIdentity(value: unknown): Exclude<StoredPairing, { status: "absent" }> {
+function classifyIdentity(value: unknown): ClassifiedIdentity {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return { status: "corrupt" };
   }
@@ -133,7 +166,10 @@ function classifyIdentity(value: unknown): Exclude<StoredPairing, { status: "abs
     if (typeof relayUrl !== "string") return { status: "corrupt" };
     const checked = checkRelayUrl(relayUrl);
     if (!checked.ok) {
-      return { status: "relay-pin-rejected", pinnedRelayUrl: relayUrl, reason: checked.reason };
+      // `checkRelayUrl`'s reasons for empty or unparseable input prompt for typing a URL, which
+      // reads wrong on a screen with no input.
+      const reason = isParseableUrl(relayUrl) ? checked.reason : INVALID_PIN_REASON;
+      return { status: "relay-pin-rejected", pinnedRelayUrl: relayUrl, reason };
     }
     if (checked.relayUrl !== relayUrl) {
       return {
@@ -149,9 +185,17 @@ function classifyIdentity(value: unknown): Exclude<StoredPairing, { status: "abs
 /**
  * Render arbitrary stored text so every character is visible: printable ASCII (U+0020–U+007E) is
  * kept, and every other code point (control characters, bidi overrides, zero-width and non-ASCII
- * look-alikes, and the `⟨` / `⟩` brackets themselves) becomes `⟨U+XXXX⟩`. This is the notation the
- * core's display model (#246) uses. Used for a rejected relay pin, which is unvalidated stored
- * text that could otherwise reorder or disguise itself on screen.
+ * look-alikes, and the `⟨` / `⟩` brackets themselves) becomes `⟨U+XXXX⟩`. Used for a rejected
+ * relay pin, which is unvalidated stored text that could otherwise reorder or disguise itself on
+ * screen.
+ *
+ * The notation matches the core's display model (#246), but the escaped set is stricter: the core
+ * escapes a defined set (C0/C1 controls, bidi, default-ignorables, separators, U+2800) and keeps
+ * printable non-ASCII, while this escapes every non-ASCII code point. Internal to this module; not
+ * part of the package's API.
+ *
+ * TODO(#246/#259): replace with the core display model once it lands and is available before
+ * pairing.
  */
 export function visiblyEscape(value: string): string {
   let out = "";
@@ -189,6 +233,12 @@ export interface PairingStore {
   save(identity: PairedIdentity): void;
   /** Remove the stored identity (used for "sign out" / reset flows). */
   clear(): void;
+  /**
+   * Remove the stored identity only if it is still exactly what `snapshot` describes, and report
+   * whether it did. Used where the human confirmed forgetting one specific stored identity: a
+   * newer one saved since (e.g. by another tab) must survive.
+   */
+  clearIfUnchanged(snapshot: StoredSnapshot): boolean;
 }
 
 /**
@@ -208,13 +258,21 @@ export function createLocalPairingStore(storage?: Storage): PairingStore {
       } catch {
         return { status: "corrupt" };
       }
-      return classifyIdentity(parsed);
+      const classified = classifyIdentity(parsed);
+      return classified.status === "relay-pin-rejected"
+        ? { ...classified, snapshot: raw as StoredSnapshot }
+        : classified;
     },
     save(identity: PairedIdentity) {
       store.setItem(STORAGE_KEY, JSON.stringify(identity));
     },
     clear() {
       store.removeItem(STORAGE_KEY);
+    },
+    clearIfUnchanged(snapshot: StoredSnapshot) {
+      if (store.getItem(STORAGE_KEY) !== snapshot) return false;
+      store.removeItem(STORAGE_KEY);
+      return true;
     },
   };
 }
@@ -546,7 +604,9 @@ function renderRelayRepairScreen(
 
   const relayBox = el("div", "pairing-relay");
   relayBox.append(text("span", "Pinned relay (no longer supported)", "pairing-relay-label"));
-  relayBox.append(text("code", visiblyEscape(rejected.pinnedRelayUrl), "pairing-relay-url"));
+  const shownPin =
+    rejected.pinnedRelayUrl === "" ? "(empty)" : visiblyEscape(rejected.pinnedRelayUrl);
+  relayBox.append(text("code", shownPin, "pairing-relay-url"));
   relayBox.append(text("p", rejected.reason, "pairing-relay-note"));
   screen.append(relayBox);
 
@@ -578,21 +638,28 @@ export interface RelayRepairGateOptions {
   readonly pairingStore: PairingStore;
   /** The rejected pin, as {@link PairingStore.load} reported it. */
   readonly rejected: RejectedRelayPin;
-  /** Called once, after the human confirmed and the stored identity was cleared. */
-  readonly onCleared: () => void;
+  /**
+   * Called once, after the human confirmed. The rejected identity has been cleared if it was still
+   * the stored one; anything saved since (e.g. by another tab) is untouched. The caller must route
+   * on what is stored **now** (`pairingStore.load()`), never assume it is empty.
+   */
+  readonly onResolved: () => void;
 }
 
 /**
  * Show the re-pair-required state for an identity whose pinned relay this build rejects (#286),
- * and clear the stored identity only when the human confirms. Until then the identity stays in
+ * and clear that identity only when the human confirms, and only if it is still the stored one.
+ * Until then the identity stays in
  * storage untouched and no relay is contacted. The production boot (`./app.ts`) mounts this before
  * asking for a relay, and {@link mountPairingGate} routes to it for the same stored state.
  */
 export function mountRelayRepairGate(options: RelayRepairGateOptions): void {
-  const { root, pairingStore, rejected, onCleared } = options;
+  const { root, pairingStore, rejected, onResolved } = options;
   renderRelayRepairScreen(root, rejected, () => {
-    pairingStore.clear();
-    onCleared();
+    // Clear only the identity this screen described. A stale tab must never forget a newer
+    // identity another tab saved after this screen was rendered.
+    pairingStore.clearIfUnchanged(rejected.snapshot);
+    onResolved();
   });
 }
 
@@ -634,8 +701,8 @@ export interface PairingGateOptions {
  * - **Returning device** (stored identity found and parseable): renders the re-auth screen.
  *   The human clicks "Unlock inbox" → `onPaired` fires with the stored identity.
  * - **Re-pair required** (stored identity pinned to a relay this build rejects, #286): renders
- *   {@link mountRelayRepairGate}. The identity is cleared only when the human confirms, and then
- *   the pairing form is shown.
+ *   {@link mountRelayRepairGate}. On the human's confirmation that identity is cleared (if it is
+ *   still the stored one) and the gate routes again on what is stored: normally the pairing form.
  * - **New / reset device** (no stored identity or corrupt stored value): renders the pairing form.
  *   The human submits valid credentials → the identity is persisted and `onPaired` fires.
  *
@@ -679,7 +746,11 @@ export function mountPairingGate(options: PairingGateOptions): void {
           root,
           pairingStore: store,
           rejected: stored,
-          onCleared: goToPairing,
+          // Route on what is stored now: normally nothing (→ pairing form), but a newer identity
+          // another tab saved meanwhile goes to the returning-device screen, never cleared.
+          onResolved: () => {
+            route(store.load());
+          },
         });
         return;
       case "absent":

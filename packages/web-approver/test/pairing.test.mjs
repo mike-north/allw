@@ -33,8 +33,9 @@ import {
   INSECURE_RELAY_URL_REASON,
   createLocalPairingStore,
   mountPairingGate,
-  visiblyEscape,
 } from "../dist/index.js";
+// Internal to the package (a stopgap until the core display model lands, #246/#259).
+import { visiblyEscape } from "../dist/pairing.js";
 import { mountWebApprover } from "../dist/browser.js";
 
 // ── Fixed clock (never Date.now() in test data) ───────────────────────────
@@ -623,10 +624,12 @@ describe("createLocalPairingStore — pinned relay (#249)", () => {
       "allw:pairing:v1",
       JSON.stringify({ ...VALID_IDENTITY, relayUrl: "http://relay.example.com" }),
     );
+    const stored = storage.getItem("allw:pairing:v1");
     assert.deepEqual(createLocalPairingStore(storage).load(), {
       status: "relay-pin-rejected",
       pinnedRelayUrl: "http://relay.example.com",
       reason: INSECURE_RELAY_URL_REASON,
+      snapshot: stored,
     });
   });
 
@@ -651,6 +654,40 @@ describe("createLocalPairingStore — pinned relay (#249)", () => {
     const loaded = createLocalPairingStore(storage).load();
     assert.equal(loaded.status, "relay-pin-rejected");
     assert.match(loaded.reason, /canonical form \(https:\/\/relay\.example\.com\)/);
+  });
+
+  for (const [label, pin] of [
+    ["an empty pin", ""],
+    ["an unparseable pin", "not a url"],
+  ]) {
+    test(`${label} is rejected with a reason that doesn't prompt for input (N1)`, () => {
+      const storage = memoryStorage();
+      storage.setItem("allw:pairing:v1", JSON.stringify({ ...VALID_IDENTITY, relayUrl: pin }));
+      const loaded = createLocalPairingStore(storage).load();
+      assert.equal(loaded.status, "relay-pin-rejected");
+      assert.equal(loaded.reason, "The stored relay is not a valid URL.");
+    });
+  }
+
+  test("clearIfUnchanged clears only the exact value that was loaded", () => {
+    const storage = memoryStorage();
+    const store = createLocalPairingStore(storage);
+    storage.setItem(
+      "allw:pairing:v1",
+      JSON.stringify({ ...VALID_IDENTITY, relayUrl: "http://[::1]:8787" }),
+    );
+    const { snapshot } = store.load();
+
+    store.save({ ...VALID_IDENTITY, deviceId: "dev-newer", relayUrl: "http://127.0.0.1:8787" });
+    assert.equal(store.clearIfUnchanged(snapshot), false, "a newer value is never cleared");
+    assert.equal(store.load().identity.deviceId, "dev-newer");
+
+    storage.setItem(
+      "allw:pairing:v1",
+      JSON.stringify({ ...VALID_IDENTITY, relayUrl: "http://[::1]:8787" }),
+    );
+    assert.equal(store.clearIfUnchanged(store.load().snapshot), true);
+    assert.deepEqual(store.load(), ABSENT);
   });
 
   test("a stored pin that is not a string is corrupt (not a re-pair state)", () => {
@@ -813,6 +850,71 @@ describe("mountPairingGate — stored pin this build rejects (#286)", () => {
       const shown = root.querySelector(".pairing-relay-url").textContent;
       assert.equal(shown, "http://evil⟨U+202E⟩example.com");
       assert.ok(!root.textContent.includes("‮"), "no raw bidi override anywhere on screen");
+    } finally {
+      restore();
+    }
+  });
+
+  test("an empty pin is shown as (empty), with a reason that doesn't prompt for input (N1)", () => {
+    const { root, restore } = mountWithStored({ ...VALID_IDENTITY, relayUrl: "" });
+    try {
+      assert.equal(root.querySelector(".pairing-relay-url").textContent, "(empty)");
+      assert.equal(
+        root.querySelector(".pairing-relay-note").textContent,
+        "The stored relay is not a valid URL.",
+      );
+    } finally {
+      restore();
+    }
+  });
+
+  test("a stale tab's confirm never clears a newer identity another tab saved (B1 regression)", () => {
+    const { root: rootA, restore } = installDom();
+    try {
+      const storage = memoryStorage();
+      storage.setItem(
+        PAIRING_KEY,
+        JSON.stringify({ ...VALID_IDENTITY, relayUrl: "http://[::1]:8787" }),
+      );
+      const rootB = rootA.ownerDocument.createElement("div");
+      rootA.ownerDocument.body.append(rootB);
+      const confirmIn = (root) =>
+        [...root.querySelectorAll("button")]
+          .find((b) => b.textContent === "Forget this pairing and pair again")
+          .click();
+      const pairingsA = [];
+      const pairingsB = [];
+      // Two tabs load the same rejected identity and both show the re-pair screen.
+      for (const [root, pairings] of [
+        [rootA, pairingsA],
+        [rootB, pairingsB],
+      ]) {
+        mountPairingGate({
+          root,
+          pairingStore: createLocalPairingStore(storage),
+          relayUrl: "http://127.0.0.1:8787",
+          onPaired: (identity) => pairings.push(identity),
+        });
+      }
+
+      // Tab B confirms and re-pairs: a new identity is saved.
+      confirmIn(rootB);
+      const newer = { ...VALID_IDENTITY, deviceId: "dev-newer" };
+      submitPairingForm(rootB, newer);
+      assert.equal(pairingsB.length, 1);
+      const savedByB = storage.getItem(PAIRING_KEY);
+      assert.equal(JSON.parse(savedByB).deviceId, "dev-newer");
+
+      // Later, the stale tab A confirms forgetting the [::1] pairing it still shows.
+      confirmIn(rootA);
+
+      assert.equal(storage.getItem(PAIRING_KEY), savedByB, "the newer identity survives");
+      assert.equal(
+        rootA.querySelector(".pairing-kicker").textContent,
+        "Already paired",
+        "tab A routes to the identity that is stored now",
+      );
+      assert.equal(pairingsA.length, 0);
     } finally {
       restore();
     }

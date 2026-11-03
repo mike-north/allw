@@ -28,7 +28,10 @@
  *   before the human commits, and pairing pins it.
  * - **Re-pair required** (#286) — the stored identity is pinned to a relay this build rejects. Before
  *   any relay is resolved or asked for, a screen names that relay and why; the identity is cleared
- *   only when the human confirms, and the browser then continues as unpaired.
+ *   only when the human confirms (and only if it is still the stored one). The browser then pairs
+ *   again, but as a **previously paired** browser, like the legacy binding above: a `?relay=` link
+ *   is ignored (with the notice) and never persisted, and the relay comes from the candidate this
+ *   browser had already persisted, or from the human.
  *
  * Every relay call after pairing ({@link bootInbox}) reads the identity's pinned `relayUrl`.
  *
@@ -156,6 +159,16 @@ function resolveCandidateRelayUrl(env: BootEnvironment): Promise<string> {
 }
 
 /**
+ * The relay for a browser re-pairing after a rejected pin (#286, decision D1). It was paired
+ * before, so, like the legacy binding in {@link resolvePinnedRelayUrl}, a `?relay=` link is never
+ * used or persisted: the relay is the candidate this browser already persisted, or one the human
+ * types.
+ */
+async function resolveRepairRelayUrl(env: BootEnvironment): Promise<string> {
+  return readStoredRelayUrl(env.storage) ?? (await promptForRelayUrl(env.root, env.storage, null));
+}
+
+/**
  * The pinned relay for a browser **with** a stored identity. An identity stored before pinning
  * existed is bound once — to the relay this browser had already persisted, or to one the human
  * types — and re-saved. The `?relay=` query is never consulted here.
@@ -173,8 +186,9 @@ async function resolvePinnedRelayUrl(
 }
 
 /**
- * Show the re-pair-required state (#286) and resolve once the human has confirmed and the stored
- * identity has been cleared. Never resolves if the human leaves instead, so nothing is cleared.
+ * Show the re-pair-required state (#286) and resolve once the human has confirmed. The rejected
+ * identity has then been cleared if it was still the stored one; the caller re-loads the store.
+ * Never resolves if the human leaves instead, so nothing is cleared.
  */
 function confirmRelayRepair(
   root: HTMLElement,
@@ -182,7 +196,7 @@ function confirmRelayRepair(
   rejected: RejectedRelayPin,
 ): Promise<void> {
   return new Promise((resolve) => {
-    mountRelayRepairGate({ root, pairingStore, rejected, onCleared: resolve });
+    mountRelayRepairGate({ root, pairingStore, rejected, onResolved: resolve });
   });
 }
 
@@ -241,17 +255,22 @@ export async function boot(env: BootEnvironment): Promise<void> {
   const { root, storage } = env;
   const pairingStore = createLocalPairingStore(storage);
   let loaded = pairingStore.load();
+  let repairing = false;
   if (loaded.status === "relay-pin-rejected") {
     await confirmRelayRepair(root, pairingStore, loaded);
+    repairing = true;
     loaded = pairingStore.load();
   }
   const stored = loaded.status === "paired" ? loaded.identity : null;
 
   let relayUrl: string;
-  if (stored !== null) {
-    relayUrl = await resolvePinnedRelayUrl(env, stored, (identity) => {
-      pairingStore.save(identity);
-    });
+  if (stored !== null || repairing) {
+    relayUrl =
+      stored !== null
+        ? await resolvePinnedRelayUrl(env, stored, (identity) => {
+            pairingStore.save(identity);
+          })
+        : await resolveRepairRelayUrl(env);
     const ignored = describeIgnoredRelayOverride(env.search, relayUrl);
     if (ignored !== null) {
       mountIgnoredRelayNotice({ host: env.noticeHost, ignored, pinnedRelayUrl: relayUrl });

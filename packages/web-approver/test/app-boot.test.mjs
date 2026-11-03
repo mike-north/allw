@@ -141,6 +141,18 @@ function submitPairingForm(root, fields) {
 
 const relayQuery = (value) => `?relay=${encodeURIComponent(value)}`;
 
+/**
+ * Resolve once `probe()` is truthy, flushing microtasks between checks, rather than relying on the
+ * exact number of awaits inside `boot`. Fails after a bounded number of ticks.
+ */
+async function waitFor(probe, ticks = 100) {
+  for (let i = 0; i < ticks; i++) {
+    if (probe()) return;
+    await Promise.resolve();
+  }
+  assert.fail("condition not met within the tick budget");
+}
+
 describe("boot — paired device with a ?relay= link to another origin (#249)", () => {
   test("nothing reaches the other origin, the stored identity is unchanged, and a notice names it", async () => {
     const storage = memoryStorage();
@@ -287,11 +299,42 @@ describe("boot — stored identity pinned to a relay this build rejects (#286)",
     assert.deepEqual(networkAttempts, []);
 
     click(root, confirmLabel);
-    const { inboxStarts } = await bootPromise;
+    const { noticeHost, inboxStarts } = await bootPromise;
 
     assert.equal(storage.getItem(PAIRING_KEY), null, "cleared only after confirmation");
-    assert.ok(root.querySelector("form.pairing-form"), "then the browser pairs as new");
+    assert.ok(root.querySelector("form.pairing-form"), "then the browser pairs again");
+    // A re-pair visit is a previously paired browser (decision D1): the ?relay= link is ignored,
+    // reported, and never persisted; the already-persisted candidate is the relay shown.
+    assert.equal(root.querySelector(".pairing-relay-url").textContent, LOOPBACK_CANDIDATE);
+    assert.equal(storage.getItem(RELAY_URL_STORAGE_KEY), LOOPBACK_CANDIDATE);
+    assert.ok(noticeHost.querySelector(".relay-pin-notice"), "the ignored link is reported");
     assert.equal(inboxStarts.length, 0, "the rejected identity never reaches the inbox");
+    assert.deepEqual(networkAttempts, []);
+  });
+
+  test("confirming in a stale tab keeps a newer identity saved since, and routes to it (B1)", async () => {
+    const storage = memoryStorage();
+    storage.setItem(ONBOARDING_KEY, "1");
+    storage.setItem(PAIRING_KEY, JSON.stringify(V6_PINNED_IDENTITY));
+    storage.setItem(RELAY_URL_STORAGE_KEY, LOOPBACK_CANDIDATE);
+
+    const bootPromise = bootWith({ search: "", storage });
+    const root = dom.window.document.getElementById("app");
+    assert.equal(root.querySelector(".pairing-kicker").textContent, "Re-pair required");
+
+    // Another tab re-pairs meanwhile and saves a new, valid identity.
+    const newer = { ...PINNED_IDENTITY, deviceId: "dev-newer", relayUrl: LOOPBACK_CANDIDATE };
+    const newerRaw = JSON.stringify(newer);
+    storage.setItem(PAIRING_KEY, newerRaw);
+
+    click(root, confirmLabel);
+    const { inboxStarts } = await bootPromise;
+
+    assert.equal(storage.getItem(PAIRING_KEY), newerRaw, "the newer identity is never cleared");
+    assert.equal(root.querySelector(".pairing-kicker").textContent, "Already paired");
+    click(root, "Unlock inbox");
+    assert.equal(inboxStarts[0].deviceId, "dev-newer");
+    assert.equal(inboxStarts[0].relayUrl, LOOPBACK_CANDIDATE);
     assert.deepEqual(networkAttempts, []);
   });
 
@@ -309,7 +352,7 @@ describe("boot — stored identity pinned to a relay this build rejects (#286)",
     assert.equal(storage.getItem(PAIRING_KEY), storedRaw);
 
     click(root, confirmLabel);
-    await Promise.resolve();
+    await waitFor(() => root.querySelector("form.relay-config-form"));
 
     assert.equal(storage.getItem(PAIRING_KEY), null);
     assert.ok(root.querySelector("form.relay-config-form"), "now the relay prompt is shown");

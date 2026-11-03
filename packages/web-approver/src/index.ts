@@ -8,13 +8,9 @@ export type {
   RejectedRelayPin,
   RelayRepairGateOptions,
   StoredPairing,
+  StoredSnapshot,
 } from "./pairing.js";
-export {
-  createLocalPairingStore,
-  mountPairingGate,
-  mountRelayRepairGate,
-  visiblyEscape,
-} from "./pairing.js";
+export { createLocalPairingStore, mountPairingGate, mountRelayRepairGate } from "./pairing.js";
 
 export type { OnboardingWalkthroughOptions, OnboardingGateOptions } from "./onboarding.js";
 export {
