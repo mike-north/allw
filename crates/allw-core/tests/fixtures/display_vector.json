@@ -1,0 +1,107 @@
+{
+  "description": "Shared Rust/WASM display-escaping vector (#246). Every expected value is written by hand from the notation in crates/allw-core/src/display.rs; never regenerate it from program output.",
+  "escape_cases": [
+    {
+      "class": "printable (no escape)",
+      "input": "git status --short naïve 日本語 ✅",
+      "escaped": "git status --short naïve 日本語 ✅",
+      "has_hidden_or_control_chars": false
+    },
+    {
+      "class": "C0 named controls (TAB, LF, CR)",
+      "input": "a\tb\nc\rd",
+      "escaped": "a\\tb\\nc\\rd",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "C0 other controls (NUL, ESC, US)",
+      "input": "\u0000\u001b\u001f",
+      "escaped": "\\x00\\x1b\\x1f",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "DEL",
+      "input": "x\u007fy",
+      "escaped": "x\\x7fy",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "C1 controls",
+      "input": "\u0080\u0085\u009b\u009f",
+      "escaped": "⟨U+0080⟩⟨U+0085⟩⟨U+009B⟩⟨U+009F⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "bidi embeddings and overrides (U+202A-U+202E)",
+      "input": "‪‫‬‭‮",
+      "escaped": "⟨U+202A⟩⟨U+202B⟩⟨U+202C⟩⟨U+202D⟩⟨U+202E⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "bidi isolates (U+2066-U+2069)",
+      "input": "⁦⁧⁨⁩",
+      "escaped": "⟨U+2066⟩⟨U+2067⟩⟨U+2068⟩⟨U+2069⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "bidi marks (LRM, RLM, ALM)",
+      "input": "‎‏؜",
+      "escaped": "⟨U+200E⟩⟨U+200F⟩⟨U+061C⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "zero-width and invisible (ZWSP, ZWNJ, ZWJ, WJ, BOM)",
+      "input": "​‌‍⁠﻿",
+      "escaped": "⟨U+200B⟩⟨U+200C⟩⟨U+200D⟩⟨U+2060⟩⟨U+FEFF⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "other default-ignorables and separators (soft hyphen, LS, PS, tag A)",
+      "input": "­  󠁁",
+      "escaped": "⟨U+00AD⟩⟨U+2028⟩⟨U+2029⟩⟨U+E0041⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "mixed: the #246 ESC/CR line-erase spoof plus a bidi override and a zero-width space",
+      "input": "rm -rf ~/x; : \u001b[2K\rgit status ‮exe.​txt",
+      "escaped": "rm -rf ~/x; : \\x1b[2K\\rgit status ⟨U+202E⟩exe.⟨U+200B⟩txt",
+      "has_hidden_or_control_chars": true
+    }
+  ],
+  "display_model_case": {
+    "context": {
+      "action": {
+        "record_schema_version": 1,
+        "surface": "command",
+        "syntactic": {
+          "bin": "rm",
+          "argv": ["rm", "-rf", "~/x;", ":", "\u001b[2K\rgit", "status"],
+          "cwd": "/home/dev/‮ppa",
+          "raw": "rm -rf ~/x; : \u001b[2K\rgit status"
+        },
+        "risk": "critical"
+      },
+      "summary": "check git status",
+      "actor": { "id": "machine:ci​", "kind": "claude-code" },
+      "risk": "critical",
+      "reversible": false,
+      "constraints": { "allowed_decisions": ["approved", "denied"], "challenge_required": false }
+    },
+    "expected": {
+      "surface": "command",
+      "risk": "critical",
+      "reversible": false,
+      "summary": "check git status",
+      "actor_id": "machine:ci⟨U+200B⟩",
+      "actor_kind": "claude-code",
+      "actor_label": "machine:ci⟨U+200B⟩ (claude-code)",
+      "syntactic": {
+        "bin": "rm",
+        "argv": ["rm", "-rf", "~/x;", ":", "\\x1b[2K\\rgit", "status"],
+        "cwd": "/home/dev/⟨U+202E⟩ppa",
+        "raw": "rm -rf ~/x; : \\x1b[2K\\rgit status"
+      },
+      "has_hidden_or_control_chars": true
+    }
+  }
+}

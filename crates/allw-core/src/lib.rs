@@ -18,7 +18,9 @@
 //! and verification landed via an EdDSA compact JWS over Ed25519. JWE context E2EE landed
 //! (multi-recipient JOSE JWE — `ECDH-ES+A256KW` X25519 → A256GCM; see [`jwe`]). Actor-key request
 //! attestation landed (verified request origin, bound to `request_id` + `request_hash`, with the
-//! actor key anchored in root-signed account state; see [`attestation`]).
+//! actor key anchored in root-signed account state; see [`attestation`]). Display escaping landed:
+//! untrusted context text reaches approver screens only through [`display_model`] /
+//! [`escape_for_display`] (see [`display`]).
 
 pub mod account;
 pub mod attestation;
@@ -26,6 +28,7 @@ pub mod audit;
 pub mod command;
 pub mod contract;
 pub mod crypto;
+pub mod display;
 pub mod file_edit;
 pub mod hash;
 pub mod jwe;
@@ -59,6 +62,10 @@ pub use crypto::{
     AccountStateRevocationKind, DeviceCertClaims, InMemoryNonceStore, JwsError, KeyError,
     NonceStore, PublicKey, SigningKeyPair, UnsignedVerdict, VerdictClaims, VerifiedVerdict,
     VerifyError,
+};
+pub use display::{
+    display_model, escape_for_display, has_hidden_or_control_chars, is_hidden_or_control_char,
+    DisplayModel, DisplaySubstrate,
 };
 pub use file_edit::action_from_file_edit;
 pub use hash::{canonical_request_bytes, compute_request_hash};
