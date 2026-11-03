@@ -150,8 +150,11 @@ divergence comes from the PR's own "CRLF is structure" rule. It is cheap to fix 
 - **Gate on PR head:** `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`,
   `cargo check --locked`, and `cargo test --locked` all pass. On the TS side, `pnpm install`, `build:wasm`,
   `pnpm -r build`, `typecheck` and `lint` pass. In `pnpm -r test`, approver passes 97/97, web-approver 287/287,
-  hook 72/72, relay 138/138, and sdk passes. codex-hook hit the known flaky subprocess test once (end-to-end
-  timeout deny). Re-run result: see the gate note at the end. The `build:wasm` step needed a local `wasm-opt`
+  hook 72/72, relay 138/138, and sdk passes. examples and openclaw-bridge pass, and `prettier --check` is clean.
+  codex-hook `integration.test.mjs:207` ("no approver response … category=timeout") failed on 3 of 3 runs here with
+  `cancelledByParent: Promise resolution is still pending but the event loop has already resolved`. This container
+  runs node v22.23; the workspace requires `node >=24` (pnpm warns about it). The PR does not touch codex-hook, so I
+  attribute this to the environment or the known flake, not to the PR. It should still be confirmed green in CI. The `build:wasm` step needed a local `wasm-opt`
   (npm `binaryen@120`) because the container could not download binaryen from GitHub. That is an environment
   problem, not a PR problem.
 - **Emoji table:** `EMOJI_VARIATION_BASES` (359 entries) is strictly sorted, so `binary_search` is valid. It is
