@@ -432,19 +432,22 @@ Limits on `POST /{acct}/requests` (#248; constants in `packages/relay/src/consta
 | `context_ciphertext`         | `MAX_CONTEXT_CIPHERTEXT_BYTES` = 64 KiB (UTF-8 bytes of the string) | **413**        |
 | Horizon (`expires_at − now`) | `MAX_REQUEST_TTL_MS`, default **15 min** (Worker var override)      | **400**        |
 
-Each value is inclusive (exactly the limit is accepted). The `context_ciphertext` ceiling is the
-one integrators can hit with honest input: it caps the encrypted context, which is larger than the
-plaintext context the SDK encrypts. Over-size fails closed — the relay stores nothing, and the SDK's
+Each value is inclusive (exactly the limit is accepted). The `context_ciphertext` ceiling is the one
+integrators can hit with honest input: it caps the encrypted context, which is larger than the plaintext
+context the SDK encrypts. Over-size fails closed — the relay stores nothing, and the SDK's
 `requestApproval` rejects with a `RelayError` with `status` 413, which a caller must treat as deny.
 `RelayError` is exported from `@allw/sdk`, so a caller narrows with
-`err instanceof RelayError && err.status === 413` (#365). The SDK does no pre-check of its own. The
-15-minute horizon covers the hooks' 420 s maximum timeout; an operator who lowers it below that makes hook requests fail closed. A
-pending request older than the horizon (only possible for one stored before the horizon existed) is
-expired by the alarm; like every terminal request it is deleted 7 days after it ends. When a request
-ends (expired, retracted or resolved) the relay blanks its stored envelope: status and verdict reads
-keep working, but the ciphertext is gone. Stored bytes are therefore bounded by submit rate ×
-retention × that small per-row residue. Submission is not yet rate-limited, nor is the number of
-pending requests per account bounded — see `docs/threat-model.md` "Relay denial of service".
+`err instanceof RelayError && err.status === 413` (#365). `requestApproval` rejects with a `RelayError`
+only for a non-2xx or malformed reply to the device fetch or the submit; once the request is submitted,
+a non-2xx poll reply (such as 401 or 403) resolves to an `expired` verdict, and a failed retract is
+ignored. The SDK does no pre-check of its own. The 15-minute horizon covers the hooks' 420 s maximum
+timeout; an operator who lowers it below that makes hook requests fail closed. A pending request older
+than the horizon (only possible for one stored before the horizon existed) is expired by the alarm; like
+every terminal request it is deleted 7 days after it ends. When a request ends (expired, retracted or
+resolved) the relay blanks its stored envelope: status and verdict reads keep working, but the
+ciphertext is gone. Stored bytes are therefore bounded by submit rate × retention × that small per-row
+residue. Submission is not yet rate-limited, nor is the number of pending requests per account bounded —
+see `docs/threat-model.md` "Relay denial of service".
 
 **`GET /{acct}/requests/{id}`** and **`GET /{acct}/requests/{id}/wait`** (WS) — Bearer
 `request_auth_token`; poll/await `{ status, verdict? }`. `status` is `pending`, terminal `expired`,

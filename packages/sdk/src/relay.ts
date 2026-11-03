@@ -77,14 +77,19 @@ export interface ApprovalRequestEnvelope {
 }
 
 /**
- * The relay answered, but not with a usable success: any non-2xx reply (for example 413 when
+ * The relay answered, but not with a usable success: a non-2xx reply (for example 413 when
  * `context_ciphertext` is over the 64 KiB ceiling, `docs/relay-api.md` §3), or a 2xx whose body is not
- * JSON or not the expected shape. `requestApproval` rejects with it; treat it as deny, like every
- * failure (fail-closed), and never retry it into an approval.
+ * JSON or not the expected shape. Every relay call throws it for such a reply.
+ *
+ * Through `requestApproval`, it is a rejection only from the steps before waiting: the device fetch
+ * and the submit. Once the request is submitted, a non-2xx or malformed poll reply (for example 401
+ * or 403) resolves to an `expired` verdict instead, and a failed retract is ignored. Treat a
+ * rejection as deny, like every failure (fail-closed), and never retry it into an approval.
  *
  * Narrow with `err instanceof RelayError`. The message names the call and status only: it never
- * quotes the relay's body, which is untrusted. A hung or unreachable relay is not a `RelayError`:
- * no reply arrived, so the rejection is a timeout or the fetch's own network error.
+ * quotes the relay's body, which is untrusted. A hung or unreachable relay is not a `RelayError`,
+ * because no reply arrived: a direct relay call rejects with a timeout or the fetch's own network
+ * error, and `requestApproval` resolves to an `expired` verdict.
  */
 export class RelayError extends Error {
   constructor(

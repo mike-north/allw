@@ -63,6 +63,38 @@ function clientWith({ devices, submitStatus }) {
   });
 }
 
+/**
+ * A client whose relay accepts the submit and then answers every poll with `pollStatus`, counting
+ * the polls in `seen.polls`.
+ */
+function clientWithPollFailure(pollStatus, seen) {
+  return createClient({
+    relayUrl: "https://relay.allw.test",
+    accountId: "acct_365",
+    approverRootKey: fixedEd25519PublicKey(),
+    webSocketFactory: undefined,
+    pollIntervalMs: 1,
+    fetchImpl: (url, init = {}) => {
+      const method = (init.method ?? "GET").toUpperCase();
+      const path = new URL(url).pathname;
+      if (method === "GET" && path.endsWith("/devices")) {
+        return Promise.resolve(jsonResponse({ devices: [DEVICE] }, 200));
+      }
+      if (method === "POST" && path.endsWith("/requests")) {
+        const { id } = JSON.parse(init.body);
+        return Promise.resolve(
+          jsonResponse(
+            { request_id: id, status: "pending", delivered_to: 1, request_auth_token: "tok_365" },
+            202,
+          ),
+        );
+      }
+      seen.polls += 1;
+      return Promise.resolve(jsonResponse({ error: "authorization denied" }, pollStatus));
+    },
+  });
+}
+
 /** A request to submit; its content is irrelevant to the relay's refusal. */
 const REQUEST = {
   action: {
@@ -114,4 +146,15 @@ test("a failure with no relay reply behind it is not a RelayError", async () => 
     assert.match(err.message, /device/i, "it is the no-enrolled-devices refusal");
     return true;
   });
+});
+
+test("a non-2xx poll after the submit resolves to an expired verdict, not a RelayError rejection", async () => {
+  // Only the device fetch and the submit reject with RelayError. Once the request is submitted, a
+  // relay error while waiting is a fail-closed "expired" verdict (docs/relay-api.md §3).
+  for (const pollStatus of [401, 403, 500]) {
+    const seen = { polls: 0 };
+    const verdict = await clientWithPollFailure(pollStatus, seen).requestApproval(REQUEST);
+    assert.equal(verdict.decision, "expired", `HTTP ${String(pollStatus)} while waiting`);
+    assert.ok(seen.polls >= 1, "the client did poll and got the error");
+  }
 });

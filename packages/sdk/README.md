@@ -74,8 +74,11 @@ fails closed: nothing is stored or shown to the human, and `requestApproval` rej
 `RelayError` whose `status` is 413. Treat that rejection, like any other, as deny; never retry it
 into an approval.
 
-`RelayError` is exported, so you can narrow on it. It covers any non-2xx relay reply, and a 2xx
-whose body is malformed; its message never quotes the relay's body.
+`RelayError` is exported, so you can narrow on it. `requestApproval` rejects with it only when
+the device fetch or the submit gets a non-2xx reply, or a 2xx whose body is malformed. Once the
+request is submitted, a non-2xx or malformed poll reply (for example 401 or 403) resolves to an
+`expired` verdict instead, and a failed retract is ignored. So does a relay that hangs or can't be
+reached. The error's message never quotes the relay's body.
 
 ```ts
 import { RelayError } from "@allw/sdk";
