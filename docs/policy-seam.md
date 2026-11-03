@@ -206,7 +206,8 @@ a program it runs.
   - A command word T1 can't know (`$x`, `$(…)`, a backtick, a glob, a `{a,b}` list) is `high`. bash `$'…'` /
     `$"…"` strings are decoded first. A decoded NUL ends the word, as in bash. A decoding bash may do
     differently (`\u`, `\c`, an unknown escape) makes it at least `high`.
-  - Substitutions (`$(…)`, backticks, `<(…)`, `>(…)`) are classified.
+  - Substitutions (`$(…)`, backticks, `<(…)`, `>(…)`) are classified. Inside one, a `#` comment runs to the end
+    of its line, so a `)` or quote in it doesn't end the substitution.
   - Heredoc delimiters are read as bash reads them (`<<''`, backslash-newline, `\"` inside double quotes). One
     T1 can't read for sure makes the line `high`. An unquoted delimiter's body has its substitutions
     classified.
@@ -227,13 +228,15 @@ a program it runs.
     - `#` as a comment or not;
     - `$'…'` as an ANSI-C string or not;
     - `((` as an arithmetic command or two subshells;
-    - a heredoc inside `$(…)` read before the closing `)` (bash ≥ 4, zsh) or the first `)` closing it (bash 3.2,
-      dash);
+    - a heredoc inside `$(…)` read before the closing `)` (bash ≥ 4, zsh, dash, ksh) or the first `)` closing it
+      (bash 3.2);
     - a body line `EOF)` ending a heredoc inside `$(…)` and closing the substitution (bash 5).
 
     These alternate readings run at every nesting level, so a nested `sh -c` string also gets dash's reading
     (`sh` is dash on Debian and Ubuntu). They are charged to the shared budget, which bounds their cost. An
-    alternate reading adds the commands its shell would run; only the bash reading sets the open-quote floor.
+    alternate reading's substitutions keep the open-quote floor, with one exception: a substitution the bash 3.2
+    reading never closes runs to the end of the input, and bash 3.2 stops at its open quote with nothing later to
+    run, so that open quote alone doesn't raise the tier. This keeps the commit and PR bodies above at `medium`.
 
 - **Bounds.** Each bound fails upward to `high`:
   - nesting of `-c`, `eval` and substitutions past 4 levels;

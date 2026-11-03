@@ -1207,3 +1207,52 @@ fn open_quote_in_a_heredoc_body_does_not_raise_the_tier() {
         Risk::High,
     );
 }
+
+/// Inside `$( )`, an unquoted `#` at a word start begins a comment that runs to the end of the
+/// line (bash ≥ 4, zsh, dash, ksh), so a `)` in it doesn't close the substitution. Before this,
+/// the closing-paren scan ended the substitution at that `)` and left the `dd` on the next line
+/// as quoted text: Medium for a line every shell runs `dd` from.
+#[test]
+fn a_paren_in_a_comment_does_not_close_a_substitution() {
+    assert_all(
+        &[
+            &format!("echo \"$(true # )\n{DD}\n)\""),
+            &format!("x=$(true # )\n{DD}\n)"),
+        ],
+        Risk::Critical,
+    );
+}
+
+/// Decision (R4, option A): a substitution an alternate reading delimits gets no open-quote floor
+/// only in the bash 3.2 reading (`heredocs_in_substitutions` off), and only when the substitution
+/// never closes there, so it runs to the end of the input and bash 3.2 has nothing later to run.
+/// Every other alternate-delimited substitution that ends in an open quote is at least High.
+#[test]
+fn the_alternate_open_quote_exemption_is_narrow() {
+    // The bash 3.2 reading never closes the substitution: no floor, as for the commit bodies.
+    assert_eq!(
+        line_risk("git commit -m \"$(cat <<'EOF'\nFix the parser's bug\nEOF\n)\""),
+        Risk::Medium
+    );
+    // The ANSI-C-off (dash) reading of the line leaves the substitution open in a quote: High.
+    // (The top-level `$'x'` makes the line call for that reading.)
+    assert_eq!(line_risk("echo $'x' \"$(echo $'it\\'s' )\""), Risk::High);
+    // A comment apostrophe can't fake a never-closing substitution in the bash 3.2 reading: the
+    // closing-paren scan honors comments there, so the substitution closes at the body's `)` and
+    // the `dd` after it is a top-level command in that reading.
+    assert_eq!(
+        line_risk(&format!(
+            "echo \"$(cat <<EOF # it's\n)\"; {DD}; echo \"\nEOF\n)\""
+        )),
+        Risk::Critical
+    );
+    // bash 3.2 closes `$( )` at a `)` inside a heredoc body and runs the rest of the line.
+    assert_eq!(
+        line_risk(&format!(
+            "echo \"$(cat <<'EOF'\nfoo )\"; {DD}; echo \"\nEOF\n)\""
+        )),
+        Risk::Critical
+    );
+    // A substitution no reading closes stays High.
+    assert_eq!(line_risk("echo \"$(echo hi # it's )\""), Risk::High);
+}

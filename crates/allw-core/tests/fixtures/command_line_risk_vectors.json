@@ -527,7 +527,7 @@
       "command": "echo \"$(((: ; dd if=/dev/zero of=/dev/sda)))\"",
       "risk": "critical",
       "bin": "echo",
-      "why": "a substitution gets the two-subshell reading of (( too"
+      "why": "fail-upward: bash, zsh, dash and ksh parse $((( as arithmetic and run nothing, but T1 also reads the (( as two subshells, which would run dd"
     },
     {
       "command": "dash <<'EOF'\n((: ; dd if=/dev/zero of=/dev/sda))\nEOF",
@@ -558,6 +558,36 @@
       "risk": "critical",
       "bin": "git",
       "why": "what precedes the open quote in a heredoc body is still read as a script: dd"
+    },
+    {
+      "command": "echo \"$(true # )\ndd if=/dev/zero of=/dev/sda\n)\"",
+      "risk": "critical",
+      "bin": "echo",
+      "why": "inside $( ) a # comment runs to the end of its line, so its ) doesn't close the substitution: every shell runs dd"
+    },
+    {
+      "command": "echo \"$(cat <<'EOF'\nfoo )\"; dd if=/dev/zero of=/dev/sda; echo \"\nEOF\n)\"",
+      "risk": "critical",
+      "bin": "echo",
+      "why": "bash 3.2 closes $( ) at the ) inside the heredoc body and runs dd as a top-level command"
+    },
+    {
+      "command": "echo \"$(cat <<EOF # it's\n)\"; dd if=/dev/zero of=/dev/sda; echo \"\nEOF\n)\"",
+      "risk": "critical",
+      "bin": "echo",
+      "why": "fail-upward: an apostrophe in a comment can't make the bash 3.2 reading run $( ) to the end; read with the comment, it closes at the body's ) and dd follows"
+    },
+    {
+      "command": "echo $'x' \"$(echo $'it\\'s' )\"",
+      "risk": "high",
+      "bin": "echo",
+      "why": "an alternate reading (dash: no $'...') leaves the substitution open in a quote, so the line is at least high"
+    },
+    {
+      "command": "echo \"$(echo hi # it's )\"",
+      "risk": "high",
+      "bin": "echo",
+      "why": "the comment swallows the closing ), so no reading closes the substitution: the line ends unterminated"
     }
   ]
 }
