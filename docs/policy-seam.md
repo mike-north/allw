@@ -133,18 +133,9 @@ record's `risk` into the request's top-level `risk`, which the caller cannot ove
 into words: shell operators, substitutions and newlines are not parsed into the record's fields, and `bin` /
 `argv` describe the word list (the first program). So callers must run `argv` without a shell.
 
-**Risk on a command line covers every command the shell would run** (#272). `action_from_command` scans the raw line
-as a POSIX shell would:
-
-- Each segment between unquoted control operators (`&&`, `||`, `;`, `|`, `&`, `(`, `)`, a newline) is
-  classified.
-- Each substitution (`$(…)`, backticks, `<(…)`) is classified, and so are `eval`'s arguments.
-- The line is at least `medium` when any operator, substitution or redirection appears.
-
-So `ls && rm -rf /` is `high`, and `echo hi > f` is `medium`. Quoted or escaped syntax is literal. Where readings
-can differ (comments, bash `$'…'` strings), the higher tier wins.
-
-Risk is a hint to the human; policy never reads it. Two things are deliberately **not** changed:
+**Risk on a command line covers the commands the shell would run** (#272). `action_from_command` also scans the
+raw line as bash would; §v1 command risk below lists the rules and their limits. So `ls && rm -rf /` is `high`, and
+`echo hi > f` is `medium`. Only `risk` changes. Two things are deliberately **not** changed:
 
 - `bin` / `argv` / `flags` / `positionals`.
 - Policy matching. A `{ bin: "ls" }` any-args allow rule still matches `ls && rm -rf /`. Making the matcher fail
@@ -167,24 +158,74 @@ Risk is a hint to the human; policy never reads it. Two things are deliberately 
 
 Do **not** build capability inference or a schema DB in v1. Just don't foreclose them.
 
-### v1 command risk: classify the program that actually runs
+### v1 command risk: classify what actually runs
 
-`risk` on a `command` record is a coarse heuristic (the table lives in `crates/allw-core/src/command.rs`). It is
-a hint shown to the human. Policy never reads it. It is classified on the program that **actually runs**, not
-only `argv[0]`, so a prefix can never make a command look less risky than it is (decided 2026-11-02, #268):
+`risk` on a `command` record is a coarse T1 heuristic. Its rules and table live in
+`crates/allw-core/src/command/risk.rs`.
 
-- **Leading `NAME=value` assignments are skipped.** The tier is that of the command after them, and at least
-  `medium`: an assignment can change what a program does (`LD_PRELOAD`, `PATH`, `GIT_SSH_COMMAND`).
-  `X=1 rm -rf ~` is `high`, the same as `rm -rf ~`.
-- **A wrapper never lowers risk.** The wrappers are `env`, `sudo`, `doas`, `nice`, `ionice`, `nohup`, `time`,
-  `timeout`, `command`, `exec`, `xargs`, `stdbuf` and `setsid`. A wrapper is at least as risky as anything it
-  may be running. T1 can't tell an option value (`nice -n 10`) from the wrapped program, so every later
-  non-flag word counts. `env rm -rf ~` is `high`. `env` with nothing to run stays `low`.
-- **`sh` / `bash` / `zsh` / `dash` / `ksh` with `-c`** is at least as risky as its command string.
-  - Nesting past 4 levels is `high` rather than analyzed further.
-  - An argv too long to analyze in full (past 256 words) treats its unanalyzed tail as `high` for any wrapper
-    or assignment in front of it.
-- The result is never lower than the `argv[0]`-only tier.
+**Who reads it.** `policy::evaluate` does not read risk, so risk never makes an action allowed. Risk is not only
+display, though:
+
+- The human sees it.
+- The Codex hook and the OpenClaw bridge derive `reversible` from it (`low` / `medium` ⇒ reversible).
+- The OpenClaw bridge requires a challenge for `critical`.
+
+So understating risk is a real defect. Every rule fails **upward**: where T1 can't tell, the tier goes up.
+
+**Rules** (decided 2026-11-02, #268 and #272). Risk is classified on what actually runs, not only `argv[0]`.
+Within the limits below, a prefix, wrapper, operator or substitution does not make a command look less risky than
+a program it runs.
+
+- **Assignments.** Leading assignment-like words (`NAME=value`, `X+=1`, `A[0]=1`) are skipped. The tier is that
+  of the command after them, and at least `medium`: an assignment can change what a program does (`LD_PRELOAD`,
+  `PATH`, `GIT_SSH_COMMAND`). `X=1 rm -rf ~` is `high`.
+- **Wrappers.** The wrappers are a curated list:
+  - `env`, `sudo`, `doas`, `run0`, `pkexec`, `su`, `nice`, `ionice`, `nohup`, `time`, `timeout`
+  - `command`, `builtin`, `exec`, `xargs`, `stdbuf`, `setsid`, `find`, `caffeinate`, `arch`
+  - `script`, `chroot`, `flock`, `watch`, `busybox`, `ssh`
+  - the GNU-prefixed `genv`, `gnice`, `gnohup`, `gtimeout`, `gstdbuf`
+
+  A wrapper is at least as risky as anything it may run. T1 can't tell an option value (`nice -n 10`) from the
+  wrapped program, so every later non-flag word counts as a program start. Every later word holding whitespace
+  counts as a command line too: `watch 'rm -rf ~'`, `ssh host 'cmd'`, and a flag value such as
+  `env -S'rm -rf ~'`. `env` running a program is at least `medium`, and `env` alone stays `low`.
+
+- **Shells and `eval`.** These read their string as a full command line under the rules here:
+  - `sh` / `bash` / `zsh` / `dash` / `ksh` / `mksh` / `ash` / `fish` / `csh` / `tcsh` with `-c`;
+  - `pwsh` / `powershell` with `-Command`;
+  - `eval`'s arguments.
+
+  An unreadable string (`-EncodedCommand`, an unterminated quote) is `high`.
+
+- **Command lines** (`action_from_command` only):
+  - Segments are split at unquoted control operators (`&&`, `||`, `;`, `|`, `&`, `(`, `)`, newline, a lone
+    `{` / `}`, zsh `&!` / `&|`). Each segment is classified.
+  - Words before the command word are skipped: keywords (`if`, `do`, `!`, `time [-p]`, …), redirections
+    (`2>/dev/null`, `> f`) and the zsh precommands (`noglob`, `nocorrect`, `-`, `repeat N`).
+  - A command word T1 can't know (`$x`, `$(…)`, a backtick, a glob, a `{a,b}` list) is `high`. bash `$'…'` /
+    `$"…"` strings are decoded first.
+  - Substitutions (`$(…)`, backticks, `<(…)`, `>(…)`) are classified.
+  - Heredoc bodies are data: a quoted delimiter makes the body literal, and an unquoted one runs only its
+    substitutions. A heredoc fed to a shell is classified as a script.
+  - Any operator, substitution or redirection makes the line at least `medium`. A line ending inside an open
+    quote or substitution is `high`, because the shell runs what comes before the syntax error.
+  - bash grammar is authoritative. The two ambiguous readings are both analyzed and the higher tier wins: `#`
+    as a comment, and `$'…'` as an ANSI-C string.
+- **Bounds.** Each bound fails upward to `high`:
+  - nesting of `-c`, `eval` and substitutions past 4 levels;
+  - argv words past the 256th, which count as a `high` candidate;
+  - one shared work budget per record (bytes scanned plus words classified), so classification time stays
+    linear and bounded inside the synchronous hook.
+
+**Known T1 limits.** For these the tier can still understate what runs (decision B: curated list plus documented
+limits, no name-sniffing of later words):
+
+- wrappers and interpreters that aren't listed: `parallel`, `git -c core.sshCommand=…` / `-c alias.*`,
+  `source` / `.`, and code in other languages (`python -c`, `node -e`, `perl -e`); tracked in #289;
+- input piped into a shell (`echo 'rm -rf ~' | sh`): the shell keeps its own tier;
+- aliases, functions and `PATH` lookups defined outside the line, and renamed or symlinked binaries;
+- arithmetic evaluation of data (`x='a[$(rm -rf ~)]'; echo $((x))` runs a substitution stored in a variable);
+- non-bash grammars (fish, csh, PowerShell strings) are read with bash's rules.
 
 This changes **only `risk`**. `bin`, `argv`, `flags`, `positionals` and `env_refs` keep their T1 meaning, and
 `bin` is still `argv[0]` (`X=1 rm -rf ~` has `bin: "X=1"`). The `bin` question is **open**: `CommandMatcher`
@@ -192,7 +233,8 @@ matches `bin` exactly, so a `{ bin: "ls" }` any-args `allow` rule would start ma
 `LD_PRELOAD=/tmp/evil.so ls` if `bin` became the real program. Changing `bin` therefore needs a matching
 policy-matcher rule for prefixed commands first (see #268).
 
-Shared Rust ↔ WASM vectors for this rule are in `crates/allw-core/tests/fixtures/command_risk_vectors.json`.
+Shared Rust ↔ WASM vectors are in `crates/allw-core/tests/fixtures/command_risk_vectors.json` (argv rules) and
+`command_line_risk_vectors.json` (command lines).
 
 ---
 
