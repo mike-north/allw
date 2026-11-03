@@ -41,7 +41,9 @@ COMMON OPTIONS:
   -v, --version      Print the version and exit.
 
 pair OPTIONS:
-  --relay <url>      Relay base URL (required), e.g. https://relay.example.com
+  --relay <url>      Relay base URL (required), e.g. https://relay.example.com. Must be https://;
+                     http:// is accepted only on localhost or 127.0.0.1. No username, password,
+                     query or fragment.
   --account <id>     Optional check: must equal the account id derived from the keyfile's
                      account root, or pairing fails. Omit it to use the derived id.
   --label <name>     Human label for this device (optional).
@@ -51,7 +53,8 @@ pair OPTIONS:
                      Bearer token returned with an existing pairing code.
 
 watch OPTIONS:
-  --relay <url>      Override the paired relay URL (defaults to the keyfile's relay_url).
+  --relay <url>      Override the paired relay URL (defaults to the keyfile's relay_url). The
+                     URL in use, override or keyfile, follows the same rule as pair --relay.
 
 keygen OPTIONS:
   --force            Overwrite an existing keyfile (orphans the current device's seeds).

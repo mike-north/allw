@@ -58,7 +58,8 @@ and [enrollment.md](./enrollment.md) (account/device enrollment, rotation, revoc
 
 The payload being approved is an **`ActionRecord`** — defined in [policy-seam.md](./policy-seam.md). v1 carries the
 **syntactic substrate** (`surface` + tokenized command / MCP call); the semantic `capabilities`/`scope` fields are
-reserved and null. The contract is **action-agnostic**: it transports and binds whatever `ActionRecord` it's given.
+reserved and null, and a device refuses a context that sets one (§Device-side context checks). The contract is
+**action-agnostic**: it transports and binds whatever `ActionRecord` it's given.
 
 ---
 
@@ -131,6 +132,30 @@ one hash is the complete WYSIWYS binding. The actor's `attestation` is verified 
 (the relay never sees it); the integrator still holds the plaintext `ApprovalContext`
 locally (it builds it and runs its policy engine before escalating), so this split only changes what crosses the
 wire to the relay.
+
+#### Device-side context checks
+
+The hash binds the whole context, but approvers show only part of it. So when a device opens a context
+(`decrypt_context` in the core, used by every approver surface), it refuses one whose hidden part says something
+the shown part doesn't. The device can't approve a refused request, so the caller is denied (fail-closed). The
+error names what broke the rule; surfaces only render it. Decided 2026-11-03 (#296).
+
+1. **Reserved semantic fields must be null.** `action.capabilities` and `action.scope` are reserved for the T3 tier
+   ([policy-seam.md](./policy-seam.md) §Forward-compat). A context that sets either one is refused, whatever the
+   value: any `scope` value, including `{}`, `[]`, `""`, `0` and `false`, and any `capabilities` array, including
+   `[]`. A non-array `capabilities` is a malformed context and was already refused. Absent and `null` both pass.
+   The error names each field that is set, for example
+   `action.capabilities and action.scope are reserved and must be null in v1`. This is checked first.
+2. **No hidden risk downgrade.** Approvers show the context's `risk`, not `action.risk`. A context whose `risk` is
+   lower than `action.risk` would hide the record's tier behind a milder one, so it is refused. The error names
+   both tiers (`context risk low is lower than action.risk critical`). A context may **raise** the risk, since an
+   integrator can ask for more care than the record's tier, so `risk >= action.risk` passes. Showing both tiers
+   when they differ is a later display change ([#340](https://github.com/mike-north/allw/issues/340)). On the raw
+   SDK path both `risk` and `action.risk` are integrator inputs, so this is a consistency check: what is shown can't
+   be milder than what is recorded. It can't stop an integrator that writes `low` in both places.
+
+The integrator side doesn't check these today: an integrator that sends such a context gets a denial, not an
+error.
 
 ### Verdict — _one-shot and scope-free_
 

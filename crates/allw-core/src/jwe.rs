@@ -66,7 +66,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use x25519_dalek::{PublicKey as XPublicKey, SharedSecret, StaticSecret};
 
-use crate::contract::ApprovalContext;
+use crate::contract::{ApprovalContext, ContextViolation};
 
 // ── JOSE constant strings (RFC 7518) ────────────────────────────────────────────
 
@@ -322,6 +322,10 @@ pub enum JweError {
     DecryptionFailed,
     /// The decrypted plaintext was not a valid JSON [`ApprovalContext`].
     InvalidPlaintext,
+    /// The plaintext parsed, but breaks a v1 rule the device enforces before showing a request
+    /// ([`ApprovalContext::check_v1_conformance`]). Like [`Self::InvalidPlaintext`], this is a
+    /// context the device can't approve.
+    ContractViolation(ContextViolation),
 }
 
 impl std::fmt::Display for JweError {
@@ -338,6 +342,9 @@ impl std::fmt::Display for JweError {
             Self::KeyUnwrapFailed => "AES key-wrap unwrap of the encrypted_key failed",
             Self::DecryptionFailed => "AES-256-GCM authentication/decryption failed",
             Self::InvalidPlaintext => "decrypted plaintext is not a valid ApprovalContext",
+            Self::ContractViolation(violation) => {
+                return write!(f, "decrypted ApprovalContext is refused: {violation}");
+            }
         };
         write!(f, "{msg}")
     }
@@ -757,7 +764,17 @@ pub fn decrypt_context(
         .map_err(|_| JweError::DecryptionFailed)?;
 
     // ── Step 6: parse the plaintext back into an ApprovalContext ──
-    serde_json::from_slice(&plaintext).map_err(|_| JweError::InvalidPlaintext)
+    let context: ApprovalContext =
+        serde_json::from_slice(&plaintext).map_err(|_| JweError::InvalidPlaintext)?;
+
+    // ── Step 7: enforce the v1 device-side rules (fail closed) ──
+    // The hash binds the whole context, but approvers show only part of it. A context whose
+    // hidden part says something the shown part doesn't is refused here, so no surface can
+    // display (and so approve) it.
+    context
+        .check_v1_conformance()
+        .map_err(JweError::ContractViolation)?;
+    Ok(context)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────────

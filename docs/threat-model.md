@@ -329,14 +329,18 @@ trust decision, and it lives in the core:
   difference remains: the web shows tool-call `params` as indented JSON lines, while the CLI prints compact JSON on
   one wrapped row. Pretty-printed continuation lines are always indented, quoted, or a bracket, so none can pose as a
   label.
-- Neither approver shows the hash-bound `action.risk`, `capabilities` or `scope` (both show the context `risk`).
-  `capabilities` and `scope` must be null in v1 but are not yet rejected on the device. Owner: #296.
+- Neither approver shows the hash-bound `action.risk`, `capabilities` or `scope` (both show the context `risk`). The
+  device now refuses a context that sets `capabilities` or `scope`, or whose shown `risk` is lower than `action.risk`
+  ([contract.md](./contract.md) §Device-side context checks, #296). The remaining residual is a context that
+  **raises** the risk: the human sees the higher tier but not the record's own. Owner: #340.
 - Relay-supplied text outside the context goes through `escape_for_display` too. The CLI approver escapes every
   `watch` log line (request ids, relay error strings, which could otherwise repaint the request block mid-prompt),
   every `pair` output line (the relay-issued pairing code and `device_id`), and the fatal error line (which can embed
   a relay HTTP error body); if the core cannot load, the fatal error text is withheld rather than printed raw. The
-  web approver escapes the verification-failed reason (which can name the relay-supplied envelope id) and the
-  relay-outage banner text; a runtime without the core escape withholds that text.
+  web approver escapes the verification-failed reason (which can name the relay-supplied envelope id), the
+  relay-outage banner text, the ignored `?relay=` link in the relay-pin notice (#307), and the rejected pin on the
+  re-pair screen (#297); a runtime without the core escape withholds that text, and the notice and re-pair screen
+  withhold theirs when the core cannot load, or has not loaded within `DISPLAY_ESCAPE_LOAD_TIMEOUT_MS` (#308).
 - Escaping is display-only. `request_hash` is computed over the original context; the display model is a separate
   value that is never hashed, signed, or sent.
 
@@ -525,7 +529,9 @@ attestation, audit records, hook/SDK fail-closed behavior, or enrollment.
 - [ ] Network failures, hung reads, refused connections, and malformed relay responses deny or expire, never allow.
 - [ ] Any new endpoint states who may call it and what authentication/authorization is required.
 - [ ] Relay URLs are accepted only as `https:` (or `http:` on loopback) and are rejected at configuration time,
-      before any request is built (web approver `checkRelayUrl`, SDK `assertRelayUrlTransport`).
+      before any request is built (web approver `checkRelayUrl`, SDK `assertRelayUrlTransport`, approver CLI
+      `assertCliRelayUrl` for `pair --relay`, `watch --relay` and the keyfile's `relay_url`). Every copy of the rule
+      is tested against `packages/sdk/test/fixtures/relay-url-vectors.json`.
 - [ ] A paired web approver talks only to the relay pinned in its stored identity; no query parameter, link, or
       other page input can re-point it without re-pairing.
 - [ ] Web approver changes keep the `_headers` CSP intact: no inline script or `'unsafe-inline'`, and

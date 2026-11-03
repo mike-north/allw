@@ -2,6 +2,8 @@
  * `allw-approver pair` — enroll this software approver as a device on an account.
  *
  * Flow (`docs/contract.md` §Lifecycle / §Transport → pairing; relay #89 auth; #242):
+ * 0. Check the relay URL against the transport rule (`https:`, or `http:` on loopback; #267) before
+ *    touching the keyfile or the relay.
  * 1. Load (or generate) the local keyfile — three software-held seeds + derived pubkeys.
  * 1a. Derive the **self-certifying account id** from the keyfile's account-root pubkey
  *    (`docs/enrollment.md` §Self-Certifying Account Id). An explicit `accountId` is accepted only
@@ -30,10 +32,15 @@ import {
   pairingStart,
   publishAccountStates,
 } from "../lib/relay-client.js";
+import { assertCliRelayUrl } from "../lib/relay-url.js";
 import type { AllwWasm } from "../lib/wasm.js";
 
 /** Options for `pair`, parsed from argv by the CLI. */
 export interface PairOptions {
+  /**
+   * Relay base URL. Must pass the relay transport rule (`../lib/relay-url.ts`: `https:`, or `http:`
+   * on loopback), or `runPair` throws before touching the keyfile or the relay.
+   */
   readonly relayUrl: string;
   /**
    * Optional explicit account id. The id is derived from the keyfile's account root; when this is
@@ -177,6 +184,10 @@ export async function runPair(
   const log: Logger = (line) => {
     rawLog(wasm.escape_for_display(line));
   };
+  // Reject a plaintext or malformed relay URL first (#267): before any request is built, and
+  // before a fresh keyfile is generated or written, so a refused `pair` leaves nothing behind.
+  // From here on only the canonical form is used: for every request and for the persisted relay_url.
+  const relayUrl = assertCliRelayUrl(options.relayUrl, "--relay");
   const now = options.now ?? Date.now();
   const { keyfile: existing, fresh } = loadOrGenerate(wasm, options.keyfilePath);
 
@@ -209,7 +220,7 @@ export async function runPair(
       randomBytes(16).toString("base64url"),
     );
     const started = await pairingStart(
-      options.relayUrl,
+      relayUrl,
       accountId,
       { rootPubkey: existing.account_root_pubkey, authorization },
       options.label,
@@ -223,7 +234,7 @@ export async function runPair(
 
   // 2. Complete pairing: register the device X25519 (encryption) key → device_id.
   const paired = await pairingComplete(
-    options.relayUrl,
+    relayUrl,
     accountId,
     code,
     pairingAuthToken,
@@ -245,20 +256,14 @@ export async function runPair(
   // 4. Publish the account state that vouches for this device, so integrators can encrypt to it.
   // Before the keyfile write: a failure here leaves the keyfile unpaired, and re-running `pair`
   // starts over cleanly.
-  const sequence = await publishDeviceAccountState(
-    wasm,
-    existing,
-    options.relayUrl,
-    accountId,
-    deviceId,
-  );
+  const sequence = await publishDeviceAccountState(wasm, existing, relayUrl, accountId, deviceId);
   log(`Published account state — sequence ${String(sequence)}`);
 
   // 5. Persist the fully-paired identity (no partial writes before this point).
   const updated: Keyfile = {
     ...existing,
     account_state_highest_sequence: sequence,
-    relay_url: options.relayUrl,
+    relay_url: relayUrl,
     account_id: accountId,
     device_id: deviceId,
     device_auth_token: paired.device_auth_token,

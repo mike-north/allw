@@ -30,13 +30,116 @@ export interface PushWakeup {
 
 /**
  * Thrown by a transport when a token is **permanently undeliverable**: the push service itself
- * reports the subscription gone (for Web Push, HTTP 404 or 410). It is the only failure that removes
- * a stored token. Every other failure, including timeouts, auth errors, and a stored token the relay
+ * reports the token gone. Per transport: Web Push 404 or 410; APNs 410; FCM 404 with the
+ * `UNREGISTERED` error code. It is the only failure that removes a stored token. Every other failure, including timeouts, auth errors, and a stored token the relay
  * refuses to send to (e.g. a Web Push endpoint outside the current allowlist), is treated as
  * transient, so a provider outage or relay misconfiguration can never silently unregister a device.
  */
 export class UndeliverablePushTokenError extends Error {
   override readonly name = "UndeliverablePushTokenError";
+}
+
+/**
+ * Whether a push-service status is a 4xx. A transport logs every 4xx it does **not** prune as a
+ * **rejection worth an operator's attention** ({@link warnPushServiceRejection}). The token is kept
+ * as transient, but such a 4xx usually means the relay sent something the push service refuses for
+ * *every* device: a bad header such as Apple's `400 BadWebPushTopic`, a VAPID or credential
+ * mismatch, a wrong APNs environment or FCM project, a bad payload. That is invisible unless it is
+ * logged (#326). A 4xx that prunes (see {@link UndeliverablePushTokenError}) is not logged; 2xx,
+ * 5xx, redirects and timeouts are not rejections in this sense.
+ */
+export function isClientErrorStatus(status: number): boolean {
+  return status >= 400 && status < 500;
+}
+
+/**
+ * The host of a push-service URL, the only part of it the relay logs. For Web Push the path is the
+ * subscription itself (a bearer capability); for APNs it carries the device token.
+ */
+export function pushServiceHost(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "(invalid endpoint)";
+  }
+}
+
+/**
+ * Log one push-service rejection (a 4xx that did not prune; see {@link isClientErrorStatus}) for
+ * `wrangler tail`. Only the
+ * transport, the push-service host, the status and an optional short `reason` are logged: never
+ * the token, the endpoint path, credentials (VAPID JWT, bearer) or request ids.
+ */
+export function warnPushServiceRejection(
+  transport: PushTransportKind,
+  host: string,
+  status: number,
+  reason?: string,
+): void {
+  const detail = reason === undefined ? "" : ` (reason ${reason})`;
+  console.warn(
+    `push: ${transport} push service ${host} rejected a wakeup with HTTP ${String(status)}${detail}; token kept`,
+  );
+}
+
+/** Reading a push service's error body gives up after this long; a stalled body never holds a send. */
+const PUSH_BODY_READ_MS = 1_000;
+
+/**
+ * Release a response body without waiting for it. Cancelling is how the relay frees the outbound
+ * connection, but a body whose `cancel()` never settles must not hold the send, so the cancel is
+ * fired and its outcome ignored.
+ */
+export function releaseBody(body: ReadableStream | null): void {
+  void body?.cancel().catch(() => undefined);
+}
+
+/**
+ * A push service's JSON error body, parsed from at most `maxBytes` of it, or `undefined` when there
+ * is no body or the prefix is not valid JSON. Reads for at most {@link PUSH_BODY_READ_MS}, then
+ * always cancels the body without waiting for the cancel, so a large or stalled body can neither hold the send nor leave the
+ * connection unreleased. A body cut off at the limit fails to parse, so callers must treat
+ * `undefined` as "no information", never as a positive signal.
+ */
+export async function readBoundedJsonBody(response: Response, maxBytes: number): Promise<unknown> {
+  const body = response.body;
+  if (!body) return undefined;
+  // Response bodies are byte streams; the Workers types leave the chunk type open.
+  const reader = (body as ReadableStream<Uint8Array>).getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const deadline = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => {
+      resolve("timeout");
+    }, PUSH_BODY_READ_MS);
+  });
+  try {
+    while (size < maxBytes) {
+      const next = await Promise.race([reader.read(), deadline]);
+      if (next === "timeout" || next.done) break;
+      chunks.push(next.value);
+      size += next.value.byteLength;
+    }
+  } catch {
+    // A body that fails mid-read just carries no information.
+  } finally {
+    clearTimeout(timer);
+    void reader.cancel().catch(() => undefined);
+  }
+  const bytes = new Uint8Array(Math.min(size, maxBytes));
+  let offset = 0;
+  for (const chunk of chunks) {
+    if (offset >= bytes.length) break;
+    const part = chunk.subarray(0, bytes.length - offset);
+    bytes.set(part, offset);
+    offset += part.length;
+  }
+  try {
+    return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Outcome of one fan-out: which tokens' wakeups the push services accepted, and which to prune. */
@@ -194,7 +297,17 @@ export async function dispatchPushWakeups(
   return { deliveredTokens, undeliverableTokens };
 }
 
-/** APNs token-auth transport. Credentials are supplied by Worker environment bindings. */
+/**
+ * APNs token-auth transport. Credentials are supplied by Worker environment bindings.
+ *
+ * Only **410** prunes: APNs's answer for a device token that is no longer active for the topic
+ * (the app was uninstalled, or the token rotated). `400 BadDeviceToken` deliberately does **not**
+ * prune. APNs also returns it for a token sent to the wrong APNs environment (a sandbox token to
+ * production, or the reverse), so a relay configured with the wrong `APNS_ENDPOINT` would otherwise
+ * unregister every device. Like every other 4xx it is logged and the token kept.
+ *
+ * @see https://developer.apple.com/documentation/usernotifications/handling-notification-responses-from-apns
+ */
 export class ApnsPushTransport implements PushTransport {
   readonly kind = "apns" as const;
 
@@ -233,13 +346,51 @@ export class ApnsPushTransport implements PushTransport {
         }),
       },
     );
-    if (!response.ok) {
-      throw new Error(`APNs wakeup failed with HTTP ${String(response.status)}`);
+    // The relay never reads APNs bodies (the status alone decides); release the connection.
+    releaseBody(response.body);
+    if (response.ok) return;
+    if (response.status === 410) {
+      throw new UndeliverablePushTokenError("APNs device token is no longer active (HTTP 410)");
     }
+    if (isClientErrorStatus(response.status)) {
+      warnPushServiceRejection("apns", pushServiceHost(this.endpoint), response.status);
+    }
+    throw new Error(`APNs wakeup failed with HTTP ${String(response.status)}`);
   }
 }
 
-/** FCM HTTP v1 transport. Credentials are supplied by Worker environment bindings. */
+/** At most this much of an FCM 404's body is read, looking for the `UNREGISTERED` error code. */
+const FCM_ERROR_MAX_BYTES = 4096;
+
+/**
+ * Whether an FCM HTTP v1 error body names the `UNREGISTERED` error code
+ * (`error.details[].errorCode`), FCM's answer for a registration token that is no longer valid.
+ */
+function isFcmUnregistered(body: unknown): boolean {
+  if (typeof body !== "object" || body === null) return false;
+  const error = (body as Record<string, unknown>).error;
+  if (typeof error !== "object" || error === null) return false;
+  const details = (error as Record<string, unknown>).details;
+  return (
+    Array.isArray(details) &&
+    details.some(
+      (detail: unknown) =>
+        typeof detail === "object" &&
+        detail !== null &&
+        (detail as Record<string, unknown>).errorCode === "UNREGISTERED",
+    )
+  );
+}
+
+/**
+ * FCM HTTP v1 transport. Credentials are supplied by Worker environment bindings.
+ *
+ * Only a **404 whose body carries the `UNREGISTERED` error code** prunes. A bare 404, or one with
+ * another code, more likely means a wrong endpoint or project (a relay misconfiguration), so it is
+ * logged like any other 4xx and the token kept. So is a body that cannot be read or parsed.
+ *
+ * @see https://firebase.google.com/docs/reference/fcm/rest/v1/ErrorCode
+ */
 export class FcmPushTransport implements PushTransport {
   readonly kind = "fcm" as const;
 
@@ -271,9 +422,19 @@ export class FcmPushTransport implements PushTransport {
         },
       }),
     });
-    if (!response.ok) {
-      throw new Error(`FCM wakeup failed with HTTP ${String(response.status)}`);
+    if (response.status === 404) {
+      // Only this answer's body is read; it is bounded and always released.
+      if (isFcmUnregistered(await readBoundedJsonBody(response, FCM_ERROR_MAX_BYTES))) {
+        throw new UndeliverablePushTokenError("FCM registration token is unregistered (HTTP 404)");
+      }
+    } else {
+      releaseBody(response.body);
     }
+    if (response.ok) return;
+    if (isClientErrorStatus(response.status)) {
+      warnPushServiceRejection("fcm", pushServiceHost(this.endpoint), response.status);
+    }
+    throw new Error(`FCM wakeup failed with HTTP ${String(response.status)}`);
   }
 }
 
