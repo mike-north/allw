@@ -17,7 +17,7 @@
  * @see ../vendor/allw-wasm/allw_wasm.d.ts (the generated FFI surface)
  */
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -217,11 +217,66 @@ function initGlue(glue: WasmGlue, dir: string): AllwWasm {
   return glue;
 }
 
-/** The actionable error for a missing/broken vendor directory. */
-function loadError(dir: string, cause: unknown): Error {
+/** The vendored files the loader reads; if any is missing, the core was never built here. */
+const VENDOR_FILES = ["allw_wasm.js", "allw_wasm_bg.wasm"] as const;
+
+/** The most characters of a load failure's cause that {@link wasmLoadError} quotes. */
+export const MAX_WASM_LOAD_CAUSE_CHARS = 200;
+
+/**
+ * A load failure's cause as one bounded line of printable ASCII. The display-escaping core is the
+ * thing that failed to load, so it can't be used here. Instead every character outside
+ * printable ASCII (including newlines and ESC) becomes a `\uXXXX` escape, so a cause can't move
+ * the cursor or spoof lines in a terminal or a hook's deny reason. The result is then clipped to
+ * {@link MAX_WASM_LOAD_CAUSE_CHARS}, with `…` when cut.
+ */
+function describeLoadCause(cause: unknown): string {
+  let text: string;
+  try {
+    text =
+      cause instanceof Error
+        ? `${cause.name}: ${cause.message}`
+        : `non-error thrown: ${String(cause)}`;
+  } catch {
+    text = "a cause that could not be described";
+  }
+  const escaped = text.replace(
+    /[^\x20-\x7e]/g,
+    (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
+  return escaped.length > MAX_WASM_LOAD_CAUSE_CHARS
+    ? `${escaped.slice(0, MAX_WASM_LOAD_CAUSE_CHARS)}…`
+    : escaped;
+}
+
+/**
+ * The actionable error for a vendored core that failed to load (#301). When a vendored file is
+ * missing, the fix is to build it, and the message says so. Otherwise the files are there and
+ * something else broke (a glue module that fails to evaluate, a corrupt `.wasm`), so the message
+ * quotes the underlying cause, escaped and bounded, instead of sending the reader to rebuild.
+ *
+ * Exported for tests; not re-exported from the package entry point.
+ *
+ * @internal
+ */
+export function wasmLoadError(
+  dir: string,
+  cause: unknown,
+  fileExists: (path: string) => boolean = existsSync,
+): Error {
+  const missing = VENDOR_FILES.filter((file) => !fileExists(join(dir, file)));
+  if (missing.length > 0) {
+    return new Error(
+      `allw: failed to load the vendored WASM core from ${dir}: ${missing.join(" and ")} ` +
+        `${missing.length === 1 ? "is" : "are"} missing. Run \`pnpm run build:wasm\` from the ` +
+        `repo root first (or reinstall @allw/sdk if it came from npm).`,
+      { cause },
+    );
+  }
   return new Error(
-    `allw: failed to load the vendored WASM core from ${dir}. ` +
-      `Run \`pnpm run build:wasm\` from the repo root first.`,
+    `allw: failed to load the vendored WASM core from ${dir}: ${describeLoadCause(cause)}. ` +
+      `The vendored files are present, so rebuilding may not help; reinstall @allw/sdk or ` +
+      `rebuild the core (\`pnpm run build:wasm\`) if the files are damaged.`,
     { cause },
   );
 }
@@ -229,7 +284,8 @@ function loadError(dir: string, cause: unknown): Error {
 /**
  * Load (and memoize) the vendored WASM core.
  *
- * @throws if the vendor directory is missing — run `pnpm run build:wasm` from the repo root first.
+ * @throws if the vendored core is missing (the message says to run `pnpm run build:wasm`) or
+ *   fails to load (the message quotes the cause, escaped and bounded; see {@link wasmLoadError}).
  */
 export async function loadWasm(): Promise<AllwWasm> {
   if (cached) return cached;
@@ -239,7 +295,7 @@ export async function loadWasm(): Promise<AllwWasm> {
     const glue = (await import(pathToFileURL(join(dir, "allw_wasm.js")).href)) as WasmGlue;
     return initGlue(glue, dir);
   } catch (cause) {
-    throw loadError(dir, cause);
+    throw wasmLoadError(dir, cause);
   }
 }
 
@@ -249,7 +305,8 @@ export async function loadWasm(): Promise<AllwWasm> {
  * top-level await, so Node's `require(esm)` loads it synchronously; it shares Node's module cache
  * (and this memo) with {@link loadWasm}, so the core is instantiated once either way.
  *
- * @throws if the vendor directory is missing — run `pnpm run build:wasm` from the repo root first.
+ * @throws if the vendored core is missing (the message says to run `pnpm run build:wasm`) or
+ *   fails to load (the message quotes the cause, escaped and bounded; see {@link wasmLoadError}).
  */
 export function loadWasmSync(): AllwWasm {
   if (cached) return cached;
@@ -259,6 +316,6 @@ export function loadWasmSync(): AllwWasm {
     const glue = require(join(dir, "allw_wasm.js")) as WasmGlue;
     return initGlue(glue, dir);
   } catch (cause) {
-    throw loadError(dir, cause);
+    throw wasmLoadError(dir, cause);
   }
 }
