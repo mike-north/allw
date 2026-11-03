@@ -357,6 +357,13 @@ check fails:
 - a registration already sent is withdrawn with the forgotten device's token (best effort);
 - the strip asks for a reload.
 
+One window remains. The checks read `localStorage`, and a browser can propagate another tab's change
+to it asynchronously when the tabs run in different processes. A check made in that gap still reads
+the old identity, so the strip can end "on" with the forgotten token back in the mirror. The relay
+side is still covered: the forget withdrew the registration and dropped the subscription, so the
+worker gets no pushes for that token. The leftover record is removed by the next load's forget or
+overwritten by a new pairing's mirror.
+
 **Files.** `scripts/build-site.mjs` bundles the worker to `sw.js` at the site root (a worker's scope
 can't be wider than its directory), and ships `manifest.webmanifest` (name, `start_url`,
 `display: "standalone"`, icons) plus `icons/`. `index.html` links the manifest and an
