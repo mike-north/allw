@@ -76,6 +76,7 @@ import {
   vapidConfigFromEnv,
   type VapidEnv,
 } from "./web-push.js";
+import { DEADLINE_SQL, deadlineOf } from "./request-deadline.js";
 import { accountSubPathSegments, resolveAccountRoute, routeParam } from "./routes.js";
 import { handleWellKnown, isWellKnownPath } from "./well-known.js";
 
@@ -623,12 +624,18 @@ export class AccountRelay implements DurableObject {
   private readonly sql: SqlStorage;
   private readonly ctx: DurableObjectState;
   private readonly pushTransports: PushTransportRegistry;
-  /** Request horizon: `expires_at - now` above this is refused at submit (#248). */
+  /**
+   * Request horizon: `expires_at - now` above this is refused at submit (#248), and a stored row's
+   * deadline is never later than `created_at + maxRequestTtlMs` ({@link deadlineOf}).
+   */
   private readonly maxRequestTtlMs: number;
   /**
-   * Clock for the submit limits, push-wakeup scheduling and Web Push TTL, and the expiry
-   * alarm/sweep. Tests replace it on the instance (via
-   * `runInDurableObject`) to probe exact boundaries; production always reads the real time.
+   * The relay's one clock (#292). Every time-dependent decision reads it: the request lifecycle
+   * (submit, delivery, expiry, retract, verdict acceptance), the alarm clamp, push-wakeup
+   * scheduling and the Web Push TTL, and the pairing, actor, account-state and push-token
+   * timestamps. Tests replace it on the instance (via `runInDurableObject`) to probe exact
+   * boundaries; production always reads the real time. It is the only `Date.now()` in the relay's
+   * Durable Object code.
    */
   private now: () => number = () => Date.now();
   /**
@@ -655,7 +662,7 @@ export class AccountRelay implements DurableObject {
       PUSH_COALESCE_MS,
       new DevicePushTokenClaimStore(this.sql),
     );
-    this.alarms = new AlarmMultiplexer(ctx.storage);
+    this.alarms = new AlarmMultiplexer(ctx.storage, () => this.now());
     // On reactivation, restore every alarm purpose from its persisted rows, in case the previous
     // isolate exited after a write but before the scheduled alarm was durably restored.
     this.ctx.waitUntil(this.armExpiryAlarm().then(() => this.armTrailingWakeupAlarm()));
@@ -885,9 +892,9 @@ export class AccountRelay implements DurableObject {
       UPDATE device_push_token SET token = lower(token)
       WHERE transport = 'apns' AND token <> lower(token);
     `);
-    // Pending requests by deadline. Every submit and trailing wakeup reads the latest pending
-    // deadline (latestPendingRequest), and the expiry alarm the earliest (armExpiryAlarm). Partial,
-    // so terminal rows awaiting the retention sweep cost nothing. Idempotent, like the
+    // Pending requests by `expires_at`. Lifecycle queries filter and order by the full deadline
+    // (`DEADLINE_SQL`), which this index cannot order by; it still narrows them to pending rows.
+    // Partial, so terminal rows awaiting the retention sweep cost nothing. Idempotent, like the
     // migrations above; it runs after them, so the columns it names always exist.
     this.sql.exec(
       `CREATE INDEX IF NOT EXISTS request_pending_by_expiry
@@ -1119,7 +1126,7 @@ export class AccountRelay implements DurableObject {
     const code = generatePairingCode();
     const pairingAuthToken = generateAuthToken();
     const pairingAuthTokenHash = await hashAuthToken(pairingAuthToken);
-    const now = Date.now();
+    const now = this.now();
 
     let jti: string;
     let jtiExpiresAt: number;
@@ -1241,14 +1248,14 @@ export class AccountRelay implements DurableObject {
     const authFailure = await this.authorizeStoredHash(request, pairing.auth_token_hash);
     if (authFailure) return authFailure;
     if (pairing.used !== 0) return json({ error: "pairing code already used" }, 409);
-    if (Date.now() > pairing.expires_at) {
+    if (this.now() > pairing.expires_at) {
       return json({ error: "pairing code expired" }, 410);
     }
 
     const deviceId = crypto.randomUUID();
     const deviceAuthToken = generateAuthToken();
     const deviceAuthTokenHash = await hashAuthToken(deviceAuthToken);
-    const now = Date.now();
+    const now = this.now();
     // Checked after the last await so the count and the inserts below are one atomic step.
     const pushTokenBudget = this.pushTokenBudgetFailure(pushTokens.length);
     if (pushTokenBudget) return pushTokenBudget;
@@ -1307,7 +1314,7 @@ export class AccountRelay implements DurableObject {
     }
 
     const label = optionalString(body, "label");
-    const now = Date.now();
+    const now = this.now();
 
     // Reject duplicates: actor_id must be unique (the caller controls the namespace).
     const existing = [
@@ -1483,7 +1490,7 @@ export class AccountRelay implements DurableObject {
       );
     }
 
-    const now = Date.now();
+    const now = this.now();
     const current = verified.filter((doc) => doc.sequence === highest).map((doc) => doc.stateJws);
     this.ctx.storage.transactionSync(() => {
       this.sql.exec(`DELETE FROM verified_account_state`);
@@ -1606,7 +1613,7 @@ export class AccountRelay implements DurableObject {
       }
     }
     const { remove, add } = diffPushTokenSet(current, desired);
-    const now = Date.now();
+    const now = this.now();
     this.ctx.storage.transactionSync(() => {
       for (const gone of remove) {
         this.sql.exec(
@@ -1666,14 +1673,7 @@ export class AccountRelay implements DurableObject {
     const authFailure = await this.authorizeStoredHash(request, device.auth_token_hash);
     if (authFailure) return authFailure;
 
-    const now = Date.now();
-    const pending = [
-      ...this.sql.exec<RequestRow>(
-        `SELECT request_id, envelope FROM request
-         WHERE status = 'pending' AND expires_at > ? ORDER BY created_at ASC`,
-        now,
-      ),
-    ];
+    const pending = this.livePendingRequests(this.now());
 
     const envelopes = pending.map((p) => JSON.parse(p.envelope) as unknown);
     return json({ envelopes });
@@ -1723,18 +1723,11 @@ export class AccountRelay implements DurableObject {
 
     if (shouldFlushOfflineQueue) {
       // Flush the offline queue: every still-live pending request, oldest first. Fail-closed: a
-      // request that expired while queued is excluded (`expires_at > now`), so a dead request is
-      // never re-pushed to a reconnecting device. (Submit fan-out needs no such guard —
-      // `handleSubmit` rejects an already-expired `expires_at`, so a freshly stored request is
-      // always future-dated.)
-      const now = Date.now();
-      const pending = [
-        ...this.sql.exec<RequestRow>(
-          `SELECT request_id, envelope FROM request
-           WHERE status = 'pending' AND expires_at > ? ORDER BY created_at ASC`,
-          now,
-        ),
-      ];
+      // request past its deadline while queued is excluded ({@link livePendingRequests}), so a dead
+      // request is never re-pushed to a reconnecting device. (Submit fan-out needs no such guard —
+      // `handleSubmit` rejects a request whose deadline has passed, so a freshly stored request is
+      // always live.)
+      const pending = this.livePendingRequests(this.now());
       for (const p of pending) {
         trySendJson(server, {
           type: "request",
@@ -1822,7 +1815,10 @@ export class AccountRelay implements DurableObject {
     }
 
     const now = this.now();
-    if (expiresAt <= now) return json({ error: "request already expired" }, 400);
+    // The row this submit would store: `created_at` is the relay's receipt time (see deadlineOf).
+    if (now >= deadlineOf({ created_at: now, expires_at: expiresAt }, this.maxRequestTtlMs)) {
+      return json({ error: "request already expired" }, 400);
+    }
     // Horizon: a far-future `expires_at` would otherwise keep a request pending (stored, counted,
     // shown to devices) indefinitely.
     if (expiresAt - now > this.maxRequestTtlMs) {
@@ -1900,7 +1896,8 @@ export class AccountRelay implements DurableObject {
   ): Promise<{ row: RequestRow; status: string } | Response> {
     const rows = [
       ...this.sql.exec<RequestRow>(
-        `SELECT request_id, status, expires_at, auth_token_hash FROM request WHERE request_id = ?`,
+        `SELECT request_id, status, created_at, expires_at, auth_token_hash FROM request
+         WHERE request_id = ?`,
         requestId,
       ),
     ];
@@ -1913,7 +1910,7 @@ export class AccountRelay implements DurableObject {
     if (authFailure) return authFailure;
     return {
       row: req,
-      status: this.expireIfDue(requestId, req.status, req.expires_at, Date.now()),
+      status: this.expireIfDue(req, this.now()),
     };
   }
 
@@ -2018,8 +2015,9 @@ export class AccountRelay implements DurableObject {
       claimedKeys.push(key);
       return true;
     });
-    // The just-stored request is pending, so the latest pending deadline is never before its own.
-    const wakeupExpiresAt = Math.max(expiresAt, this.latestPendingRequest(now)?.expires_at ?? 0);
+    // The just-stored request is pending, so the latest pending deadline is never before its own
+    // (stored with `created_at = now`, its deadline is `expiresAt`: submit refused anything later).
+    const wakeupExpiresAt = Math.max(expiresAt, this.latestPendingRequest(now)?.deadline ?? 0);
     this.startPushFanOut(tokens, claimedKeys, accountId, requestId, wakeupExpiresAt, now);
     return { scheduled: tokens.length, coalesced };
   }
@@ -2051,34 +2049,50 @@ export class AccountRelay implements DurableObject {
   }
 
   /**
-   * The pending, unexpired request with the latest deadline, or `undefined` if none. Its deadline
-   * is how long any wakeup stays useful: a wakeup leads to an inbox fetch that returns every pending
-   * request.
+   * The live pending request with the latest deadline ({@link deadlineOf}), or `undefined` if none.
+   * Its deadline is how long any wakeup stays useful: a wakeup leads to an inbox fetch that returns
+   * every live pending request.
    */
-  private latestPendingRequest(
-    now: number,
-  ): { request_id: string; expires_at: number } | undefined {
+  private latestPendingRequest(now: number): { request_id: string; deadline: number } | undefined {
     return [
-      ...this.sql.exec<{ request_id: string; expires_at: number }>(
-        `SELECT request_id, expires_at FROM request
-         WHERE status = 'pending' AND expires_at > ?
-         ORDER BY expires_at DESC LIMIT 1`,
+      ...this.sql.exec<{ request_id: string; deadline: number }>(
+        `SELECT request_id, ${DEADLINE_SQL} AS deadline FROM request
+         WHERE status = 'pending' AND ${DEADLINE_SQL} > ?
+         ORDER BY deadline DESC LIMIT 1`,
+        this.maxRequestTtlMs,
+        this.maxRequestTtlMs,
         now,
       ),
     ][0];
   }
 
-  /** `requestId` if it names a pending, unexpired request at `now`; otherwise `fallback`. */
+  /** `requestId` if it names a live pending request at `now` ({@link deadlineOf}); otherwise `fallback`. */
   private pendingRequestIdOr(requestId: string | null, now: number, fallback: string): string {
     if (requestId === null) return fallback;
     const live = [
       ...this.sql.exec(
-        `SELECT 1 FROM request WHERE request_id = ? AND status = 'pending' AND expires_at > ?`,
+        `SELECT 1 FROM request WHERE request_id = ? AND status = 'pending' AND ${DEADLINE_SQL} > ?`,
         requestId,
+        this.maxRequestTtlMs,
         now,
       ),
     ];
     return live.length > 0 ? requestId : fallback;
+  }
+
+  /**
+   * Every live pending request at `now` ({@link deadlineOf}), oldest first: what the device inbox
+   * returns and the reconnect flush sends.
+   */
+  private livePendingRequests(now: number): RequestRow[] {
+    return [
+      ...this.sql.exec<RequestRow>(
+        `SELECT request_id, envelope FROM request
+         WHERE status = 'pending' AND ${DEADLINE_SQL} > ? ORDER BY created_at ASC`,
+        this.maxRequestTtlMs,
+        now,
+      ),
+    ];
   }
 
   /** Point the `webpush-trailing-wakeup` alarm purpose at the earliest owed trailing wakeup, if any. */
@@ -2184,7 +2198,7 @@ export class AccountRelay implements DurableObject {
         batch.claimedKeys,
         accountId,
         requestId,
-        latest.expires_at,
+        latest.deadline,
         now,
       );
     }
@@ -2312,7 +2326,7 @@ export class AccountRelay implements DurableObject {
       return json({ request_id: requestId, status: "retracted" });
     }
 
-    const now = Date.now();
+    const now = this.now();
     this.sql.exec(
       `UPDATE request SET status = 'retracted', terminal_at = ?, envelope = ''
        WHERE request_id = ? AND status = 'pending'`,
@@ -2380,20 +2394,20 @@ export class AccountRelay implements DurableObject {
   }
 
   /**
-   * Fail-closed lazy expiry (contract §Invariants #6): if a `pending` request is past its
-   * `expires_at`, transition it to the terminal `expired` status. Returns the effective status so
-   * read paths report `expired` — never a perpetual `pending` — the first time anyone looks after
-   * the deadline. This shared transition also notifies live clients so a poll or late verdict cannot
-   * clear the alarm while leaving existing waiters/devices stuck on the stale pending request.
+   * Fail-closed lazy expiry (contract §Invariants #6): if a `pending` request has reached its
+   * deadline ({@link deadlineOf}), transition it to the terminal `expired` status. Returns the
+   * effective status so read paths report `expired` — never a perpetual `pending` — the first time
+   * anyone looks after the deadline. This shared transition also notifies live clients so a poll or
+   * late verdict cannot clear the alarm while leaving existing waiters/devices stuck on the stale
+   * pending request.
    */
   private expireIfDue(
-    requestId: string,
-    status: string,
-    expiresAt: number,
+    req: Pick<RequestRow, "request_id" | "status" | "created_at" | "expires_at">,
     now: number,
     options: { skipDeviceSocket?: WebSocket } = {},
   ): string {
-    if (status === "pending" && now > expiresAt) {
+    const { request_id: requestId, status } = req;
+    if (status === "pending" && now >= deadlineOf(req, this.maxRequestTtlMs)) {
       this.sql.exec(
         `UPDATE request SET status = 'expired', terminal_at = ?, envelope = ''
          WHERE request_id = ? AND status = 'pending'`,
@@ -2559,7 +2573,8 @@ export class AccountRelay implements DurableObject {
 
     const reqRows = [
       ...this.sql.exec<RequestRow>(
-        `SELECT request_id, envelope, status, expires_at FROM request WHERE request_id = ?`,
+        `SELECT request_id, envelope, status, created_at, expires_at FROM request
+         WHERE request_id = ?`,
         requestId,
       ),
     ];
@@ -2581,11 +2596,11 @@ export class AccountRelay implements DurableObject {
       return;
     }
 
-    // Fail-closed (contract §Invariants #6): a request past its deadline must NEVER become
-    // approvable. Transition pending→expired and refuse to record the verdict.
-    const now = Date.now();
-    if (req.status === "expired" || (req.status === "pending" && now > req.expires_at)) {
-      this.expireIfDue(requestId, req.status, req.expires_at, now, { skipDeviceSocket: ws });
+    // Fail-closed (contract §Invariants #6): a request at or past its deadline must NEVER become
+    // approvable. Transition pending→expired and refuse to record the verdict. The same `now` is
+    // the verdict's received/terminal time below, so acceptance and recording read one instant.
+    const now = this.now();
+    if (this.expireIfDue(req, now, { skipDeviceSocket: ws }) === "expired") {
       trySendJson(ws, { type: "ack", request_id: requestId, status: "expired" });
       return;
     }
@@ -2748,15 +2763,14 @@ export class AccountRelay implements DurableObject {
   }
 
   /**
-   * Point the `request-expiry` alarm purpose at the nearest pending deadline, or clear it when no
-   * pending request remains. A pending row's deadline is its `expires_at`, capped at
-   * `created_at + maxRequestTtlMs` so a row stored before the horizon existed (far-future
-   * `expires_at`) is still expired and swept.
+   * Point the `request-expiry` alarm purpose at the nearest pending deadline ({@link deadlineOf}),
+   * or clear it when no pending request remains. The horizon cap means a row stored before the
+   * horizon existed (far-future `expires_at`) is still expired and swept.
    */
   private async armExpiryAlarm(): Promise<void> {
     const next = [
       ...this.sql.exec<{ deadline: number }>(
-        `SELECT MIN(expires_at, created_at + ?) AS deadline FROM request
+        `SELECT ${DEADLINE_SQL} AS deadline FROM request
          WHERE status = 'pending' ORDER BY deadline ASC LIMIT 1`,
         this.maxRequestTtlMs,
       ),
@@ -2766,19 +2780,19 @@ export class AccountRelay implements DurableObject {
 
   /**
    * Mark every overdue pending request expired and return the rows that changed state. Overdue
-   * means past `expires_at`, or older than the horizon (`created_at + maxRequestTtlMs <= now`) —
-   * the latter only happens to rows stored before the horizon was enforced. Once expired, a row is
-   * removed by {@link sweepTerminalRows} after the retention window, so no pending row is stored
-   * forever.
+   * means at or past its deadline ({@link deadlineOf}): past `expires_at`, or older than the
+   * horizon — the latter only happens to rows stored before the horizon was enforced or lowered.
+   * Once expired, a row is removed by {@link sweepTerminalRows} after the retention window, so no
+   * pending row is stored forever.
    */
   private expirePendingDue(now: number): RequestRow[] {
     const overdue = [
       ...this.sql.exec<RequestRow>(
         `SELECT request_id, envelope, created_at, expires_at, status, terminal_at FROM request
-         WHERE status = 'pending' AND (expires_at <= ? OR created_at <= ?)
+         WHERE status = 'pending' AND ${DEADLINE_SQL} <= ?
          ORDER BY expires_at ASC`,
+        this.maxRequestTtlMs,
         now,
-        now - this.maxRequestTtlMs,
       ),
     ];
     for (const request of overdue) {
