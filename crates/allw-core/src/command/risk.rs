@@ -68,6 +68,9 @@
 //!   (a shell, a wrapper, a compound command, `eval`, or `cat`), and the higher tier wins. This is a
 //!   deliberate fail-upward rule: deciding which consumers run their input is a moving target
 //!   (`{ bash; } <<'EOF'`, `eval bash <<'EOF'`, …), and over-reading a body only raises the tier.
+//!   An open quote inside a heredoc body doesn't raise the tier on its own: a shell fed the body
+//!   stops at that syntax error before running anything after the quote, and everything before it
+//!   is still classified. So commit and PR bodies (`it's`, `don't`) keep their command's tier.
 //! - `((…))` at a command position (including `for ((…))`) is arithmetic: a `<<` inside it is a
 //!   shift, not a heredoc.
 //! - Any operator, substitution or redirection makes the line at least `Medium`. A line that ends
@@ -81,27 +84,32 @@
 //! - whether `$'…'` is an ANSI-C string (bash) or not (dash, `shlex`);
 //! - whether `((` opens an arithmetic command or two subshells;
 //! - whether a heredoc inside `$(…)` is read before the closing `)` (bash ≥ 4, zsh) or the first
-//!   `)` closes the substitution (bash 3.2, dash).
+//!   `)` closes the substitution (bash 3.2, dash);
+//! - whether a body line `EOF)` ends a heredoc inside `$(…)` and closes the substitution
+//!   (bash 5).
 //!
-//! Each alternate reading runs only when the line holds the syntax it is about, and only at the
-//! top level: nested `-c` strings, `eval` arguments and substitutions are read the bash way, so
-//! the readings don't multiply with depth. zsh-only syntax gets fail-upward handling only: its
-//! precommand words, and `&!` / `&|` as operators.
+//! Each alternate reading runs only when the line holds the syntax it is about, at every nesting
+//! level (a nested `dash -c` string gets dash's reading), charged to the shared budget. An
+//! alternate adds the commands its shell would run; the bash reading alone sets the open-quote
+//! floor. zsh-only syntax gets fail-upward handling only: its precommand words, and `&!` / `&|`
+//! as operators.
 //!
 //! # Bounds (all fail upward)
 //!
 //! - Nesting of `-c`, `eval` and substitutions past [`MAX_SHELL_NESTING`] levels: `High`.
 //! - Argv positions past [`MAX_PROGRAM_CANDIDATES`] are not analyzed. They count as a `High`
 //!   candidate for any wrapper, shell or assignment in front of them.
-//! - Before any budgeted work, an unbudgeted linear pre-pass records the tier of every visible
-//!   program word: each argv word, and the command word of every top-level segment.
+//! - Before any budgeted work, an unbudgeted pre-pass records the tier of every visible program
+//!   word: each argv word, and the command word of every segment, descending into substitutions,
+//!   backticks and heredoc bodies down to [`MAX_SHELL_NESTING`] levels. It scans each level's
+//!   text once, so it is linear for each level.
 //! - All analysis of one record shares one budget of [`MAX_RISK_WORK`] units (bytes scanned,
 //!   split or copied, plus argv positions classified). Exhausting it makes the record at least
-//!   `High`, and never lowers a tier already found: any program word visible at the top level
-//!   keeps its tier on exhaustion (a `dd` padded with megabytes after it stays `Critical`). Only
+//!   `High`, and never lowers a tier already found: any program word the pre-pass sees keeps its
+//!   tier on exhaustion (a `dd` or `$(dd)` padded with megabytes after it stays `Critical`). Only
 //!   text the analysis never reached falls back to `High`.
-//!   Every candidate string is analyzed once per level, and every look-ahead scan is linear, so
-//!   work grows linearly with input size.
+//!   Every look-ahead scan is linear and charged. Alternate readings can multiply with nesting
+//!   depth; the budget, not skipped readings, bounds that cost.
 //!
 //! # Known T1 limits (the tier can understate these)
 //!
@@ -208,7 +216,7 @@ pub(super) fn command_line_risk(line: &str, words: &[String]) -> Risk {
 fn line_and_words_risk(line: &str, words: &[String], budget: &mut Budget) -> Risk {
     note_visible_programs(Some(line), words, budget);
     let risk = classify_argv(words, 0, budget);
-    match shell_line_risk(line, 0, budget) {
+    match shell_line_risk(line, Source::CommandLine, 0, budget) {
         Some(line_risk) => max_risk(risk, line_risk),
         None => risk,
     }
@@ -431,10 +439,15 @@ fn flag_command_values(token: &str) -> Vec<&str> {
 /// Risk of `text` read as a command line nested one level below `depth`, or `None` when it holds
 /// no command. Past [`MAX_SHELL_NESTING`] it is [`Risk::High`] unread.
 fn command_string_risk(text: &str, depth: usize, budget: &mut Budget) -> Option<Risk> {
+    script_risk(text, Source::CommandLine, depth, budget)
+}
+
+/// [`command_string_risk`] for text from `source`, one nesting level below `depth`.
+fn script_risk(text: &str, source: Source, depth: usize, budget: &mut Budget) -> Option<Risk> {
     if depth >= MAX_SHELL_NESTING {
         return Some(Risk::High);
     }
-    shell_line_risk(text, depth + 1, budget)
+    shell_line_risk(text, source, depth + 1, budget)
 }
 
 /// The table's tier for the command starting at `argv[j]`. Only `rm` / `git` / `chmod` read their
@@ -610,8 +623,8 @@ fn classify_argv(argv: &[String], depth: usize, budget: &mut Budget) -> Risk {
 // ── Shell-line scanning ───────────────────────────────────────────────────────
 
 /// How the scanner reads the places where shells (or tokenizers, or bash versions) disagree. The
-/// bash ≥ 4 reading ([`Reading::BASH`]) is authoritative; the others are analyzed only for the
-/// top-level line, only when it holds the ambiguous syntax, and can only raise the tier.
+/// bash ≥ 4 reading ([`Reading::BASH`]) is authoritative; the others are analyzed at every
+/// nesting level, only when the line holds the ambiguous syntax, and can only raise the tier.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Reading {
     /// An unquoted `#` at the start of a word starts a comment that runs to the end of the line.
@@ -625,6 +638,10 @@ struct Reading {
     /// A heredoc inside `$(…)` is read as a heredoc, so a `)` in its body doesn't close the
     /// substitution (bash ≥ 4, zsh). Otherwise the first unquoted `)` closes it (bash 3.2, dash).
     heredocs_in_substitutions: bool,
+    /// Inside `$(…)`, a body line that starts with the delimiter followed by `)` ends the heredoc,
+    /// and that `)` closes the substitution (bash 5 accepts `EOF)` with a warning). Off in bash 4
+    /// and zsh, where only a line equal to the delimiter ends it.
+    heredoc_ends_before_paren: bool,
 }
 
 impl Reading {
@@ -633,7 +650,27 @@ impl Reading {
         ansi_c_quotes: true,
         arithmetic_commands: true,
         heredocs_in_substitutions: true,
+        heredoc_ends_before_paren: false,
     };
+}
+
+/// Where a line handed to [`shell_line_risk`] comes from, which decides how an open quote at its
+/// end counts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Source {
+    /// A command line, `-c` string, `eval` argument, here-string, or substitution in the bash
+    /// reading: an open quote at the end hides what follows it, so the line is at least High.
+    CommandLine,
+    /// A heredoc body read as a script (the always-a-script rule). A shell fed this body stops at
+    /// the syntax error before running anything after the open quote, and everything before it is
+    /// still classified, so an open quote alone doesn't raise the tier. This keeps ordinary
+    /// commit and PR bodies (`it's`, `don't`) at the tier of the command that consumes them.
+    HeredocBody,
+    /// A substitution as an alternate [`Reading`] delimits it. The bash reading already applies
+    /// its own floors; an alternate only adds the commands its shell would run, and that shell
+    /// stops at an open quote. (bash 3.2 reads `"$(cat <<'EOF'`⏎`it's`⏎`EOF`⏎`)"` as an
+    /// unterminated quote and runs nothing.)
+    AlternateSubstitution,
 }
 
 /// A heredoc whose body begins at the next unquoted newline.
@@ -650,13 +687,18 @@ struct ShellLine<'a> {
     segments: Vec<&'a str>,
     /// Bodies of command and process substitutions, each a command line of its own.
     substitutions: Vec<&'a str>,
+    /// Substitutions inside unquoted heredoc bodies. They are also inside [`ShellLine::heredocs`],
+    /// so the lexical pre-pass doesn't descend into them twice.
+    body_substitutions: Vec<&'a str>,
     /// Heredoc bodies. Each is always also classified as a script, whatever reads it.
     heredocs: Vec<&'a str>,
     /// Any operator, substitution or redirection: shell syntax beyond plain words.
     has_shell_syntax: bool,
-    /// The line ends inside an open quote, substitution or backtick, or holds syntax T1 can't
-    /// read for sure (an uncertain heredoc delimiter). Either way the line is at least High.
+    /// The line ends inside an open substitution or backtick, or holds syntax T1 can't read for
+    /// sure (an uncertain heredoc delimiter). Either way the line is at least High.
     unterminated: bool,
+    /// The line ends inside an open quote (`'`, `"` or `$'`). See [`Source`] for how it counts.
+    open_quote: bool,
     /// The line holds an unquoted `#` at a word start (the comment reading is ambiguous).
     saw_comment: bool,
     /// The line holds an unquoted `$'` (the ANSI-C reading is ambiguous).
@@ -744,6 +786,13 @@ fn find_closing_paren(b: &[u8], start: usize, reading: Reading) -> Option<usize>
             b'\n' if !in_double && !pending.is_empty() => {
                 let mut pos = i + 1;
                 for heredoc in pending.drain(..) {
+                    if reading.heredoc_ends_before_paren {
+                        if let Some(paren) = heredoc_end_before_paren(b, pos, &heredoc) {
+                            // bash 5: the body ends, and the `)` is read as syntax again.
+                            pos = paren;
+                            break;
+                        }
+                    }
                     pos = consume_heredoc(b, pos, &heredoc).1;
                 }
                 i = pos;
@@ -929,6 +978,32 @@ fn consume_heredoc(b: &[u8], pos: usize, heredoc: &PendingHeredoc) -> (usize, us
     (b.len(), b.len())
 }
 
+/// For a heredoc inside `$(…)` read the bash 5 way: the index of the `)` on the first body line
+/// that starts with the delimiter followed by `)`, if that line comes before one equal to the
+/// delimiter. bash 5 ends the body there and reads the `)` as closing the substitution.
+fn heredoc_end_before_paren(b: &[u8], pos: usize, heredoc: &PendingHeredoc) -> Option<usize> {
+    let mut line_start = pos;
+    while line_start < b.len() {
+        let line_end = find_byte(b, line_start, b'\n').unwrap_or(b.len());
+        let mut start = line_start;
+        if heredoc.strip_tabs {
+            while b.get(start) == Some(&b'\t') && start < line_end {
+                start += 1;
+            }
+        }
+        let line = &b[start..line_end];
+        if line == heredoc.delimiter.as_slice() {
+            return None;
+        }
+        if line.starts_with(&heredoc.delimiter) && line.get(heredoc.delimiter.len()) == Some(&b')')
+        {
+            return Some(start + heredoc.delimiter.len());
+        }
+        line_start = line_end + 1;
+    }
+    None
+}
+
 /// The command substitutions in an unquoted heredoc body. Quotes are literal there; only `$(…)`,
 /// backticks and backslash escapes are special.
 fn heredoc_substitutions<'a>(body: &'a str, reading: Reading, out: &mut Vec<&'a str>) -> bool {
@@ -999,7 +1074,7 @@ fn scan_shell_line(text: &str, reading: Reading) -> ShellLine<'_> {
                 match find_byte(b, i + 1, b'\'') {
                     Some(q) => i = q + 1,
                     None => {
-                        line.unterminated = true;
+                        line.open_quote = true;
                         i = b.len();
                     }
                 }
@@ -1011,7 +1086,7 @@ fn scan_shell_line(text: &str, reading: Reading) -> ShellLine<'_> {
                     match skip_ansi_c_string(b, i + 2) {
                         Some(end) => i = end,
                         None => {
-                            line.unterminated = true;
+                            line.open_quote = true;
                             i = b.len();
                         }
                     }
@@ -1125,7 +1200,7 @@ fn scan_shell_line(text: &str, reading: Reading) -> ShellLine<'_> {
                     let (end, next) = consume_heredoc(b, pos, &heredoc);
                     let body = &text[pos..end];
                     if !heredoc.quoted
-                        && heredoc_substitutions(body, reading, &mut line.substitutions)
+                        && heredoc_substitutions(body, reading, &mut line.body_substitutions)
                     {
                         line.unterminated = true;
                     }
@@ -1142,9 +1217,7 @@ fn scan_shell_line(text: &str, reading: Reading) -> ShellLine<'_> {
     }
     line.segments
         .push(text.get(seg_start..).unwrap_or_default());
-    if in_double {
-        line.unterminated = true;
-    }
+    line.open_quote |= in_double;
     line
 }
 
@@ -1571,14 +1644,19 @@ fn reading_risk(
     for segment in &line.segments {
         tier = raise_opt(tier, segment_risk(segment, depth, reading, budget));
     }
-    for body in &line.substitutions {
-        tier = raise_opt(tier, command_string_risk(body, depth, budget));
+    let substitution_source = if reading == Reading::BASH {
+        Source::CommandLine
+    } else {
+        Source::AlternateSubstitution
+    };
+    for body in line.substitutions.iter().chain(&line.body_substitutions) {
+        tier = raise_opt(tier, script_risk(body, substitution_source, depth, budget));
     }
     // A heredoc body is always also read as a script (deliberate fail-upward rule): whatever
     // consumes it may be a shell, directly or through a compound command, `eval` or a wrapper.
     // Over-counting a body that is only data (`cat <<EOF`) can only raise the tier.
     for body in &line.heredocs {
-        tier = raise_opt(tier, command_string_risk(body, depth, budget));
+        tier = raise_opt(tier, script_risk(body, Source::HeredocBody, depth, budget));
     }
     if line.has_shell_syntax {
         tier = raise(tier, Risk::Medium);
@@ -1622,30 +1700,36 @@ fn alternate_readings(text: &str, primary: &ShellLine<'_>) -> Vec<Reading> {
             ..bash
         });
     }
+    if text.contains("<<") && text.contains("$(") {
+        alternates.push(Reading {
+            heredoc_ends_before_paren: true,
+            ..bash
+        });
+    }
     alternates
 }
 
 /// Risk of every command a shell would run for `text`, or `None` when it runs nothing. See the
-/// module doc § Command lines. Alternate readings are analyzed for the top-level line only
-/// (`depth == 0`), so they can't multiply at every nesting level.
-fn shell_line_risk(text: &str, depth: usize, budget: &mut Budget) -> Option<Risk> {
+/// module doc § Command lines. Every alternate reading the line calls for is analyzed at every
+/// nesting level, charged to the shared budget: a nested `dash -c` string gets dash's reading
+/// too. The budget, not skipped readings, bounds the cost, and [`note_visible_programs`] keeps
+/// the visible tiers if it runs out.
+fn shell_line_risk(text: &str, source: Source, depth: usize, budget: &mut Budget) -> Option<Risk> {
     if !budget.spend(text.len()) {
         return Some(Risk::High);
     }
     let primary = scan_shell_line(text, Reading::BASH);
     let mut tier = reading_risk(&primary, depth, Reading::BASH, budget);
-    if primary.unterminated {
+    if primary.unterminated || (primary.open_quote && source == Source::CommandLine) {
         // The shell runs what precedes the syntax error, and what follows can't be read.
         tier = raise(tier, Risk::High);
     }
-    if depth == 0 {
-        for reading in alternate_readings(text, &primary) {
-            if !budget.spend(text.len()) {
-                break;
-            }
-            let line = scan_shell_line(text, reading);
-            tier = raise_opt(tier, reading_risk(&line, depth, reading, budget));
+    for reading in alternate_readings(text, &primary) {
+        if !budget.spend(text.len()) {
+            break;
         }
+        let line = scan_shell_line(text, reading);
+        tier = raise_opt(tier, reading_risk(&line, depth, reading, budget));
     }
     if budget.exhausted {
         // Keep what was found; what wasn't read counts as High.
@@ -1656,21 +1740,28 @@ fn shell_line_risk(text: &str, depth: usize, budget: &mut Budget) -> Option<Risk
 
 // ── Lexical pre-pass ──────────────────────────────────────────────────────────
 
-/// Record, before any budgeted work, the program-table tier of every program word visible at
-/// the top level: every word of `words` (the line's `shlex` split, or the argv), and the command
-/// word of every segment of `line` in the bash reading. The pass is linear and isn't charged.
-/// Its tiers are only read if the budget runs out, so a `dd` the line plainly runs keeps its
-/// tier however much padding follows it. Counting a word that turns out not to run (`echo dd`)
-/// can only raise the tier.
+/// Record, before any budgeted work, the program-table tier of every program word visible in the
+/// text: every word of `words` (the line's `shlex` split, or the argv), and the command word of
+/// every segment of `line` in the bash reading, descending into substitutions, backticks and
+/// heredoc bodies down to [`MAX_SHELL_NESTING`] levels. The pass isn't charged; each level scans
+/// its text once, so it is linear for each level. Its tiers are only read if the budget runs out,
+/// so a `dd` the line plainly runs, at the top level or in a `$(dd)`, keeps its tier however much
+/// padding follows it. Counting a word that turns out not to run (`echo dd`) can only raise the
+/// tier.
 fn note_visible_programs(line: Option<&str>, words: &[String], budget: &mut Budget) {
     for word in words {
         budget.note(classify_program(word, &[], &[]));
     }
-    let Some(line) = line else {
-        return;
-    };
+    if let Some(line) = line {
+        note_line_programs(line, 0, budget);
+    }
+}
+
+/// The [`note_visible_programs`] pass over one line at nesting `depth`.
+fn note_line_programs(text: &str, depth: usize, budget: &mut Budget) {
     let mut unlimited = Budget::new(usize::MAX);
-    for segment in scan_shell_line(line, Reading::BASH).segments {
+    let line = scan_shell_line(text, Reading::BASH);
+    for segment in &line.segments {
         let unquoted: Vec<Word> = raw_words(segment, Reading::BASH)
             .iter()
             .map(|w| unquote_word(w, Reading::BASH, &mut unlimited))
@@ -1686,6 +1777,13 @@ fn note_visible_programs(line: Option<&str>, words: &[String], budget: &mut Budg
                 ));
             }
         }
+    }
+    if depth >= MAX_SHELL_NESTING {
+        return;
+    }
+    // Substitutions inside heredoc bodies are reached through the bodies themselves.
+    for nested in line.substitutions.iter().chain(&line.heredocs) {
+        note_line_programs(nested, depth + 1, budget);
     }
 }
 
