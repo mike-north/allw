@@ -130,8 +130,27 @@ return the core's `action_from_argv` / `action_from_command` record unchanged. `
 record into a full request. By default it sets `actor: { id: "machine:<hostname>", kind: "script" }`,
 `reversible: false` and `cwd: process.cwd()` (an explicit `cwd: null` leaves the record unbound). It copies the
 record's `risk` into the request's top-level `risk`, which the caller cannot override. A command line is only split
-into words: shell operators, substitutions and newlines are not parsed and the record describes only the first
-program, so callers must run `argv` without a shell.
+into words: shell operators, substitutions and newlines are not parsed into the record's fields, and `bin` /
+`argv` describe the word list (the first program). So callers must run `argv` without a shell.
+
+**Risk on a command line covers every command the shell would run** (#272). `action_from_command` scans the raw line
+as a POSIX shell would:
+
+- Each segment between unquoted control operators (`&&`, `||`, `;`, `|`, `&`, `(`, `)`, a newline) is
+  classified.
+- Each substitution (`$(…)`, backticks, `<(…)`) is classified, and so are `eval`'s arguments.
+- The line is at least `medium` when any operator, substitution or redirection appears.
+
+So `ls && rm -rf /` is `high`, and `echo hi > f` is `medium`. Quoted or escaped syntax is literal. Where readings
+can differ (comments, bash `$'…'` strings), the higher tier wins.
+
+Risk is a hint to the human; policy never reads it. Two things are deliberately **not** changed:
+
+- `bin` / `argv` / `flags` / `positionals`.
+- Policy matching. A `{ bin: "ls" }` any-args allow rule still matches `ls && rm -rf /`. Making the matcher fail
+  closed on compound lines is an open policy-seam decision (#272).
+
+`action_from_argv` records an argv run without a shell, so its words are never read as shell syntax.
 
 ### Forward-compat requirements on `allw-core` v1 (cheap now, painful later)
 
