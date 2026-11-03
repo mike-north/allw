@@ -1,11 +1,12 @@
 import {
+  joinToolIdentity,
   quoteToken,
   reconstructCommand,
   renderArgv,
   renderList,
   toolIdentity,
 } from "./command-line.js";
-export { toolIdentity } from "./command-line.js";
+export { TOOL_MISSING, toolIdentity } from "./command-line.js";
 
 export type { AllwWasm, WasmModuleSource } from "./wasm.js";
 export { initWasm, initWasmSync, resetWasmForTests } from "./wasm.js";
@@ -643,8 +644,9 @@ export const NO_ACTION_FIELDS_HEADLINE = "(no command, tool, or file-edit fields
  * (`renderActionHeadline` in `packages/approver/src/lib/render.ts`), and both are checked against
  * the shared fixture `test/fixtures/action-headline.json`.
  *
- * 1. A tool surface with a `tool`: its {@link toolIdentity}. Its `raw` is shown as the caller's
- *    description, and any command form it also carries is shown with a warning.
+ * 1. A tool surface naming a `tool` or a `server`: its {@link toolIdentity} (`server :: (tool
+ *    missing)` when there is no tool). Its `raw` is shown as the caller's description, and any
+ *    command form it also carries is shown with a warning.
  * 2. When raw and argv diverge: the hash-bound argv form, never the possibly benign `raw` (the card
  *    then shows a warning and both forms).
  * 3. A file edit: its diff summary, else `operation paths`.
@@ -668,7 +670,7 @@ export function actionSummary(context: ApprovalContext): string {
   if (s.raw !== undefined) return s.raw;
   const reconstructed = reconstructCommand(s);
   if (reconstructed !== undefined) return reconstructed;
-  if (s.tool !== undefined) return s.server !== undefined ? `${s.server} :: ${s.tool}` : s.tool;
+  if (s.tool !== undefined) return joinToolIdentity(s.server, s.tool) ?? s.tool;
   return fileEdit ?? s.paramsJson ?? NO_ACTION_FIELDS_HEADLINE;
 }
 
@@ -689,7 +691,7 @@ export function exactPlaintext(context: ApprovalContext): string {
     s.server !== undefined &&
     s.tool !== undefined;
   if (toolCallFirst) {
-    lines.push(`${context.kind}: ${s.server ?? ""} :: ${s.tool ?? ""}`);
+    lines.push(`${context.kind}: ${joinToolIdentity(s.server, s.tool) ?? ""}`);
   }
   const operationFirst = context.kind === "file_edit" && s.operation !== undefined;
   if (operationFirst) lines.push(`file_edit: ${s.operation ?? ""}`);

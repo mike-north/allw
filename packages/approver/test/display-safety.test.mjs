@@ -37,6 +37,7 @@ import {
   HIDDEN_CHARS_WARNING,
   RAW_ARGV_DIVERGENCE_WARNING,
   TOOL_COMMAND_FORM_WARNING,
+  TOOL_MISSING,
   WRAP_MARKER,
   rawDivergesFromArgv,
   reconstructCommand,
@@ -203,7 +204,7 @@ test("summary, argv, flags, chain and MCP params are escaped", async () => {
   assert.doesNotMatch(rendered, RAW_BIDI_OR_INVISIBLE);
   assert.match(rendered, /Summary:\s+safe\\roverwritten/);
   assert.match(rendered, /Chain:\s+'gate\\x1b'/, "list items are quoted at their boundary");
-  assert.match(rendered, /MCP:\s+fs :: write⟨U\+2066⟩/);
+  assert.match(rendered, /MCP:\s+fs :: 'write⟨U\+2066⟩'/);
   assert.ok(rendered.includes(`Params:     {"path":"/tmp/⟨U+202E⟩txt.exe"}`));
   assert.ok(rendered.includes("Flags:      '--x\\r'"), "escaped token is quoted at its boundary");
 });
@@ -522,9 +523,15 @@ test("UAT: `watch` stdout/stderr bytes carry no raw ESC/CR for the #246 spoof", 
 test("UAT: `watch` heads an OpenClaw tool call with its tool and flags its command form (#321)", async () => {
   // An OpenClaw plugin permission request: `raw` is the plugin's own description, and the record
   // also carries a hash-bound argv. The human must see the tool as the action, the description
-  // labelled as such, and a warning about the command, right above the prompt.
+  // labelled as such, and the command plus a warning about it right above the prompt. The params
+  // are agent-controlled and printed in full, so 120 keys push the block's own Argv row more than
+  // a screen above the prompt: the command must be repeated at the decision point.
   const dir = mkdtempSync(join(tmpdir(), "allw-tool-headline-uat-"));
   try {
+    const params = {};
+    for (let i = 0; i < 120; i++)
+      params[`key_${String(i)}`] =
+        `value number ${String(i)} padded to be long enough to wrap the row`;
     const contextFile = join(dir, "context.json");
     writeFileSync(
       contextFile,
@@ -538,6 +545,7 @@ test("UAT: `watch` heads an OpenClaw tool call with its tool and flags its comma
               tool: "deploy_service",
               raw: "This plugin wants to deploy to production.",
               argv: ["rm", "-rf", "/srv"],
+              params,
             },
             risk: "critical",
           },
@@ -557,14 +565,19 @@ test("UAT: `watch` heads an OpenClaw tool call with its tool and flags its comma
     const beforePrompt = text.slice(0, promptAt).split("\n");
     assert.ok(beforePrompt.includes("  Action:     deploy-plugin :: deploy_service"));
     assert.ok(beforePrompt.includes("  Description: This plugin wants to deploy to production."));
-    assert.ok(beforePrompt.includes("  Argv:       rm -rf /srv"), "the command form is shown");
     assert.ok(!beforePrompt.some((l) => l.startsWith("  Action:     This plugin")));
+    // The block's own Argv row is far above the prompt, behind the wrapped params.
+    const bodyArgvAt = beforePrompt.indexOf("  Argv:       rm -rf /srv");
+    assert.ok(bodyArgvAt >= 0, "the command form is shown in the block");
+    assert.ok(beforePrompt.length - bodyArgvAt > 100, "the params push the block's Argv row away");
+    // The decision point: the tool, then the command, then the warning, then the prompt.
     assert.equal(
       beforePrompt.at(-2),
       TOOL_COMMAND_FORM_WARNING,
       "warning is the line above the prompt",
     );
-    assert.equal(beforePrompt.at(-3), "  Deciding on: deploy-plugin :: deploy_service");
+    assert.equal(beforePrompt.at(-3), "  Argv:       rm -rf /srv", "the command is at the prompt");
+    assert.equal(beforePrompt.at(-4), "  Deciding on: deploy-plugin :: deploy_service");
     assert.ok(
       !text.includes(RAW_ARGV_DIVERGENCE_WARNING),
       "a description is never a divergent raw",
@@ -785,7 +798,8 @@ test("the Action and Deciding on lines match the shared CLI/web headline fixture
       "utf8",
     ),
   );
-  assert.equal(fixture.cases.length, 15);
+  assert.equal(fixture.cases.length, 20);
+  const blocks = new Map();
   for (const [i, c] of fixture.cases.entries()) {
     const ctx = context({
       action: {
@@ -797,6 +811,11 @@ test("the Action and Deciding on lines match the shared CLI/web headline fixture
     });
     const { rendered } = await render(ctx, `req-headline-${String(i)}`);
     const lines = unwrap(rendered).split("\n");
+    // Everything but the request id and hash, for the `distinct_from` comparison below.
+    blocks.set(
+      c.name,
+      lines.filter((l) => !/^ {2}(Request:|request_hash)/.test(l)),
+    );
     assert.ok(lines.includes(`  Action:     ${c.headline}`), `${c.name}: Action line`);
     assert.ok(lines.includes(`  Deciding on: ${c.heading}`), `${c.name}: Deciding on line`);
     // On a tool surface the caller's raw is a labelled description, never the headline (#321).
@@ -812,6 +831,39 @@ test("the Action and Deciding on lines match the shared CLI/web headline fixture
     );
     if (c.tool_command_form === true) {
       assert.ok(!lines.includes(RAW_ARGV_DIVERGENCE_WARNING), `${c.name}: no divergence warning`);
+      // The command is repeated directly under the tool identity at the decision point.
+      const decidingAt = lines.indexOf(`  Deciding on: ${c.heading}`);
+      assert.ok(lines[decidingAt + 1].startsWith("  Argv:       "), `${c.name}: Argv at decision`);
     }
+  }
+  // Two records that differ only in how a name splits into server and tool must not look alike.
+  for (const c of fixture.cases) {
+    if (c.distinct_from === undefined) continue;
+    assert.ok(blocks.has(c.distinct_from), `${c.name}: names a real case`);
+    assert.notDeepEqual(blocks.get(c.name), blocks.get(c.distinct_from), `${c.name}: distinct`);
+  }
+});
+
+test("a tool call with a server and no tool always shows its server (#332 review)", async () => {
+  // The server is hash-bound. With no tool, the headline is the missing-tool marker and raw stays
+  // the description; the server's own row is shown too, on both tool surfaces.
+  for (const [surface, label] of [
+    ["mcp_tool_call", "  MCP:        "],
+    ["agent_tool_call", "  Agent/plugin: "],
+  ]) {
+    const ctx = context({
+      action: {
+        record_schema_version: 1,
+        surface,
+        syntactic: { server: "fs", raw: "fs :: read_file", params: { path: "/etc/shadow" } },
+        risk: "high",
+      },
+    });
+    const { rendered } = await render(ctx, `req-server-only-${surface}`);
+    const lines = unwrap(rendered).split("\n");
+    assert.ok(lines.includes(`  Action:     fs :: ${TOOL_MISSING}`), `${surface}: Action`);
+    assert.ok(lines.includes("  Description: fs :: read_file"), `${surface}: Description`);
+    assert.ok(lines.includes(`${label}fs :: ${TOOL_MISSING}`), `${surface}: server row`);
+    assert.ok(lines.includes(`  Deciding on: fs :: ${TOOL_MISSING}`), `${surface}: Deciding on`);
   }
 });

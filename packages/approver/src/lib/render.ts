@@ -29,8 +29,9 @@
  * screen before the human answers. So the block ends with a one-line escaped headline and, when the
  * model reports hidden/control characters, the warning — the last lines printed before the prompt.
  * When `raw` and the hash-bound argv diverge, that headline is the argv form, followed by a
- * divergence warning.
- * The warning is also printed directly under the header.
+ * divergence warning. When a tool call (which heads with its tool identity) also carries a
+ * hash-bound command, that command follows the headline on its own `Argv:` row, then a warning.
+ * The hidden-character warning is also printed directly under the header.
  */
 
 import type { RenderableRequest } from "./approver-core.js";
@@ -184,16 +185,54 @@ export function rawDivergesFromArgv(action: ActionRecord): boolean {
 }
 
 /**
- * The tool identity a tool-surface record heads with: `server :: tool`, or the tool alone. It is
- * `undefined` on any other surface, or when the record has no `tool`. A `.` join would make server
- * `fs.delete` + tool `x` look like server `fs` + tool `delete.x`, hence `::`.
+ * Shown in place of the tool when a record names a `server` but no `tool`: `fs :: (tool missing)`.
+ * A real tool literally named `(tool missing)` contains a space, so it is always shown quoted
+ * ({@link quoteIdentityPart}) and can't pass for this marker.
+ */
+export const TOOL_MISSING = "(tool missing)";
+
+/**
+ * Quote one half of a `server :: tool` identity so the split between the two stays visible. A half
+ * is shown bare only when it is printable ASCII, contains no `::`, and {@link quoteToken} would
+ * leave it bare (no whitespace, quote or shell metacharacter). Anything else, including any
+ * non-ASCII text (which could hold a lookalike of the ` :: ` separator), is single-quoted, so
+ * server `fs :: read_file` + tool `delete_all` shows as `'fs :: read_file' :: delete_all`, never
+ * like server `fs` + tool `read_file :: delete_all` (`fs :: 'read_file :: delete_all'`).
+ */
+function quoteIdentityPart(part: string): string {
+  if (/^[\x21-\x7e]+$/.test(part) && !part.includes("::")) return quoteToken(part);
+  return `'${part.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * The `server :: tool` identity of whichever tool-call fields a record carries, each half quoted by
+ * {@link quoteIdentityPart}: the tool alone when there is no server, `server :: (tool missing)`
+ * when there is no tool, `undefined` when there is neither. The web approver applies the same rule
+ * (`packages/web-approver/src/command-line.ts`).
+ */
+function joinToolIdentity(
+  server: string | undefined,
+  tool: string | undefined,
+): string | undefined {
+  if (tool === undefined) {
+    return server !== undefined ? `${quoteIdentityPart(server)} :: ${TOOL_MISSING}` : undefined;
+  }
+  const quotedTool = quoteIdentityPart(tool);
+  return server !== undefined ? `${quoteIdentityPart(server)} :: ${quotedTool}` : quotedTool;
+}
+
+/**
+ * The tool identity a tool-surface record heads with: `server :: tool`, the tool alone, or
+ * `server :: (tool missing)` ({@link joinToolIdentity}). It is `undefined` on any other surface, or
+ * when the record names neither a server nor a tool. A `.` join would make server `fs.delete` +
+ * tool `x` look like server `fs` + tool `delete.x`, hence `::`, with each half quoted when it could
+ * blur the split.
  */
 export function toolIdentity(display: DisplayModel): string | undefined {
   const isToolSurface =
     display.surface === "mcp_tool_call" || display.surface === "agent_tool_call";
-  const { server, tool } = display.syntactic;
-  if (!isToolSurface || tool === undefined) return undefined;
-  return server !== undefined ? `${server} :: ${tool}` : tool;
+  if (!isToolSurface) return undefined;
+  return joinToolIdentity(display.syntactic.server, display.syntactic.tool);
 }
 
 /**
@@ -209,9 +248,10 @@ export function toolIdentity(display: DisplayModel): string | undefined {
  *   `argv` does not already lead with it — the human must never see args without the program they
  *   belong to (per `docs/policy-seam.md`, `bin` and `argv` are distinct substrate fields).
  *
- * On a tool surface (`mcp_tool_call`, `agent_tool_call`) with a `tool`, the headline is the tool
- * identity ({@link toolIdentity}): there `raw` is the caller's description of the call (OpenClaw's
- * plugin text), not the action, so it is shown on its own labelled `Description:` line instead.
+ * On a tool surface (`mcp_tool_call`, `agent_tool_call`) naming a `tool` or a `server`, the headline
+ * is the tool identity ({@link toolIdentity}; `server :: (tool missing)` when there is no tool):
+ * there `raw` is the caller's description of the call (OpenClaw's plugin text), not the action, so
+ * it is shown on its own labelled `Description:` line instead.
  * Otherwise `raw` (the agent's original string form) is preferred when present; then we
  * reconstruct from `bin`/`argv`; then a `server :: tool` headline; then the compact params JSON so
  * nothing is ever silently dropped. The web approver uses the same rule, and both are checked
@@ -243,10 +283,8 @@ export function renderActionHeadline(display: DisplayModel): string {
   const reconstructed = reconstructCommand(s);
   if (reconstructed !== undefined) return reconstructed;
 
-  // MCP / agent_tool_call headline when there is no command form and no `raw`: "server :: tool".
-  if (s.tool !== undefined) {
-    return s.server !== undefined ? `${s.server} :: ${s.tool}` : s.tool;
-  }
+  // A stray tool on another surface, when there is no command form and no `raw`: "server :: tool".
+  if (s.tool !== undefined) return joinToolIdentity(s.server, s.tool) ?? s.tool;
 
   // File-edit headline when no raw summary is present: "patch src/app.ts".
   if (s.operation !== undefined && s.paths !== undefined && s.paths.length > 0) {
@@ -301,16 +339,20 @@ function substrateDetailLines(action: ActionRecord, display: DisplayModel): stri
 
   // Server/tool are hash-bound but were rendered on NO line when a `raw` headline ran — so a
   // benign `raw` ("echo hello") could mask a dangerous `fs :: delete_all_files`. Surface them on an
-  // unconditional labeled line whenever both are present (mirrors the command-surface fix; #56).
-  // The label distinguishes an actual MCP tool call from an `agent_tool_call` (a harness/plugin
-  // gating a tool call itself, not an MCP server — `docs/openclaw-integration.md` §5.2) so the
-  // human is never told a plugin-owned action is an MCP call it never was.
-  if (s.server !== undefined && s.tool !== undefined) {
-    lines.push(
+  // unconditional labeled line whenever either is present (mirrors the command-surface fix; #56),
+  // so a `server` with no `tool` is shown too. The label distinguishes an actual MCP tool call from
+  // an `agent_tool_call` (a harness/plugin gating a tool call itself, not an MCP server —
+  // `docs/openclaw-integration.md` §5.2) so the human is never told a plugin-owned action is an
+  // MCP call it never was; on any other surface the fields are named for what they are.
+  const identity = joinToolIdentity(s.server, s.tool);
+  if (identity !== undefined) {
+    const label =
       display.surface === "agent_tool_call"
-        ? `  Agent/plugin: ${s.server} :: ${s.tool}`
-        : `  MCP:        ${s.server} :: ${s.tool}`,
-    );
+        ? "Agent/plugin:"
+        : display.surface === "mcp_tool_call"
+          ? "MCP:       "
+          : "Server/tool:";
+    lines.push(`  ${label} ${identity}`);
   }
 
   // MCP params are the entire call payload — show them in full (compact JSON), never elided.
@@ -373,10 +415,12 @@ export const RAW_ARGV_DIVERGENCE_WARNING =
 
 /**
  * Printed directly above the prompt when a tool-surface record, which heads with its tool identity,
- * also carries a hash-bound command form (`bin`/`argv`). The `Argv:` line in the block shows it.
+ * also carries a hash-bound command form (`bin`/`argv`). The command itself is repeated as an
+ * `Argv:` row directly under `Deciding on:`, so it is on screen at the decision point however far
+ * the block's own `Argv:` row has scrolled.
  */
 export const TOOL_COMMAND_FORM_WARNING =
-  "  ⚠ WARNING: this tool call also carries a command (see Argv above) — it is hash-bound too. Review both.";
+  "  ⚠ WARNING: this tool call also carries a command (the Argv line) — it is hash-bound too. Review both.";
 
 /** Shown under the header whenever the core escaped at least one character (#246). */
 export const HIDDEN_CHARS_WARNING =
@@ -498,20 +542,24 @@ export function renderRequest(
   // with the action (one escaped line) and any warning on screen however long the block was. When
   // raw and argv diverge, the decision line shows the hash-bound argv (never only the `raw` half,
   // which may be the benign one) and says so on the last line before the prompt.
-  // On a tool surface `raw` is a description, not a command, so it is never compared with argv;
-  // a command form there is flagged by its own warning instead.
+  // On a tool surface `raw` is a description, not a command, so it is never compared with argv.
+  // A command form there is repeated on its own row under the tool identity, then flagged by its
+  // own warning: the block's `Argv:` row can sit far above, behind agent-controlled params.
   const toolHeadline = toolIdentity(display) !== undefined;
   const diverges = !toolHeadline && rawDivergesFromArgv(context.action);
   const decidingOn = diverges ? reconstructCommand(display.syntactic) : undefined;
-  const toolCommandForm = toolHeadline && reconstructCommand(display.syntactic) !== undefined;
+  const toolCommand = toolHeadline ? reconstructCommand(display.syntactic) : undefined;
   lines.push(`  Deciding on: ${decidingOn ?? renderActionHeadline(display)}`);
+  if (toolCommand !== undefined) {
+    lines.push(`  Argv:       ${toolCommand}`);
+  }
   if (display.has_hidden_or_control_chars) {
     lines.push(HIDDEN_CHARS_WARNING);
   }
   if (decidingOn !== undefined) {
     lines.push(RAW_ARGV_DIVERGENCE_WARNING);
   }
-  if (toolCommandForm) {
+  if (toolCommand !== undefined) {
     lines.push(TOOL_COMMAND_FORM_WARNING);
   }
 
