@@ -56,6 +56,18 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   | `device_auth_token`     | `POST /pairing/complete`      | all `devices/{id}/…`, `actors`, `account-states`                    | until revoked             |
   | `request_auth_token`    | `POST /requests` (integrator) | `requests/{id}` polling/wait, `requests/{id}/retract`               | 7 days post-terminal      |
 
+- **CORS (browser clients).** A browser page may call the relay only from an allowlisted origin
+  (`CORS_ALLOWED_ORIGINS`, `docs/relay-deploy.md` §2; the hosted relay allows
+  `https://allw-web-approver.pages.dev`). The policy covers every route, account and relay-level
+  (`/.well-known/allw/…`, e.g. the VAPID public key) alike. Preflights (`OPTIONS` with `Access-Control-Request-Method`)
+  from an allowed origin get **204** with `Access-Control-Allow-Methods: GET, POST`,
+  `Access-Control-Allow-Headers: Authorization, Content-Type` and `Access-Control-Max-Age: 600`.
+  Responses to an allowed origin echo it in `Access-Control-Allow-Origin`. A disallowed origin,
+  method or header gets a **403** preflight with no CORS headers. Every response except a WebSocket
+  upgrade (101, returned untouched) carries `Vary: Origin`, including a 500 when a handler fails. There is no credentials mode (`Access-Control-Allow-Credentials` is never sent):
+  auth is the bearer header, never a cookie. CORS does not apply to WebSocket upgrades, and the relay
+  does not check `Origin` there, since the socket authenticates with `?auth=`. Non-browser clients
+  send no `Origin` and are unaffected.
 - **Errors** are plain bodies with the status code; `400` covers malformed JSON / bad fields /
   unexpected envelope keys (zero-knowledge guard).
 
