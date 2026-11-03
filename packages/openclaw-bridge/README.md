@@ -85,11 +85,12 @@ The SDK encrypts each request only to the devices your account root vouches for 
 state (`GET /{acct}/account-states`), never to the relay's device list, so a relay that lists a key it
 holds cannot read the request (`docs/enrollment.md` §Model, #243). `allw-approver pair` publishes that
 state. If the relay has none, the approval is denied with an error naming `allw-approver pair`; a state that does not verify is denied too. Each machine records the highest account-state sequence it has accepted in
-`~/.allw/state/<account-id>.floor.json` (`0600` in a `0700` directory) before sending, and denies a
+`<ALLW_OPENCLAW_STATE_DIR>/state/<account-id>.floor.json` (`0600` in a `0700` directory) before sending, and denies a
 request when the relay serves an older state. A floor file that is unreadable, corrupt, or not owned
 by you also denies; delete it only if you know why it is wrong.
-The floor lives under `~/.allw/state/`, not `ALLW_OPENCLAW_STATE_DIR`, so every allw integrator on the
-machine shares one floor per account.
+With the default state directory (`~/.allw`) that is `~/.allw/state/`, the same directory the hooks
+use, so the bridge and the hooks on one machine share one floor per account. A bridge given its own
+`ALLW_OPENCLAW_STATE_DIR` keeps its own floor there.
 
 ## Pairing
 
