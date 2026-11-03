@@ -353,6 +353,22 @@ describe("PUT /devices/{id}/push-tokens — auth (self only, revoke's order)", (
     expect(await readRows(acct)).toEqual([]);
   });
 
+  it.each([
+    ["a lowercase scheme", (token: string) => `bearer ${token}`],
+    ["a Basic scheme", () => "Basic YWxsdzphbGx3"],
+    ["a malformed bearer value", () => "Bearer a.b"],
+  ])("is 401 for a garbled Authorization header (%s)", async (_name, header) => {
+    const acct = testAccount(`acct-push-tokens-garbled-${_name.replace(/\W+/g, "-")}`);
+    const device = await pairDevice(acct);
+
+    const put = await putPushTokens(acct, device.deviceId, BODY, {
+      Authorization: header(device.authToken),
+    });
+
+    expect(put.status).toBe(401);
+    expect(await readRows(acct)).toEqual([]);
+  });
+
   it("is 403 for a bearer that is no device's token", async () => {
     const acct = testAccount("acct-push-tokens-bad-bearer");
     const device = await pairDevice(acct);
@@ -374,6 +390,67 @@ describe("PUT /devices/{id}/push-tokens — auth (self only, revoke's order)", (
     expect(await readRows(acct, target.deviceId)).toEqual([
       expect.objectContaining({ token: MOZILLA_ENDPOINT }),
     ]);
+  });
+
+  it("is 403 for a pairing auth token, which is not a device bearer", async () => {
+    const acct = testAccount("acct-push-tokens-pairing-bearer");
+    const device = await pairDevice(acct);
+    const start = await post<{ code: string; pairing_auth_token: string }>(
+      acct,
+      "/pairing/start",
+      pairingStartBody(acct),
+    );
+    expect(start.status).toBe(201);
+
+    const put = await putPushTokens(
+      acct,
+      device.deviceId,
+      BODY,
+      bearer(start.data.pairing_auth_token),
+    );
+
+    expect(put.status).toBe(403);
+    expect(await readRows(acct)).toEqual([]);
+  });
+
+  it("is 403 for a device bearer from another account, whatever the target", async () => {
+    const accountA = testAccount("acct-push-tokens-cross-a");
+    const accountB = testAccount("acct-push-tokens-cross-b");
+    const unbound = testAccount("acct-push-tokens-cross-unbound");
+    const deviceA = await pairDevice(accountA);
+    const deviceB = await pairDevice(accountB, [{ transport: "webpush", token: MOZILLA_ENDPOINT }]);
+
+    // A's own device id under account B, B's device under B, and an account with no devices.
+    expect(
+      (await putPushTokens(accountB, deviceA.deviceId, BODY, bearer(deviceA.authToken))).status,
+    ).toBe(403);
+    expect(
+      (await putPushTokens(accountB, deviceB.deviceId, BODY, bearer(deviceA.authToken))).status,
+    ).toBe(403);
+    expect(
+      (await putPushTokens(unbound, deviceA.deviceId, BODY, bearer(deviceA.authToken))).status,
+    ).toBe(403);
+    expect((await readRows(accountB)).map((row) => row.token)).toEqual([MOZILLA_ENDPOINT]);
+    expect(await readRows(accountA)).toEqual([]);
+  });
+
+  it("checks auth and the target device before validating the body", async () => {
+    const acct = testAccount("acct-push-tokens-auth-order");
+    const target = await pairDevice(acct, [{ transport: "webpush", token: MOZILLA_ENDPOINT }]);
+    const other = await pairDevice(acct);
+
+    // Another device's bearer is refused (403) before a malformed or incomplete body is a 400 …
+    expect(
+      (await putPushTokens(acct, target.deviceId, "{bad", bearer(other.authToken))).status,
+    ).toBe(403);
+    expect((await putPushTokens(acct, target.deviceId, {}, bearer(other.authToken))).status).toBe(
+      403,
+    );
+    // … and an unknown target is a 404 before the body is judged.
+    expect((await putPushTokens(acct, "dev-unknown", "{bad", bearer(other.authToken))).status).toBe(
+      404,
+    );
+    expect((await readRows(acct)).map((row) => row.token)).toEqual([MOZILLA_ENDPOINT]);
   });
 
   it("is 404 for a device id that is not enrolled", async () => {
@@ -500,6 +577,44 @@ describe("PUT /devices/{id}/push-tokens — account budget", () => {
 
     expect(put.status).toBe(409);
     expect(put.data.error).toMatch(/push-token limit/);
+    expect((await readRows(acct, device.deviceId)).map((row) => row.token)).toEqual([APNS_TOKEN]);
+  });
+
+  it("never refuses a clear, even on an account already over the budget (legacy rows)", async () => {
+    const acct = testAccount("acct-push-tokens-budget-legacy-clear");
+    const device = await pairDevice(acct, [{ transport: "apns", token: APNS_TOKEN }]);
+    // Only rows from before budgets existed can exceed 32.
+    await seedRows(acct, otherDeviceRows(33));
+
+    const cleared = await putPushTokens(
+      acct,
+      device.deviceId,
+      { push_tokens: [] },
+      bearer(device.authToken),
+    );
+
+    expect(cleared.status).toBe(200);
+    expect(await readRows(acct, device.deviceId)).toEqual([]);
+  });
+
+  it("still refuses growth on an account already over the budget", async () => {
+    const acct = testAccount("acct-push-tokens-budget-legacy-grow");
+    const device = await pairDevice(acct, [{ transport: "apns", token: APNS_TOKEN }]);
+    await seedRows(acct, otherDeviceRows(33));
+
+    const grown = await putPushTokens(
+      acct,
+      device.deviceId,
+      {
+        push_tokens: [
+          { transport: "apns", token: APNS_TOKEN },
+          { transport: "webpush", token: FCM_ENDPOINT },
+        ],
+      },
+      bearer(device.authToken),
+    );
+
+    expect(grown.status).toBe(409);
     expect((await readRows(acct, device.deviceId)).map((row) => row.token)).toEqual([APNS_TOKEN]);
   });
 

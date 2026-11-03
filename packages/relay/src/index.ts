@@ -1272,7 +1272,8 @@ export class AccountRelay implements DurableObject {
    * - 404: `{device_id}` is not enrolled (or was revoked)
    * - 403: the bearer belongs to another device
    * - 400: invalid JSON, `push_tokens` missing, or invalid / over-budget per registration
-   * - 409: the account push-token budget would be exceeded (the device's own rows don't count)
+   * - 409: a growing set would exceed the account push-token budget (the device's own rows don't
+   *        count; a set that stays the same size or shrinks is never refused)
    *
    * The replace is a diff applied in one transaction: unchanged tokens keep their row (and
    * `created_at`), so repeating the same body is a no-op.
@@ -1297,22 +1298,26 @@ export class AccountRelay implements DurableObject {
       return json({ error: "'push_tokens' must contain supported transport/token pairs" }, 400);
     }
 
-    const otherDevicesRow = [
-      ...this.sql.exec<{ n: number }>(
-        `SELECT COUNT(*) AS n FROM device_push_token WHERE device_id != ?`,
-        deviceId,
-      ),
-    ][0];
-    if ((otherDevicesRow?.n ?? 0) + desired.length > MAX_PUSH_TOKENS_PER_ACCOUNT) {
-      return json({ error: "account push-token limit reached" }, 409);
-    }
-
     const current = [
       ...this.sql.exec<DevicePushTokenRow>(
         `SELECT device_id, transport, token, created_at FROM device_push_token WHERE device_id = ?`,
         deviceId,
       ),
     ];
+    // The budget gates growth only: a set that stays the same size or shrinks is always allowed,
+    // so a device can clear or trim its tokens even on an account already over the budget (rows
+    // registered before budgets existed).
+    if (desired.length > current.length) {
+      const otherDevicesRow = [
+        ...this.sql.exec<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM device_push_token WHERE device_id != ?`,
+          deviceId,
+        ),
+      ][0];
+      if ((otherDevicesRow?.n ?? 0) + desired.length > MAX_PUSH_TOKENS_PER_ACCOUNT) {
+        return json({ error: "account push-token limit reached" }, 409);
+      }
+    }
     const { remove, add } = diffPushTokenSet(current, desired);
     const now = Date.now();
     this.ctx.storage.transactionSync(() => {
