@@ -1,5 +1,5 @@
 {
-  "$comment": "Shared accept/reject vectors for the relay-URL transport rule (issue #249). Loaded by the SDK (assertRelayUrlTransport), the web approver (checkRelayUrl) and the web-approver site build (relayConnectSources). `runtime` is the verdict of the SDK and web-approver runtime rule; `canonical` is the web approver's canonical form when runtime accepts; `build` is the verdict of the CSP connect-src relay list, which additionally requires a bare origin and no IPv6 literal. Expected values are written from the rule in docs/web-approver-deploy.md §2 and §3.1, not captured from the implementation.",
+  "$comment": "Shared accept/reject vectors for the relay-URL transport rule (issue #249). Loaded by the SDK (assertRelayUrlTransport), the web approver (checkRelayUrl) and the web-approver site build (relayConnectSources). `runtime` is the verdict of the SDK and web-approver runtime rule; `canonical` is the web approver's canonical form when runtime accepts; `build` is the verdict of the CSP connect-src relay list, which additionally requires a bare origin. Expected values are written from the rule in docs/web-approver-deploy.md §2 and §3.1, not captured from the implementation.",
   "vectors": [
     {
       "input": "https://relay.example.com",
@@ -80,10 +80,9 @@
     },
     {
       "input": "http://[::1]:8787",
-      "runtime": "accept",
-      "canonical": "http://[::1]:8787",
+      "runtime": "reject",
       "build": "reject",
-      "why": "http on IPv6 loopback; a CSP host-source cannot express IPv6"
+      "why": "IPv6 loopback is rejected: a CSP host-source cannot express it, so 127.0.0.1 is the loopback to use"
     },
     {
       "input": "http://relay.example.com",

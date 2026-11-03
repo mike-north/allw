@@ -85,6 +85,10 @@ const REQUIRED_IDENTITY_FIELDS: readonly (keyof ApproverIdentity)[] = [
  * Narrow a parsed JSON value to a {@link PairedIdentity}. Returns `null` on any structural failure,
  * including a present-but-invalid pinned `relayUrl` (a tampered or insecure pin is treated as a
  * corrupt identity — fail-closed — never silently dropped, which would un-pin the device).
+ *
+ * The pin must equal `checkRelayUrl`'s canonical form exactly. Changing that canonical form
+ * therefore requires migrating stored pins in the same change; otherwise every existing pin loads
+ * as corrupt and the pairing gate clears the stored identity, so devices silently lose it.
  */
 function parseIdentity(value: unknown): PairedIdentity | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;

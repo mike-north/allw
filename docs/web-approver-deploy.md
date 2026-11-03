@@ -76,13 +76,15 @@ priority order (`src/relay-config.ts`):
 That order applies **only before pairing**. Once a browser is paired, its relay is pinned (below).
 
 **HTTPS only.** A relay URL is accepted only if it is `https:`, or `http:` on a loopback host
-(`localhost`, `127.0.0.1`, `[::1]`) for local development against `wrangler dev`, and it carries no
+(`localhost` or `127.0.0.1`) for local development against `wrangler dev`, and it carries no
 username, password, query (`?`) or fragment (`#`) — userinfo lets a link look like one host while
 pointing at another (`https://relay.example.com@evil.example` is `evil.example`). Anything else —
-including `http://relay.example.com` — is rejected at configuration time and the config prompt
-shows why, so bearer tokens and ciphertext never travel unencrypted. A path is allowed. The
-accepted URL is stored in canonical form: the origin (lowercased, punycode host, default port
-dropped) plus the path without trailing slashes. The SDK's `createClient` enforces the same rule;
+including `http://relay.example.com` — is rejected at configuration time and the config prompt shows
+why, so bearer tokens and ciphertext never travel unencrypted. For a local relay use `127.0.0.1`,
+not `[::1]`: a CSP cannot list an IPv6 address (§3.1), so the IPv6 loopback is rejected by the web
+approver, the SDK, and the site build alike. A path is allowed. The accepted URL is stored in
+canonical form: the origin (lowercased, punycode host, default port dropped) plus the path without
+trailing slashes. The SDK's `createClient` enforces the same rule;
 `packages/sdk/test/fixtures/relay-url-vectors.json` holds the shared accept/reject vectors (issue
 #249).
 
