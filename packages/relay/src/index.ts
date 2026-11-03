@@ -35,6 +35,7 @@ import {
   CoreUnavailableError,
   checkAccountIdForRoot,
   ensureCore,
+  isSmallOrderX25519PublicKey,
   verifyAccountState,
   verifyPairingStartAuthorization,
 } from "./core.js";
@@ -336,6 +337,34 @@ function validatePubkey(pubkey: string): Uint8Array | null {
     bytes[i] = binary.charCodeAt(i);
   }
   return bytes;
+}
+
+/**
+ * Validate a device's X25519 encryption key for enrollment (`POST /pairing/complete`). Integrators
+ * JWE-encrypt every request to this key, so beyond `validatePubkey`'s 32 base64url bytes it must not
+ * be a small-order point: ECDH with one yields a publicly known shared secret, and the core's
+ * `encrypt_context` refuses the whole request rather than encrypt to it (#248). Rejecting it here
+ * keeps such a key out of the device registry. The denylist is the core's, through WASM.
+ *
+ * Returns the 400 to send, a 500 if the core is unavailable, or `null` when the key is acceptable.
+ */
+function deviceEncryptionKeyFailure(pubkey: string): Response | null {
+  if (!validatePubkey(pubkey)) {
+    return json({ error: "'pubkey' must be a base64url-unpadded 32-byte public key" }, 400);
+  }
+  let smallOrder: boolean;
+  try {
+    smallOrder = isSmallOrderX25519PublicKey(pubkey);
+  } catch (err) {
+    return coreUnavailable(err);
+  }
+  if (smallOrder) {
+    return json(
+      { error: "'pubkey' is a small-order X25519 key, which can never be an encryption target" },
+      400,
+    );
+  }
+  return null;
 }
 
 /** Parse a JSON body; returns null if the body is invalid JSON or not an object. */
@@ -1091,7 +1120,9 @@ export class AccountRelay implements DurableObject {
    * - 404: code not found
    * - 409: code already used, or the account's push-token budget is full (code not consumed)
    * - 410: code expired
-   * - 400: invalid pubkey (not base64url or not 32 bytes), or invalid / over-budget push_tokens
+   * - 400: invalid pubkey (not base64url, not 32 bytes, or a small-order X25519 point), or
+   *        invalid / over-budget push_tokens
+   * - 500: the relay's verification core failed to initialize
    */
   private async handlePairingComplete(request: Request): Promise<Response> {
     // Every pairing row this relay issues is created together with (or after) the root bind, so a
@@ -1109,9 +1140,8 @@ export class AccountRelay implements DurableObject {
     const pubkey = requiredString(body, "pubkey");
     if (!pubkey) return json({ error: "'pubkey' is required (string)" }, 400);
 
-    if (!validatePubkey(pubkey)) {
-      return json({ error: "'pubkey' must be a base64url-unpadded 32-byte public key" }, 400);
-    }
+    const pubkeyFailure = deviceEncryptionKeyFailure(pubkey);
+    if (pubkeyFailure) return pubkeyFailure;
 
     const label = optionalString(body, "label");
     const pushTokens = optionalPushTokens(body);
