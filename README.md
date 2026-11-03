@@ -16,10 +16,12 @@ governance layer that grows around it. See [`docs/`](./docs):
 - [decision-history.md](./docs/decision-history.md) — on-device, encrypted, ephemeral decision history and the reflection pass (post-v1).
 - [decision-flywheel.md](./docs/decision-flywheel.md) — recognized-tool tallies: the only sanctioned, aggregate-only egress.
 - [threat-model.md](./docs/threat-model.md) — adversaries, residual risks, and the security review checklist.
+- [releasing.md](./docs/releasing.md) — how the `@allw/*` npm packages are released (CI-only, npm trusted publishing) and the one-time bootstrap.
 
 ## Quickstart (zero → first approval)
 
-Get a real shell command **blocked until you approve it from a second device** — verified end to end.
+Get a real shell command **blocked until you approve it from a separate approver** — verified end to
+end. (The CLI approver below is a demo when it runs on the agent's machine.)
 Full walkthrough with troubleshooting: **[docs/quickstart.md](./docs/quickstart.md)**.
 
 > Requires Node ≥ 24 and Claude Code. **No Rust toolchain needed** — the audited core ships pre-built
@@ -33,15 +35,21 @@ Full walkthrough with troubleshooting: **[docs/quickstart.md](./docs/quickstart.
 # 1. Install the CLIs in your project (the @allw/sdk + bundled WASM come along automatically):
 npm install @allw/hook @allw/approver
 
-# 2. Pair a second device (a second terminal). Prints your account id + account-root public key
+# 2. Pair an approver (demo: a second terminal on this machine). Prints your account id + account-root public key
 #    (the account id is derived from the account-root key — you don't choose it):
-npx allw-approver pair --relay https://allw-relay.mnorth.workers.dev --label my-laptop
+npx --no-install allw-approver pair --relay https://allw-relay.mnorth.workers.dev --label my-laptop
 
-# 3. Watch for requests on that device (leave running — this is your "phone" for now):
-npx allw-approver watch
+# 3. Watch for requests in that terminal (leave running; it stands in for your phone):
+npx --no-install allw-approver watch
 ```
 
-Then point the Claude Code **PreToolUse** hook at `npx allw-hook` with the relay URL, account id, and
+> **⚠ Demo only.** The CLI approver keeps the account root and signing keys on the machine it runs on,
+> so the agent you are gating can read them and approve its own requests. For real use, pair the
+> [hosted web approver](https://allw-web-approver.pages.dev) from a machine the agent can't read
+> (quickstart §2).
+
+Then point the Claude Code **PreToolUse** hook at `npx --no-install allw-hook` (never plain `npx`,
+which can download and run a registry package of that name) with the relay URL, account id, and
 account-root key as env vars, ask Claude Code to run `git status`, and approve it from the watch
 terminal. The exact hook config block and env vars are in
 **[docs/quickstart.md](./docs/quickstart.md)** (steps 4–5).

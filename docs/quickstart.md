@@ -1,7 +1,8 @@
 # Quickstart: zero → first approval
 
-Goal: install `allw`, pair a second device, wire the Claude Code hook, and get a real shell command
-**blocked until you approve it from a second surface** — cryptographically verified, end to end.
+Goal: install `allw`, pair an approver, wire the Claude Code hook, and get a real shell command
+**blocked until you approve it from a separate approver** — cryptographically verified, end to end.
+(The CLI approver this guide uses is a demo when it runs on the agent's machine; see §2.)
 
 This is the v0 "walking skeleton" experience. Read it honestly: some pieces are deliberate v0
 stand-ins, called out inline. Where a step is **not yet wired**, it says so rather than pretending.
@@ -14,17 +15,19 @@ stand-ins, called out inline. Where a step is **not yet wired**, it says so rath
 >   approval request and only emits `allow` for a verified human "yes".
 > - The same gate for **Codex** (`@allw/codex-hook`) — see [`docs/codex-integration.md`](./codex-integration.md)
 >   for the Codex-specific hook config; steps 0–3 below (relay, install, pairing, watch) are identical.
-> - A **second-device approver** (`@allw/approver`) that renders the exact action (WYSIWYS), prompts
->   Approve / Deny, and returns a signed verdict.
-> - A **zero-knowledge relay** (`@allw/relay`) — this quickstart defaults to the hosted relay at
->   `https://allw-relay.mnorth.workers.dev`; you can also run your own (Cloudflare or locally via
->   `wrangler dev`).
+> - An **approver** (`@allw/approver`, a CLI stand-in for a second device; demo-only when run on the
+>   agent's machine, see §2) that renders the exact action (WYSIWYS), prompts Approve / Deny, and
+>   returns a signed verdict.
+> - A **relay** (`@allw/relay`) designed to be zero-knowledge — this quickstart defaults to the hosted
+>   relay at `https://allw-relay.mnorth.workers.dev`; you can also run your own (Cloudflare or locally
+>   via `wrangler dev`). **Not yet zero-knowledge against a malicious relay operator:** see the caveat
+>   in step 0.
 >
 > **v0 stand-ins (not production):**
 >
-> - The "second device" is a **CLI** (`allw-approver`), not yet a phone/web app. The hosted web
->   inbox is designed but not shipped (see `design/` and issue tracker). The wire protocol does not
->   change when the phone/web surface lands.
+> - The "second device" in this walkthrough is a **CLI** (`allw-approver`). A hosted **web approver**
+>   is also live (see the browser option in step 2); the native phone app is not shipped yet. The wire
+>   protocol does not change when the phone surface lands.
 > - The approver holds its keys in a **software keyfile**, not hardware (Secure Enclave / StrongBox).
 >   Tracked by [#23](https://github.com/mike-north/allw/issues/23). The protocol is unchanged.
 > - The requesting **actor identity is unverified** in v0 ([#16](https://github.com/mike-north/allw/issues/16));
@@ -46,7 +49,7 @@ package, and `@allw/hook` / `@allw/approver` load it from there.
 
 ## 0. The relay endpoint
 
-`allw` routes encrypted requests through a **zero-knowledge relay**. This quickstart uses the
+`allw` routes encrypted requests through a relay designed to be **zero-knowledge**. This quickstart uses the
 **hosted relay** so you can start without standing up any infrastructure:
 
 ```
@@ -55,9 +58,16 @@ https://allw-relay.mnorth.workers.dev
 
 That's the `<RELAY_URL>` referenced in the steps below — no Cloudflare account or setup needed.
 
-> The relay only ever sees **ciphertext + signed verdicts** — never plaintext or any signing key
-> (`docs/architecture.md`, `docs/contract.md`). That's true whether you use the hosted relay above
-> or run your own.
+> The relay is only ever sent **ciphertext + signed verdicts** — never plaintext or any signing key
+> (`docs/architecture.md`, `docs/contract.md`).
+>
+> **Caveat — not yet zero-knowledge against the relay itself.** The SDK encrypts each request to the
+> device list the relay returns (`GET /{account}/devices`), and the shipped hooks do not yet check that
+> list against root-signed account state. A malicious or compromised relay operator could therefore
+> list a key it holds as a device and decrypt the action context. Until the fixes land
+> ([#243](https://github.com/mike-north/allw/issues/243): encrypt only to root-vouched devices;
+> [#242](https://github.com/mike-north/allw/issues/242): verified account state), only use a relay
+> whose operator you trust — or run your own. See `docs/threat-model.md` §Residual Risks.
 
 **Prefer to self-host?** Either option below gives you a `<RELAY_URL>` to use in place of the
 hosted one — everything else in this quickstart is unchanged.
@@ -82,6 +92,12 @@ hosted one — everything else in this quickstart is unchanged.
 
 ## 1. Install the CLIs
 
+> **Not on npm yet.** The `@allw/*` packages on npm are only `0.0.0-bootstrap` name reservations with
+> no bin, so `npm install` below gives you nothing to run. Until the first release, install from a
+> checkout: `pnpm install && pnpm run build:wasm && pnpm -r build` (needs Rust and `wasm-pack`), then
+> `pnpm pack` in `packages/sdk`, `packages/hook` and `packages/approver` and `npm install` the three
+> tarballs (as `scripts/smoke-packaged-install.mjs` does).
+
 In the project where you run Claude Code (or globally):
 
 ```sh
@@ -92,9 +108,14 @@ npm install @allw/hook @allw/approver
 Confirm they're installed and which version you have (useful for bug reports):
 
 ```sh
-npx allw-hook --version
-npx allw-approver --version
+npx --no-install allw-hook --version
+npx --no-install allw-approver --version
 ```
+
+> **Always run the allw bins as `npx --no-install …`** (or by absolute path, see step 4). Plain
+> `npx allw-hook` downloads and runs whatever package of that name the registry serves when it can't
+> find the bin locally, without asking when there's no terminal. `--no-install` makes `npx` exit with
+> an error instead, so a mistyped or squatted package can never run in place of the gate.
 
 > Using **Codex** instead of Claude Code? Install `@allw/codex-hook` in place of `@allw/hook`
 > (`npm install @allw/codex-hook @allw/approver`) and skip to
@@ -103,7 +124,7 @@ npx allw-approver --version
 
 ---
 
-## 2. Pair a second device (the approver)
+## 2. Pair an approver
 
 The approver is the surface where **you** see and decide the request.
 
@@ -112,11 +133,23 @@ The approver is the surface where **you** see and decide the request.
 > browser (including your phone) and paste the pairing output from the CLI below into its pairing
 > form. See [`web-approver-deploy.md`](./web-approver-deploy.md) for details or self-hosting.
 
-For the CLI approver, in a **second terminal** (leave it running), pair it with an account on your
-relay:
+> **⚠ The CLI approver is for demos only.** It keeps the account root key and the device signing key
+> in a keyfile on the machine where you run it. Any process running as the same user, including the
+> AI agent you are gating, can read that file and approve its own requests. The signatures still
+> verify; you are just no longer the one deciding. `allw-approver pair`, `watch` and `keygen` print
+> this warning every time they run.
+>
+> For real use, approve from a device the agent can't reach: the
+> [hosted web approver](https://allw-web-approver.pages.dev) on your phone. Today the web approver is
+> paired with the values `allw-approver pair` produces, so run `pair` on a machine (or OS user) the
+> agent can't read, not on the machine the agent runs on. Moving the account root off the agent's
+> machine entirely is tracked in [#244](https://github.com/mike-north/allw/issues/244).
+
+For the CLI approver demo, in a **second terminal** (leave it running), pair it with an account on
+your relay:
 
 ```sh
-npx allw-approver pair \
+npx --no-install allw-approver pair \
   --relay <RELAY_URL> \
   --label "my-laptop"
 ```
@@ -145,10 +178,11 @@ In that same second terminal, start the watch loop. It opens the device presence
 you Approve / Deny for each incoming request:
 
 ```sh
-npx allw-approver watch
+npx --no-install allw-approver watch
 ```
 
-Leave this running. This is your "phone" for now.
+Leave this running. It stands in for your phone in this demo; on the agent's machine it offers no
+protection against the agent (see the warning in §2).
 
 ---
 
@@ -162,7 +196,7 @@ The hook reads its config from the environment. Export these in the shell where 
 
 ```sh
 export ALLW_RELAY_URL="<RELAY_URL>"
-export ALLW_ACCOUNT_ID="my-account"
+export ALLW_ACCOUNT_ID="<ACCOUNT_ID_FROM_STEP_2>"
 export ALLW_APPROVER_ROOT_KEY="<ACCOUNT_ROOT_PUBLIC_KEY_FROM_STEP_2>"
 ```
 
@@ -178,8 +212,9 @@ hook. The matcher `Bash|mcp__.*` gates shell commands and any MCP tool call:
         "hooks": [
           {
             "type": "command",
-            "command": "npx allw-hook",
-            "timeout": 480
+            "command": "npx --no-install allw-hook",
+            "timeout": 480,
+            "onFailure": "block"
           }
         ]
       }
@@ -192,10 +227,35 @@ hook. The matcher `Bash|mcp__.*` gates shell commands and any MCP tool call:
 > the pin guarantees the hook always emits an explicit `allow`/`deny` before Claude Code could time
 > it out (the fail-closed timeout-ordering invariant — see [`@allw/hook`](../packages/hook/README.md)).
 >
-> `npx allw-hook` resolves the installed bin. If your Claude Code launch environment does not see the
-> project's `node_modules/.bin` on `PATH`, use the absolute path to the resolved bin instead (find it
-> with `node -e "console.log(require.resolve('@allw/hook/package.json'))"` → the `dist/cli.js` beside
+> **Use `npx --no-install allw-hook`, never plain `npx allw-hook`.** With `--no-install`, `npx` runs
+> the bin installed in the project (or globally) and exits with an error if there is none. It never
+> downloads a package from the registry and runs it as your gate. (Checked on npm 10.9.4 and 11.21.1:
+> with no local install, `npx --no-install allw-hook` exits 1 with "npx canceled due to missing
+> packages" and downloads nothing; plain `npx allw-hook` downloads and runs the registry package.)
+> If your Claude Code launch environment doesn't run from the project directory, use the absolute
+> path to the installed bin instead (find it with
+> `node -e "console.log(require.resolve('@allw/hook/package.json'))"` → the `dist/cli.js` beside
 > it), e.g. `"command": "node /abs/path/to/@allw/hook/dist/cli.js"`.
+
+### If the hook can't start
+
+If Claude Code can't start the hook (a wrong path, `node` missing from `PATH`, the package not
+installed so `npx --no-install` exits 1), the **tool call is not gated by default**. Claude Code's
+[hooks reference](https://code.claude.com/docs/en/hooks#exit-code-output) treats a hook that fails
+to start, or exits with any code other than 0 or 2, as a _non-blocking error_: it shows a
+`PreToolUse:<tool> hook error` notice in the transcript and **the action goes ahead**.
+
+`"onFailure": "block"` in the config above reverses that: if the hook fails to start, exits with a
+code other than 0 or 2, or times out, Claude Code
+[blocks the tool call](https://code.claude.com/docs/en/hooks#block-the-action-when-a-hook-fails)
+instead. It needs **Claude Code v2.1.295 or later**. On older versions Claude Code ignores the key
+without warning, so a hook that can't start still lets the call through. Check `claude --version`.
+`@allw/hook`
+exits 0 on every decision it makes, deny included, so the setting only changes what happens when
+the hook never gets to decide.
+
+Codex has no equivalent setting: a Codex hook that can't start is reported and the tool call goes
+ahead. See [`docs/codex-integration.md`](./codex-integration.md#if-the-hook-cant-start).
 
 ---
 
@@ -217,8 +277,9 @@ What happens:
 5. Press **`d`** to deny (or just wait for the timeout): the hook emits `deny` and Claude Code is
    blocked. **Fail-closed both ways.**
 
-That's the full loop: a real agent action, gated by a human decision on a second device,
-end-to-end-encrypted and cryptographically verified.
+That's the full loop: a real agent action, gated by a human decision in a separate approver,
+end-to-end-encrypted and cryptographically verified. With the CLI approver on the same machine as the
+agent, that decision is only as trustworthy as the machine: the agent can read the keyfile (§2).
 
 ---
 
@@ -230,6 +291,7 @@ end-to-end-encrypted and cryptographically verified.
 | Hook denies with "vendored wasm not found"   | You're running an unbuilt checkout, not the installed package. `npm install @allw/hook` (it bundles the WASM via `@allw/sdk`). |
 | No prompt appears in the watch terminal      | The account id / `--relay` printed by `pair` must match the hook's `ALLW_ACCOUNT_ID` / `ALLW_RELAY_URL`.                       |
 | Request times out immediately                | Check the relay is running (step 0) and reachable at `ALLW_RELAY_URL`.                                                         |
+| Transcript shows `PreToolUse:… hook error`   | The hook couldn't start (bad path, or not installed). See [If the hook can't start](#if-the-hook-cant-start).                  |
 | `git status` runs without prompting          | Only `Bash` and `mcp__*` are gated. Reads/edits/greps pass through by design (v0 conservative matcher).                        |
 
 ---

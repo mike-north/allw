@@ -45,7 +45,8 @@ for direct file edits, and `mcp__.*` for any MCP tool call:
           {
             "type": "command",
             "command": "node /absolute/path/to/packages/hook/dist/cli.js",
-            "timeout": 480
+            "timeout": 480,
+            "onFailure": "block"
           }
         ]
       }
@@ -54,8 +55,20 @@ for direct file edits, and `mcp__.*` for any MCP tool call:
 }
 ```
 
-> Use an absolute path to `dist/cli.js` (or the resolved `allw-hook` bin). The `command` is run under
-> `node`; there is no native binary to sign or allow-list.
+> Use an absolute path to `dist/cli.js`, or `npx --no-install allw-hook`. **Never plain
+> `npx allw-hook`:** when no installed bin resolves, plain `npx` downloads and runs the registry
+> package of that name, so a squatted package would run as the gate; `--no-install` exits 1 instead
+> (checked on npm 10.9.4 and 11.21.1). The `command` is run under `node`; there is no native binary
+> to sign or allow-list.
+
+> **Set `"onFailure": "block"`** (Claude Code v2.1.295 or later; older versions ignore the key
+> without warning, so check `claude --version`). Without it, if Claude Code can't start the hook (a
+> wrong path, `node` missing from `PATH`, the package not installed), the [hooks
+> reference](https://code.claude.com/docs/en/hooks#exit-code-output) treats that as a non-blocking
+> error and **the tool call goes ahead ungated**. With it, Claude Code [blocks the
+> call](https://code.claude.com/docs/en/hooks#block-the-action-when-a-hook-fails) when the hook
+> fails to start, exits with a code other than 0 or 2, or times out. This hook exits 0 on every
+> decision, deny included, so the setting only matters when the hook never gets to decide.
 
 > **Always pin `"timeout"`** (here `480`, in seconds). Without it the hook inherits Claude Code's
 > 600s default, and a too-large `ALLW_TIMEOUT_MS` could let that timeout fire before the hook decides
@@ -68,8 +81,8 @@ before any external timeout fires.** This must never depend on what Claude Code 
 fails to emit a decision, because that behavior is fail-**open** and partly undocumented:
 
 - Claude Code's command-hook `timeout` defaults to **600 seconds**.
-- A hook **timeout** is treated as a _non-blocking error_ → **the tool proceeds** (fail-open). Claude
-  Code's exact behavior on hook timeout is otherwise undocumented and version-dependent.
+- A hook **timeout** does not block the call → **the tool proceeds** through Claude Code's normal
+  permission flow (fail-open), unless the hook sets `"onFailure": "block"`.
 - (Likewise, a non-zero, non-2 hook _exit code_ is a non-blocking error → the tool proceeds.)
 
 So we never rely on it. The invariant we control:

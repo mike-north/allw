@@ -4,7 +4,7 @@ import test from "node:test";
 import { JSDOM } from "jsdom";
 
 import { mountWebApprover } from "../dist/browser.js";
-import { WebApproverController } from "../dist/index.js";
+import { WITHHELD_ERROR_TEXT, WebApproverController } from "../dist/index.js";
 
 const NOW = Date.parse("2026-06-12T16:00:00.000Z");
 
@@ -56,6 +56,8 @@ function runtime(fixtures) {
       assert.ok(value, `missing fixture for ${envelopeInput.id}`);
       return { expiresAt: envelopeInput.expires_at, ...value };
     },
+    // Test double: identity escape. The real core escape is covered by display-safety.test.mjs.
+    escapeForDisplay: (text) => text,
     async signDecision(input) {
       signCalls.push(input);
       return {
@@ -544,4 +546,13 @@ test("retract removes expired and unverified requests too (both are still deny-o
 
   assert.equal(controller.detail(expired.id), undefined);
   assert.equal(controller.detail(tampered.id), undefined);
+});
+
+test("a runtime without a display escaper has its error text withheld, never shown raw (#246)", async () => {
+  const tampered = envelope("req-no-escaper");
+  const fake = runtime(new Map([[tampered.id, new Error("relay said \u001b[2J")]]));
+  delete fake.escapeForDisplay;
+  const controller = new WebApproverController({ runtime: fake, nowMs: () => NOW });
+  await controller.sync([tampered]);
+  assert.equal(controller.detail("req-no-escaper")?.verificationError, WITHHELD_ERROR_TEXT);
 });
