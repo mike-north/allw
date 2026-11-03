@@ -481,6 +481,14 @@ describe("webPushTtlSeconds — remaining lifetime rounded up to a coarse bucket
 
   it("caps at the 28-day push-service ceiling", () => {
     expect(webPushTtlSeconds(NOW_MS + 90 * DAY, NOW_MS)).toBe(28 * 24 * 60 * 60);
+    expect(webPushTtlSeconds(Infinity, NOW_MS)).toBe(28 * 24 * 60 * 60);
+  });
+
+  it("fails toward a short TTL when the deadline or clock is not a number (review-322 N1)", () => {
+    // NaN used to fall through every bucket comparison to the 28-day cap.
+    expect(webPushTtlSeconds(Number.NaN, NOW_MS)).toBe(0);
+    expect(webPushTtlSeconds(NOW_MS + 60_000, Number.NaN)).toBe(0);
+    expect(webPushTtlSeconds(-Infinity, NOW_MS)).toBe(0);
   });
 });
 

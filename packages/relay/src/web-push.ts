@@ -337,12 +337,14 @@ async function signVapidJwt(
 /**
  * `TTL` for a wakeup: the request's remaining lifetime rounded **up** to the next bucket in
  * {@link WEB_PUSH_TTL_BUCKETS_SECONDS} (anything beyond the largest is capped at 28 days), or `0`
- * once the deadline has passed. Rounding up never expires a wakeup before its request (which would
+ * once the deadline has passed or is not a number. Rounding up never expires a wakeup before its request (which would
  * drop a push); at worst it outlives the request by less than one bucket step.
  */
 export function webPushTtlSeconds(expiresAtMs: number, nowMs: number): number {
   const remaining = Math.ceil((expiresAtMs - nowMs) / 1000);
-  if (remaining <= 0) return 0;
+  // Fail toward a short TTL: a non-finite deadline (NaN) must never become the 28-day cap.
+  // An infinite one is capped like any other far-future deadline.
+  if (Number.isNaN(remaining) || remaining <= 0) return 0;
   const largest =
     WEB_PUSH_TTL_BUCKETS_SECONDS[WEB_PUSH_TTL_BUCKETS_SECONDS.length - 1] ?? remaining;
   return WEB_PUSH_TTL_BUCKETS_SECONDS.find((bucket) => remaining <= bucket) ?? largest;

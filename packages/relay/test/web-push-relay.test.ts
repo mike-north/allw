@@ -973,3 +973,22 @@ describe("submit — a wakeup's TTL covers every pending request, not just its o
     expect(ttlOf(fetcher, 2)).toBe(String(5 * 60));
   });
 });
+
+describe("request table — the latest pending deadline is read through an index", () => {
+  it("plans latestPendingRequest's query on the partial pending-by-expiry index", async () => {
+    // Every unauthenticated submit runs this query, so it must not scan the whole request table.
+    const acct = testAccount("acct-request-pending-index");
+    const plan = await runInDurableObject(relayStub(acct), (instance: AccountRelay) => [
+      ...(instance as unknown as RelayInternals).sql.exec<{ detail: string }>(
+        `EXPLAIN QUERY PLAN
+         SELECT request_id, expires_at FROM request
+         WHERE status = 'pending' AND expires_at > ?
+         ORDER BY expires_at DESC LIMIT 1`,
+        0,
+      ),
+    ]);
+    const details = plan.map((row) => row.detail).join(" | ");
+    expect(details).toContain("request_pending_by_expiry");
+    expect(details).not.toContain("USE TEMP B-TREE FOR ORDER BY");
+  });
+});

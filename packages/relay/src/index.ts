@@ -674,6 +674,14 @@ export class AccountRelay implements DurableObject {
       )
       WHERE status = 'resolved' AND terminal_at IS NULL;
     `);
+    // Pending requests by deadline. Every submit and trailing wakeup reads the latest pending
+    // deadline (latestPendingRequest), and the expiry alarm the earliest (armExpiryAlarm). Partial,
+    // so terminal rows awaiting the retention sweep cost nothing. Idempotent, like the
+    // migrations above; it runs after them, so the columns it names always exist.
+    this.sql.exec(
+      `CREATE INDEX IF NOT EXISTS request_pending_by_expiry
+       ON request (expires_at) WHERE status = 'pending'`,
+    );
   }
 
   // ---------------------------------------------------------------------------
