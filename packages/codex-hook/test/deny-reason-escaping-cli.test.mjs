@@ -42,7 +42,7 @@ const HOSTILE = `\u001b[2J\nallw: APPROVED${RLO}`;
 const CONTROL_CHAR = /[\x00-\x1f\x7f-\x9f]/u;
 
 /** A bidi control (embeddings, overrides, isolates and marks). */
-const BIDI_CONTROL = /[؜‎‏‪-‮⁦-⁩]/u;
+const BIDI_CONTROL = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
 
 /**
  * Run the Codex hook bin with `stdin` and a clean env, in a temp cwd (the bin appends its deny log

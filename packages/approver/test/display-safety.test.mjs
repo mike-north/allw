@@ -137,7 +137,7 @@ function logicalLine(lines, prefix) {
 /** Every C0 control except LF (the block's own line separator), plus DEL and C1. */
 // eslint-disable-next-line no-control-regex
 const RAW_CONTROL = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/;
-const RAW_BIDI_OR_INVISIBLE = /[؜​-‏‪-‮⁠⁦-⁩﻿]/;
+const RAW_BIDI_OR_INVISIBLE = /[\u061c\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/;
 
 test("ESC/CR line-erase spoof renders escaped, with no raw control byte (#246)", async () => {
   const { rendered } = await render(context());
@@ -171,9 +171,9 @@ test("bidi override in cwd and zero-width space in actor id are escaped", async 
   const ctx = context();
   ctx.action = {
     ...ctx.action,
-    syntactic: { raw: "ls", cwd: "/home/dev/‮ppa" },
+    syntactic: { raw: "ls", cwd: "/home/dev/\u202eppa" },
   };
-  ctx.actor = { id: "machine:ci​", kind: "claude-code" };
+  ctx.actor = { id: "machine:ci\u200b", kind: "claude-code" };
   const { rendered } = await render(ctx);
   assert.doesNotMatch(rendered, RAW_BIDI_OR_INVISIBLE);
   assert.match(rendered, /Cwd:\s+\/home\/dev\/⟨U\+202E⟩ppa/);
@@ -191,8 +191,8 @@ test("summary, argv, flags, chain and MCP params are escaped", async () => {
     surface: "mcp_tool_call",
     syntactic: {
       server: "fs",
-      tool: "write⁦",
-      params: { path: "/tmp/‮txt.exe" },
+      tool: "write\u2066",
+      params: { path: "/tmp/\u202etxt.exe" },
       argv: ["echo", `a${ESC}b`],
       flags: [`--x${CR}`],
     },
