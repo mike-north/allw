@@ -308,9 +308,13 @@ async function tokenMatches(storedHash: string | null, token: string | null): Pr
 }
 
 /**
- * Validate that `pubkey` is a valid base64url-unpadded string that decodes to exactly 32 bytes.
+ * Validate that `pubkey` is the canonical base64url-unpadded encoding of exactly 32 bytes.
  * This covers both Ed25519 verifying keys and X25519 public keys, which are both 32-byte.
  * Returns the decoded bytes on success, or `null` on failure.
+ *
+ * Canonical means re-encoding the bytes gives back `pubkey` exactly. The 43rd symbol carries 2
+ * unused low bits, which `atob` silently drops but the core's decoder rejects. Without this check a
+ * key with stray bits would be stored here and then fail in the core on every use.
  */
 function validatePubkey(pubkey: string): Uint8Array | null {
   // 32 bytes encode to exactly 43 base64url-unpadded chars (ceil(32*4/3)). Reject by length
@@ -332,6 +336,9 @@ function validatePubkey(pubkey: string): Uint8Array | null {
   }
   if (binary.length !== 32) return null;
 
+  const canonical = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  if (canonical !== pubkey) return null;
+
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {
     bytes[i] = binary.charCodeAt(i);
@@ -346,7 +353,8 @@ function validatePubkey(pubkey: string): Uint8Array | null {
  * `encrypt_context` refuses the whole request rather than encrypt to it (#248). Rejecting it here
  * keeps such a key out of the device registry. The denylist is the core's, through WASM.
  *
- * Returns the 400 to send, a 500 if the core is unavailable, or `null` when the key is acceptable.
+ * Returns the 400 to send, a 500 only if the core failed to initialize, or `null` when the key is
+ * acceptable.
  */
 function deviceEncryptionKeyFailure(pubkey: string): Response | null {
   if (!validatePubkey(pubkey)) {
@@ -356,7 +364,10 @@ function deviceEncryptionKeyFailure(pubkey: string): Response | null {
   try {
     smallOrder = isSmallOrderX25519PublicKey(pubkey);
   } catch (err) {
-    return coreUnavailable(err);
+    // Only a core that failed to initialize is the relay's fault. Any other throw is the core
+    // rejecting the key's encoding, which is the caller's input: the same 400 as a bad shape.
+    if (err instanceof CoreUnavailableError) return coreUnavailable(err);
+    return json({ error: "'pubkey' must be a base64url-unpadded 32-byte public key" }, 400);
   }
   if (smallOrder) {
     return json(

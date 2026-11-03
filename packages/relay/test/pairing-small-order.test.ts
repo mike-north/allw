@@ -18,7 +18,7 @@
  */
 
 import { SELF } from "cloudflare:test";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import * as glue from "@allw/sdk/vendor/allw-wasm/allw_wasm.js";
 import smallOrderVectorText from "../../../crates/allw-core/tests/fixtures/x25519_small_order.json?raw";
 import { pairingStartBody, testAccount } from "./support/accounts.js";
@@ -36,6 +36,26 @@ interface SmallOrderVector {
 }
 
 const VECTOR = JSON.parse(smallOrderVectorText) as SmallOrderVector;
+
+/** The exact 400 body for a key that is not the canonical base64url encoding of 32 bytes. */
+const SHAPE_ERROR = { error: "'pubkey' must be a base64url-unpadded 32-byte public key" };
+
+/**
+ * 43-symbol keys whose last symbol has one of its 2 unused low bits set. `atob` drops those bits,
+ * so they decode to 32 bytes; the core's decoder rejects them ("Invalid last symbol").
+ * - 32 × 0x00 (the zero point), last symbol `A` → `B`;
+ * - the RFC 7748 Alice key ({@link DEVICE_X25519_PUBKEY}), last symbol `o` → `p`.
+ */
+const NON_CANONICAL_KEYS = [
+  {
+    label: "the zero point with a stray bit",
+    pubkey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB",
+  },
+  {
+    label: "the Alice key with a stray bit",
+    pubkey: "hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmp",
+  },
+];
 
 /** The exact 400 body for a small-order key. */
 const SMALL_ORDER_ERROR = {
@@ -152,8 +172,82 @@ describe("pairing/complete — small-order X25519 device keys (#248)", () => {
 
     const rejected = await completePairing(accountId, start, "A".repeat(42));
     expect(rejected.status).toBe(400);
-    expect(rejected.body).toEqual({
-      error: "'pubkey' must be a base64url-unpadded 32-byte public key",
+    expect(rejected.body).toEqual(SHAPE_ERROR);
+  });
+});
+
+/**
+ * Regression (#354 review): a non-canonical key passed `atob`, then the core's decoder threw, and
+ * that throw was reported as a 500 "core unavailable" with an operator log line, reachable without
+ * credentials. It is the caller's bad input: a 400.
+ */
+describe("pairing/complete — non-canonical base64url keys", () => {
+  it.each(NON_CANONICAL_KEYS)(
+    "rejects $label with the 400 shape error, no error log, and a usable code",
+    async ({ label, pubkey }) => {
+      const errors = vi.spyOn(console, "error");
+      try {
+        const accountId = testAccount(`acct-non-canonical-${label}`);
+        const start = await startPairing(accountId);
+
+        const rejected = await completePairing(accountId, start, pubkey);
+        expect(rejected).toEqual({ status: 400, body: SHAPE_ERROR });
+        expect(await listDevicePubkeys(accountId)).toEqual([]);
+        expect(errors).not.toHaveBeenCalled();
+
+        const retried = await completePairing(accountId, start, DEVICE_X25519_PUBKEY);
+        expect(retried.status).toBe(201);
+      } finally {
+        errors.mockRestore();
+      }
+    },
+  );
+
+  it.each(NON_CANONICAL_KEYS)(
+    "rejects $label with a 400 before auth or code lookup",
+    async ({ label, pubkey }) => {
+      const errors = vi.spyOn(console, "error");
+      try {
+        const accountId = testAccount(`acct-non-canonical-unauth-${label}`);
+        await startPairing(accountId);
+
+        const resp = await SELF.fetch(url(accountId, "/pairing/complete"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ code: "NO-SUCH-CODE", pubkey }),
+        });
+        expect({ status: resp.status, body: await resp.json() }).toEqual({
+          status: 400,
+          body: SHAPE_ERROR,
+        });
+        expect(errors).not.toHaveBeenCalled();
+      } finally {
+        errors.mockRestore();
+      }
+    },
+  );
+});
+
+/** The same helper guards actor keys, which were stored verbatim with a 201 before. */
+describe("POST /actors — non-canonical base64url keys", () => {
+  it.each(NON_CANONICAL_KEYS)("rejects $label with a 400", async ({ label, pubkey }) => {
+    const accountId = testAccount(`acct-actor-non-canonical-${label}`);
+    const start = await startPairing(accountId);
+    const paired = await completePairing(accountId, start, DEVICE_X25519_PUBKEY);
+    expect(paired.status).toBe(201);
+    const { device_auth_token: deviceToken } = paired.body as { device_auth_token: string };
+
+    const resp = await SELF.fetch(url(accountId, "/actors"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${deviceToken}` },
+      body: JSON.stringify({ actor_id: "actor-1", pubkey }),
     });
+    expect({ status: resp.status, body: await resp.json() }).toEqual({
+      status: 400,
+      body: SHAPE_ERROR,
+    });
+
+    const listed = await SELF.fetch(url(accountId, "/actors"));
+    expect(((await listed.json()) as { actors: unknown[] }).actors).toEqual([]);
   });
 });
