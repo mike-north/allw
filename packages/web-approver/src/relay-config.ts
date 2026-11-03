@@ -90,10 +90,11 @@ function hasUrlExtras(raw: string, parsed: URL): boolean {
  * The canonical form is `URL.origin` (lowercased, punycode host, default port dropped) plus the
  * parsed pathname with trailing slashes stripped — never the caller's raw text — so the value
  * stored in a pin, compared against a `?relay=` link, and shown to the human is one unambiguous
- * string. `./pairing.ts` `parseIdentity` requires a stored pin to equal this form, so **changing the
- * canonical form or narrowing what this function accepts requires migrating stored pins**.
- * Otherwise an existing pin loads as corrupt, the browser is treated as unpaired, and the pairing
- * gate's `store.clear()` silently discards the device identity.
+ * string. `./pairing.ts` requires a stored pin to equal this form, so **changing the canonical form
+ * or narrowing what this function accepts** puts every affected browser into the re-pair-required
+ * state (#286): its identity is unusable and the human must confirm re-pairing. A change that does
+ * so should ship a migration for stored pins, or say in its release notes that those devices must
+ * re-pair.
  */
 export function checkRelayUrl(candidate: string): RelayUrlCheck {
   const trimmed = candidate.trim();
@@ -237,8 +238,13 @@ export interface IgnoredRelayNoticeOptions {
   readonly host: HTMLElement;
   /** What {@link describeIgnoredRelayOverride} returned for the ignored `?relay=` value. */
   readonly ignored: string;
-  /** The relay URL pinned in the stored identity. */
+  /** The relay URL pinned in the stored identity, or the relay a re-pair visit pairs against. */
   readonly pinnedRelayUrl: string;
+  /**
+   * Whether this browser is re-pairing (#286): it has no usable identity yet, but is treated as
+   * previously paired, so the notice says it is re-pairing with the relay rather than paired.
+   */
+  readonly repairing?: boolean;
 }
 
 /**
@@ -247,13 +253,14 @@ export interface IgnoredRelayNoticeOptions {
  * gate hands off to the inbox. All attacker-influenced text goes through `textContent`.
  */
 export function mountIgnoredRelayNotice(options: IgnoredRelayNoticeOptions): void {
-  const { host, ignored, pinnedRelayUrl } = options;
+  const { host, ignored, pinnedRelayUrl, repairing = false } = options;
+  const relation = repairing ? "is re-pairing with" : "is paired with";
   const notice = el("div", "relay-pin-notice");
   notice.setAttribute("role", "status");
   notice.append(text("strong", "Relay link ignored. ", "relay-pin-notice-title"));
   notice.append(
     document.createTextNode(
-      `This browser is paired with ${relayOrigin(pinnedRelayUrl)} and only talks to that relay. ` +
+      `This browser ${relation} ${relayOrigin(pinnedRelayUrl)} and only talks to that relay. ` +
         "The link asked to use ",
     ),
   );
