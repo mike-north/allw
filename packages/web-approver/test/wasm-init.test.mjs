@@ -15,7 +15,7 @@
 import assert from "node:assert/strict";
 import { beforeEach, describe, test } from "node:test";
 
-import { initWasm, resetWasmForTests } from "../dist/index.js";
+import { initWasm, initWasmSync, resetWasmForTests } from "../dist/index.js";
 
 /** The FFI functions `assertGlueShape` requires, as no-ops. */
 const FFI = Object.fromEntries(
@@ -100,6 +100,31 @@ describe("initWasm — one init for overlapping callers", () => {
     fake.finish();
     assert.equal(await retry, fake.glue);
     assert.equal(fake.calls.length, 2, "the failure was not memoized");
+  });
+
+  test("initWasmSync refuses to instantiate while an initWasm is in flight", async () => {
+    const fake = deferredGlue();
+    let syncInits = 0;
+    const syncGlue = {
+      ...FFI,
+      default: async () => ({}),
+      initSync() {
+        syncInits += 1;
+      },
+    };
+    const pending = initWasm(fake.glue, "core.wasm");
+    assert.throws(() => initWasmSync(syncGlue, {}), /an async initWasm is in flight/);
+    assert.equal(syncInits, 0, "nothing was instantiated a second time");
+
+    await Promise.resolve();
+    fake.finish();
+    await pending;
+    assert.equal(
+      initWasmSync(syncGlue, {}),
+      fake.glue,
+      "once it finishes, the sync call reuses it",
+    );
+    assert.equal(syncInits, 0);
   });
 
   test("a glue missing the FFI subset is rejected, and not memoized", async () => {

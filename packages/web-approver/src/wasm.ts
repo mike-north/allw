@@ -168,10 +168,18 @@ async function instantiate(
  * `WebAssembly.Module`, synchronously instantiating it. Useful for Node/test hosts that read the
  * bytes themselves; the browser path is {@link initWasm}.
  *
- * @throws if the glue is missing the FFI subset.
+ * It can't join an {@link initWasm} that is still instantiating, and instantiating alongside it
+ * would replace the exports that init's handles use, so it throws instead.
+ *
+ * @throws if the glue is missing the FFI subset, or an {@link initWasm} is in flight.
  */
 export function initWasmSync(glueModule: unknown, module: WebAssembly.Module): AllwWasm {
   if (cached) return cached;
+  if (pending !== undefined) {
+    throw new Error(
+      "allw: an async initWasm is in flight; await it instead of calling initWasmSync",
+    );
+  }
   const glue = glueModule as Partial<WasmGlue>;
   assertGlueShape(glue);
   glue.initSync({ module });
