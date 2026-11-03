@@ -8,7 +8,9 @@
  * appear to be gating.
  */
 
+import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
+import { pathToFileURL } from "node:url";
 
 import { createClient } from "@allw/sdk";
 import { loadWasm } from "@allw/hook";
@@ -91,8 +93,24 @@ export async function runBridge(argv: readonly string[]): Promise<number> {
   return 0;
 }
 
-/** Run only when invoked as the process entrypoint (not when imported by tests). */
-if (process.argv[1] !== undefined && import.meta.url === `file://${process.argv[1]}`) {
+/**
+ * Whether this module is the process entrypoint (run the bridge) rather than imported by a test.
+ * An installed bin is a **symlink** in `node_modules/.bin`, so `argv[1]` is the symlink path while
+ * `import.meta.url` is the real `dist/cli.js`; comparing them raw made `allw-openclaw-bridge` exit
+ * silently without doing anything. Resolve the symlink first, as `@allw/hook` does.
+ * Regression-tested by the packaged-install smoke test (`scripts/smoke-packaged-install.mjs`).
+ */
+function isMainEntrypoint(): boolean {
+  const argv1 = process.argv[1];
+  if (argv1 === undefined) return false;
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(argv1)).href;
+  } catch {
+    return import.meta.url === pathToFileURL(argv1).href;
+  }
+}
+
+if (isMainEntrypoint()) {
   runBridge(process.argv.slice(2))
     .then((code) => {
       process.exitCode = code;
