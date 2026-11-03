@@ -52,6 +52,30 @@ test("display_model matches the shared vector's full model case", async () => {
   assert.deepEqual(model, dm.expected);
 });
 
+test("display_model raw_lines match every per-surface case in the shared vector", async () => {
+  const wasm = await loadWasm();
+  const { raw_lines_cases: cases } = loadVector();
+  assert.ok(cases.length > 0);
+  for (const c of cases) {
+    const context = {
+      action: {
+        record_schema_version: 1,
+        surface: c.surface,
+        syntactic: { raw: c.raw },
+        risk: "high",
+      },
+      summary: "s",
+      actor: { id: "machine:ci", kind: "claude-code" },
+      risk: "high",
+      reversible: false,
+      constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
+    };
+    const model = JSON.parse(wasm.display_model(JSON.stringify(context)));
+    assert.deepEqual(model.syntactic.raw_lines, c.raw_lines, c.class);
+    assert.equal(model.has_hidden_or_control_chars, c.has_hidden_or_control_chars, c.class);
+  }
+});
+
 test("display_model leaves the request hash bound to the raw bytes", async () => {
   const wasm = await loadWasm();
   const { display_model_case: dm } = loadVector();

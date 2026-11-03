@@ -57,13 +57,21 @@
 //! # Structure inside multi-line content
 //!
 //! `raw` is multi-line content: a shell command with a heredoc, or a file edit. In
-//! [`DisplaySubstrate::raw_lines`] a line feed is **structure** (the content is split on it), a TAB
-//! renders as [`TAB_MARKER`], and a CR directly before a line feed renders as [`CRLF_MARKER`].
-//! None of these set the flag: once ESC and lone CRs are escaped, a TAB or a line ending cannot
-//! overwrite or hide anything, and flagging every Go edit or heredoc commit would train humans to
-//! ignore the warning. Everywhere else — single-line fields (argv tokens, `bin`, flags, `cwd`, ids,
-//! the summary) and the single-line [`DisplaySubstrate::raw`] — TAB, LF and CR are escaped and set
-//! the flag, because they have no business there.
+//! [`DisplaySubstrate::raw_lines`] a line feed is **structure** (the content is split on it) and a
+//! TAB renders as [`TAB_MARKER`]; neither sets the flag. Once ESC and lone CRs are escaped, a TAB
+//! or a line feed cannot overwrite or hide anything, and flagging every Go edit or heredoc commit
+//! would train humans to ignore the warning.
+//!
+//! A CR directly before a line feed is structure **only for a file edit**, where CRLF line endings
+//! are ordinary content: it renders as [`CRLF_MARKER`] without setting the flag. On every other
+//! surface `raw` is executed (by a shell, or as a tool's input), and there a CR before LF is data,
+//! not a line ending: in bash, `cd ../scratch` + CR + LF + `rm -rf -- *` fails the `cd` (the target
+//! is `../scratch` + CR) and runs the `rm` in the original directory. So outside a file edit that
+//! CR is escaped as `\r` and sets the flag, like any other CR.
+//!
+//! Everywhere else — single-line fields (argv tokens, `bin`, flags, `cwd`, ids, the summary) and
+//! the single-line [`DisplaySubstrate::raw`] — TAB, LF and CR are escaped and set the flag, because
+//! they have no business there.
 //!
 //! # Notation
 //!
@@ -71,13 +79,21 @@
 //! - Every other C0 control and DEL renders as `\xHH` with lowercase hex (ESC → `\x1b`).
 //! - Everything else renders as `⟨U+XXXX⟩` with at least four uppercase hex digits
 //!   (U+202E → `⟨U+202E⟩`, U+E0041 → `⟨U+E0041⟩`).
-//! - In `raw_lines` only: TAB → [`TAB_MARKER`], CR before LF → [`CRLF_MARKER`] (no flag).
+//! - In `raw_lines` only: TAB → [`TAB_MARKER`], and in a file edit CR before LF →
+//!   [`CRLF_MARKER`] (no flag).
 //!
 //! The notation is not injective against *literal* text: a string containing the four printable
 //! characters `\x1b` displays the same as one containing an ESC byte. That is why every model
 //! carries [`DisplayModel::has_hidden_or_control_chars`] — surfaces show a warning whenever an
 //! escape was applied, so the human always knows when what they read is a stand-in for a byte they
 //! cannot see.
+//!
+//! The two structure markers are not injective either, and they **never** set the flag: a line
+//! containing the literal text `→   ` displays exactly like one with a TAB, and a file-edit line
+//! ending in a literal `␍` displays exactly like a CRLF ending. This is accepted because neither
+//! substitution changes what the content does in a way the human could be misled about: a TAB and
+//! four characters of indentation are both whitespace to a reader, and a CRLF ending is shown only
+//! for file content, where it is not executed. The hash still binds the real bytes.
 //!
 //! # Display-only
 //!
@@ -228,9 +244,9 @@ enum Context {
 /// padded to four columns, so indentation stays readable. It does not set the flag.
 pub const TAB_MARKER: &str = "→   ";
 
-/// How a CR directly before a line feed (a CRLF line ending) is shown at the end of a
-/// [`DisplaySubstrate::raw_lines`] entry. It does not set the flag; a CR anywhere else is escaped
-/// as `\r` and does.
+/// How a CR directly before a line feed (a CRLF line ending) in a **file edit** is shown at the end
+/// of a [`DisplaySubstrate::raw_lines`] entry. It does not set the flag. Any other CR — including a
+/// CR before LF in a command or another executed surface — is escaped as `\r` and does.
 pub const CRLF_MARKER: &str = "␍";
 
 /// Escape `text` into `out`, returning whether any flagged escape was applied.
@@ -314,10 +330,12 @@ fn push_codepoint(out: &mut String, c: char) {
     let _ = write!(out, "⟨U+{:04X}⟩", u32::from(c));
 }
 
-/// Render multi-line content as display lines: split on LF (structure), show a CR directly before
-/// an LF as [`CRLF_MARKER`] and a TAB as [`TAB_MARKER`] (both unflagged), and escape everything
-/// else as a single-line field would. Returns the lines and whether any flagged escape was applied.
-fn content_lines(text: &str) -> (Vec<String>, bool) {
+/// Render multi-line content as display lines: split on LF (structure), show a TAB as
+/// [`TAB_MARKER`] (unflagged), and escape everything else as a single-line field would. When
+/// `crlf_is_structure` (file edits only), a CR directly before an LF is shown as [`CRLF_MARKER`]
+/// without setting the flag; otherwise it is escaped as `\r` and flagged. Returns the lines and
+/// whether any flagged escape was applied.
+fn content_lines(text: &str, crlf_is_structure: bool) -> (Vec<String>, bool) {
     let mut flagged = false;
     let segments: Vec<&str> = text.split('\n').collect();
     let last = segments.len() - 1;
@@ -325,10 +343,10 @@ fn content_lines(text: &str) -> (Vec<String>, bool) {
         .iter()
         .enumerate()
         .map(|(i, segment)| {
-            // Only a CR that is followed by an LF is a line ending; a trailing CR on the final
-            // segment (no LF after it) is an ordinary CR and is escaped.
+            // Only a CR that is followed by an LF is a line ending, and only in file content; a
+            // trailing CR on the final segment (no LF after it) is an ordinary CR and is escaped.
             let (body, crlf) = match segment.strip_suffix('\r') {
-                Some(body) if i < last => (body, true),
+                Some(body) if crlf_is_structure && i < last => (body, true),
                 _ => (*segment, false),
             };
             let mut line = String::with_capacity(body.len());
@@ -406,9 +424,10 @@ pub struct DisplaySubstrate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw: Option<String>,
     /// `raw` as multi-line content, present whenever `raw` is: split on line feeds, each line
-    /// escaped. Line feeds, TABs (shown as [`TAB_MARKER`]) and a CR directly before a line feed
-    /// (shown as [`CRLF_MARKER`]) are structure and do not set
-    /// [`DisplayModel::has_hidden_or_control_chars`]; anything else that is escaped does. This is
+    /// escaped. Line feeds and TABs (shown as [`TAB_MARKER`]) are structure and do not set
+    /// [`DisplayModel::has_hidden_or_control_chars`]; in a file edit only, neither does a CR
+    /// directly before a line feed (shown as [`CRLF_MARKER`]). Anything else that is escaped does,
+    /// including a CR before LF in a command. This is
     /// the field a surface prints as the full action (a multi-line command as continuation lines, a
     /// file edit as its content).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -488,7 +507,7 @@ impl Escaper {
         }
     }
 
-    fn substrate(&mut self, s: &SyntacticSubstrate) -> DisplaySubstrate {
+    fn substrate(&mut self, surface: Surface, s: &SyntacticSubstrate) -> DisplaySubstrate {
         let (params_json, params_json_lines) = match &s.params {
             Some(params) => {
                 self.scan_json(params);
@@ -508,7 +527,9 @@ impl Escaper {
 
         let (raw, raw_lines) = match &s.raw {
             Some(raw) => {
-                let (lines, flagged) = content_lines(raw);
+                // CRLF is a line ending only in file content; everywhere else `raw` is executed and
+                // a CR before LF is data (see the module docs).
+                let (lines, flagged) = content_lines(raw, surface == Surface::FileEdit);
                 self.found |= flagged;
                 (Some(escape_for_display(raw)), Some(lines))
             }
@@ -547,7 +568,7 @@ pub fn display_model(context: &ApprovalContext) -> DisplayModel {
     let actor_id = esc.text(&context.actor.id);
     let actor_kind = esc.text(&context.actor.kind);
     let actor_label = format!("{actor_id} ({actor_kind})");
-    let syntactic = esc.substrate(&context.action.syntactic);
+    let syntactic = esc.substrate(context.action.surface, &context.action.syntactic);
     let chain = esc.list(context.chain.as_ref());
     DisplayModel {
         surface: context.action.surface,
@@ -1147,6 +1168,41 @@ mod tests {
                 ])
             );
         }
+    }
+
+    #[test]
+    fn a_crlf_line_ending_in_a_command_is_escaped_and_warns() {
+        // The cloud-review repro: bash reads `../scratch` + CR as the `cd` target, the `cd` fails,
+        // and `rm` runs in the original directory.
+        for surface in [
+            Surface::Command,
+            Surface::McpToolCall,
+            Surface::AgentToolCall,
+        ] {
+            let model = raw_model(surface, "cd ../scratch\r\nrm -rf -- *");
+            assert!(model.has_hidden_or_control_chars, "{surface:?}");
+            assert_eq!(
+                model.syntactic.raw_lines,
+                Some(vec![
+                    "cd ../scratch\\r".to_string(),
+                    "rm -rf -- *".to_string()
+                ]),
+                "{surface:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tab_in_a_command_stays_unflagged_structure() {
+        let model = raw_model(Surface::Command, "printf 'a\tb'\n\techo indented");
+        assert!(!model.has_hidden_or_control_chars);
+        assert_eq!(
+            model.syntactic.raw_lines,
+            Some(vec![
+                "printf 'a→   b'".to_string(),
+                "→   echo indented".to_string()
+            ])
+        );
     }
 
     #[test]

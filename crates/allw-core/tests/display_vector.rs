@@ -3,7 +3,8 @@
 //! `tests/fixtures/display_vector.json` is consumed by both this test (the Rust core) and
 //! `packages/sdk/test/wasm.test.mjs` (the compiled `.wasm`), so the two can never disagree about
 //! how untrusted text is shown to a human. It covers each escaped character class, one mixed
-//! string, and one full `display_model` case.
+//! string, one full `display_model` case, and per-surface `raw_lines` cases (which line endings and
+//! TABs are structure).
 //!
 //! Spec-first: every expected value in the fixture is written by hand from the notation documented
 //! in `crates/allw-core/src/display.rs`. There is deliberately no regenerate mode — a mismatch here
@@ -36,9 +37,37 @@ struct DisplayModelCase {
 }
 
 #[derive(Deserialize)]
+struct RawLinesCase {
+    class: String,
+    surface: String,
+    raw: String,
+    raw_lines: Vec<String>,
+    has_hidden_or_control_chars: bool,
+}
+
+#[derive(Deserialize)]
 struct Vector {
     escape_cases: Vec<EscapeCase>,
     display_model_case: DisplayModelCase,
+    raw_lines_cases: Vec<RawLinesCase>,
+}
+
+/// A minimal context on `surface` whose only substrate field is `raw`.
+fn raw_context(surface: &str, raw: &str) -> ApprovalContext {
+    serde_json::from_value(serde_json::json!({
+        "action": {
+            "record_schema_version": 1,
+            "surface": surface,
+            "syntactic": { "raw": raw },
+            "risk": "high"
+        },
+        "summary": "s",
+        "actor": { "id": "machine:ci", "kind": "claude-code" },
+        "risk": "high",
+        "reversible": false,
+        "constraints": { "allowed_decisions": ["approved", "denied"], "challenge_required": false }
+    }))
+    .expect("a valid ApprovalContext")
 }
 
 fn load() -> Vector {
@@ -91,4 +120,24 @@ fn display_model_case_hash_binds_the_raw_bytes() {
     let before = compute_request_hash(&ctx, 1_700_003_600_000);
     let _ = display_model(&ctx);
     assert_eq!(compute_request_hash(&ctx, 1_700_003_600_000), before);
+}
+
+#[test]
+fn every_raw_lines_case_matches_the_vector() {
+    let vector = load();
+    assert!(!vector.raw_lines_cases.is_empty());
+    for case in &vector.raw_lines_cases {
+        let model = display_model(&raw_context(&case.surface, &case.raw));
+        assert_eq!(
+            model.syntactic.raw_lines.as_ref(),
+            Some(&case.raw_lines),
+            "class: {}",
+            case.class
+        );
+        assert_eq!(
+            model.has_hidden_or_control_chars, case.has_hidden_or_control_chars,
+            "class: {}",
+            case.class
+        );
+    }
 }
