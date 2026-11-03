@@ -352,6 +352,8 @@ describe("AccountRelay — pairing", () => {
   });
 
   it("rejects completing a pairing with an unknown code (404)", async () => {
+    // Bind the root first: an unbound account refuses every completion (403) before code lookup.
+    await startPairing(testAccount("acct-unknown-code"));
     const { status, data } = await post<{ error: string }>(
       testAccount("acct-unknown-code"),
       "/pairing/complete",

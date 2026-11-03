@@ -268,6 +268,17 @@ describe("pairing/start — root-signed authorization", () => {
     await expectUnchanged(acct);
   });
 
+  it("403 for a non-EdDSA alg, even with an honest root signature", async () => {
+    // The forger always signs with the root's Ed25519 key; only the header `alg` differs, so
+    // each 403 is the alg check (the honest-header control is the forge-helper test above).
+    for (const alg of ["none", "HS256"]) {
+      const acct = testAccount(`auth-alg-${alg}`);
+      const header = { ...honestHeader(acct), alg };
+      expect(await postForged(acct, header, honestClaims(acct)), alg).toBe(403);
+      await expectUnchanged(acct);
+    }
+  });
+
   it("403 for an expired authorization", async () => {
     const acct = testAccount("auth-expired");
     const issuedAt = Date.now() - 10 * 60 * 1000;
@@ -346,6 +357,25 @@ describe("pairing/start — root-signed authorization", () => {
     expect(await accountState(acct)).toEqual({ boundRoot: otherRoot, pairings: 0 });
   });
 
+  it("keeps a used jti for the clock-skew margin past its expiry", async () => {
+    // A DO re-instantiated on a host whose clock lags could still accept a just-expired
+    // authorization as fresh, so its replay record must outlive expires_at by the 60 s skew.
+    const acct = testAccount("auth-jti-retention");
+    expect((await postStart(acct, pairingStartBody(acct))).status).toBe(201);
+    const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(acct));
+    await runInDurableObject(stub, (instance: AccountRelay) => {
+      const relay = instance as unknown as { sql: SqlStorage };
+      relay.sql.exec(`UPDATE pairing_start_jti SET expires_at = ?`, Date.now() - 30 * 1000);
+    });
+    expect((await postStart(acct, pairingStartBody(acct))).status).toBe(201);
+    const remaining = await runInDurableObject(stub, (instance: AccountRelay) => {
+      const relay = instance as unknown as { sql: SqlStorage };
+      return [...relay.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM pairing_start_jti`)][0]
+        ?.n;
+    });
+    expect(remaining).toBe(2);
+  });
+
   it("sweeps expired jti rows on the next pairing start", async () => {
     const acct = testAccount("auth-jti-sweep");
     expect((await postStart(acct, pairingStartBody(acct))).status).toBe(201);
@@ -361,5 +391,134 @@ describe("pairing/start — root-signed authorization", () => {
         ?.n;
     });
     expect(remaining).toBe(1);
+  });
+});
+
+/**
+ * Before root binding existed, anyone could create devices, pairing codes, actors and account
+ * state under any account id — including one derived from a root key they merely know (root keys
+ * are public: integrators are configured with them). Binding a root over such rows would launder
+ * them as root-authorized, so the first bind refuses (409) and an unbound account refuses every
+ * pairing completion (403). The rows below are exactly what the pre-binding relay could leave.
+ */
+describe("pairing — state from before root binding is never adopted", () => {
+  const ATTACKER_PUBKEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+  const LEGACY_PAIRING_TOKEN = "legacy-pairing-token-from-the-unauthenticated-start";
+
+  async function seed(accountId: string, sql: string, ...params: (string | number)[]) {
+    const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
+    await runInDurableObject(stub, (instance: AccountRelay) => {
+      (instance as unknown as { sql: SqlStorage }).sql.exec(sql, ...params);
+    });
+  }
+
+  async function count(accountId: string, table: string): Promise<number> {
+    const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
+    return runInDurableObject(stub, (instance: AccountRelay) => {
+      const relay = instance as unknown as { sql: SqlStorage };
+      return [...relay.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`)][0]?.n ?? 0;
+    });
+  }
+
+  async function legacyTokenHash(): Promise<string> {
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(LEGACY_PAIRING_TOKEN),
+    );
+    return b64url(new Uint8Array(digest));
+  }
+
+  const PRE_BINDING_ROWS: {
+    table: string;
+    sql: string;
+    params: () => Promise<(string | number)[]>;
+  }[] = [
+    {
+      table: "device",
+      sql: `INSERT INTO device (device_id, pubkey, label, created_at, auth_token_hash)
+              VALUES ('attacker-device', ?, 'attacker', 0, 'x')`,
+      params: () => Promise.resolve([ATTACKER_PUBKEY]),
+    },
+    {
+      table: "pairing",
+      sql: `INSERT INTO pairing (code, label, created_at, expires_at, used, auth_token_hash)
+              VALUES ('LEGACY01', NULL, 0, ?, 0, ?)`,
+      params: async () => [Date.now() + 10 * 60 * 1000, await legacyTokenHash()],
+    },
+    {
+      table: "actor",
+      sql: `INSERT INTO actor (actor_id, pubkey, label, created_at)
+              VALUES ('attacker-actor', ?, NULL, 0)`,
+      params: () => Promise.resolve([ATTACKER_PUBKEY]),
+    },
+    {
+      table: "account_state",
+      sql: `INSERT INTO account_state (ordinal, state_jws, created_at) VALUES (0, 'a.b.c', 0)`,
+      params: () => Promise.resolve([]),
+    },
+    {
+      table: "account_state_meta",
+      sql: `INSERT INTO account_state_meta (id, max_sequence, updated_at) VALUES (1, ?, 0)`,
+      params: () => Promise.resolve([Number.MAX_SAFE_INTEGER]),
+    },
+  ];
+
+  for (const row of PRE_BINDING_ROWS) {
+    it(`409 and no bind when the unbound account already has ${row.table} rows`, async () => {
+      const acct = testAccount(`pre-binding-${row.table}`);
+      await seed(acct, row.sql, ...(await row.params()));
+
+      const { status, data } = await postStart(acct, pairingStartBody(acct));
+      expect(status).toBe(409);
+      expect(String(data.error)).toMatch(/before root binding/);
+
+      const state = await accountState(acct);
+      expect(state.boundRoot).toBeNull();
+      // Refused, not purged: the seeded row is left in place for the operator to see.
+      expect(await count(acct, row.table)).toBe(1);
+      expect(await count(acct, "pairing_start_jti")).toBe(0);
+    });
+  }
+
+  it("the refused bind adds no device next to a pre-binding one", async () => {
+    const acct = testAccount("pre-binding-device-list");
+    const device = PRE_BINDING_ROWS[0];
+    if (!device) throw new Error("missing device row fixture");
+    await seed(acct, device.sql, ...(await device.params()));
+
+    expect((await postStart(acct, pairingStartBody(acct))).status).toBe(409);
+    const resp = await SELF.fetch(`http://relay.test/${acct}/devices`);
+    const listed = (await resp.json()) as { devices: { device_id: string }[] };
+    expect(listed.devices.map((d) => d.device_id)).toEqual(["attacker-device"]);
+  });
+
+  it("403 when completing a pre-binding pairing code on an unbound account", async () => {
+    const acct = testAccount("pre-binding-complete");
+    const pairing = PRE_BINDING_ROWS[1];
+    if (!pairing) throw new Error("missing pairing row fixture");
+    await seed(acct, pairing.sql, ...(await pairing.params()));
+
+    const resp = await SELF.fetch(`http://relay.test/${acct}/pairing/complete`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${LEGACY_PAIRING_TOKEN}`,
+      },
+      body: JSON.stringify({ code: "LEGACY01", pubkey: ATTACKER_PUBKEY }),
+    });
+    expect(resp.status).toBe(403);
+    expect(await count(acct, "device")).toBe(0);
+    const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(acct));
+    const used = await runInDurableObject(stub, (instance: AccountRelay) => {
+      const relay = instance as unknown as { sql: SqlStorage };
+      return [...relay.sql.exec<{ used: number }>(`SELECT used FROM pairing`)][0]?.used;
+    });
+    expect(used).toBe(0);
+  });
+
+  it("an honest first bind on an empty account still succeeds", async () => {
+    const acct = testAccount("pre-binding-empty-control");
+    expect((await postStart(acct, pairingStartBody(acct))).status).toBe(201);
+    expect((await accountState(acct)).boundRoot).toBe(rootFor(acct).rootPubkey);
   });
 });

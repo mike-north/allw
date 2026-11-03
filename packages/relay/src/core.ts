@@ -17,6 +17,10 @@
  * Every function here throws on any failure (malformed key, bad signature, expired, …). Callers map
  * a throw to a rejection status; there is no non-throwing failure path.
  *
+ * A failure to instantiate the wasm itself is the relay's fault, not the caller's, so it throws a
+ * distinct {@link CoreUnavailableError}; handlers call {@link ensureCore} first and map that to a
+ * 500 (still fail-closed) instead of blaming the request.
+ *
  * @see ../../../docs/enrollment.md §Model
  * @see ../../../crates/allw-wasm/src/lib.rs (the exported functions)
  */
@@ -26,13 +30,33 @@ import * as glue from "@allw/sdk/vendor/allw-wasm/allw_wasm.js";
 
 let initialized = false;
 
-/** Instantiate the wasm once per isolate. */
+/** The audited core could not be instantiated (a bad build or runtime change), not a bad input. */
+export class CoreUnavailableError extends Error {
+  constructor(cause: unknown) {
+    super("allw core wasm failed to initialize", { cause });
+    this.name = "CoreUnavailableError";
+  }
+}
+
+/** Instantiate the wasm once per isolate; throws {@link CoreUnavailableError} if it cannot. */
 function core(): typeof glue {
   if (!initialized) {
-    glue.initSync({ module: wasmModule });
+    try {
+      glue.initSync({ module: wasmModule });
+    } catch (cause) {
+      throw new CoreUnavailableError(cause);
+    }
     initialized = true;
   }
   return glue;
+}
+
+/**
+ * Instantiate the core now, so a handler can tell "the relay's core is broken" (500) apart from
+ * "the request failed verification" (4xx). Throws {@link CoreUnavailableError}.
+ */
+export function ensureCore(): void {
+  core();
 }
 
 /** Verified claims of an `allw-pairing-start+jws` (mirrors `allw_core::PairingStartClaims`). */
