@@ -297,10 +297,13 @@ trust decision, and it lives in the core:
   summary is labelled as the agent's description and sits below the action heading. Whenever the hidden-character
   badge shows, the escaped character is visible on the card. When `raw` and the hash-bound argv diverge, the card
   heading is the argv form and a "raw and argv differ" alert shows, as on the CLI; the two approvers decide divergence
-  with the same rule, tested against one shared fixture. The card heading uses the CLI's headline precedence whatever
-  the surface (a file edit's summary, then `raw`, then the reconstructed argv, then `server :: tool`), so a record
-  that mixes substrates (a tool call that also carries `argv`) heads with the command on both; a second shared
-  fixture covers it.
+  with the same rule, tested against one shared fixture. Both approvers head a request the same way, pinned by a second
+  shared fixture. On a tool surface (`mcp_tool_call`, `agent_tool_call`) with a tool, the heading is the tool
+  identity (`server :: tool`, or the tool alone), never `raw`: there `raw` is the caller's description (an OpenClaw
+  plugin's prose, say), not what executes. It is shown labelled as the description (CLI `Description:`, web
+  `description:`). Raw/argv divergence does not apply there; instead, a hash-bound bin/argv on a tool call is shown
+  with an alert that the call also carries a command (#321). Every other record heads with the first of: a file edit's
+  summary, `raw`, the reconstructed argv.
 - **Nothing on the web card or the audit receipt is clipped at any width.** Every value wraps
   (`overflow-wrap: anywhere`) and nothing is hidden behind `overflow: hidden` or a sideways scroll. The card's grid
   track is `minmax(0, 1fr)`, and the receipt's detail pane sets `min-width: 0`, so one long token cannot widen the page
