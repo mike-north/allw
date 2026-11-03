@@ -4,8 +4,9 @@
  * deny.
  *
  * This module is deliberately free of stdin/stdout and network I/O and is dependency-injected — the
- * WASM core and the approval function are passed in — so the full decision matrix is unit-testable
- * without the relay. `runHook` in `../cli.ts` wires the real `@allw/sdk` client into it.
+ * WASM core, the command-request builder and the approval function are passed in — so the full
+ * decision matrix is unit-testable without the relay. `runHook` in `../cli.ts` wires the real
+ * `@allw/sdk` functions into it.
  *
  * # Building the request
  * A POSIX shell command (`Bash`, or `Monitor` with a `command`) is built through `@allw/sdk`'s
@@ -35,7 +36,7 @@
  * @see ../../../sdk/src/index.ts (requestApproval is itself fail-closed: approved ⇒ verified)
  */
 
-import { CommandActionError, commandRequest } from "@allw/sdk";
+import { CommandActionError, type commandRequest } from "@allw/sdk";
 
 import type { HookWasm } from "./wasm.js";
 import { agentSafeErrorText, agentSafeText } from "./agent-text.js";
@@ -75,12 +76,20 @@ export interface HookApprovalRequest {
 /** The injectable approval function — the real one is `client.requestApproval` from `@allw/sdk`. */
 export type RequestApprovalFn = (req: HookApprovalRequest) => Promise<ApprovalVerdict>;
 
+/**
+ * The injectable command-request builder — the real one is `@allw/sdk`'s `commandRequest`. It
+ * rejects with a `CommandActionError` for a command it refuses; any rejection denies.
+ */
+export type CommandRequestFn = typeof commandRequest;
+
 export { MAX_ERROR_TEXT_CHARS, agentSafeErrorText, agentSafeText } from "./agent-text.js";
 
 /** Everything `decide` needs that isn't the parsed input — all injectable for tests. */
 export interface DecideDeps {
   readonly wasm: HookWasm;
   readonly config: HookConfig;
+  /** Builds the request for a POSIX shell command (`Bash`, `Monitor`'s `command`). */
+  readonly commandRequest: CommandRequestFn;
   readonly requestApproval: RequestApprovalFn;
 }
 
@@ -132,16 +141,18 @@ function hookActor(hostname: string): HookApprovalRequest["actor"] {
  * is unchanged, so the request is the one the hook built by hand before #269.
  *
  * @throws {@link CommandActionError} (as a rejection) when the SDK refuses the command: invalid
- * shell syntax, a blank command or program, or a blank `cwd`. The caller denies.
+ * shell syntax, or a blank command or program. (It also refuses a blank `cwd`, which the stdin
+ * parser has already turned into an absent one.) The caller denies.
  */
 async function commandApprovalRequest(
+  build: CommandRequestFn,
   command: string,
   summary: string,
   cwd: string | undefined,
   config: HookConfig,
   hostname: string,
 ): Promise<HookApprovalRequest> {
-  const req = await commandRequest({
+  const req = await build({
     commandLine: command,
     summary,
     cwd: cwd ?? null,
@@ -215,15 +226,16 @@ type PreparedCall =
  */
 async function prepareCall(
   input: PreToolUseInput,
-  config: HookConfig,
-  wasm: HookWasm,
+  deps: DecideDeps,
   hostname: string,
 ): Promise<PreparedCall> {
+  const { config, wasm } = deps;
   const command = posixCommandCall(input.toolName, input.toolInput);
   if (command !== null) {
     if (command.kind !== "command") return command;
     try {
       const req = await commandApprovalRequest(
+        deps.commandRequest,
         command.command,
         command.summary,
         input.cwd,
@@ -232,7 +244,8 @@ async function prepareCall(
       );
       return { kind: "request", req, summary: command.summary };
     } catch (err) {
-      // A command the SDK refuses is never submitted; the human is not asked (fail-closed).
+      // A command the SDK refuses, or any other failure to build the request (the SDK's WASM
+      // loader, say), is never submitted; the human is not asked (fail-closed).
       return {
         kind: "build-error",
         reason: `allw: could not build an ActionRecord for the command (fail-closed deny): ${agentSafeErrorText(
@@ -270,7 +283,7 @@ export async function decide(
   deps: DecideDeps,
   hostname: string,
 ): Promise<ClaudeHookResult> {
-  const prepared = await prepareCall(input, deps.config, deps.wasm, hostname);
+  const prepared = await prepareCall(input, deps, hostname);
 
   if (prepared.kind === "pass-through") {
     return noDecisionOutput();

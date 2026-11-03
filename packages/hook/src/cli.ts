@@ -35,6 +35,7 @@ import { pathToFileURL } from "node:url";
 
 import {
   MAX_ESCAPED_DIAGNOSTIC_CHARS,
+  commandRequest,
   createClient,
   escapeToPrintableAscii,
   type ClientConfig,
@@ -138,7 +139,7 @@ export async function runHook(
     // The SDK's ApprovalRequest is structurally what the hook builds; the SDK validates it.
     client.requestApproval(req as Parameters<typeof client.requestApproval>[0]);
 
-  return decide(parsed.input, { wasm, config, requestApproval }, osHostname());
+  return decide(parsed.input, { wasm, config, commandRequest, requestApproval }, osHostname());
 }
 
 /**
