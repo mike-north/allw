@@ -17,14 +17,20 @@ pnpm run build:wasm
 pnpm --filter @allw/codex-hook build
 ```
 
-Pair an approver device with `@allw/approver`, then export the same relay/account environment the
-Claude Code hook uses:
+Pair an approver device with `@allw/approver`, then write the same integrator config file the
+Claude Code hook uses, `~/.allw/config.json` (`0600`; see `docs/quickstart.md` §4):
 
-```sh
-export ALLW_RELAY_URL="https://relay.example"
-export ALLW_ACCOUNT_ID="acct_..."
-export ALLW_APPROVER_ROOT_KEY="..."
+```json
+{
+  "version": 1,
+  "relay_url": "https://relay.example",
+  "account_id": "<account id from pair>",
+  "approver_root_key": "<account-root public key from pair>"
+}
 ```
+
+`ALLW_RELAY_URL`, `ALLW_ACCOUNT_ID`, and `ALLW_APPROVER_ROOT_KEY` override the file per field;
+`ALLW_CONFIG` moves it.
 
 Add the hook to `~/.codex/hooks.json` or a trusted project `.codex/hooks.json`:
 

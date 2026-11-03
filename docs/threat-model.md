@@ -53,6 +53,7 @@ Out of scope:
 | Relay routing state         | Relay Durable Object                   | Stores opaque pending envelopes, device presence, and signed verdicts.                                                                                     |
 | Policy rules                | Approver device / policy store         | Standing user grants or denials; signed and precedence-ordered.                                                                                            |
 | `enrollment_secret`         | Account-root holder + enrollee only    | Authenticates the CSR the account root is about to certify; whoever holds it during the ceremony can get a key certified as an approver device (#175, R8). |
+| Integrator config file (`~/.allw/config.json`) | Integrator machine user | Trust anchor at rest: holds `approver_root_key` (with `relay_url` and `account_id`); whoever can write it can redirect approvals to a root they control. No secrets. Mitigations: kept `0600` in a `0700` `~/.allw` (the documented hand-written setup today; the `allw-approver pair` writer, still open in #230, will enforce it), never holds keyfile seeds or tokens (the loader rejects unknown keys), and `loadClientConfig` fails closed on a malformed / unknown-version / incomplete file and on an `account_id` that does not derive from `approver_root_key`. Env overrides (`ALLW_*`) are equally trusted, so whoever controls the agent's environment holds the same power. |
 
 ## Trust Boundaries
 
@@ -380,6 +381,7 @@ attestation, audit records, hook/SDK fail-closed behavior, or enrollment.
 - [ ] `from_approval` emits a signed `PolicyRule`; it does not mutate or reuse the one-shot verdict.
 - [ ] Audit records contain the verdict artifact, request hash, actor, action, policy result, and previous hash.
 - [ ] New config has fail-closed validation and cannot weaken timeout-ordering or verification guarantees.
+- [ ] Integrator trust-anchor config (`~/.allw/config.json` + `ALLW_*` overrides) is read only through `loadClientConfig`; it never holds secrets, and the account-id/root-key consistency check goes through the core.
 
 ## Review Evidence To Include In PRs
 

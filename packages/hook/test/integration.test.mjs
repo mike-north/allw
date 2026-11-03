@@ -21,6 +21,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { runHook } from "../dist/cli.js";
 import { loadWasm } from "../dist/lib/wasm.js";
@@ -28,7 +31,14 @@ import { loadWasm } from "../dist/lib/wasm.js";
 // ── Fixed, deterministic timeline (no Date.now in fixtures) ─────────────────────────────────────
 const NOW_MS = 1_700_000_000_000;
 const TIMEOUT_MS = 300_000;
-const ACCOUNT_ID = "acct-hook-integration";
+// Accounts are self-certifying (docs/enrollment.md §Model): the id is the core's derivation from
+// the account-root key (seed 11, below), so the config loader's derivation check passes.
+const ACCOUNT_ID = await (async () => {
+  const wasm = await loadWasm();
+  return wasm.account_id_for_root(
+    wasm.ed25519_public_key(Buffer.alloc(32, 11).toString("base64url")),
+  );
+})();
 const DEVICE_ID = "dev-hook-integration";
 const DEVICE_LABEL = "test device";
 
@@ -251,6 +261,87 @@ test("end-to-end (fail-closed): missing config (no ALLW_RELAY_URL) → deny with
 
   assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
   assert.ok(/ALLW_RELAY_URL is not set/.test(output.hookSpecificOutput.permissionDecisionReason));
+  assert.equal(dialed, false, "missing config fails closed before any relay dial");
+});
+
+/**
+ * Point HOME at a fresh temp dir for one test, optionally holding `~/.allw/config.json`, so the
+ * loader's *default* path is exercised (issue #230) and a real `~/.allw` never leaks in.
+ */
+function withConfigHome(t, file) {
+  const home = mkdtempSync(join(tmpdir(), "allw-hook-home-"));
+  const prev = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  t.after(() => {
+    for (const [key, value] of Object.entries(prev)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    rmSync(home, { recursive: true, force: true });
+  });
+  if (file !== undefined) {
+    mkdirSync(join(home, ".allw"), { mode: 0o700 });
+    writeFileSync(join(home, ".allw", "config.json"), JSON.stringify(file), { mode: 0o600 });
+  }
+  return home;
+}
+
+test("end-to-end (#230): config file only, no ALLW_* env → the hook gates and emits allow", async (t) => {
+  const wasm = await loadWasm();
+  const approver = await pairedApprover(wasm);
+  const { fetchImpl } = relayDouble(wasm, approver, "approved");
+  withConfigHome(t, {
+    version: 1,
+    relay_url: "https://relay.allw.test",
+    account_id: ACCOUNT_ID,
+    approver_root_key: approver.accountRootPub,
+  });
+
+  const output = await runHook(
+    bashStdin("rm -rf build", "/workspace/project"),
+    {}, // no ALLW_* env at all: every coordinate comes from ~/.allw/config.json
+    overrides(fetchImpl),
+  );
+
+  assert.equal(
+    output.hookSpecificOutput.permissionDecision,
+    "allow",
+    "a verified approval, with the coordinates read from the config file",
+  );
+});
+
+test("end-to-end (#230, fail-closed): config file only, denied verdict → deny", async (t) => {
+  const wasm = await loadWasm();
+  const approver = await pairedApprover(wasm);
+  const { fetchImpl } = relayDouble(wasm, approver, "denied");
+  withConfigHome(t, {
+    version: 1,
+    relay_url: "https://relay.allw.test",
+    account_id: ACCOUNT_ID,
+    approver_root_key: approver.accountRootPub,
+  });
+
+  const output = await runHook(bashStdin("rm -rf build", "/w"), {}, overrides(fetchImpl));
+  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+});
+
+test("end-to-end (#230, fail-closed): neither config file nor env → deny naming both ways to configure", async (t) => {
+  const home = withConfigHome(t, undefined);
+  let dialed = false;
+  const fetchImpl = () => {
+    dialed = true;
+    return Promise.reject(new Error("should not be called"));
+  };
+
+  const output = await runHook(bashStdin("rm -rf build", "/w"), {}, { fetchImpl });
+
+  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  const reason = output.hookSpecificOutput.permissionDecisionReason;
+  assert.ok(reason.includes(join(home, ".allw", "config.json")), `names the file: ${reason}`);
+  assert.match(reason, /ALLW_RELAY_URL/);
+  assert.match(reason, /ALLW_ACCOUNT_ID/);
+  assert.match(reason, /ALLW_APPROVER_ROOT_KEY/);
   assert.equal(dialed, false, "missing config fails closed before any relay dial");
 });
 
