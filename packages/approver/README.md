@@ -59,7 +59,11 @@ or `127.0.0.1` (not `[::1]`), and the URL may not carry a username, password, qu
 Every relay request carries pairing material or the device's bearer token, so a plaintext or
 malformed URL is refused before the keyfile or the relay is touched, with a non-zero exit
 ([#267](https://github.com/mike-north/allw/issues/267)). The rule is the SDK's and the web
-approver's, and `watch` applies it too, to `--relay` or else the keyfile's stored `relay_url`.
+approver's, and `watch` applies it too, to `--relay` or else the keyfile's stored `relay_url`. An
+accepted URL is used and stored in canonical form (lower-case scheme and host, no default port, no
+trailing `/`), so `pair --relay HTTPS://Relay.Example.COM/` stores `https://relay.example.com`.
+Library callers of the exported request builders (`pairingStart`, `deviceConnectWsUrl`, …) apply
+the exported `assertCliRelayUrl` first and use the URL it returns.
 
 > Pass `--code <code>` to redeem a code the account owner (root holder) generated via a root-signed `/pairing/start`. Omit it and
 > the CLI drives both start + complete itself (fine for the v0 skeleton).

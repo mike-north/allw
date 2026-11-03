@@ -86,7 +86,8 @@ export async function runPair(
   };
   // Reject a plaintext or malformed relay URL first (#267): before any request is built, and
   // before a fresh keyfile is generated or written, so a refused `pair` leaves nothing behind.
-  assertCliRelayUrl(options.relayUrl, "--relay");
+  // From here on only the canonical form is used: for every request and for the persisted relay_url.
+  const relayUrl = assertCliRelayUrl(options.relayUrl, "--relay");
   const now = options.now ?? Date.now();
   const { keyfile: existing, fresh } = loadOrGenerate(wasm, options.keyfilePath);
 
@@ -119,7 +120,7 @@ export async function runPair(
       randomBytes(16).toString("base64url"),
     );
     const started = await pairingStart(
-      options.relayUrl,
+      relayUrl,
       accountId,
       { rootPubkey: existing.account_root_pubkey, authorization },
       options.label,
@@ -133,7 +134,7 @@ export async function runPair(
 
   // 2. Complete pairing: register the device X25519 (encryption) key → device_id.
   const paired = await pairingComplete(
-    options.relayUrl,
+    relayUrl,
     accountId,
     code,
     pairingAuthToken,
@@ -155,7 +156,7 @@ export async function runPair(
   // 4. Persist the fully-paired identity (no partial writes before this point).
   const updated: Keyfile = {
     ...existing,
-    relay_url: options.relayUrl,
+    relay_url: relayUrl,
     account_id: accountId,
     device_id: deviceId,
     device_auth_token: paired.device_auth_token,

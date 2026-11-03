@@ -395,12 +395,12 @@ export async function runWatch(
   // (field absent) from paired.
   let keyfile = readKeyfile(options.keyfilePath);
 
-  const relayUrl = options.relayUrl ?? keyfile.relay_url;
+  const configuredRelayUrl = options.relayUrl ?? keyfile.relay_url;
   const accountId = keyfile.account_id;
   const deviceId = keyfile.device_id;
   const deviceAuthToken = keyfile.device_auth_token;
   if (
-    relayUrl === undefined ||
+    configuredRelayUrl === undefined ||
     accountId === undefined ||
     deviceId === undefined ||
     deviceAuthToken === undefined
@@ -413,8 +413,12 @@ export async function runWatch(
 
   // The presence socket carries the device bearer token in its query, and account-state fetches
   // carry it as a header: refuse a plaintext or malformed relay URL before either is built (#267).
-  // The URL in use is checked and named by its source, `--relay` when it overrides the keyfile.
-  assertCliRelayUrl(relayUrl, options.relayUrl !== undefined ? "--relay" : "keyfile relay_url");
+  // The URL in use is checked and named by its source, `--relay` when it overrides the keyfile;
+  // from here on only its canonical form is used, for the socket and for account-state fetches.
+  const relayUrl = assertCliRelayUrl(
+    configuredRelayUrl,
+    options.relayUrl !== undefined ? "--relay" : "keyfile relay_url",
+  );
 
   const url = deviceConnectWsUrl(relayUrl, accountId, deviceId, deviceAuthToken);
   log.info(`Connecting to ${redactAuthQuery(url)} …`);

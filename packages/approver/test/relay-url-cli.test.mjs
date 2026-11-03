@@ -105,7 +105,9 @@ before(async () => {
     probe.listen(0, "::", resolve);
   }).catch(
     () =>
-      new Promise((resolve) => {
+      new Promise((resolve, reject) => {
+        // If IPv4 loopback can't be bound either, fail before() at once instead of hanging.
+        probe.once("error", reject);
         probe.listen(0, "127.0.0.1", resolve);
       }),
   );
