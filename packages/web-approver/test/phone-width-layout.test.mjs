@@ -13,6 +13,9 @@
  * - a wrapped row of a value starts indented, never in column 0 where field labels start;
  * - the hidden-character warning is inside the viewport, above the action heading.
  *
+ * The audit-history receipt shows the same hash-bound content after the decision, so it is held to
+ * the same bar: nothing past the viewport and every tail laid out inside it.
+ *
  * It needs a Chrome or Chromium binary (`CHROME_PATH`, the macOS app, or one on `PATH`; GitHub's
  * Ubuntu runners ship `google-chrome`). Without one it skips and says so.
  *
@@ -29,7 +32,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { mountWith } from "./support/real-runtime.mjs";
+import { mountAuditWith, mountWith } from "./support/real-runtime.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = join(here, "..", "public");
@@ -95,7 +98,7 @@ const CONTEXTS = [
  * (an iframe is its own viewport, so media queries see the phone width). On load a script measures
  * the layout and writes the JSON result into `#result`, which Chrome's `--dump-dom` returns.
  */
-function harnessHtml(appHtml) {
+function harnessHtml(appHtml, markers) {
   const css = ["tokens.css", "styles.css"]
     .map((file) => readFileSync(join(PUBLIC_DIR, file), "utf8"))
     .join("\n");
@@ -117,12 +120,12 @@ function harnessHtml(appHtml) {
           out.overflowing.push(el.tagName + "." + el.className + " [" + r.left + ", " + r.right + "]");
         }
       }
-      out.scrollers = [...doc.querySelectorAll(".approval-plaintext, .approval-card")]
+      out.scrollers = [...doc.querySelectorAll(".approval-plaintext, .approval-card, .audit-wysiwys__pre, .audit-detail")]
         .filter((el) => el.scrollWidth > el.clientWidth + 1)
         .map((el) => el.className);
       const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
       for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-        for (const marker of ${JSON.stringify(MARKERS)}) {
+        for (const marker of ${JSON.stringify(markers)}) {
           const at = node.data.indexOf(marker);
           if (at < 0) continue;
           const range = doc.createRange();
@@ -190,6 +193,40 @@ function measureInChrome(chrome, html) {
   }
 }
 
+/**
+ * The shared layout bar: the iframe is the phone viewport, nothing extends past it or scrolls
+ * sideways, and every marker is laid out inside it (on an indented row when it follows a wrap in
+ * a plaintext block).
+ */
+function assertNothingOffScreen(m, markers) {
+  assert.equal(m.vw, VIEWPORT_WIDTH, "the iframe is the phone viewport");
+  assert.ok(m.docScrollWidth <= VIEWPORT_WIDTH, `page scrolls sideways (${m.docScrollWidth})`);
+  assert.deepEqual(m.overflowing, [], "no element extends past the viewport");
+  assert.deepEqual(m.scrollers, [], "no card, pane or plaintext block scrolls sideways");
+
+  for (const marker of markers) {
+    const hits = m.markers[marker];
+    assert.ok(hits?.length, `${marker} is rendered`);
+    for (const hit of hits) {
+      for (const r of hit.rects) {
+        assert.ok(
+          r.left >= 0 && r.right <= VIEWPORT_WIDTH + 0.5,
+          `${marker} is inside the viewport`,
+        );
+      }
+      if (hit.inPlaintext) {
+        // Each of these tails comes after a wrap, so it must sit on a hanging-indented row: at
+        // least 3ch in from the line's start, never in the label column.
+        const first = hit.rects[0];
+        assert.ok(
+          first.left >= hit.lineLeft + 3 * hit.chWidth,
+          `${marker} starts on an indented wrapped row (left ${first.left}, line ${hit.lineLeft})`,
+        );
+      }
+    }
+  }
+}
+
 const chrome = findChrome();
 
 test(
@@ -197,34 +234,9 @@ test(
   { skip: chrome === undefined ? "no Chrome/Chromium binary found (set CHROME_PATH)" : false },
   async () => {
     const root = await mountWith(CONTEXTS);
-    const m = measureInChrome(chrome, harnessHtml(root.outerHTML));
+    const m = measureInChrome(chrome, harnessHtml(root.outerHTML, MARKERS));
 
-    assert.equal(m.vw, VIEWPORT_WIDTH, "the iframe is the phone viewport");
-    assert.ok(m.docScrollWidth <= VIEWPORT_WIDTH, `page scrolls sideways (${m.docScrollWidth})`);
-    assert.deepEqual(m.overflowing, [], "no element extends past the viewport");
-    assert.deepEqual(m.scrollers, [], "no card or plaintext block scrolls sideways");
-
-    for (const marker of MARKERS) {
-      const hits = m.markers[marker];
-      assert.ok(hits?.length, `${marker} is on the card`);
-      for (const hit of hits) {
-        for (const r of hit.rects) {
-          assert.ok(
-            r.left >= 0 && r.right <= VIEWPORT_WIDTH + 0.5,
-            `${marker} is inside the viewport`,
-          );
-        }
-        if (hit.inPlaintext) {
-          // Each of these tails comes after a wrap, so it must sit on a hanging-indented row: at
-          // least 3ch in from the line's start, never in the label column.
-          const first = hit.rects[0];
-          assert.ok(
-            first.left >= hit.lineLeft + 3 * hit.chWidth,
-            `${marker} starts on an indented wrapped row (left ${first.left}, line ${hit.lineLeft})`,
-          );
-        }
-      }
-    }
+    assertNothingOffScreen(m, MARKERS);
 
     assert.ok(m.badge, "the hidden-character warning shows");
     assert.ok(
@@ -232,5 +244,35 @@ test(
       "the hidden-character warning is inside the viewport",
     );
     assert.ok(m.badge.rect.bottom <= m.badge.headingTop, "the warning comes before the action");
+  },
+);
+
+/** Tail markers on the audit receipt: each must end up laid out inside the viewport. */
+const AUDIT_MARKERS = ["TAIL-OF-AUDIT-SUMMARY", "TAIL-OF-AUDIT-CWD", "TAIL-OF-AUDIT-ARG"];
+
+const AUDIT_CONTEXTS = [
+  // The #309 round-2 probe: a long unbroken context summary in the receipt's detail pane.
+  context(
+    "command",
+    {
+      bin: "deploy",
+      argv: ["deploy", `${"x".repeat(300)}TAIL-OF-AUDIT-ARG`],
+      cwd: `/srv/${"c".repeat(200)}TAIL-OF-AUDIT-CWD`,
+    },
+    `${"s".repeat(800)}TAIL-OF-AUDIT-SUMMARY`,
+  ),
+];
+
+test(
+  `at ${String(VIEWPORT_WIDTH)} px the audit receipt keeps every hash-bound tail on-screen`,
+  { skip: chrome === undefined ? "no Chrome/Chromium binary found (set CHROME_PATH)" : false },
+  async () => {
+    const root = await mountAuditWith(AUDIT_CONTEXTS);
+    assert.ok(
+      root.querySelector(".audit-context-summary"),
+      "the receipt shows the context summary",
+    );
+    const m = measureInChrome(chrome, harnessHtml(root.outerHTML, AUDIT_MARKERS));
+    assertNothingOffScreen(m, AUDIT_MARKERS);
   },
 );

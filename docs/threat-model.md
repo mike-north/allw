@@ -301,12 +301,14 @@ trust decision, and it lives in the core:
   the surface (a file edit's summary, then `raw`, then the reconstructed argv, then `server :: tool`), so a record
   that mixes substrates (a tool call that also carries `argv`) heads with the command on both; a second shared
   fixture covers it.
-- **Nothing on the web card is clipped at any width.** Every value wraps (`overflow-wrap: anywhere`) and nothing is
-  hidden behind `overflow: hidden` or a sideways scroll. The card's grid track is `minmax(0, 1fr)`, so one long token
-  cannot widen the page past the viewport. The hidden-character badge is the card's first line, above the action. In
+- **Nothing on the web card or the audit receipt is clipped at any width.** Every value wraps
+  (`overflow-wrap: anywhere`) and nothing is hidden behind `overflow: hidden` or a sideways scroll. The card's grid
+  track is `minmax(0, 1fr)`, and the receipt's detail pane sets `min-width: 0`, so one long token cannot widen the page
+  past the viewport. The hidden-character badge is the card's first line, above the action. In
   the exact plaintext (card and audit receipt), each logical line has a hanging indent, so a wrapped row of a long or
   padded value starts indented and never in the label column, the web analogue of the CLI's `↪`. A headless-Chrome
-  test renders hostile cards at 360 px and checks that every tail is laid out inside the viewport. One layout
+  test renders hostile cards and a hostile receipt at 360 px and checks that every tail is laid out inside the
+  viewport. One layout
   difference remains: the web shows tool-call `params` as indented JSON lines, while the CLI prints compact JSON on
   one wrapped row. Pretty-printed continuation lines are always indented, quoted, or a bracket, so none can pose as a
   label.

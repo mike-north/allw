@@ -6,8 +6,9 @@
 
 import { JSDOM } from "jsdom";
 
+import { mountAuditHistory } from "../../dist/audit-history.js";
 import { mountWebApprover } from "../../dist/browser.js";
-import { createWasmRuntime } from "../../dist/index.js";
+import { createWasmRuntime, WebApproverController } from "../../dist/index.js";
 import { loadTestWasm } from "../wasm-helper.mjs";
 
 export const ACCOUNT_ID = "acct-web-display-test";
@@ -82,5 +83,35 @@ export async function mountWith(contexts) {
     globalThis.document = saved.document;
     globalThis.window = saved.window;
     globalThis.HTMLButtonElement = saved.HTMLButtonElement;
+  }
+}
+
+/**
+ * Mount the audit-history receipt for `contexts`, each recorded as an approved decision, over the
+ * real WASM runtime, and return the rendered root. The runtime's own `prepare` builds every view;
+ * only the resolved decision is supplied, as a relay-recorded history would.
+ */
+export async function mountAuditWith(contexts) {
+  const wasm = await loadTestWasm();
+  const { identity, encryptTo } = pairedIdentity(wasm);
+  const envelopes = contexts.map((ctx, i) => envelope(`req-audit-${String(i)}`, encryptTo(ctx)));
+  const real = createWasmRuntime({ wasm, identity, nowMs: () => NOW_MS });
+  const runtime = {
+    ...real,
+    prepare: async (input) => ({ ...(await real.prepare(input)), resolvedDecision: "approved" }),
+  };
+  const controller = new WebApproverController({ runtime, nowMs: () => NOW_MS });
+  await controller.sync(envelopes);
+  const dom = new JSDOM('<div id="audit"></div>', { url: "https://approver.local/" });
+  const root = dom.window.document.getElementById("audit");
+  const saved = { document: globalThis.document, window: globalThis.window };
+  globalThis.document = dom.window.document;
+  globalThis.window = dom.window;
+  try {
+    mountAuditHistory(root, controller);
+    return root;
+  } finally {
+    globalThis.document = saved.document;
+    globalThis.window = saved.window;
   }
 }
