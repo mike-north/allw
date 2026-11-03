@@ -16,6 +16,7 @@ import { parseArgs } from "node:util";
 import { runKeygen } from "./commands/keygen.js";
 import { runPair } from "./commands/pair.js";
 import { createReadlinePrompter, runWatch, type WebSocketLike } from "./commands/watch.js";
+import { printSameMachineDemoWarning } from "./lib/demo-warning.js";
 import { defaultKeyfilePath } from "./lib/paths.js";
 import { loadWasm } from "./lib/wasm.js";
 import { getVersion } from "./version.js";
@@ -57,6 +58,10 @@ keygen OPTIONS:
 
 ⚠ v0 stand-in: device keys are held in software in the keyfile. Production custody is hardware-
   backed (Secure Enclave / StrongBox) — see issue #23. The wire protocol is unchanged either way.
+
+⚠ DEMO ONLY: pair and watch print a warning on every run. The keyfile holds the account root and
+  device signing keys, so any process running as this user (including a gated agent) can read them
+  and approve its own requests. Keep the keyfile off the machine the agent runs on.
 `;
 
 /** Print usage and exit with the given code. */
@@ -111,6 +116,12 @@ async function main(): Promise<void> {
     process.exit(0);
   }
   if (values.help) printUsageAndExit(0);
+
+  // `pair` and `watch` hold or create the account root and signing seeds on this machine. Label the
+  // setup as demo-only on every run, before any work, so the warning shows even if the command fails.
+  if (command === "pair" || command === "watch" || command === "serve") {
+    printSameMachineDemoWarning();
+  }
 
   const keyfilePath = values.keyfile ?? defaultKeyfilePath();
   const wasm = await loadWasm();
