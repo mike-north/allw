@@ -226,6 +226,7 @@ a program it runs.
       dash).
 
     These alternate readings run only at the top level, so they don't multiply with nesting.
+
 - **Bounds.** Each bound fails upward to `high`:
   - nesting of `-c`, `eval` and substitutions past 4 levels;
   - argv words past the 256th, which count as a `high` candidate;
