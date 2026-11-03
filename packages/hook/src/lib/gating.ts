@@ -146,7 +146,23 @@ type MonitorRequest =
   | { readonly kind: "ws" }
   | { readonly kind: "malformed" };
 
-/** Classify a `Monitor` `tool_input`. A `ws` watch needs an object with a string `url`. */
+/**
+ * The `Monitor` input keys a WebSocket watch may carry, top level and inside `ws`, from Claude
+ * Code's closed Monitor input schema. A watch with any other key is not one the hook can vouch runs
+ * nothing, so it is malformed (denied) rather than passed through.
+ */
+const MONITOR_WS_KEYS = new Set(["ws", "description", "timeout_ms"]);
+const MONITOR_WS_FIELDS = new Set(["url", "protocols"]);
+
+/** True if every key of `value` is in `allowed`. */
+function onlyKeys(value: Record<string, unknown>, allowed: ReadonlySet<string>): boolean {
+  return Object.keys(value).every((key) => allowed.has(key));
+}
+
+/**
+ * Classify a `Monitor` `tool_input`. A `ws` watch needs an object with a string `url`, and no key
+ * outside the watch schema at either level.
+ */
 function readMonitorRequest(toolInput: unknown): MonitorRequest {
   if (typeof toolInput !== "object" || toolInput === null || Array.isArray(toolInput)) {
     return { kind: "malformed" };
@@ -160,7 +176,12 @@ function readMonitorRequest(toolInput: unknown): MonitorRequest {
       : { kind: "malformed" };
   }
   if (hasWs && !hasCommand) {
-    return readStringField(record.ws, "url") !== null ? { kind: "ws" } : { kind: "malformed" };
+    const ws = record.ws;
+    const wellFormed =
+      readStringField(ws, "url") !== null &&
+      onlyKeys(record, MONITOR_WS_KEYS) &&
+      onlyKeys(ws as Record<string, unknown>, MONITOR_WS_FIELDS);
+    return wellFormed ? { kind: "ws" } : { kind: "malformed" };
   }
   return { kind: "malformed" };
 }
@@ -236,8 +257,23 @@ type FileEditReduction =
 const NOTEBOOK_EDIT_MODES = new Set(["replace", "insert", "delete"]);
 
 /**
+ * Every `NotebookEdit` input key the hook understands. A call carrying any other key (for example
+ * the older `cell_number` targeting field) is denied: a key the hook drops would be neither bound
+ * nor shown, so it could change which cell is edited without the human seeing it.
+ */
+const NOTEBOOK_EDIT_KEYS = new Set([
+  "notebook_path",
+  "cell_id",
+  "cell_type",
+  "edit_mode",
+  "new_source",
+]);
+
+/**
  * Reduce a `NotebookEdit` call (one cell of a Jupyter notebook) into the core's file_edit builder
  * inputs. The hash-bound bytes are the cell-level change itself: which cell, how, and the new source.
+ * The summary names the cell: `replace` and `delete` must target one by `cell_id`, and `insert`
+ * adds a cell after the given one, or at the start of the notebook without one.
  */
 function reduceNotebookEdit(toolInput: unknown): FileEditReduction {
   const notebookPath = readStringField(toolInput, "notebook_path");
@@ -245,6 +281,10 @@ function reduceNotebookEdit(toolInput: unknown): FileEditReduction {
     return { error: "NotebookEdit tool_input missing a string 'notebook_path'" };
   }
   const record = toolInput as Record<string, unknown>;
+  const unknownKey = Object.keys(record).find((key) => !NOTEBOOK_EDIT_KEYS.has(key));
+  if (unknownKey !== undefined) {
+    return { error: `NotebookEdit tool_input has an unsupported key '${unknownKey}'` };
+  }
   const optionalString = (key: string): string | null | undefined => {
     const value = record[key];
     if (value === undefined || value === null) return null;
@@ -266,8 +306,16 @@ function reduceNotebookEdit(toolInput: unknown): FileEditReduction {
   if (newSource === undefined || (newSource === null && mode !== "delete")) {
     return { error: "NotebookEdit tool_input missing a string 'new_source'" };
   }
+  if (cellId === null && mode !== "insert") {
+    return { error: `NotebookEdit '${mode}' needs a string 'cell_id' naming the cell` };
+  }
   const paths = [notebookPath];
-  const target = cellId === null ? mode : `cell ${cellId}, ${mode}`;
+  const target =
+    mode === "insert"
+      ? cellId === null
+        ? "insert at start"
+        : `insert after cell ${cellId}`
+      : `${mode} cell ${cellId ?? ""}`;
   return {
     operation: "notebook_edit",
     paths,

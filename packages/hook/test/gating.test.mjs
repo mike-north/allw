@@ -354,6 +354,84 @@ test("gateToolCall(NotebookEdit) with a malformed input → build-error (#298)",
   }
 });
 
+// Regression (#316 review S2): the human must be shown which cell a NotebookEdit changes.
+
+test("gateToolCall(NotebookEdit replace/delete) without a cell_id → build-error (#316 S2)", async () => {
+  const wasm = await loadWasm();
+  for (const input of [
+    { notebook_path: "/repo/n.ipynb", new_source: "x" },
+    { notebook_path: "/repo/n.ipynb", new_source: "x", edit_mode: "replace" },
+    { notebook_path: "/repo/n.ipynb", edit_mode: "delete" },
+    { notebook_path: "/repo/n.ipynb", edit_mode: "delete", cell_id: null },
+  ]) {
+    assert.equal(
+      gateToolCall(wasm, "NotebookEdit", input, "/repo").kind,
+      "build-error",
+      `NotebookEdit ${JSON.stringify(input)} names no cell, so it must deny`,
+    );
+  }
+});
+
+test("gateToolCall(NotebookEdit) with a key the hook doesn't understand → build-error (#316 S2)", async () => {
+  const wasm = await loadWasm();
+  // `cell_number` is the older targeting field: dropped, it would pick a cell the human never saw.
+  for (const input of [
+    { notebook_path: "/repo/n.ipynb", cell_number: 3, new_source: "x" },
+    { notebook_path: "/repo/n.ipynb", cell_id: "c1", new_source: "x", path: "/etc/x" },
+  ]) {
+    assert.equal(
+      gateToolCall(wasm, "NotebookEdit", input, "/repo").kind,
+      "build-error",
+      `NotebookEdit ${JSON.stringify(input)} must deny`,
+    );
+  }
+});
+
+test("gateToolCall(NotebookEdit insert) says where the cell goes (#316 S2)", async () => {
+  const wasm = await loadWasm();
+  const base = { notebook_path: "/repo/n.ipynb", new_source: "x = 1", cell_type: "code" };
+  const after = gateToolCall(wasm, "NotebookEdit", { ...base, edit_mode: "insert", cell_id: "c1" });
+  assert.match(after.summary, /insert after cell c1/);
+  assert.doesNotMatch(after.summary, /\(cell c1, insert\)/, "never reads as 'at cell c1'");
+  const start = gateToolCall(wasm, "NotebookEdit", { ...base, edit_mode: "insert" });
+  assert.match(start.summary, /insert at start/);
+  const replace = gateToolCall(wasm, "NotebookEdit", { ...base, cell_id: "c1" });
+  assert.match(replace.summary, /replace cell c1/);
+});
+
+// Monitor's input schema is closed (`command` | `ws`, plus `description` and `timeout_ms`; `ws`
+// holds only `url` and `protocols`). A watch carrying anything else isn't one the hook can vouch
+// runs nothing (#316 review N3).
+
+test("gateToolCall(Monitor ws) with the documented optional keys → pass-through", async () => {
+  const wasm = await loadWasm();
+  const out = gateToolCall(
+    wasm,
+    "Monitor",
+    {
+      ws: { url: "wss://example.test/events", protocols: ["v1"] },
+      description: "deploy events",
+      timeout_ms: 300000,
+    },
+    "/repo",
+  );
+  assert.equal(out.kind, "pass-through");
+});
+
+test("gateToolCall(Monitor ws) with an unknown key at either level → build-error (#316 N3)", async () => {
+  const wasm = await loadWasm();
+  for (const input of [
+    { ws: { url: "wss://example.test" }, script: "rm -rf ~" },
+    { ws: { url: "wss://example.test", command: "rm -rf ~" } },
+  ]) {
+    assert.equal(
+      gateToolCall(wasm, "Monitor", input, "/repo").kind,
+      "build-error",
+      `Monitor ${JSON.stringify(input)} must deny`,
+    );
+  }
+});
+
 test("gateToolCall(non-gated) → pass-through", async () => {
   const wasm = await loadWasm();
   const out = gateToolCall(wasm, "Read", { file_path: "/etc/hosts" }, "/repo");
