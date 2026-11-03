@@ -161,3 +161,14 @@ The PM keeps this scheme current; if a label is missing or ambiguous, ask rather
     `npm stage reject`, `npm publish`, `npm trust` or the npm bootstrap script. CI only _stages_ a
     release; a human maintainer cuts the tag and approves each staged version with npm 2FA
     (`docs/releasing.md`). Changing the release tooling in a PR is fine; running it is not.
+
+## Delegation & model choice
+
+30. **Size the model to the task when delegating to Claude.** Default simple and moderately
+    complicated work to **Sonnet** (subagent `model: "sonnet"`, or `--model sonnet` on a launched
+    agent). That covers docs, test additions, CI/lint/format fixes, rebases and conflict
+    resolution, small non-security features, and reviews of non-security PRs.
+31. **Keep Opus for the work where depth pays.** That means anything touching a security boundary
+    (crypto, verdict signing/verification, account binding, fail-closed paths), design-heavy or
+    cross-module changes, and the adversarial review of any of those. When unsure whether a task
+    touches a security boundary, treat it as if it does.
