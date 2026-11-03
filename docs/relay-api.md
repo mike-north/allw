@@ -599,24 +599,23 @@ and timeouts are transient and not logged.
   Durable Object hibernates or is evicted inside the window (#319). Removing the token removes its
   claim too. A stored claim dated in the future (a clock anomaly on the host that wrote it) counts as
   made now, so it blocks the token for one window at most.
-- **Trailing wakeup.** A skipped submit may have landed after the service worker already fetched its
+- **Trailing wakeup.** A skipped submit may have landed after the device already fetched its
   inbox for the earlier wakeup, so the skip alone could leave that request with no push at all
-  (#313). The relay therefore records the subscription as owed a wakeup. A request whose submit was
+  (#313). The relay therefore records the token as owed a wakeup. A request whose submit was
   skipped keeps its owed wakeup until a later wakeup is accepted: a wakeup claimed after the window
   clears it once the push service answers 2xx, unless another submit was skipped while that wakeup
-  was in flight. If none is accepted by the end of the window, the subscription gets **one**
+  was in flight. If none is accepted by the end of the window, the token gets **one**
   trailing send, however many submits were skipped, and that trailing send is not retried. A failed
   wakeup for the submit that claimed it is not retried (#333). The trailing wakeup is held to the
   same one-per-window bound, so it still respects an in-flight wakeup. Its own due time is stored,
   so it is never sent less than one window after the claim it trails, even across eviction. It is
-  dropped when no request is pending by then or the subscription is gone. Like every wakeup, its
+  dropped when no request is pending by then or the token is gone. Like every wakeup, its
   `TTL` covers the longest-lived pending request. Because the window starts at dispatch, every
   request gets a wakeup **attempt** after it was stored, within about 30 s (a slow fan-out can
   stretch that by its send timeouts). The owed wakeups are stored durably and sent from the
   account's alarm, so they survive the Durable Object hibernating or being evicted.
 
-  The same holds for APNs and FCM tokens, which are owed trailing wakeups exactly as subscriptions
-  are. Because a native wakeup carries a `request_id`, its trailing wakeup carries the id of the
+  This applies to every transport. Because a native wakeup carries a `request_id`, its trailing wakeup carries the id of the
   **latest** submit the window skipped (ties go to the newer submit), as long as that request is
   still pending and unexpired when the wakeup is sent. Otherwise, and for a row owed before the
   relay recorded that id, it carries the longest-lived pending request's id. Either way the id is
