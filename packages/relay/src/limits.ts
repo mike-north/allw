@@ -32,7 +32,11 @@ export async function readBodyCapped(request: Request, maxBytes: number): Promis
     if (!/^\d+$/.test(declared.trim()) || !Number.isSafeInteger(length)) {
       return { kind: "unreadable" };
     }
-    if (length > maxBytes) return { kind: "too_large" };
+    if (length > maxBytes) {
+      // Release the unread body rather than leaving the sender's stream dangling.
+      await request.body?.cancel().catch(() => undefined);
+      return { kind: "too_large" };
+    }
   }
   if (request.body === null) return { kind: "ok", text: "" };
 

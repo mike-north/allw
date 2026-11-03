@@ -16,6 +16,12 @@
  */
 export const PAIRING_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
+/**
+ * How long a terminal (expired / resolved / retracted) request row and its verdict are kept after
+ * `terminal_at` before the alarm's sweep deletes them.
+ */
+export const REQUEST_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
 // ---------------------------------------------------------------------------
 // Abuse limits on the unauthenticated `POST /{acct}/requests` (#248). Exported so tests can probe
 // each boundary (at the limit and one past it) without restating the numbers.

@@ -32,6 +32,7 @@ import {
   MAX_PENDING_REQUESTS_PER_ACCOUNT,
   MAX_REQUEST_BODY_BYTES,
   PAIRING_TTL_MS,
+  REQUEST_RETENTION_MS,
 } from "./constants.js";
 import {
   CoreUnavailableError,
@@ -201,7 +202,6 @@ if (PAIRING_ALPHABET.length !== 32) {
 }
 
 const PAIRING_CODE_LENGTH = 8;
-const REQUEST_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const AUTH_TOKEN_BYTES = 32;
 const MAX_ACCOUNT_STATE_DOCS = 16;
 const MAX_ACCOUNT_STATE_JWS_BYTES = 32 * 1024;
