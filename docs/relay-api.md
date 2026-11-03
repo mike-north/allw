@@ -455,25 +455,29 @@ number delivered.
   are collapsed on the device instead: the web approver's service worker shows them under one
   fixed notification `tag` (#237).
 
-- **Coalescing.** At most one wakeup per subscription (device id + endpoint) is sent per
-  **30 s** (`WEB_PUSH_COALESCE_MS`): a submit that finds a wakeup to that subscription in flight, or
-  sent within the window, skips it. This bounds push volume per subscription however fast
-  unauthenticated submits arrive (#248). The bound holds **per instance**: the last-claim times are
-  kept in memory, so a Durable Object that was evicted forgets earlier claims and can send one more
-  wakeup inside the window (#319).
-- **Trailing wakeup.** A skipped submit may have landed after the service worker already fetched
-  its inbox for the earlier wakeup, so the skip alone could leave that request with no push at all
-  (#313). The relay therefore records the subscription and sends it **one** more wakeup when its
-  window ends, however many submits were skipped. The trailing wakeup is held to the same
-  one-per-window bound (per instance; an evicted object forgets earlier claims, #319), so it still
-  respects an in-flight wakeup. Its own due time is stored, so it is never sent less than one window
-  after the claim it trails, even across eviction. It is dropped when no request
-  is pending by then or the subscription is gone. A submit that is woken normally after the window
-  covers everything stored before it, so it clears any trailing wakeup owed. Like every
-  wakeup, its `TTL` covers the longest-lived pending request.
-  Because the window starts at dispatch, every request gets a wakeup sent after it was stored,
-  within about 30 s. The owed wakeups are stored durably and sent from the account's alarm, so they
-  survive the Durable Object hibernating or being evicted.
+- **Coalescing.** At most one wakeup per subscription (device id + endpoint) is sent per **30 s**
+  (`WEB_PUSH_COALESCE_MS`): a submit that finds a wakeup to that subscription in flight, or sent
+  within the window, skips it. This bounds push volume per subscription however fast unauthenticated
+  submits arrive (#248). The time of each subscription's last wakeup is stored on its token row, so
+  the bound also holds when the Durable Object hibernates or is evicted inside the window (#319).
+  Removing the subscription removes its claim too. A stored claim dated in the future (a clock
+  anomaly on the host that wrote it) counts as made now, so it blocks the subscription for one
+  window at most.
+- **Trailing wakeup.** A skipped submit may have landed after the service worker already fetched its
+  inbox for the earlier wakeup, so the skip alone could leave that request with no push at all
+  (#313). The relay therefore records the subscription as owed a wakeup. A request whose submit was
+  skipped keeps its owed wakeup until a later wakeup is accepted: a wakeup claimed after the window
+  clears it once the push service answers 2xx, unless another submit was skipped while that wakeup
+  was in flight. If none is accepted by the end of the window, the subscription gets **one**
+  trailing send, however many submits were skipped, and that trailing send is not retried. A failed
+  wakeup for the submit that claimed it is not retried (#333). The trailing wakeup is held to the
+  same one-per-window bound, so it still respects an in-flight wakeup. Its own due time is stored,
+  so it is never sent less than one window after the claim it trails, even across eviction. It is
+  dropped when no request is pending by then or the subscription is gone. Like every wakeup, its
+  `TTL` covers the longest-lived pending request. Because the window starts at dispatch, every
+  request gets a wakeup **attempt** after it was stored, within about 30 s (a slow fan-out can
+  stretch that by its send timeouts). The owed wakeups are stored durably and sent from the
+  account's alarm, so they survive the Durable Object hibernating or being evicted.
 - **VAPID public key.** Clients subscribe with the key from `GET /.well-known/allw/vapid-public-key`
   (§3).
 - **Pruning.** When the push service answers **404 or 410** (the subscription is gone), the relay
