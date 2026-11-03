@@ -58,7 +58,7 @@ import { closeSync, constants as fsConstants, fstatSync, openSync, readSync } fr
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
-import { escapeToPrintableAscii } from "./printable-ascii.js";
+import { MAX_ESCAPED_DIAGNOSTIC_CHARS, escapeToPrintableAscii } from "./printable-ascii.js";
 import { assertRelayUrlTransport } from "./relay.js";
 import { loadWasmSync, type AllwWasm } from "./wasm.js";
 
@@ -170,13 +170,13 @@ function envValue(env: ConfigEnv, key: string): string | null {
 /**
  * Environment-sourced text (a config path built from `ALLW_CONFIG`, the path option or `HOME`, or an
  * env value) as it appears in an error message: printable ASCII via the core-free
- * {@link escapeToPrintableAscii} (#358). The hooks put these messages into the deny reason the agent
+ * {@link escapeToPrintableAscii}, clipped to {@link MAX_ESCAPED_DIAGNOSTIC_CHARS} (#358). The hooks put these messages into the deny reason the agent
  * reads, and config loading runs before the WASM core (and its display escape) is loaded, so a
  * newline or ESC in the env must not reach that channel raw. File content is never quoted at all
  * (#301). `ClientConfigError.path` keeps the raw path; only the message is escaped.
  */
 function shown(text: string): string {
-  return escapeToPrintableAscii(text);
+  return escapeToPrintableAscii(text, MAX_ESCAPED_DIAGNOSTIC_CHARS);
 }
 
 /** Where a resolved field came from, for error messages. */

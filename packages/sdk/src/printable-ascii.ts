@@ -14,6 +14,14 @@
  */
 
 /**
+ * The bound, in characters of escaped output, for environment- or input-sourced text quoted in a
+ * diagnostic (a config path, an env value, a hook input field, an unexpected error's message). It
+ * keeps a hostile value from inflating an error or deny reason: 100 KB of ESC would otherwise
+ * escape to 600 KB. Long enough for any real path or value to read in full.
+ */
+export const MAX_ESCAPED_DIAGNOSTIC_CHARS = 512;
+
+/**
  * `text` as printable ASCII (0x20-0x7e):
  *
  * - every UTF-16 unit outside printable ASCII (newlines, ESC, bidi controls, any non-ASCII
@@ -21,8 +29,9 @@
  * - the backslash becomes `\u005c` too, so a literal `\u001b` in the text reads differently from
  *   an escaped ESC.
  *
- * With `maxChars`, the result is clipped to at most that many characters on an escape boundary
- * (never inside a `\uXXXX`), and `...` is appended when anything was cut.
+ * With `maxChars`, at most that many characters of escaped text are kept, cut on an escape
+ * boundary (never inside a `\uXXXX`). `maxChars` is the budget before the marker: when anything
+ * was cut, `...` is appended, so a clipped result is up to `maxChars + 3` characters long.
  */
 export function escapeToPrintableAscii(text: string, maxChars?: number): string {
   let out = "";

@@ -40,7 +40,7 @@ export {
   loadClientConfig,
 } from "./config.js";
 export type { ConfigEnv, IntegratorConfig, LoadClientConfigOptions } from "./config.js";
-export { escapeToPrintableAscii } from "./printable-ascii.js";
+export { MAX_ESCAPED_DIAGNOSTIC_CHARS, escapeToPrintableAscii } from "./printable-ascii.js";
 export type {
   CommandActionErrorReason,
   CommandActionFromLineOptions,

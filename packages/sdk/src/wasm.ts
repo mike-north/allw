@@ -22,7 +22,7 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { escapeToPrintableAscii } from "./printable-ascii.js";
+import { MAX_ESCAPED_DIAGNOSTIC_CHARS, escapeToPrintableAscii } from "./printable-ascii.js";
 
 /**
  * The subset of the `allw-wasm` FFI the SDK calls. Every function takes and returns JSON strings
@@ -263,16 +263,19 @@ export function wasmLoadError(
   fileExists: (path: string) => boolean = existsSync,
 ): Error {
   const missing = VENDOR_FILES.filter((file) => !fileExists(join(dir, file)));
+  // The vendor dir comes from the install location, which can hold any characters; it is quoted
+  // escaped and bounded like the cause (#358).
+  const shownDir = escapeToPrintableAscii(dir, MAX_ESCAPED_DIAGNOSTIC_CHARS);
   if (missing.length > 0) {
     return new Error(
-      `allw: failed to load the vendored WASM core from ${dir}: ${missing.join(" and ")} ` +
+      `allw: failed to load the vendored WASM core from ${shownDir}: ${missing.join(" and ")} ` +
         `${missing.length === 1 ? "is" : "are"} missing. Run \`pnpm run build:wasm\` from the ` +
         `repo root first (or reinstall @allw/sdk if it came from npm).`,
       { cause },
     );
   }
   return new Error(
-    `allw: failed to load the vendored WASM core from ${dir} (${describeLoadCause(cause)}). ` +
+    `allw: failed to load the vendored WASM core from ${shownDir} (${describeLoadCause(cause)}). ` +
       `The vendored files are present, so rebuilding may not help; reinstall @allw/sdk or ` +
       `rebuild the core (\`pnpm run build:wasm\`) if the files are damaged.`,
     { cause },

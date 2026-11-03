@@ -136,6 +136,16 @@ test("a non-Error cause, even one that throws when stringified, is described", (
   assert.match(wasmLoadError(DIR, hostile, allPresent).message, /could not be described/);
 });
 
+test("the vendor dir is quoted escaped too, in both messages (#358)", () => {
+  const dir = "/opt/allw\nallw: APPROVED\u001b[2J/vendor";
+  const shown = "/opt/allw\\u000aallw: APPROVED\\u001b[2J/vendor";
+  for (const exists of [allPresent, () => false]) {
+    const message = wasmLoadError(dir, new Error("x"), exists).message;
+    assert.match(message, PRINTABLE_ASCII, message);
+    assert.ok(message.includes(`from ${shown}`), message);
+  }
+});
+
 /** A package-shaped temp dir: the loader's `dist/` modules (copied) beside `vendor/allw-wasm/` (as given). */
 function packageWithVendor(t, files) {
   const root = mkdtempSync(join(tmpdir(), "allw-wasm-load-"));

@@ -27,6 +27,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   CLIENT_CONFIG_VERSION,
   ClientConfigError,
+  MAX_ESCAPED_DIAGNOSTIC_CHARS,
   defaultClientConfigPath,
   loadClientConfig,
 } from "../dist/index.js";
@@ -785,5 +786,32 @@ test("a file-sourced error names its escaped path in the source description (#35
   assertEscapedConfigError(
     () => loadClientConfig({ env: {}, path }),
     [`from 'relay_url' in ${join(base, `dir${HOSTILE_358_SHOWN}`, "config.json")}`],
+  );
+});
+
+test("a huge env-sourced path is quoted clipped to the shared bound (#358)", () => {
+  // 100,000 ESCs would escape to 600,000 characters of message.
+  const path = `/nonexistent-allw-358/${"\u001b".repeat(100_000)}`;
+  assert.throws(
+    () => loadClientConfig({ env: { ALLW_CONFIG: path } }),
+    (err) => {
+      assert.ok(err instanceof ClientConfigError);
+      assert.equal(err.path, path, ".path stays raw");
+      assert.doesNotMatch(err.message, CONTROL_CHAR);
+      // The path is too long to open (ENAMETOOLONG), so which message fires depends on the OS;
+      // either way it quotes the path once, from the start, clipped with "...".
+      const prefix = "allw: config file ";
+      assert.ok(err.message.startsWith(`${prefix}/nonexistent-allw-358/`), err.message);
+      const quoted = err.message.slice(prefix.length, err.message.indexOf("...") + "...".length);
+      assert.ok(
+        quoted.length <= MAX_ESCAPED_DIAGNOSTIC_CHARS + "...".length,
+        String(quoted.length),
+      );
+      assert.ok(
+        err.message.length < MAX_ESCAPED_DIAGNOSTIC_CHARS + 300,
+        String(err.message.length),
+      );
+      return true;
+    },
   );
 });
