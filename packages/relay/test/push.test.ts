@@ -16,6 +16,7 @@ import {
   WakeupCoalescer,
   buildPushWakeupPayload,
   dispatchPushWakeups,
+  type Fetcher,
   type PushTransport,
   type StoredPushToken,
 } from "../src/push.js";
@@ -82,7 +83,7 @@ describe("push fan-out", () => {
   });
 
   it("formats APNs and FCM requests while keeping only request_id in the logical wakeup", async () => {
-    const fetcher = vi.fn(async () => new Response(null, { status: 202 }));
+    const fetcher = vi.fn<Fetcher>(async () => new Response(null, { status: 202 }));
     const apns = new ApnsPushTransport({
       endpoint: "https://api.push.apple.test",
       topic: "com.example.allw",
@@ -110,14 +111,14 @@ describe("push fan-out", () => {
       token: "fcm-token",
     });
 
-    const apnsBody = JSON.parse((fetcher.mock.calls[0]?.[1] as RequestInit).body as string) as {
+    const apnsBody = JSON.parse(fetcher.mock.calls[0]?.[1]?.body as string) as {
       request_id?: string;
       context_ciphertext?: string;
     };
     expect(apnsBody.request_id).toBe("req-format");
     expect(apnsBody.context_ciphertext).toBeUndefined();
 
-    const fcmBody = JSON.parse((fetcher.mock.calls[1]?.[1] as RequestInit).body as string) as {
+    const fcmBody = JSON.parse(fetcher.mock.calls[1]?.[1]?.body as string) as {
       message?: { data?: Record<string, string> };
     };
     expect(fcmBody.message?.data).toEqual({ request_id: "req-format" });
