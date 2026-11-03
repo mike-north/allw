@@ -404,6 +404,10 @@ offline queue (still-pending, non-expired) as `request` messages. Hibernatable.
 - `{ "type": "retract", "request_id": string }` — resolved elsewhere, expired, or the submitting
   integrator cancelled it (`POST …/requests/{id}/retract`, #195); clear the notification either way.
 - `{ "type": "error", "error": string }` — your last message was malformed.
+- `{ "type": "error", "request_id": string, "error": string }` — your verdict for `request_id` was
+  refused and **not recorded** (#245): `"verdict failed provenance verification"` or
+  `"verdict is signed by another device"`. Nothing changed: the request is still pending, no
+  `retract` went out, and another device (or a corrected verdict from you) can still answer it.
 
 **device → relay**
 
@@ -415,8 +419,40 @@ offline queue (still-pending, non-expired) as `request` messages. Hibernatable.
   is `expired` (rejected, fail-closed); a verdict for a request the integrator already cancelled is
   `retracted` (rejected — a retract is never overridable, #195).
 
-Only device sockets may submit verdicts. On the first valid verdict the relay marks the request
-`resolved`, retracts it from other device sockets, and pushes it to any waiting integrator.
+Only device sockets may submit verdicts, and only a verdict with valid **provenance** is recorded
+(#245). The relay checks it in the core (`verify_verdict_provenance`), without the plaintext,
+against the account root bound at pairing (#242), the account-state documents it has verified,
+and the request it holds:
+
+- the signing device, named by the outer `approver.device_id`, is the device this socket
+  authenticated as (checked first, before any signature work);
+- the verdict's `decided_at` lies in the request envelope's `[created_at, expires_at]`, the same
+  window the integrator's `verify_verdict` checks (`docs/contract.md` §Verification checklist,
+  step 5). This runs before the certificate is judged, because `decided_at` is the time chosen by
+  the device;
+- the device certificate chains to that root, names this account and the signing device, and was
+  unexpired at that `decided_at`;
+- the device is not revoked in the highest-sequence verified account state (when any is stored);
+- the JWS verifies under the certified device key, its `kid` is that device, and every outer field
+  equals its signed claim;
+- the signed `request_id` is the frame's `request_id`, and the certified signer is the socket's
+  device.
+
+A verdict that fails any of these gets the `error` frame above. The request stays `pending`,
+nothing is stored, and no device is retracted, so one bad or compromised device can no longer
+answer every request first. A genuine verdict, approving or not, is recorded as before: on the
+first one the relay marks the request `resolved`, retracts it from other device sockets, and pushes
+it to any waiting integrator. Provenance is not a decision. The relay cannot check the WYSIWYS
+`request_hash` (it never sees the plaintext) or nonce replay, so the integrator still verifies
+every verdict in full (`docs/contract.md` §Verification checklist).
+
+A device can still backdate `decided_at` inside the request's window, so a device whose certificate
+expired partway through a request can answer it with a time when the certificate was valid. That
+holds only for a request whose envelope `created_at` precedes the certificate's expiry. That
+`created_at` is the submitter's clock, which the relay does not check at submit (see #248). The
+integrator's own
+`verify_verdict` accepts the same verdict. Revocation, not certificate expiry, is how a device is
+cut off at once.
 
 ### `ApprovalEnvelope` (relay-visible; wire field names)
 
@@ -568,7 +604,8 @@ Answers to load-bearing client questions, confirmed against the relay source + t
    canonical Verdict **object** JSON (`{ v, request_id, request_hash, decision, decided_at,
 approver:{account_id,device_id}, sig:<compact JWS>, note?, challenge_response?, device_cert? }`) —
    `JSON.parse` it and inline the object. The relay stores it opaquely and forwards the object to the
-   integrator; only `sig`/`device_cert` carry the cryptography (verified downstream, never by the relay).
+   integrator; only `sig`/`device_cert` carry the cryptography. The relay checks their provenance
+   before recording the verdict (§4, #245); the integrator verifies the verdict in full.
 
 2. **`ack` reconciliation.** The relay replies `{type:"ack", status}`:
    - `resolved` — your verdict won; row is terminal.

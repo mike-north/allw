@@ -60,12 +60,12 @@ pub use contract::{
 pub use crypto::{
     derive_number_match_challenge, effective_allow, issue_device_cert, revoked_device_ids,
     sign_account_state, sign_verdict, verify_account_state, verify_verdict,
-    verify_verdict_for_account, verify_verdict_with_account_states,
+    verify_verdict_for_account, verify_verdict_provenance, verify_verdict_with_account_states,
     verify_verdict_with_account_states_for_account, AccountState, AccountStateActor,
     AccountStateDevice, AccountStateError, AccountStatePreviousRoot, AccountStateRevocation,
     AccountStateRevocationKind, DeviceCertClaims, InMemoryNonceStore, JwsError, KeyError,
     NonceStore, PublicKey, SignVerdictError, SigningKeyPair, UnsignedVerdict, VerdictClaims,
-    VerifiedVerdict, VerifyError, MAX_NOTE_BYTES,
+    VerdictProvenance, VerifiedVerdict, VerifyError, MAX_NOTE_BYTES,
 };
 pub use display::{
     display_model, escape_for_display, has_hidden_or_control_chars, is_combining_mark,
