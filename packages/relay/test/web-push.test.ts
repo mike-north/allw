@@ -10,7 +10,7 @@
  * @see ../../../docs/relay-api.md (§5 Push wakeups)
  */
 
-import { SELF, env } from "cloudflare:test";
+import { env, exports } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import worker from "../src/index.js";
 import { UndeliverablePushTokenError } from "../src/push.js";
@@ -23,6 +23,7 @@ import {
   webPushTtlSeconds,
   type VapidConfig,
 } from "../src/web-push.js";
+import { urlOf } from "./support/fetch-input.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures (fixed clock; never `Date.now()` in data)
@@ -64,7 +65,7 @@ async function makeVapid(): Promise<{ config: VapidConfig; verifyKey: CryptoKey 
 }
 
 function capturingFetcher(status: number) {
-  return vi.fn<typeof fetch>(async () => new Response(null, { status }));
+  return vi.fn<typeof fetch>(() => Promise.resolve(new Response(null, { status })));
 }
 
 function wakeup(token = FCM_ENDPOINT) {
@@ -80,7 +81,7 @@ function wakeup(token = FCM_ENDPOINT) {
 function onlyCall(fetcher: ReturnType<typeof capturingFetcher>): [string, RequestInit] {
   expect(fetcher).toHaveBeenCalledTimes(1);
   const [input, init] = fetcher.mock.calls[0] ?? [];
-  return [String(input), init ?? {}];
+  return [urlOf(input), init ?? {}];
 }
 
 // ---------------------------------------------------------------------------
@@ -373,12 +374,13 @@ describe("WebPushTransport — payload-less VAPID wakeup", () => {
   it("cancels the push-service response body instead of leaving it unconsumed", async () => {
     const { config } = await makeVapid();
     const cancelled = vi.fn();
-    const fetcher = vi.fn<typeof fetch>(
-      async () =>
+    const fetcher = vi.fn<typeof fetch>(() =>
+      Promise.resolve(
         new Response(new ReadableStream({ cancel: cancelled }), {
           status: 400,
           headers: { "Content-Type": "application/json" },
         }),
+      ),
     );
     const transport = new WebPushTransport({ vapid: config, fetcher, now: () => NOW_MS });
 
@@ -432,7 +434,7 @@ describe("WebPushTransport — a push-service rejection is logged with its reaso
     endpoint = APPLE_ENDPOINT,
   ): Promise<{ warnings: string[]; failure: unknown; authorization: string }> {
     const { config } = await makeVapid();
-    const fetcher = vi.fn<typeof fetch>(async () => response());
+    const fetcher = vi.fn<typeof fetch>(() => Promise.resolve(response()));
     const transport = new WebPushTransport({ vapid: config, fetcher, now: () => NOW_MS });
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
@@ -514,8 +516,8 @@ describe("WebPushTransport — a push-service rejection is logged with its reaso
     async (status, _kind, expected) => {
       const { config } = await makeVapid();
       const cancelled = vi.fn(() => new Promise<void>(() => undefined));
-      const fetcher = vi.fn<typeof fetch>(
-        async () =>
+      const fetcher = vi.fn<typeof fetch>(() =>
+        Promise.resolve(
           new Response(
             new ReadableStream<Uint8Array>({
               start(controller) {
@@ -525,6 +527,7 @@ describe("WebPushTransport — a push-service rejection is logged with its reaso
             }),
             { status },
           ),
+        ),
       );
       const transport = new WebPushTransport({ vapid: config, fetcher, now: () => NOW_MS });
       const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
@@ -534,7 +537,11 @@ describe("WebPushTransport — a push-service rejection is logged with its reaso
             () => null,
             (error: unknown) => error,
           ),
-          new Promise((resolve) => setTimeout(() => resolve("hung"), 3_000)),
+          new Promise((resolve) =>
+            setTimeout(() => {
+              resolve("hung");
+            }, 3_000),
+          ),
         ]);
 
         if (expected === null) expect(outcome).toBeNull();
@@ -730,7 +737,7 @@ describe("GET /.well-known/allw/vapid-public-key", () => {
   });
 
   it("is 404 when Web Push is not configured (the test Worker has no VAPID bindings)", async () => {
-    const resp = await SELF.fetch(url);
+    const resp = await exports.default.fetch(url);
 
     expect(resp.status).toBe(404);
     expect(await resp.json()).toEqual({ error: "web push is not configured" });

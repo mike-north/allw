@@ -17,7 +17,7 @@
  * @see ../../../docs/relay-api.md §3 Pairing (`POST /{acct}/pairing/complete`)
  */
 
-import { SELF } from "cloudflare:test";
+import { exports } from "cloudflare:workers";
 import { describe, it, expect, vi } from "vitest";
 import * as glue from "@allw/sdk/vendor/allw-wasm/allw_wasm.js";
 import smallOrderVectorText from "../../../crates/allw-core/tests/fixtures/x25519_small_order.json?raw";
@@ -92,21 +92,21 @@ interface PairingStart {
 }
 
 async function startPairing(accountId: string): Promise<PairingStart> {
-  const resp = await SELF.fetch(url(accountId, "/pairing/start"), {
+  const resp = await exports.default.fetch(url(accountId, "/pairing/start"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(pairingStartBody(accountId)),
   });
   expect(resp.status).toBe(201);
-  return (await resp.json()) as PairingStart;
+  return await resp.json<PairingStart>();
 }
 
 async function completePairing(
   accountId: string,
   start: PairingStart,
   pubkey: string,
-): Promise<{ status: number; body: unknown }> {
-  const resp = await SELF.fetch(url(accountId, "/pairing/complete"), {
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const resp = await exports.default.fetch(url(accountId, "/pairing/complete"), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -114,13 +114,13 @@ async function completePairing(
     },
     body: JSON.stringify({ code: start.code, pubkey }),
   });
-  return { status: resp.status, body: await resp.json() };
+  return { status: resp.status, body: await resp.json<Record<string, unknown>>() };
 }
 
 async function listDevicePubkeys(accountId: string): Promise<string[]> {
-  const resp = await SELF.fetch(url(accountId, "/devices"));
+  const resp = await exports.default.fetch(url(accountId, "/devices"));
   expect(resp.status).toBe(200);
-  const body = (await resp.json()) as { devices: Array<{ pubkey: string }> };
+  const body = await resp.json<{ devices: { pubkey: string }[] }>();
   return body.devices.map((device) => device.pubkey);
 }
 
@@ -211,7 +211,7 @@ describe("pairing/complete — non-canonical base64url keys", () => {
         const accountId = testAccount(`acct-non-canonical-unauth-${label}`);
         await startPairing(accountId);
 
-        const resp = await SELF.fetch(url(accountId, "/pairing/complete"), {
+        const resp = await exports.default.fetch(url(accountId, "/pairing/complete"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ code: "NO-SUCH-CODE", pubkey }),
@@ -235,9 +235,11 @@ describe("POST /actors — non-canonical base64url keys", () => {
     const start = await startPairing(accountId);
     const paired = await completePairing(accountId, start, DEVICE_X25519_PUBKEY);
     expect(paired.status).toBe(201);
-    const { device_auth_token: deviceToken } = paired.body as { device_auth_token: string };
+    const deviceToken = paired.body.device_auth_token;
+    if (typeof deviceToken !== "string")
+      throw new Error("pairing/complete returned no device token");
 
-    const resp = await SELF.fetch(url(accountId, "/actors"), {
+    const resp = await exports.default.fetch(url(accountId, "/actors"), {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${deviceToken}` },
       body: JSON.stringify({ actor_id: "actor-1", pubkey }),
@@ -247,7 +249,7 @@ describe("POST /actors — non-canonical base64url keys", () => {
       body: SHAPE_ERROR,
     });
 
-    const listed = await SELF.fetch(url(accountId, "/actors"));
-    expect(((await listed.json()) as { actors: unknown[] }).actors).toEqual([]);
+    const listed = await exports.default.fetch(url(accountId, "/actors"));
+    expect((await listed.json<{ actors: unknown[] }>()).actors).toEqual([]);
   });
 });

@@ -14,7 +14,8 @@
  * @see ./README.md
  */
 
-import { env, runInDurableObject } from "cloudflare:test";
+import { runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:workers";
 import type { AccountRelay } from "../../src/index.js";
 import { rootFor } from "./accounts.js";
 

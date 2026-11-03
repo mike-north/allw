@@ -37,6 +37,8 @@ const ALLOWED_COMMANDS = [
   /^tsc -p tsconfig\.test\.json --noEmit$/,
   /^node --test "test\/\*\*\/\*\.test\.mjs"$/,
   /^eslint src$/,
+  // A package that lints its test sources too (the relay, #290). ESLint only reads.
+  /^eslint \.$/,
   /^vitest run$/,
 ];
 
@@ -120,6 +122,7 @@ test("the allowlist accepts the real script shapes", () => {
     [`${GUARDS.runtime} && tsc -p tsconfig.json && node --test "test/**/*.test.mjs"`, "runtime"],
     [`${GUARDS.types} && tsc -p tsconfig.json --noEmit`, "types"],
     [`${GUARDS.types} && eslint src`, "types"],
+    ["eslint .", null],
     [`tsc -p tsconfig.json && node --test "test/**/*.test.mjs"`, null],
     ["vitest run", null],
     ["tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit", null],

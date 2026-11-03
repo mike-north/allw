@@ -1,13 +1,14 @@
 /**
  * Tests for the relay's CORS policy (#258). The Worker runs under the dev `wrangler.jsonc` vars, which
  * allow the hosted web approver plus loopback on any port, so the browser-facing behaviour is tested
- * end to end through `SELF`. Overrides go through the default export with a custom `env`.
+ * end to end through the Worker's loopback (`exports.default` from `cloudflare:workers`). Overrides
+ * go through the default export with a custom `env`.
  *
  * @see https://fetch.spec.whatwg.org/#http-cors-protocol (preflight, ACAO, credentials mode)
  * @see ../../../docs/relay-api.md (§1 Conventions: CORS)
  */
 
-import { SELF, env } from "cloudflare:test";
+import { env, exports } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import worker from "../src/index.js";
 import {
@@ -33,7 +34,7 @@ function preflight(
   method: string,
   requestHeaders = "authorization",
 ): Promise<Response> {
-  return SELF.fetch(url("acct-cors-preflight", "/devices/dev-x/inbox"), {
+  return exports.default.fetch(url("acct-cors-preflight", "/devices/dev-x/inbox"), {
     method: "OPTIONS",
     headers: {
       Origin: origin,
@@ -106,13 +107,16 @@ describe("CORS preflight", () => {
   );
 
   it("rejects a preflight that carries no Origin, still varying on Origin", async () => {
-    const resp = await SELF.fetch(url("acct-cors-preflight-no-origin", "/devices/dev-x/inbox"), {
-      method: "OPTIONS",
-      headers: {
-        "Access-Control-Request-Method": "GET",
-        "Access-Control-Request-Headers": "authorization",
+    const resp = await exports.default.fetch(
+      url("acct-cors-preflight-no-origin", "/devices/dev-x/inbox"),
+      {
+        method: "OPTIONS",
+        headers: {
+          "Access-Control-Request-Method": "GET",
+          "Access-Control-Request-Headers": "authorization",
+        },
       },
-    });
+    );
 
     expect(resp.status).toBe(403);
     expectNoCorsGrant(resp);
@@ -127,10 +131,13 @@ describe("CORS preflight", () => {
   });
 
   it("leaves a non-preflight OPTIONS (no Access-Control-Request-Method) to the router", async () => {
-    const resp = await SELF.fetch(url("acct-cors-plain-options", "/devices/dev-x/inbox"), {
-      method: "OPTIONS",
-      headers: { Origin: HOSTED_APPROVER },
-    });
+    const resp = await exports.default.fetch(
+      url("acct-cors-plain-options", "/devices/dev-x/inbox"),
+      {
+        method: "OPTIONS",
+        headers: { Origin: HOSTED_APPROVER },
+      },
+    );
 
     expect(resp.status).toBe(405);
     expect(resp.headers.get("Access-Control-Allow-Origin")).toBe(HOSTED_APPROVER);
@@ -180,32 +187,32 @@ function browserPreflightFailure(
 describe("CORS — browser-shaped flow from the hosted web approver", () => {
   it("passes Chrome's preflight + CORS check for a JSON PUT of the device's push tokens", async () => {
     const acct = testAccount("acct-cors-browser-push-tokens");
-    const start = (await (
-      await SELF.fetch(url(acct, "/pairing/start"), {
+    const start = await (
+      await exports.default.fetch(url(acct, "/pairing/start"), {
         method: "POST",
         body: JSON.stringify(pairingStartBody(acct)),
       })
-    ).json()) as { code: string; pairing_auth_token: string };
-    const device = (await (
-      await SELF.fetch(url(acct, "/pairing/complete"), {
+    ).json<{ code: string; pairing_auth_token: string }>();
+    const device = await (
+      await exports.default.fetch(url(acct, "/pairing/complete"), {
         method: "POST",
         headers: { Authorization: `Bearer ${start.pairing_auth_token}` },
         body: JSON.stringify({ code: start.code, pubkey: DEVICE_PUBKEY }),
       })
-    ).json()) as { device_id: string; device_auth_token: string };
+    ).json<{ device_id: string; device_auth_token: string }>();
     const pushTokens = url(acct, `/devices/${device.device_id}/push-tokens`);
     const subscription = "https://fcm.googleapis.com/fcm/send/c3Vic2NyaXB0aW9uLWE";
 
     // 1. Chrome's preflight for `fetch(url, { method: "PUT", headers: { Authorization,
     //    "Content-Type": "application/json" } })`: a non-simple method plus non-safelisted headers.
-    const pre = await SELF.fetch(pushTokens, {
+    const pre = await exports.default.fetch(pushTokens, {
       method: "OPTIONS",
       headers: chromePreflightHeaders("PUT", "authorization,content-type"),
     });
     expect(browserPreflightFailure(pre, "PUT", ["authorization", "content-type"])).toBeNull();
 
     // 2. The actual request, as Chrome sends it after a passing preflight.
-    const actual = await SELF.fetch(pushTokens, {
+    const actual = await exports.default.fetch(pushTokens, {
       method: "PUT",
       headers: {
         Accept: "*/*",
@@ -227,30 +234,30 @@ describe("CORS — browser-shaped flow from the hosted web approver", () => {
 
   it("passes Chrome's preflight + CORS check for the authenticated inbox poll", async () => {
     const acct = testAccount("acct-cors-browser-inbox");
-    const start = (await (
-      await SELF.fetch(url(acct, "/pairing/start"), {
+    const start = await (
+      await exports.default.fetch(url(acct, "/pairing/start"), {
         method: "POST",
         body: JSON.stringify(pairingStartBody(acct)),
       })
-    ).json()) as { code: string; pairing_auth_token: string };
-    const device = (await (
-      await SELF.fetch(url(acct, "/pairing/complete"), {
+    ).json<{ code: string; pairing_auth_token: string }>();
+    const device = await (
+      await exports.default.fetch(url(acct, "/pairing/complete"), {
         method: "POST",
         headers: { Authorization: `Bearer ${start.pairing_auth_token}` },
         body: JSON.stringify({ code: start.code, pubkey: DEVICE_PUBKEY }),
       })
-    ).json()) as { device_id: string; device_auth_token: string };
+    ).json<{ device_id: string; device_auth_token: string }>();
     const inbox = url(acct, `/devices/${device.device_id}/inbox`);
 
     // 1. Chrome's preflight for `fetch(inbox, { headers: { Authorization } })` (relay-poll.ts).
-    const pre = await SELF.fetch(inbox, {
+    const pre = await exports.default.fetch(inbox, {
       method: "OPTIONS",
       headers: chromePreflightHeaders("GET", "authorization"),
     });
     expect(browserPreflightFailure(pre, "GET", ["authorization"])).toBeNull();
 
     // 2. The actual request, as Chrome sends it after a passing preflight.
-    const actual = await SELF.fetch(inbox, {
+    const actual = await exports.default.fetch(inbox, {
       headers: {
         Accept: "*/*",
         Authorization: `Bearer ${device.device_auth_token}`,
@@ -266,7 +273,7 @@ describe("CORS — browser-shaped flow from the hosted web approver", () => {
   });
 
   it("passes Chrome's preflight for a JSON POST with a bearer (pairing completion)", async () => {
-    const pre = await SELF.fetch(url("acct-cors-browser-post", "/pairing/complete"), {
+    const pre = await exports.default.fetch(url("acct-cors-browser-post", "/pairing/complete"), {
       method: "OPTIONS",
       // Chrome lowercases and sorts the list, comma-separated without spaces.
       headers: chromePreflightHeaders("POST", "authorization,content-type"),
@@ -278,7 +285,7 @@ describe("CORS — browser-shaped flow from the hosted web approver", () => {
 
 describe("CORS on actual responses", () => {
   it("echoes an allowed origin and sets Vary: Origin, preserving the handler's response", async () => {
-    const resp = await SELF.fetch(url("acct-cors-get", "/devices/dev-x/inbox"), {
+    const resp = await exports.default.fetch(url("acct-cors-get", "/devices/dev-x/inbox"), {
       headers: { Origin: HOSTED_APPROVER },
     });
 
@@ -291,7 +298,7 @@ describe("CORS on actual responses", () => {
 
   it("decorates a successful JSON POST from an allowed origin", async () => {
     const acct = testAccount("acct-cors-post");
-    const resp = await SELF.fetch(url(acct, "/pairing/start"), {
+    const resp = await exports.default.fetch(url(acct, "/pairing/start"), {
       method: "POST",
       headers: { Origin: HOSTED_APPROVER, "Content-Type": "application/json" },
       body: JSON.stringify(pairingStartBody(acct)),
@@ -302,9 +309,12 @@ describe("CORS on actual responses", () => {
   });
 
   it("gives a disallowed origin no ACAO; the request is otherwise handled as before", async () => {
-    const resp = await SELF.fetch(url("acct-cors-get-disallowed", "/devices/dev-x/inbox"), {
-      headers: { Origin: "https://evil.example" },
-    });
+    const resp = await exports.default.fetch(
+      url("acct-cors-get-disallowed", "/devices/dev-x/inbox"),
+      {
+        headers: { Origin: "https://evil.example" },
+      },
+    );
 
     expect(resp.status).toBe(404);
     expectNoCorsGrant(resp);
@@ -312,7 +322,7 @@ describe("CORS on actual responses", () => {
   });
 
   it("adds no CORS grant for a non-browser request without Origin", async () => {
-    const resp = await SELF.fetch(url("acct-cors-no-origin", "/devices/dev-x/inbox"));
+    const resp = await exports.default.fetch(url("acct-cors-no-origin", "/devices/dev-x/inbox"));
 
     expect(resp.status).toBe(404);
     expectNoCorsGrant(resp);
@@ -320,21 +330,21 @@ describe("CORS on actual responses", () => {
 
   it("passes a WebSocket upgrade from an allowed origin through untouched (101)", async () => {
     const acct = testAccount("acct-cors-websocket");
-    const start = (await (
-      await SELF.fetch(url(acct, "/pairing/start"), {
+    const start = await (
+      await exports.default.fetch(url(acct, "/pairing/start"), {
         method: "POST",
         body: JSON.stringify(pairingStartBody(acct)),
       })
-    ).json()) as { code: string; pairing_auth_token: string };
-    const complete = (await (
-      await SELF.fetch(url(acct, "/pairing/complete"), {
+    ).json<{ code: string; pairing_auth_token: string }>();
+    const complete = await (
+      await exports.default.fetch(url(acct, "/pairing/complete"), {
         method: "POST",
         headers: { Authorization: `Bearer ${start.pairing_auth_token}` },
         body: JSON.stringify({ code: start.code, pubkey: DEVICE_PUBKEY }),
       })
-    ).json()) as { device_id: string; device_auth_token: string };
+    ).json<{ device_id: string; device_auth_token: string }>();
 
-    const resp = await SELF.fetch(
+    const resp = await exports.default.fetch(
       url(
         acct,
         `/devices/${complete.device_id}/connect?auth=${encodeURIComponent(complete.device_auth_token)}`,
@@ -406,9 +416,12 @@ describe("CORS on relay-level routes (/.well-known/allw/…)", () => {
   });
 
   it("gives a disallowed origin no ACAO on a relay-level route", async () => {
-    const resp = await SELF.fetch("https://relay.allw.test/.well-known/allw/vapid-public-key", {
-      headers: { Origin: "https://evil.example" },
-    });
+    const resp = await exports.default.fetch(
+      "https://relay.allw.test/.well-known/allw/vapid-public-key",
+      {
+        headers: { Origin: "https://evil.example" },
+      },
+    );
 
     // The test Worker has no VAPID bindings (404), but the CORS decision is the same either way.
     expect(resp.status).toBe(404);
@@ -462,9 +475,10 @@ describe("withCors — a throwing handler still answers with CORS headers", () =
 
 /**
  * Strip `//` and `/* *\/` comments and trailing commas from JSONC, leaving string contents (which
- * hold `http://…` origins) untouched. Enough for the committed `wrangler.jsonc`.
+ * hold `http://…` origins) untouched, so the result parses as JSON. Enough for the committed
+ * `wrangler.jsonc`.
  */
-function parseJsonc(text: string): unknown {
+function stripJsonc(text: string): string {
   let out = "";
   let inString = false;
   for (let i = 0; i < text.length; i++) {
@@ -485,11 +499,11 @@ function parseJsonc(text: string): unknown {
       out += c;
     }
   }
-  return JSON.parse(out.replace(/,(\s*[}\]])/g, "$1"));
+  return out.replace(/,(\s*[}\]])/g, "$1");
 }
 
 describe("committed wrangler.jsonc CORS configuration", () => {
-  const config = parseJsonc(wranglerConfigText) as {
+  const config = JSON.parse(stripJsonc(wranglerConfigText)) as {
     vars?: { CORS_ALLOWED_ORIGINS?: string };
     env?: { production?: { vars?: { CORS_ALLOWED_ORIGINS?: string } } };
   };

@@ -17,9 +17,10 @@
  * @see ../../../docs/threat-model.md (push endpoint SSRF allowlist)
  */
 
-import { SELF, env, runInDurableObject } from "cloudflare:test";
+import { runInDurableObject } from "cloudflare:test";
+import { env, exports } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
-import { AccountRelay, type Env } from "../src/index.js";
+import { AccountRelay } from "../src/index.js";
 import {
   ApnsPushTransport,
   FcmPushTransport,
@@ -34,6 +35,7 @@ import { WebPushTransport, type VapidConfig } from "../src/web-push.js";
 import { pairingStartBody, testAccount, testRequestId as rid } from "./support/accounts.js";
 import { DEVICE_X25519_PUBKEY } from "./support/keys.js";
 import { bindAccountRoot, pinRelayClock } from "./support/relay-state.js";
+import { urlOf } from "./support/fetch-input.js";
 
 /** A full-order X25519 device key (pairing rejects small-order keys, #248). */
 const DEVICE_PUBKEY = DEVICE_X25519_PUBKEY;
@@ -58,6 +60,7 @@ function relayUrl(accountId: string, subPath: string): string {
   return `https://relay.allw.test/${accountId}${subPath}`;
 }
 
+// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters -- T types the parsed body for the caller, as Response.json<T>() does.
 async function post<T>(
   accountId: string,
   subPath: string,
@@ -70,7 +73,7 @@ async function post<T>(
     await pinRelayClock(accountId, RELAY_NOW);
     prepared.add(accountId);
   }
-  const resp = await SELF.fetch(relayUrl(accountId, subPath), {
+  const resp = await exports.default.fetch(relayUrl(accountId, subPath), {
     method: "POST",
     headers: { "Content-Type": "application/json", ...headers },
     body: JSON.stringify(body),
@@ -101,7 +104,7 @@ async function pairWithPushTokens(
   };
 }
 
-async function readPushTokens(accountId: string): Promise<Array<{ token: string }>> {
+async function readPushTokens(accountId: string): Promise<{ token: string }[]> {
   const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
   return runInDurableObject(stub, (relay: AccountRelay) => {
     return [
@@ -143,8 +146,8 @@ async function installWebPush(
   accountId: string,
   statusFor: (endpoint: string) => number,
 ): Promise<ReturnType<typeof vi.fn<typeof fetch>>> {
-  const fetcher = vi.fn<typeof fetch>(
-    async (input) => new Response(null, { status: statusFor(String(input)) }),
+  const fetcher = vi.fn<typeof fetch>((input) =>
+    Promise.resolve(new Response(null, { status: statusFor(urlOf(input)) })),
   );
   await installPushTransports(accountId, {
     // Same clock as the relay instance, as `buildPushTransports` wires it in production.
@@ -195,7 +198,7 @@ async function pushFanOutSettled(accountId: string): Promise<void> {
 
 async function seedPushTokenRows(
   accountId: string,
-  rows: ReadonlyArray<{ device_id: string; transport: string; token: string; created_at?: number }>,
+  rows: readonly { device_id: string; transport: string; token: string; created_at?: number }[],
 ): Promise<void> {
   const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
   await runInDurableObject(stub, (relay: AccountRelay) => {
@@ -355,12 +358,12 @@ describe("submit — APNs and FCM tokens are pruned only on an unregistered answ
         endpoint: "https://api.push.apple.test",
         topic: "com.example.allw",
         bearerToken: "apns-bearer",
-        fetcher: async () => apnsAnswer(),
+        fetcher: () => Promise.resolve(apnsAnswer()),
       }),
       fcm: new FcmPushTransport({
         endpoint: "https://fcm.googleapis.test/v1/projects/allw/messages:send",
         bearerToken: "fcm-bearer",
-        fetcher: async () => fcmAnswer(),
+        fetcher: () => Promise.resolve(fcmAnswer()),
       }),
     });
     return acct;
@@ -602,7 +605,7 @@ describe("submit — Web Push wakeups off the response path, with pruning", () =
 
     expect(submit.data.push_wakeups).toBe(32);
     await pushFanOutSettled(acct);
-    const requested = fetcher.mock.calls.map(([input]) => String(input));
+    const requested = fetcher.mock.calls.map(([input]) => urlOf(input));
     expect(requested).toHaveLength(32);
     expect(requested).not.toContain(`${FCM_ENDPOINT}-seed-0`);
     expect(requested).toContain(`${FCM_ENDPOINT}-seed-32`);
@@ -623,7 +626,7 @@ describe("submit — Web Push wakeups off the response path, with pruning", () =
     await pushFanOutSettled(acct);
     expect(fetcher).toHaveBeenCalledTimes(1);
     const [input, init] = fetcher.mock.calls[0] ?? [];
-    const sent = new Request(String(input), init);
+    const sent = new Request(urlOf(input), init);
     expect((await sent.arrayBuffer()).byteLength).toBe(0);
     // The deadline is 2 minutes after the relay clock, rounded up to the 5-minute TTL bucket.
     expect(sent.headers.get("TTL")).toBe(String(5 * 60));
@@ -696,7 +699,7 @@ describe("submit — Web Push wakeups are coalesced per subscription", () => {
         return Promise.resolve();
       },
     };
-    const fetcher = vi.fn<typeof fetch>(async () => new Response(null, { status: 201 }));
+    const fetcher = vi.fn<typeof fetch>(() => Promise.resolve(new Response(null, { status: 201 })));
     await installPushTransports(acct, {
       apns,
       webpush: new WebPushTransport({ vapid: await makeVapid(), fetcher }),
@@ -726,7 +729,8 @@ describe("submit — Web Push wakeups are coalesced per subscription", () => {
 // Trailing wakeups (#313): a submit skipped by coalescing still gets a wakeup when the window ends
 // ---------------------------------------------------------------------------
 
-/** The relay internals these tests drive. The alarm and the coalescer are not reachable over HTTP. */
+/** A `webpush_trailing_wakeup` row, as the alarm-path tests read it back. */
+// eslint-disable-next-line @typescript-eslint/consistent-type-definitions -- a type alias satisfies SqlStorage.exec's row constraint; an interface doesn't.
 type TrailingRow = { device_id: string; token: string; due_at: number };
 
 function relayStub(accountId: string): DurableObjectStub {
@@ -816,7 +820,7 @@ async function submitRequest(accountId: string, body: Record<string, unknown>): 
 
 function ttlOf(fetcher: ReturnType<typeof vi.fn<typeof fetch>>, call: number): string | null {
   const [input, init] = fetcher.mock.calls[call] ?? [];
-  return new Request(String(input), init).headers.get("TTL");
+  return new Request(urlOf(input), init).headers.get("TTL");
 }
 
 describe("submit — a coalesced submit gets a trailing wakeup when the window ends (#313)", () => {
@@ -1017,7 +1021,7 @@ describe("submit — a coalesced submit gets a trailing wakeup when the window e
 
     // A new instance on the same storage: nothing in memory, only what SQLite kept.
     await runInDurableObject(relayStub(acct), async (instance: AccountRelay, state) => {
-      const fresh = new AccountRelay(state, env as unknown as Env);
+      const fresh = new AccountRelay(state, env);
       fresh["pushTransports"] = instance["pushTransports"];
       // A fresh instance starts on the real clock; pin it like the evicted one (#248 horizon).
       fresh["now"] = () => RELAY_NOW;
@@ -1122,7 +1126,7 @@ describe("submit — the coalescing bound survives eviction (#319)", () => {
     body: Record<string, unknown>,
   ): Promise<number> {
     return runInDurableObject(relayStub(accountId), async (instance: AccountRelay, state) => {
-      const fresh = new AccountRelay(state, env as unknown as Env);
+      const fresh = new AccountRelay(state, env);
       fresh["pushTransports"] = instance["pushTransports"];
       // A fresh instance starts on the real clock; pin it like the evicted one (#248 horizon).
       fresh["now"] = () => RELAY_NOW;
@@ -1135,7 +1139,7 @@ describe("submit — the coalescing bound survives eviction (#319)", () => {
       );
       expect(response.status).toBe(202);
       await fresh["pushFanOut"];
-      return ((await response.json()) as { push_wakeups: number }).push_wakeups;
+      return (await response.json<{ push_wakeups: number }>()).push_wakeups;
     });
   }
 
@@ -1344,7 +1348,7 @@ describe("submit — an owed trailing wakeup is cleared only by an accepted wake
             body: JSON.stringify(envelope(rid(id))),
           }),
         );
-        return ((await response.json()) as { push_wakeups: number }).push_wakeups;
+        return (await response.json<{ push_wakeups: number }>()).push_wakeups;
       };
 
       const first = await submit("req-n2-in-flight-1");
