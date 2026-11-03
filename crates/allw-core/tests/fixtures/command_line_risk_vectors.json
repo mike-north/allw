@@ -1,0 +1,203 @@
+{
+  "description": "Shared Rust <-> WASM vectors for action_from_command risk on command lines with shell operators, substitutions, redirections and newlines (issue #272). Expected values are derived by hand from the risk table and rule in crates/allw-core/src/command.rs (shell_line_risk) and docs/policy-seam.md; bin is always the first shlex word (unchanged by #272). Append-only.",
+  "cases": [
+    {
+      "command": "ls && rm -rf /",
+      "risk": "high",
+      "bin": "ls",
+      "why": "&& runs rm -rf /: High"
+    },
+    {
+      "command": "ls || rm -rf /",
+      "risk": "high",
+      "bin": "ls",
+      "why": "|| runs rm -rf /: High"
+    },
+    {
+      "command": "ls & rm -rf /",
+      "risk": "high",
+      "bin": "ls",
+      "why": "& backgrounds ls, then runs rm -rf /: High"
+    },
+    {
+      "command": "ls; rm -rf /",
+      "risk": "high",
+      "bin": "ls;",
+      "why": "; runs rm -rf / (bin keeps the shlex word ls;)"
+    },
+    {
+      "command": "ls\nrm -rf /",
+      "risk": "high",
+      "bin": "ls",
+      "why": "a newline separates two commands"
+    },
+    {
+      "command": "cat x | sh",
+      "risk": "medium",
+      "bin": "cat",
+      "why": "a pipe is shell syntax: at least Medium; sh alone is Medium"
+    },
+    {
+      "command": "echo $(rm -rf ~)",
+      "risk": "high",
+      "bin": "echo",
+      "why": "command substitution runs rm -rf ~"
+    },
+    {
+      "command": "echo `rm -rf ~`",
+      "risk": "high",
+      "bin": "echo",
+      "why": "backtick substitution runs rm -rf ~"
+    },
+    {
+      "command": "echo \"$(rm -rf ~)\"",
+      "risk": "high",
+      "bin": "echo",
+      "why": "double quotes do not stop command substitution"
+    },
+    {
+      "command": "cat <(rm -rf ~)",
+      "risk": "high",
+      "bin": "cat",
+      "why": "process substitution runs rm -rf ~"
+    },
+    {
+      "command": "echo $(echo $(rm -rf ~))",
+      "risk": "high",
+      "bin": "echo",
+      "why": "nested substitution is analyzed"
+    },
+    {
+      "command": "echo hi > /etc/passwd",
+      "risk": "medium",
+      "bin": "echo",
+      "why": "a redirection is shell syntax: at least Medium"
+    },
+    {
+      "command": "ls 2>&1",
+      "risk": "medium",
+      "bin": "ls",
+      "why": "a redirection is shell syntax; 2>&1 is not a command"
+    },
+    {
+      "command": "git status && git push --force",
+      "risk": "high",
+      "bin": "git",
+      "why": "the second command is a force push"
+    },
+    {
+      "command": "ls && dd if=/dev/zero of=/dev/sda",
+      "risk": "critical",
+      "bin": "ls",
+      "why": "the second command is dd: Critical"
+    },
+    {
+      "command": "if true; then rm -rf /; fi",
+      "risk": "high",
+      "bin": "if",
+      "why": "the then-branch runs rm -rf /; keywords are skipped"
+    },
+    {
+      "command": "for f in a; do rm -rf $f; done",
+      "risk": "high",
+      "bin": "for",
+      "why": "the loop body runs rm -rf; keywords are skipped"
+    },
+    {
+      "command": "{ rm -rf /; }",
+      "risk": "high",
+      "bin": "{",
+      "why": "a brace group runs rm -rf /"
+    },
+    {
+      "command": "(rm -rf /)",
+      "risk": "high",
+      "bin": "(rm",
+      "why": "a subshell runs rm -rf /"
+    },
+    {
+      "command": "eval 'rm -rf /'",
+      "risk": "high",
+      "bin": "eval",
+      "why": "eval runs its arguments as a command line"
+    },
+    {
+      "command": "eval rm -rf /",
+      "risk": "high",
+      "bin": "eval",
+      "why": "eval runs its arguments as a command line"
+    },
+    {
+      "command": "ls # it's\nrm -rf /",
+      "risk": "high",
+      "bin": "ls",
+      "why": "the quote is inside a comment; the next line still runs"
+    },
+    {
+      "command": "echo $'\\''\nrm -rf /\n'",
+      "risk": "high",
+      "bin": "echo",
+      "why": "in bash $'\\'' is one quote character, so the next line runs"
+    },
+    {
+      "command": "ls # && rm -rf /",
+      "risk": "high",
+      "bin": "ls",
+      "why": "a comment is also read as code; the higher reading wins"
+    },
+    {
+      "command": "echo $((1+2))",
+      "risk": "medium",
+      "bin": "echo",
+      "why": "arithmetic expansion is read like a substitution: at least Medium"
+    },
+    {
+      "command": "echo 'ls && rm -rf /'",
+      "risk": "low",
+      "bin": "echo",
+      "why": "single-quoted operators are literal"
+    },
+    {
+      "command": "echo \"a && rm -rf /\"",
+      "risk": "low",
+      "bin": "echo",
+      "why": "double-quoted operators are literal"
+    },
+    {
+      "command": "echo \\&\\& rm -rf /",
+      "risk": "low",
+      "bin": "echo",
+      "why": "backslash-escaped operators are literal"
+    },
+    {
+      "command": "echo '$(rm -rf ~)'",
+      "risk": "low",
+      "bin": "echo",
+      "why": "single quotes stop substitution"
+    },
+    {
+      "command": "echo \"a\nb\"",
+      "risk": "low",
+      "bin": "echo",
+      "why": "a quoted newline is literal"
+    },
+    {
+      "command": "echo $HOME",
+      "risk": "low",
+      "bin": "echo",
+      "why": "a variable reference is not a substitution"
+    },
+    {
+      "command": "rm -rf ~",
+      "risk": "high",
+      "bin": "rm",
+      "why": "a plain command is unchanged"
+    },
+    {
+      "command": "ls -la",
+      "risk": "low",
+      "bin": "ls",
+      "why": "a plain command is unchanged"
+    }
+  ]
+}

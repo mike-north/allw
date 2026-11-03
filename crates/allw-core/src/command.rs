@@ -34,6 +34,30 @@
 //! If the shell string is syntactically invalid (unmatched quotes), the tokenization
 //! returns an error.  [`action_from_argv`] does not tokenize and never fails.
 //!
+//! # Command lines with shell syntax (risk only)
+//!
+//! Tokenization only splits words, so `ls && rm -rf /` records `bin: "ls"` and the argv
+//! `["ls", "&&", "rm", "-rf", "/"]`. Those fields are unchanged. **Risk**, though, covers every
+//! command a shell would run for the line: [`action_from_command`] also scans the raw line.
+//!
+//! - Each segment between unquoted control operators (`&&`, `||`, `;`, `|`, `&`, `(`, `)`, a
+//!   newline) is classified, after leading shell keywords (`if`, `then`, `do`, `{`, `!`, …).
+//! - Each command or process substitution (`$(…)`, backticks, `<(…)`, `>(…)`) is classified as a
+//!   command line. So are the arguments of `eval`.
+//! - Any operator, substitution or redirection makes the line at least `Medium`.
+//! - The tier is never lower than the first word's own tier.
+//!
+//! Quoting follows POSIX: single quotes are literal; double quotes stop operators but not
+//! substitutions; a backslash escapes the next character. Where shells or tokenizers can
+//! disagree, every reading is analyzed and the highest tier is kept:
+//!
+//! - whether `#` starts a comment;
+//! - whether `$'…'` is an ANSI-C string (bash) or not (dash, `shlex`).
+//!
+//! Bounds: nesting past 4 levels is `High`. Heredoc bodies are not recognized; their lines are
+//! read as commands, which can only raise the result. [`action_from_argv`] records an argv that
+//! runs without a shell, so its words are never read as shell syntax.
+//!
 //! # Flag classification
 //!
 //! A token is classified as a **flag** if it begins with `-` (single-dash short options,
@@ -182,7 +206,14 @@ pub fn action_from_command(
     ctx: &CommandContext,
 ) -> Result<ActionRecord, CommandError> {
     let argv = shlex::split(command_line).ok_or(CommandError::InvalidShellSyntax)?;
-    Ok(build_record(argv, ctx, Some(command_line.to_string())))
+    let mut record = build_record(argv, ctx, Some(command_line.to_string()));
+    // A command line can hold more than one command (`ls && rm -rf /`). `bin` / `argv` / `flags`
+    // / `positionals` still describe the word list, but risk must cover every command a shell
+    // would run (see `shell_line_risk`).
+    if let Some(line_risk) = shell_line_risk(command_line, 0) {
+        record.risk = max_risk(record.risk, line_risk);
+    }
+    Ok(record)
 }
 
 /// Build an [`ActionRecord`] from a pre-tokenized argument vector, optionally carrying the
@@ -646,6 +677,262 @@ fn classify_effective_risk(argv: &[String], depth: usize) -> Risk {
         }
     }
     risk[0]
+}
+
+// ── Shell-line risk ───────────────────────────────────────────────────────────
+
+/// The higher of an optional running maximum and a new tier.
+fn raise(current: Option<Risk>, tier: Risk) -> Option<Risk> {
+    Some(current.map_or(tier, |c| max_risk(c, tier)))
+}
+
+/// Words a shell reads as syntax at the start of a command (`if x; then rm -rf /; fi`). They are
+/// skipped before a segment is classified, so they can't hide the program after them.
+const SHELL_KEYWORDS: &[&str] = &[
+    "!", "{", "}", "if", "then", "else", "elif", "fi", "do", "done", "while", "until", "for",
+    "select", "case", "esac", "function", "coproc", "time",
+];
+
+/// What a shell does with a command line, as far as risk needs to know.
+#[derive(Default)]
+struct ShellLine<'a> {
+    /// The text between unquoted control operators (`&&`, `||`, `;`, `|`, `&`, `(`, `)`, a
+    /// newline): each is one simple command, still quoted as written.
+    segments: Vec<&'a str>,
+    /// The bodies of command and process substitutions (`$(…)`, `` `…` ``, `<(…)`, `>(…)`). Each
+    /// runs as a command line of its own.
+    substitutions: Vec<&'a str>,
+    /// Whether any operator, substitution or redirection appeared: shell syntax beyond plain words.
+    has_shell_syntax: bool,
+}
+
+/// Index of the next `quote` byte at or after `from`, or `None`.
+fn find_byte(b: &[u8], from: usize, quote: u8) -> Option<usize> {
+    b.get(from..)?
+        .iter()
+        .position(|&c| c == quote)
+        .map(|p| from + p)
+}
+
+/// How a shell may read quoting and comments where shells (or this scanner) can disagree. Every
+/// reading is analyzed and the highest tier wins, so an ambiguity can only raise risk.
+#[derive(Clone, Copy)]
+struct Reading {
+    /// An unquoted `#` at the start of a word starts a comment that runs to the end of the line.
+    honor_comments: bool,
+    /// `$'…'` is an ANSI-C string in which `\'` does not end the string (bash, zsh, ksh; not
+    /// dash, and not the `shlex` tokenizer).
+    ansi_c_quotes: bool,
+}
+
+/// Every [`Reading`] [`shell_line_risk`] analyzes.
+const READINGS: [Reading; 4] = [
+    Reading {
+        honor_comments: true,
+        ansi_c_quotes: true,
+    },
+    Reading {
+        honor_comments: true,
+        ansi_c_quotes: false,
+    },
+    Reading {
+        honor_comments: false,
+        ansi_c_quotes: true,
+    },
+    Reading {
+        honor_comments: false,
+        ansi_c_quotes: false,
+    },
+];
+
+/// Index just past the `'` closing an ANSI-C string whose body starts at `start`, or `b.len()`.
+fn skip_ansi_c_string(b: &[u8], start: usize) -> usize {
+    let mut i = start;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            b'\'' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    b.len()
+}
+
+/// Index of the `)` closing a `(` whose body starts at `start`, honoring quotes and backslashes,
+/// or `b.len()` if it is never closed (the rest of the line is then the body).
+fn find_closing_paren(b: &[u8], start: usize, reading: Reading) -> usize {
+    let mut depth = 1usize;
+    let mut in_double = false;
+    let mut i = start;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => {
+                i += 2;
+                continue;
+            }
+            b'\'' if !in_double => {
+                i = find_byte(b, i + 1, b'\'').map_or(b.len(), |q| q + 1);
+                continue;
+            }
+            b'$' if reading.ansi_c_quotes && !in_double && b.get(i + 1) == Some(&b'\'') => {
+                i = skip_ansi_c_string(b, i + 2);
+                continue;
+            }
+            b'"' => in_double = !in_double,
+            b'(' if !in_double => depth += 1,
+            b')' if !in_double => {
+                depth -= 1;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    b.len()
+}
+
+/// Index of the backtick closing a `` ` `` whose body starts at `start`, or `b.len()`.
+fn find_closing_backtick(b: &[u8], start: usize) -> usize {
+    let mut i = start;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            b'`' => return i,
+            _ => i += 1,
+        }
+    }
+    b.len()
+}
+
+/// Split a command line the way a POSIX shell does for risk: segments between unquoted control
+/// operators, and the bodies of substitutions. Single quotes are literal; double quotes stop
+/// operators but not substitutions; a backslash escapes the next byte.
+///
+/// `reading` decides comments and `$'…'` strings (see [`Reading`]).
+///
+/// Only ASCII bytes are ever matched, so every slice boundary falls on a UTF-8 char boundary.
+fn scan_shell_line(text: &str, reading: Reading) -> ShellLine<'_> {
+    let b = text.as_bytes();
+    let mut line = ShellLine::default();
+    let mut seg_start = 0;
+    let mut in_double = false;
+    let mut i = 0;
+    while i < b.len() {
+        let at_word_start = i == 0
+            || matches!(
+                b[i - 1],
+                b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>'
+            );
+        match b[i] {
+            b'\\' => {
+                i += 2;
+                continue;
+            }
+            b'\'' if !in_double => {
+                i = find_byte(b, i + 1, b'\'').map_or(b.len(), |q| q + 1);
+                continue;
+            }
+            b'$' if reading.ansi_c_quotes && !in_double && b.get(i + 1) == Some(&b'\'') => {
+                i = skip_ansi_c_string(b, i + 2);
+                continue;
+            }
+            b'"' => in_double = !in_double,
+            b'#' if reading.honor_comments && !in_double && at_word_start => {
+                line.segments.push(&text[seg_start..i]);
+                i = find_byte(b, i, b'\n').unwrap_or(b.len());
+                seg_start = i;
+                continue;
+            }
+            b'`' => {
+                let end = find_closing_backtick(b, i + 1);
+                line.substitutions.push(&text[i + 1..end]);
+                line.has_shell_syntax = true;
+                i = end + 1;
+                continue;
+            }
+            b'$' | b'<' | b'>' if b.get(i + 1) == Some(&b'(') && (b[i] == b'$' || !in_double) => {
+                let end = find_closing_paren(b, i + 2, reading);
+                line.substitutions.push(&text[i + 2..end]);
+                line.has_shell_syntax = true;
+                i = end + 1;
+                continue;
+            }
+            b'<' | b'>' if !in_double => line.has_shell_syntax = true,
+            b';' | b'&' | b'|' | b'(' | b')' | b'\n' if !in_double => {
+                line.segments.push(&text[seg_start..i]);
+                line.has_shell_syntax = true;
+                seg_start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    line.segments
+        .push(text.get(seg_start..).unwrap_or_default());
+    line
+}
+
+/// Risk of one simple command (a segment's words, with leading [`SHELL_KEYWORDS`] removed).
+/// `eval` runs its arguments as a command line, so that line is classified too.
+fn segment_risk(words: &[String], depth: usize) -> Risk {
+    let (flags, positionals) = split_flags_and_positionals(words);
+    let own = classify_risk(&words[0], &flags, &positionals);
+    if basename(&words[0]) != "eval" || words.len() < 2 {
+        return own;
+    }
+    let evaluated = if depth >= MAX_SHELL_NESTING {
+        Risk::High
+    } else {
+        shell_line_risk(&words[1..].join(" "), depth + 1).unwrap_or(Risk::Medium)
+    };
+    max_risk(own, evaluated)
+}
+
+/// Risk of every command a shell would run for `text`, or `None` when it holds no command.
+///
+/// - Each segment between control operators is classified on its own.
+/// - Each substitution body is classified as a command line, `depth + 1` levels down. Past
+///   [`MAX_SHELL_NESTING`] it is [`Risk::High`].
+/// - Any operator, substitution or redirection makes the line at least [`Risk::Medium`].
+/// - A segment the tokenizer can't split is at least [`Risk::Medium`].
+///
+/// The line is analyzed under every [`Reading`] and the highest tier is kept. Heredoc bodies are
+/// not recognized; their lines are read as commands, which can only raise the result.
+fn shell_line_risk(text: &str, depth: usize) -> Option<Risk> {
+    let mut tier = None;
+    for reading in READINGS {
+        let line = scan_shell_line(text, reading);
+        for segment in &line.segments {
+            match shlex::split(segment) {
+                Some(words) => {
+                    let skip = words
+                        .iter()
+                        .take_while(|w| SHELL_KEYWORDS.contains(&w.as_str()))
+                        .count();
+                    if skip < words.len() {
+                        tier = raise(tier, segment_risk(&words[skip..], depth));
+                    }
+                }
+                None => tier = raise(tier, Risk::Medium),
+            }
+        }
+        for body in &line.substitutions {
+            let body_risk = if depth >= MAX_SHELL_NESTING {
+                Some(Risk::High)
+            } else {
+                shell_line_risk(body, depth + 1)
+            };
+            if let Some(r) = body_risk {
+                tier = raise(tier, r);
+            }
+        }
+        if line.has_shell_syntax {
+            tier = raise(tier, Risk::Medium);
+        }
+    }
+    tier
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1421,5 +1708,175 @@ mod tests {
         assert_eq!(bin(&r), "sh");
         assert_eq!(positionals(&r), ["ssh user@example.com"]);
         assert_eq!(r.syntactic.host, None, "host stays argv[0]-based");
+    }
+
+    // ── Risk of every command on a shell line (#272) ─────────────────────────
+    //
+    // Expected tiers are derived by hand from the module-doc risk table: operators, substitutions
+    // and redirections never make a line look less risky than a command it runs. The shared
+    // Rust ↔ WASM table is `tests/fixtures/command_line_risk_vectors.json`.
+
+    fn line_risk(cmd: &str) -> Risk {
+        action_from_command(cmd, &ctx_no_cwd()).unwrap().risk
+    }
+
+    /// Regression (#272): `ls && rm -rf /` was Low because only `ls` was classified.
+    #[test]
+    fn risk_272_control_operators_expose_every_command() {
+        for cmd in [
+            "ls && rm -rf /",
+            "ls || rm -rf /",
+            "ls & rm -rf /",
+            "ls; rm -rf /",
+            "ls\nrm -rf /",
+            "git status && git push --force",
+        ] {
+            assert_eq!(line_risk(cmd), Risk::High, "{cmd:?} runs a High command");
+        }
+    }
+
+    /// Regression (#272): a substitution's command ran unseen.
+    #[test]
+    fn risk_272_substitutions_are_classified() {
+        for cmd in [
+            "echo $(rm -rf ~)",
+            "echo `rm -rf ~`",
+            "echo \"$(rm -rf ~)\"",
+            "cat <(rm -rf ~)",
+            "echo $(echo $(rm -rf ~))",
+        ] {
+            assert_eq!(line_risk(cmd), Risk::High, "{cmd:?} runs a High command");
+        }
+    }
+
+    /// Shell syntax with only low-risk commands is at least Medium.
+    #[test]
+    fn risk_272_shell_syntax_is_at_least_medium() {
+        assert_eq!(line_risk("echo hi > /etc/passwd"), Risk::Medium);
+        assert_eq!(line_risk("ls 2>&1"), Risk::Medium);
+        assert_eq!(line_risk("ls | cat"), Risk::Medium);
+    }
+
+    /// Compound commands: keywords, groups and subshells don't hide the program.
+    #[test]
+    fn risk_272_keywords_groups_and_subshells_do_not_hide_program() {
+        for cmd in [
+            "if true; then rm -rf /; fi",
+            "for f in a; do rm -rf $f; done",
+            "{ rm -rf /; }",
+            "(rm -rf /)",
+            "! rm -rf /",
+        ] {
+            assert_eq!(line_risk(cmd), Risk::High, "{cmd:?} runs a High command");
+        }
+    }
+
+    /// `eval` runs its arguments as a command line.
+    #[test]
+    fn risk_272_eval_classifies_its_arguments() {
+        assert_eq!(line_risk("eval 'rm -rf /'"), Risk::High);
+        assert_eq!(line_risk("eval rm -rf /"), Risk::High);
+        assert_eq!(
+            line_risk("eval 'ls && dd if=/dev/zero of=/dev/sda'"),
+            Risk::Critical
+        );
+    }
+
+    /// Negative: quoted or escaped operators and substitutions are literal and don't raise risk.
+    #[test]
+    fn risk_272_quoted_or_escaped_syntax_is_literal() {
+        for cmd in [
+            "echo 'ls && rm -rf /'",
+            "echo \"a && rm -rf /\"",
+            "echo \\&\\& rm -rf /",
+            "echo '$(rm -rf ~)'",
+            "echo \"a\nb\"",
+            "echo $HOME",
+        ] {
+            assert_eq!(line_risk(cmd), Risk::Low, "{cmd:?} is one echo");
+        }
+    }
+
+    /// A quote inside a comment must not hide the next line: comments are read both ways.
+    #[test]
+    fn risk_272_quote_in_comment_does_not_hide_next_line() {
+        assert_eq!(line_risk("ls # it's\nrm -rf /"), Risk::High);
+    }
+
+    /// In bash, `$'\''` is a one-character string, so the next line runs. The plain-quote reading
+    /// (shlex, dash) would see one long quoted word; the ANSI-C reading must still find `rm`.
+    #[test]
+    fn risk_272_ansi_c_quote_does_not_hide_next_line() {
+        assert_eq!(line_risk("echo $'\\''\nrm -rf /\n'"), Risk::High);
+    }
+
+    /// An unterminated substitution still has its body classified.
+    #[test]
+    fn risk_272_unterminated_substitution_body_is_classified() {
+        assert_eq!(line_risk("echo $(rm -rf ~"), Risk::High);
+        assert_eq!(line_risk("echo `rm -rf ~"), Risk::High);
+    }
+
+    /// Non-ASCII text around operators is handled without slicing inside a character.
+    #[test]
+    fn risk_272_non_ascii_text_is_scanned_safely() {
+        assert_eq!(line_risk("echo héllo && rm -rf /"), Risk::High);
+        assert_eq!(line_risk("echo 日本 $(rm -rf ~)"), Risk::High);
+        assert_eq!(line_risk("echo 'é'"), Risk::Low);
+    }
+
+    /// `levels` nested `$(…)` substitutions around `innermost`.
+    fn nested_substitutions(levels: usize, innermost: &str) -> String {
+        let mut line = innermost.to_string();
+        for _ in 0..levels {
+            line = format!("echo $({line})");
+        }
+        line
+    }
+
+    /// Substitutions are analyzed up to `MAX_SHELL_NESTING` levels deep.
+    #[test]
+    fn risk_272_nested_substitutions_up_to_limit_are_analyzed() {
+        let line = nested_substitutions(MAX_SHELL_NESTING, "dd if=/dev/zero of=/dev/sda");
+        assert_eq!(line_risk(&line), Risk::Critical);
+        let line = nested_substitutions(MAX_SHELL_NESTING, "echo hi");
+        assert_eq!(
+            line_risk(&line),
+            Risk::Medium,
+            "syntax makes it Medium; echo is Low"
+        );
+    }
+
+    /// Nesting past the limit is not analyzed and is High, so depth cannot hide a command.
+    #[test]
+    fn risk_272_nested_substitutions_past_limit_are_high() {
+        let line = nested_substitutions(MAX_SHELL_NESTING + 1, "echo hi");
+        assert_eq!(line_risk(&line), Risk::High);
+    }
+
+    /// #272 changes only `risk`: the record's words are still the shlex split of the line, so
+    /// policy matching cannot shift.
+    #[test]
+    fn risk_272_syntactic_fields_unchanged() {
+        let r = action_from_command("ls && rm -rf /", &ctx_no_cwd()).unwrap();
+        assert_eq!(bin(&r), "ls");
+        assert_eq!(argv(&r), ["ls", "&&", "rm", "-rf", "/"]);
+        assert_eq!(flags(&r), ["-rf"]);
+        assert_eq!(positionals(&r), ["&&", "rm", "/"]);
+        assert_eq!(r.syntactic.env_refs, None);
+
+        let r = action_from_command("echo $(rm -rf $HOME)", &ctx_no_cwd()).unwrap();
+        assert_eq!(bin(&r), "echo");
+        assert_eq!(argv(&r), ["echo", "$(rm", "-rf", "$HOME)"]);
+        assert_eq!(r.syntactic.env_refs, Some(vec!["HOME".to_string()]));
+    }
+
+    /// Negative: `action_from_argv` binds an argv that runs without a shell, so operator words in
+    /// it are literal arguments and don't raise risk (`raw` is display text, not what runs).
+    #[test]
+    fn risk_272_argv_records_are_not_read_as_shell_lines() {
+        let argv: Vec<String> = ["ls", "&&", "rm", "-rf", "/"].map(String::from).to_vec();
+        let r = action_from_argv(&argv, Some("ls && rm -rf /"), &ctx_no_cwd());
+        assert_eq!(r.risk, Risk::Low);
     }
 }
