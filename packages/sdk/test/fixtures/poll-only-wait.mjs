@@ -8,6 +8,8 @@
  * - `never` (default): the relay never answers; expect `expired` at the 400 ms deadline.
  * - `early`: the relay reports a terminal outcome on the first poll while a 60 s deadline is still
  *   pending; expect the process to exit at once (the deadline timer must not hold it open).
+ * - `long-interval`: as `never`, but the poll interval (5 s) exceeds the 400 ms deadline; expect
+ *   `expired` and a prompt exit (the poll sleep is clamped to the deadline, not slept in full).
  *
  * Regression for #254: the bug where every SDK wait timer was `unref`'d, so on the poll path nothing held
  * the event loop between polls and Node exited mid-wait (code 13 under top-level await; code 0 with
@@ -59,7 +61,7 @@ const client = createClient({
   approverRootKey: glue.ed25519_public_key(Buffer.alloc(32, 7).toString("base64url")),
   fetchImpl,
   webSocketFactory: undefined,
-  pollIntervalMs: 100,
+  pollIntervalMs: mode === "long-interval" ? 5_000 : 100,
 });
 
 const verdict = await client.requestApproval({

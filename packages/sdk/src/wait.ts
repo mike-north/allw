@@ -41,7 +41,14 @@ export interface WaitDeps {
   readonly webSocketFactory?: WebSocketFactory;
   /** Poll cadence in ms (fallback path). */
   readonly pollIntervalMs: number;
-  /** Schedules `fn` after `ms`; injectable so tests can drive a fake clock. Defaults to `setTimeout`. */
+  /**
+   * Schedules `fn` after `ms`; injectable so tests can drive a fake clock. When absent, the wait
+   * uses two defaults: an `unref`'d `setTimeout` for the deadline backstop (so it never holds a
+   * process open after a verdict) and a plain, ref'd `setTimeout` for the poll sleep (so a process
+   * stays alive between polls). An override replaces **both**, and must honor the same keep-alive
+   * contract: if the poll sleep does not hold the event loop, node can exit mid-wait with no
+   * verdict (#254).
+   */
   readonly schedule?: (fn: () => void, ms: number) => void;
 }
 
@@ -100,8 +107,8 @@ const DEFAULT_DEADLINE_SCHEDULE = (fn: () => void, ms: number): void => {
  * Default scheduler for the **poll sleep**. Deliberately *not* `unref`'d: on the poll path it is the
  * only thing holding the event loop between polls. If it were unref'd, node would exit mid-wait
  * with no verdict at all (code 13 under top-level await; code 0 with no output under `void main()`,
- * which a hook host would read as "no decision"). The loop is bounded: it returns at the first poll
- * at or past the deadline.
+ * which a hook host would read as "no decision"). It cannot hold the process past the deadline:
+ * each sleep is clamped to the time remaining, and the loop stops once the wait has settled.
  */
 const DEFAULT_POLL_SCHEDULE = (fn: () => void, ms: number): void => {
   setTimeout(fn, ms);
@@ -139,7 +146,18 @@ export async function awaitVerdict(requestId: string, deps: WaitDeps): Promise<V
     }
   }
 
-  return Promise.race([pollUntilTerminal(requestId, deps, pollSchedule), deadlinePromise]);
+  // `isSettled` stops the poll loop once the race is decided (e.g. the deadline won while a poll sleep
+  // was pending), so it neither lingers nor sends a poll after the caller already has its outcome.
+  let settled = false;
+  const isSettled = (): boolean => settled;
+  try {
+    return await Promise.race([
+      pollUntilTerminal(requestId, deps, pollSchedule, isSettled),
+      deadlinePromise,
+    ]);
+  } finally {
+    settled = true;
+  }
 }
 
 /**
@@ -189,18 +207,27 @@ function waitOverSocket(
   });
 }
 
-/** Poll `GET /:acct/requests/:id` on a cadence until a terminal outcome appears. */
+/**
+ * Poll `GET /:acct/requests/:id` on a cadence until a terminal outcome appears, the deadline passes,
+ * or `isSettled()` reports that the surrounding race was already decided.
+ *
+ * Each sleep is clamped to the time left before the deadline, so the (ref'd) poll timer never holds
+ * the process past the deadline even when `pollIntervalMs` exceeds the remaining time.
+ */
 async function pollUntilTerminal(
   requestId: string,
   deps: WaitDeps,
   schedule: (fn: () => void, ms: number) => void,
+  isSettled: () => boolean,
 ): Promise<VerdictOutcome> {
   for (;;) {
     const outcome = await deps.relay.poll(requestId);
     if (outcome) return outcome;
-    if (deps.now() >= deps.deadline) return { kind: "timeout" };
+    const remaining = deps.deadline - deps.now();
+    if (remaining <= 0 || isSettled()) return { kind: "timeout" };
     await new Promise<void>((resolve) => {
-      schedule(resolve, deps.pollIntervalMs);
+      schedule(resolve, Math.min(deps.pollIntervalMs, remaining));
     });
+    if (isSettled()) return { kind: "timeout" };
   }
 }

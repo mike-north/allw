@@ -21,25 +21,50 @@ import { fileURLToPath } from "node:url";
 
 const fixture = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "poll-only-wait.mjs");
 
-test("poll-path wait keeps the process alive until the deadline, then resolves expired", async () => {
-  const result = await new Promise((resolve) => {
-    execFile(process.execPath, [fixture], (error, stdout, stderr) => {
-      resolve({ code: error ? error.code : 0, stdout, stderr });
-    });
+/**
+ * Run the fixture in `mode` as a subprocess; resolves `{ code, signal, stdout, stderr, ms }`. The
+ * hard `timeout` makes a regression that never exits fail fast instead of wedging the test run.
+ */
+function runFixture(mode) {
+  return new Promise((resolve) => {
+    const startedAt = performance.now();
+    execFile(
+      process.execPath,
+      [fixture, mode],
+      { timeout: 15_000, killSignal: "SIGKILL" },
+      (error, stdout, stderr) => {
+        resolve({
+          code: error ? error.code : 0,
+          signal: error ? error.signal : null,
+          stdout,
+          stderr,
+          ms: performance.now() - startedAt,
+        });
+      },
+    );
   });
+}
+
+test("poll-path wait keeps the process alive until the deadline, then resolves expired", async () => {
+  const result = await runFixture("never");
+  assert.equal(result.signal, null, "the fixture exited on its own (not killed by the timeout)");
   assert.equal(result.code, 0, `the process waited and exited cleanly (stderr: ${result.stderr})`);
   assert.match(result.stdout, /^decision: expired$/m);
 });
 
 test("an outcome before the deadline still lets the process exit promptly", async () => {
-  const result = await new Promise((resolve) => {
-    const startedAt = performance.now();
-    execFile(process.execPath, [fixture, "early"], (error, stdout, stderr) => {
-      resolve({ code: error ? error.code : 0, stdout, stderr, ms: performance.now() - startedAt });
-    });
-  });
+  const result = await runFixture("early");
   assert.equal(result.code, 0, `stderr: ${result.stderr}`);
   assert.match(result.stdout, /^decision: expired$/m);
   // The pending 60 s deadline timer is unref'd, so it does not keep the process alive.
   assert.ok(result.ms < 10_000, `exited promptly (took ${String(Math.round(result.ms))} ms)`);
+});
+
+test("a poll interval longer than the deadline does not hold the process past it", async () => {
+  const result = await runFixture("long-interval");
+  assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+  assert.match(result.stdout, /^decision: expired$/m);
+  // The 5 s poll sleep is clamped to the 400 ms deadline and the loop stops once the race settles,
+  // so the process exits well before a full poll interval would have elapsed.
+  assert.ok(result.ms < 3_000, `exited promptly (took ${String(Math.round(result.ms))} ms)`);
 });
