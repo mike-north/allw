@@ -24,16 +24,24 @@ const SOURCES = import.meta.glob("./**/*.ts", { query: "?raw", import: "default"
 const SELF_PATH = "./private-state-access.test.ts";
 
 /**
- * The only types a test may double-cast to: runtime objects tests stub with a partial literal, the
- * Worker env, and the WASM glue module. None of them is, or stands in for, `AccountRelay`.
+ * The types any test may double-cast to: runtime objects tests stub with a partial literal, and the
+ * Worker env. None of them can name `AccountRelay`'s private members.
  */
 const ALLOWED_DOUBLE_CAST_TARGETS = new Set([
   "WebSocket",
   "Env",
   "DurableObjectState",
   "DurableObjectStorage",
-  "Record<string, unknown>",
 ]);
+
+/**
+ * Double-cast targets allowed only in one file. `Record<string, unknown>` accepts any key, so a
+ * global allowance would let `relay as unknown as Record<string, unknown>` assign a stale name
+ * unchecked. Only the WASM glue module needs it, to read its exports by name.
+ */
+const ALLOWED_DOUBLE_CAST_TARGETS_BY_FILE: Readonly<Record<string, readonly string[]>> = {
+  "./core.test.ts": ["Record<string, unknown>"],
+};
 
 const DOUBLE_CAST = ["as", "unknown", "as"].join(" ");
 /** `<expr> as unknown as <target>`, capturing the target up to the end of its type expression. */
@@ -46,7 +54,8 @@ function forbiddenDoubleCasts(path: string, source: string): string[] {
   source.split("\n").forEach((line, index) => {
     for (const match of line.matchAll(DOUBLE_CAST_TARGET)) {
       const target = match[1] ?? "";
-      if (!ALLOWED_DOUBLE_CAST_TARGETS.has(target)) {
+      const allowedHere = ALLOWED_DOUBLE_CAST_TARGETS_BY_FILE[path] ?? [];
+      if (!ALLOWED_DOUBLE_CAST_TARGETS.has(target) && !allowedHere.includes(target)) {
         found.push(`${path}:${String(index + 1)}: ${target}`);
       }
     }
@@ -75,5 +84,13 @@ describe("private-state access in relay tests", () => {
   it("flags a planted double cast to a stale private-state shape", () => {
     const planted = `const relay = instance ${DOUBLE_CAST} { webPushCoalescer: WakeupCoalescer };`;
     expect(forbiddenDoubleCasts("./planted.test.ts", planted)).toEqual(["./planted.test.ts:1: {"]);
+  });
+
+  it("allows a Record<string, unknown> double cast only in the file that needs it", () => {
+    const planted = `const r = relay ${DOUBLE_CAST} Record<string, unknown>; r["webPushCoalescer"] = 1;`;
+    expect(forbiddenDoubleCasts("./planted.test.ts", planted)).toEqual([
+      "./planted.test.ts:1: Record<string, unknown>",
+    ]);
+    expect(forbiddenDoubleCasts("./core.test.ts", planted)).toEqual([]);
   });
 });

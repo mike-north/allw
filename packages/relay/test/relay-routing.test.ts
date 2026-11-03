@@ -295,6 +295,9 @@ async function installPushTransports(
  * A real `AccountRelay` over a stub Durable Object state, for driving one private method without a
  * runtime instance. `state` supplies the WebSocket methods the test needs; `exec` answers every SQL
  * statement, the constructor's schema setup included. Alarm and transaction calls are no-ops.
+ *
+ * The constructor's migrations and alarm arming run against the stub and have no effect: nothing is
+ * persisted and no alarm is set, so a test can't rely on schema or alarm state from it.
  */
 function relayOverStubState(
   state: Partial<Pick<DurableObjectState, "acceptWebSocket" | "getWebSockets" | "getTags">>,
