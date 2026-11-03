@@ -174,8 +174,9 @@ verifying once).
 **Rotating the keypair invalidates every existing browser subscription**: browsers must re-subscribe
 with the new public key. The relay does **not** prune the old endpoints: a push service rejects them
 with an auth error (401/403), which the relay deliberately treats as transient, so a misconfigured
-relay can never unregister every device. Stale endpoints stay registered until the device
-re-registers its push tokens (#236).
+relay can never unregister every device. Stale endpoints stay registered until each device
+replaces its push tokens with its new subscription (`PUT /{acct}/devices/{device_id}/push-tokens`,
+`docs/relay-api.md` §3), which a web approver should do when it re-subscribes (client flow: #237).
 
 ### Secrets inventory summary
 
