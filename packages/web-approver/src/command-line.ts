@@ -13,6 +13,8 @@
  * @see ../../approver/src/lib/render.ts (the CLI rules this mirrors)
  */
 
+import type { ApprovalContext } from "./index.js";
+
 /**
  * Quote one token **for display** so its boundaries are visible: `["rm","-rf","my dir"]` shows as
  * `rm -rf 'my dir'`, never like three separate arguments. A token with whitespace, a quoting or
@@ -127,12 +129,6 @@ export function rawDivergesFromArgv(syntactic: unknown): boolean {
   return renderArgv(tokens) !== raw;
 }
 
-/** What {@link toolIdentity} reads: the request's surface kind and its tool-call fields. */
-export interface ToolIdentityParts {
-  readonly kind: string;
-  readonly substrate: { readonly server?: string | undefined; readonly tool?: string | undefined };
-}
-
 /**
  * Shown in place of the tool when a request names a `server` but no `tool`: `fs :: (tool missing)`.
  * A real tool literally named `(tool missing)` contains a space, so it is always shown quoted and
@@ -169,9 +165,12 @@ export function joinToolIdentity(
   return server !== undefined ? `${quoteIdentityPart(server)} :: ${quotedTool}` : quotedTool;
 }
 
-/** What {@link toolIdentity} reads: the request's surface kind and its tool-call fields. */
+/**
+ * What {@link toolIdentity} reads: the request's surface kind (the view model's `kind`, not the
+ * wire surface, so `"mcp"` rather than `"mcp_tool_call"`) and its tool-call fields.
+ */
 export interface ToolIdentityParts {
-  readonly kind: string;
+  readonly kind: ApprovalContext["kind"];
   readonly substrate: { readonly server?: string | undefined; readonly tool?: string | undefined };
 }
 
