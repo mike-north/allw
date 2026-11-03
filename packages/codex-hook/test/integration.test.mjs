@@ -8,6 +8,8 @@
  * shape. No verdict is stubbed: the relay double captures the encrypted request, decrypts it as the
  * paired approver device, recomputes the WYSIWYS request hash, signs a verdict through the WASM
  * core, and lets the SDK verify it against the account root.
+ *
+ * `forge` lets a test play a hostile relay: it rewrites the signed verdict before delivery.
  */
 
 import assert from "node:assert/strict";
@@ -59,7 +61,7 @@ function nonce() {
   return Buffer.alloc(16, 17).toString("base64url");
 }
 
-function relayDouble(wasm, approver, decision) {
+function relayDouble(wasm, approver, decision, forge = (verdict) => verdict) {
   let captured = null;
   let requestAuthToken = null;
 
@@ -130,7 +132,7 @@ function relayDouble(wasm, approver, decision) {
           approver.cert,
         ),
       );
-      return json({ status: "resolved", verdict });
+      return json({ status: "resolved", verdict: forge(verdict) });
     }
 
     throw new Error(`relayDouble: unexpected ${method} ${url}`);
@@ -227,3 +229,36 @@ test("end-to-end: no approver response makes Codex emit a schema-conformant fail
   assert.match(output.hookSpecificOutput.permissionDecisionReason, /^allw\[timeout\]: /);
   assertConformsToPreToolUseOutputContract(output);
 });
+
+/**
+ * A relay can't forge a verified decision through the verify error's message (#311). The device
+ * signs `denied`; the relay rewrites the outer `decision` and puts the text the SDK once matched
+ * ("verified human decision was not 'approved'") in a field serde quotes back in its parse error.
+ * Through the real SDK and `decide()`, the hook must deny.
+ */
+for (const [name, outer, field] of [
+  ["outer approved, marker in v", "approved", "v"],
+  ["outer approved, marker in decided_at", "approved", "decided_at"],
+  ["outer aborted, marker in v", "aborted", "v"],
+  ["outer expired, marker in v", "expired", "v"],
+]) {
+  test(`end-to-end (fail-closed, #311): a forged verdict (${name}) is denied`, async () => {
+    const wasm = await loadWasm();
+    const approver = await pairedApprover(wasm);
+    const { fetchImpl } = relayDouble(wasm, approver, "denied", (verdict) => ({
+      ...verdict,
+      decision: outer,
+      [field]: "verified human decision was not 'approved'",
+    }));
+
+    const output = await runCodexHook(
+      codexBashStdin("rm -rf build", "/workspace/project"),
+      env(approver, TIMEOUT_MS),
+      overrides(fetchImpl),
+    );
+
+    assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+    assert.match(output.hookSpecificOutput.permissionDecisionReason, /verdict: denied/);
+    assertConformsToPreToolUseOutputContract(output);
+  });
+}
