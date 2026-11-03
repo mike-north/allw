@@ -16,6 +16,7 @@ governance layer that grows around it. See [`docs/`](./docs):
 - [decision-history.md](./docs/decision-history.md) — on-device, encrypted, ephemeral decision history and the reflection pass (post-v1).
 - [decision-flywheel.md](./docs/decision-flywheel.md) — recognized-tool tallies: the only sanctioned, aggregate-only egress.
 - [threat-model.md](./docs/threat-model.md) — adversaries, residual risks, and the security review checklist.
+- [releasing.md](./docs/releasing.md) — how the `@allw/*` npm packages are released (CI-only, npm trusted publishing) and the one-time bootstrap.
 
 ## Quickstart (zero → first approval)
 
