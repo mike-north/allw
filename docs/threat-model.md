@@ -211,11 +211,15 @@ trust decision, and it lives in the core:
   U+2060, U+FEFF), the rest of Unicode `Default_Ignorable_Code_Point`, U+2028/U+2029, U+FFF9–U+FFFB, and U+2800
   BRAILLE PATTERN BLANK. Notation: `\t`, `\n`, `\r`, `\xHH` for other C0 controls and DEL (ESC → `\x1b`), and
   `⟨U+XXXX⟩` for everything else.
-- Variation selectors are escaped by context, because a run of them encodes an arbitrary hidden payload ("emoji
-  smuggling") and one after ASCII is invisible (`main` + U+FE0F looks like `main`). A selector is shown as-is only
-  when it is the first one directly after a non-ASCII base character that is itself shown (not escaped, not a
-  selector, not a combining diacritical mark), as in `⚠️` or a CJK ideographic variation sequence, or when it is
-  the U+FE0F of an ASCII `0`–`9`/`#`/`*` keycap followed by U+20E3. Every other selector is escaped and sets the flag.
+- Variation selectors are escaped unless they follow a base their range defines variants for, because each one
+  can carry a hidden byte ("emoji smuggling"): one selector after every bullet or em dash of a message would
+  exfiltrate a secret, and `main` + U+FE0F looks like `main`. Shown as-is only: U+FE0E/U+FE0F after a non-ASCII base
+  listed in Unicode `emoji-variation-sequences.txt` (Emoji 16.0) or as the U+FE0F of an ASCII `0`–`9`/`#`/`*`
+  keycap followed by U+20E3; U+E0100–U+E01EF after a `Unified_Ideograph`; U+180B–U+180D/U+180F after a
+  Mongolian-block character. U+FE00–U+FE0D and every other selector are escaped and set the flag. **Accepted
+  residual:** a shown selector still carries about 1 bit per listed emoji and up to about one byte per CJK ideograph
+  (240 ideographic selectors), so a payload can still ride on a run of emoji or CJK text. Ordinary prose can no
+  longer carry one. This is a deliberate trade-off against warning on every emoji and CJK variant form.
 - `raw` is multi-line content (a heredoc command, a file edit). In its `raw_lines` rendering a line feed is
   structure, a TAB shows as `→   ` and a CR directly before a line feed shows as `␍`, without setting the flag:
   once ESC and lone CRs are escaped they cannot overwrite or hide anything, and a warning on every Go edit or heredoc
@@ -230,7 +234,8 @@ trust decision, and it lives in the core:
   flag is set the surface shows a warning (CLI: a line under the header, and again as the last line before the
   prompt; web: a badge on the card). The CLI ends every request block with a one-line escaped `Deciding on:` headline
   directly above the prompt, so the action and the warning are on screen when the human answers, however long the
-  block is. A multi-line command prints its further lines behind a `│` marker, so none can pass for a field label.
+  block is. When `raw` and the hash-bound argv diverge, `Deciding on:` shows the argv form and a "raw and argv
+  differ" warning is the last line before the prompt, so the decision point never shows only the benign half. A multi-line command prints its further lines behind a `│` marker, so none can pass for a field label.
 - Relay-supplied text outside the context goes through `escape_for_display` too. The CLI approver escapes every
   `watch` log line (request ids, relay error strings, which could otherwise repaint the request block mid-prompt),
   every `pair` output line (the relay-issued pairing code and `device_id`), and the fatal error line (which can embed
@@ -247,8 +252,9 @@ Validation:
 - Any new `ActionRecord` syntactic field must either render directly or be explicitly marked non-decision-making.
 - A new syntactic field must also be added to `DisplaySubstrate` so it is escaped before any surface can show it.
 - The shared vector `crates/allw-core/tests/fixtures/display_vector.json` (asserted by the Rust core and through
-  WASM) covers each escaped class, a mixed string, a variation-selector run, a selector after ASCII, and the allowed
-  emoji, keycap and CJK variation forms. CLI tests assert the `watch` process's stdout/stderr bytes contain no raw
+  WASM) covers each escaped class, a mixed string, a variation-selector run, a selector after ASCII or after
+  ordinary non-ASCII text (bullet, em dash, NBSP, Cyrillic, a Thai mark, an emoji with no variation sequence), and
+  the allowed emoji, keycap and CJK variation forms. CLI tests assert the `watch` process's stdout/stderr bytes contain no raw
   ESC/CR for the spoof above and that the warning is the line directly above the prompt, that the `pair` process
   escapes relay-supplied text, and that Go edits and heredoc commits do not warn while ESC/CR spoofs still do. Web
   tests assert a U+202E payload, an escaped envelope id and an escaped outage banner reach the DOM, with the warning

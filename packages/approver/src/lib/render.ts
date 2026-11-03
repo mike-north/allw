@@ -28,6 +28,8 @@
  * A long block (a file edit, a multi-line command) can scroll the header and the `Action:` line off
  * screen before the human answers. So the block ends with a one-line escaped headline and, when the
  * model reports hidden/control characters, the warning — the last lines printed before the prompt.
+ * When `raw` and the hash-bound argv diverge, that headline is the argv form, followed by a
+ * divergence warning.
  * The warning is also printed directly under the header.
  */
 
@@ -291,6 +293,14 @@ function actionLines(display: DisplayModel): string[] {
   return [`  Action:     ${first}`, ...rest.map((line) => `            │ ${line}`)];
 }
 
+/**
+ * Printed directly above the prompt when the hash-bound `bin`/`argv` reconstructs to a different
+ * command than `raw`. The `Deciding on:` line then shows the argv form, so the decision point never
+ * shows only the benign half of a divergent pair.
+ */
+export const RAW_ARGV_DIVERGENCE_WARNING =
+  "  ⚠ WARNING: raw and argv differ — the line above is the hash-bound argv; the Action line shows raw. Review both.";
+
 /** Shown under the header whenever the core escaped at least one character (#246). */
 export const HIDDEN_CHARS_WARNING =
   "  ⚠ WARNING: contains hidden/control characters — shown escaped below (e.g. \\x1b, \\r, ⟨U+202E⟩). Review carefully.";
@@ -349,10 +359,17 @@ export function renderRequest(prepared: RenderableRequest): string {
   lines.push(`  request_hash (WYSIWYS): ${requestHash}`);
   lines.push(rule);
   // Repeated at the decision point: the prompt follows these lines directly, so the human answers
-  // with the action (one escaped line) and any warning on screen however long the block was.
-  lines.push(`  Deciding on: ${renderActionHeadline(display)}`);
+  // with the action (one escaped line) and any warning on screen however long the block was. When
+  // raw and argv diverge, the decision line shows the hash-bound argv (never only the `raw` half,
+  // which may be the benign one) and says so on the last line before the prompt.
+  const diverges = rawDivergesFromArgv(context.action);
+  const decidingOn = diverges ? reconstructCommand(display.syntactic) : undefined;
+  lines.push(`  Deciding on: ${decidingOn ?? renderActionHeadline(display)}`);
   if (display.has_hidden_or_control_chars) {
     lines.push(HIDDEN_CHARS_WARNING);
+  }
+  if (decidingOn !== undefined) {
+    lines.push(RAW_ARGV_DIVERGENCE_WARNING);
   }
 
   return lines.join("\n");

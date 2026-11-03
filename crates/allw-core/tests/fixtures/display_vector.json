@@ -68,9 +68,9 @@
       "has_hidden_or_control_chars": true
     },
     {
-      "class": "variation selector run after an emoji (smuggling): only the first selector is shown",
-      "input": "Looks fine 😀️︁󠄀󠇯",
-      "escaped": "Looks fine 😀️⟨U+FE01⟩⟨U+E0100⟩⟨U+E01EF⟩",
+      "class": "variation selector run after an emoji variation base (smuggling): only the first selector is shown",
+      "input": "Looks fine ❤️️︁󠄀󠇯",
+      "escaped": "Looks fine ❤️⟨U+FE0F⟩⟨U+FE01⟩⟨U+E0100⟩⟨U+E01EF⟩",
       "has_hidden_or_control_chars": true
     },
     {
@@ -80,9 +80,9 @@
       "has_hidden_or_control_chars": true
     },
     {
-      "class": "emoji presentation (one VS-16 after a non-ASCII base)",
-      "input": "⚠️ careful",
-      "escaped": "⚠️ careful",
+      "class": "emoji and text presentation (VS-16 / VS-15 after listed emoji variation bases)",
+      "input": "⚠️ careful ❤️ ©︎",
+      "escaped": "⚠️ careful ❤️ ©︎",
       "has_hidden_or_control_chars": false
     },
     {
@@ -101,6 +101,54 @@
       "class": "braille pattern blank",
       "input": "rm⠀-rf⠀/",
       "escaped": "rm⟨U+2800⟩-rf⟨U+2800⟩/",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "variation selector after a bullet (not a variation base)",
+      "input": "ok•️",
+      "escaped": "ok•⟨U+FE0F⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "variation selector after a em dash (not a variation base)",
+      "input": "ok—️",
+      "escaped": "ok—⟨U+FE0F⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "variation selector after a no-break space (not a variation base)",
+      "input": "ok ️",
+      "escaped": "ok ⟨U+FE0F⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "variation selector after a Cyrillic letter (not a variation base)",
+      "input": "okд️",
+      "escaped": "okд⟨U+FE0F⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "variation selector after a Thai tone mark (not a variation base)",
+      "input": "ok่️",
+      "escaped": "ok่⟨U+FE0F⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "variation selector after a emoji with no variation sequence (grinning face) (not a variation base)",
+      "input": "ok😀️",
+      "escaped": "ok😀⟨U+FE0F⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "ideographic variation selector after a non-ideograph",
+      "input": "❤󠄀",
+      "escaped": "❤⟨U+E0100⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "U+FE00–U+FE0D are always escaped",
+      "input": "葛︀",
+      "escaped": "葛⟨U+FE00⟩",
       "has_hidden_or_control_chars": true
     }
   ],

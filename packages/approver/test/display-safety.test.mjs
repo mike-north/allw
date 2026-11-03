@@ -33,7 +33,11 @@ import { fileURLToPath } from "node:url";
 import { loadWasm } from "../dist/index.js";
 import { generateKeyfile } from "../dist/lib/keyfile.js";
 import { prepareRequest } from "../dist/lib/approver-core.js";
-import { HIDDEN_CHARS_WARNING, renderRequest } from "../dist/lib/render.js";
+import {
+  HIDDEN_CHARS_WARNING,
+  RAW_ARGV_DIVERGENCE_WARNING,
+  renderRequest,
+} from "../dist/lib/render.js";
 import { runWatch } from "../dist/commands/watch.js";
 import { writeKeyfile } from "../dist/lib/keyfile.js";
 
@@ -282,6 +286,40 @@ test("the escaped headline and the warning are the last lines before the prompt"
   assert.ok(lines.at(-2)?.startsWith(`  Deciding on: ${SPOOF_ESCAPED}\\necho line 0`));
 });
 
+test("a raw/argv divergence is shown at the decision point, not just the benign raw", async () => {
+  // Review repro: benign raw, dangerous argv, and a cwd padded so the Argv line scrolls away.
+  const ctx = context({ summary: "check status" });
+  ctx.action = {
+    ...ctx.action,
+    syntactic: {
+      raw: "git status",
+      argv: ["rm", "-rf", "~"],
+      cwd: `/home/me/project${" ".repeat(20000)}`,
+    },
+  };
+  const { rendered } = await render(ctx);
+  const lines = rendered.split("\n");
+  assert.equal(lines.at(-1), RAW_ARGV_DIVERGENCE_WARNING, "the divergence warning is last");
+  assert.equal(
+    lines.at(-2),
+    "  Deciding on: rm -rf '~'",
+    "the decision line is the hash-bound argv",
+  );
+  assert.ok(!rendered.includes("Deciding on: git status"));
+  assert.ok(!rendered.includes(HIDDEN_CHARS_WARNING), "no hidden characters are involved");
+});
+
+test("without a divergence, the decision line is the raw headline and no divergence warning", async () => {
+  const ctx = context();
+  ctx.action = {
+    ...ctx.action,
+    syntactic: { raw: "git status", argv: ["git", "status"] },
+  };
+  const { rendered } = await render(ctx);
+  assert.equal(rendered.split("\n").at(-1), "  Deciding on: git status");
+  assert.ok(!rendered.includes(RAW_ARGV_DIVERGENCE_WARNING));
+});
+
 test("a variation selector after ASCII cannot make a divergent argv look identical", async () => {
   // `main` + VS-16 renders like `main`; the Argv divergence line must show the difference.
   const ctx = context();
@@ -291,6 +329,7 @@ test("a variation selector after ASCII cannot make a divergent argv look identic
   };
   const { rendered } = await render(ctx);
   assert.match(rendered, /^ {2}Argv:\s+git push origin main⟨U\+FE0F⟩$/m);
+  assert.equal(rendered.split("\n").at(-1), RAW_ARGV_DIVERGENCE_WARNING);
   assert.ok(rendered.includes(HIDDEN_CHARS_WARNING));
 });
 
@@ -442,8 +481,6 @@ test("UAT: `pair` output and the fatal error line escape relay-supplied text", a
       join(dir, "keyfile.json"),
       "--relay",
       relay.url,
-      "--account",
-      ACCOUNT_ID,
     ]);
     assert.equal(result.status, 1, "pairing fails on the relay error");
     for (const [name, bytes] of [

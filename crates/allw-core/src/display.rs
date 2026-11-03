@@ -31,18 +31,28 @@
 //! ## Variation selectors
 //!
 //! Variation selectors (U+FE00–U+FE0F, U+E0100–U+E01EF, Mongolian U+180B–U+180D and U+180F) are
-//! invisible, and a run of them can encode an arbitrary hidden payload (each selector carries a
-//! byte — "emoji smuggling"). A selector after ASCII has no glyph to select, so `main` + U+FE0F
-//! looks exactly like `main`. A selector is therefore escaped **unless** it is
+//! invisible, and each one can carry a hidden byte ("emoji smuggling"): one selector after every
+//! bullet, em dash or accented letter of an ordinary message exfiltrates a secret, and a selector
+//! after ASCII makes `main` + U+FE0F look exactly like `main`. A selector is therefore shown as-is
+//! only directly after a base its range actually defines variants for:
 //!
-//! - the **first** selector directly after a non-ASCII base character that is itself shown as-is
-//!   (not escaped, not a selector, not a combining diacritical mark), as in `⚠️` (U+26A0 U+FE0F) or a
-//!   CJK ideographic variation sequence; or
-//! - U+FE0F inside an emoji keycap: ASCII `0`–`9`, `#` or `*`, then U+FE0F, then U+20E3 (`1️⃣`).
+//! - **U+FE0E / U+FE0F** after a non-ASCII base listed in Unicode `emoji-variation-sequences.txt`
+//!   (Emoji 16.0; `EMOJI_VARIATION_BASES`), as in `⚠️` or `❤️`; or U+FE0F inside an emoji keycap
+//!   (ASCII `0`–`9`, `#` or `*`, then U+FE0F, then U+20E3, as in `1️⃣`);
+//! - **U+E0100–U+E01EF** (ideographic variation selectors) after a `Unified_Ideograph`, as in a
+//!   CJK ideographic variation sequence;
+//! - **U+180B–U+180D, U+180F** after a Mongolian-block character (U+1800–U+18AF).
 //!
-//! Every other selector — the second and later in a run, one after ASCII, one after a combining
-//! mark — is escaped and sets the flag. A legitimate emoji or CJK sequence therefore never warns,
-//! and a smuggling run can carry at most one hidden selector per visible base character.
+//! U+FE00–U+FE0D are always escaped, and so is every selector anywhere else — after ASCII, after
+//! punctuation or a letter outside those tables, after a combining mark, or after another selector.
+//! An escaped selector sets the flag.
+//!
+//! **Accepted residual.** A shown selector still carries a little information, because a base may
+//! take more than one selector: about 1 bit per listed emoji (U+FE0E or U+FE0F), and up to about one
+//! byte per CJK ideograph (240 ideographic selectors). Hiding a payload this way needs a matching run
+//! of emoji or CJK text in the request; plain prose with bullets, dashes, quotes or non-CJK letters
+//! can no longer carry one. This residual is a deliberate trade-off against warning on every emoji
+//! and every CJK variant form (`docs/threat-model.md` R3).
 //!
 //! # Structure inside multi-line content
 //!
@@ -155,27 +165,54 @@ pub fn is_variation_selector(c: char) -> bool {
     )
 }
 
-/// The combining-diacritical-mark blocks. A variation selector after one of these has no base glyph
-/// of its own to select, so it is escaped like one after ASCII. This is a block-level check, not the
-/// full `Mn`/`Me` category; it exists so a run of accents cannot each carry a hidden selector.
-fn is_combining_diacritic(c: char) -> bool {
+/// Whether `c` is a `Unified_Ideograph` (Unicode 16.0.0 `PropList.txt`): the only bases after
+/// which an ideographic variation selector (U+E0100–U+E01EF) is shown.
+///
+/// @see https://www.unicode.org/Public/16.0.0/ucd/PropList.txt
+fn is_unified_ideograph(c: char) -> bool {
     matches!(
         c,
-        '\u{0300}'..='\u{036F}'
-            | '\u{1AB0}'..='\u{1AFF}'
-            | '\u{1DC0}'..='\u{1DFF}'
-            | '\u{20D0}'..='\u{20FF}'
-            | '\u{FE20}'..='\u{FE2F}'
+        '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{FA0E}'..='\u{FA0F}'
+            | '\u{FA11}'
+            | '\u{FA13}'..='\u{FA14}'
+            | '\u{FA1F}'
+            | '\u{FA21}'
+            | '\u{FA23}'..='\u{FA24}'
+            | '\u{FA27}'..='\u{FA29}'
+            | '\u{20000}'..='\u{2A6DF}'
+            | '\u{2A700}'..='\u{2B739}'
+            | '\u{2B740}'..='\u{2B81D}'
+            | '\u{2B820}'..='\u{2CEA1}'
+            | '\u{2CEB0}'..='\u{2EBE0}'
+            | '\u{2EBF0}'..='\u{2EE5D}'
+            | '\u{30000}'..='\u{3134A}'
+            | '\u{31350}'..='\u{323AF}'
     )
 }
 
-/// Whether a variation selector directly after `prev` selects a glyph form of it (and so is shown
-/// as-is when it is the first selector after it).
-fn is_variation_base(prev: char) -> bool {
-    !prev.is_ascii()
-        && !is_hidden_or_control_char(prev)
-        && !is_variation_selector(prev)
-        && !is_combining_diacritic(prev)
+/// Whether the variation selector `c`, between `prev` and `next`, is shown as-is rather than
+/// escaped. Each selector range has its own allowed bases (see the module docs, "Variation
+/// selectors"); a base is never itself a selector or a hidden character, so a selector directly
+/// after another selector is always escaped.
+fn selector_is_shown(c: char, prev: Option<char>, next: Option<char>) -> bool {
+    let Some(base) = prev.filter(|&p| !is_variation_selector(p) && !is_hidden_or_control_char(p))
+    else {
+        return false;
+    };
+    match c {
+        '\u{FE0E}' | '\u{FE0F}' => {
+            EMOJI_VARIATION_BASES.binary_search(&base).is_ok()
+                || (c == '\u{FE0F}'
+                    && (base.is_ascii_digit() || base == '#' || base == '*')
+                    && next == Some('\u{20E3}'))
+        }
+        '\u{E0100}'..='\u{E01EF}' => is_unified_ideograph(base),
+        '\u{180B}'..='\u{180D}' | '\u{180F}' => ('\u{1800}'..='\u{18AF}').contains(&base),
+        // U+FE00–U+FE0D (math, Myanmar, Phags-pa standardized variants): never shown.
+        _ => false,
+    }
 }
 
 /// Where the text being escaped sits, which decides whether TAB is structure.
@@ -203,24 +240,16 @@ pub const CRLF_MARKER: &str = "␍";
 fn escape_into(out: &mut String, text: &str, context: Context) -> bool {
     let mut flagged = false;
     let mut prev: Option<char> = None;
-    // Whether the previous character was a selector shown as-is (so the next one would be a run).
-    let mut prev_selector_shown = false;
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
-        let mut selector_shown = false;
         if c == '\t' && context == Context::ContentLine {
             out.push_str(TAB_MARKER);
         } else if is_hidden_or_control_char(c) {
             push_escaped(out, c);
             flagged = true;
         } else if is_variation_selector(c) {
-            let after_base = !prev_selector_shown && prev.is_some_and(is_variation_base);
-            let keycap = c == '\u{FE0F}'
-                && prev.is_some_and(|p| p.is_ascii_digit() || p == '#' || p == '*')
-                && chars.peek() == Some(&'\u{20E3}');
-            if after_base || keycap {
+            if selector_is_shown(c, prev, chars.peek().copied()) {
                 out.push(c);
-                selector_shown = true;
             } else {
                 push_codepoint(out, c);
                 flagged = true;
@@ -229,7 +258,6 @@ fn escape_into(out: &mut String, text: &str, context: Context) -> bool {
             out.push(c);
         }
         prev = Some(c);
-        prev_selector_shown = selector_shown;
     }
     flagged
 }
@@ -535,6 +563,71 @@ pub fn display_model(context: &ApprovalContext) -> DisplayModel {
     }
 }
 
+/// The non-ASCII bases of the emoji variation sequences: every code point listed with U+FE0E/U+FE0F
+/// in Unicode `emoji-variation-sequences.txt`, **Emoji Version 16.0** (Unicode 16.0.0, file dated
+/// 2024-05-01; each listed base has both the text and the emoji style). Sorted for binary search.
+///
+/// The file's ASCII bases (`#`, `*`, `0`–`9`) are deliberately left out: a selector after ASCII is
+/// shown only in the full keycap form (`1` U+FE0F U+20E3), handled separately.
+///
+/// @see https://www.unicode.org/Public/16.0.0/ucd/emoji/emoji-variation-sequences.txt
+/// @see https://www.unicode.org/reports/tr51/#def_emoji_presentation_sequence
+#[rustfmt::skip]
+const EMOJI_VARIATION_BASES: [char; 359] = [
+    '\u{00A9}', '\u{00AE}', '\u{203C}', '\u{2049}', '\u{2122}', '\u{2139}', '\u{2194}',
+    '\u{2195}', '\u{2196}', '\u{2197}', '\u{2198}', '\u{2199}', '\u{21A9}', '\u{21AA}',
+    '\u{231A}', '\u{231B}', '\u{2328}', '\u{23CF}', '\u{23E9}', '\u{23EA}', '\u{23EB}',
+    '\u{23EC}', '\u{23ED}', '\u{23EE}', '\u{23EF}', '\u{23F0}', '\u{23F1}', '\u{23F2}',
+    '\u{23F3}', '\u{23F8}', '\u{23F9}', '\u{23FA}', '\u{24C2}', '\u{25AA}', '\u{25AB}',
+    '\u{25B6}', '\u{25C0}', '\u{25FB}', '\u{25FC}', '\u{25FD}', '\u{25FE}', '\u{2600}',
+    '\u{2601}', '\u{2602}', '\u{2603}', '\u{2604}', '\u{260E}', '\u{2611}', '\u{2614}',
+    '\u{2615}', '\u{2618}', '\u{261D}', '\u{2620}', '\u{2622}', '\u{2623}', '\u{2626}',
+    '\u{262A}', '\u{262E}', '\u{262F}', '\u{2638}', '\u{2639}', '\u{263A}', '\u{2640}',
+    '\u{2642}', '\u{2648}', '\u{2649}', '\u{264A}', '\u{264B}', '\u{264C}', '\u{264D}',
+    '\u{264E}', '\u{264F}', '\u{2650}', '\u{2651}', '\u{2652}', '\u{2653}', '\u{265F}',
+    '\u{2660}', '\u{2663}', '\u{2665}', '\u{2666}', '\u{2668}', '\u{267B}', '\u{267E}',
+    '\u{267F}', '\u{2692}', '\u{2693}', '\u{2694}', '\u{2695}', '\u{2696}', '\u{2697}',
+    '\u{2699}', '\u{269B}', '\u{269C}', '\u{26A0}', '\u{26A1}', '\u{26A7}', '\u{26AA}',
+    '\u{26AB}', '\u{26B0}', '\u{26B1}', '\u{26BD}', '\u{26BE}', '\u{26C4}', '\u{26C5}',
+    '\u{26C8}', '\u{26CE}', '\u{26CF}', '\u{26D1}', '\u{26D3}', '\u{26D4}', '\u{26E9}',
+    '\u{26EA}', '\u{26F0}', '\u{26F1}', '\u{26F2}', '\u{26F3}', '\u{26F4}', '\u{26F5}',
+    '\u{26F7}', '\u{26F8}', '\u{26F9}', '\u{26FA}', '\u{26FD}', '\u{2702}', '\u{2705}',
+    '\u{2708}', '\u{2709}', '\u{270A}', '\u{270B}', '\u{270C}', '\u{270D}', '\u{270F}',
+    '\u{2712}', '\u{2714}', '\u{2716}', '\u{271D}', '\u{2721}', '\u{2728}', '\u{2733}',
+    '\u{2734}', '\u{2744}', '\u{2747}', '\u{274C}', '\u{274E}', '\u{2753}', '\u{2754}',
+    '\u{2755}', '\u{2757}', '\u{2763}', '\u{2764}', '\u{2795}', '\u{2796}', '\u{2797}',
+    '\u{27A1}', '\u{27B0}', '\u{27BF}', '\u{2934}', '\u{2935}', '\u{2B05}', '\u{2B06}',
+    '\u{2B07}', '\u{2B1B}', '\u{2B1C}', '\u{2B50}', '\u{2B55}', '\u{3030}', '\u{303D}',
+    '\u{3297}', '\u{3299}', '\u{1F004}', '\u{1F170}', '\u{1F171}', '\u{1F17E}', '\u{1F17F}',
+    '\u{1F202}', '\u{1F21A}', '\u{1F22F}', '\u{1F237}', '\u{1F30D}', '\u{1F30E}', '\u{1F30F}',
+    '\u{1F315}', '\u{1F31C}', '\u{1F321}', '\u{1F324}', '\u{1F325}', '\u{1F326}', '\u{1F327}',
+    '\u{1F328}', '\u{1F329}', '\u{1F32A}', '\u{1F32B}', '\u{1F32C}', '\u{1F336}', '\u{1F378}',
+    '\u{1F37D}', '\u{1F393}', '\u{1F396}', '\u{1F397}', '\u{1F399}', '\u{1F39A}', '\u{1F39B}',
+    '\u{1F39E}', '\u{1F39F}', '\u{1F3A7}', '\u{1F3AC}', '\u{1F3AD}', '\u{1F3AE}', '\u{1F3C2}',
+    '\u{1F3C4}', '\u{1F3C6}', '\u{1F3CA}', '\u{1F3CB}', '\u{1F3CC}', '\u{1F3CD}', '\u{1F3CE}',
+    '\u{1F3D4}', '\u{1F3D5}', '\u{1F3D6}', '\u{1F3D7}', '\u{1F3D8}', '\u{1F3D9}', '\u{1F3DA}',
+    '\u{1F3DB}', '\u{1F3DC}', '\u{1F3DD}', '\u{1F3DE}', '\u{1F3DF}', '\u{1F3E0}', '\u{1F3ED}',
+    '\u{1F3F3}', '\u{1F3F5}', '\u{1F3F7}', '\u{1F408}', '\u{1F415}', '\u{1F41F}', '\u{1F426}',
+    '\u{1F43F}', '\u{1F441}', '\u{1F442}', '\u{1F446}', '\u{1F447}', '\u{1F448}', '\u{1F449}',
+    '\u{1F44D}', '\u{1F44E}', '\u{1F453}', '\u{1F46A}', '\u{1F47D}', '\u{1F4A3}', '\u{1F4B0}',
+    '\u{1F4B3}', '\u{1F4BB}', '\u{1F4BF}', '\u{1F4CB}', '\u{1F4DA}', '\u{1F4DF}', '\u{1F4E4}',
+    '\u{1F4E5}', '\u{1F4E6}', '\u{1F4EA}', '\u{1F4EB}', '\u{1F4EC}', '\u{1F4ED}', '\u{1F4F7}',
+    '\u{1F4F9}', '\u{1F4FA}', '\u{1F4FB}', '\u{1F4FD}', '\u{1F508}', '\u{1F50D}', '\u{1F512}',
+    '\u{1F513}', '\u{1F549}', '\u{1F54A}', '\u{1F550}', '\u{1F551}', '\u{1F552}', '\u{1F553}',
+    '\u{1F554}', '\u{1F555}', '\u{1F556}', '\u{1F557}', '\u{1F558}', '\u{1F559}', '\u{1F55A}',
+    '\u{1F55B}', '\u{1F55C}', '\u{1F55D}', '\u{1F55E}', '\u{1F55F}', '\u{1F560}', '\u{1F561}',
+    '\u{1F562}', '\u{1F563}', '\u{1F564}', '\u{1F565}', '\u{1F566}', '\u{1F567}', '\u{1F56F}',
+    '\u{1F570}', '\u{1F573}', '\u{1F574}', '\u{1F575}', '\u{1F576}', '\u{1F577}', '\u{1F578}',
+    '\u{1F579}', '\u{1F587}', '\u{1F58A}', '\u{1F58B}', '\u{1F58C}', '\u{1F58D}', '\u{1F590}',
+    '\u{1F5A5}', '\u{1F5A8}', '\u{1F5B1}', '\u{1F5B2}', '\u{1F5BC}', '\u{1F5C2}', '\u{1F5C3}',
+    '\u{1F5C4}', '\u{1F5D1}', '\u{1F5D2}', '\u{1F5D3}', '\u{1F5DC}', '\u{1F5DD}', '\u{1F5DE}',
+    '\u{1F5E1}', '\u{1F5E3}', '\u{1F5E8}', '\u{1F5EF}', '\u{1F5F3}', '\u{1F5FA}', '\u{1F610}',
+    '\u{1F687}', '\u{1F68D}', '\u{1F691}', '\u{1F694}', '\u{1F698}', '\u{1F6AD}', '\u{1F6B2}',
+    '\u{1F6B9}', '\u{1F6BA}', '\u{1F6BC}', '\u{1F6CB}', '\u{1F6CD}', '\u{1F6CE}', '\u{1F6CF}',
+    '\u{1F6E0}', '\u{1F6E1}', '\u{1F6E2}', '\u{1F6E3}', '\u{1F6E4}', '\u{1F6E5}', '\u{1F6E9}',
+    '\u{1F6F0}', '\u{1F6F3}',
+];
+
 #[cfg(test)]
 mod tests {
     //! Unit tests for display escaping. Expected strings are written by hand from the notation in
@@ -684,8 +777,8 @@ mod tests {
             "日本語",
             "שלום",
             "✅",
-            // Emoji presentation: one VS-16 after a non-ASCII base.
-            "⚠\u{FE0F} careful",
+            // Emoji and text presentation: VS-16 / VS-15 after a listed emoji variation base.
+            "⚠\u{FE0F} careful ❤\u{FE0F} ©\u{FE0E}",
             // Keycap: ASCII digit/#/*, VS-16, combining enclosing keycap.
             "1\u{FE0F}\u{20E3} #\u{FE0F}\u{20E3} *\u{FE0F}\u{20E3}",
             // CJK ideographic variation sequence (葛 + VS-17).
@@ -701,12 +794,71 @@ mod tests {
     #[test]
     fn a_variation_selector_run_is_escaped_after_the_first() {
         // "Emoji smuggling": bytes encoded as selectors after one emoji. Only the first is shown.
-        let text = "Looks fine \u{1F600}\u{FE0F}\u{FE01}\u{E0100}\u{E01EF}";
+        let text = "Looks fine ❤\u{FE0F}\u{FE0F}\u{FE01}\u{E0100}\u{E01EF}";
         assert_eq!(
             escape_for_display(text),
-            "Looks fine \u{1F600}\u{FE0F}⟨U+FE01⟩⟨U+E0100⟩⟨U+E01EF⟩"
+            "Looks fine ❤\u{FE0F}⟨U+FE0F⟩⟨U+FE01⟩⟨U+E0100⟩⟨U+E01EF⟩"
         );
         assert!(has_hidden_or_control_chars(text));
+    }
+
+    #[test]
+    fn a_variation_selector_after_ordinary_non_ascii_text_is_escaped() {
+        // Each of these bases defines no variation sequence for the selector after it, so a
+        // selector there is a hidden byte (the round-2 review's exfiltration channel).
+        for (base, name) in [
+            ('\u{2022}', "bullet"),
+            ('\u{2014}', "em dash"),
+            ('\u{201C}', "left double quotation mark"),
+            ('\u{2026}', "ellipsis"),
+            ('\u{00A0}', "no-break space"),
+            ('\u{0434}', "Cyrillic de"),
+            ('\u{0E48}', "Thai tone mark mai ek"),
+            ('\u{093F}', "Devanagari vowel sign i"),
+            ('\u{05B0}', "Hebrew point sheva"),
+            (
+                '\u{1F600}',
+                "grinning face (emoji with no variation sequence)",
+            ),
+        ] {
+            for selector in ['\u{FE0F}', '\u{FE0E}', '\u{FE01}', '\u{E0100}', '\u{180B}'] {
+                let text = format!("a{base}{selector}");
+                let expected = format!("a{base}⟨U+{:04X}⟩", u32::from(selector));
+                assert_eq!(escape_for_display(&text), expected, "{name} + {selector:?}");
+                assert!(has_hidden_or_control_chars(&text), "{name} + {selector:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn each_selector_range_is_shown_only_after_its_own_bases() {
+        // An ideographic selector after an emoji, and VS-16 after an ideograph, are escaped.
+        assert_eq!(escape_for_display("❤\u{E0100}"), "❤⟨U+E0100⟩");
+        assert_eq!(escape_for_display("\u{845B}\u{FE0F}"), "\u{845B}⟨U+FE0F⟩");
+        // U+FE00–U+FE0D are never shown, even after an ideograph or an emoji base.
+        assert_eq!(escape_for_display("\u{845B}\u{FE00}"), "\u{845B}⟨U+FE00⟩");
+        assert_eq!(escape_for_display("❤\u{FE0D}"), "❤⟨U+FE0D⟩");
+        // A Mongolian selector after Latin is escaped; after a Mongolian letter only the first shows.
+        assert_eq!(escape_for_display("a\u{180B}"), "a⟨U+180B⟩");
+        assert_eq!(
+            escape_for_display("\u{1820}\u{180B}\u{180C}"),
+            "\u{1820}\u{180B}⟨U+180C⟩"
+        );
+    }
+
+    #[test]
+    fn a_secret_hidden_one_selector_per_bullet_is_fully_escaped() {
+        // The round-2 repro: one selector after each bullet of a status line.
+        let secret = "sk-live-4f9a2b7c1d";
+        let mut text = String::from("Status: done ");
+        for byte in secret.bytes() {
+            text.push('\u{2022}');
+            text.push(char::from_u32(0xE0100 + u32::from(byte)).expect("valid selector"));
+        }
+        let escaped = escape_for_display(&text);
+        assert!(has_hidden_or_control_chars(&text));
+        assert!(!escaped.chars().any(is_variation_selector), "{escaped}");
+        assert_eq!(escaped.matches("⟨U+E01").count(), secret.len());
     }
 
     #[test]
@@ -723,6 +875,7 @@ mod tests {
 
     #[test]
     fn a_variation_selector_after_a_hidden_or_combining_character_is_escaped() {
+        assert_eq!(escape_for_display("e\u{0301}\u{FE0F}"), "e\u{0301}⟨U+FE0F⟩");
         assert_eq!(escape_for_display("\u{200B}\u{FE0F}"), "⟨U+200B⟩⟨U+FE0F⟩");
         // A run of accents cannot each carry one hidden selector.
         assert_eq!(escape_for_display("e\u{0301}\u{FE01}"), "e\u{0301}⟨U+FE01⟩");
