@@ -110,6 +110,7 @@ async function bootWith({ search, storage }) {
   const root = document.getElementById("app");
   const noticeHost = document.getElementById("notices");
   const inboxStarts = [];
+  const notificationStarts = [];
   await boot({
     root,
     noticeHost,
@@ -118,8 +119,11 @@ async function bootWith({ search, storage }) {
     startInbox: async (_root, identity) => {
       inboxStarts.push(identity);
     },
+    startNotifications: (identity) => {
+      notificationStarts.push(identity);
+    },
   });
-  return { root, noticeHost, inboxStarts };
+  return { root, noticeHost, inboxStarts, notificationStarts };
 }
 
 function click(root, label) {
@@ -139,6 +143,36 @@ function submitPairingForm(root, fields) {
 }
 
 const relayQuery = (value) => `?relay=${encodeURIComponent(value)}`;
+
+describe("boot — notification controls (#237)", () => {
+  test("mount only once the human unlocks, with the pinned identity, after the inbox starts", async () => {
+    const storage = memoryStorage();
+    storage.setItem(PAIRING_KEY, JSON.stringify(PINNED_IDENTITY));
+
+    const { root, inboxStarts, notificationStarts } = await bootWith({ search: "", storage });
+    assert.equal(notificationStarts.length, 0, "nothing before the returning-device unlock");
+
+    click(root, "Unlock inbox");
+    assert.equal(inboxStarts.length, 1);
+    assert.equal(notificationStarts.length, 1);
+    assert.equal(notificationStarts[0].relayUrl, PINNED_RELAY);
+    assert.equal(notificationStarts[0].deviceId, PINNED_IDENTITY.deviceId);
+    assert.deepEqual(networkAttempts, []);
+  });
+
+  test("an unpaired browser gets no notification controls until it pairs", async () => {
+    const storage = memoryStorage();
+    storage.setItem(ONBOARDING_KEY, "1");
+    const { root, notificationStarts } = await bootWith({
+      search: relayQuery("https://relay.selfhost.example"),
+      storage,
+    });
+    assert.equal(notificationStarts.length, 0);
+    submitPairingForm(root, LEGACY_IDENTITY);
+    assert.equal(notificationStarts.length, 1);
+    assert.equal(notificationStarts[0].relayUrl, "https://relay.selfhost.example");
+  });
+});
 
 describe("boot — paired device with a ?relay= link to another origin (#249)", () => {
   test("nothing reaches the other origin, the stored identity is unchanged, and a notice names it", async () => {

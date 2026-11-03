@@ -846,3 +846,57 @@ input {
 .relay-pin-notice-origin {
   font-family: var(--font-mono);
 }
+
+/* Notification controls (#237). Live in #notifications, outside #app, so a denied, unsupported or
+   failed state is visible but never covers or gates the inbox. Neutral surface; accent button. */
+.push-controls {
+  margin: var(--step-3) auto 0;
+  max-width: 640px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 16px;
+  border-radius: var(--r-sm);
+  padding: 10px 14px;
+  color: var(--ink-2);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.push-controls-text {
+  flex: 1 1 280px;
+  margin: 0;
+}
+
+.push-controls-btn {
+  min-height: 36px;
+  border: 0;
+  border-radius: var(--r-sm);
+  padding: 0 14px;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--accent-ink);
+  background: var(--accent);
+  cursor: pointer;
+}
+
+.push-controls-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* Problems the human may want to fix: amber "caution" palette from tokens.css. */
+.push-controls--denied,
+.push-controls--failed {
+  color: var(--risk-med-fg);
+  background: var(--risk-med-bg);
+  border-color: var(--risk-med-edge);
+}
+
+@media (max-width: 480px) {
+  .push-controls-btn {
+    width: 100%;
+  }
+}

@@ -252,6 +252,73 @@ manual entry) is tracked separately and out of scope for this bundling/deploy is
 
 ---
 
+## 6. Notifications (Web Push)
+
+A paired browser can get a notification when an approval request arrives, so the approver doesn't
+need an open tab (#237). It uses the relay's Web Push transport (`docs/relay-api.md` §5).
+
+**What the human sees.** After pairing, a strip above the inbox offers **Enable notifications**.
+Enabling it:
+
+1. asks for notification permission (an explicit click; never on page load);
+2. fetches the relay's VAPID public key (`GET /.well-known/allw/vapid-public-key`);
+3. subscribes with `pushManager.subscribe({ userVisibleOnly: true, applicationServerKey })`;
+4. registers the subscription's `endpoint` as the device's only `webpush` token
+   (`PUT /{acct}/devices/{device_id}/push-tokens`, the device's own bearer token).
+
+Denied, dismissed, unsupported, "relay has notifications turned off" and failed states are shown
+in that strip, with how to fix them. None of them gates the inbox: with the tab open, approving
+works exactly as before. On every later load the subscription is checked, and re-registered if its
+endpoint changed or it was registered for a previous pairing. A subscription made for a different
+relay is dropped, and the human is asked to enable again.
+
+**What a notification says.** Fixed text and, at most, a count: "2 approval requests are waiting."
+It never contains a summary, command, actor, cwd or any other request data, and the service worker
+never decrypts anything. A wakeup is payload-less, so the worker fetches
+`GET /{acct}/devices/{device_id}/inbox` and counts the pending envelopes. It shows a notification on
+**every** push: browsers throttle or revoke a subscription whose pushes show nothing (Safari after a
+few). When the inbox is already empty (another device answered, the request expired, or the relay
+coalesced several submits into one wakeup) it says "An approval request was handled or expired."
+When the inbox can't be read, it says "Open allw approvals to check for approval requests."
+Tapping a notification focuses an open approver window or opens the app; deciding and number-match
+still happen only in the full UI, behind the pairing gate.
+
+**What the service worker can read.** A service worker can't read `localStorage`, so on enabling,
+the page mirrors exactly four values to IndexedDB (`allw-push`): the pinned relay URL, account id,
+device id and `device_auth_token`. The device seeds, device cert and account root key are **never**
+mirrored. The token there has the same exposure as the identity in `localStorage`: any script
+running on the approver origin can read both (`docs/threat-model.md`).
+
+**Files.** `scripts/build-site.mjs` bundles the worker to `sw.js` at the site root (a worker's scope
+can't be wider than its directory), and ships `manifest.webmanifest` (name, `start_url`,
+`display: "standalone"`, icons) plus `icons/`. `index.html` links the manifest and an
+`apple-touch-icon`. `_headers` serves the manifest as `application/manifest+json` and `sw.js` with
+`Cache-Control: no-cache`. The CSP needs no change: `worker-src` and `manifest-src` fall back to
+`'self'`, and the worker's relay requests are covered by the same `connect-src` relay list (§3.1).
+
+**[OPERATOR] Requirements.**
+
+- The relay must have Web Push configured (`docs/relay-deploy.md` §3d). Without it the key endpoint
+  answers 404 and the strip says the relay doesn't send notifications.
+- The relay must answer CORS for the approver's origin. The page and the worker call it
+  cross-origin, and the inbox and push-token calls carry an `Authorization` header, so they are
+  preflighted.
+
+### iPhone and iPad: install to the Home Screen first
+
+iOS and iPadOS (16.4+) deliver Web Push only to a web app **installed to the Home Screen**. In a
+browser tab the strip shows instructions instead of the button: tap **Share**, choose **Add to
+Home Screen**, then open allw approvals from the Home Screen and enable notifications there. The
+installed app runs standalone, and shows the button. This applies to every iOS browser, since all
+of them use WebKit. iPadOS reports a Mac user agent, so it is recognized by touch support.
+
+**[OPERATOR] Manual check.** On a real iPhone: install the approver to the Home Screen, pair it,
+enable notifications, then submit a request against the account from another machine. A
+notification should arrive with the app closed, say only that a request is waiting, and open the
+app when tapped.
+
+---
+
 ## Appendix: what this runbook has and has not verified
 
 | Item                                                                          | Status                                                               |
@@ -268,3 +335,7 @@ manual entry) is tracked separately and out of scope for this bundling/deploy is
 | CSP header present on the live Pages deployment (`curl -sI`)                  | **Not run** — post-deploy operator step (§3.1)                       |
 | Actual deploy to Cloudflare Pages (or any host)                               | **Not run** — human operator step (§3)                               |
 | Mobile-browser smoke test against a live deployed relay                       | **Not run** — human operator step (§4); requires a real device/relay |
+| Notification text has no request data; every push shows one (incl. empty)     | Verified (`test/push.test.mjs`)                                      |
+| Subscribe flow, re-registration, denied/unsupported/failed states, iOS branch | Verified (`test/push.test.mjs`, injected browser APIs)               |
+| Manifest, icons and root-scope `sw.js` bundled                                | Verified (`test/site-build.test.mjs`)                                |
+| A notification received on a real iPhone installed to the Home Screen         | **Not run** — human operator step (§6); requires a device and relay  |
