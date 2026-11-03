@@ -47,6 +47,17 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   **WebSocket** upgrades (which can't easily set headers), pass `?auth=<token>` as a query param.
   The relay stores only `SHA-256(token)`; the plaintext is returned **once** at issuance — cache it.
   Missing token ⇒ **401**; wrong/expired/cross-scope token ⇒ **403**.
+- **No existence answers before auth (#357).** A request id and a pairing code are each guarded by
+  their own token, whose hash lives in the identifier's row. An identifier with no row answers exactly
+  as a wrong token does: **401** `{"error":"authorization required"}` without a bearer token, **403**
+  `{"error":"authorization denied"}` with one. So these routes never say "not found", and an
+  unauthenticated caller cannot tell a live identifier from a guess. A row with no stored token hash
+  (a pre-auth leftover) answers the same way. The relay hashes a presented token either way, so the
+  work does not depend on whether the row exists.
+  Account existence is outside this rule. Account ids are self-certifying, `GET /devices` answers for
+  any id, and `pairing/complete` answers 403 "root not bound" before any credential. A route with no
+  credential to check first, such as `POST /requests`, may say an account is unknown without creating
+  a new oracle.
 - **Public keys.** Every key field the relay accepts (`root_pubkey`, a device or actor `pubkey`) is
   the **canonical** base64url-unpadded encoding of 32 bytes: 43 characters, with the 2 unused low bits
   of the last one zero, so re-encoding the bytes gives back the same string. Anything else is a **400**,
@@ -217,18 +228,19 @@ pairing code is not consumed (#248). Every ECDH with such a key gives a publicly
 (`X25519_SMALL_ORDER_POINTS`, libsodium's `has_small_order` seven points, matched with bit 255 masked),
 called through the relay's WASM binding, not a copy.
 
-Errors:
+Errors, in the order the relay checks them. Every check before the token check is independent of
+the code, so none of them says whether the code exists:
 
-- 403 when no root is bound to the account (a code on an unbound account predates root binding and is
-  never honored);
-- 400 (bad body, a pubkey that isn't the canonical encoding of 32 bytes (§1), small-order pubkey,
-  push_token, unexpected key, or over budget);
-- 401/403 (token);
-- 404 (code unknown);
-- 409 (code already used, or account push-token budget full);
-- 410 (code expired);
-- 500 only when the relay's verification core failed to initialize (logged). A key the core rejects
-  is the 400 above, never a 500.
+1. 403 when no root is bound to the account (a code on an unbound account predates root binding and is
+   never honored);
+2. 400 (bad body, a pubkey that isn't the canonical encoding of 32 bytes (§1), small-order pubkey,
+   push_token, unexpected key, or over budget); 500 only when the relay's verification core failed to
+   initialize while checking the pubkey (logged). A key the core rejects is the 400, never a 500;
+3. 401 (no bearer token) / 403 (a token that is not this code's). An unknown code gets the same 401 /
+   403, never a "not found" (§1, #357);
+4. 409 (code already used);
+5. 410 (code expired);
+6. 409 (account push-token budget full; the code is not consumed).
 
 Atomic — no half-enrollment.
 
@@ -379,7 +391,10 @@ specified-but-unimplemented `action_structure` / `privacy_preference` (#216); `e
 `{ request_id, status:"pending", delivered_to, push_wakeups, request_auth_token }`. 409 on dup `id`.
 **`GET /{acct}/requests/{id}`** and **`GET /{acct}/requests/{id}/wait`** (WS) — Bearer
 `request_auth_token`; poll/await `{ status, verdict? }`. `status` is `pending`, terminal `expired`,
-terminal `retracted` (see below), or `resolved` (+ `verdict`).
+terminal `retracted` (see below), or `resolved` (+ `verdict`). Errors, in order: `…/wait` without an
+`Upgrade: websocket` header is **426** at the router; then **401** (no token) / **403** (a token that
+is not this request's). An unknown id, including a request swept after its retention window, gets the
+same 401 / 403, never a "not found" (§1, #357).
 
 **`POST /{acct}/requests/{id}/retract`** — Bearer `request_auth_token`, scoped to exactly the
 request that token was issued for (issue #195). Cancels the integrator's own still-`pending`
@@ -389,7 +404,8 @@ request — **NOT a verdict**; it never appears in the audit chain as a decision
 any live `…/wait` socket, then closes it. **409** if the request already reached a real terminal
 state (`resolved` — a device decided, the verdict stands; or `expired`) — a retract can never
 discard a decision or override the fail-closed timeout. Idempotent on an already-`retracted`
-request (200). `404` unknown request; `401`/`403` missing/wrong/cross-request token.
+request (200). Errors, in order: **401** (no token) / **403** (missing/wrong/cross-request token; an
+unknown id gets the same, never a "not found", §1, #357); then **409** as above.
 
 ---
 
