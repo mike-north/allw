@@ -199,11 +199,40 @@ Validation:
 The approver UI must render all material fields that are included in the request hash and relevant to the human
 decision. A summary may help readability, but it is not a substitute for rendering the action substrate.
 
+Rendering must also be **display-safe**: every context string is attacker-influenced, and a control or bidi
+character can make the screen show something other than the bytes the hash binds. A command whose JSON carries
+`ESC [2K` + `CR` erases and repaints its own terminal line, so `rm -rf ~/x; : <ESC>[2K<CR>git status` shows as
+`git status` while the verdict binds the real bytes. In a browser, bidi overrides (U+202E, Trojan Source /
+CVE-2021-42574) reorder text and zero-width characters hide it. How untrusted text reaches the human is therefore a
+trust decision, and it lives in the core:
+
+- `allw_core::display` (`crates/allw-core/src/display.rs`) defines the escaped set: C0 controls, DEL, C1 controls,
+  bidi controls (U+061C, U+200E/F, U+202A–U+202E, U+2066–U+2069), zero-width and invisible characters (U+200B–U+200D,
+  U+2060, U+FEFF), the rest of Unicode `Default_Ignorable_Code_Point` except variation selectors, U+2028/U+2029, and
+  U+FFF9–U+FFFB. Notation: `\t`, `\n`, `\r`, `\xHH` for other C0 controls and DEL (ESC → `\x1b`), and `⟨U+XXXX⟩`
+  for everything else.
+- `display_model(context)` returns every string a surface shows (summary, actor id/kind/label, every syntactic
+  substrate field, params as JSON, chain) already escaped, plus `has_hidden_or_control_chars`. It is exported through
+  WASM (`display_model`, `escape_for_display`) and UniFFI (`display_model_json`, `escape_for_display`).
+- Surfaces print only that model and never escape anything themselves. Layout (which field is the headline, argv
+  quoting, the `raw`/`argv` divergence line) stays surface code, but layout _decisions_ such as divergence are taken
+  on the raw bytes, because distinct inputs can escape to the same text (a literal `\x1b` vs a real ESC). When the
+  flag is set the surface shows a warning (CLI: a line under the header, above the prompt; web: a badge on the card).
+- The CLI approver also passes every log line through `escape_for_display`: log lines interpolate relay-supplied text
+  (request ids, relay error strings), and a malicious relay could otherwise repaint the request block mid-prompt.
+- Escaping is display-only. `request_hash` is computed over the original context; the display model is a separate
+  value that is never hashed, signed, or sent.
+
 Validation:
 
 - Approver render tests cover command `argv`, flags, cwd, env refs, MCP server/tool/params, divergent raw/parsed
   forms, risk, actor, expiry, and challenge state.
 - Any new `ActionRecord` syntactic field must either render directly or be explicitly marked non-decision-making.
+- A new syntactic field must also be added to `DisplaySubstrate` so it is escaped before any surface can show it.
+- The shared vector `crates/allw-core/tests/fixtures/display_vector.json` (asserted by the Rust core and through
+  WASM) covers each escaped class and a mixed string. CLI tests assert the `watch` process's stdout/stderr bytes
+  contain no raw ESC/CR for the spoof above; web tests assert a U+202E payload reaches the DOM escaped with the
+  warning badge present.
 
 ### R4. Fail-closed execution
 
@@ -364,6 +393,12 @@ attestation, audit records, hook/SDK fail-closed behavior, or enrollment.
 ### WYSIWYS and Approver UX
 
 - [ ] Every field covered by `request_hash` that matters to the decision is rendered or intentionally explained.
+- [ ] Every untrusted string reaches the screen through the core display model (`display_model` /
+      `escape_for_display`); no surface prints a raw context, envelope, or relay string or escapes on its own (R3).
+- [ ] Control, bidi, and zero-width characters render as visible escapes, and the surface shows its
+      hidden-character warning whenever `has_hidden_or_control_chars` is set.
+- [ ] Display escaping never feeds `request_hash`; layout decisions (e.g. raw/argv divergence) compare raw bytes,
+      not escaped text.
 - [ ] Parsed and raw command/MCP forms cannot diverge silently.
 - [ ] Expiry, actor identity, risk, reversible status, and challenge requirement are visible before signing.
 - [ ] Unverified actor identity is not presented as verified.
