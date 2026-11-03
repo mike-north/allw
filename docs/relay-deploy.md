@@ -146,23 +146,29 @@ node_modules/.bin/wrangler secret put VAPID_PRIVATE_KEY --env production
 # Paste the printed private key when prompted. Then discard the local copy.
 ```
 
-Verify after deploy: `curl https://<relay>/push/vapid-public-key` returns
-`{"vapid_public_key":"<your public key>"}` (a 404 means one of the three values is missing or
-malformed). **Rotating the keypair invalidates every existing browser subscription**: browsers must
-re-subscribe with the new public key, and old endpoints are pruned as push services reject them.
+Verify after deploy: `curl https://<relay>/.well-known/allw/vapid-public-key` returns
+`{"vapid_public_key":"<your public key>"}`. A 404 means one of the three values is missing or
+malformed, or the public and private keys are not one keypair (the relay checks by signing and
+verifying once).
+
+**Rotating the keypair invalidates every existing browser subscription**: browsers must re-subscribe
+with the new public key. The relay does **not** prune the old endpoints: a push service rejects them
+with an auth error (401/403), which the relay deliberately treats as transient, so a misconfigured
+relay can never unregister every device. Stale endpoints stay registered until the device
+re-registers its push tokens (#236).
 
 ### Secrets inventory summary
 
-| Secret / var        | Required | Description                                                                                                                                 |
-| ------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `APNS_ENDPOINT`     | Optional | APNs base URL (plain var in `wrangler.jsonc`). Production: `https://api.push.apple.com`; sandbox: `https://api.development.push.apple.com`. |
-| `APNS_TOPIC`        | Optional | App bundle id, e.g. `com.example.allw` (plain var in `wrangler.jsonc`).                                                                     |
-| `APNS_BEARER_TOKEN` | Optional | APNs token-auth JWT (set via `wrangler secret put`). Short-lived; rotate hourly.                                                            |
-| `FCM_ENDPOINT`      | Optional | FCM HTTP v1 send URL (plain var in `wrangler.jsonc`).                                                                                       |
-| `FCM_BEARER_TOKEN`  | Optional | FCM OAuth 2.0 access token for a service account (set via `wrangler secret put`).                                                           |
-| `VAPID_PUBLIC_KEY`  | Optional | Web Push VAPID public key, base64url uncompressed P-256 point (plain var in `wrangler.jsonc`). Served at `GET /push/vapid-public-key`.      |
-| `VAPID_PRIVATE_KEY` | Optional | Web Push VAPID private key, base64url 32-byte scalar (set via `wrangler secret put`). Long-lived; rotating it invalidates subscriptions.    |
-| `VAPID_SUBJECT`     | Optional | Web Push operator contact, `mailto:` or `https:` URI (plain var in `wrangler.jsonc`).                                                       |
+| Secret / var        | Required | Description                                                                                                                                        |
+| ------------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `APNS_ENDPOINT`     | Optional | APNs base URL (plain var in `wrangler.jsonc`). Production: `https://api.push.apple.com`; sandbox: `https://api.development.push.apple.com`.        |
+| `APNS_TOPIC`        | Optional | App bundle id, e.g. `com.example.allw` (plain var in `wrangler.jsonc`).                                                                            |
+| `APNS_BEARER_TOKEN` | Optional | APNs token-auth JWT (set via `wrangler secret put`). Short-lived; rotate hourly.                                                                   |
+| `FCM_ENDPOINT`      | Optional | FCM HTTP v1 send URL (plain var in `wrangler.jsonc`).                                                                                              |
+| `FCM_BEARER_TOKEN`  | Optional | FCM OAuth 2.0 access token for a service account (set via `wrangler secret put`).                                                                  |
+| `VAPID_PUBLIC_KEY`  | Optional | Web Push VAPID public key, base64url uncompressed P-256 point (plain var in `wrangler.jsonc`). Served at `GET /.well-known/allw/vapid-public-key`. |
+| `VAPID_PRIVATE_KEY` | Optional | Web Push VAPID private key, base64url 32-byte scalar (set via `wrangler secret put`). Long-lived; rotating it invalidates subscriptions.           |
+| `VAPID_SUBJECT`     | Optional | Web Push operator contact, `mailto:` or `https:` URI (plain var in `wrangler.jsonc`).                                                              |
 
 No other secrets are required. The relay derives all per-account auth tokens internally and stores
 only SHA-256 hashes in the Durable Object SQLite database. Its only static signing key is the
