@@ -249,11 +249,14 @@ trust decision, and it lives in the core:
   untrusted text to the terminal width (80 columns when stdout is not a TTY), with a `↪` marker on every wrapped row.
   Spaces are printable and never escaped, so without this a padded field would soft-wrap its tail onto a row of its
   own, where it could pose as a field label or a forged `✓ VERIFIED` origin row.
-- **The web approver shows less than the CLI.** Its card renders `argv`, `cwd`, `raw`, MCP/agent-tool
-  `server :: tool` and `params`, all from the core model, but not yet `bin`, `flags`, `positionals`, `host`,
-  `env_refs`, `chain`, a file edit's `operation`/`paths`/`diff_summary`/`diff_hash`, or a raw/argv divergence
-  warning, although all are bound into `request_hash`. Until the web parity follow-up lands, the CLI is the complete
-  view.
+- **The web approver shows every hash-bound field the CLI shows.** Its view model carries the core's whole display
+  substrate rather than a per-surface subset, so the card lists every present field whatever the surface (`bin`,
+  `argv`, `flags`, `positionals`, `cwd`, `host`, `env_refs`, `server :: tool`, `params`, a file edit's
+  `operation`/`paths`/`diff_summary`/`diff_hash`/content, and `raw`), plus the chain and the context summary. The
+  summary is labelled as the agent's description and sits below the action heading. Whenever the hidden-character
+  badge shows, the escaped character is visible on the card. When `raw` and the hash-bound argv diverge, the card
+  heading is the argv form and a "raw and argv differ" alert shows, as on the CLI; the two approvers decide divergence
+  with the same rule, tested against one shared fixture.
 - Relay-supplied text outside the context goes through `escape_for_display` too. The CLI approver escapes every
   `watch` log line (request ids, relay error strings, which could otherwise repaint the request block mid-prompt),
   every `pair` output line (the relay-issued pairing code and `device_id`), and the fatal error line (which can embed
@@ -445,7 +448,6 @@ attestation, audit records, hook/SDK fail-closed behavior, or enrollment.
 ### WYSIWYS and Approver UX
 
 - [ ] Every field covered by `request_hash` that matters to the decision is rendered or intentionally explained.
-      (Known gap: the web card omits several hash-bound fields the CLI shows; see R3.)
 - [ ] Every untrusted string reaches the screen through the core display model (`display_model` /
       `escape_for_display`); no surface prints a raw context, envelope, or relay string or escapes on its own (R3).
 - [ ] Control, bidi, and zero-width characters render as visible escapes, and the surface shows its
