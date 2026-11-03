@@ -46,12 +46,6 @@ export const MAX_CONTEXT_CIPHERTEXT_BYTES = 64 * 1024;
 export const DEFAULT_MAX_REQUEST_TTL_MS = 15 * 60 * 1000;
 
 /**
- * Most live pending requests one account may hold; the next submit gets 429. Requests past their
- * `expires_at` (or past the horizon), resolved, expired and retracted requests do not count.
- */
-export const MAX_PENDING_REQUESTS_PER_ACCOUNT = 64;
-
-/**
  * Largest accepted `POST /{acct}/pairing/start` or `POST /{acct}/pairing/complete` body, in bytes
  * (checked before parsing; larger gets 413). Both bodies are a few keys plus short tokens.
  */
