@@ -20,6 +20,35 @@ export interface DeviceRecord {
   readonly created_at: number;
 }
 
+/**
+ * The shape a relay-listed `device_id` must have before the SDK uses it. The relay mints device ids
+ * as UUIDs; this accepts the base64url alphabet up to 64 characters, so an honest id always passes.
+ *
+ * The relay is untrusted, and a device id flows into JWE recipient headers, the revocation filter,
+ * and error messages that the hooks put in the agent-visible deny reason. Rejecting anything else
+ * (newlines, quotes, control characters, unbounded length) keeps relay-chosen text from reaching
+ * the agent as if it were an allw diagnostic.
+ */
+const DEVICE_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
+/**
+ * Whether one relay device-list entry carries the fields the SDK routes on: a well-formed
+ * `device_id` ({@link DEVICE_ID_PATTERN}) and a string `pubkey`. The key bytes themselves are
+ * checked by the core when it encrypts. `label` and `created_at` are informational and unused here,
+ * so they are not checked.
+ */
+function hasRoutableRecipientFields(
+  value: unknown,
+): value is Pick<DeviceRecord, "device_id" | "pubkey"> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.device_id === "string" &&
+    DEVICE_ID_PATTERN.test(record.device_id) &&
+    typeof record.pubkey === "string"
+  );
+}
+
 /** The relay-visible `ApprovalRequest` envelope — exactly the contract's key set, nothing more. */
 export interface ApprovalRequestEnvelope {
   readonly v: number;
@@ -249,7 +278,11 @@ export class RelayClient {
   /**
    * Fetch the approver's enrolled devices (`GET /:acct/devices`) to use as JWE recipients.
    *
-   * @throws {RelayError} on a non-2xx response or a malformed body.
+   * Every entry must have a well-formed `device_id` and a string `pubkey`. One bad entry fails the
+   * whole call (fail-closed) rather than being dropped, and the error names only its index, never
+   * the relay-supplied text.
+   *
+   * @throws {RelayError} on a non-2xx response, a malformed body, or a malformed device entry.
    */
   async fetchDevices(): Promise<readonly DeviceRecord[]> {
     const resp = await this.timedFetch(`${this.base}/devices`, { method: "GET" });
@@ -263,6 +296,14 @@ export class RelayClient {
     const devices: unknown = body.devices;
     if (!Array.isArray(devices)) {
       throw new RelayError("relay device list 'devices' is not an array", resp.status);
+    }
+    const malformed = devices.findIndex((d) => !hasRoutableRecipientFields(d));
+    if (malformed !== -1) {
+      throw new RelayError(
+        `relay device list entry ${String(malformed)} is malformed (device_id must match ` +
+          `${DEVICE_ID_PATTERN.source} and pubkey must be a string)`,
+        resp.status,
+      );
     }
     return devices as readonly DeviceRecord[];
   }

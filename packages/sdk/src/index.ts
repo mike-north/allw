@@ -829,8 +829,9 @@ export function createClient(config: ClientConfig): Client {
     // each fetch; here we additionally ensure a *transport* failure on these calls fails closed to
     // a `Verdict` (expired) instead of rejecting — the same fail-closed terminal a wait-stage
     // timeout produces (issue #52, contract §Invariants #6). HTTP-level errors (a relay
-    // `RelayError` with a real status), a no-devices account, and an all-devices-revoked account
-    // still throw, surfacing integrator/protocol misconfiguration loudly.
+    // `RelayError` with a real status, including a malformed device entry), a no-devices account,
+    // and an all-devices-revoked account still throw, surfacing integrator/protocol misconfiguration
+    // loudly.
     let contextCiphertext: string;
     try {
       const devices = await relay.fetchDevices();

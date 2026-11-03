@@ -189,6 +189,12 @@ Validation:
   masked) through WASM, so device-key registration can reject the same keys up front. A shared vector
   (`crates/allw-core/tests/fixtures/x25519_small_order.json`) asserts the denylist and encryption agree in
   Rust and through WASM (#248).
+- Device ids in that registry are relay-chosen text, and SDK error messages reach the agent through the
+  hooks' deny reason. A hostile id could therefore pose as an allw diagnostic (prompt injection). Two layers
+  stop this. The SDK fails closed on any relay device entry whose `device_id` doesn't match
+  `^[A-Za-z0-9_-]{1,64}$` (the relay mints UUIDs) or whose `pubkey` isn't a string, and its error names only
+  the entry's index. The core's `EncryptError` message renders a device id escaped (`{:?}`) and capped at 64
+  characters, while the variant keeps the full id.
 
 ### R2. Verdict authenticity and binding
 
