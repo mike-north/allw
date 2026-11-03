@@ -166,7 +166,12 @@ verdict `sig` (+ optional integrator counter-sign). Periodically anchor the head
    `request_hash` equals the integrator's locally-computed hash of the canonical `ApprovalContext`. Both are
    required — `request_hash` excludes `id`, so two content-identical requests share a hash; the `id` check
    distinguishes them.
-3. `decision == approved`.
+3. `decision == approved`. A verdict that passes every other check but whose signed decision is not `approved` is a
+   _verified_ human "no". Report it with the decision from the **signed claims**, delivered structurally (the core's
+   `NotApproved`; WASM throws an `Error` with `kind: "not_approved"` and `decision`). Never classify a failure by
+   its error message, because untrusted verdict fields are echoed into parse errors
+   ([#311](https://github.com/mike-north/allw/issues/311)). Any other failure is unverifiable and reports a
+   synthesized `denied`.
 4. Not expired; `decided_at` within window; nonce unseen (anti-replay).
 5. If the verdict is approved and destructive challenge is required: `challenge_response` equals the derived
    number-match challenge. Authenticated denials stay denials without a challenge response.

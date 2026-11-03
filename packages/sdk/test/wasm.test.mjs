@@ -2428,3 +2428,184 @@ test("select_recipients throws — never returns [] — when no recipient set is
     );
   }
 });
+
+// ── Sealing to root-vouched recipients (#243) ───────────────────────────────────────
+// @see crates/allw-core/src/sealing.rs (one core call: select, then encrypt)
+// @see https://www.rfc-editor.org/rfc/rfc7516 §7.2 (General JWE JSON Serialization)
+
+/** The JWE recipient `kid`s, in order (RFC 7516 §7.2.1 `recipients[].header.kid`). */
+function recipientKids(ciphertext) {
+  return JSON.parse(ciphertext).recipients.map((r) => r.header.kid);
+}
+
+test("seal_context_for_account_state encrypts only to the vouched devices in the Rust vector", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  const sealed = JSON.parse(
+    wasm.seal_context_for_account_state(
+      v.context_json,
+      v.seal_account_states_json,
+      v.expected_account_id_for_root,
+      v.approver_root_pubkey_b64,
+      v.recipient_now_ms,
+      v.seal_sequence,
+    ),
+  );
+  // Spec: the seal reports the sequence it selected from, and its recipients are the selection.
+  assert.equal(sealed.sequence, v.seal_sequence);
+  const expected = JSON.parse(v.seal_expected_recipient_ids_json);
+  assert.deepEqual(recipientKids(sealed.ciphertext), expected);
+  assert.deepEqual(expected, ["laptop", "phone"]);
+
+  const seeds = JSON.parse(v.seal_x25519_seeds_json);
+  for (const id of expected) {
+    assert.deepEqual(
+      JSON.parse(wasm.decrypt_context(sealed.ciphertext, id, seeds[id])),
+      JSON.parse(v.context_json),
+      `${id} opens the sealed context`,
+    );
+  }
+  // The revoked device, the expired one, and a key the root never vouched for (listed only in a
+  // stale sequence) get no recipient entry.
+  for (const id of ["old", "injected", "expired"]) {
+    assert.throws(
+      () => wasm.decrypt_context(sealed.ciphertext, id, seeds[id]),
+      /no recipient header kid matches/,
+      id,
+    );
+  }
+});
+
+test("seal_context_for_account_state reports the selected sequence, not the caller's floor", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  // Spec (sealing.rs): `sequence` is the highest verified sequence the recipients came from; the
+  // caller persists it as its floor, so returning the floor itself would let a rollback through.
+  for (const floor of [1, undefined]) {
+    const sealed = JSON.parse(
+      wasm.seal_context_for_account_state(
+        v.context_json,
+        v.seal_account_states_json,
+        v.expected_account_id_for_root,
+        v.approver_root_pubkey_b64,
+        v.recipient_now_ms,
+        floor,
+      ),
+    );
+    assert.equal(sealed.sequence, 3, `floor ${String(floor)}`);
+  }
+});
+
+test("seal_context_for_account_state throws, encrypting nothing, when no recipient set is allowed", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  const seal = (states, floor = undefined, nowMs = v.recipient_now_ms, ctx = v.context_json) =>
+    wasm.seal_context_for_account_state(
+      ctx,
+      states,
+      v.expected_account_id_for_root,
+      v.approver_root_pubkey_b64,
+      nowMs,
+      floor,
+    );
+  assert.throws(() => seal("[]"), /no account-state document/);
+  assert.throws(
+    () => seal(v.seal_account_states_json, v.seal_sequence + 1),
+    /highest account-state sequence 3 is below the required floor 4/,
+  );
+  assert.throws(
+    () => seal(v.seal_account_states_json, undefined, -1),
+    /now_ms must be a non-negative/,
+  );
+  assert.throws(() => seal(v.seal_account_states_json, -1), /min_sequence must be a non-negative/);
+  assert.throws(
+    () => seal(v.seal_account_states_json, undefined, v.recipient_now_ms, "{}"),
+    /ApprovalContext/,
+  );
+  const otherRoot = wasm.ed25519_public_key(Buffer.alloc(32, 0x33).toString("base64url"));
+  assert.throws(
+    () =>
+      wasm.seal_context_for_account_state(
+        v.context_json,
+        v.seal_account_states_json,
+        v.expected_account_id_for_root,
+        otherRoot,
+        v.recipient_now_ms,
+        undefined,
+      ),
+    /did not verify/,
+  );
+});
+
+/**
+ * A verified non-approval is reported structurally, never through the message (#311). For each
+ * genuinely signed non-approval in the shared vector, both verify functions throw an `Error` whose
+ * own `kind` is `"not_approved"` and whose `decision` is the signed decision. For each forged case
+ * (outer `decision` rewritten, the old message marker echoed through other fields), the throw has
+ * no `kind` or `decision`, even when its message contains the marker.
+ *
+ * @see crates/allw-core/tests/wasm_vector.rs (`fixture_not_approved_cases_follow_the_signed_claims`)
+ */
+test("verify_verdict reports a verified non-approval only as the structured signed decision", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  const verifiers = [
+    [
+      "verify_verdict",
+      (verdictJson) =>
+        wasm.verify_verdict(
+          verdictJson,
+          v.request_json,
+          v.context_json,
+          v.approver_root_pubkey_b64,
+          v.now_ms,
+        ),
+    ],
+    [
+      "verify_verdict_with_account_states",
+      (verdictJson) =>
+        wasm.verify_verdict_with_account_states(
+          verdictJson,
+          v.request_json,
+          v.context_json,
+          v.approver_root_pubkey_b64,
+          v.now_ms,
+          "[]",
+        ),
+    ],
+  ];
+  const thrown = (verify, verdictJson) => {
+    try {
+      verify(verdictJson);
+    } catch (err) {
+      return err;
+    }
+    assert.fail("verification must throw");
+  };
+
+  assert.equal(v.not_approved_verdicts.length, 3);
+  assert.equal(v.forged_not_approved_verdicts.length, 7);
+  for (const [name, verify] of verifiers) {
+    for (const c of v.not_approved_verdicts) {
+      const err = thrown(verify, c.verdict_json);
+      assert.ok(err instanceof Error, `${name} / ${c.name}: an Error`);
+      assert.equal(err.kind, "not_approved", `${name} / ${c.name}: kind`);
+      assert.equal(err.decision, c.signed_decision, `${name} / ${c.name}: the signed decision`);
+    }
+    for (const c of v.forged_not_approved_verdicts) {
+      const err = thrown(verify, c.verdict_json);
+      assert.ok(err instanceof Error, `${name} / ${c.name}: an Error`);
+      assert.equal(err.kind, undefined, `${name} / ${c.name}: unclassified`);
+      assert.equal(err.decision, undefined, `${name} / ${c.name}: no decision`);
+      if (c.message_echoes_marker) {
+        assert.ok(
+          err.message.includes("verified human decision was not 'approved'"),
+          `${name} / ${c.name}: the message echoes the marker (a message classifier is fooled)`,
+        );
+      }
+    }
+  }
+
+  // The approved vector verdict still verifies (no throw).
+  assert.equal(JSON.parse(verifiers[0][1](v.verdict_json)).approved, true);
+});
