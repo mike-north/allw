@@ -186,21 +186,38 @@ only forward on `latest`.
       Every commit there is on `main`, so it was reviewed, but it's your last look before the
       bytes go public.
 
-   2. Check out exactly GitHub's `main`, unmodified, and log in to npm (`npm login`) and to `gh`.
-      The verifier refuses to run otherwise: `git status --porcelain` must be empty and `HEAD` must
-      equal the `main` SHA that `git ls-remote` reports. Its code and the release constants it
-      imports come from this checkout, which an agent or anyone with local access could have
-      edited.
+   2. Get a **fresh clone of GitHub's `main`** in a new temp directory, never your working checkout.
+      Then log in to npm (`npm login`) and to `gh`.
 
       ```sh
-      git fetch https://github.com/mike-north/allw.git main && git checkout --detach FETCH_HEAD
+      MAIN=$(git ls-remote https://github.com/mike-north/allw.git refs/heads/main | cut -f1)
+      DIR=$(mktemp -d)
+      git -c core.hooksPath=/dev/null clone --filter=blob:none \
+        https://github.com/mike-north/allw.git "$DIR"
+      cd "$DIR" && test "$(git rev-parse HEAD)" = "$MAIN" && echo "at main $MAIN"
       ```
 
-   3. Run the verifier for the version, naming the run whose stages you mean to approve:
+      `--filter=blob:none` keeps every commit but fetches file contents lazily. A `--depth 1`
+      clone would be smaller, but it lacks the history the ancestry check needs, so the verifier
+      would report every tag as not on `main`. That fails safe, but you couldn't use it.
+
+   3. Run the verifier from that clone in a **clean environment**, so your shell's `NODE_OPTIONS`,
+      aliases and extra PATH entries don't apply. Name the run whose stages you mean to approve:
 
       ```sh
-      node scripts/verify-staged-release.mjs 0.2.0 --run <run-id>
+      NODE_DIR=$(dirname "$(nodenv which node 2>/dev/null || command -v node)")
+      env -i HOME="$HOME" TERM="$TERM" PATH="$NODE_DIR:/opt/homebrew/bin:/usr/bin:/bin" \
+        node scripts/verify-staged-release.mjs 0.2.0 --run <run-id>
       ```
+
+      The verifier also refuses a dirty checkout, or one whose `HEAD` isn't GitHub's current
+      `main`. That only catches a stale or accidentally edited checkout. It is not a defense
+      against a hostile process on your machine:
+      - `git update-index --skip-worktree` hides edits from `git status`;
+      - a shim for `git`, `npm`, `gh` or `node` on your PATH, a git hook, or an edited copy of the
+        verifier can make every check pass.
+
+      The fresh clone and the clean environment narrow that. They don't close it.
 
       [`scripts/verify-staged-release.mjs`](../scripts/verify-staged-release.mjs) exits non-zero
       unless all of the following hold:
@@ -216,7 +233,10 @@ only forward on `latest`.
         `refs/tags/v0.2.0` in `mike-north/allw`, at that commit, from that run, for that sha512.
 
       npm's stage reads don't prompt for 2FA themselves. If your account's 2FA covers authorization,
-      the verifier asks for a one-time password and retries with it. Without one, it stops.
+      the verifier asks for a one-time password and retries with it. Without one, it stops. The
+      code reaches npm only through the child process's environment, never its command line, and
+      npm's log file is disabled for those calls, so the code doesn't show up in `ps` or
+      `~/.npm/_logs`.
 
    4. If it passes, approve **only the stage ids it prints**, in the order it prints them:
 
@@ -228,6 +248,14 @@ only forward on `latest`.
 
    5. Log out of npm (`npm logout`). Stay logged out when you're not releasing, so a stray
       `npm stage approve` can't happen.
+
+   **Residual risk: the 2FA approval is only as strong as the machine you type it on.** Malware or
+   a compromised agent on that machine could fake the verifier's output, or swap what you approve.
+   The verifier can't prove its own integrity. For a release you need to be sure of, verify and
+   approve somewhere no agent runs:
+   - **On npmjs.com:** open each package's **Staged Packages** tab in a browser, check that each
+     stage's version and shasum match the verifier's output, and approve there.
+   - **From a separate macOS user account** that runs no coding agents: do steps 2–5 there.
 
    **What actually protects you before approval is the byte match.** The verifier checks that each
    staged tarball is byte-for-byte what a successful run built from a reviewed commit on `main`.
@@ -274,7 +302,9 @@ reads registry state before every step and asks before every write.
 3. **Trusted publishers.** It runs `npm trust github` on each `@allw/*` package (workflow
    `release.yml`, repo `mike-north/allw`, environment `npm-publish`, `--allow-stage-publish` only).
    - It reads every config on the package. If reading needs 2FA, it asks for a one-time password
-     and retries with `--otp`, and it fails closed when it gets none.
+     and retries with it, and it fails closed when it gets none. The code goes to npm through the
+     child process's environment (`npm_config_otp`), never its command line, and npm's log file is
+     disabled for those reads.
    - Every config that differs in any way is revoked: a different identity, or one that allows
      direct `npm publish`, even alongside staging. The stage-only config is created only after the
      revokes succeed.
