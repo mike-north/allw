@@ -33,8 +33,9 @@ Full walkthrough with troubleshooting: **[docs/quickstart.md](./docs/quickstart.
 # 1. Install the CLIs in your project (the @allw/sdk + bundled WASM come along automatically):
 npm install @allw/hook @allw/approver
 
-# 2. Pair a second device (a second terminal). Prints your account-root public key:
-npx allw-approver pair --relay https://allw-relay.mnorth.workers.dev --account my-account --label my-laptop
+# 2. Pair a second device (a second terminal). Prints your account id + account-root public key
+#    (the account id is derived from the account-root key — you don't choose it):
+npx allw-approver pair --relay https://allw-relay.mnorth.workers.dev --label my-laptop
 
 # 3. Watch for requests on that device (leave running — this is your "phone" for now):
 npx allw-approver watch

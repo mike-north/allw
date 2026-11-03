@@ -37,21 +37,25 @@
 //! lost in practice. A non-integer or out-of-`i64`-range value is rejected with a `JsError`.
 
 use allw_core::{
+    account_id_for_root as core_account_id_for_root,
     action_from_agent_tool_call as core_action_from_agent_tool_call,
     action_from_agent_tool_call_with_raw as core_action_from_agent_tool_call_with_raw,
     action_from_argv as core_action_from_argv, action_from_command as core_action_from_command,
     action_from_file_edit as core_action_from_file_edit,
     action_from_mcp_tool_call as core_action_from_mcp_tool_call,
+    check_account_id_for_root as core_check_account_id_for_root,
     compute_request_hash as core_compute_request_hash, decrypt_context as core_decrypt_context,
     derive_number_match_challenge as core_derive_number_match_challenge,
     encrypt_context as core_encrypt_context, evaluate as core_evaluate,
     evaluate_for_actor as core_evaluate_for_actor, issue_device_cert as core_issue_device_cert,
     revoked_device_ids as core_revoked_device_ids, sign_account_state as core_sign_account_state,
     sign_actor_attestation as core_sign_actor_attestation,
+    sign_pairing_start_authorization as core_sign_pairing_start_authorization,
     sign_policy_rule as core_sign_policy_rule, sign_verdict as core_sign_verdict,
     verified_origin_string as core_verified_origin_string,
     verify_account_state as core_verify_account_state,
     verify_actor_attestation_with_account_states as core_verify_actor_attestation_with_account_states,
+    verify_pairing_start_authorization as core_verify_pairing_start_authorization,
     verify_policy_rule as core_verify_policy_rule,
     verify_policy_rule_for_account as core_verify_policy_rule_for_account,
     verify_policy_rule_with_account_states as core_verify_policy_rule_with_account_states,
@@ -659,6 +663,95 @@ pub fn revoked_device_ids(
     // Sort for a deterministic wire result (a `HashSet` has no defined iteration order).
     ids.sort_unstable();
     to_json(&ids, "revoked device ids")
+}
+
+// ── self-certifying account id + pairing-start authorization ────────────────────────
+
+/// Decodes and validates an account-root Ed25519 public key argument.
+fn parse_account_root_pubkey(account_root_pubkey_b64: &str) -> Result<PublicKey, JsError> {
+    let root_bytes = decode_b64_32(account_root_pubkey_b64, "account_root_pubkey_b64")?;
+    PublicKey::from_bytes(&root_bytes).map_err(|e| {
+        JsError::new(&format!(
+            "account_root_pubkey_b64 is not a valid Ed25519 key: {e}"
+        ))
+    })
+}
+
+/// Derives the self-certifying account id for an account-root public key
+/// (`docs/enrollment.md` §Model): `base64url(SHA-256("allw/account-id/v1" || 0x00 || root))`.
+///
+/// # Errors
+///
+/// Throws if `account_root_pubkey_b64` is not a valid base64url Ed25519 public key.
+#[wasm_bindgen]
+pub fn account_id_for_root(account_root_pubkey_b64: &str) -> Result<String, JsError> {
+    let root = parse_account_root_pubkey(account_root_pubkey_b64)?;
+    Ok(core_account_id_for_root(&root))
+}
+
+/// Checks that `account_id` is exactly the id derived from `account_root_pubkey_b64`. Returns
+/// nothing on success.
+///
+/// # Errors
+///
+/// Throws if the public key is malformed or the account id does not derive from it.
+#[wasm_bindgen]
+pub fn check_account_id_for_root(
+    account_id: &str,
+    account_root_pubkey_b64: &str,
+) -> Result<(), JsError> {
+    let root = parse_account_root_pubkey(account_root_pubkey_b64)?;
+    core_check_account_id_for_root(account_id, &root)
+        .map_err(|e| JsError::new(&format!("check_account_id_for_root failed: {e}")))
+}
+
+/// Signs an `allw-pairing-start+jws` authorization with the account root, for the account id
+/// derived from that root. `jti` must be 16–128 base64url characters (generate it randomly);
+/// `expires_at - issued_at` must be in `(0, 5 min]`.
+///
+/// # Errors
+///
+/// Throws if the seed is malformed, a timestamp is not an in-range integer, or the `jti` /
+/// validity window would be rejected by the verifier.
+#[wasm_bindgen]
+pub fn sign_pairing_start_authorization(
+    account_root_seed_b64: &str,
+    issued_at: f64,
+    expires_at: f64,
+    jti: &str,
+) -> Result<String, JsError> {
+    let seed = decode_b64_32(account_root_seed_b64, "account_root_seed_b64")?;
+    let account_root = SigningKeyPair::from_seed(&seed);
+    let issued_at = ms_to_i64(issued_at, "issued_at")?;
+    let expires_at = ms_to_i64(expires_at, "expires_at")?;
+    core_sign_pairing_start_authorization(&account_root, issued_at, expires_at, jti)
+        .map_err(|e| JsError::new(&format!("sign_pairing_start_authorization failed: {e}")))
+}
+
+/// Verifies an `allw-pairing-start+jws` authorization for `expected_account_id` against the
+/// presented account root at `now_ms`, returning the verified
+/// [`PairingStartClaims`](allw_core::PairingStartClaims) JSON. The caller must still reject a
+/// replayed `jti` (the relay keeps each accepted `jti` until its `expires_at`).
+///
+/// # Errors
+///
+/// Throws if the public key is malformed, the account id does not derive from it, or the
+/// authorization fails any check (signature, `typ`, account, version, `jti`, lifetime, freshness).
+#[wasm_bindgen]
+pub fn verify_pairing_start_authorization(
+    authorization: &str,
+    expected_account_id: &str,
+    account_root_pubkey_b64: &str,
+    now_ms: f64,
+) -> Result<String, JsError> {
+    let root = parse_account_root_pubkey(account_root_pubkey_b64)?;
+    let now_ms = ms_to_i64(now_ms, "now_ms")?;
+    let claims =
+        core_verify_pairing_start_authorization(authorization, expected_account_id, &root, now_ms)
+            .map_err(|e| {
+                JsError::new(&format!("verify_pairing_start_authorization failed: {e}"))
+            })?;
+    to_json(&claims, "PairingStartClaims")
 }
 
 // ── policy rules ──────────────────────────────────────────────────────────────────────

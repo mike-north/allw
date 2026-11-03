@@ -6,12 +6,17 @@
  * against a lightweight in-Node HTTP server that mimics the relay's device-facing pairing surface
  * (`docs/contract.md` §Transport → Relay routing API; relay package `POST /:acct/pairing/start`,
  * `POST /:acct/pairing/complete`). It asserts the approver:
+ *   - derives the self-certifying account id from its account root and authorizes
+ *     `/pairing/start` with a root-signed `allw-pairing-start+jws` — the fake relay verifies it with
+ *     the real core exactly as the relay does (derivation, signature, freshness, one-time `jti`),
  *   - sends only the **X25519 (encryption) public key** to `/pairing/complete` (never a seed),
  *   - mints + stores a device_cert and the relay/account/device metadata,
  *   - builds the correct `ws(s)://…/devices/:id/connect` presence URL.
  *
  * @see ../../relay/src/index.ts (the endpoints mimicked here)
  * @see ../../../docs/contract.md §Identity & keys, §Transport
+ * @see ../../../docs/relay-api.md §3 Pairing (root-signed pairing/start)
+ * @see ../../../docs/enrollment.md §Self-Certifying Account Id
  */
 
 import { test } from "node:test";
@@ -37,13 +42,22 @@ const PAIRING_CODE = "ABC23456";
 const ASSIGNED_DEVICE_ID = "dev-from-relay-xyz";
 const PAIRING_AUTH_TOKEN = "pairing-token-from-relay";
 const DEVICE_AUTH_TOKEN = "device-token-from-relay";
+/** The fixed clock both `runPair` (`now`) and the fake relay's verifier use. */
+const FIXED_NOW = 1700000000000;
 
 /**
  * Start a fake relay mimicking the pairing endpoints. Captures every request body so tests can
- * assert exactly what the approver sent. Returns { url, requests, close }.
+ * assert exactly what the approver sent. `pairing/start` is verified like the real relay: the path's
+ * account id must derive from `root_pubkey` (400), `authorization` is required (401), and the core
+ * must accept it at `now` with an unused `jti` (403); the first success binds the root.
+ * Returns { url, requests, boundRoots, close }.
  */
-function startFakeRelay() {
+async function startFakeRelay({ now = FIXED_NOW } = {}) {
+  const wasm = await loadWasm();
   const requests = [];
+  /** account id → bound root pubkey. */
+  const boundRoots = new Map();
+  const seenJtis = new Set();
   const server = createServer((req, res) => {
     let body = "";
     req.on("data", (chunk) => (body += chunk));
@@ -58,6 +72,36 @@ function startFakeRelay() {
 
       // POST /:acct/pairing/start → { code, expires_at }
       if (req.method === "POST" && req.url.endsWith("/pairing/start")) {
+        const accountId = decodeURIComponent(req.url.split("/")[1] ?? "");
+        const reject = (status) => {
+          res.writeHead(status, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: `rejected ${String(status)}` }));
+        };
+        if (typeof parsed.root_pubkey !== "string") return reject(400);
+        let derived;
+        try {
+          derived = wasm.account_id_for_root(parsed.root_pubkey);
+        } catch {
+          return reject(400);
+        }
+        if (derived !== accountId) return reject(400);
+        if (typeof parsed.authorization !== "string") return reject(401);
+        let claims;
+        try {
+          claims = JSON.parse(
+            wasm.verify_pairing_start_authorization(
+              parsed.authorization,
+              accountId,
+              parsed.root_pubkey,
+              now,
+            ),
+          );
+        } catch {
+          return reject(403);
+        }
+        if (seenJtis.has(claims.jti)) return reject(403);
+        seenJtis.add(claims.jti);
+        if (!boundRoots.has(accountId)) boundRoots.set(accountId, parsed.root_pubkey);
         res.writeHead(201, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
@@ -110,6 +154,7 @@ function startFakeRelay() {
       resolve({
         url: `http://127.0.0.1:${port}`,
         requests,
+        boundRoots,
         close: () => new Promise((r) => server.close(r)),
       });
     });
@@ -155,14 +200,58 @@ function withTempKeyfile(fn) {
   }
 }
 
-test("pairingStart returns the relay's code", async () => {
-  await loadWasm();
+/** A deterministic account root for client-level tests. */
+function testRoot(wasm, fill) {
+  const seed = Buffer.alloc(32, fill).toString("base64url");
+  const pubkey = wasm.ed25519_public_key(seed);
+  return { seed, pubkey, accountId: wasm.account_id_for_root(pubkey) };
+}
+
+test("pairingStart sends the root pubkey + root-signed authorization and returns the code", async () => {
+  const wasm = await loadWasm();
   const relay = await startFakeRelay();
   try {
-    const result = await pairingStart(relay.url, "acct-1");
+    const root = testRoot(wasm, 0x41);
+    const authorization = wasm.sign_pairing_start_authorization(
+      root.seed,
+      FIXED_NOW,
+      FIXED_NOW + 60_000,
+      "jti-client-test-0001",
+    );
+    const result = await pairingStart(
+      relay.url,
+      root.accountId,
+      { rootPubkey: root.pubkey, authorization },
+      "desk",
+    );
     assert.equal(result.code, PAIRING_CODE);
     assert.equal(result.pairing_auth_token, PAIRING_AUTH_TOKEN);
-    assert.equal(relay.requests[0].url, "/acct-1/pairing/start");
+    assert.equal(relay.requests[0].url, `/${root.accountId}/pairing/start`);
+    assert.deepEqual(relay.requests[0].body, {
+      root_pubkey: root.pubkey,
+      authorization,
+      label: "desk",
+    });
+  } finally {
+    await relay.close();
+  }
+});
+
+test("pairingStart surfaces a relay rejection (account id not derived from the root) as an error", async () => {
+  const wasm = await loadWasm();
+  const relay = await startFakeRelay();
+  try {
+    const root = testRoot(wasm, 0x42);
+    const authorization = wasm.sign_pairing_start_authorization(
+      root.seed,
+      FIXED_NOW,
+      FIXED_NOW + 60_000,
+      "jti-client-test-0002",
+    );
+    await assert.rejects(
+      () => pairingStart(relay.url, "acct-free-form", { rootPubkey: root.pubkey, authorization }),
+      /HTTP 400/,
+    );
   } finally {
     await relay.close();
   }
@@ -228,24 +317,43 @@ test("fetchAccountStatesWithMetadata returns relay max_sequence metadata", async
 test("runPair self-drives start+complete, mints a device_cert, and persists pairing state", async () => {
   const wasm = await loadWasm();
   const relay = await startFakeRelay();
+  const logLines = [];
   try {
     await withTempKeyfile(async (keyfilePath) => {
       const updated = await runPair(
         wasm,
         {
           relayUrl: relay.url,
-          accountId: "acct-3",
           keyfilePath,
           label: "cabin",
-          now: 1700000000000,
+          now: FIXED_NOW,
         },
-        () => {}, // silence logging in the test
+        (line) => logLines.push(line),
       );
+
+      // The account id is derived from the keyfile's root (never chosen), the relay verified the
+      // root-signed start for that id, and bound that root.
+      const derivedId = wasm.account_id_for_root(updated.account_root_pubkey);
+      assert.match(derivedId, /^[A-Za-z0-9_-]{43}$/);
+      assert.equal(updated.account_id, derivedId);
+      assert.equal(relay.requests[0].url, `/${derivedId}/pairing/start`);
+      assert.equal(relay.requests[1].url, `/${derivedId}/pairing/complete`);
+      assert.equal(relay.boundRoots.get(derivedId), updated.account_root_pubkey);
+      // Integrator-facing output shows the derived id next to the trust anchor.
+      assert.ok(logLines.some((l) => l.includes(`account id:          ${derivedId}`)));
+      assert.ok(
+        logLines.some((l) => l.includes(`account-root pubkey: ${updated.account_root_pubkey}`)),
+      );
+      // The start request carried no secret material.
+      assert.deepEqual(Object.keys(relay.requests[0].body).sort(), [
+        "authorization",
+        "label",
+        "root_pubkey",
+      ]);
 
       // The persisted keyfile carries the relay-issued device id + a minted cert.
       assert.equal(updated.device_id, ASSIGNED_DEVICE_ID);
       assert.equal(updated.device_auth_token, DEVICE_AUTH_TOKEN);
-      assert.equal(updated.account_id, "acct-3");
       assert.equal(updated.relay_url, relay.url);
       assert.ok(
         updated.device_cert && updated.device_cert.split(".").length === 3,
@@ -285,7 +393,7 @@ test("runPair self-drives start+complete, mints a device_cert, and persists pair
         request_hash: requestHash,
         decision: "approved",
         decided_at: 1700001000000,
-        approver: { account_id: "acct-3", device_id: ASSIGNED_DEVICE_ID },
+        approver: { account_id: updated.account_id, device_id: ASSIGNED_DEVICE_ID },
       };
       const nonce = Buffer.alloc(16, 5).toString("base64url");
       const verdict = wasm.sign_verdict(
@@ -299,7 +407,7 @@ test("runPair self-drives start+complete, mints a device_cert, and persists pair
         id: requestId,
         created_at: 1700000000000,
         expires_at: expiresAt,
-        approver: "acct-3",
+        approver: updated.account_id,
       });
       const result = JSON.parse(
         wasm.verify_verdict(
@@ -339,7 +447,14 @@ test("pairingStart ABORTS against a hung relay (fail-closed AbortSignal.timeout 
     // with it, the request must reject (aborted via AbortSignal.timeout) rather than block.
     const started = Date.now();
     await assert.rejects(
-      () => pairingStart(relay.url, "acct-hung", undefined, INJECTED_TIMEOUT_MS),
+      () =>
+        pairingStart(
+          relay.url,
+          "acct-hung",
+          { rootPubkey: "unused", authorization: "unused" },
+          undefined,
+          INJECTED_TIMEOUT_MS,
+        ),
       // Node surfaces an AbortSignal.timeout as a TimeoutError (name), not a generic Error message —
       // assert specifically so this can't pass on some unrelated transport rejection.
       (err) => err instanceof Error && err.name === "TimeoutError",
@@ -379,7 +494,7 @@ test("runPair refuses to overwrite a CORRUPT keyfile with a fresh identity (revi
       // replaced with a new identity — that could orphan a relay-registered device.
       writeFileSync(keyfilePath, "{ corrupt keyfile");
       await assert.rejects(
-        () => runPair(wasm, { relayUrl: relay.url, accountId: "acct-x", keyfilePath }, () => {}),
+        () => runPair(wasm, { relayUrl: relay.url, keyfilePath }, () => {}),
         /not valid JSON/,
         "pair must fail loudly on a corrupt keyfile, not mint a new identity over it",
       );
@@ -388,6 +503,70 @@ test("runPair refuses to overwrite a CORRUPT keyfile with a fresh identity (revi
         relay.requests.length,
         0,
         "no relay registration happens when the existing keyfile is corrupt",
+      );
+    });
+  } finally {
+    await relay.close();
+  }
+});
+
+test("runPair rejects an explicit --account that does not match the derived id, before any relay call", async () => {
+  const wasm = await loadWasm();
+  const relay = await startFakeRelay();
+  try {
+    await withTempKeyfile(async (keyfilePath) => {
+      await assert.rejects(
+        () =>
+          runPair(
+            wasm,
+            { relayUrl: relay.url, accountId: "my-account", keyfilePath, now: FIXED_NOW },
+            () => {},
+          ),
+        /does not match the account id derived/,
+      );
+      assert.equal(relay.requests.length, 0, "a mismatched id never reaches the relay");
+    });
+  } finally {
+    await relay.close();
+  }
+});
+
+test("runPair accepts an explicit --account equal to the derived id", async () => {
+  const wasm = await loadWasm();
+  const relay = await startFakeRelay();
+  try {
+    await withTempKeyfile(async (keyfilePath) => {
+      // Generate the identity first so the test knows the derived id up front.
+      const { runKeygen } = await import("../dist/commands/keygen.js");
+      const keyfile = runKeygen(wasm, { keyfilePath }, () => {});
+      const derivedId = wasm.account_id_for_root(keyfile.account_root_pubkey);
+      const updated = await runPair(
+        wasm,
+        { relayUrl: relay.url, accountId: derivedId, keyfilePath, now: FIXED_NOW },
+        () => {},
+      );
+      assert.equal(updated.account_id, derivedId);
+      assert.equal(relay.boundRoots.get(derivedId), keyfile.account_root_pubkey);
+    });
+  } finally {
+    await relay.close();
+  }
+});
+
+test("runPair fails closed when the relay rejects the authorization (e.g. stale clock)", async () => {
+  const wasm = await loadWasm();
+  // The relay's clock is 10 minutes ahead: the 2-minute authorization pair signs is expired there.
+  const relay = await startFakeRelay({ now: FIXED_NOW + 10 * 60 * 1000 });
+  try {
+    await withTempKeyfile(async (keyfilePath) => {
+      await assert.rejects(
+        () => runPair(wasm, { relayUrl: relay.url, keyfilePath, now: FIXED_NOW }, () => {}),
+        /HTTP 403/,
+      );
+      assert.equal(
+        relay.requests.filter((r) => r.url.endsWith("/pairing/complete")).length,
+        0,
+        "no device is registered after a rejected start",
       );
     });
   } finally {

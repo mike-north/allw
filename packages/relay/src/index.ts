@@ -13,9 +13,27 @@
  * Registry and request endpoints use relay-scoped bearer capability tokens. Tokens are random,
  * short protocol secrets; the DO stores only SHA-256 hashes so persisted state cannot be replayed
  * as a bearer credential. See issue #89 and `docs/enrollment.md`.
+ *
+ * # Self-certifying accounts
+ * An account id is derived from its account-root public key (`docs/enrollment.md` §Model). Starting
+ * a pairing — the only way to add a device — requires a root-signed authorization that the core
+ * verifies against a root that derives to the path's account id; the first verified root is then
+ * bound to the account's Durable Object. Root verification runs in the audited core (`./core.ts`).
+ *
+ * The first bind requires an account with no prior device, pairing, actor or account-state rows:
+ * before roots were bound, anyone could create those under any id (including a derived one), so
+ * such rows are attacker-seedable and binding over them would launder them under the root. The bind
+ * is refused (409) instead of purging, so the condition is visible rather than silently repaired.
+ * `pairing/complete` likewise refuses (403) on an unbound account.
  */
 
 import { PAIRING_TTL_MS } from "./constants.js";
+import {
+  CoreUnavailableError,
+  checkAccountIdForRoot,
+  ensureCore,
+  verifyPairingStartAuthorization,
+} from "./core.js";
 import {
   ApnsPushTransport,
   FcmPushTransport,
@@ -90,6 +108,10 @@ interface PairingRow extends Record<string, string | number | null | ArrayBuffer
   auth_token_hash: string | null;
 }
 
+interface AccountMetaRow extends Record<string, string | number | null | ArrayBuffer> {
+  root_pubkey: string;
+}
+
 interface RequestRow extends Record<string, string | number | null | ArrayBuffer> {
   request_id: string;
   envelope: string;
@@ -153,6 +175,14 @@ const REQUEST_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const AUTH_TOKEN_BYTES = 32;
 const MAX_ACCOUNT_STATE_DOCS = 16;
 const MAX_ACCOUNT_STATE_JWS_BYTES = 32 * 1024;
+
+/**
+ * How long a used pairing-start `jti` is kept past its authorization's `expires_at`. Equal to the
+ * core's `PAIRING_START_MAX_CLOCK_SKEW_MS` (60 s): a Durable Object re-instantiated on a host whose
+ * clock lags the one that swept the row would otherwise accept the authorization as fresh again
+ * with no replay record. Must never be smaller than that skew.
+ */
+const PAIRING_START_JTI_RETENTION_MARGIN_MS = 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -220,6 +250,18 @@ function authError(status: 401 | 403): Response {
     { error: status === 401 ? "authorization required" : "authorization denied" },
     status,
   );
+}
+
+/**
+ * The relay's audited core could not be instantiated. Fail closed with a 500 that does not blame
+ * the caller's input, and log the cause for the operator.
+ */
+function coreUnavailable(err: unknown): Response {
+  console.error(
+    "allw relay: core unavailable",
+    err instanceof CoreUnavailableError ? err.cause : err,
+  );
+  return json({ error: "relay verification core unavailable" }, 500);
 }
 
 async function tokenMatches(storedHash: string | null, token: string | null): Promise<boolean> {
@@ -406,7 +448,9 @@ function parseSurfaceId(request: Request): string | null | undefined {
  * # Endpoint auth
  * Pairing completion, device presence, actor enrollment, device revocation, and request poll/wait
  * use relay-scoped bearer capability tokens introduced by #89. Token hashes are stored in SQLite;
- * plaintext bearer values are returned once to the caller.
+ * plaintext bearer values are returned once to the caller. Pairing start is authorized by the
+ * account root itself (a root-signed authorization verified by the core), and the first verified
+ * root is bound in `account_meta`.
  */
 export class AccountRelay implements DurableObject {
   private readonly sql: SqlStorage;
@@ -452,6 +496,23 @@ export class AccountRelay implements DurableObject {
         pubkey     TEXT    NOT NULL,
         label      TEXT,
         created_at INTEGER NOT NULL
+      );
+
+      -- The account root this Durable Object is bound to: written once, by the first pairing
+      -- start whose root-signed authorization verified against a root that derives to this
+      -- account's id. Later root-signed calls are verified against this row. Public key only.
+      CREATE TABLE IF NOT EXISTS account_meta (
+        id          INTEGER PRIMARY KEY CHECK (id = 1),
+        root_pubkey TEXT    NOT NULL,
+        bound_at    INTEGER NOT NULL
+      );
+
+      -- One-time ids of accepted pairing-start authorizations, kept until the authorization
+      -- expires so a replay inside its validity window is rejected. Expired rows are swept on the
+      -- next pairing start; an authorization past expires_at is rejected by the core anyway.
+      CREATE TABLE IF NOT EXISTS pairing_start_jti (
+        jti        TEXT    PRIMARY KEY,
+        expires_at INTEGER NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS pairing (
@@ -551,9 +612,9 @@ export class AccountRelay implements DurableObject {
     const path1 = subSegments[1] ?? "";
     const path2 = subSegments[2] ?? "";
 
-    // POST /pairing/start
+    // POST /pairing/start — root-signed; binds the account root on first success.
     if (method === "POST" && path0 === "pairing" && path1 === "start") {
-      return this.handlePairingStart(request);
+      return this.handlePairingStart(request, segments[0] ?? "");
     }
 
     // POST /pairing/complete
@@ -691,32 +752,143 @@ export class AccountRelay implements DurableObject {
   }
 
   /**
-   * POST /pairing/start
-   * Body: { label?: string }
-   * Response: { code: string, expires_at: number }
-   *
-   * Generates a short human-enterable pairing code and stores it with a TTL.
-   * The code is shown to the account owner (e.g. as a QR or typed string) to enroll a new device.
+   * The account-root public key this Durable Object is bound to, or `null` before the first
+   * verified root-signed pairing start. Root-authorized operations verify against this row.
    */
-  private async handlePairingStart(request: Request): Promise<Response> {
-    const body = await parseJsonBody(request);
-    const label = body ? optionalString(body, "label") : undefined;
+  private boundRootPubkey(): string | null {
+    const rows = [
+      ...this.sql.exec<AccountMetaRow>(`SELECT root_pubkey FROM account_meta WHERE id = 1`),
+    ];
+    return rows[0]?.root_pubkey ?? null;
+  }
 
+  /**
+   * Whether this unbound account already holds rows that, under the pre-binding relay, anyone could
+   * create for any account id: devices, pairing codes, actors, or account state. Binding a root over
+   * them would make them look root-authorized, so the first bind refuses (see the module doc).
+   */
+  private hasPreBindingState(): boolean {
+    for (const table of ["device", "pairing", "actor", "account_state", "account_state_meta"]) {
+      if ([...this.sql.exec(`SELECT 1 FROM ${table} LIMIT 1`)].length > 0) return true;
+    }
+    return false;
+  }
+
+  /**
+   * POST /pairing/start
+   * Body: { root_pubkey: string (b64url Ed25519), authorization: string (allw-pairing-start+jws),
+   *         label?: string }
+   * Response: { code: string, expires_at: number, pairing_auth_token: string }
+   *
+   * Only the account root may start a pairing, because a pairing code enrolls a device that every
+   * later request is encrypted to. The relay checks, fail-closed:
+   * - 400: invalid JSON, `root_pubkey` malformed, or `{acct}` does not derive from `root_pubkey`
+   * - 401: `authorization` missing
+   * - 403: the core rejects `authorization` (bad signature, wrong `typ`, wrong `account_id`,
+   *        expired / not-yet-valid / overlong window), its `jti` was already used, or the presented
+   *        root differs from the root already bound to this account
+   * - 409: no root is bound yet but the account already holds devices, pairing codes, actors or
+   *        account state from before root binding (refused, never purged — see the module doc)
+   * - 500: the relay's core wasm failed to initialize (logged; nothing about the request is judged)
+   *
+   * On success the root is bound to the account (first time only) and a short pairing code plus its
+   * pairing auth token are issued. See `docs/relay-api.md` §3 Pairing.
+   */
+  private async handlePairingStart(request: Request, accountId: string): Promise<Response> {
+    try {
+      ensureCore();
+    } catch (err) {
+      return coreUnavailable(err);
+    }
+
+    const body = await parseJsonBody(request);
+    if (!body) return json({ error: "invalid JSON body" }, 400);
+
+    const rootPubkey = requiredString(body, "root_pubkey");
+    if (rootPubkey === null || !validatePubkey(rootPubkey)) {
+      return json({ error: "'root_pubkey' must be a base64url-unpadded 32-byte public key" }, 400);
+    }
+    try {
+      checkAccountIdForRoot(accountId, rootPubkey);
+    } catch {
+      return json(
+        {
+          error:
+            "'root_pubkey' is not a valid Ed25519 key or the account id does not derive from it",
+        },
+        400,
+      );
+    }
+
+    const authorization = requiredString(body, "authorization");
+    if (authorization === null) return authError(401);
+    const label = optionalString(body, "label");
+
+    // Mint the pairing secret before the critical section so nothing below awaits: the verify,
+    // replay check, root bind, and code insert run without interleaving another request.
     const code = generatePairingCode();
     const pairingAuthToken = generateAuthToken();
     const pairingAuthTokenHash = await hashAuthToken(pairingAuthToken);
     const now = Date.now();
-    const expiresAt = now + PAIRING_TTL_MS;
+
+    let jti: string;
+    let jtiExpiresAt: number;
+    try {
+      const claims = verifyPairingStartAuthorization(authorization, accountId, rootPubkey, now);
+      jti = claims.jti;
+      jtiExpiresAt = claims.expires_at;
+    } catch {
+      return authError(403);
+    }
+
+    // Defense in depth: the id derives from the root, so a different bound root would need a
+    // SHA-256 collision. Never let a second root act on an account regardless.
+    const boundRoot = this.boundRootPubkey();
+    if (boundRoot !== null && boundRoot !== rootPubkey) return authError(403);
+    if (boundRoot === null && this.hasPreBindingState()) {
+      return json(
+        {
+          error:
+            "account has devices, pairing codes, actors or account state from before root binding; " +
+            "refusing to bind a root over them (use a new account root)",
+        },
+        409,
+      );
+    }
 
     this.sql.exec(
-      `INSERT INTO pairing (code, label, created_at, expires_at, used, auth_token_hash)
-       VALUES (?, ?, ?, ?, 0, ?)`,
-      code,
-      label ?? null,
+      `DELETE FROM pairing_start_jti WHERE expires_at + ? <= ?`,
+      PAIRING_START_JTI_RETENTION_MARGIN_MS,
       now,
-      expiresAt,
-      pairingAuthTokenHash,
     );
+    const replayed = [...this.sql.exec(`SELECT jti FROM pairing_start_jti WHERE jti = ?`, jti)]
+      .length;
+    if (replayed > 0) return authError(403);
+
+    const expiresAt = now + PAIRING_TTL_MS;
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec(
+        `INSERT INTO pairing_start_jti (jti, expires_at) VALUES (?, ?)`,
+        jti,
+        jtiExpiresAt,
+      );
+      if (boundRoot === null) {
+        this.sql.exec(
+          `INSERT INTO account_meta (id, root_pubkey, bound_at) VALUES (1, ?, ?)`,
+          rootPubkey,
+          now,
+        );
+      }
+      this.sql.exec(
+        `INSERT INTO pairing (code, label, created_at, expires_at, used, auth_token_hash)
+         VALUES (?, ?, ?, ?, 0, ?)`,
+        code,
+        label ?? null,
+        now,
+        expiresAt,
+        pairingAuthTokenHash,
+      );
+    });
 
     return json({ code, expires_at: expiresAt, pairing_auth_token: pairingAuthToken }, 201);
   }
@@ -728,12 +900,20 @@ export class AccountRelay implements DurableObject {
    * Response: { device_id: string }
    *
    * Validates the pairing code and enrolls the device's public key.
+   * - 403: no account root is bound (a pairing code on an unbound account predates root binding,
+   *        so it was never root-authorized), or the pairing auth token is wrong
    * - 404: code not found
    * - 409: code already used
    * - 410: code expired
    * - 400: invalid pubkey (not base64url or not 32 bytes)
    */
   private async handlePairingComplete(request: Request): Promise<Response> {
+    // Every pairing row this relay issues is created together with (or after) the root bind, so a
+    // code on an unbound account is a pre-binding leftover: never let it enroll a device.
+    if (this.boundRootPubkey() === null) {
+      return json({ error: "account root not bound; start a root-signed pairing first" }, 403);
+    }
+
     const body = await parseJsonBody(request);
     if (!body) return json({ error: "invalid JSON body" }, 400);
 

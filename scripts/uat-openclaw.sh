@@ -18,7 +18,8 @@ UAT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/allw-openclaw-uat.XXXXXX")"
 STATE_DIR="$UAT_DIR/state"
 KEYFILE="$UAT_DIR/approver-keyfile.json"
 RELAY_LOG="$UAT_DIR/relay.log"
-ACCOUNT_ID="acct_openclaw_uat_$(date +%s)_$$"
+# The account id is derived from the approver keyfile's account root at pairing time (#242).
+ACCOUNT_ID=""
 RELAY_PORT="${ALLW_UAT_RELAY_PORT:-8787}"
 RELAY_URL="http://127.0.0.1:$RELAY_PORT"
 GATEWAY_URL="${ALLW_OPENCLAW_GATEWAY_URL:-ws://127.0.0.1:18789}"
@@ -51,7 +52,7 @@ wait_for_relay() {
   while ((SECONDS < deadline)); do
     # Any HTTP response proves wrangler is listening; the pairing call below is
     # the protocol-level readiness check.
-    if [[ "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 1 "$RELAY_URL/$ACCOUNT_ID/pairing/start" || true)" != "000" ]]; then
+    if [[ "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 1 "$RELAY_URL/" || true)" != "000" ]]; then
       return 0
     fi
     sleep 1
@@ -85,7 +86,7 @@ printf '==> Starting local relay at %s\n' "$RELAY_URL"
 RELAY_PID=$!
 wait_for_relay
 
-printf '==> Pairing temporary approver account %s\n' "$ACCOUNT_ID"
+printf '==> Pairing a temporary approver (fresh account root)\n'
 (
   cd "$ROOT_DIR"
   # Invoke the built CLI directly: pnpm does not link a package's OWN bin into
@@ -93,11 +94,13 @@ printf '==> Pairing temporary approver account %s\n' "$ACCOUNT_ID"
   # checkout.
   node "$ROOT_DIR/packages/approver/dist/cli.js" pair \
     --relay "$RELAY_URL" \
-    --account "$ACCOUNT_ID" \
     --label "openclaw-uat-$(hostname -s 2>/dev/null || hostname)" \
     --keyfile "$KEYFILE"
 )
 
+ACCOUNT_ID="$(
+  node -e 'const fs = require("node:fs"); const keyfile = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(keyfile.account_id);' "$KEYFILE"
+)"
 ACCOUNT_ROOT_KEY="$(
   node -e 'const fs = require("node:fs"); const keyfile = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(keyfile.account_root_pubkey);' "$KEYFILE"
 )"

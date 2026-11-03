@@ -13,6 +13,7 @@
     "build": "echo \"relay builds via wrangler\" && exit 0"
   },
   "devDependencies": {
+    "@allw/sdk": "workspace:*",
     "@cloudflare/vitest-pool-workers": "^0.16.14",
     "@cloudflare/workers-types": "^4.20260609.1",
     "@types/node": "^22.0.0",

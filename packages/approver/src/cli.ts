@@ -26,8 +26,9 @@ USAGE:
   allw-approver <command> [options]
 
 COMMANDS:
-  pair      Pair this approver with an account via the relay (registers the device key, mints a
-            device certificate, prints the account-root trust anchor).
+  pair      Pair this approver with its account via the relay (registers the device key, mints a
+            device certificate, prints the account id and account-root trust anchor).
+            The account id is derived from the keyfile's account root.
   watch     Open the device presence WebSocket and approve/deny requests as they arrive.
             Alias: serve.
   keygen    Generate a fresh local keyfile (three software-held seeds) without pairing.
@@ -40,7 +41,8 @@ COMMON OPTIONS:
 
 pair OPTIONS:
   --relay <url>      Relay base URL (required), e.g. https://relay.example.com
-  --account <id>     Account id to pair with (required).
+  --account <id>     Optional check: must equal the account id derived from the keyfile's
+                     account root, or pairing fails. Omit it to use the derived id.
   --label <name>     Human label for this device (optional).
   --code <code>      Use an existing pairing code (account owner ran /pairing/start). If omitted,
                      the CLI drives /pairing/start itself.
@@ -120,10 +122,9 @@ async function main(): Promise<void> {
     }
     case "pair": {
       const relayUrl = requireOption(values.relay, "--relay");
-      const accountId = requireOption(values.account, "--account");
       await runPair(wasm, {
         relayUrl,
-        accountId,
+        ...(values.account !== undefined ? { accountId: values.account } : {}),
         keyfilePath,
         ...(values.label !== undefined ? { label: values.label } : {}),
         ...(values.code !== undefined ? { code: values.code } : {}),

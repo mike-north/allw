@@ -8,5 +8,11 @@
   "approver_root_pubkey_b64": "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc",
   "now_ms": 1700001500000,
   "agent_tool_call_context_json": "{\"action\":{\"record_schema_version\":1,\"surface\":\"agent_tool_call\",\"syntactic\":{\"server\":\"openclaw\",\"tool\":\"deploy_service\",\"raw\":\"openclaw.deploy_service()\"},\"risk\":\"medium\"},\"summary\":\"push to main\",\"actor\":{\"id\":\"machine:x\",\"kind\":\"claude-code\"},\"risk\":\"high\",\"reversible\":false,\"constraints\":{\"allowed_decisions\":[\"approved\",\"denied\"],\"challenge_required\":false}}",
-  "agent_tool_call_expected_request_hash_b64": "hCAKXRiujeHFCtFqgRpATXAFEsf7Zxa4VvRxc0LS-HY"
+  "agent_tool_call_expected_request_hash_b64": "hCAKXRiujeHFCtFqgRpATXAFEsf7Zxa4VvRxc0LS-HY",
+  "expected_account_id_for_root": "hUes5Gso3s5hHMmZjDI-P0tyaD905KSl1B97nsp2VIo",
+  "pairing_start_authorization": "eyJhbGciOiJFZERTQSIsInR5cCI6ImFsbHctcGFpcmluZy1zdGFydCtqd3MiLCJraWQiOiJoVWVzNUdzbzNzNWhITW1aakRJLVAwdHlhRDkwNUtTbDFCOTduc3AyVklvIn0.eyJ2IjoxLCJhY2NvdW50X2lkIjoiaFVlczVHc28zczVoSE1tWmpESS1QMHR5YUQ5MDVLU2wxQjk3bnNwMlZJbyIsImlzc3VlZF9hdCI6MTcwMDAwMDAwMDAwMCwiZXhwaXJlc19hdCI6MTcwMDAwMDEyMDAwMCwianRpIjoianRpX3dhc21fdmVjdG9yXzAxIn0.hy09WA0YFM2NJ3yE0GWPQ2UtQWKbeedVzDl5N3rSTtEojwAkqUcU-z2wfXaQrVskFMHsgAa5Ic7pr5CZG89kCg",
+  "pairing_start_issued_at": 1700000000000,
+  "pairing_start_expires_at": 1700000120000,
+  "pairing_start_jti": "jti_wasm_vector_01",
+  "pairing_start_now_ms": 1700000001000
 }

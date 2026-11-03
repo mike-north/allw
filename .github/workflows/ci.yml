@@ -108,12 +108,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The relay verifies root signatures through the allw-core wasm build, so its tests need
+      # the wasm built first — same pinned toolchain + wasm-pack as the `wasm` job.
+      - run: rustup toolchain install && rustc --version
+      - uses: Swatinem/rust-cache@v2
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: v0.15.1
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - run: pnpm run build:wasm
       - run: pnpm --filter @allw/relay test
 
   native-bindings:

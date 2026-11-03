@@ -56,6 +56,28 @@ export interface AllwWasm {
     issued_at: number,
     expires_at?: number,
   ): string;
+  /**
+   * Derive the self-certifying account id for an account-root public key (base64url):
+   * `base64url(SHA-256("allw/account-id/v1" || 0x00 || root))` (`docs/enrollment.md` §Model).
+   */
+  account_id_for_root(account_root_pubkey_b64: string): string;
+  /**
+   * Sign an `allw-pairing-start+jws` with the account-root seed, for the id derived from that root.
+   * Throws for a malformed `jti` (16–128 base64url chars) or a window outside `(0, 5 min]`.
+   */
+  sign_pairing_start_authorization(
+    account_root_seed_b64: string,
+    issued_at: number,
+    expires_at: number,
+    jti: string,
+  ): string;
+  /** Verify an `allw-pairing-start+jws` (test helper: the fake relay checks what `pair` sends). */
+  verify_pairing_start_authorization(
+    authorization: string,
+    expected_account_id: string,
+    account_root_pubkey_b64: string,
+    now_ms: number,
+  ): string;
   /** Encrypt an ApprovalContext to recipient device(s); returns the JWE (test/round-trip helper). */
   encrypt_context(context_json: string, recipients_json: string): string;
   /** Verify a verdict against its request/context and the account-root key (test/round-trip). */

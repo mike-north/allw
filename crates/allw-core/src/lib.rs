@@ -20,6 +20,7 @@
 //! attestation landed (verified request origin, bound to `request_id` + `request_hash`, with the
 //! actor key anchored in root-signed account state; see [`attestation`]).
 
+pub mod account;
 pub mod attestation;
 pub mod audit;
 pub mod command;
@@ -31,6 +32,12 @@ pub mod jwe;
 pub mod mcp;
 pub mod policy;
 
+pub use account::{
+    account_id_for_root, check_account_id_for_root, sign_pairing_start_authorization,
+    verify_pairing_start_authorization, AccountIdError, PairingStartClaims, PairingStartError,
+    PAIRING_START_JTI_MAX_LEN, PAIRING_START_JTI_MIN_LEN, PAIRING_START_MAX_CLOCK_SKEW_MS,
+    PAIRING_START_MAX_LIFETIME_MS,
+};
 pub use attestation::{
     sign_actor_attestation, verified_origin_string, verify_actor_attestation,
     verify_actor_attestation_with_account_states, ActorAttestationClaims, AttestationError,

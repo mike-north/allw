@@ -39,16 +39,22 @@ pnpm --filter @allw/approver build  # compiles the CLI to dist/
 ### 1. Pair with an account
 
 ```sh
-allw-approver pair --relay https://relay.example.com --account <account-id> --label "my-laptop"
+allw-approver pair --relay https://relay.example.com --label "my-laptop"
 ```
 
-This generates a local keyfile (three software-held seeds + their public keys), obtains a pairing
-code, registers the device **X25519** encryption key with the relay, mints a **device certificate**
-(the account-root key signs the device signing key, so verifiers need only the account-root key),
-and prints the **account-root public key** — the integrator's trust anchor
-([#12](https://github.com/mike-north/allw/issues/12)).
+This generates a local keyfile (three software-held seeds + their public keys), derives the
+**account id** from the account-root public key, obtains a pairing code with a root-signed
+`pairing/start`, registers the device **X25519** encryption key with the relay, mints a **device
+certificate** (the account-root key signs the device signing key, so verifiers need only the
+account-root key), and prints the **account id** and **account-root public key** — what an
+integrator is configured with ([#12](https://github.com/mike-north/allw/issues/12)).
 
-> Pass `--code <code>` to redeem a code the account owner generated via `/pairing/start`. Omit it and
+The account id is self-certifying (`docs/enrollment.md` §Self-Certifying Account Id): it is
+`base64url(SHA-256("allw/account-id/v1" || 0x00 || account_root_pubkey))`, so only the root holder
+can add devices to it. `--account <id>` is optional; when given it must equal the derived id or
+`pair` fails before contacting the relay.
+
+> Pass `--code <code>` to redeem a code the account owner (root holder) generated via a root-signed `/pairing/start`. Omit it and
 > the CLI drives both start + complete itself (fine for the v0 skeleton).
 
 The keyfile defaults to `~/.allw/approver-keyfile.json` (override with `--keyfile <path>`) and is

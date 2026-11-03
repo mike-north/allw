@@ -149,10 +149,10 @@ surface and presses Approve / Deny, and the recording itself is the artifact. To
 2. **Terminal B — pair the approver (the "second device"):**
    ```sh
    node packages/approver/dist/cli.js pair \
-     --relay http://localhost:8787 --account demo --label "my phone" \
+     --relay http://localhost:8787 --label "my phone" \
      --keyfile /tmp/allw-demo-keyfile.json
    ```
-   Copy the printed **account-root pubkey**.
+   Copy the printed **account id** (derived from the account root) and **account-root pubkey**.
 3. **Terminal B — watch interactively** (this is the surface you record pressing a key on):
    ```sh
    node packages/approver/dist/cli.js watch --keyfile /tmp/allw-demo-keyfile.json

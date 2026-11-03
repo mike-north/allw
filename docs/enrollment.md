@@ -63,6 +63,41 @@ real enrollment. (See the `derive_device_keys_json` doc comment in `crates/allw-
 The account root signs `device_cert` objects for device signing keys. Integrators verify verdicts with only the
 configured account-root public key plus the `device_cert` carried in the verdict.
 
+### Self-Certifying Account Id
+
+An account is a cryptographic object: the account id is **derived from the account-root public key**, never
+chosen:
+
+```text
+account_id = base64url-unpadded( SHA-256( "allw/account-id/v1" || 0x00 || account_root_pub ) )
+```
+
+- The full 256-bit digest is kept — 43 base64url characters, URL-path safe. There is no truncation, so the id has
+  the full collision resistance of SHA-256. The domain tag and `0x00` separator keep the digest distinct from every
+  other SHA-256 use in the core. Implemented once in the core as `account_id_for_root` /
+  `check_account_id_for_root` (`crates/allw-core/src/account.rs`), exported through WASM, and pinned by the shared
+  Rust↔WASM vector.
+- **The relay re-derives, it never trusts.** Every root-signed relay call presents the root public key; the relay
+  rejects any `{account_id}` it cannot re-derive from that key. Free-form account ids (including ids created before
+  this change) can therefore never start a pairing.
+- **Root binding.** After the first verified root signature (today: a root-signed `pairing/start`), the account's
+  Durable Object stores the root public key in an `account_meta` row. The root is derived, not trusted on first
+  contact; later root-authorized operations verify against that bound row, and a different root is refused.
+- **The first bind requires an empty account (refuse, never purge).** Before roots were bound, anyone could create
+  devices, pairing codes, actors and account state under any id — including one derived from a root they merely
+  know (root public keys are not secret; integrators are configured with them). Binding a root over such rows would
+  make them look root-authorized, so the relay **refuses** the first bind (409) when the account already holds any
+  device, pairing, actor or account-state row, and `pairing/complete` refuses (403) on an unbound account. Refusing
+  is fail-closed and visible; purging would silently drop state. An honest derived-id account cannot hit this
+  (no approver before this change could produce a derived id), so a populated unbound account was seeded by
+  someone else; its owner starts again under a new root.
+- **Rejected alternative — trust on first use.** Binding whatever root first contacts an arbitrary id lets anyone
+  who learns an id before its owner first uses it squat it. A derived id cannot be squatted: only the holder of the
+  matching root can produce a valid authorization for it.
+- **Root rotation creates a new account in v1.** Because the id is a function of the root, a new root derives a new
+  id; relying parties reconfigure both the trust anchor and the account id. Keeping an id stable across root
+  rotation is a tracked follow-up (see §Account-Root Rotation and §Deferred Decisions).
+
 ## Requirements
 
 1. Private keys and seeds must never cross the relay boundary.
@@ -94,7 +129,16 @@ Device enrollment binds an approver device to an account in two places:
 
 The v1 pairing flow is:
 
-1. Account owner starts a short-lived pairing: `POST /{account_id}/pairing/start`.
+1. Account owner (the account-root holder) starts a short-lived pairing: `POST /{account_id}/pairing/start` with
+   `{ root_pubkey, authorization }`. `authorization` is a root-signed compact JWS (`typ = "allw-pairing-start+jws"`,
+   `kid = account_id`) whose payload `{ v: 1, account_id, issued_at, expires_at, jti }` binds the derived account
+   id, a validity window of at most **5 minutes** (60 s of clock skew tolerated on `issued_at`), and a one-time
+   `jti` (16–128 base64url characters). The relay checks that `root_pubkey` derives to `{account_id}`, verifies the
+   authorization in the core (`verify_pairing_start_authorization`), rejects a `jti` it has already accepted (each
+   accepted `jti` is remembered until 60 s past its `expires_at`, the clock-skew margin), and binds the root on
+   first success — refusing (409) if the account already holds state from before root binding (§Self-Certifying
+   Account Id). Only the root can therefore add a device — before this, anyone who knew an account id could enroll
+   a key every later request was encrypted to.
 2. Relay returns `{ code, expires_at, pairing_auth_token }`; the code and bearer token are shown
    out-of-band to the device or delivered through the account-owner pairing ceremony.
 3. Device completes pairing with `{ code, pubkey, label?, push_tokens? }`, where `pubkey` is its **X25519
@@ -749,6 +793,12 @@ Validation example:
 Account-root rotation changes the account trust anchor. It is the highest-risk operation because every verifier
 ultimately trusts the root.
 
+**v1 interaction with the self-certifying account id:** the account id is derived from the root
+(§Self-Certifying Account Id), so in v1 a rotated root derives a **new account id** — rotation creates a new
+account, with its own relay Durable Object, bound root, and device registry. The transition statement below
+describes the intended id-preserving rotation; supporting it requires the relay to accept an old-root-signed
+transition that rebinds `account_meta` without changing the id. That is a tracked follow-up, not a v1 property.
+
 Rules:
 
 - The old root signs a root-transition statement naming the new root, `account_id`, `issued_at`, and
@@ -859,7 +909,7 @@ Current relay mechanics cover the registry subset and #89 adds relay-scoped endp
 
 | Endpoint                           | Enrollment meaning                                                                      |
 | ---------------------------------- | --------------------------------------------------------------------------------------- |
-| `POST /pairing/start`              | Create a short-lived single-use device enrollment code.                                 |
+| `POST /pairing/start`              | Root-authorized: create a short-lived single-use device enrollment code; bind the root. |
 | `POST /pairing/complete`           | Redeem the code with its pairing bearer token and store a device encryption public key. |
 | `POST /enrollments/start`          | Open a single-use cert-issuance mailbox pair for the ceremony (#175).                   |
 | `POST /enrollments/{id}/csr`       | Enrollee deposits its MAC-authenticated CSR (write-once).                               |
@@ -876,10 +926,15 @@ Current relay mechanics cover the registry subset and #89 adds relay-scoped endp
 
 Endpoint authentication and authorization rules:
 
-- `POST /pairing/start`, `POST /enrollments/start`, and `POST /requests` are deliberately unauthenticated token
-  issuers: pairing start and enrollment start are account-owner ceremony boundaries that only mint a capability
-  scoped to the object they create, while request submit returns a per-request read capability that can only
-  tighten the caller's authority;
+- `POST /pairing/start` requires the account root: a `root_pubkey` that derives to the path's account id
+  (`400` otherwise) and a fresh, one-time, root-signed `allw-pairing-start+jws` authorization (`401` when missing,
+  `403` when the core rejects it or its `jti` was already used). A pairing code enrolls a device that integrators
+  encrypt every later request to, so starting one is root-authorized rather than an open ceremony boundary
+  (§Self-Certifying Account Id);
+- `POST /enrollments/start` and `POST /requests` are deliberately unauthenticated token issuers: enrollment start
+  only opens a mailbox pair whose CSR the root holder authenticates with an out-of-band MAC before certifying
+  anything, while request submit returns a per-request read capability that can only tighten the caller's
+  authority;
 - completing pairing requires the code plus the `pairing_auth_token`;
 - depositing a CSR and collecting a cert require the enrollee's `device_auth_token`, and the relay additionally
   requires the CSR's `device_id` to be the authenticated device — a device may only ever request a certificate
@@ -921,6 +976,9 @@ Implementation PRs for this spec should add fixtures or tests for:
   hardware security key.
 - Account-state transport format: compact JWS payload versus JSON document plus detached signature.
 - Root-transition grace-period defaults.
+- **Account-id-preserving root rotation.** In v1 the account id is derived from the root, so rotating the root
+  creates a new account (§Self-Certifying Account Id). Keeping the id requires an old-root-signed transition the
+  relay verifies against the bound root before rebinding it.
 - **Account-root-authorized device revocation at the relay.** `POST /devices/{id}/revoke` is self-revoke only, so
   the root holder cannot evict a lost device from the relay registry (account-state revocation, which is what
   verifiers enforce, still works). A root-signed revoke request would close that gap.
