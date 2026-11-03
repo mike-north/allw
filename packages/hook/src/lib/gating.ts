@@ -154,14 +154,33 @@ type MonitorRequest =
 const MONITOR_WS_KEYS = new Set(["ws", "description", "timeout_ms"]);
 const MONITOR_WS_FIELDS = new Set(["url", "protocols"]);
 
+/**
+ * True if the optional fields of a WebSocket watch have the types Claude Code's schema gives them,
+ * when present: `ws.protocols` an array of strings, `description` a string, `timeout_ms` a finite
+ * number. A watch with a field of any other type is malformed (denied).
+ */
+function monitorWsFieldTypesValid(
+  record: Record<string, unknown>,
+  ws: Record<string, unknown>,
+): boolean {
+  const { protocols } = ws;
+  const { description, timeout_ms: timeoutMs } = record;
+  return (
+    (protocols === undefined ||
+      (Array.isArray(protocols) && protocols.every((p) => typeof p === "string"))) &&
+    (description === undefined || typeof description === "string") &&
+    (timeoutMs === undefined || (typeof timeoutMs === "number" && Number.isFinite(timeoutMs)))
+  );
+}
+
 /** True if every key of `value` is in `allowed`. */
 function onlyKeys(value: Record<string, unknown>, allowed: ReadonlySet<string>): boolean {
   return Object.keys(value).every((key) => allowed.has(key));
 }
 
 /**
- * Classify a `Monitor` `tool_input`. A `ws` watch needs an object with a string `url`, and no key
- * outside the watch schema at either level.
+ * Classify a `Monitor` `tool_input`. A `ws` watch needs an object with a string `url`, no key
+ * outside the watch schema at either level, and correctly typed optional fields.
  */
 function readMonitorRequest(toolInput: unknown): MonitorRequest {
   if (typeof toolInput !== "object" || toolInput === null || Array.isArray(toolInput)) {
@@ -180,7 +199,8 @@ function readMonitorRequest(toolInput: unknown): MonitorRequest {
     const wellFormed =
       readStringField(ws, "url") !== null &&
       onlyKeys(record, MONITOR_WS_KEYS) &&
-      onlyKeys(ws as Record<string, unknown>, MONITOR_WS_FIELDS);
+      onlyKeys(ws as Record<string, unknown>, MONITOR_WS_FIELDS) &&
+      monitorWsFieldTypesValid(record, ws as Record<string, unknown>);
     return wellFormed ? { kind: "ws" } : { kind: "malformed" };
   }
   return { kind: "malformed" };

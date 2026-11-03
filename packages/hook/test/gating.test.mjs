@@ -437,6 +437,29 @@ test("gateToolCall(Monitor ws) with an unknown key at either level → build-err
   }
 });
 
+// Regression (#316 Copilot review): a watch's optional fields must have their schema types, or the
+// call isn't the documented "runs no command" shape and must deny.
+test("gateToolCall(Monitor ws) with a mistyped optional field → build-error", async () => {
+  const wasm = await loadWasm();
+  const url = "wss://example.test";
+  for (const input of [
+    { ws: { url, protocols: "v1" } },
+    { ws: { url, protocols: ["v1", 2] } },
+    { ws: { url, protocols: null } },
+    { ws: { url }, description: 5 },
+    { ws: { url }, description: null },
+    { ws: { url }, timeout_ms: "300000" },
+    { ws: { url }, timeout_ms: Number.POSITIVE_INFINITY },
+    { ws: { url }, timeout_ms: Number.NaN },
+  ]) {
+    assert.equal(
+      gateToolCall(wasm, "Monitor", input, "/repo").kind,
+      "build-error",
+      `Monitor ${JSON.stringify(input)} must deny`,
+    );
+  }
+});
+
 test("gateToolCall(non-gated) → pass-through", async () => {
   const wasm = await loadWasm();
   const out = gateToolCall(wasm, "Read", { file_path: "/etc/hosts" }, "/repo");
