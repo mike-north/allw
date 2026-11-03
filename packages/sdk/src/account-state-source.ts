@@ -41,6 +41,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import type { AccountStateSet, AccountStateSource } from "./index.js";
+import { MAX_ESCAPED_DIAGNOSTIC_CHARS, escapeToPrintableAscii } from "./printable-ascii.js";
 import { RelayClient, type FetchImpl, type ScheduleImpl } from "./relay.js";
 import {
   errorCode,
@@ -78,14 +79,22 @@ export interface SequenceFloorStore {
   raise(sequence: number): Promise<void>;
 }
 
-/** A floor store that cannot be read or written safely. Fail-closed: the request is denied. */
+/**
+ * A floor store that cannot be read or written safely. Fail-closed: the request is denied. `path`
+ * keeps the raw path; the message shows it escaped to printable ASCII (#358), since it is built from
+ * `HOME` or the caller's `dir` and the message can reach the agent through a hook's deny reason.
+ */
 export class SequenceFloorError extends Error {
   constructor(
     readonly path: string,
     message: string,
     options?: { cause?: unknown },
   ) {
-    super(`allw: sequence floor ${path} ${message} (fail-closed)`, options);
+    super(
+      `allw: sequence floor ${escapeToPrintableAscii(path, MAX_ESCAPED_DIAGNOSTIC_CHARS)} ` +
+        `${message} (fail-closed)`,
+      options,
+    );
     this.name = "SequenceFloorError";
   }
 }

@@ -85,6 +85,30 @@ function writeFloorFile(dir, body, mode = 0o600) {
   return path;
 }
 
+// Regression (#358 follow-through): the floor path comes from HOME or the caller's `dir`, and a
+// floor error's message can reach the agent through a hook's deny reason. A newline or ESC in that
+// path must show escaped, never raw; the error's `path` keeps the real value.
+test(
+  "floor: a control character in the state path is escaped in the error message",
+  { skip: process.platform === "win32" },
+  () => {
+    const dir = join(tempDir(), "line\nbreak\u001b[31m");
+    mkdirSync(dir, { mode: 0o700 });
+    writeFloorFile(dir, "{");
+    const store = fileSequenceFloorStore({ accountId: ACCOUNT_ID, dir });
+    return assert.rejects(
+      () => store.read(),
+      (err) => {
+        assert.ok(err instanceof SequenceFloorError, String(err));
+        assert.doesNotMatch(err.message, /[\u0000-\u001f\u007f]/, "no raw control characters");
+        assert.match(err.message, /line\\u000abreak\\u001b\[31m/, "shown escaped");
+        assert.equal(err.path, floorPath(dir), "the raw path is kept on the error");
+        return true;
+      },
+    );
+  },
+);
+
 // ── fileSequenceFloorStore ────────────────────────────────────────────────────────────
 
 test("floor: an account id without the self-certifying syntax is refused before any path is built", () => {

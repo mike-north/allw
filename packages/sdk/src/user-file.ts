@@ -23,6 +23,8 @@
 
 import { closeSync, constants as fsConstants, fstatSync, openSync, readSync } from "node:fs";
 
+import { MAX_ESCAPED_DIAGNOSTIC_CHARS, escapeToPrintableAscii } from "./printable-ascii.js";
+
 /** Why a user-owned file could not be read. */
 export type UserFileProblem =
   /** Opening failed with `EACCES` / `EPERM`. */
@@ -40,14 +42,22 @@ export type UserFileProblem =
   /** Reading the open descriptor failed. */
   | { readonly kind: "read_failed"; readonly code: string | undefined };
 
-/** A fail-closed read failure for a user-owned file. */
+/**
+ * A fail-closed read failure for a user-owned file. `path` keeps the raw path; the message shows it
+ * escaped to printable ASCII (#358), because paths come from the environment (`HOME`, `ALLW_CONFIG`)
+ * and the message can reach the agent through a hook's deny reason.
+ */
 export class UserFileError extends Error {
   constructor(
     readonly path: string,
     readonly problem: UserFileProblem,
     options?: { cause?: unknown },
   ) {
-    super(`allw: ${path} cannot be trusted (${problem.kind})`, options);
+    super(
+      `allw: ${escapeToPrintableAscii(path, MAX_ESCAPED_DIAGNOSTIC_CHARS)} cannot be trusted ` +
+        `(${problem.kind})`,
+      options,
+    );
     this.name = "UserFileError";
   }
 }
