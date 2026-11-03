@@ -2,6 +2,8 @@
  * `allw-approver pair` — enroll this software approver as a device on an account.
  *
  * Flow (`docs/contract.md` §Lifecycle / §Transport → pairing; relay #89 auth; #242):
+ * 0. Check the relay URL against the transport rule (`https:`, or `http:` on loopback; #267) before
+ *    touching the keyfile or the relay.
  * 1. Load (or generate) the local keyfile — three software-held seeds + derived pubkeys.
  * 1a. Derive the **self-certifying account id** from the keyfile's account-root pubkey
  *    (`docs/enrollment.md` §Self-Certifying Account Id). An explicit `accountId` is accepted only
@@ -21,10 +23,15 @@ import { randomBytes } from "node:crypto";
 
 import { generateKeyfile, loadKeyfile, writeKeyfile, type Keyfile } from "../lib/keyfile.js";
 import { pairingComplete, pairingStart } from "../lib/relay-client.js";
+import { assertCliRelayUrl } from "../lib/relay-url.js";
 import type { AllwWasm } from "../lib/wasm.js";
 
 /** Options for `pair`, parsed from argv by the CLI. */
 export interface PairOptions {
+  /**
+   * Relay base URL. Must pass the relay transport rule (`../lib/relay-url.ts`: `https:`, or `http:`
+   * on loopback), or `runPair` throws before touching the keyfile or the relay.
+   */
   readonly relayUrl: string;
   /**
    * Optional explicit account id. The id is derived from the keyfile's account root; when this is
@@ -77,6 +84,9 @@ export async function runPair(
   const log: Logger = (line) => {
     rawLog(wasm.escape_for_display(line));
   };
+  // Reject a plaintext or malformed relay URL first (#267): before any request is built, and
+  // before a fresh keyfile is generated or written, so a refused `pair` leaves nothing behind.
+  assertCliRelayUrl(options.relayUrl, "--relay");
   const now = options.now ?? Date.now();
   const { keyfile: existing, fresh } = loadOrGenerate(wasm, options.keyfilePath);
 
