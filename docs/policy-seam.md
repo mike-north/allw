@@ -144,8 +144,18 @@ return the core's `action_from_argv` / `action_from_command` record unchanged. `
 record into a full request. By default it sets `actor: { id: "machine:<hostname>", kind: "script" }`,
 `reversible: false` and `cwd: process.cwd()` (an explicit `cwd: null` leaves the record unbound). It copies the
 record's `risk` into the request's top-level `risk`, which the caller cannot override. A command line is only split
-into words: shell operators, substitutions and newlines are not parsed and the record describes only the first
-program, so callers must run `argv` without a shell.
+into words: shell operators, substitutions and newlines are not parsed into the record's fields, and `bin` /
+`argv` describe the word list (the first program). So callers must run `argv` without a shell.
+
+**Risk on a command line covers the commands the shell would run** (#272). `action_from_command` also scans the
+raw line as bash would; §v1 command risk below lists the rules and their limits. So `ls && rm -rf /` is `high`, and
+`echo hi > f` is `medium`. Only `risk` changes. Two things are deliberately **not** changed:
+
+- `bin` / `argv` / `flags` / `positionals`.
+- Policy matching. A `{ bin: "ls" }` any-args allow rule still matches `ls && rm -rf /`. Making the matcher fail
+  closed on compound lines is an open policy-seam decision (#272).
+
+`action_from_argv` records an argv run without a shell, so its words are never read as shell syntax.
 
 **PowerShell lines** (Claude Code's `PowerShell` tool, #298) are also `command` records, built by the core's
 `action_from_powershell_command` (decided 2026-11-03). `raw` is the exact line and argv is **always** a plain
@@ -182,6 +192,115 @@ PowerShell: for example `$env:PATH` records `env` in `env_refs`. `raw` is author
    they are added — see §Structure vs. data above.
 
 Do **not** build capability inference or a schema DB in v1. Just don't foreclose them.
+
+### v1 command risk: classify what actually runs
+
+`risk` on a `command` record is a coarse T1 heuristic. Its rules and table live in
+`crates/allw-core/src/command/risk.rs`.
+
+**Who reads it.** `policy::evaluate` does not read risk, so risk never makes an action allowed. Risk is not only
+display, though:
+
+- The human sees it.
+- The Codex hook and the OpenClaw bridge derive `reversible` from it (`low` / `medium` ⇒ reversible).
+- The OpenClaw bridge requires a challenge for `critical`.
+
+So understating risk is a real defect. Every rule fails **upward**: where T1 can't tell, the tier goes up.
+
+**Rules** (decided 2026-11-02, #268 and #272). Risk is classified on what actually runs, not only `argv[0]`.
+Within the limits below, a prefix, wrapper, operator or substitution does not make a command look less risky than
+a program it runs.
+
+- **Assignments.** Leading assignment-like words (`NAME=value`, `X+=1`, `A[0]=1`) are skipped. The tier is that
+  of the command after them, and at least `medium`: an assignment can change what a program does (`LD_PRELOAD`,
+  `PATH`, `GIT_SSH_COMMAND`). `X=1 rm -rf ~` is `high`.
+- **Wrappers.** The wrappers are a curated list:
+  - `env`, `sudo`, `doas`, `run0`, `pkexec`, `su`, `nice`, `ionice`, `nohup`, `time`, `timeout`
+  - `command`, `builtin`, `exec`, `xargs`, `stdbuf`, `setsid`, `find`, `caffeinate`, `arch`
+  - `script`, `chroot`, `flock`, `watch`, `busybox`, `ssh`
+  - the GNU-prefixed `genv`, `gnice`, `gnohup`, `gtimeout`, `gstdbuf`
+
+  A wrapper is at least as risky as anything it may run. T1 can't tell an option value (`nice -n 10`) from the
+  wrapped program, so every later non-flag word counts as a program start. Every later word holding whitespace
+  counts as a command line too: `watch 'rm -rf ~'`, `ssh host 'cmd'`, and a flag value such as
+  `env -S'rm -rf ~'`. `env` running a program is at least `medium`, and `env` alone stays `low`.
+
+- **Shells and `eval`.** These read their string as a full command line under the rules here:
+  - `sh` / `bash` / `zsh` / `dash` / `ksh` / `mksh` / `ash` / `fish` / `csh` / `tcsh` with `-c`;
+  - `pwsh` / `powershell` with `-Command`;
+  - `eval`'s arguments.
+
+  An unreadable string (`-EncodedCommand`, an unterminated quote) is `high`.
+
+- **Command lines** (`action_from_command` only):
+  - Segments are split at unquoted control operators (`&&`, `||`, `;`, `|`, `&`, `(`, `)`, newline, a lone
+    `{` / `}`, zsh `&!` / `&|`). Each segment is classified.
+  - Words before the command word are skipped: keywords (`if`, `do`, `!`, `time [-p]`, …), redirections
+    (`2>/dev/null`, `> f`, and attached ones: `dd>/dev/null` runs `dd`) and the zsh precommands (`noglob`,
+    `nocorrect`, `-`, `repeat N`).
+  - A command word T1 can't know (`$x`, `$(…)`, a backtick, a glob, a `{a,b}` list) is `high`. bash `$'…'` /
+    `$"…"` strings are decoded first. A decoded NUL ends the word, as in bash. A decoding bash may do
+    differently (`\u`, `\c`, an unknown escape) makes it at least `high`.
+  - Substitutions (`$(…)`, backticks, `<(…)`, `>(…)`) are classified. Inside one, a `#` comment runs to the end
+    of its line, so a `)` or quote in it doesn't end the substitution.
+  - Heredoc delimiters are read as bash reads them (`<<''`, backslash-newline, `\"` inside double quotes). One
+    T1 can't read for sure makes the line `high`. An unquoted delimiter's body has its substitutions
+    classified.
+  - **Every heredoc and here-string body is also read as a script, whatever consumes it.** This is a deliberate
+    fail-upward rule. Which consumers run their input (a shell, a wrapper, `{ bash; }`, `( bash )`, `eval`,
+    an `if` / `while` compound) is a moving target. Reading every body as a script means a new consumer can't
+    hide one, and over-reading a `cat <<EOF` body only raises the tier.
+  - **An open quote inside a heredoc body doesn't raise the tier on its own.** A shell fed the body stops at
+    that syntax error before running anything after the open quote, and everything before it is still
+    classified. So ordinary commit and PR bodies (`git commit -m "$(cat <<'EOF'`… `it's` …) keep the tier of the
+    command that consumes them (`medium`), while a `dd` before the quote is still `critical`. Elsewhere (a
+    command line, a `-c` string, a substitution) an open quote still makes the line `high`.
+  - `((…))` at a command position (including `for ((…))`) is arithmetic, so a `<<` inside it is a shift.
+  - Any operator, substitution or redirection makes the line at least `medium`. A line ending inside an open
+    quote or substitution is `high`, because the shell runs what comes before the syntax error.
+  - bash ≥ 4 grammar is authoritative. Where shells or versions disagree, the line is read both ways and the
+    higher tier wins:
+    - `#` as a comment or not;
+    - `$'…'` as an ANSI-C string or not;
+    - `((` as an arithmetic command or two subshells;
+    - a heredoc inside `$(…)` read before the closing `)` (bash ≥ 4, zsh, dash, ksh) or the first `)` closing it
+      (bash 3.2);
+    - a body line `EOF)` ending a heredoc inside `$(…)` and closing the substitution (bash 5).
+
+    These alternate readings run at every nesting level, so a nested `sh -c` string also gets dash's reading
+    (`sh` is dash on Debian and Ubuntu). They are charged to the shared budget, which bounds their cost. An
+    alternate reading's substitutions keep the open-quote floor, with one exception: a substitution the bash 3.2
+    reading never closes runs to the end of the input (or of the heredoc body holding it), and bash 3.2 stops at
+    its open quote with nothing later in it to run, so that open quote alone doesn't raise the tier. This keeps the commit and PR bodies above at `medium`.
+
+- **Bounds.** Each bound fails upward to `high`:
+  - nesting of `-c`, `eval` and substitutions past 4 levels;
+  - argv words past the 256th, which count as a `high` candidate;
+  - one shared work budget per record (bytes scanned, split or copied, plus words classified), so
+    classification time stays linear and bounded inside the synchronous hook. Running out of it never lowers a
+    tier already found. An unbudgeted pre-pass first records every visible program word (each argv word,
+    and each segment's command word, descending into substitutions, backticks and heredoc bodies down to the
+    nesting limit), so those keep their tier on exhaustion: a `$(dd …)` that runs first stays `critical`
+    however much padding follows it. Only text never reached falls back to `high`.
+
+**Known T1 limits.** For these the tier can still understate what runs (decision B: curated list plus documented
+limits, no name-sniffing of later words):
+
+- wrappers and interpreters that aren't listed: `parallel`, `git -c core.sshCommand=…` / `-c alias.*`,
+  `source` / `.`, and code in other languages (`python -c`, `node -e`, `perl -e`); tracked in #289;
+- input piped into a shell (`echo 'rm -rf ~' | sh`): the shell keeps its own tier;
+- aliases, functions and `PATH` lookups defined outside the line, and renamed or symlinked binaries;
+- arithmetic evaluation of data (`x='a[$(rm -rf ~)]'; echo $((x))` runs a substitution stored in a variable);
+- non-bash grammars (fish, csh, PowerShell strings) are read with bash's rules.
+
+This changes **only `risk`**. `bin`, `argv`, `flags`, `positionals` and `env_refs` keep their T1 meaning, and
+`bin` is still `argv[0]` (`X=1 rm -rf ~` has `bin: "X=1"`). The `bin` question is **open**: `CommandMatcher`
+matches `bin` exactly, so a `{ bin: "ls" }` any-args `allow` rule would start matching
+`LD_PRELOAD=/tmp/evil.so ls` if `bin` became the real program. Changing `bin` therefore needs a matching
+policy-matcher rule for prefixed commands first (see #268).
+
+Shared Rust ↔ WASM vectors are in `crates/allw-core/tests/fixtures/command_risk_vectors.json` (argv rules) and
+`command_line_risk_vectors.json` (command lines).
 
 ---
 

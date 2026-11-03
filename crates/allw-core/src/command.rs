@@ -34,6 +34,14 @@
 //! If the shell string is syntactically invalid (unmatched quotes), the tokenization
 //! returns an error.  [`action_from_argv`] does not tokenize and never fails.
 //!
+//! # Command lines with shell syntax (risk only)
+//!
+//! Tokenization only splits words, so `ls && rm -rf /` records `bin: "ls"` and the argv
+//! `["ls", "&&", "rm", "-rf", "/"]`. Those fields are unchanged. **Risk**, though, covers the
+//! commands a shell would run for the line: [`action_from_command`] also scans the raw line (see
+//! § Risk heuristic). [`action_from_argv`] records an argv that runs without a shell, so its words
+//! are never read as shell syntax.
+//!
 //! # Flag classification
 //!
 //! A token is classified as a **flag** if it begins with `-` (single-dash short options,
@@ -85,18 +93,26 @@
 //! A coarse, documented heuristic assigns a [`Risk`] tier.  This is a v1 placeholder;
 //! `docs/policy-seam.md §The three tiers` states that T3 will derive risk from capabilities.
 //!
+//! The rules live in the private `command/risk.rs` module, whose module doc is the reference: the
+//! program table, how the program that actually runs is found (assignments, wrappers, shells with
+//! `-c`, `eval`), how a command line is scanned (operators, substitutions, heredocs), the bounds
+//! (all failing upward to `High`), and the known T1 limits. The table, in short:
+//!
 //! | Risk       | Matched commands / flags                                                      |
 //! |------------|-------------------------------------------------------------------------------|
 //! | `Critical` | `dd`, `mkfs`, `mkfs.*`, `fdisk`, `parted`, `shred`                           |
-//! | `High`     | `rm` recursive+force, `git push` with a force flag, `chmod -R` (recursive), `sudo` |
+//! | `High`     | `rm` recursive+force, `git push` with a force flag, `chmod -R`, `sudo`, `doas`, `run0`, `pkexec`, `su` |
 //! | `Low`      | `ls`, `cat`, `echo`, `pwd`, `whoami`, `date`, `env`, `printenv`, `which`     |
 //! | `Medium`   | everything else                                                               |
 //!
-//! Matching is case-sensitive on `bin` (exact match after basename extraction) and flag
-//! presence checks use a set membership test on the `flags` list.
+//! Only `risk` follows what really runs. `bin` / `argv` / `flags` / `positionals` / `env_refs`
+//! stay `argv[0]`-based, so policy matching (which keys on `bin`) is unchanged; see
+//! `docs/policy-seam.md` §v1 command risk.
 
 use crate::contract::{ActionRecord, Risk, Surface, SyntacticSubstrate};
 use std::collections::HashSet;
+
+mod risk;
 
 // ── Record schema version ─────────────────────────────────────────────────────
 
@@ -164,7 +180,16 @@ pub fn action_from_command(
     ctx: &CommandContext,
 ) -> Result<ActionRecord, CommandError> {
     let argv = shlex::split(command_line).ok_or(CommandError::InvalidShellSyntax)?;
-    Ok(build_record(argv, ctx, Some(command_line.to_string())))
+    // A command line can hold more than one command (`ls && rm -rf /`). `bin` / `argv` / `flags`
+    // / `positionals` still describe the word list, but risk covers every command a shell would
+    // run (`risk` module).
+    let risk = risk::command_line_risk(command_line, &argv);
+    Ok(build_record(
+        argv,
+        ctx,
+        Some(command_line.to_string()),
+        risk,
+    ))
 }
 
 /// Build an [`ActionRecord`] from a pre-tokenized argument vector, optionally carrying the
@@ -192,12 +217,21 @@ pub fn action_from_command(
 /// let bound = action_from_argv(&argv, Some("git push"), &CommandContext::default());
 /// ```
 pub fn action_from_argv(argv: &[String], raw: Option<&str>, ctx: &CommandContext) -> ActionRecord {
-    build_record(argv.to_vec(), ctx, raw.map(str::to_string))
+    // The argv runs without a shell, so `raw` is display text and is not read for risk.
+    let risk = risk::argv_risk(argv);
+    build_record(argv.to_vec(), ctx, raw.map(str::to_string), risk)
 }
 
 // ── Core builder ─────────────────────────────────────────────────────────────
 
-fn build_record(argv: Vec<String>, ctx: &CommandContext, raw: Option<String>) -> ActionRecord {
+/// Assemble the record for `argv`. `risk` is computed by the caller, because only the caller knows
+/// whether a shell runs the line (`risk::command_line_risk`) or not (`risk::argv_risk`).
+fn build_record(
+    argv: Vec<String>,
+    ctx: &CommandContext,
+    raw: Option<String>,
+    risk: Risk,
+) -> ActionRecord {
     let bin = argv.first().cloned().unwrap_or_default();
     let (flags, positionals) = split_flags_and_positionals(&argv);
     let env_refs = raw.as_deref().map(extract_env_refs).unwrap_or_default();
@@ -208,8 +242,6 @@ fn build_record(argv: Vec<String>, ctx: &CommandContext, raw: Option<String>) ->
     };
 
     let host = extract_host(&bin, &positionals);
-
-    let risk = classify_risk(&bin, &flags, &positionals);
 
     let bin_opt = if argv.is_empty() {
         None
@@ -394,88 +426,6 @@ fn extract_scp_host(positionals: &[String]) -> Option<String> {
 /// Used to normalize `bin` before pattern matching, e.g. `/usr/bin/rm` → `rm`.
 fn basename(s: &str) -> &str {
     s.rsplit('/').next().unwrap_or(s)
-}
-
-// ── Risk classification ───────────────────────────────────────────────────────
-
-/// Classify the coarse risk tier for a command.
-///
-/// v1 heuristic only; T3 will derive this from capabilities.
-/// Documented rules are in the module-level doc table.
-fn classify_risk(bin: &str, flags: &[String], positionals: &[String]) -> Risk {
-    let base = basename(bin);
-
-    // Critical: disk/partition destructive tools
-    match base {
-        "dd" | "fdisk" | "parted" | "shred" => return Risk::Critical,
-        b if b.starts_with("mkfs") => return Risk::Critical,
-        _ => {}
-    }
-
-    // Low: read-only utilities
-    match base {
-        "ls" | "cat" | "echo" | "pwd" | "whoami" | "date" | "env" | "printenv" | "which" => {
-            return Risk::Low
-        }
-        _ => {}
-    }
-
-    // High: dangerous flag combinations or commands
-    match base {
-        "rm" => {
-            // rm with any combination that includes both -r/-R (recursive) and -f (force)
-            let has_recursive = flags.iter().any(|f| {
-                f == "-r"
-                    || f == "-R"
-                    || f == "--recursive"
-                    || combined_short_flags(f).contains('r')
-                    || combined_short_flags(f).contains('R')
-            });
-            let has_force = flags
-                .iter()
-                .any(|f| f == "-f" || f == "--force" || combined_short_flags(f).contains('f'));
-            if has_recursive && has_force {
-                return Risk::High;
-            }
-        }
-        "git" => {
-            // Only `git push` with a force flag is High — NOT e.g. `git checkout -f`.
-            // The subcommand is the first positional (`git push ...` → positionals[0] == "push").
-            let is_push = positionals.first().is_some_and(|p| p == "push");
-            let has_force = flags.iter().any(|f| {
-                f == "--force"
-                    || f == "-f"
-                    || f == "--force-with-lease"
-                    || combined_short_flags(f).contains('f')
-            });
-            if is_push && has_force {
-                return Risk::High;
-            }
-        }
-        "chmod" => {
-            let has_recursive = flags
-                .iter()
-                .any(|f| f == "-R" || combined_short_flags(f).contains('R'));
-            if has_recursive {
-                return Risk::High;
-            }
-        }
-        "sudo" => return Risk::High,
-        _ => {}
-    }
-
-    Risk::Medium
-}
-
-/// Extract the single-character flags from a combined short-flag token like `-rf`.
-///
-/// Only applies to tokens that start with exactly one `-` (not `--`).
-/// Returns the characters after the `-` (e.g. `rf` for `-rf`).
-fn combined_short_flags(token: &str) -> &str {
-    if token.starts_with("--") {
-        return "";
-    }
-    token.strip_prefix('-').unwrap_or_default()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -859,69 +809,6 @@ mod tests {
         assert!(r.syntactic.env_refs.is_none());
     }
 
-    // ── Risk heuristic ───────────────────────────────────────────────────────
-
-    /// Critical: disk destructive tools.
-    #[test]
-    fn risk_critical_for_disk_tools() {
-        for cmd in &[
-            "dd if=/dev/zero of=/dev/sda",
-            "mkfs.ext4 /dev/sdb1",
-            "fdisk /dev/sda",
-            "shred /dev/sda",
-        ] {
-            let r = action_from_command(cmd, &ctx_no_cwd()).unwrap();
-            assert_eq!(
-                r.risk,
-                Risk::Critical,
-                "`{cmd}` must be classified as Risk::Critical"
-            );
-        }
-    }
-
-    /// Low: read-only utilities.
-    #[test]
-    fn risk_low_for_read_only_tools() {
-        for cmd in &["ls -la", "cat /etc/hosts", "echo hello", "pwd", "whoami"] {
-            let r = action_from_command(cmd, &ctx_no_cwd()).unwrap();
-            assert_eq!(r.risk, Risk::Low, "`{cmd}` must be classified as Risk::Low");
-        }
-    }
-
-    /// High: sudo.
-    #[test]
-    fn risk_high_for_sudo() {
-        let r = action_from_command("sudo apt-get install vim", &ctx_no_cwd()).unwrap();
-        assert_eq!(r.risk, Risk::High);
-    }
-
-    /// High: git push --force.
-    #[test]
-    fn risk_high_for_git_push_force() {
-        let r = action_from_command("git push --force origin main", &ctx_no_cwd()).unwrap();
-        assert_eq!(r.risk, Risk::High);
-    }
-
-    /// Regression (#33 review): a force flag on a NON-`push` git subcommand must NOT be High.
-    /// The risk rule requires `positionals[0] == "push"`, so `git checkout -f` stays Medium —
-    /// before the fix, any `git` with a force flag was wrongly elevated.
-    #[test]
-    fn risk_not_high_for_git_force_without_push_subcommand() {
-        let r = action_from_command("git checkout -f main", &ctx_no_cwd()).unwrap();
-        assert_eq!(
-            r.risk,
-            Risk::Medium,
-            "git checkout -f is not a force-push; must not be High"
-        );
-    }
-
-    /// Medium: unrecognized commands default to medium.
-    #[test]
-    fn risk_medium_for_unknown_commands() {
-        let r = action_from_command("docker build .", &ctx_no_cwd()).unwrap();
-        assert_eq!(r.risk, Risk::Medium);
-    }
-
     // ── Host extraction ──────────────────────────────────────────────────────
 
     /// ssh user@host → host extracted.
@@ -1080,5 +967,51 @@ mod tests {
             Risk::High,
             "risk heuristic must use basename of bin path"
         );
+    }
+
+    /// #268 changes only `risk`: `bin` is still `argv[0]` and the syntactic fields keep their
+    /// documented T1 meaning (module doc §Flag/§Positional classification), so policy matching
+    /// cannot shift.
+    #[test]
+    fn risk_268_syntactic_fields_unchanged() {
+        let r = action_from_command("FOO=1 git push --force origin main", &ctx_no_cwd()).unwrap();
+        assert_eq!(bin(&r), "FOO=1");
+        assert_eq!(
+            argv(&r),
+            ["FOO=1", "git", "push", "--force", "origin", "main"]
+        );
+        assert_eq!(flags(&r), ["--force"]);
+        assert_eq!(positionals(&r), ["git", "push", "origin", "main"]);
+        assert_eq!(r.syntactic.env_refs, None);
+        assert_eq!(r.syntactic.host, None);
+
+        let r = action_from_command("env X=$HOME rm -rf ~", &ctx_no_cwd()).unwrap();
+        assert_eq!(bin(&r), "env");
+        assert_eq!(argv(&r), ["env", "X=$HOME", "rm", "-rf", "~"]);
+        assert_eq!(flags(&r), ["-rf"]);
+        assert_eq!(positionals(&r), ["X=$HOME", "rm", "~"]);
+        assert_eq!(r.syntactic.env_refs, Some(vec!["HOME".to_string()]));
+
+        let r = action_from_command("sh -c 'ssh user@example.com'", &ctx_no_cwd()).unwrap();
+        assert_eq!(bin(&r), "sh");
+        assert_eq!(positionals(&r), ["ssh user@example.com"]);
+        assert_eq!(r.syntactic.host, None, "host stays argv[0]-based");
+    }
+
+    /// #272 changes only `risk`: the record's words are still the shlex split of the line, so
+    /// policy matching cannot shift.
+    #[test]
+    fn risk_272_syntactic_fields_unchanged() {
+        let r = action_from_command("ls && rm -rf /", &ctx_no_cwd()).unwrap();
+        assert_eq!(bin(&r), "ls");
+        assert_eq!(argv(&r), ["ls", "&&", "rm", "-rf", "/"]);
+        assert_eq!(flags(&r), ["-rf"]);
+        assert_eq!(positionals(&r), ["&&", "rm", "/"]);
+        assert_eq!(r.syntactic.env_refs, None);
+
+        let r = action_from_command("echo $(rm -rf $HOME)", &ctx_no_cwd()).unwrap();
+        assert_eq!(bin(&r), "echo");
+        assert_eq!(argv(&r), ["echo", "$(rm", "-rf", "$HOME)"]);
+        assert_eq!(r.syntactic.env_refs, Some(vec!["HOME".to_string()]));
     }
 }
