@@ -337,8 +337,20 @@ mod tests {
     /// Hand-assembles a root-signed pairing-start JWS with arbitrary header/claims, so tests can
     /// reach verifier branches the honest signer refuses to produce.
     fn forge(typ: &str, kid: &str, claims: &PairingStartClaims, key: &SigningKeyPair) -> String {
+        forge_with_alg(ALG_EDDSA, typ, kid, claims, key)
+    }
+
+    /// Like [`forge`], with an arbitrary header `alg`. The signature is always a genuine Ed25519
+    /// signature by `key` over the transmitted `header.payload`, whatever `alg` claims.
+    fn forge_with_alg(
+        alg: &str,
+        typ: &str,
+        kid: &str,
+        claims: &PairingStartClaims,
+        key: &SigningKeyPair,
+    ) -> String {
         let header = JwsHeader {
-            alg: ALG_EDDSA.to_string(),
+            alg: alg.to_string(),
             typ: typ.to_string(),
             kid: kid.to_string(),
         };
@@ -463,6 +475,41 @@ mod tests {
     fn rejects_wrong_typ() {
         let forged = forge(TYP_DEVICE_CERT, &account_id(), &claims(), &root());
         assert_eq!(verify(&forged), Err(PairingStartError::WrongTyp));
+    }
+
+    #[test]
+    fn rejects_non_eddsa_alg() {
+        // Control: the same forger with `alg: EdDSA` is accepted, so each rejection below is
+        // caused by the header `alg` alone — the root's Ed25519 signature is honest throughout.
+        let control = forge_with_alg(
+            ALG_EDDSA,
+            TYP_PAIRING_START,
+            &account_id(),
+            &claims(),
+            &root(),
+        );
+        assert_eq!(verify(&control), Ok(claims()));
+
+        for alg in ["none", "HS256", "eddsa", ""] {
+            let forged = forge_with_alg(alg, TYP_PAIRING_START, &account_id(), &claims(), &root());
+            assert_eq!(
+                verify(&forged),
+                Err(PairingStartError::InvalidSignature),
+                "alg {alg:?}"
+            );
+            // Pin the branch: the JWS layer rejects on `alg` before checking `typ` or signature.
+            assert!(
+                matches!(
+                    decode_and_verify_jws::<PairingStartClaims>(
+                        &forged,
+                        TYP_PAIRING_START,
+                        &root().public_key()
+                    ),
+                    Err(JwsError::UnexpectedAlg)
+                ),
+                "alg {alg:?}"
+            );
+        }
     }
 
     #[test]
