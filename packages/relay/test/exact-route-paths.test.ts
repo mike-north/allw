@@ -201,6 +201,8 @@ describe("matchRoutePath", () => {
 });
 
 describe.each(DOCUMENTED_ROUTES)("$method /$path", (route) => {
+  // Each route's handler behaviour is pinned by its own suite (account-relay, pairing-start-auth,
+  // account-state-verified, push-tokens, relay-routing); this only checks the router reaches it.
   it("reaches its handler on the exact path", async () => {
     const { status, body } = await call(route.method, `/${route.concrete}`);
     // The handler decides the status (often 400/401/404 for this junk input); the router's own
@@ -241,6 +243,19 @@ describe.each(DOCUMENTED_ROUTES.filter((route) => route.path.includes("{")))(
     });
   },
 );
+
+describe("dot segments", () => {
+  // The WHATWG URL parser resolves `.` / `..` (and `%2e%2e`) before the router sees the path, so
+  // these are the inbox route itself, not an extra or missing segment.
+  it.each(["/devices/d1/inbox/../inbox", "/devices/d1/x/%2e%2e/inbox", "/devices/./d1/inbox"])(
+    "%s reaches GET /devices/{device_id}/inbox",
+    async (subPath) => {
+      const direct = await call("GET", "/devices/d1/inbox");
+      expect(direct.body).not.toEqual(NOT_FOUND);
+      expect(await call("GET", subPath)).toEqual(direct);
+    },
+  );
+});
 
 describe("the account root", () => {
   it.each(["", "/"])("is 404 for '/%s' below the account id", async (suffix) => {

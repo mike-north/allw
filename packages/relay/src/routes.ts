@@ -5,7 +5,8 @@
  * 405-vs-404 decision both come from {@link resolveAccountRoute}, so they cannot disagree.
  *
  * # Matching rule
- * A route matches only its **exact** segment sequence, compared as sent (not percent-decoded):
+ * A route matches only its **exact** segment sequence, compared as the URL parser yields them
+ * (percent-encoding preserved; `.` and `..` segments, `%2e%2e` included, already resolved):
  * - the same number of segments;
  * - every literal segment equal;
  * - every `{param}` segment non-empty.

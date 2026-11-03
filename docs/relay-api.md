@@ -70,8 +70,8 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   send no `Origin` and are unaffected.
 - **Errors** are plain bodies with the status code; `400` covers malformed JSON / bad fields /
   unexpected envelope keys (zero-knowledge guard).
-- **Exact paths.** An account route answers only on its exact path, compared segment by segment as sent
-  (not percent-decoded): the same number of segments, every literal equal, and every `{param}` non-empty
+- **Exact paths.** An account route answers only on its exact path, compared segment by segment as the URL
+  parser yields them (percent-encoding preserved, `.` and `..` segments resolved): the same number of segments, every literal equal, and every `{param}` non-empty
   (#302). Anything else is **404** `{ "error": "not found" }`, whatever the method: an extra segment
   (`…/revoke/extra`), a trailing slash (`/devices/`), an empty segment (`/devices//revoke`) or a missing
   one. A path that is exactly a route's, reached with a method the route doesn't serve, is **405**
