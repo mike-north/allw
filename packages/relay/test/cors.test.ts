@@ -574,6 +574,7 @@ describe("parseCorsAllowedOrigins / isCorsOriginAllowed", () => {
     // Empty credentials, which URL parsing would discard (review-338).
     ["empty userinfo", "https://@approver.example.com"],
     ["an empty user and password", "https://:@approver.example.com"],
+    ["an empty port", "https://approver.example.com:"],
   ])("drops %s rather than widening the allowlist", (_name, entry) => {
     expect(parseCorsAllowedOrigins(entry)).toEqual([]);
   });

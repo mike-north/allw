@@ -113,8 +113,9 @@ function parseOriginRule(entry: string): OriginRule | null {
   // `/%2e`), reads `\` as `/` and strips tabs and newlines, so those spellings would otherwise
   // come out as a bare origin (#305). Nothing but the scheme and the host and port may follow
   // `://`. That excludes `@` too, so credentials are dropped as written, even empty ones
-  // (`https://@host`, `https://:@host`), which the URL parser would discard.
-  if (!/^https?:\/\/[^/\\?#@\s]+$/i.test(entry)) return null;
+  // (`https://@host`, `https://:@host`), which the URL parser would discard. So is an empty port
+  // (`https://host:`), which it would drop.
+  if (!/^https?:\/\/[^/\\?#@\s]+$/i.test(entry) || entry.endsWith(":")) return null;
   const exact = parseOrigin(entry);
   // Defence in depth only: after the raw-text check above, an http(s) URL always parses with the
   // path `/`. The path rule lives in that check, not here.
