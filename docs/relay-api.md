@@ -131,15 +131,19 @@ authorization is rejected at or after `expires_at`. Sign it with the core
 (`sign_pairing_start_authorization`), which always binds the id derived from the signing root.
 
 → **201** `{ code: string (8-char Crockford base32), expires_at: number(ms), pairing_auth_token: string }`.
-Code is single-use, 10-min TTL. The first success binds `root_pubkey` to the account.
+Code is single-use, 10-min TTL. The first success binds `root_pubkey` to the account — but only into an account
+with no device, pairing, actor or account-state rows; otherwise the bind is refused (409), never purged
+(`docs/enrollment.md` §Self-Certifying Account Id). A used `jti` is remembered until 60 s past its `expires_at`.
 
 | Status | When                                                                                                                                                                                                                                                        |
 | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 400    | body is not a JSON object; `root_pubkey` missing, malformed, or not an Ed25519 key; `{acct}` does not derive from `root_pubkey`                                                                                                                             |
 | 401    | `authorization` missing (or not a string)                                                                                                                                                                                                                   |
 | 403    | bad signature, wrong `typ`, wrong `kid`/`account_id`, unsupported `v`, malformed `jti`, invalid/overlong window, not yet valid, expired, a `jti` already accepted for this account, or a `root_pubkey` different from the root already bound to the account |
+| 409    | no root is bound yet but the account already holds devices, pairing codes, actors or account state from before root binding                                                                                                                                 |
+| 500    | the relay's verification core failed to initialize (logged; the request is not judged)                                                                                                                                                                      |
 
-Every rejection leaves the account unchanged (no root bound, no code issued).
+Every rejection leaves the account unchanged (no root bound, no code issued, nothing purged).
 
 **`POST /{acct}/pairing/complete`** — Bearer `pairing_auth_token`. Body:
 
@@ -153,7 +157,8 @@ Every rejection leaves the account unchanged (no root bound, no code issued).
 ```
 
 → **201** `{ device_id: string, device_auth_token: string }`. APNs `token` = 64-char hex.
-Errors: 400 (bad body/pubkey/push_token/unexpected key), 401/403 (token), 404 (code unknown),
+Errors: 403 when no root is bound to the account (a code on an unbound account predates root binding and
+is never honored), 400 (bad body/pubkey/push_token/unexpected key), 401/403 (token), 404 (code unknown),
 409 (code already used), 410 (code expired). Atomic — no half-enrollment.
 
 ### Enrollment courier (cross-device `device_cert` issuance, #175)

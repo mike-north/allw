@@ -83,6 +83,14 @@ account_id = base64url-unpadded( SHA-256( "allw/account-id/v1" || 0x00 || accoun
 - **Root binding.** After the first verified root signature (today: a root-signed `pairing/start`), the account's
   Durable Object stores the root public key in an `account_meta` row. The root is derived, not trusted on first
   contact; later root-authorized operations verify against that bound row, and a different root is refused.
+- **The first bind requires an empty account (refuse, never purge).** Before roots were bound, anyone could create
+  devices, pairing codes, actors and account state under any id — including one derived from a root they merely
+  know (root public keys are not secret; integrators are configured with them). Binding a root over such rows would
+  make them look root-authorized, so the relay **refuses** the first bind (409) when the account already holds any
+  device, pairing, actor or account-state row, and `pairing/complete` refuses (403) on an unbound account. Refusing
+  is fail-closed and visible; purging would silently drop state. An honest derived-id account cannot hit this
+  (no approver before this change could produce a derived id), so a populated unbound account was seeded by
+  someone else; its owner starts again under a new root.
 - **Rejected alternative — trust on first use.** Binding whatever root first contacts an arbitrary id lets anyone
   who learns an id before its owner first uses it squat it. A derived id cannot be squatted: only the holder of the
   matching root can produce a valid authorization for it.
@@ -127,9 +135,10 @@ The v1 pairing flow is:
    id, a validity window of at most **5 minutes** (60 s of clock skew tolerated on `issued_at`), and a one-time
    `jti` (16–128 base64url characters). The relay checks that `root_pubkey` derives to `{account_id}`, verifies the
    authorization in the core (`verify_pairing_start_authorization`), rejects a `jti` it has already accepted (each
-   accepted `jti` is remembered until its `expires_at`), and binds the root on first success. Only the root can
-   therefore add a device — before this, anyone who knew an account id could enroll a key every later request was
-   encrypted to.
+   accepted `jti` is remembered until 60 s past its `expires_at`, the clock-skew margin), and binds the root on
+   first success — refusing (409) if the account already holds state from before root binding (§Self-Certifying
+   Account Id). Only the root can therefore add a device — before this, anyone who knew an account id could enroll
+   a key every later request was encrypted to.
 2. Relay returns `{ code, expires_at, pairing_auth_token }`; the code and bearer token are shown
    out-of-band to the device or delivered through the account-owner pairing ceremony.
 3. Device completes pairing with `{ code, pubkey, label?, push_tokens? }`, where `pubkey` is its **X25519
