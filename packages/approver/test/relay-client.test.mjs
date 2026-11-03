@@ -49,6 +49,9 @@ const DEVICE_AUTH_TOKEN = "device-token-from-relay";
 /** The fixed clock both `runPair` (`now`) and the fake relay's verifier use. */
 const FIXED_NOW = 1700000000000;
 /** What the fake relay serves for an account nothing was published to (opaque to the client). */
+/** What the real relay serves for an account that has never published account state. */
+const NO_ACCOUNT_STATES = { account_states: [], max_sequence: 0 };
+
 const DEFAULT_ACCOUNT_STATES = {
   account_states: ["account-state-jws-1", "account-state-jws-2"],
   max_sequence: 7,
@@ -61,10 +64,16 @@ const DEFAULT_ACCOUNT_STATES = {
  * must accept it at `now` with an unused `jti` (403); the first success binds the root.
  * `account-states` mirrors the relay too: `POST` needs a bound root (409), every document must pass
  * the core's `verify_account_state` (403), and the highest sequence must rise (409); `GET` needs no
- * token. Unpublished accounts serve `DEFAULT_ACCOUNT_STATES`.
- * Returns { url, requests, boundRoots, close }.
+ * token. Unpublished accounts serve `unpublished` (default `DEFAULT_ACCOUNT_STATES`; pairing tests
+ * use the real relay's empty set). `/pairing/complete` assigns `deviceIds` in order (the last one
+ * repeats). Returns { url, requests, boundRoots, publishedStates, close }.
  */
-async function startFakeRelay({ now = FIXED_NOW } = {}) {
+async function startFakeRelay({
+  now = FIXED_NOW,
+  unpublished = DEFAULT_ACCOUNT_STATES,
+  deviceIds = [ASSIGNED_DEVICE_ID],
+} = {}) {
+  let completes = 0;
   const wasm = await loadWasm();
   const requests = [];
   /** account id → bound root pubkey. */
@@ -133,10 +142,12 @@ async function startFakeRelay({ now = FIXED_NOW } = {}) {
           res.end(JSON.stringify({ error: "authorization denied" }));
           return;
         }
+        const deviceId = deviceIds[Math.min(completes, deviceIds.length - 1)];
+        completes += 1;
         res.writeHead(201, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
-            device_id: ASSIGNED_DEVICE_ID,
+            device_id: deviceId,
             device_auth_token: DEVICE_AUTH_TOKEN,
           }),
         );
@@ -180,7 +191,7 @@ async function startFakeRelay({ now = FIXED_NOW } = {}) {
       if (req.method === "GET" && req.url.endsWith("/account-states")) {
         const accountId = decodeURIComponent(req.url.split("/")[1] ?? "");
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(publishedStates.get(accountId) ?? DEFAULT_ACCOUNT_STATES));
+        res.end(JSON.stringify(publishedStates.get(accountId) ?? unpublished));
         return;
       }
       res.writeHead(404, { "Content-Type": "application/json" });
@@ -194,6 +205,7 @@ async function startFakeRelay({ now = FIXED_NOW } = {}) {
         url: `http://127.0.0.1:${port}`,
         requests,
         boundRoots,
+        publishedStates,
         close: () => new Promise((r) => server.close(r)),
       });
     });
@@ -230,10 +242,11 @@ function startHungRelay() {
   });
 }
 
-function withTempKeyfile(fn) {
+async function withTempKeyfile(fn) {
   const dir = mkdtempSync(join(tmpdir(), "allw-approver-pair-"));
   try {
-    return fn(join(dir, "keyfile.json"));
+    // Awaited, so the directory outlives an async `fn`.
+    return await fn(join(dir, "keyfile.json"));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -453,7 +466,7 @@ test("publishAccountStates fails closed on a relay rejection", async () => {
 
 test("runPair self-drives start+complete, mints a device_cert, and persists pairing state", async () => {
   const wasm = await loadWasm();
-  const relay = await startFakeRelay();
+  const relay = await startFakeRelay({ unpublished: NO_ACCOUNT_STATES });
   const logLines = [];
   try {
     await withTempKeyfile(async (keyfilePath) => {
@@ -670,7 +683,7 @@ test("runPair rejects an explicit --account that does not match the derived id, 
 
 test("runPair accepts an explicit --account equal to the derived id", async () => {
   const wasm = await loadWasm();
-  const relay = await startFakeRelay();
+  const relay = await startFakeRelay({ unpublished: NO_ACCOUNT_STATES });
   try {
     await withTempKeyfile(async (keyfilePath) => {
       // Generate the identity first so the test knows the derived id up front.
@@ -708,5 +721,118 @@ test("runPair fails closed when the relay rejects the authorization (e.g. stale 
     });
   } finally {
     await relay.close();
+  }
+});
+
+// ── pair publishes the account state that vouches for the device (#243) ─────────────────────────
+
+/** Verify the relay's published documents for `keyfile`'s account; returns the AccountState JSONs. */
+function publishedStatesFor(wasm, relay, keyfile) {
+  const published = relay.publishedStates.get(keyfile.account_id);
+  assert.ok(published, "pair published account state");
+  return published.account_states.map((jws) =>
+    JSON.parse(wasm.verify_account_state(jws, keyfile.account_id, keyfile.account_root_pubkey)),
+  );
+}
+
+test("runPair publishes a root-signed account state vouching for exactly this device (#243)", async () => {
+  const wasm = await loadWasm();
+  const relay = await startFakeRelay({ unpublished: NO_ACCOUNT_STATES });
+  try {
+    await withTempKeyfile(async (keyfilePath) => {
+      const updated = await runPair(
+        wasm,
+        { relayUrl: relay.url, keyfilePath, now: FIXED_NOW },
+        () => {},
+      );
+      const [state] = publishedStatesFor(wasm, relay, updated);
+      assert.equal(state.sequence, 1, "the first state of a fresh account");
+      assert.equal(state.current_root, updated.account_root_pubkey);
+      assert.deepEqual(state.devices, [
+        {
+          device_id: ASSIGNED_DEVICE_ID,
+          encryption_pubkey: updated.device_encryption_pubkey,
+          signing_pubkey: updated.device_signing_pubkey,
+          status: "active",
+        },
+      ]);
+      assert.equal(updated.account_state_highest_sequence, 1, "the device's own floor follows");
+      // The publish came after pairing/complete and carried no device token.
+      const urls = relay.requests.map((r) => `${r.method} ${r.url.split("/").slice(2).join("/")}`);
+      assert.deepEqual(urls.slice(-2), ["GET account-states", "POST account-states"]);
+      assert.equal(relay.requests.at(-1).authorization, undefined);
+    });
+  } finally {
+    await relay.close();
+  }
+});
+
+test("runPair for a second device carries the first device forward at the next sequence (#243)", async () => {
+  const wasm = await loadWasm();
+  const relay = await startFakeRelay({
+    unpublished: NO_ACCOUNT_STATES,
+    deviceIds: ["dev-first", "dev-second"],
+  });
+  try {
+    await withTempKeyfile(async (firstPath) => {
+      const first = await runPair(
+        wasm,
+        { relayUrl: relay.url, keyfilePath: firstPath, now: FIXED_NOW },
+        () => {},
+      );
+      await withTempKeyfile(async (secondPath) => {
+        // A second device under the same account root: same root seed, its own device keys.
+        const { generateKeyfile, writeKeyfile } = await import("../dist/lib/keyfile.js");
+        const fresh = generateKeyfile(wasm);
+        writeKeyfile(secondPath, {
+          ...fresh,
+          account_root_seed: first.account_root_seed,
+          account_root_pubkey: first.account_root_pubkey,
+        });
+        const second = await runPair(
+          wasm,
+          { relayUrl: relay.url, keyfilePath: secondPath, now: FIXED_NOW },
+          () => {},
+        );
+        const [state] = publishedStatesFor(wasm, relay, second);
+        assert.equal(state.sequence, 2);
+        assert.deepEqual(
+          state.devices.map((d) => [d.device_id, d.encryption_pubkey]),
+          [
+            ["dev-first", first.device_encryption_pubkey],
+            ["dev-second", second.device_encryption_pubkey],
+          ],
+        );
+      });
+    });
+  } finally {
+    await relay.close();
+  }
+});
+
+test("runPair fails closed, leaving the keyfile unpaired, when the relay's account state cannot be trusted (#243)", async () => {
+  const wasm = await loadWasm();
+  for (const [name, unpublished] of [
+    ["a document that does not verify", DEFAULT_ACCOUNT_STATES],
+    ["a max_sequence no document backs", { account_states: [], max_sequence: 4 }],
+  ]) {
+    const relay = await startFakeRelay({ unpublished });
+    try {
+      await withTempKeyfile(async (keyfilePath) => {
+        await assert.rejects(
+          () => runPair(wasm, { relayUrl: relay.url, keyfilePath, now: FIXED_NOW }, () => {}),
+          undefined,
+          name,
+        );
+        assert.equal(readKeyfile(keyfilePath).device_id, undefined, `${name}: not paired on disk`);
+        assert.equal(
+          relay.requests.some((r) => r.method === "POST" && r.url.endsWith("/account-states")),
+          false,
+          `${name}: nothing published`,
+        );
+      });
+    } finally {
+      await relay.close();
+    }
   }
 });

@@ -89,6 +89,8 @@ export interface AllwWasm {
     now_ms: number,
     expected_account_id?: string | null,
   ): string;
+  /** Root-sign an `AccountState` JSON as a compact `allw-account-state+jws` document. */
+  sign_account_state(account_state_json: string, account_root_seed_b64: string): string;
   /** Verify a compact account-state JWS and return the authenticated AccountState JSON. */
   verify_account_state(
     account_state_jws: string,

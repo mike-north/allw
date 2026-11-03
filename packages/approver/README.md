@@ -46,8 +46,12 @@ This generates a local keyfile (three software-held seeds + their public keys), 
 **account id** from the account-root public key, obtains a pairing code with a root-signed
 `pairing/start`, registers the device **X25519** encryption key with the relay, mints a **device
 certificate** (the account-root key signs the device signing key, so verifiers need only the
-account-root key), and prints the **account id** and **account-root public key** — what an
-integrator is configured with ([#12](https://github.com/mike-north/allw/issues/12)).
+account-root key), publishes a root-signed **account state** that names this device, and prints the
+**account id** and **account-root public key** — what an integrator is configured with
+([#12](https://github.com/mike-north/allw/issues/12)). Integrators encrypt requests only to devices
+that account state lists (#243), so a device is unreachable until a state naming it is published.
+Pairing a second device carries the existing devices forward at the next sequence; `pair` refuses to
+publish when the relay's account states don't verify or are older than the keyfile has seen.
 
 The account id is self-certifying (`docs/enrollment.md` §Self-Certifying Account Id): it is
 `base64url(SHA-256("allw/account-id/v1" || 0x00 || account_root_pubkey))`, so only the root holder
