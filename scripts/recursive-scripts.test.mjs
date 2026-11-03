@@ -32,6 +32,9 @@ const guardModeFor = (scriptName) => (scriptName === "test" ? "runtime" : "types
  */
 const ALLOWED_COMMANDS = [
   /^tsc -p tsconfig\.json( --noEmit)?$/,
+  // A package's test-source typecheck (the relay's cloudflare:test sources, #282). Type-check only:
+  // `--noEmit` is required, so it never writes output another package could read mid-run.
+  /^tsc -p tsconfig\.test\.json --noEmit$/,
   /^node --test "test\/\*\*\/\*\.test\.mjs"$/,
   /^eslint src$/,
   /^vitest run$/,
@@ -119,6 +122,7 @@ test("the allowlist accepts the real script shapes", () => {
     [`${GUARDS.types} && eslint src`, "types"],
     [`tsc -p tsconfig.json && node --test "test/**/*.test.mjs"`, null],
     ["vitest run", null],
+    ["tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit", null],
   ];
   for (const [script, guard] of ok) {
     assert.deepEqual(validationScriptViolations(script, guard), [], script);
@@ -139,6 +143,7 @@ test("the allowlist rejects every way of building another package", () => {
     "pnpm run build:deps",
     "tsc -p ../sdk/tsconfig.json",
     "tsc -p tsconfig.json; pnpm build",
+    "tsc -p tsconfig.test.json",
   ];
   const node = 'node --test "test/**/*.test.mjs"';
   for (const cmd of rebuilds) {
