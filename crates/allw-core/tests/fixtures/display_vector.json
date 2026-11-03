@@ -210,6 +210,42 @@
       "input": "1\ufe0f\u20e3",
       "escaped": "1\ufe0f\u20e3",
       "has_hidden_or_control_chars": false
+    },
+    {
+      "class": "a Unicode 17.0 combining mark (U+1ACF) is capped like any other",
+      "input": "o\u1acf\u1acf\u1acf",
+      "escaped": "o\u1acf\u1acf⟨U+1ACF⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "an unassigned code point (U+0378, Cn in 17.0.0) counts toward a run of combining marks",
+      "input": "e\u0301\u0301\u0378",
+      "escaped": "e\u0301\u0301⟨U+0378⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "an unassigned code point outside a run of marks is shown",
+      "input": "o\u0378",
+      "escaped": "o\u0378",
+      "has_hidden_or_control_chars": false
+    },
+    {
+      "class": "an ideographic variation selector after a Unicode 17.0 ideograph (CJK Extension J) is shown",
+      "input": "𳑹\udb40\udd00",
+      "escaped": "𳑹\udb40\udd00",
+      "has_hidden_or_control_chars": false
+    },
+    {
+      "class": "accepted false positive: Burmese မြို့ ('city', U+1019 U+103C U+102D U+102F U+1037) has three marks after the spacing medial; the third warns",
+      "input": "မ\u103c\u102d\u102f\u1037",
+      "escaped": "မ\u103c\u102d\u102f⟨U+1037⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "accepted false positive: Tibetan སྐྱེས ('born', U+0F66 U+0F90 U+0FB1 U+0F7A U+0F66), subjoined ka and ya then the vowel e; the vowel warns",
+      "input": "ས\u0f90\u0fb1\u0f7aས",
+      "escaped": "ས\u0f90\u0fb1⟨U+0F7A⟩ས",
+      "has_hidden_or_control_chars": true
     }
   ],
   "display_model_case": {

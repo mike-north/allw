@@ -45,6 +45,35 @@ test("escape_for_display matches every class in the shared vector", async () => 
   }
 });
 
+/** The core's notation for an escaped code point: `⟨U+XXXX⟩`, uppercase hex, at least 4 digits. */
+function codepointNotation(cp) {
+  return `⟨U+${cp.toString(16).toUpperCase().padStart(4, "0")}⟩`;
+}
+
+test("canary: every combining mark in this runtime's Unicode is capped at two in a run", async () => {
+  // The core's mark table is generated from one Unicode version (`UNICODE_VERSION`,
+  // crates/allw-core/src/display/unicode_tables.rs), but approvers render on runtimes whose
+  // Unicode may be newer. For every code point this runtime's ICU calls a nonspacing or
+  // enclosing mark, three of them on one base must show the third escaped. A mark the core's
+  // version doesn't assign still passes, because an unassigned code point counts toward a run;
+  // a failure here means the core shows a known mark uncapped.
+  const wasm = await loadWasm();
+  const mark = /^[\p{Mn}\p{Me}]$/u;
+  let checked = 0;
+  const uncapped = [];
+  for (let cp = 0; cp <= 0x10ffff; cp += 1) {
+    if (cp >= 0xd800 && cp <= 0xdfff) continue;
+    const c = String.fromCodePoint(cp);
+    if (!mark.test(c)) continue;
+    checked += 1;
+    if (!wasm.escape_for_display(`o${c}${c}${c}`).endsWith(codepointNotation(cp))) {
+      uncapped.push(codepointNotation(cp));
+    }
+  }
+  assert.ok(checked > 2000, `the runtime's ICU knows ${String(checked)} marks`);
+  assert.deepEqual(uncapped, [], "a third stacked mark is shown raw");
+});
+
 test("display_model matches the shared vector's full model case", async () => {
   const wasm = await loadWasm();
   const { display_model_case: dm } = loadVector();
