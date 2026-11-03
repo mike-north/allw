@@ -53,16 +53,23 @@ naming the file path and the env vars.
 Pair an approver device first (e.g. with [`@allw/approver`](../approver)) to obtain the account id and
 the account-root public key.
 
-Wire the hook into your project's (or user's) `.claude/settings.json` as a `PreToolUse` hook. The
-matcher selects which tools `allw` gates — `Bash` for shell commands, `Edit`/`Write`/`MultiEdit`
-for direct file edits, and `mcp__.*` for any MCP tool call:
+Wire the hook into your user-level `~/.claude/settings.json` (or a project's `.claude/settings.json`
+for a demo) as a `PreToolUse` hook. Install it outside any tree the agent works in, so the agent
+can't edit the gate: see
+[Install the hook where the agent can't write it](../../docs/claude-code-integration.md#install-the-hook-where-the-agent-cant-write-it).
+The matcher `^(Bash|Edit|MultiEdit|Write)$|^mcp__` is a regular expression anchored to whole tool
+names: it sends exactly `Bash` (shell commands), `Edit`/`MultiEdit`/`Write` (direct file edits) and
+every `mcp__…` tool to `allw`, and nothing else (not `NotebookEdit`). The `deny` rules turn off
+`Monitor`, `PowerShell` and `NotebookEdit`, which run shell commands or edit files without passing
+through `allw` ([#298](https://github.com/mike-north/allw/issues/298)). `Monitor` also follows your
+`Bash` permission rules, so a `Bash` allow rule would run it with no prompt at all:
 
 ```json
 {
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|Edit|MultiEdit|Write|mcp__.*",
+        "matcher": "^(Bash|Edit|MultiEdit|Write)$|^mcp__",
         "hooks": [
           {
             "type": "command",
@@ -73,6 +80,9 @@ for direct file edits, and `mcp__.*` for any MCP tool call:
         ]
       }
     ]
+  },
+  "permissions": {
+    "deny": ["Monitor", "PowerShell", "NotebookEdit"]
   }
 }
 ```
@@ -98,8 +108,8 @@ for direct file edits, and `mcp__.*` for any MCP tool call:
 
 ### The timeout-ordering invariant (issue #52)
 
-`allw` is fail-closed only because the hook **always emits an explicit `allow`/`deny` (exit 0)
-before any external timeout fires.** This must never depend on what Claude Code does when a hook
+`allw` is fail-closed only because the hook **always reaches its decision (exit 0) before any
+external timeout fires.** This must never depend on what Claude Code does when a hook
 fails to emit a decision, because that behavior is fail-**open** and partly undocumented:
 
 - Claude Code's command-hook `timeout` defaults to **600 seconds**.
@@ -152,21 +162,33 @@ The hook implements the Claude Code PreToolUse wire contract verbatim.
 }
 ```
 
-**stdout** (the permission decision; the hook exits 0):
+**stdout** (the hook always exits 0): **empty** when allw has no objection, or one `deny`:
 
 ```jsonc
 {
   "hookSpecificOutput": {
     "hookEventName": "PreToolUse",
-    "permissionDecision": "allow", // or "deny"
+    "permissionDecision": "deny", // the only decision allw ever emits
     "permissionDecisionReason": "allw: …",
   },
 }
 ```
 
-`allw` only ever emits `allow` (a verified human approval, or a non-gated pass-through) or `deny`
-(everything else). It never emits `ask`. The hook always exits `0` with a parseable decision — it
-speaks in decisions, not error codes.
+**allw only adds a gate; it never grants.** A verified human approval, a non-gated tool and a
+pass-through all get **no decision** (empty stdout), so Claude Code goes on to apply your own
+permission rules exactly as without allw. allw never emits `allow`, because in Claude Code an `allow`
+skips the permission prompt: an approval (or a matcher widened to tools allw never asks about) would
+then grant access your own rules would have asked about. It never emits `ask` either. Approved calls
+can therefore still get Claude Code's own prompt at the desk; to make the phone the only prompt, see
+[After an approval](../../docs/claude-code-integration.md#after-an-approval-claude-codes-own-permissions-still-apply).
+
+Because empty stdout means "no objection", the hook also has an **exit backstop**: if the process
+reaches exit before it has decided (for example, the event loop drained while an approval was
+pending, an uncaught exception, or a stray `process.exit`), or receives `SIGTERM`, `SIGINT` or
+`SIGHUP` while waiting, it prints one `deny` and exits 0 instead of exiting with nothing (or exits
+1 if the deny can't be written, so it never reads as "no objection"). A
+`SIGKILL`, a native crash or Claude Code's own timeout can't be answered from inside the process;
+`"onFailure": "block"` makes Claude Code block the call in those cases.
 
 ## What is gated (v0)
 
@@ -177,31 +199,36 @@ effects:
 - **`Edit` / `Write` / `MultiEdit`** — direct file edits (`tool_input.file_path` plus edit
   payload).
 - **`mcp__<server>__<tool>`** — any MCP tool call (`tool_input` is the raw params object).
-- **everything else** (`Read`, `Glob`, `Grep`, `WebFetch`, …) — **not gated**; it passes through as
-  `allow` without bothering the human (and without needing any `allw` config).
+- **everything else** (`Read`, `Glob`, `Grep`, `WebFetch`, …) — **not gated**; allw makes no
+  decision for it, without bothering the human (and without needing any `allw` config).
+- **Not gated yet, so the install block turns them off:** `Monitor` and `PowerShell` (both run shell
+  commands; `Monitor` follows your `Bash` permission rules) and `NotebookEdit` (edits notebook
+  files). Gating them is [#298](https://github.com/mike-north/allw/issues/298).
 
-Widening the matcher later is an additive change.
+Widening the matcher only ever adds gating: a tool allw doesn't gate gets no decision, never an
+`allow`.
 
 ## Fail-closed (contract §Invariants #6)
 
-The primitive never returns a bare "allow"; the hook composes it. Every uncertain path blocks:
+The primitive never returns a bare "allow", and neither does the hook. Every uncertain path blocks:
 
-| Situation                                                    | Decision               |
-| ------------------------------------------------------------ | ---------------------- |
-| Not a gated tool                                             | `allow` (pass-through) |
-| Gated, verified verdict `decision === "approved"`            | `allow`                |
-| Gated, verified human `denied` / `expired` / `aborted`       | `deny`                 |
-| Gated, request timed out (no response by the deadline)       | `deny`                 |
-| Gated, the `ActionRecord` could not be built                 | `deny`                 |
-| Gated, the approval request threw (network/relay/no devices) | `deny`                 |
-| Malformed hook stdin (not JSON, wrong event, …)              | `deny`                 |
-| Missing/invalid configuration (file and env)                 | `deny`                 |
-| Any unexpected internal error                                | `deny`                 |
+| Situation                                                    | Decision            |
+| ------------------------------------------------------------ | ------------------- |
+| Not a gated tool                                             | none (empty stdout) |
+| Gated, verified verdict `decision === "approved"`            | none (empty stdout) |
+| Gated, verified human `denied` / `expired` / `aborted`       | `deny`              |
+| Gated, request timed out (no response by the deadline)       | `deny`              |
+| Gated, the `ActionRecord` could not be built                 | `deny`              |
+| Gated, the approval request threw (network/relay/no devices) | `deny`              |
+| Malformed hook stdin (not JSON, wrong event, …)              | `deny`              |
+| Missing/invalid configuration (file and env)                 | `deny`              |
+| Any unexpected internal error                                | `deny`              |
+| The process reached exit before deciding (exit backstop)     | `deny`              |
 
-A verdict is `allow` **only** when it is delivered, cryptographically verified against the approver's
-account-root key, bound to this exact request (WYSIWYS), fresh, and a human "yes". The verification
-itself lives in the audited core; the hook just maps the verified result onto the Claude Code
-decision.
+A gated call escapes allw's `deny` **only** when its verdict is delivered, cryptographically verified
+against the approver's account-root key, bound to this exact request (WYSIWYS), fresh, and a human
+"yes". The verification itself lives in the audited core; the hook just maps the verified result
+onto the Claude Code decision.
 
 ## Development
 

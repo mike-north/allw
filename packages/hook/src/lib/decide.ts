@@ -1,25 +1,28 @@
 /**
  * The hook's decision core: turn a parsed PreToolUse input into a permission decision by routing a
- * gated tool call through a human approval and mapping the **verified** verdict to allow/deny.
+ * gated tool call through a human approval and mapping the **verified** verdict to "no decision" or
+ * deny.
  *
  * This module is deliberately I/O-free and dependency-injected — the WASM core, the approval
  * function, and a clock are all passed in — so the full decision matrix is unit-testable without
  * touching stdin/stdout, the network, or the real SDK. `runHook` in `../cli.ts` wires the real
  * `@allw/sdk` client into it.
  *
- * # Fail-closed mapping (contract §Invariants #6)
- * The primitive never returns a bare "allow"; the hook composes it:
+ * # Fail-closed, deny-only mapping (contract §Invariants)
+ * A verdict may only tighten access, so the hook never emits `allow` (see `./hook-io.ts`):
  *
- * | Outcome                                            | Decision |
- * | -------------------------------------------------- | -------- |
- * | not a gated tool                                   | `allow` (pass-through; the human isn't bothered) |
- * | gated, `ActionRecord` build error                  | `deny`   |
- * | gated, verdict `decision === "approved"`           | `allow`  |
- * | gated, verdict `denied` / `expired` / `aborted`    | `deny`   |
- * | gated, `requestApproval` threw (network/config/…)  | `deny`   |
+ * | Outcome                                            | Decision                       |
+ * | -------------------------------------------------- | ------------------------------ |
+ * | not a gated tool (`pass-through`)                  | none (empty stdout)            |
+ * | gated, `ActionRecord` build error                  | `deny`                         |
+ * | gated, verdict `decision === "approved"`           | none (empty stdout)            |
+ * | gated, verdict `denied` / `expired` / `aborted`    | `deny`                         |
+ * | gated, `requestApproval` threw (network/config/…)  | `deny`                         |
  *
- * Only a verdict whose `decision` is exactly `approved` (which the SDK resolves **only** for a
- * fully-verified, bound, fresh, human-approved verdict) becomes `allow`. Every other path denies.
+ * "None" hands the call back to Claude Code's own permission rules. Only a verdict whose `decision`
+ * is exactly `approved` (which the SDK resolves **only** for a fully-verified, bound, fresh,
+ * human-approved verdict) gets there; every other gated path denies. (`../cli.ts` also returns no
+ * decision for a non-gated tool before reading config, so `decide` normally sees gated tools only.)
  *
  * @see ../../../../docs/contract.md §Invariants #6 (fail-closed), §Lifecycle
  * @see ../../../sdk/src/index.ts (requestApproval is itself fail-closed: approved ⇒ verified)
@@ -27,7 +30,12 @@
 
 import type { HookWasm } from "./wasm.js";
 import { gateToolCall } from "./gating.js";
-import { allowOutput, denyOutput, type PreToolUseInput, type PreToolUseOutput } from "./hook-io.js";
+import {
+  denyOutput,
+  noDecisionOutput,
+  type ClaudeHookResult,
+  type PreToolUseInput,
+} from "./hook-io.js";
 import type { HookConfig } from "./config.js";
 
 /**
@@ -166,9 +174,9 @@ function buildApprovalRequest(
 /**
  * Decide a single PreToolUse call.
  *
- * Non-gated calls pass through as `allow` without contacting the relay. Gated calls build an
+ * Pass-through calls get no decision without contacting the relay. Gated calls build an
  * `ActionRecord` (via the WASM core), request a human approval (via the injected SDK), and map the
- * **verified** verdict to allow/deny. Every error path — build failure, a thrown
+ * **verified** verdict: approved ⇒ no decision (Claude Code's own rules apply), anything else ⇒ deny. Every error path — build failure, a thrown
  * `requestApproval`, a non-`approved` verdict — denies (fail-closed).
  *
  * @param hostname the local machine name for the actor identity (`machine:<hostname>`).
@@ -177,11 +185,11 @@ export async function decide(
   input: PreToolUseInput,
   deps: DecideDeps,
   hostname: string,
-): Promise<PreToolUseOutput> {
+): Promise<ClaudeHookResult> {
   const gate = gateToolCall(deps.wasm, input.toolName, input.toolInput, input.cwd);
 
   if (gate.kind === "pass-through") {
-    return allowOutput(gate.reason);
+    return noDecisionOutput();
   }
   if (gate.kind === "build-error") {
     return denyOutput(gate.reason);
@@ -205,7 +213,9 @@ export async function decide(
   }
 
   if (verdict.decision === "approved") {
-    return allowOutput(`allw: ${gate.summary} — approved by the human`);
+    // A verified human "yes" removes allw's objection; it does not grant. Claude Code still applies
+    // the user's own permission rules to the call.
+    return noDecisionOutput();
   }
   // denied / expired / aborted ⇒ deny (a verified human "no", a timeout, or a device abort).
   return denyOutput(`allw: ${gate.summary} — not approved (verdict: ${verdict.decision})`);

@@ -5,6 +5,10 @@
  * Reads a Codex pending tool call from stdin, routes gated Bash/MCP actions through allw, and
  * prints a Codex `hookSpecificOutput` decision. Unexpected failures still emit a parseable `deny`
  * and exit 0 so Codex receives an explicit blocking decision instead of a hook error.
+ *
+ * Output goes through `@allw/hook`'s deny-only writer, shared with the Claude Code hook: empty stdout
+ * means "allw does not block this call", and a premature exit (the process reaching
+ * `beforeExit`/`exit` before `main()` decides) prints a `deny` instead of reading as consent (#265).
  */
 
 import { hostname as osHostname } from "node:os";
@@ -12,7 +16,7 @@ import { appendFileSync, realpathSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { createClient, type ClientConfig } from "@allw/sdk";
-import { isGatedTool, loadWasm, readConfig } from "@allw/hook";
+import { installDecisionBackstop, isGatedTool, loadWasm, readConfig } from "@allw/hook";
 
 import { decide, type RequestApprovalFn } from "./lib/decide.js";
 import {
@@ -20,6 +24,7 @@ import {
   noBlockOutput,
   parseCodexHookInput,
   type CodexHookResult,
+  type CodexPreToolUseOutput,
 } from "./lib/codex-io.js";
 import { getVersion } from "./version.js";
 
@@ -46,15 +51,11 @@ async function readStdin(): Promise<string> {
 }
 
 /**
- * Emit the Codex decision. `null` ("allw does not block this call") means writing nothing at all:
- * Codex's documented `PreToolUse` contract treats exit 0 with no output as a clean success, and a
- * bare `permissionDecision: "allow"` is an unsupported decision on the current release (see
- * `lib/codex-io.ts` module doc comment). A non-null decision is always an explicit `deny`.
+ * The deny the exit backstop prints when the process reaches exit without a finalized decision
+ * (#265). Codex reads empty stdout + exit 0 as "no objection", so a premature exit must deny.
  */
-function emit(output: CodexHookResult): void {
-  if (output === null) return;
-  process.stdout.write(`${JSON.stringify(output)}\n`);
-}
+export const BACKSTOP_DENY_REASON =
+  "allw: Codex hook exited before reaching a decision (fail-closed deny)";
 
 /**
  * Append a single deny log line to `.codex/allw-hook.log` in the given directory.
@@ -128,11 +129,18 @@ function handleDiagnosticFlags(argv: readonly string[]): boolean {
   return false;
 }
 
-/** Process entrypoint: always emit an explicit decision and exit 0. */
+/** Process entrypoint: write the decision (nothing, or a `deny`) and exit 0. */
 async function main(): Promise<void> {
   if (handleDiagnosticFlags(process.argv.slice(2))) {
     process.exit(0);
   }
+
+  // From here on, any exit without a finalized decision prints a deny (#265). Decisions are written
+  // by `@allw/hook`'s shared deny-only writer: `null` ("allw does not block this call") writes
+  // nothing — Codex's documented clean-success path — and a non-null decision is always a `deny`.
+  const decision = installDecisionBackstop<CodexPreToolUseOutput>(() =>
+    denyOutput(BACKSTOP_DENY_REASON, "premature-exit"),
+  );
 
   let output: CodexHookResult;
   try {
@@ -147,7 +155,8 @@ async function main(): Promise<void> {
   }
 
   // Append a deny line to the project log so operators can audit without parsing stdout. `output`
-  // is non-null only for an explicit `deny` (see `emit`); approvals/pass-throughs log nothing.
+  // is non-null only for an explicit `deny`; approvals and pass-throughs write nothing and log
+  // nothing.
   if (output !== null) {
     appendDenyLog(
       process.cwd(),
@@ -156,7 +165,7 @@ async function main(): Promise<void> {
     );
   }
 
-  emit(output);
+  decision.finalize(output);
   process.exit(0);
 }
 

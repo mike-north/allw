@@ -6,12 +6,15 @@
  * asserted verbatim against the verified contract.
  *
  * @see https://code.claude.com/docs/en/hooks (PreToolUse JSON schema)
+ * @see https://github.com/mike-north/allw/issues/247 (deny-only output)
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { allowOutput, denyOutput, makeOutput, parseHookInput } from "../dist/lib/hook-io.js";
+import * as hookIo from "../dist/lib/hook-io.js";
+
+const { denyOutput, noDecisionOutput, parseHookInput } = hookIo;
 
 test("parses a well-formed Bash PreToolUse input", () => {
   const raw = JSON.stringify({
@@ -81,20 +84,21 @@ test("empty-string tool_name → not ok", () => {
 
 // ── output builders ───────────────────────────────────────────────────────────────────────────
 
-test("makeOutput/allowOutput/denyOutput produce the exact hookSpecificOutput shape", () => {
-  const allow = allowOutput("ok");
-  assert.deepEqual(allow, {
+test("denyOutput produces the exact hookSpecificOutput deny shape", () => {
+  assert.deepEqual(denyOutput("nope"), {
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
-      permissionDecision: "allow",
-      permissionDecisionReason: "ok",
+      permissionDecision: "deny",
+      permissionDecisionReason: "nope",
     },
   });
+});
 
-  const deny = denyOutput("nope");
-  assert.equal(deny.hookSpecificOutput.permissionDecision, "deny");
-  assert.equal(deny.hookSpecificOutput.permissionDecisionReason, "nope");
+test("noDecisionOutput is null (empty stdout), never a wire allow (#247)", () => {
+  assert.equal(noDecisionOutput(), null);
+});
 
-  const ask = makeOutput("ask", "why");
-  assert.equal(ask.hookSpecificOutput.permissionDecision, "ask");
+test("hook-io exposes no allow-producing builder (#247: deny is the only decision allw emits)", () => {
+  assert.equal(hookIo.allowOutput, undefined);
+  assert.equal(hookIo.makeOutput, undefined);
 });

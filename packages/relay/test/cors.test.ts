@@ -55,7 +55,7 @@ describe("CORS preflight", () => {
 
     expect(resp.status).toBe(204);
     expect(resp.headers.get("Access-Control-Allow-Origin")).toBe(HOSTED_APPROVER);
-    expect(resp.headers.get("Access-Control-Allow-Methods")).toBe("GET, POST");
+    expect(resp.headers.get("Access-Control-Allow-Methods")).toBe("GET, POST, PUT");
     expect(resp.headers.get("Access-Control-Allow-Headers")).toBe("Authorization, Content-Type");
     expect(resp.headers.get("Access-Control-Max-Age")).toBe("600");
     expect(resp.headers.get("Vary")).toBe("Origin");
@@ -94,7 +94,7 @@ describe("CORS preflight", () => {
     expect(resp.headers.get("Vary")).toBe("Origin");
   });
 
-  it.each(["DELETE", "PUT", "PATCH"])(
+  it.each(["DELETE", "PATCH"])(
     "rejects a preflight for a method the relay does not route (%s)",
     async (method) => {
       const resp = await preflight(HOSTED_APPROVER, method);
@@ -177,6 +177,53 @@ function browserPreflightFailure(
 }
 
 describe("CORS — browser-shaped flow from the hosted web approver", () => {
+  it("passes Chrome's preflight + CORS check for a JSON PUT of the device's push tokens", async () => {
+    const acct = testAccount("acct-cors-browser-push-tokens");
+    const start = (await (
+      await SELF.fetch(url(acct, "/pairing/start"), {
+        method: "POST",
+        body: JSON.stringify(pairingStartBody(acct)),
+      })
+    ).json()) as { code: string; pairing_auth_token: string };
+    const device = (await (
+      await SELF.fetch(url(acct, "/pairing/complete"), {
+        method: "POST",
+        headers: { Authorization: `Bearer ${start.pairing_auth_token}` },
+        body: JSON.stringify({ code: start.code, pubkey: DEVICE_PUBKEY }),
+      })
+    ).json()) as { device_id: string; device_auth_token: string };
+    const pushTokens = url(acct, `/devices/${device.device_id}/push-tokens`);
+    const subscription = "https://fcm.googleapis.com/fcm/send/c3Vic2NyaXB0aW9uLWE";
+
+    // 1. Chrome's preflight for `fetch(url, { method: "PUT", headers: { Authorization,
+    //    "Content-Type": "application/json" } })`: a non-simple method plus non-safelisted headers.
+    const pre = await SELF.fetch(pushTokens, {
+      method: "OPTIONS",
+      headers: chromePreflightHeaders("PUT", "authorization,content-type"),
+    });
+    expect(browserPreflightFailure(pre, "PUT", ["authorization", "content-type"])).toBeNull();
+
+    // 2. The actual request, as Chrome sends it after a passing preflight.
+    const actual = await SELF.fetch(pushTokens, {
+      method: "PUT",
+      headers: {
+        Accept: "*/*",
+        Authorization: `Bearer ${device.device_auth_token}`,
+        "Content-Type": "application/json",
+        Origin: HOSTED_APPROVER,
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "cross-site",
+      },
+      body: JSON.stringify({ push_tokens: [{ transport: "webpush", token: subscription }] }),
+    });
+    expect(actual.status).toBe(200);
+    // Fetch §4.9 CORS check: ACAO must equal the request origin for the page to read the body.
+    expect(actual.headers.get("Access-Control-Allow-Origin")).toBe(HOSTED_APPROVER);
+    expect(await actual.json()).toEqual({
+      push_tokens: [{ transport: "webpush", token: subscription }],
+    });
+  });
+
   it("passes Chrome's preflight + CORS check for the authenticated inbox poll", async () => {
     const acct = testAccount("acct-cors-browser-inbox");
     const start = (await (
