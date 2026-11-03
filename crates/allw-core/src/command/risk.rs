@@ -92,9 +92,9 @@
 //! Each alternate reading runs only when the line holds the syntax it is about, at every nesting
 //! level (a nested `dash -c` string gets dash's reading), charged to the shared budget. An
 //! alternate reading's substitutions keep the open-quote floor, with one exception: a
-//! substitution the bash 3.2 reading never closes runs to the end of the input, and bash 3.2
-//! stops at its open quote with nothing later to run, so that open quote alone doesn't raise the
-//! tier. zsh-only syntax gets fail-upward handling only: its precommand words, and `&!` / `&|`
+//! substitution the bash 3.2 reading never closes runs to the end of the input (or of the
+//! heredoc body holding it), and bash 3.2 stops at its open quote with nothing later in it to
+//! run, so that open quote alone doesn't raise the tier. zsh-only syntax gets fail-upward handling only: its precommand words, and `&!` / `&|`
 //! as operators.
 //!
 //! # Bounds (all fail upward)
@@ -671,8 +671,10 @@ enum Source {
     /// commit and PR bodies (`it's`, `don't`) at the tier of the command that consumes them.
     HeredocBody,
     /// A substitution that the bash 3.2 reading (`heredocs_in_substitutions` off) never closes,
-    /// so it runs to the end of the input. bash 3.2 stops at the open quote and has no later
-    /// command to run, and the bash reading applies its own floors. (bash 3.2 reads
+    /// so it runs to the end of the input, or, inside an unquoted heredoc body, to the end of
+    /// that body. bash 3.2 stops at the open quote: on the command line it has no later command
+    /// to run, and in a heredoc body the error stops only the command reading the body, while
+    /// later lines are classified by the enclosing line. The bash reading applies its own floors. (bash 3.2 reads
     /// `"$(cat <<'EOF'`⏎`it's`⏎`EOF`⏎`)"` as an unterminated quote and runs nothing.) A
     /// substitution any other alternate delimits, or one bash 3.2 closes, is a
     /// [`Source::CommandLine`].

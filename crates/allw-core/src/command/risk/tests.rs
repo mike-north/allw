@@ -1223,6 +1223,27 @@ fn a_paren_in_a_comment_does_not_close_a_substitution() {
     );
 }
 
+/// The word-start test for a comment looks only at the byte before the `#`, so a `#` after an
+/// escaped blank (`a\ #`) or right after a nested substitution's `)` (`$(true)#x`) is read as a
+/// comment, though bash reads it mid-word. That can only stretch the substitution, never shorten
+/// it: the stretched body is still classified, or the line ends unterminated. No shell runs the
+/// `dd` in these lines, so `Critical` and `High` here pin the fail-upward direction. The bash and
+/// bash 3.2 readings share the rule, so it can't reach the open-quote exemption.
+#[test]
+fn a_hash_after_an_escape_or_a_nested_paren_fails_upward() {
+    assert_all(
+        &[
+            &format!("echo \"$(echo a\\ # )\n{DD}\n)\""),
+            &format!("echo \"$(echo $(true)#x )\n{DD}\n)\""),
+        ],
+        Risk::Critical,
+    );
+    assert_all(
+        &["echo \"$(echo a\\ # )\"", "echo \"$(echo $(true)#x )\""],
+        Risk::High,
+    );
+}
+
 /// Decision (R4, option A): a substitution an alternate reading delimits gets no open-quote floor
 /// only in the bash 3.2 reading (`heredocs_in_substitutions` off), and only when the substitution
 /// never closes there, so it runs to the end of the input and bash 3.2 has nothing later to run.

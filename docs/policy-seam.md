@@ -256,8 +256,8 @@ a program it runs.
     These alternate readings run at every nesting level, so a nested `sh -c` string also gets dash's reading
     (`sh` is dash on Debian and Ubuntu). They are charged to the shared budget, which bounds their cost. An
     alternate reading's substitutions keep the open-quote floor, with one exception: a substitution the bash 3.2
-    reading never closes runs to the end of the input, and bash 3.2 stops at its open quote with nothing later to
-    run, so that open quote alone doesn't raise the tier. This keeps the commit and PR bodies above at `medium`.
+    reading never closes runs to the end of the input (or of the heredoc body holding it), and bash 3.2 stops at
+    its open quote with nothing later in it to run, so that open quote alone doesn't raise the tier. This keeps the commit and PR bodies above at `medium`.
 
 - **Bounds.** Each bound fails upward to `high`:
   - nesting of `-c`, `eval` and substitutions past 4 levels;
