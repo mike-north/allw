@@ -363,6 +363,9 @@ test("gateToolCall(NotebookEdit replace/delete) without a cell_id → build-erro
     { notebook_path: "/repo/n.ipynb", new_source: "x", edit_mode: "replace" },
     { notebook_path: "/repo/n.ipynb", edit_mode: "delete" },
     { notebook_path: "/repo/n.ipynb", edit_mode: "delete", cell_id: null },
+    // Regression (#316 review R2-4): an empty cell_id names no cell either.
+    { notebook_path: "/repo/n.ipynb", new_source: "x", cell_id: "" },
+    { notebook_path: "/repo/n.ipynb", edit_mode: "delete", cell_id: "" },
   ]) {
     assert.equal(
       gateToolCall(wasm, "NotebookEdit", input, "/repo").kind,
@@ -395,6 +398,8 @@ test("gateToolCall(NotebookEdit insert) says where the cell goes (#316 S2)", asy
   assert.doesNotMatch(after.summary, /\(cell c1, insert\)/, "never reads as 'at cell c1'");
   const start = gateToolCall(wasm, "NotebookEdit", { ...base, edit_mode: "insert" });
   assert.match(start.summary, /insert at start/);
+  const emptyId = gateToolCall(wasm, "NotebookEdit", { ...base, edit_mode: "insert", cell_id: "" });
+  assert.match(emptyId.summary, /insert at start/, "an empty cell_id never reads 'after cell '");
   const replace = gateToolCall(wasm, "NotebookEdit", { ...base, cell_id: "c1" });
   assert.match(replace.summary, /replace cell c1/);
 });

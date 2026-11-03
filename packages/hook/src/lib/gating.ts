@@ -306,16 +306,18 @@ function reduceNotebookEdit(toolInput: unknown): FileEditReduction {
   if (newSource === undefined || (newSource === null && mode !== "delete")) {
     return { error: "NotebookEdit tool_input missing a string 'new_source'" };
   }
-  if (cellId === null && mode !== "insert") {
+  // An empty `cell_id` names no cell, so it counts as absent; the hash still binds the value sent.
+  const namedCell = cellId === null || cellId === "" ? null : cellId;
+  if (namedCell === null && mode !== "insert") {
     return { error: `NotebookEdit '${mode}' needs a string 'cell_id' naming the cell` };
   }
   const paths = [notebookPath];
   const target =
     mode === "insert"
-      ? cellId === null
+      ? namedCell === null
         ? "insert at start"
-        : `insert after cell ${cellId}`
-      : `${mode} cell ${cellId ?? ""}`;
+        : `insert after cell ${namedCell}`
+      : `${mode} cell ${namedCell ?? ""}`;
   return {
     operation: "notebook_edit",
     paths,

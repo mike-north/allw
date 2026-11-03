@@ -201,7 +201,8 @@ effects:
 - **`Edit` / `Write` / `MultiEdit`** — direct file edits (`tool_input.file_path` plus edit
   payload).
 - **`NotebookEdit`** — a notebook cell edit (`tool_input.notebook_path` plus the cell change). An
-  edit that doesn't name its cell, or carries a key the hook doesn't know, is denied.
+  edit is denied when it is a `replace` or `delete` that doesn't name its cell, or carries a key the
+  hook doesn't know.
 - **`mcp__<server>__<tool>`** — any MCP tool call (`tool_input` is the raw params object).
 - **everything else** (`Read`, `Glob`, `Grep`, `WebFetch`, …) — **not gated**; allw makes no
   decision for it, without bothering the human (and without needing any `allw` config).
