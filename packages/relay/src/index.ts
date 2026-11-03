@@ -634,8 +634,9 @@ export class AccountRelay implements DurableObject {
    * (submit, delivery, expiry, retract, verdict acceptance), the alarm clamp, push-wakeup
    * scheduling and the Web Push TTL, and the pairing, actor, account-state and push-token
    * timestamps. Tests replace it on the instance (via `runInDurableObject`) to probe exact
-   * boundaries; production always reads the real time. It is the only `Date.now()` in the relay's
-   * Durable Object code.
+   * boundaries; production always reads the real time. The relay's other clocks, in the alarm
+   * multiplexer and the Web Push transport, are handed this one; their `Date.now` defaults are only
+   * for standalone use. A guard test (`request-deadline.test.ts`) holds every relay source to that.
    */
   private now: () => number = () => Date.now();
   /**

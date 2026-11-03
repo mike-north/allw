@@ -17,8 +17,6 @@ import { describe, expect, it } from "vitest";
 import type { SqlStorage } from "@cloudflare/workers-types";
 import type { AccountRelay } from "../src/index.js";
 import { DEADLINE_SQL, deadlineOf } from "../src/request-deadline.js";
-import alarmsSource from "../src/alarms.ts?raw";
-import indexSource from "../src/index.ts?raw";
 import { testAccount } from "./support/accounts.js";
 
 /** A fixed relay receipt time (2023-11-14Z). */
@@ -80,22 +78,37 @@ describe("DEADLINE_SQL", () => {
 });
 
 describe("the relay's one clock", () => {
-  /** Lines that call `Date.now()` outside comments. */
+  /** Every relay source file's text, by path (`../src/<file>.ts`). New files are covered too. */
+  const SOURCES = import.meta.glob("../src/*.ts", {
+    query: "?raw",
+    import: "default",
+    eager: true,
+  });
+
+  /** Lines that read the real time (`Date.now`, called or not, or `new Date()`) outside comments. */
   function clockReads(source: string): string[] {
     return source
       .split("\n")
       .map((line) => line.trim())
       .filter((line) => !line.startsWith("*") && !line.startsWith("//") && !line.startsWith("/*"))
-      .filter((line) => line.includes("Date.now()"));
+      .filter((line) => line.includes("Date.now") || line.includes("new Date()"));
   }
 
-  it("AccountRelay reads the real time only as its injectable clock's default", () => {
-    expect(clockReads(indexSource)).toEqual(["private now: () => number = () => Date.now();"]);
-  });
-
-  it("AlarmMultiplexer reads the real time only as its clock parameter's default", () => {
-    expect(clockReads(alarmsSource)).toEqual([
-      "constructor(storage: DurableObjectStorage, now: () => number = () => Date.now()) {",
-    ]);
+  it("reads the real time only as the default of an injectable clock", () => {
+    expect(Object.keys(SOURCES)).toContain("../src/index.ts");
+    const reads = Object.fromEntries(
+      Object.entries(SOURCES)
+        .map(([path, source]) => [path, clockReads(source)] as const)
+        .filter(([, lines]) => lines.length > 0),
+    );
+    // AccountRelay's clock is the one production reads. It hands itself to the other two: the
+    // alarm multiplexer and the Web Push transport (via `buildPushTransports`).
+    expect(reads).toEqual({
+      "../src/index.ts": ["private now: () => number = () => Date.now();"],
+      "../src/alarms.ts": [
+        "constructor(storage: DurableObjectStorage, now: () => number = () => Date.now()) {",
+      ],
+      "../src/web-push.ts": ["this.now = options.now ?? Date.now;"],
+    });
   });
 });
