@@ -429,6 +429,62 @@ function reduceFileEdit(toolName: string, toolInput: unknown): FileEditReduction
 }
 
 /**
+ * A POSIX shell command call (`Bash`, or `Monitor` with a `command`), read from its `tool_input`
+ * but not yet built into a record:
+ * - `command`: the command line to record, and the one-line `summary` the human is shown.
+ * - `pass-through`: a `Monitor` WebSocket watch, which runs no command.
+ * - `build-error`: the `tool_input` has the wrong shape; deny (`reason` is a constant).
+ *
+ * The Claude Code hook builds the request for a `command` through `@allw/sdk`'s `commandRequest`
+ * (#269); {@link gateToolCall} builds it through the core directly, for the codex-hook.
+ */
+export type PosixCommandCall =
+  | { readonly kind: "command"; readonly command: string; readonly summary: string }
+  | { readonly kind: "pass-through"; readonly reason: string }
+  | { readonly kind: "build-error"; readonly reason: string };
+
+/**
+ * Read a POSIX shell command call (`Bash`, or `Monitor`'s `command`) from its `tool_input`.
+ * Returns `null` for any other tool. This only reads the input; the record is built by the caller.
+ */
+export function posixCommandCall(toolName: string, toolInput: unknown): PosixCommandCall | null {
+  if (toolName === BASH_TOOL_NAME) {
+    const command = readBashCommand(toolInput);
+    if (command === null) {
+      return {
+        kind: "build-error",
+        reason: "allw: Bash tool_input missing a string 'command' (fail-closed deny)",
+      };
+    }
+    return { kind: "command", command, summary: oneLine(`Run command: ${command}`) };
+  }
+
+  if (toolName === MONITOR_TOOL_NAME) {
+    const request = readMonitorRequest(toolInput);
+    if (request.kind === "ws") {
+      // A WebSocket watch runs no command: it is a read-only network subscription, and allw does
+      // not gate raw egress (docs/policy-seam.md). Claude Code's own WebSocket prompt still applies.
+      return { kind: "pass-through", reason: "allw: Monitor WebSocket watch runs no command" };
+    }
+    if (request.kind === "malformed") {
+      return {
+        kind: "build-error",
+        reason:
+          "allw: Monitor tool_input must have either a string 'command' or a 'ws' object with a " +
+          "string 'url' (fail-closed deny)",
+      };
+    }
+    return {
+      kind: "command",
+      command: request.command,
+      summary: oneLine(`Run command (Monitor): ${request.command}`),
+    };
+  }
+
+  return null;
+}
+
+/**
  * Build a `command` record for a POSIX shell command (Bash, or Monitor's `command`) through the core.
  * A core error (invalid shell syntax) is a `build-error`, so the caller denies.
  */
@@ -444,7 +500,7 @@ function gatePosixCommand(
       cwd === undefined
         ? wasm.action_from_command(command)
         : wasm.action_from_command(command, cwd);
-    return { kind: "gated", actionRecord, summary: oneLine(summary) };
+    return { kind: "gated", actionRecord, summary };
   } catch (err) {
     return {
       kind: "build-error",
@@ -469,38 +525,11 @@ export function gateToolCall(
   toolInput: unknown,
   cwd: string | undefined,
 ): GateOutcome {
-  if (toolName === BASH_TOOL_NAME) {
-    const command = readBashCommand(toolInput);
-    if (command === null) {
-      return {
-        kind: "build-error",
-        reason: "allw: Bash tool_input missing a string 'command' (fail-closed deny)",
-      };
-    }
-    return gatePosixCommand(wasm, command, cwd, `Run command: ${command}`);
-  }
-
-  if (toolName === MONITOR_TOOL_NAME) {
-    const request = readMonitorRequest(toolInput);
-    if (request.kind === "ws") {
-      // A WebSocket watch runs no command: it is a read-only network subscription, and allw does
-      // not gate raw egress (docs/policy-seam.md). Claude Code's own WebSocket prompt still applies.
-      return { kind: "pass-through", reason: "allw: Monitor WebSocket watch runs no command" };
-    }
-    if (request.kind === "malformed") {
-      return {
-        kind: "build-error",
-        reason:
-          "allw: Monitor tool_input must have either a string 'command' or a 'ws' object with a " +
-          "string 'url' (fail-closed deny)",
-      };
-    }
-    return gatePosixCommand(
-      wasm,
-      request.command,
-      cwd,
-      `Run command (Monitor): ${request.command}`,
-    );
+  const posix = posixCommandCall(toolName, toolInput);
+  if (posix !== null) {
+    return posix.kind === "command"
+      ? gatePosixCommand(wasm, posix.command, cwd, posix.summary)
+      : posix;
   }
 
   if (toolName === POWERSHELL_TOOL_NAME) {

@@ -191,7 +191,8 @@ pending, an uncaught exception, or a stray `process.exit`), or receives `SIGTERM
 Deliberately conservative, so the human is only interrupted for actions that actually run side
 effects:
 
-- **`Bash`** — a shell command (`tool_input.command`).
+- **`Bash`** — a shell command (`tool_input.command`). A blank command, or one whose program is an
+  empty word (`'' rm -rf build`), is denied without asking: there is no program to show the human.
 - **`Monitor`** with a `command` — gated exactly like `Bash` (it runs the command in the background
   under your `Bash` permission rules). A `Monitor` WebSocket watch (`tool_input.ws`) runs no command
   and gets no decision; any other `Monitor` input is denied. Monitors a plugin declares start

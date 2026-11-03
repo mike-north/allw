@@ -29,6 +29,7 @@ export {
   agentSafeText,
   decide,
   type ApprovalVerdict,
+  type CommandRequestFn,
   type DecideDeps,
   type HookApprovalRequest,
   type RequestApprovalFn,

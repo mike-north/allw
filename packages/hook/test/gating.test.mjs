@@ -9,7 +9,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { gateToolCall, isGatedTool, parseMcpToolName } from "../dist/lib/gating.js";
+import {
+  gateToolCall,
+  isGatedTool,
+  parseMcpToolName,
+  posixCommandCall,
+} from "../dist/lib/gating.js";
 import { loadWasm } from "../dist/lib/wasm.js";
 
 // ── MCP tool-name parsing ───────────────────────────────────────────────────────────────────────
@@ -484,4 +489,24 @@ test("gateToolCall(non-gated) → pass-through", async () => {
   const wasm = await loadWasm();
   const out = gateToolCall(wasm, "Read", { file_path: "/etc/hosts" }, "/repo");
   assert.equal(out.kind, "pass-through");
+});
+
+test("(#269) posixCommandCall reads Bash and Monitor commands, and only those", () => {
+  assert.deepEqual(posixCommandCall("Bash", { command: "ls  -la\n" }), {
+    kind: "command",
+    command: "ls  -la\n",
+    summary: "Run command: ls -la",
+  });
+  assert.deepEqual(posixCommandCall("Monitor", { command: "tail -f log" }), {
+    kind: "command",
+    command: "tail -f log",
+    summary: "Run command (Monitor): tail -f log",
+  });
+  assert.equal(posixCommandCall("Monitor", { ws: { url: "wss://x.test" } }).kind, "pass-through");
+  assert.equal(posixCommandCall("Bash", {}).kind, "build-error");
+  assert.equal(posixCommandCall("Monitor", { command: 1 }).kind, "build-error");
+  // PowerShell is a command too, but has no SDK builder; it stays with gateToolCall.
+  for (const toolName of ["PowerShell", "Edit", "mcp__srv__tool", "Read"]) {
+    assert.equal(posixCommandCall(toolName, { command: "ls" }), null, toolName);
+  }
 });
