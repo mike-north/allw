@@ -172,6 +172,7 @@ The PM keeps this scheme current; if a label is missing or ambiguous, ask rather
     security boundary (crypto, verdict signing/verification, account binding, fail-closed paths)
     and design-heavy or cross-module changes. When unsure whether a task touches a security
     boundary, treat it as if it does.
-32. **Use Fable for security review and bug finding** (subagent `model: "fable"`, or
-    `--model fable`). That covers adversarial reviews of security-boundary PRs, security audits,
-    and hunting for correctness bugs in a diff or module.
+32. **Use Fable for security review and bug finding.** Use subagent `model: "fable"`, or
+    `--model fable` on a launched agent. That covers adversarial reviews of security-boundary PRs,
+    security audits, and hunting for correctness bugs in a diff or module. A security-boundary PR is
+    implemented by Opus and reviewed by Fable, never reviewed by Sonnet.
