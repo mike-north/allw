@@ -111,6 +111,9 @@ test("(#364) a malformed MCP tool name with ESC, LF and U+202E is quoted escaped
   assert.equal(relay.seen.submits, 0, "denied before any request reached the relay");
 });
 
+// The "not approved" cases send LF too, but the gate's `oneLine` collapses it to a space before
+// the summary is hashed and shown, so no LF can reach that reason. ESC and U+202E do, and they are
+// what these cases check. Don't add an LF assertion here: the malformed-name case covers LF.
 test("(#364) an MCP server name with ESC, LF and U+202E is escaped in the 'not approved' deny", async (t) => {
   const { reason, relay } = await denyReasonFor(t, `mcp__srv${HOSTILE}__tool`);
   assertEscaped(reason);

@@ -196,6 +196,25 @@ test("(#364) agentSafeText escapes and caps any text the same way, and withholds
   );
 });
 
+test("(#368) agentSafeText never cuts an escape token in half at the cap", async () => {
+  const wasm = await loadWasm();
+  const rlo = String.fromCharCode(0x202e);
+  // 251 + "⟨U+202E⟩" (8) = 259 > 256: a plain cut would end "⟨U+20", which reads as U+0020.
+  assert.equal(agentSafeText(wasm, `${"a".repeat(251)}${rlo}`), `${"a".repeat(251)}…`);
+  // 253 + "\x1b" (4) = 257: a plain cut would end "\x1".
+  assert.equal(agentSafeText(wasm, `${"a".repeat(253)}\u001b`), `${"a".repeat(253)}…`);
+  // Sweep every offset: after removing whole tokens, no "⟨" or "\" is left dangling.
+  const whole = /⟨U\+[0-9A-F]{4,6}⟩|\\x[0-9a-f]{2}|\\[ntr]/gu;
+  for (let pad = 230; pad <= 262; pad += 1) {
+    for (const hidden of [rlo, "\u001b", "\n", String.fromCodePoint(0xe0001)]) {
+      const out = agentSafeText(wasm, `${"a".repeat(pad)}${hidden.repeat(4)}`);
+      assert.ok(Array.from(out).length <= MAX_ERROR_TEXT_CHARS + 1, out);
+      const rest = out.replace(whole, "");
+      assert.ok(!rest.includes("⟨") && !rest.includes("\\"), `a cut token in: ${out.slice(-24)}`);
+    }
+  }
+});
+
 test("agentSafeErrorText withholds the text when the core escape throws", () => {
   const broken = {
     escape_for_display() {
