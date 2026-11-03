@@ -168,8 +168,8 @@ try {
   ok("allw-hook makes no decision for a non-gated tool call (no relay)");
 
   // 3c-ii. A gated call loads the BUNDLED wasm (`@allw/sdk/vendor/...`) to build its ActionRecord,
-  // then fails closed: the relay URL points at a closed loopback port, so the approval can't be
-  // obtained and the hook prints a deny whose summary was rendered by the wasm core.
+  // then fails closed: the relay URL points at a closed loopback port, so the account state that
+  // names the request's recipients can't be loaded and the hook prints a deny.
   const gatedStdin = JSON.stringify({
     hook_event_name: "PreToolUse",
     cwd: projectDir,
@@ -206,7 +206,14 @@ try {
   }).stdout;
   const gated = JSON.parse(gatedOut).hookSpecificOutput;
   assert.equal(gated.permissionDecision, "deny", "a gated call with no reachable relay must deny");
-  assert.match(gated.permissionDecisionReason, /rm -rf build/, "the wasm core built the summary");
+  // The deny comes from loading account state (the dead relay), which the hook reaches only after
+  // the bundled wasm core built the ActionRecord; a wasm that failed to load denies earlier, with
+  // a different reason ("vendored wasm not found").
+  assert.match(
+    gated.permissionDecisionReason,
+    /approval request failed \(fail-closed deny\): allw: loading account state failed/,
+    "the gate built the ActionRecord with the bundled wasm, then failed closed loading account state",
+  );
   ok("allw-hook denies a gated call it cannot get approved (bundled wasm loaded)");
 
   console.log("\nPASS: packaged install works with no Rust toolchain.");
