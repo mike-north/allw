@@ -65,17 +65,24 @@ function sleepSync(ms: number): void {
 /**
  * Write every byte of `bytes` to `fd`, synchronously. `fs.writeSync` may write fewer bytes than asked
  * (a short write) or throw `EAGAIN` when `fd` is a non-blocking pipe whose buffer is full; this loops
- * until the whole buffer is out, backing off briefly on `EAGAIN`. Any other error is thrown.
+ * until the whole buffer is out, backing off briefly on `EAGAIN`. Any other error is thrown, and so
+ * is a write that reports no progress (0 bytes without an error), which would otherwise loop forever.
  */
 export function writeAllSync(fd: number, bytes: Uint8Array, write: WriteSyncFn = writeSync): void {
   let offset = 0;
   while (offset < bytes.length) {
+    let written: number;
     try {
-      offset += write(fd, bytes, offset, bytes.length - offset);
+      written = write(fd, bytes, offset, bytes.length - offset);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EAGAIN") throw err;
       sleepSync(EAGAIN_BACKOFF_MS);
+      continue;
     }
+    if (written <= 0) {
+      throw Object.assign(new Error(`write to fd ${String(fd)} made no progress`), { code: "EIO" });
+    }
+    offset += written;
   }
 }
 
@@ -93,6 +100,10 @@ export interface DecisionBackstop<T extends object> {
   /**
    * Write the decision (`null` ⇒ nothing) and mark the process as decided, so the exit backstop
    * stays silent. Call it once, right before exiting.
+   *
+   * The attempt is final: if the write fails, part of the decision may already be on stdout, so the
+   * backstop must not append a second one. The process exits 1 instead (a hook failure, which
+   * `"onFailure": "block"` turns into a blocked call).
    */
   finalize(decision: T | null): void;
 }
@@ -131,7 +142,9 @@ export function installDecisionBackstop<T extends object>(
   };
 
   // The event loop drained while `main()` was still waiting (a promise that will never settle and
-  // holds no refs). Deny, then exit explicitly so the process does not linger.
+  // holds no refs). Deny, then exit explicitly so the process does not linger. The `exit` listener
+  // below would also catch a drain; this one is kept as defence in depth, so the drain case doesn't
+  // depend on writing from inside `exit`.
   process.once("beforeExit", () => {
     if (decided) return;
     process.exit(emitBackstopDeny());
@@ -157,8 +170,13 @@ export function installDecisionBackstop<T extends object>(
 
   return {
     finalize(decision: T | null): void {
-      writeDecision(decision);
       decided = true;
+      try {
+        writeDecision(decision);
+      } catch {
+        backstopExitCode = 1;
+        process.exit(1);
+      }
     },
   };
 }

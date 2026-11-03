@@ -176,14 +176,32 @@ try {
     tool_name: "Bash",
     tool_input: { command: "rm -rf build" },
   });
+  // Accounts are self-certifying, so derive a valid root key and its account id with the installed
+  // package's own core; the config loader rejects anything else before the gate runs.
+  const coordinates = JSON.parse(
+    run(
+      "node",
+      [
+        "--input-type=module",
+        "-e",
+        [
+          'import { loadWasm } from "@allw/hook";',
+          "const wasm = await loadWasm();",
+          'const root = wasm.ed25519_public_key(Buffer.alloc(32, 7).toString("base64url"));',
+          "console.log(JSON.stringify({ root, account: wasm.account_id_for_root(root) }));",
+        ].join("\n"),
+      ],
+      { cwd: projectDir },
+    ).stdout,
+  );
   const gatedOut = run(hookBin, [], {
     cwd: projectDir,
     input: gatedStdin,
     env: {
       ...process.env,
       ALLW_RELAY_URL: "http://127.0.0.1:9",
-      ALLW_ACCOUNT_ID: "acct_smoke",
-      ALLW_APPROVER_ROOT_KEY: Buffer.alloc(32, 7).toString("base64url"),
+      ALLW_ACCOUNT_ID: coordinates.account,
+      ALLW_APPROVER_ROOT_KEY: coordinates.root,
     },
   }).stdout;
   const gated = JSON.parse(gatedOut).hookSpecificOutput;

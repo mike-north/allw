@@ -19,7 +19,6 @@
 
 import { createServer } from "node:http";
 
-const ACCOUNT_ID = "acct_approving_relay";
 const DEVICE_ID = "dev_approving_relay";
 /** A fixed issue time for the device cert (no expiry, so it is never the thing under test). */
 const CERT_ISSUED_AT_MS = 1_700_000_000_000;
@@ -35,6 +34,8 @@ export async function startApprovingRelay({ wasm, decision }) {
   const deviceSigningSeed = Buffer.alloc(32, 22).toString("base64url");
   const deviceEncryptionSeed = Buffer.alloc(32, 33).toString("base64url");
   const accountRootPub = wasm.ed25519_public_key(accountSeed);
+  // Accounts are self-certifying: the id is the core's derivation from the root key.
+  const ACCOUNT_ID = wasm.account_id_for_root(accountRootPub);
   const cert = wasm.issue_device_cert(
     accountSeed,
     ACCOUNT_ID,

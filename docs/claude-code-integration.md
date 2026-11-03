@@ -293,7 +293,8 @@ while an approval was pending, the shape of [#254](https://github.com/mike-north
 uncaught exception; a stray `process.exit(n)`), or receives `SIGTERM`, `SIGINT` or `SIGHUP` while
 waiting, it prints the backstop `deny` above once and exits `0`. If the deny itself can't be
 written (stdout is gone), it exits `1` instead, never `0` with empty stdout, so `"onFailure":
-"block"` still blocks the call. What the process can't answer is covered in
+"block"` still blocks the call. The same holds when the hook's own decision fails part-way: it
+exits `1` and never appends a second decision after the partial one. What the process can't answer is covered in
 [Fail-Closed Analysis](#fail-closed-analysis).
 
 ### After an approval: Claude Code's own permissions still apply

@@ -44,3 +44,8 @@ test("any other error (e.g. EPIPE) is thrown, not retried", () => {
   const { write } = fakeWriter({ chunk: 4, errors: ["EPIPE"] });
   assert.throws(() => writeAllSync(1, Buffer.from("abc"), write), { code: "EPIPE" });
 });
+
+test("a write that reports no progress (0 bytes, no error) throws instead of looping forever", () => {
+  const write = () => 0;
+  assert.throws(() => writeAllSync(1, Buffer.from("abc"), write), { code: "EIO" });
+});

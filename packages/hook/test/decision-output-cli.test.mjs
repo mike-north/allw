@@ -31,11 +31,13 @@ import { fileURLToPath } from "node:url";
 import { loadWasm } from "../dist/lib/wasm.js";
 import { startApprovingRelay } from "./support/approving-relay.mjs";
 import { FETCH_PENDING_MARKER } from "./support/stalled-fetch.mjs";
+import { PARTIAL_BYTES } from "./support/partial-write-fault.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const CLI = join(here, "..", "dist", "cli.js");
 const NEVER_SETTLING_FETCH = join(here, "support", "never-settling-fetch.mjs");
 const STALLED_FETCH = join(here, "support", "stalled-fetch.mjs");
+const PARTIAL_WRITE_FAULT = join(here, "support", "partial-write-fault.mjs");
 
 /**
  * Run the hook bin (optionally with node flags first); resolves `{ code, signal, stdout, stderr }`.
@@ -69,6 +71,15 @@ function runCli(stdin, env, nodeArgs = [], { signalOnPending, stdoutFd } = {}) {
     });
     child.stdin.end(stdin);
   });
+}
+
+/**
+ * A valid account root key and its derived (self-certifying) account id, so the config loader
+ * accepts the env and the run reaches the relay wait under test.
+ */
+function backstopCoordinates(wasm) {
+  const root = wasm.ed25519_public_key(Buffer.alloc(32, 7).toString("base64url"));
+  return { ALLW_ACCOUNT_ID: wasm.account_id_for_root(root), ALLW_APPROVER_ROOT_KEY: root };
 }
 
 /** A gated Bash call, as Claude Code sends it. */
@@ -121,8 +132,7 @@ test("backstop: an SDK wait that never settles (no refs) prints deny, not empty 
     BASH_STDIN,
     {
       ALLW_RELAY_URL: "http://127.0.0.1:9",
-      ALLW_ACCOUNT_ID: "acct_backstop",
-      ALLW_APPROVER_ROOT_KEY: wasm.ed25519_public_key(Buffer.alloc(32, 7).toString("base64url")),
+      ...backstopCoordinates(wasm),
     },
     ["--import", NEVER_SETTLING_FETCH],
   );
@@ -143,8 +153,7 @@ async function stalledEnv(extra = {}) {
   const wasm = await loadWasm();
   return {
     ALLW_RELAY_URL: "http://127.0.0.1:9",
-    ALLW_ACCOUNT_ID: "acct_backstop",
-    ALLW_APPROVER_ROOT_KEY: wasm.ed25519_public_key(Buffer.alloc(32, 7).toString("base64url")),
+    ...backstopCoordinates(wasm),
     ...extra,
   };
 }
@@ -225,3 +234,20 @@ for (const [label, extraEnv, nodeArgs, opts] of [
     assert.notEqual(code, 0, "an unwritten deny must read as a hook failure, not as no objection");
   });
 }
+
+// Regression (#294 review R2-N2): a deny write that fails part-way must be final. Before the fix,
+// `finalize` left the process undecided, so the exit backstop appended a second, full deny after the
+// partial one: invalid JSON on exit 0. Now the hook exits 1 with only the partial bytes on stdout.
+test("finalize: a decision write that fails part-way exits 1 and never appends a second deny", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "allw-hook-home-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  // No config file in this HOME and no ALLW_* env: the hook's own decision is a config deny.
+  const { code, signal, stdout, stderr } = await runCli(BASH_STDIN, { HOME: home }, [
+    "--import",
+    PARTIAL_WRITE_FAULT,
+  ]);
+  assert.equal(signal, null, `stderr: ${stderr}`);
+  assert.equal(code, 1, "a failed decision write is a hook failure, not a decision");
+  assert.equal(stdout.length, PARTIAL_BYTES, `only the partial write reached stdout: ${stdout}`);
+  assert.doesNotMatch(stdout, /exited before reaching a decision/, "no backstop deny was appended");
+});
