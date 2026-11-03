@@ -2119,3 +2119,86 @@ test("action_from_argv with an empty argv still records raw (visible, not erased
   assert.ok(!("argv" in record.syntactic));
   assert.equal(record.syntactic.raw, "  ");
 });
+
+// ── Self-certifying account id + pairing-start authorization (#242) ─────────────────
+// @see docs/enrollment.md §Model (account id derivation, pairing-start authorization)
+
+test("account_id_for_root reproduces the Rust account-id vector", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  assert.equal(
+    wasm.account_id_for_root(v.approver_root_pubkey_b64),
+    v.expected_account_id_for_root,
+  );
+  // Spec: 43 base64url chars (unpadded SHA-256) — URL-path safe.
+  assert.match(v.expected_account_id_for_root, /^[A-Za-z0-9_-]{43}$/);
+  assert.throws(() => wasm.account_id_for_root("not-a-key"), /account_root_pubkey_b64/);
+});
+
+test("check_account_id_for_root accepts only the derived id", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  wasm.check_account_id_for_root(v.expected_account_id_for_root, v.approver_root_pubkey_b64);
+  assert.throws(
+    () => wasm.check_account_id_for_root("acc_wasm_vector_01", v.approver_root_pubkey_b64),
+    /check_account_id_for_root failed/,
+  );
+});
+
+test("sign_pairing_start_authorization reproduces the Rust JWS byte-for-byte", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  const rootSeed = Buffer.alloc(32, 0x11).toString("base64url"); // ROOT_SEED in wasm_vector.rs
+  assert.equal(
+    wasm.sign_pairing_start_authorization(
+      rootSeed,
+      v.pairing_start_issued_at,
+      v.pairing_start_expires_at,
+      v.pairing_start_jti,
+    ),
+    v.pairing_start_authorization,
+    "Ed25519 is deterministic, so WASM and Rust must emit identical compact JWS bytes",
+  );
+});
+
+test("verify_pairing_start_authorization accepts the vector and rejects misuse", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  const claims = JSON.parse(
+    wasm.verify_pairing_start_authorization(
+      v.pairing_start_authorization,
+      v.expected_account_id_for_root,
+      v.approver_root_pubkey_b64,
+      v.pairing_start_now_ms,
+    ),
+  );
+  assert.deepEqual(claims, {
+    v: 1,
+    account_id: v.expected_account_id_for_root,
+    issued_at: v.pairing_start_issued_at,
+    expires_at: v.pairing_start_expires_at,
+    jti: v.pairing_start_jti,
+  });
+  // Expired: now == expires_at is outside the (exclusive) window.
+  assert.throws(
+    () =>
+      wasm.verify_pairing_start_authorization(
+        v.pairing_start_authorization,
+        v.expected_account_id_for_root,
+        v.approver_root_pubkey_b64,
+        v.pairing_start_expires_at,
+      ),
+    /expired/,
+  );
+  // An account id that does not derive from the presented root.
+  assert.throws(
+    () =>
+      wasm.verify_pairing_start_authorization(
+        v.pairing_start_authorization,
+        "acc_wasm_vector_01",
+        v.approver_root_pubkey_b64,
+        v.pairing_start_now_ms,
+      ),
+    /does not derive/,
+  );
+});
