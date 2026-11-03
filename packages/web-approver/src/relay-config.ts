@@ -278,8 +278,10 @@ export interface IgnoredRelayNoticeOptions {
   /**
    * The core's display escape, once the core has loaded; `null` when it can't. The notice renders
    * at once, with the ignored link's name pending, and fills the name in when this settles: the
-   * core's escape of it, or the withheld text (`./display-escape.ts`) if there is no core. A core that never
-   * loads leaves the name pending; the notice still says a link was ignored.
+   * core's escape of it, or the withheld text (`./display-escape.ts`) if there is no core. Boot
+   * settles this within `DISPLAY_ESCAPE_LOAD_TIMEOUT_MS` (`./app.ts`), with `null` once the deadline
+   * passes (#308). Only a caller that passes a promise that never settles leaves the name pending;
+   * the notice still says a link was ignored.
    */
   readonly escapeForDisplay: Promise<DisplayEscape | null>;
   /**

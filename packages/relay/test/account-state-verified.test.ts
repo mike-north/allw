@@ -26,6 +26,7 @@ import {
   testRoot,
   type TestAccount,
 } from "./support/accounts.js";
+import { DEVICE_X25519_PUBKEY } from "./support/keys.js";
 
 /** 2^53-1: the largest sequence a JS number represents exactly. */
 const MAX_SAFE_SEQUENCE = Number.MAX_SAFE_INTEGER;
@@ -80,7 +81,7 @@ async function enrollDevice(accountId: string): Promise<string> {
   const start = await bindRoot(accountId);
   const { status, data } = await request(accountId, "/pairing/complete", {
     method: "POST",
-    body: { code: start.code, pubkey: UNRELATED_PUBKEY },
+    body: { code: start.code, pubkey: DEVICE_X25519_PUBKEY },
     headers: { Authorization: `Bearer ${start.pairing_auth_token}` },
   });
   expect(status).toBe(201);

@@ -202,9 +202,13 @@ Validation:
   `EncryptError::LowOrderRecipientKey` naming the device instead of panicking, and refuses the whole
   encryption rather than dropping that recipient. The SDK rethrows it, so the hook denies. The core also
   exports its denylist (`X25519_SMALL_ORDER_POINTS`, libsodium's `has_small_order` list, matched with bit 255
-  masked) through WASM, so device-key registration can reject the same keys up front. A shared vector
-  (`crates/allw-core/tests/fixtures/x25519_small_order.json`) asserts the denylist and encryption agree in
-  Rust and through WASM (#248).
+  masked) through WASM. The relay's `POST /pairing/complete` uses it to refuse such a device key with a 400
+  before the pairing code is consumed, so the key never enters the device registry (`docs/relay-api.md` §3
+  Pairing). A shared vector (`crates/allw-core/tests/fixtures/x25519_small_order.json`) asserts that the
+  denylist and encryption agree in Rust and through WASM. The relay's tests drive every vector point, and
+  its bit-255 variant, through pairing (#248).
+  - Encryption still refuses such a key, so it fails closed whichever way the key arrives: a hostile
+    relay that skips the check, a device enrolled before it, or a key from verified account state.
 - Relay-chosen text (device ids, error bodies, any response body) can reach SDK error messages, and the hooks
   put those messages in the deny reason the agent reads. A hostile relay could therefore pose as an allw
   diagnostic (prompt injection). The defence is layered:
@@ -345,7 +349,7 @@ trust decision, and it lives in the core:
   web approver escapes the verification-failed reason (which can name the relay-supplied envelope id), the
   relay-outage banner text, the ignored `?relay=` link in the relay-pin notice (#307), and the rejected pin on the
   re-pair screen (#297); a runtime without the core escape withholds that text, and the notice and re-pair screen
-  withhold theirs when the core cannot load.
+  withhold theirs when the core cannot load, or has not loaded within `DISPLAY_ESCAPE_LOAD_TIMEOUT_MS` (#308).
 - Escaping is display-only. `request_hash` is computed over the original context; the display model is a separate
   value that is never hashed, signed, or sent.
 
@@ -538,7 +542,9 @@ attestation, audit records, hook/SDK fail-closed behavior, or enrollment.
 - [ ] Network failures, hung reads, refused connections, and malformed relay responses deny or expire, never allow.
 - [ ] Any new endpoint states who may call it and what authentication/authorization is required.
 - [ ] Relay URLs are accepted only as `https:` (or `http:` on loopback) and are rejected at configuration time,
-      before any request is built (web approver `checkRelayUrl`, SDK `assertRelayUrlTransport`).
+      before any request is built (web approver `checkRelayUrl`, SDK `assertRelayUrlTransport`, approver CLI
+      `assertCliRelayUrl` for `pair --relay`, `watch --relay` and the keyfile's `relay_url`). Every copy of the rule
+      is tested against `packages/sdk/test/fixtures/relay-url-vectors.json`.
 - [ ] A paired web approver talks only to the relay pinned in its stored identity; no query parameter, link, or
       other page input can re-point it without re-pairing.
 - [ ] Web approver changes keep the `_headers` CSP intact: no inline script or `'unsafe-inline'`, and

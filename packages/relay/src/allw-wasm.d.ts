@@ -95,4 +95,13 @@ declare module "@allw/sdk/vendor/allw-wasm/allw_wasm.js" {
     nonce_b64: string,
     device_cert: string,
   ): string;
+
+  /**
+   * Whether a base64url 32-byte X25519 public key is one of the core's small-order points
+   * (`X25519_SMALL_ORDER_POINTS`, bit 255 masked). Throws unless it is 32 base64url bytes.
+   */
+  export function is_small_order_x25519_public_key(public_key_b64: string): boolean;
+
+  /** The core's small-order X25519 denylist as a JSON array of base64url strings (tests). */
+  export function x25519_small_order_points(): string;
 }

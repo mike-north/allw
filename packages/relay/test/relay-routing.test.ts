@@ -39,13 +39,14 @@ import {
   testAccount,
   testRoot,
 } from "./support/accounts.js";
+import { DEVICE_X25519_PUBKEY } from "./support/keys.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures (deterministic; never `Date.now()` in data — see fixed-dates rule)
 // ---------------------------------------------------------------------------
 
-/** A 32-byte base64url-unpadded device key (32 × 0x00). Matches the registry's pubkey shape. */
-const DEVICE_PUBKEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+/** A full-order X25519 device key (pairing rejects small-order keys, #248). */
+const DEVICE_PUBKEY = DEVICE_X25519_PUBKEY;
 
 /** Far-future expiry (2100-01-01Z, ms) — deterministic AND always > the relay's real `Date.now()`. */
 const FUTURE_EXPIRES_AT = 4102444800000;

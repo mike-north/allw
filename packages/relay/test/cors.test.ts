@@ -18,10 +18,11 @@ import {
 } from "../src/cors.js";
 import wranglerConfigText from "../wrangler.jsonc?raw";
 import { pairingStartBody, testAccount } from "./support/accounts.js";
+import { DEVICE_X25519_PUBKEY } from "./support/keys.js";
 
 const HOSTED_APPROVER = "https://allw-web-approver.pages.dev";
-/** A 32-byte base64url-unpadded device key (32 × 0x00). */
-const DEVICE_PUBKEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+/** A full-order X25519 device key (pairing rejects small-order keys, #248). */
+const DEVICE_PUBKEY = DEVICE_X25519_PUBKEY;
 
 function url(accountId: string, subPath: string): string {
   return `https://relay.allw.test/${accountId}${subPath}`;

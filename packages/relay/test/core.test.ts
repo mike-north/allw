@@ -30,6 +30,8 @@ const DECLARED_GLUE_FUNCTIONS: Record<keyof typeof glue, true> = {
   verify_verdict_provenance: true,
   issue_device_cert: true,
   sign_verdict: true,
+  is_small_order_x25519_public_key: true,
+  x25519_small_order_points: true,
 };
 
 describe("core binding", () => {

@@ -36,6 +36,7 @@ import {
   accountIdForRoot,
   checkAccountIdForRoot,
   ensureCore,
+  isSmallOrderX25519PublicKey,
   verifyAccountState,
   verifyPairingStartAuthorization,
   verifyVerdictProvenance,
@@ -66,6 +67,7 @@ import {
   vapidConfigFromEnv,
   type VapidEnv,
 } from "./web-push.js";
+import { accountSubPathSegments, resolveAccountRoute, routeParam } from "./routes.js";
 import { handleWellKnown, isWellKnownPath } from "./well-known.js";
 
 export interface Env extends VapidEnv, CorsEnv {
@@ -309,9 +311,13 @@ async function tokenMatches(storedHash: string | null, token: string | null): Pr
 }
 
 /**
- * Validate that `pubkey` is a valid base64url-unpadded string that decodes to exactly 32 bytes.
+ * Validate that `pubkey` is the canonical base64url-unpadded encoding of exactly 32 bytes.
  * This covers both Ed25519 verifying keys and X25519 public keys, which are both 32-byte.
  * Returns the decoded bytes on success, or `null` on failure.
+ *
+ * Canonical means re-encoding the bytes gives back `pubkey` exactly. The 43rd symbol carries 2
+ * unused low bits, which `atob` silently drops but the core's decoder rejects. Without this check a
+ * key with stray bits would be stored here and then fail in the core on every use.
  */
 function validatePubkey(pubkey: string): Uint8Array | null {
   // 32 bytes encode to exactly 43 base64url-unpadded chars (ceil(32*4/3)). Reject by length
@@ -333,11 +339,46 @@ function validatePubkey(pubkey: string): Uint8Array | null {
   }
   if (binary.length !== 32) return null;
 
+  const canonical = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  if (canonical !== pubkey) return null;
+
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {
     bytes[i] = binary.charCodeAt(i);
   }
   return bytes;
+}
+
+/**
+ * Validate a device's X25519 encryption key for enrollment (`POST /pairing/complete`). Integrators
+ * JWE-encrypt every request to this key, so beyond `validatePubkey`'s 32 base64url bytes it must not
+ * be a small-order point: ECDH with one yields a publicly known shared secret, and the core's
+ * `encrypt_context` refuses the whole request rather than encrypt to it (#248). Rejecting it here
+ * keeps such a key out of the device registry. The denylist is the core's, through WASM.
+ *
+ * Returns the 400 to send, a 500 only if the core failed to initialize, or `null` when the key is
+ * acceptable.
+ */
+function deviceEncryptionKeyFailure(pubkey: string): Response | null {
+  if (!validatePubkey(pubkey)) {
+    return json({ error: "'pubkey' must be a base64url-unpadded 32-byte public key" }, 400);
+  }
+  let smallOrder: boolean;
+  try {
+    smallOrder = isSmallOrderX25519PublicKey(pubkey);
+  } catch (err) {
+    // Only a core that failed to initialize is the relay's fault. Any other throw is the core
+    // rejecting the key's encoding, which is the caller's input: the same 400 as a bad shape.
+    if (err instanceof CoreUnavailableError) return coreUnavailable(err);
+    return json({ error: "'pubkey' must be a base64url-unpadded 32-byte public key" }, 400);
+  }
+  if (smallOrder) {
+    return json(
+      { error: "'pubkey' is a small-order X25519 key, which can never be an encryption target" },
+      400,
+    );
+  }
+  return null;
 }
 
 /** Parse a JSON body; returns null if the body is invalid JSON or not an object. */
@@ -772,135 +813,87 @@ export class AccountRelay implements DurableObject {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    // Strip the leading "/<accountId>" segment forwarded by the Worker.
-    const segments = url.pathname.split("/").filter(Boolean);
-    // segments[0] is the accountId (stripped); the sub-path starts at [1].
-    const subSegments = segments.slice(1);
+    // The Worker forwards the full path; its first segment is the account id, and every route
+    // matches the rest exactly (`routes.ts`, #302).
+    const accountId = url.pathname.split("/")[1] ?? "";
     const method = request.method.toUpperCase();
-    const path0 = subSegments[0] ?? "";
-    const path1 = subSegments[1] ?? "";
-    const path2 = subSegments[2] ?? "";
-
-    // POST /pairing/start — root-signed; binds the account root on first success.
-    if (method === "POST" && path0 === "pairing" && path1 === "start") {
-      return this.handlePairingStart(request, segments[0] ?? "");
-    }
-
-    // POST /pairing/complete
-    if (method === "POST" && path0 === "pairing" && path1 === "complete") {
-      return this.handlePairingComplete(request);
-    }
-
-    // POST /actors
-    if (method === "POST" && path0 === "actors" && !path1) {
-      return this.handleActorEnroll(request);
-    }
-
-    // GET /actors
-    if (method === "GET" && path0 === "actors" && !path1) {
-      return this.handleActorList();
-    }
-
-    // POST /account-states — anyone may publish; only documents verified against the bound root
-    // are stored.
-    if (method === "POST" && path0 === "account-states" && !path1) {
-      return this.handleAccountStatePublish(request, segments[0] ?? "");
-    }
-
-    // GET /account-states — unauthenticated: the documents are public and relay-verified.
-    if (method === "GET" && path0 === "account-states" && !path1) {
-      return this.handleAccountStateList();
-    }
-
-    // GET /devices
-    if (method === "GET" && path0 === "devices" && !path1) {
-      return this.handleDeviceList();
-    }
-
-    // POST /devices/{device_id}/revoke
-    if (method === "POST" && path0 === "devices" && path1 !== "" && path2 === "revoke") {
-      return this.handleDeviceRevoke(path1, request);
-    }
-
-    // PUT /devices/{device_id}/push-tokens — the device replaces its own push-token set.
-    if (
-      method === "PUT" &&
-      path0 === "devices" &&
-      path1 !== "" &&
-      path2 === "push-tokens" &&
-      (subSegments[3] ?? "") === ""
-    ) {
-      return this.handleDevicePushTokens(path1, request);
-    }
-
-    // GET /devices/{device_id}/inbox — authenticated device polls its pending envelopes.
-    if (method === "GET" && path0 === "devices" && path1 !== "" && path2 === "inbox") {
-      return this.handleDeviceInbox(path1, request);
-    }
-
-    // GET /devices/{device_id}/connect (WebSocket) — device presence + offline-queue flush.
-    if (method === "GET" && path0 === "devices" && path1 !== "" && path2 === "connect") {
-      if (!isWebSocketUpgrade(request)) {
-        return json({ error: "WebSocket upgrade required" }, 426);
-      }
-      return this.handleDeviceConnect(path1, request);
-    }
-
-    // POST /requests — integrator submits an ApprovalRequest envelope (ciphertext + routing).
-    if (method === "POST" && path0 === "requests" && !path1) {
-      return this.handleSubmit(request, segments[0] ?? "");
-    }
-
-    // GET /requests/{request_id}/wait (WebSocket) — integrator awaits the verdict (pushed).
-    if (method === "GET" && path0 === "requests" && path1 !== "" && path2 === "wait") {
-      if (!isWebSocketUpgrade(request)) {
-        return json({ error: "WebSocket upgrade required" }, 426);
-      }
-      return this.handleIntegratorWait(path1, request);
-    }
-
-    // GET /requests/{request_id} — integrator polls request status / fetches the verdict.
-    if (method === "GET" && path0 === "requests" && path1 !== "" && path2 === "") {
-      return this.handleGetRequest(path1, request);
-    }
-
-    // POST /requests/{request_id}/retract — integrator cancels its own pending request (#195).
-    if (method === "POST" && path0 === "requests" && path1 !== "" && path2 === "retract") {
-      return this.handleRetract(path1, request);
-    }
+    const route = resolveAccountRoute(method, accountSubPathSegments(url.pathname));
 
     // 405 only for a KNOWN route path reached with an unsupported method; any other (unknown)
-    // sub-path is a 404 — e.g. `GET /devices/<id>` or `GET /pairing/unknown` are not routes.
-    const isKnownRoutePath =
-      (path0 === "pairing" && (path1 === "start" || path1 === "complete") && path2 === "") ||
-      (path0 === "actors" && path1 === "") ||
-      (path0 === "account-states" && path1 === "") ||
-      (path0 === "devices" && path1 === "") ||
-      (path0 === "devices" &&
-        path1 !== "" &&
-        path2 === "revoke" &&
-        (subSegments[3] ?? "") === "") ||
-      (path0 === "devices" && path1 !== "" && path2 === "inbox" && (subSegments[3] ?? "") === "") ||
-      (path0 === "devices" &&
-        path1 !== "" &&
-        path2 === "push-tokens" &&
-        (subSegments[3] ?? "") === "") ||
-      (path0 === "devices" &&
-        path1 !== "" &&
-        path2 === "connect" &&
-        (subSegments[3] ?? "") === "") ||
-      (path0 === "requests" && path1 === "") ||
-      (path0 === "requests" && path1 !== "" && path2 === "" && (subSegments[2] ?? "") === "") ||
-      (path0 === "requests" && path1 !== "" && path2 === "wait" && (subSegments[3] ?? "") === "") ||
-      (path0 === "requests" &&
-        path1 !== "" &&
-        path2 === "retract" &&
-        (subSegments[3] ?? "") === "");
-    if (isKnownRoutePath) {
-      return json({ error: "method not allowed" }, 405);
-    }
+    // sub-path is a 404 — e.g. `GET /devices/<id>`, `GET /pairing/unknown`, or any route with an
+    // extra segment or trailing slash.
+    if (route.kind === "method-not-allowed") return json({ error: "method not allowed" }, 405);
+    if (route.kind === "not-found") return json({ error: "not found" }, 404);
 
-    return json({ error: "not found" }, 404);
+    const { params } = route;
+    switch (route.name) {
+      // POST /pairing/start — root-signed; binds the account root on first success.
+      case "pairingStart":
+        return this.handlePairingStart(request, accountId);
+
+      // POST /pairing/complete
+      case "pairingComplete":
+        return this.handlePairingComplete(request);
+
+      // POST /actors
+      case "actorEnroll":
+        return this.handleActorEnroll(request);
+
+      // GET /actors
+      case "actorList":
+        return this.handleActorList();
+
+      // POST /account-states — anyone may publish; only documents verified against the bound
+      // root are stored.
+      case "accountStatePublish":
+        return this.handleAccountStatePublish(request, accountId);
+
+      // GET /account-states — unauthenticated: the documents are public and relay-verified.
+      case "accountStateList":
+        return this.handleAccountStateList();
+
+      // GET /devices
+      case "deviceList":
+        return this.handleDeviceList();
+
+      // POST /devices/{device_id}/revoke
+      case "deviceRevoke":
+        return this.handleDeviceRevoke(routeParam(params, "device_id"), request);
+
+      // PUT /devices/{device_id}/push-tokens — the device replaces its own push-token set.
+      case "devicePushTokens":
+        return this.handleDevicePushTokens(routeParam(params, "device_id"), request);
+
+      // GET /devices/{device_id}/inbox — authenticated device polls its pending envelopes.
+      case "deviceInbox":
+        return this.handleDeviceInbox(routeParam(params, "device_id"), request);
+
+      // GET /devices/{device_id}/connect (WebSocket) — device presence + offline-queue flush.
+      case "deviceConnect":
+        if (!isWebSocketUpgrade(request)) {
+          return json({ error: "WebSocket upgrade required" }, 426);
+        }
+        return this.handleDeviceConnect(routeParam(params, "device_id"), request);
+
+      // POST /requests — integrator submits an ApprovalRequest envelope (ciphertext + routing).
+      case "requestSubmit":
+        return this.handleSubmit(request, accountId);
+
+      // GET /requests/{request_id}/wait (WebSocket) — integrator awaits the verdict (pushed).
+      case "requestWait":
+        if (!isWebSocketUpgrade(request)) {
+          return json({ error: "WebSocket upgrade required" }, 426);
+        }
+        return this.handleIntegratorWait(routeParam(params, "request_id"), request);
+
+      // GET /requests/{request_id} — integrator polls request status / fetches the verdict.
+      case "requestGet":
+        return this.handleGetRequest(routeParam(params, "request_id"), request);
+
+      // POST /requests/{request_id}/retract — integrator cancels its own pending request (#195).
+      case "requestRetract":
+        return this.handleRetract(routeParam(params, "request_id"), request);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1093,7 +1086,9 @@ export class AccountRelay implements DurableObject {
    * - 404: code not found
    * - 409: code already used, or the account's push-token budget is full (code not consumed)
    * - 410: code expired
-   * - 400: invalid pubkey (not base64url or not 32 bytes), or invalid / over-budget push_tokens
+   * - 400: invalid pubkey (not base64url, not 32 bytes, or a small-order X25519 point), or
+   *        invalid / over-budget push_tokens
+   * - 500: the relay's verification core failed to initialize
    */
   private async handlePairingComplete(request: Request): Promise<Response> {
     // Every pairing row this relay issues is created together with (or after) the root bind, so a
@@ -1111,9 +1106,8 @@ export class AccountRelay implements DurableObject {
     const pubkey = requiredString(body, "pubkey");
     if (!pubkey) return json({ error: "'pubkey' is required (string)" }, 400);
 
-    if (!validatePubkey(pubkey)) {
-      return json({ error: "'pubkey' must be a base64url-unpadded 32-byte public key" }, 400);
-    }
+    const pubkeyFailure = deviceEncryptionKeyFailure(pubkey);
+    if (pubkeyFailure) return pubkeyFailure;
 
     const label = optionalString(body, "label");
     const pushTokens = optionalPushTokens(body);

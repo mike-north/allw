@@ -94,6 +94,16 @@ export function verifyAccountState(
 }
 
 /**
+ * Whether `pubkey` (base64url-unpadded, 32 bytes) is one of the core's small-order X25519 points
+ * (`allw_core::X25519_SMALL_ORDER_POINTS`, matched with bit 255 masked). Every ECDH with such a key
+ * yields a publicly known shared secret, so it can never be an encryption target. The relay keeps
+ * no copy of the list; the core is the single source. A key that is not 32 base64url bytes throws.
+ */
+export function isSmallOrderX25519PublicKey(pubkey: string): boolean {
+  return core().is_small_order_x25519_public_key(pubkey);
+}
+
+/**
  * Throws unless `accountId` is exactly the id the core derives from `rootPubkey` (base64url
  * Ed25519). A malformed key also throws.
  */
