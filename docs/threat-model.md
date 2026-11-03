@@ -216,6 +216,10 @@ Validation:
     `escape_for_display` and cap it at 256 characters (`agentSafeErrorText` in `@allw/hook`), so no SDK path,
     present or future, can put raw relay text into the agent's context. If the escape fails, the text is
     withheld.
+  - **Third-party names get the same treatment.** An MCP server or tool name, tool input and the gate's
+    one-line summary of the call come from outside allw too. Every post-WASM deny reason that quotes them
+    (a malformed MCP tool name, a build error, the final "not approved") passes them through `agentSafeText`,
+    the same escape and cap (#364). The approver still receives the raw summary and escapes it for display.
   - **The SDK keeps relay text out of its messages.** A rejected `submit` reports only the HTTP status, not
     the relay's `error` field. A body that isn't JSON reports only the call and status, not the parser's
     message (which quotes the body). A relay device entry whose `device_id` doesn't match

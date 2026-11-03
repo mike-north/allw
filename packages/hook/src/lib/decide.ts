@@ -29,6 +29,7 @@
  */
 
 import type { HookWasm } from "./wasm.js";
+import { agentSafeErrorText, agentSafeText } from "./agent-text.js";
 import { gateToolCall } from "./gating.js";
 import {
   denyOutput,
@@ -64,37 +65,7 @@ export interface HookApprovalRequest {
 /** The injectable approval function — the real one is `client.requestApproval` from `@allw/sdk`. */
 export type RequestApprovalFn = (req: HookApprovalRequest) => Promise<ApprovalVerdict>;
 
-/** The most characters of error text a deny reason carries (after escaping), plus `…`. */
-export const MAX_ERROR_TEXT_CHARS = 256;
-
-/** Shown instead of error text the core escape could not process. */
-const WITHHELD_ERROR_TEXT = "details withheld (the display-escaping core is unavailable)";
-
-/**
- * The text of an error from the approval round-trip, made safe to put in a deny reason the agent
- * reads.
- *
- * Errors from `requestApproval` can carry relay-supplied text (a status body, a device id, a JSON
- * parse snippet), and the relay is untrusted. A newline-laden message could pose as an allw
- * diagnostic and instruct the agent (prompt injection). This is the single choke point both hooks
- * use: the text goes through the core's `escape_for_display`, so control, bidi and zero-width
- * characters (newlines included) become visible escapes, and it is capped at
- * {@link MAX_ERROR_TEXT_CHARS} characters. If the core escape fails, the text is withheld.
- */
-export function agentSafeErrorText(wasm: HookWasm, err: unknown): string {
-  const message = err instanceof Error ? err.message : String(err);
-  let escaped: string;
-  try {
-    escaped = wasm.escape_for_display(message);
-  } catch {
-    return WITHHELD_ERROR_TEXT;
-  }
-  // Cap by code point, so a surrogate pair is never split.
-  const chars = Array.from(escaped);
-  return chars.length > MAX_ERROR_TEXT_CHARS
-    ? `${chars.slice(0, MAX_ERROR_TEXT_CHARS).join("")}…`
-    : escaped;
-}
+export { MAX_ERROR_TEXT_CHARS, agentSafeErrorText, agentSafeText } from "./agent-text.js";
 
 /** Everything `decide` needs that isn't the parsed input — all injectable for tests. */
 export interface DecideDeps {
@@ -218,5 +189,10 @@ export async function decide(
     return noDecisionOutput();
   }
   // denied / expired / aborted ⇒ deny (a verified human "no", a timeout, or a device abort).
-  return denyOutput(`allw: ${gate.summary} — not approved (verdict: ${verdict.decision})`);
+  // The summary quotes the tool call (a command, tool and server names, MCP params), which can come
+  // from a third party, so it goes through the core escape before the agent reads it (#364). The
+  // approver still gets the raw summary and applies its own display escape.
+  return denyOutput(
+    `allw: ${agentSafeText(deps.wasm, gate.summary)} — not approved (verdict: ${verdict.decision})`,
+  );
 }
