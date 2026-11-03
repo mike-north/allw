@@ -451,6 +451,9 @@ type NonApprovingDecision = Exclude<Decision, "approved">;
  */
 function signedNonApproval(err: unknown): NonApprovingDecision | null {
   if (!(err instanceof Error)) return null;
+  // Own properties only, as WASM sets them: an inherited `kind`/`decision` (a polluted
+  // `Error.prototype`) would otherwise turn every unverifiable error into a "verified" decision.
+  if (!Object.hasOwn(err, "kind") || !Object.hasOwn(err, "decision")) return null;
   const { kind, decision } = err as { kind?: unknown; decision?: unknown };
   if (kind !== "not_approved") return null;
   if (decision === "denied" || decision === "expired" || decision === "aborted") return decision;
@@ -666,6 +669,11 @@ export async function verifyAccountState(
  * Verify a verdict while enforcing account-state device revocations. The optional nonce store is
  * checked after the core authenticates the signed nonce, so replay protection composes with the
  * revocation-aware verification path.
+ *
+ * Throws on every verification failure (fail-closed). A *verified* non-approval throws an `Error`
+ * with own properties `kind: "not_approved"` and `decision` (`denied`/`expired`/`aborted`, from the
+ * signed claims); any other throw is unverifiable. Never classify by the error message: the relay
+ * controls text echoed into it.
  */
 export async function verifyVerdictWithAccountStates(
   input: VerifyVerdictWithAccountStatesInput,
