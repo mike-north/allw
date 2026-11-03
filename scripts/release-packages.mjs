@@ -3,7 +3,8 @@
  *
  * This module is the single source of truth for *which* `@allw/*` packages are published to npm,
  * *in what order*, and *under which trusted-publisher identity* (repo + workflow file + GitHub
- * environment). Both the CI release workflow (`.github/workflows/release.yml`) and the one-shot
+ * environment). It also lists the unscoped names held only as anti-squatting claims and never
+ * released (`CLAIM_ONLY_NAMES`). Both the CI release workflow (`.github/workflows/release.yml`) and the one-shot
  * operator bootstrap (`scripts/npm-bootstrap-trusted-publishing.mjs`) import it, so the identity npm
  * is told to trust and the identity that actually publishes can never drift apart.
  *
@@ -68,6 +69,24 @@ export const PUBLISHED_PACKAGES = Object.freeze([
   { name: "@allw/approver", dir: "packages/approver" },
   { name: "@allw/codex-hook", dir: "packages/codex-hook" },
   { name: "@allw/openclaw-bridge", dir: "packages/openclaw-bridge" },
+]);
+
+/**
+ * Unscoped names we **claim but never release** ("claim-only"), so nobody else can squat them.
+ *
+ * Every bin of a published package is here, because `npx <bin>` run outside a project that has the
+ * scoped package installed resolves a *registry package* of that bare name. A squatter publishing
+ * `allw-hook` would get code execution from anyone who types `npx allw-hook`. `allw` is here
+ * because it's the name people guess first. Each claim holds an inert placeholder whose import and
+ * bin throw an error naming `pointsTo`, the real scoped package. No trusted publisher is attached:
+ * the release workflow never publishes these names.
+ */
+export const CLAIM_ONLY_NAMES = Object.freeze([
+  { name: "allw", pointsTo: "@allw/sdk" },
+  { name: "allw-hook", pointsTo: "@allw/hook" },
+  { name: "allw-approver", pointsTo: "@allw/approver" },
+  { name: "allw-codex-hook", pointsTo: "@allw/codex-hook" },
+  { name: "allw-openclaw-bridge", pointsTo: "@allw/openclaw-bridge" },
 ]);
 
 /** Read a package's manifest (`dir` is repo-relative). */

@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import {
+  CLAIM_ONLY_NAMES,
   PUBLISHED_PACKAGES,
   RELEASE_ENVIRONMENT,
   RELEASE_WORKFLOW_FILE,
@@ -65,6 +66,26 @@ const goodManifest = (name, deps = {}) => ({
 
 test("the release set is exactly the non-private workspace packages", () => {
   assert.deepEqual(PUBLISHED_PACKAGES.map((p) => p.name).sort(), publicWorkspacePackages());
+});
+
+// `npx <bin>` outside a project resolves a registry package named after the bin, so every bin a
+// published package declares must be claimed (and point back at the package that declares it).
+test("claim-only names cover `allw` and every published bin, and are never released", () => {
+  const claims = new Map(CLAIM_ONLY_NAMES.map((c) => [c.name, c.pointsTo]));
+  const published = new Set(PUBLISHED_PACKAGES.map((p) => p.name));
+  assert.equal(claims.get("allw"), "@allw/sdk");
+  for (const pkg of PUBLISHED_PACKAGES) {
+    const bin = readManifest(pkg.dir).bin;
+    const bins = typeof bin === "string" ? [pkg.name.split("/")[1]] : Object.keys(bin ?? {});
+    for (const name of bins) {
+      assert.equal(claims.get(name), pkg.name, `bin ${name} of ${pkg.name} must be claimed`);
+    }
+  }
+  for (const { name, pointsTo } of CLAIM_ONLY_NAMES) {
+    assert.ok(!published.has(name), `${name} is claim-only, so it must not be in the release set`);
+    assert.ok(!name.startsWith("@"), `${name}: claims are for unscoped names`);
+    assert.ok(published.has(pointsTo), `${name} points at ${pointsTo}, which is not released`);
+  }
 });
 
 test("the real release set is releasable at its current lockstep version", () => {

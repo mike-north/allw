@@ -10,7 +10,8 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -20,10 +21,13 @@ import {
   bootstrap,
   isExpectedTrust,
   parseTrustList,
+  parseMaintainers,
   trustGithubArgs,
   versionAtLeast,
+  writePlaceholder,
 } from "./npm-bootstrap-trusted-publishing.mjs";
 import {
+  CLAIM_ONLY_NAMES,
   PUBLISHED_PACKAGES,
   RELEASE_ENVIRONMENT,
   RELEASE_WORKFLOW_FILE,
@@ -31,6 +35,7 @@ import {
 } from "./release-packages.mjs";
 
 const NAMES = PUBLISHED_PACKAGES.map((p) => p.name);
+const CLAIMS = CLAIM_ONLY_NAMES.map((c) => c.name);
 
 /** The trust config the release workflow needs, as `npm trust list --json` prints it. */
 const EXPECTED_TRUST = {
@@ -53,6 +58,7 @@ function fakeNpm({
   registry = {},
   failTrustCreate = false,
   viewError = null,
+  maintainersError = false,
 } = {}) {
   const calls = [];
   const placeholders = [];
@@ -74,7 +80,13 @@ function fakeNpm({
     if (cmd === "view") {
       if (viewError) return err(viewError);
       const pkg = registry[sub];
-      return pkg ? ok(JSON.stringify(pkg.versions)) : err("npm error code E404\n404 Not Found");
+      if (!pkg) return err("npm error code E404\n404 Not Found");
+      if (args[2] === "maintainers") {
+        return maintainersError
+          ? err("npm error code ECONNRESET")
+          : ok(JSON.stringify(pkg.maintainers ?? [`${user} <${user}@example.test>`]));
+      }
+      return ok(JSON.stringify(pkg.versions));
     }
     if (cmd === "publish") {
       const manifest = JSON.parse(readFileSync(join(sub, "package.json"), "utf8"));
@@ -110,17 +122,18 @@ function fakeNpm({
 }
 
 /** Run the bootstrap with captured log, a scripted confirm, and no real sleeping. */
-async function run(fake, { dryRun = false, answer = true } = {}) {
+async function run(fake, { dryRun = false, refreshTrust = false, answer = true } = {}) {
   const lines = [];
   const questions = [];
   const sleeps = [];
   const result = await bootstrap({
     dryRun,
+    refreshTrust,
     npm: fake.npm,
     log: (line) => lines.push(line),
     confirm: async (q) => {
       questions.push(q);
-      return answer;
+      return typeof answer === "function" ? answer(q) : answer;
     },
     sleep: async (ms) => {
       sleeps.push(ms);
@@ -129,10 +142,19 @@ async function run(fake, { dryRun = false, answer = true } = {}) {
   return { ...result, out: lines.join("\n"), questions, sleeps };
 }
 
-const configuredRegistry = () =>
-  Object.fromEntries(
+/** A registry where every release package is trusted and every claim-only name is ours. */
+const configuredRegistry = () => ({
+  ...Object.fromEntries(
     NAMES.map((n) => [n, { versions: ["0.1.0"], trust: [{ ...EXPECTED_TRUST }] }]),
-  );
+  ),
+  ...Object.fromEntries(CLAIMS.map((n) => [n, { versions: [PLACEHOLDER_VERSION], trust: [] }])),
+});
+
+/** The names a run passed to `npm trust` (any subcommand that changes state). */
+const trustTargets = (fake) =>
+  fake.calls
+    .filter(({ args }) => args[0] === "trust" && args[1] !== "list")
+    .map(({ args }) => args[2]);
 
 test("not logged in → fails with the `npm login` fix and writes nothing", async () => {
   const fake = fakeNpm({ user: null });
@@ -180,34 +202,43 @@ test("--dry-run on a fresh registry reports the plan and writes nothing, without
   assert.equal(exitCode, 0);
   assert.deepEqual(fake.writes(), []);
   assert.deepEqual(questions, []);
-  for (const name of NAMES) {
+  for (const name of [...NAMES, ...CLAIMS]) {
     assert.match(out, new RegExp(`\\[dry-run\\] npm publish <placeholder for ${name}>`));
   }
   assert.match(out, /Re-run without --dry-run/);
-  assert.match(out, /within 48 hours/);
+  // The release is on hold: expiry is explained, and no tag push is demanded.
+  assert.match(out, /No release is needed now/);
+  assert.match(out, /--refresh-trust/);
+  assert.doesNotMatch(out, /Cut the first real release/);
 });
 
 test("fresh registry: placeholders then trusted publishers, in release order, after confirmation", async () => {
   const fake = fakeNpm();
   const { exitCode, questions, sleeps, out } = await run(fake);
   assert.equal(exitCode, 0);
-  assert.equal(questions.length, 2, "one confirmation for placeholders, one for trust");
+  assert.equal(questions.length, 3, "one confirmation each: placeholders, trust, unscoped claims");
 
   const writes = fake.writes();
   const publishes = writes.filter(({ args }) => args[0] === "publish");
   const trusts = writes.filter(({ args }) => args[1] === "github");
   assert.deepEqual(
     fake.placeholders.map((p) => p.manifest.name),
-    NAMES,
-    "placeholders are published in dependency order",
+    [...NAMES, ...CLAIMS],
+    "release placeholders in dependency order, then the unscoped claims",
   );
   for (const p of fake.placeholders) {
+    const claimOnly = CLAIMS.includes(p.manifest.name);
     assert.equal(p.manifest.version, PLACEHOLDER_VERSION);
     assert.deepEqual(p.args.slice(2), ["--access", "public", "--tag", PLACEHOLDER_TAG]);
-    // A placeholder carries no package code — only a stub that points at real releases.
-    assert.equal(p.manifest.bin, undefined);
+    // A placeholder carries no package code, only a stub that points at the real package. A
+    // claim-only name also gets a same-named bin, so `npx <name>` hits the stub too.
+    assert.deepEqual(p.manifest.bin, claimOnly ? { [p.manifest.name]: "index.js" } : undefined);
     assert.equal(p.manifest.dependencies, undefined);
+    assert.equal(p.manifest.scripts, undefined);
     assert.equal(p.hasIndex, true);
+  }
+  for (const claim of CLAIMS) {
+    assert.ok(!trustTargets(fake).includes(claim), `${claim} must not get a trusted publisher`);
   }
   assert.ok(
     publishes.every((c) => c.interactive),
@@ -305,4 +336,103 @@ test("versionAtLeast compares numerically, not lexically", () => {
   assert.equal(versionAtLeast("12.0.0", "11.15.0"), true);
   assert.equal(versionAtLeast("11.5.1", "11.15.0"), false);
   assert.equal(versionAtLeast("11.9.9", "11.15.0"), false);
+});
+
+test("--dry-run also previews the unscoped claims, and never attaches trust to them", async () => {
+  const fake = fakeNpm();
+  await run(fake, { dryRun: true });
+  for (const claim of CLAIMS) {
+    assert.ok(!trustTargets(fake).includes(claim), `${claim} must not get a trusted publisher`);
+  }
+  assert.deepEqual(fake.writes(), []);
+});
+
+test("an unscoped name someone else owns is reported, not published over", async () => {
+  const registry = configuredRegistry();
+  registry["allw-hook"] = {
+    versions: ["9.9.9"],
+    trust: [],
+    maintainers: ["mallory <m@example.test>"],
+  };
+  const fake = fakeNpm({ registry });
+  const { exitCode, out, claimRows } = await run(fake);
+  assert.equal(exitCode, 0);
+  assert.deepEqual(fake.writes(), []);
+  assert.equal(claimRows.find((r) => r.name === "allw-hook").placeholder, "TAKEN by mallory");
+  assert.match(out, /belong to someone else[\s\S]*allw-hook \(mallory\)/);
+});
+
+test("declining only the claim prompt still reserves the release packages", async () => {
+  const fake = fakeNpm();
+  const { claimRows } = await run(fake, { answer: (q) => !/unscoped/.test(q) });
+  assert.deepEqual(
+    fake.placeholders.map((p) => p.manifest.name),
+    NAMES,
+  );
+  assert.ok(claimRows.every((r) => r.placeholder === "skipped (declined)"));
+});
+
+test("unreadable claim-name maintainers → fails closed and claims nothing", async () => {
+  const registry = configuredRegistry();
+  delete registry.allw;
+  const fake = fakeNpm({ registry, maintainersError: true });
+  const { exitCode } = await run(fake);
+  assert.equal(exitCode, 1);
+  assert.deepEqual(fake.writes(), []);
+});
+
+test("--refresh-trust revokes and recreates every trust config, after one confirmation", async () => {
+  const fake = fakeNpm({ registry: configuredRegistry() });
+  const { exitCode, questions, out } = await run(fake, { refreshTrust: true });
+  assert.equal(exitCode, 0);
+  assert.equal(questions.length, 1);
+  assert.deepEqual(
+    fake.writes().map(({ args }) => args.slice(0, 3)),
+    NAMES.flatMap((n) => [
+      ["trust", "revoke", n],
+      ["trust", "github", n],
+    ]),
+  );
+  assert.match(out, /Push the release tag within 48 hours/);
+  assert.doesNotMatch(out, /No release is needed now/);
+});
+
+test("claim-only placeholder: importing it and running its bin both throw a pointer to @allw", () => {
+  const dir = writePlaceholder({ name: "allw-hook", pointsTo: "@allw/hook" });
+  try {
+    const manifest = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+    assert.deepEqual(manifest.bin, { "allw-hook": "index.js" });
+    assert.equal(manifest.publishConfig, undefined, "unscoped packages are public by default");
+    const res = spawnSync(process.execPath, [join(dir, "index.js")], { encoding: "utf8" });
+    assert.notEqual(res.status, 0);
+    assert.match(res.stderr, /not an allw package[\s\S]*use @allw\/hook instead/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("release-package placeholder: no bin, scoped public access, import throws", () => {
+  const dir = writePlaceholder({ name: "@allw/sdk", dir: "packages/sdk" });
+  try {
+    const manifest = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+    assert.equal(manifest.bin, undefined);
+    assert.deepEqual(manifest.publishConfig, { access: "public" });
+    assert.equal(manifest.repository.directory, "packages/sdk");
+    const res = spawnSync(process.execPath, [join(dir, "index.js")], { encoding: "utf8" });
+    assert.notEqual(res.status, 0);
+    assert.match(res.stderr, /empty name-reservation placeholder/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("parseMaintainers reads both shapes npm prints", () => {
+  assert.deepEqual(parseMaintainers('["mike-north <m@example.test>", "other <o@example.test>"]'), [
+    "mike-north",
+    "other",
+  ]);
+  assert.deepEqual(parseMaintainers('[{"name":"mike-north","email":"m@example.test"}]'), [
+    "mike-north",
+  ]);
+  assert.deepEqual(parseMaintainers('"solo <s@example.test>"'), ["solo"]);
 });

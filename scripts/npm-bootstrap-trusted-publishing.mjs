@@ -6,6 +6,9 @@
  *
  *   node scripts/npm-bootstrap-trusted-publishing.mjs --dry-run   # see what it would do
  *   node scripts/npm-bootstrap-trusted-publishing.mjs             # do it (prompts before writes)
+ *   node scripts/npm-bootstrap-trusted-publishing.mjs --refresh-trust
+ *       # right before the first real release: revoke and recreate every trust config, because one
+ *       # that saw no publish within 48 hours has expired
  *
  * Why it exists: npm can only attach a trusted publisher (GitHub Actions OIDC) to a package that
  * already exists on the registry, and none of ours do yet. So, for each package in the release set
@@ -19,7 +22,10 @@
  *      mike-north/allw, workflow `release.yml`, environment `npm-publish`, permission `publish`. If a
  *      different trust config is already attached, it offers to revoke and replace it. If the CLI path
  *      fails, it prints the exact npmjs.com page and field values to enter by hand.
- *   3. Prints a checklist of what is done and what the human must still do.
+ *   3. Claims the unscoped names in CLAIM_ONLY_NAMES (`allw`, and every bin name `npx` could
+ *      resolve to a registry package) with the same kind of inert placeholder. Each is gated on its
+ *      own confirmation. They are name claims only and get no trusted publisher.
+ *   4. Prints a checklist of what is done and what the human must still do.
  *
  * Idempotent: every step first reads registry state and skips work that is already done, so re-running
  * is safe (and is the fix for a trust config that expired before its first publish).
@@ -44,6 +50,7 @@ import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 
 import {
+  CLAIM_ONLY_NAMES,
   NPM_SCOPE,
   PUBLISHED_PACKAGES,
   RELEASE_ENVIRONMENT,
@@ -137,32 +144,58 @@ export function manualTrustInstructions(name) {
   ].join("\n");
 }
 
-/** Write the placeholder package for `pkg` into a fresh temp dir; returns the dir. */
-export function writePlaceholder(pkg) {
+/**
+ * Write a placeholder package into a fresh temp dir and return the dir. There are two kinds:
+ *
+ * - a scoped release package (`{ name, dir }`): reserves the name so a trusted publisher can be
+ *   attached. Real versions replace it.
+ * - a claim-only name (`{ name, pointsTo }`): blocks squatting for good. Its `bin` (named after the
+ *   package, which is what `npx <name>` runs) throws too.
+ *
+ * Neither kind has dependencies or install scripts. Running or importing one only throws an error
+ * that points at the real package.
+ */
+export function writePlaceholder(entry) {
   const dir = mkdtempSync(join(tmpdir(), "allw-npm-placeholder-"));
   const repoUrl = `https://github.com/${TRUSTED_REPOSITORY}`;
+  const claimOnly = typeof entry.pointsTo === "string";
+  const message = claimOnly
+    ? `${entry.name} is a name reservation, not an allw package. The allw packages live under the ${NPM_SCOPE} scope — use ${entry.pointsTo} instead (npm install ${entry.pointsTo} / npx ${entry.pointsTo}).`
+    : `${entry.name}@${PLACEHOLDER_VERSION} is an empty name-reservation placeholder. Install a real release: npm install ${entry.name}@latest`;
   const manifest = {
-    name: pkg.name,
+    name: entry.name,
     version: PLACEHOLDER_VERSION,
-    description: `Name reservation for ${pkg.name}. Real releases are published from CI with provenance — see ${repoUrl}.`,
+    description: claimOnly
+      ? `Name reservation only. Not an allw package: use ${entry.pointsTo} (${repoUrl}).`
+      : `Name reservation for ${entry.name}. Real releases are published from CI with provenance — see ${repoUrl}.`,
     license: "MIT",
     main: "index.js",
+    ...(claimOnly && { bin: { [entry.name]: "index.js" } }),
     files: ["index.js", "README.md"],
-    repository: { type: "git", url: `git+${repoUrl}.git`, directory: pkg.dir },
-    publishConfig: { access: "public" },
+    repository: {
+      type: "git",
+      url: `git+${repoUrl}.git`,
+      ...(entry.dir && { directory: entry.dir }),
+    },
+    ...(entry.name.startsWith("@") && { publishConfig: { access: "public" } }),
   };
   writeFileSync(join(dir, "package.json"), `${JSON.stringify(manifest, null, 2)}\n`);
   writeFileSync(
     join(dir, "index.js"),
-    `throw new Error(${JSON.stringify(
-      `${pkg.name}@${PLACEHOLDER_VERSION} is an empty name-reservation placeholder. Install a real release: npm install ${pkg.name}@latest`,
-    )});\n`,
+    `#!/usr/bin/env node\nthrow new Error(${JSON.stringify(message)});\n`,
   );
   writeFileSync(
     join(dir, "README.md"),
-    `# ${pkg.name} (placeholder)\n\nThis version (\`${PLACEHOLDER_VERSION}\`) only reserves the package name so npm trusted publishing\ncan be configured. It contains no code. Install a real release instead: \`npm install ${pkg.name}@latest\`.\n\nSource and releases: ${repoUrl}\n`,
+    claimOnly
+      ? `# ${entry.name} (name reservation)\n\nThis is not an allw package and contains no code. It only stops someone else from\npublishing under this name. Use [\`${entry.pointsTo}\`](https://www.npmjs.com/package/${entry.pointsTo}) instead.\n\nSource: ${repoUrl}\n`
+      : `# ${entry.name} (placeholder)\n\nThis version (\`${PLACEHOLDER_VERSION}\`) only reserves the package name so npm trusted publishing\ncan be configured. It contains no code. Install a real release instead: \`npm install ${entry.name}@latest\`.\n\nSource and releases: ${repoUrl}\n`,
   );
   return dir;
+}
+
+/** The `npm publish` arguments for a placeholder written to `dir`. */
+export function placeholderPublishArgs(dir) {
+  return ["publish", dir, "--access", "public", "--tag", PLACEHOLDER_TAG];
 }
 
 /**
@@ -295,24 +328,78 @@ function registryVersions(npm, name) {
 }
 
 /**
+ * npm usernames of a package's maintainers. npm prints them as `"user <email>"` strings or as
+ * `{ name, email }` objects, depending on version.
+ */
+export function parseMaintainers(stdout) {
+  const parsed = JSON.parse(stdout || "[]");
+  return (Array.isArray(parsed) ? parsed : [parsed])
+    .map((m) => (typeof m === "string" ? m.split(/\s+</)[0] : m?.name))
+    .filter((m) => typeof m === "string" && m !== "");
+}
+
+/**
+ * Publish a placeholder for each of `rows` (all missing from the registry), after one confirmation.
+ * Sets each row's `placeholder` status. Returns false if any publish failed.
+ */
+async function publishPlaceholders({ rows, what, npm, confirm, log, dryRun }) {
+  if (rows.length === 0) return true;
+  if (dryRun) {
+    for (const row of rows) {
+      row.placeholder = "would publish placeholder";
+      log(
+        `  [dry-run] npm publish <placeholder for ${row.name}> --access public --tag ${PLACEHOLDER_TAG}`,
+      );
+    }
+    return true;
+  }
+  if (!(await confirm(`Publish ${rows.length} ${what} now?`))) {
+    for (const row of rows) row.placeholder = "skipped (declined)";
+    log(`Skipped: no ${what} published.`);
+    return true;
+  }
+  let ok = true;
+  for (const row of rows) {
+    const dir = writePlaceholder(row);
+    try {
+      if (npm(placeholderPublishArgs(dir), { interactive: true }).status === 0) {
+        row.placeholder = "placeholder published";
+        row.versions = [PLACEHOLDER_VERSION];
+        log(`✓ published ${row.name}@${PLACEHOLDER_VERSION}`);
+      } else {
+        ok = false;
+        row.placeholder = "placeholder publish FAILED";
+        log(`✗ npm publish failed for ${row.name}`);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  return ok;
+}
+
+/**
  * Run the bootstrap. Every side effect goes through the injected `npm` / `confirm` / `log` /
  * `sleep`, so tests can drive it without a registry. Returns the per-package rows and exit code.
  */
 export async function bootstrap({
   dryRun = false,
+  refreshTrust = false,
   npm = defaultNpm,
   confirm = defaultConfirm,
   log = (line) => console.log(line),
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   root = REPO_ROOT,
   packages = PUBLISHED_PACKAGES,
+  claims = CLAIM_ONLY_NAMES,
 } = {}) {
   const mode = dryRun ? " (dry run — no changes will be made)" : "";
   log(`npm trusted-publishing bootstrap for ${TRUSTED_REPOSITORY}${mode}\n`);
 
-  log("[1/3] preconditions");
+  log("[1/4] preconditions");
+  let user;
   try {
-    checkPreconditions({ npm, log, root, packages });
+    user = checkPreconditions({ npm, log, root, packages });
   } catch (err) {
     if (err instanceof PreconditionError) {
       log(`\n✗ ${err.message}`);
@@ -325,7 +412,7 @@ export async function bootstrap({
   const rows = packages.map((p) => ({ ...p, versions: null, placeholder: "", trust: "" }));
   let failed = false;
 
-  log("\n[2/3] reserve package names");
+  log("\n[2/4] reserve the release package names");
   try {
     for (const row of rows) row.versions = registryVersions(npm, row.name);
   } catch (err) {
@@ -348,40 +435,18 @@ export async function bootstrap({
         `\nEach will get an empty name-reservation placeholder ${code(PLACEHOLDER_VERSION)} under dist-tag "${PLACEHOLDER_TAG}",\n` +
         `published from this machine as you. It contains no code; real versions come from CI.`,
     );
-    if (dryRun) {
-      for (const row of missing) {
-        row.placeholder = "would publish placeholder";
-        log(
-          `  [dry-run] npm publish <placeholder for ${row.name}> --access public --tag ${PLACEHOLDER_TAG}`,
-        );
-      }
-    } else if (await confirm(`Publish ${missing.length} placeholder package(s) now?`)) {
-      for (const row of missing) {
-        const dir = writePlaceholder(row);
-        try {
-          const res = npm(["publish", dir, "--access", "public", "--tag", PLACEHOLDER_TAG], {
-            interactive: true,
-          });
-          if (res.status === 0) {
-            row.placeholder = "placeholder published";
-            row.versions = [PLACEHOLDER_VERSION];
-            log(`✓ published ${row.name}@${PLACEHOLDER_VERSION}`);
-          } else {
-            failed = true;
-            row.placeholder = "placeholder publish FAILED";
-            log(`✗ npm publish failed for ${row.name}`);
-          }
-        } finally {
-          rmSync(dir, { recursive: true, force: true });
-        }
-      }
-    } else {
-      for (const row of missing) row.placeholder = "skipped (declined)";
-      log("Skipped: no placeholders published.");
-    }
   }
+  const reserved = await publishPlaceholders({
+    rows: missing,
+    what: "release-package placeholder(s)",
+    npm,
+    confirm,
+    log,
+    dryRun,
+  });
+  if (!reserved) failed = true;
 
-  log("\n[3/3] trusted publishers");
+  log("\n[3/4] trusted publishers (release packages only)");
   const toCreate = [];
   for (const row of rows) {
     if (row.versions === null) {
@@ -402,7 +467,11 @@ export async function bootstrap({
       log(`  ${row.name}: reading trust configs needs 2FA — showing them interactively:`);
       const shown = npm(["trust", "list", row.name], { interactive: true });
       const expected = `repository ${TRUSTED_REPOSITORY}, file ${RELEASE_WORKFLOW_FILE}, environment ${RELEASE_ENVIRONMENT}`;
-      if (shown.status === 0 && (await confirm(`Does the output above show ${expected}?`))) {
+      if (
+        !refreshTrust &&
+        shown.status === 0 &&
+        (await confirm(`Does the output above show ${expected}?`))
+      ) {
         row.trust = "configured";
         continue;
       }
@@ -416,6 +485,12 @@ export async function bootstrap({
       continue;
     }
     const configs = parseTrustList(list.stdout);
+    if (refreshTrust && configs.length > 0) {
+      // A config that saw no publish within 48 hours of creation has expired, but may still be
+      // listed. Recreate them all so the release about to run gets a fresh window.
+      toCreate.push({ row, replace: configs });
+      continue;
+    }
     if (configs.some(isExpectedTrust)) {
       row.trust = "configured";
       log(`✓ ${row.name}: trusted publisher already configured`);
@@ -473,8 +548,54 @@ export async function bootstrap({
     }
   }
 
-  printChecklist({ rows, log, dryRun });
-  return { exitCode: failed ? 1 : 0, rows };
+  log("\n[4/4] claim the unscoped names (anti-squatting; never released)");
+  /** @type {Array<{name: string, pointsTo: string, versions: string[] | null, placeholder: string, owner: string}>} */
+  const claimRows = claims.map((c) => ({ ...c, versions: null, placeholder: "", owner: "" }));
+  try {
+    for (const row of claimRows) {
+      row.versions = registryVersions(npm, row.name);
+      if (row.versions === null) continue;
+      const res = npm(["view", row.name, "maintainers", "--json"]);
+      if (res.status !== 0) {
+        throw new PreconditionError(`could not read the maintainers of ${row.name}`);
+      }
+      const maintainers = parseMaintainers(res.stdout);
+      row.owner = maintainers.includes(user) ? "you" : maintainers.join(", ") || "unknown";
+      row.placeholder = row.owner === "you" ? "claimed (yours)" : `TAKEN by ${row.owner}`;
+      log(
+        row.owner === "you"
+          ? `✓ ${row.name} already claimed by you`
+          : `! ${row.name} is owned by ${row.owner}`,
+      );
+    }
+  } catch (err) {
+    // Fail closed: an unreadable registry is never treated as "free to claim".
+    if (!(err instanceof PreconditionError)) throw err;
+    failed = true;
+    log(`✗ ${err.message}`);
+    for (const row of claimRows) if (row.placeholder === "") row.placeholder = "could not read";
+  }
+  const unclaimed = claimRows.filter((r) => r.versions === null && r.placeholder === "");
+  if (unclaimed.length > 0) {
+    log(
+      `These unscoped names are free. Anyone could publish them, and \`npx <name>\` would run that code:\n` +
+        unclaimed.map((r) => `  - ${r.name} (placeholder points at ${r.pointsTo})`).join("\n") +
+        `\nEach will get an inert placeholder ${code(PLACEHOLDER_VERSION)} (dist-tag "${PLACEHOLDER_TAG}") whose import and\n` +
+        `bin only throw an error pointing at the ${NPM_SCOPE} package. No trusted publisher is attached to these.`,
+    );
+  }
+  const claimed = await publishPlaceholders({
+    rows: unclaimed,
+    what: "unscoped name-claim placeholder(s)",
+    npm,
+    confirm,
+    log,
+    dryRun,
+  });
+  if (!claimed) failed = true;
+
+  printChecklist({ rows, claimRows, log, dryRun, refreshTrust });
+  return { exitCode: failed ? 1 : 0, rows, claimRows };
 }
 
 /** Inline-code helper for log text. */
@@ -482,11 +603,16 @@ function code(text) {
   return `\`${text}\``;
 }
 
-function printChecklist({ rows, log, dryRun }) {
-  const width = Math.max(...rows.map((row) => row.name.length));
+function printChecklist({ rows, claimRows, log, dryRun, refreshTrust }) {
+  const width = Math.max(...[...rows, ...claimRows].map((row) => row.name.length));
   log("\nSummary");
   for (const row of rows) {
     log(`  ${row.name.padEnd(width)}  npm: ${row.placeholder.padEnd(26)}  trust: ${row.trust}`);
+  }
+  for (const row of claimRows) {
+    log(
+      `  ${row.name.padEnd(width)}  npm: ${row.placeholder.padEnd(26)}  trust: none (claim only)`,
+    );
   }
 
   const todo = [];
@@ -504,14 +630,28 @@ function printChecklist({ rows, log, dryRun }) {
       "Some packages are not configured yet (see above) — fix the cause and re-run this script.",
     );
   }
-  if (newTrust || dryRun) {
+  const taken = claimRows.filter((row) => row.placeholder.startsWith("TAKEN"));
+  if (taken.length > 0) {
     todo.push(
-      "Cut the first real release within 48 hours — npm expires a trusted-publisher config that has not\n" +
-        "     completed a publish in that window (re-running this script recreates an expired one):\n" +
-        "       node scripts/release-packages.mjs verify v<version>   # lockstep version check\n" +
-        "       git tag v<version> <commit on main> && git push https://github.com/mike-north/allw.git v<version>",
+      `These unscoped names belong to someone else, so \`npx <name>\` runs their code. Check who owns them, and\n` +
+        `     consider renaming the matching bins: ${taken.map((row) => `${row.name} (${row.owner})`).join(", ")}`,
     );
   }
+  if (refreshTrust && !dryRun && allTrusted) {
+    todo.push(
+      "The trust configs are fresh. Push the release tag within 48 hours, before they expire\n" +
+        "     (docs/releasing.md → Cutting a release).",
+    );
+  } else if (newTrust || dryRun) {
+    todo.push(
+      "No release is needed now. npm expires a trusted-publisher config that has not completed a publish\n" +
+        "     within 48 hours, so the configs made today will lapse while the release is on hold. That is\n" +
+        "     expected. Right before the first real release, recreate them:\n" +
+        "       node scripts/npm-bootstrap-trusted-publishing.mjs --refresh-trust\n" +
+        "     then push the release tag within 48 hours (docs/releasing.md → Cutting a release).",
+    );
+  }
+
   todo.push(
     `Recommended: protect the "${RELEASE_ENVIRONMENT}" GitHub environment (required reviewer, deployment\n` +
       `     from \`v*\` tags only): https://github.com/${TRUSTED_REPOSITORY}/settings/environments`,
@@ -519,7 +659,7 @@ function printChecklist({ rows, log, dryRun }) {
   const placeholders = rows.filter((row) => row.versions?.includes(PLACEHOLDER_VERSION));
   if (placeholders.length > 0) {
     todo.push(
-      "After the first CI release succeeds, deprecate the placeholders:\n" +
+      "After the first CI release succeeds, deprecate the release-package placeholders:\n" +
         placeholders
           .map(
             (row) =>
@@ -538,10 +678,16 @@ function printChecklist({ rows, log, dryRun }) {
 
 function usage() {
   return [
-    "usage: node scripts/npm-bootstrap-trusted-publishing.mjs [--dry-run]",
+    "usage: node scripts/npm-bootstrap-trusted-publishing.mjs [--dry-run] [--refresh-trust]",
     "",
-    "Reserves the @allw/* package names on npm (placeholder) and attaches the GitHub Actions",
-    "trusted publisher for .github/workflows/release.yml. Run after `npm login`. Safe to re-run.",
+    "Reserves the @allw/* package names on npm (placeholder), attaches the GitHub Actions trusted",
+    "publisher for .github/workflows/release.yml, and claims the unscoped names (allw, allw-hook, …)",
+    "against squatting. Run after `npm login`. Safe to re-run.",
+    "",
+    "  --dry-run        report what would happen; change nothing",
+    "  --refresh-trust  revoke and recreate every trust config (run right before the first release,",
+    "                   since configs that saw no publish within 48 hours expire)",
+    "",
     "See docs/releasing.md.",
   ].join("\n");
 }
@@ -552,11 +698,14 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     console.log(usage());
     process.exit(0);
   }
-  const unknown = args.filter((a) => a !== "--dry-run");
+  const unknown = args.filter((a) => a !== "--dry-run" && a !== "--refresh-trust");
   if (unknown.length > 0) {
     console.error(`unknown argument(s): ${unknown.join(" ")}\n\n${usage()}`);
     process.exit(2);
   }
-  const { exitCode } = await bootstrap({ dryRun: args.includes("--dry-run") });
+  const { exitCode } = await bootstrap({
+    dryRun: args.includes("--dry-run"),
+    refreshTrust: args.includes("--refresh-trust"),
+  });
   process.exit(exitCode);
 }
