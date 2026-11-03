@@ -243,19 +243,26 @@ Three bindings are declared under `"ratelimits"` in `packages/relay/wrangler.jso
 **and** under `env.production` (named environments do not inherit them). The client identity is
 `CF-Connecting-IP`, with an IPv6 address reduced to its /64:
 
-| Binding               | Routes                                                           | Key                 | Default      |
-| --------------------- | ---------------------------------------------------------------- | ------------------- | ------------ |
-| `RATE_LIMIT_CLIENT`   | `POST /{acct}/pairing/start`, `…/pairing/complete`, `…/requests` | client IP           | 120 per 60 s |
-| `RATE_LIMIT_PAIRING`  | `POST /{acct}/pairing/start`, `…/pairing/complete`               | account + client IP | 10 per 60 s  |
-| `RATE_LIMIT_REQUESTS` | `POST /{acct}/requests`                                          | account + client IP | 60 per 60 s  |
+| Binding               | Routes                                                                               | Key                 | Default      |
+| --------------------- | ------------------------------------------------------------------------------------ | ------------------- | ------------ |
+| `RATE_LIMIT_CLIENT`   | `POST /{acct}/pairing/start`, `…/pairing/complete`, `…/account-states`, `…/requests` | client IP           | 120 per 60 s |
+| `RATE_LIMIT_PAIRING`  | `POST /{acct}/pairing/start`, `…/pairing/complete`, `…/account-states`               | account + client IP | 10 per 60 s  |
+| `RATE_LIMIT_REQUESTS` | `POST /{acct}/requests`                                                              | account + client IP | 60 per 60 s  |
 
 The per-client binding is checked first, so minting fresh account ids does not buy a client new
 budget. That per-IP budget is shared by every client behind one address (a corporate NAT, a CGNAT
 pool, an IPv6 /64), so a busy office can exhaust it; raise `RATE_LIMIT_CLIENT`'s `limit` for such
-deployments. Tune `simple.limit` (and `period`, which must be `10` or `60`) per environment; keep the
-binding names. Each `namespace_id` must be unique within your Cloudflare account. **If a binding is
-missing the routes it covers fail closed with 503**, so a deploy that drops the block takes pairing
-and submission offline rather than running unlimited.
+deployments. Tune `simple.limit` per environment and keep the binding names. Keep `period` at `60`:
+a 429's `Retry-After` is the relay's `RATE_LIMIT_PERIOD_SECONDS` (60), not read from the binding,
+and a test pins every committed binding to it. **If a binding is missing the routes it covers fail
+closed with 503**, so a deploy that drops the block takes pairing, account-state publish and
+submission offline rather than running unlimited.
+
+A `namespace_id` identifies one rate-limiting namespace within your Cloudflare account, and every
+binding that names it shares its counters. The top-level and `env.production` blocks reuse the same
+three ids on purpose: both describe the same Worker (`allw-relay`), and the counters are keyed by
+account id and client IP, so sharing them is correct. An environment that deploys a Worker under a
+different `name` (a staging Worker, say) needs its own ids, or it shares production's budgets.
 
 Workers rate limiting is per Cloudflare location and eventually consistent, so treat it as flood
 damping. What the other limits bound (`docs/relay-api.md` §3 Integrator endpoints):
