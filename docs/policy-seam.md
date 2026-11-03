@@ -142,9 +142,10 @@ knows no PowerShell commands, risk is at least `medium`, and at least `high` whe
 than one command, runs one T1 can't read, or builds one at run time (uncertain ⇒ upward): `;`, `|`, `&`, a line break,
 a backtick, `(` or `{`, `[scriptblock]` or `.Invoke`, a command word that runs other code (`iex`, `Invoke-Expression`,
 `Invoke-Command` / `icm`, `Start-Process` / `start` / `saps`, `Start-Job` / `sajb`, `powershell`, `pwsh`, `cmd`), a
-program named like PowerShell itself (a name starting `pwsh` or `powershell` after any path and quotes, such as
-`pwsh-preview` or `powershell_ise`), an `-EncodedCommand` parameter or any prefix of it (or `-ec`) led by `-`, `/` or a
-Unicode dash (U+2013, U+2014, U+2015) and possibly inside one layer of quotes (#328), or dot-sourcing (a leading `.`
+program named like PowerShell itself (a name starting `pwsh` or `powershell` after any path, with its quotes removed,
+such as `pwsh-preview`, `powershell_ise` or `p''wsh`), an `-EncodedCommand` parameter or any prefix of it (or `-ec`) led
+by one or two of `-`, `/` and the Unicode dashes U+2013, U+2014, U+2015, with every quote character in the token
+ignored (`'-enc'`, `-"enc"`, `-e''nc`, #328), or dot-sourcing (a leading `.`
 word, or `.` directly followed by a quoted or variable path such as `.'x.ps1'`). There is no PowerShell field on the
 record and no schema change: surfaces label the line for the human in the summary (`PowerShell: <command>`). The
 other substrate fields come from the command builder's T1 scans of the tokens and `raw`, so they can disagree with
