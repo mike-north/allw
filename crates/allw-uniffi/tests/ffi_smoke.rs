@@ -849,3 +849,49 @@ fn uniffi_signed_note_is_bound_to_the_verdict() {
     let err = verify(&added).expect_err("an injected note must fail");
     assert!(format!("{err:?}").contains("note"), "got {err:?}");
 }
+
+// ── Display safety (#246) ─────────────────────────────────────────────────────
+
+/// The native surface gets the same escaped display model as WASM: the #246 ESC/CR spoof and a
+/// bidi override come back as visible escapes with the warning flag set.
+#[test]
+fn display_model_json_escapes_untrusted_context_text() {
+    let context = json!({
+        "action": {
+            "record_schema_version": 1,
+            "surface": "command",
+            "syntactic": { "raw": "rm -rf ~/x; : \u{1b}[2K\rgit status" },
+            "risk": "high"
+        },
+        "summary": "check \u{202E}status",
+        "actor": { "id": "actor-1", "kind": "agent" },
+        "risk": "high",
+        "reversible": false,
+        "constraints": { "allowed_decisions": ["approved", "denied"], "challenge_required": false }
+    });
+
+    let model: serde_json::Value =
+        serde_json::from_str(&allw_uniffi::display_model_json(context.to_string()).unwrap())
+            .unwrap();
+
+    assert_eq!(
+        model["syntactic"]["raw"],
+        "rm -rf ~/x; : \\x1b[2K\\rgit status"
+    );
+    assert_eq!(model["summary"], "check ⟨U+202E⟩status");
+    assert_eq!(model["has_hidden_or_control_chars"], true);
+}
+
+/// Malformed context JSON is an error, never a partially-escaped model.
+#[test]
+fn display_model_json_rejects_malformed_context() {
+    assert!(allw_uniffi::display_model_json("{\"summary\":1}".to_string()).is_err());
+}
+
+#[test]
+fn escape_for_display_matches_core_notation() {
+    assert_eq!(
+        allw_uniffi::escape_for_display("a\u{1b}b\u{200B}".to_string()),
+        "a\\x1bb⟨U+200B⟩"
+    );
+}

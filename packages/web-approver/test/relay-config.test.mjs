@@ -72,7 +72,7 @@ describe("checkRelayUrl", () => {
     });
   });
 
-  for (const loopback of ["http://localhost:8787", "http://127.0.0.1:8787", "http://[::1]:8787"]) {
+  for (const loopback of ["http://localhost:8787", "http://127.0.0.1:8787"]) {
     test(`accepts plaintext http:// on loopback (${loopback})`, () => {
       assert.deepEqual(checkRelayUrl(loopback), { ok: true, relayUrl: loopback });
     });
@@ -83,7 +83,14 @@ describe("checkRelayUrl", () => {
     assert.equal(checked.ok, false);
     assert.equal(checked.reason, INSECURE_RELAY_URL_REASON);
     assert.match(checked.reason, /https:\/\//);
-    assert.match(checked.reason, /localhost, 127\.0\.0\.1, or \[::1\]/);
+    assert.match(checked.reason, /localhost or 127\.0\.0\.1/);
+  });
+
+  test("rejects http://[::1] and points to 127.0.0.1 (a CSP cannot list the IPv6 loopback)", () => {
+    const checked = checkRelayUrl("http://[::1]:8787");
+    assert.equal(checked.ok, false);
+    assert.equal(checked.reason, INSECURE_RELAY_URL_REASON);
+    assert.match(checked.reason, /use 127\.0\.0\.1 rather than \[::1\]/);
   });
 
   test("rejects http:// to a host that merely starts with 'localhost'", () => {
