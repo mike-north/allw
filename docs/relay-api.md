@@ -549,13 +549,19 @@ cut off at once.
 
 Integrator submission fans out **request-id-only** wakeups (no context, not E2EE) to registered
 tokens. APNs payload: `{ "aps": { "content-available": 1 }, "request_id": "…" }`. The device wakes,
-then fetches the full envelope via the socket or `/inbox`.
+then fetches its **whole inbox** via the socket or `/inbox`, which returns every pending request
+with its full envelope.
+
+**A wakeup's `request_id` is advisory.** It names a request that prompted the wakeup, not the only
+one to show: one wakeup can stand for several submits (see Coalescing below), and the request it
+names may already have ended. A device must not resolve a wakeup by its id alone (for example, by
+fetching only that request); it fetches its inbox and shows every pending request there.
 
 **Fan-out is off the response path.** The submit returns as soon as the request is stored; wakeups
 are sent afterwards (at most 4 in flight, each push-service request bounded by a 5 s timeout), so a
 slow, hung, or failing push service can never delay or fail a submit. Consequently `push_wakeups` in
 the submit response is the number of wakeups **scheduled** (tokens with a configured transport, up to
-the 32-token account budget, newest registrations first, minus coalesced Web Push wakeups), not the
+the 32-token account budget, newest registrations first, minus coalesced wakeups), not the
 number delivered.
 
 **Pruning, APNs and FCM.** A token is deleted only when its push service says it is no longer valid:
@@ -608,29 +614,39 @@ and timeouts are transient and not logged.
   are collapsed on the device instead: the web approver's service worker shows them under one
   fixed notification `tag` (#237).
 
-- **Coalescing.** At most one wakeup per subscription (device id + endpoint) is sent per **30 s**
-  (`WEB_PUSH_COALESCE_MS`): a submit that finds a wakeup to that subscription in flight, or sent
-  within the window, skips it. This bounds push volume per subscription however fast unauthenticated
-  submits arrive (#248). The time of each subscription's last wakeup is stored on its token row, so
-  the bound also holds when the Durable Object hibernates or is evicted inside the window (#319).
-  Removing the subscription removes its claim too. A stored claim dated in the future (a clock
-  anomaly on the host that wrote it) counts as made now, so it blocks the subscription for one
-  window at most.
-- **Trailing wakeup.** A skipped submit may have landed after the service worker already fetched its
+- **Coalescing (every transport).** At most one wakeup per push token (transport + device id +
+  token: a Web Push subscription endpoint, an APNs device token or an FCM registration token) is sent
+  per **30 s** (`PUSH_COALESCE_MS`): a submit that finds a wakeup to that token in flight, or sent
+  within the window, skips it. This bounds push volume per token however fast unauthenticated
+  submits arrive, and so per account to the 32-token budget × one wakeup per window (#248). The
+  time of each token's last wakeup is stored on its token row, so the bound also holds when the
+  Durable Object hibernates or is evicted inside the window (#319). Removing the token removes its
+  claim too. A stored claim dated in the future (a clock anomaly on the host that wrote it) counts as
+  made now, so it blocks the token for one window at most.
+- **Trailing wakeup.** A skipped submit may have landed after the device already fetched its
   inbox for the earlier wakeup, so the skip alone could leave that request with no push at all
-  (#313). The relay therefore records the subscription as owed a wakeup. A request whose submit was
+  (#313). The relay therefore records the token as owed a wakeup. A request whose submit was
   skipped keeps its owed wakeup until a later wakeup is accepted: a wakeup claimed after the window
   clears it once the push service answers 2xx, unless another submit was skipped while that wakeup
-  was in flight. If none is accepted by the end of the window, the subscription gets **one**
+  was in flight. If none is accepted by the end of the window, the token gets **one**
   trailing send, however many submits were skipped, and that trailing send is not retried. A failed
   wakeup for the submit that claimed it is not retried (#333). The trailing wakeup is held to the
   same one-per-window bound, so it still respects an in-flight wakeup. Its own due time is stored,
   so it is never sent less than one window after the claim it trails, even across eviction. It is
-  dropped when no request is pending by then or the subscription is gone. Like every wakeup, its
+  dropped when no request is pending by then or the token is gone. Like every wakeup, its
   `TTL` covers the longest-lived pending request. Because the window starts at dispatch, every
   request gets a wakeup **attempt** after it was stored, within about 30 s (a slow fan-out can
   stretch that by its send timeouts). The owed wakeups are stored durably and sent from the
   account's alarm, so they survive the Durable Object hibernating or being evicted.
+
+  This applies to every transport. Because a native wakeup carries a `request_id`, its trailing wakeup carries the id of the
+  **latest** submit the window skipped (ties go to the newer submit), as long as that request is
+  still pending and unexpired when the wakeup is sent. Otherwise, and for a row owed before the
+  relay recorded that id, it carries the longest-lived pending request's id. Either way the id is
+  advisory (above). Owed wakeups are kept per transport, so one string registered under two
+  transports owes each its own. An owed wakeup is dropped without sending when its token is
+  unregistered or its transport is no longer configured.
+
 - **VAPID public key.** Clients subscribe with the key from `GET /.well-known/allw/vapid-public-key`
   (§3).
 - **Pruning.** When the push service answers **404 or 410** (the subscription is gone), the relay
