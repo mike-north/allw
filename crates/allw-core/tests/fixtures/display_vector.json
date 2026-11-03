@@ -21,13 +21,13 @@
     },
     {
       "class": "DEL",
-      "input": "x\u007fy",
+      "input": "xy",
       "escaped": "x\\x7fy",
       "has_hidden_or_control_chars": true
     },
     {
       "class": "C1 controls",
-      "input": "\u0080\u0085\u009b\u009f",
+      "input": "",
       "escaped": "⟨U+0080⟩⟨U+0085⟩⟨U+009B⟩⟨U+009F⟩",
       "has_hidden_or_control_chars": true
     },
@@ -66,6 +66,42 @@
       "input": "rm -rf ~/x; : \u001b[2K\rgit status ‮exe.​txt",
       "escaped": "rm -rf ~/x; : \\x1b[2K\\rgit status ⟨U+202E⟩exe.⟨U+200B⟩txt",
       "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "variation selector run after an emoji (smuggling): only the first selector is shown",
+      "input": "Looks fine 😀️︁󠄀󠇯",
+      "escaped": "Looks fine 😀️⟨U+FE01⟩⟨U+E0100⟩⟨U+E01EF⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "variation selector after ASCII",
+      "input": "main️",
+      "escaped": "main⟨U+FE0F⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "emoji presentation (one VS-16 after a non-ASCII base)",
+      "input": "⚠️ careful",
+      "escaped": "⚠️ careful",
+      "has_hidden_or_control_chars": false
+    },
+    {
+      "class": "emoji keycap (ASCII digit, VS-16, U+20E3)",
+      "input": "1️⃣ #️⃣",
+      "escaped": "1️⃣ #️⃣",
+      "has_hidden_or_control_chars": false
+    },
+    {
+      "class": "CJK ideographic variation sequence",
+      "input": "葛󠄀",
+      "escaped": "葛󠄀",
+      "has_hidden_or_control_chars": false
+    },
+    {
+      "class": "braille pattern blank",
+      "input": "rm⠀-rf⠀/",
+      "escaped": "rm⟨U+2800⟩-rf⟨U+2800⟩/",
+      "has_hidden_or_control_chars": true
     }
   ],
   "display_model_case": {
@@ -82,10 +118,16 @@
         "risk": "critical"
       },
       "summary": "check git status",
-      "actor": { "id": "machine:ci​", "kind": "claude-code" },
+      "actor": {
+        "id": "machine:ci​",
+        "kind": "claude-code"
+      },
       "risk": "critical",
       "reversible": false,
-      "constraints": { "allowed_decisions": ["approved", "denied"], "challenge_required": false }
+      "constraints": {
+        "allowed_decisions": ["approved", "denied"],
+        "challenge_required": false
+      }
     },
     "expected": {
       "surface": "command",
@@ -99,7 +141,8 @@
         "bin": "rm",
         "argv": ["rm", "-rf", "~/x;", ":", "\\x1b[2K\\rgit", "status"],
         "cwd": "/home/dev/⟨U+202E⟩ppa",
-        "raw": "rm -rf ~/x; : \\x1b[2K\\rgit status"
+        "raw": "rm -rf ~/x; : \\x1b[2K\\rgit status",
+        "raw_lines": ["rm -rf ~/x; : \\x1b[2K\\rgit status"]
       },
       "has_hidden_or_control_chars": true
     }

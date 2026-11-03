@@ -65,7 +65,7 @@ pub use crypto::{
 };
 pub use display::{
     display_model, escape_for_display, has_hidden_or_control_chars, is_hidden_or_control_char,
-    DisplayModel, DisplaySubstrate,
+    is_variation_selector, DisplayModel, DisplaySubstrate, CRLF_MARKER, TAB_MARKER,
 };
 pub use file_edit::action_from_file_edit;
 pub use hash::{canonical_request_bytes, compute_request_hash};

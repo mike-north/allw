@@ -22,10 +22,38 @@
 //! - **zero-width / invisible** U+200B–U+200D, U+2060, U+FEFF;
 //! - the rest of Unicode's `Default_Ignorable_Code_Point` set (soft hyphen U+00AD, U+034F, Hangul
 //!   fillers, U+2061–U+2064 invisible operators, U+206A–U+206F, tag characters U+E0000–U+E007F,
-//!   …) **except variation selectors**, which only pick a glyph form (emoji presentation) and
-//!   cannot hide or reorder text; and
+//!   …), with variation selectors handled by context (below);
 //! - **line/paragraph separators** U+2028, U+2029 and the interlinear-annotation controls
-//!   U+FFF9–U+FFFB, which break or hide lines in some renderers.
+//!   U+FFF9–U+FFFB, which break or hide lines in some renderers; and
+//! - **U+2800 BRAILLE PATTERN BLANK**, which renders as an empty cell but is neither whitespace nor
+//!   default-ignorable, so `rm⠀-rf⠀/` would otherwise read as three tokens.
+//!
+//! ## Variation selectors
+//!
+//! Variation selectors (U+FE00–U+FE0F, U+E0100–U+E01EF, Mongolian U+180B–U+180D and U+180F) are
+//! invisible, and a run of them can encode an arbitrary hidden payload (each selector carries a
+//! byte — "emoji smuggling"). A selector after ASCII has no glyph to select, so `main` + U+FE0F
+//! looks exactly like `main`. A selector is therefore escaped **unless** it is
+//!
+//! - the **first** selector directly after a non-ASCII base character that is itself shown as-is
+//!   (not escaped, not a selector, not a combining diacritical mark), as in `⚠️` (U+26A0 U+FE0F) or a
+//!   CJK ideographic variation sequence; or
+//! - U+FE0F inside an emoji keycap: ASCII `0`–`9`, `#` or `*`, then U+FE0F, then U+20E3 (`1️⃣`).
+//!
+//! Every other selector — the second and later in a run, one after ASCII, one after a combining
+//! mark — is escaped and sets the flag. A legitimate emoji or CJK sequence therefore never warns,
+//! and a smuggling run can carry at most one hidden selector per visible base character.
+//!
+//! # Structure inside multi-line content
+//!
+//! `raw` is multi-line content: a shell command with a heredoc, or a file edit. In
+//! [`DisplaySubstrate::raw_lines`] a line feed is **structure** (the content is split on it), a TAB
+//! renders as [`TAB_MARKER`], and a CR directly before a line feed renders as [`CRLF_MARKER`].
+//! None of these set the flag: once ESC and lone CRs are escaped, a TAB or a line ending cannot
+//! overwrite or hide anything, and flagging every Go edit or heredoc commit would train humans to
+//! ignore the warning. Everywhere else — single-line fields (argv tokens, `bin`, flags, `cwd`, ids,
+//! the summary) and the single-line [`DisplaySubstrate::raw`] — TAB, LF and CR are escaped and set
+//! the flag, because they have no business there.
 //!
 //! # Notation
 //!
@@ -33,6 +61,7 @@
 //! - Every other C0 control and DEL renders as `\xHH` with lowercase hex (ESC → `\x1b`).
 //! - Everything else renders as `⟨U+XXXX⟩` with at least four uppercase hex digits
 //!   (U+202E → `⟨U+202E⟩`, U+E0041 → `⟨U+E0041⟩`).
+//! - In `raw_lines` only: TAB → [`TAB_MARKER`], CR before LF → [`CRLF_MARKER`] (no flag).
 //!
 //! The notation is not injective against *literal* text: a string containing the four printable
 //! characters `\x1b` displays the same as one containing an ESC byte. That is why every model
@@ -103,24 +132,124 @@ pub fn is_hidden_or_control_char(c: char) -> bool {
             // Shorthand format controls; musical symbol format controls.
             | '\u{1BCA0}'..='\u{1BCA3}'
             | '\u{1D173}'..='\u{1D17A}'
+            // Braille pattern blank: an empty-looking cell that is neither whitespace nor
+            // default-ignorable.
+            | '\u{2800}'
             // Tag characters and the surrounding default-ignorable planes (variation selectors
-            // U+E0100–U+E01EF are deliberately excluded).
+            // U+E0100–U+E01EF are handled by context; see `is_variation_selector`).
             | '\u{E0000}'..='\u{E00FF}'
             | '\u{E01F0}'..='\u{E0FFF}'
     )
 }
 
-/// Whether `text` contains any character [`escape_for_display`] would escape.
+/// Whether `c` is a variation selector (U+FE00–U+FE0F, U+E0100–U+E01EF, Mongolian U+180B–U+180D,
+/// U+180F).
+///
+/// Variation selectors are escaped by context rather than unconditionally: the first selector after
+/// a non-ASCII base shows as-is (emoji presentation, CJK variants); every other one is escaped. See
+/// the module docs, "Variation selectors".
+pub fn is_variation_selector(c: char) -> bool {
+    matches!(
+        c,
+        '\u{180B}'..='\u{180D}' | '\u{180F}' | '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}'
+    )
+}
+
+/// The combining-diacritical-mark blocks. A variation selector after one of these has no base glyph
+/// of its own to select, so it is escaped like one after ASCII. This is a block-level check, not the
+/// full `Mn`/`Me` category; it exists so a run of accents cannot each carry a hidden selector.
+fn is_combining_diacritic(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0300}'..='\u{036F}'
+            | '\u{1AB0}'..='\u{1AFF}'
+            | '\u{1DC0}'..='\u{1DFF}'
+            | '\u{20D0}'..='\u{20FF}'
+            | '\u{FE20}'..='\u{FE2F}'
+    )
+}
+
+/// Whether a variation selector directly after `prev` selects a glyph form of it (and so is shown
+/// as-is when it is the first selector after it).
+fn is_variation_base(prev: char) -> bool {
+    !prev.is_ascii()
+        && !is_hidden_or_control_char(prev)
+        && !is_variation_selector(prev)
+        && !is_combining_diacritic(prev)
+}
+
+/// Where the text being escaped sits, which decides whether TAB is structure.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Context {
+    /// A single-line field: every hidden or control character is escaped and flagged.
+    SingleLine,
+    /// One line of multi-line content: TAB is structure.
+    ContentLine,
+}
+
+/// How a TAB inside multi-line content ([`DisplaySubstrate::raw_lines`]) is shown: a visible arrow
+/// padded to four columns, so indentation stays readable. It does not set the flag.
+pub const TAB_MARKER: &str = "→   ";
+
+/// How a CR directly before a line feed (a CRLF line ending) is shown at the end of a
+/// [`DisplaySubstrate::raw_lines`] entry. It does not set the flag; a CR anywhere else is escaped
+/// as `\r` and does.
+pub const CRLF_MARKER: &str = "␍";
+
+/// Escape `text` into `out`, returning whether any flagged escape was applied.
+///
+/// This is the single escaping engine: [`escape_for_display`], [`has_hidden_or_control_chars`] and
+/// the [`DisplayModel`] builder all go through it, so the flag and the rendering can never disagree.
+fn escape_into(out: &mut String, text: &str, context: Context) -> bool {
+    let mut flagged = false;
+    let mut prev: Option<char> = None;
+    // Whether the previous character was a selector shown as-is (so the next one would be a run).
+    let mut prev_selector_shown = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        let mut selector_shown = false;
+        if c == '\t' && context == Context::ContentLine {
+            out.push_str(TAB_MARKER);
+        } else if is_hidden_or_control_char(c) {
+            push_escaped(out, c);
+            flagged = true;
+        } else if is_variation_selector(c) {
+            let after_base = !prev_selector_shown && prev.is_some_and(is_variation_base);
+            let keycap = c == '\u{FE0F}'
+                && prev.is_some_and(|p| p.is_ascii_digit() || p == '#' || p == '*')
+                && chars.peek() == Some(&'\u{20E3}');
+            if after_base || keycap {
+                out.push(c);
+                selector_shown = true;
+            } else {
+                push_codepoint(out, c);
+                flagged = true;
+            }
+        } else {
+            out.push(c);
+        }
+        prev = Some(c);
+        prev_selector_shown = selector_shown;
+    }
+    flagged
+}
+
+/// Whether `text` contains any character [`escape_for_display`] would escape (including a
+/// variation selector outside the allowed contexts).
 pub fn has_hidden_or_control_chars(text: &str) -> bool {
-    text.chars().any(is_hidden_or_control_char)
+    escape_into(
+        &mut String::with_capacity(text.len()),
+        text,
+        Context::SingleLine,
+    )
 }
 
 /// Render `text` for display, replacing every hidden or control character with a visible escape.
 ///
-/// Printable text (including all ordinary non-ASCII letters, emoji, and variation selectors) passes
-/// through unchanged. The output never contains a character for which
+/// Printable text (including all ordinary non-ASCII letters, emoji, and a variation selector in an
+/// allowed position) passes through unchanged. The output never contains a character for which
 /// [`is_hidden_or_control_char`] is true, and escaping is idempotent: escaping already-escaped
-/// output returns it unchanged.
+/// output returns it unchanged. This is the single-line rendering: TAB, LF and CR are escaped.
 ///
 /// # Examples
 ///
@@ -133,18 +262,12 @@ pub fn has_hidden_or_control_chars(text: &str) -> bool {
 /// ```
 pub fn escape_for_display(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        push_escaped(&mut out, c);
-    }
+    escape_into(&mut out, text, Context::SingleLine);
     out
 }
 
-/// Append `c` to `out`, escaped if it is hidden or a control character.
+/// Append the visible escape for a hidden or control character `c`.
 fn push_escaped(out: &mut String, c: char) {
-    if !is_hidden_or_control_char(c) {
-        out.push(c);
-        return;
-    }
     match c {
         '\t' => out.push_str("\\t"),
         '\n' => out.push_str("\\n"),
@@ -153,10 +276,42 @@ fn push_escaped(out: &mut String, c: char) {
             // Writing to a String is infallible.
             let _ = write!(out, "\\x{:02x}", u32::from(c));
         }
-        _ => {
-            let _ = write!(out, "⟨U+{:04X}⟩", u32::from(c));
-        }
+        _ => push_codepoint(out, c),
     }
+}
+
+/// Append `c` in `⟨U+XXXX⟩` notation.
+fn push_codepoint(out: &mut String, c: char) {
+    // Writing to a String is infallible.
+    let _ = write!(out, "⟨U+{:04X}⟩", u32::from(c));
+}
+
+/// Render multi-line content as display lines: split on LF (structure), show a CR directly before
+/// an LF as [`CRLF_MARKER`] and a TAB as [`TAB_MARKER`] (both unflagged), and escape everything
+/// else as a single-line field would. Returns the lines and whether any flagged escape was applied.
+fn content_lines(text: &str) -> (Vec<String>, bool) {
+    let mut flagged = false;
+    let segments: Vec<&str> = text.split('\n').collect();
+    let last = segments.len() - 1;
+    let lines = segments
+        .iter()
+        .enumerate()
+        .map(|(i, segment)| {
+            // Only a CR that is followed by an LF is a line ending; a trailing CR on the final
+            // segment (no LF after it) is an ordinary CR and is escaped.
+            let (body, crlf) = match segment.strip_suffix('\r') {
+                Some(body) if i < last => (body, true),
+                _ => (*segment, false),
+            };
+            let mut line = String::with_capacity(body.len());
+            flagged |= escape_into(&mut line, body, Context::ContentLine);
+            if crlf {
+                line.push_str(CRLF_MARKER);
+            }
+            line
+        })
+        .collect();
+    (lines, flagged)
 }
 
 /// The escaped syntactic substrate of an action: each field of [`SyntacticSubstrate`], rendered
@@ -217,14 +372,17 @@ pub struct DisplaySubstrate {
     /// Escaped file-edit diff hash.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff_hash: Option<String>,
-    /// Escaped `raw`, as a single display line (a line feed renders as `\n`).
+    /// Escaped `raw`, as a single display line (TAB, LF and CR render as `\t`, `\n`, `\r`). For
+    /// a compact one-line rendering, such as a headline repeated next to the decision prompt. The
+    /// flag is computed from [`Self::raw_lines`], not from this field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw: Option<String>,
-    /// For `file_edit` only: `raw` split on line feeds, each line escaped. The line feeds of a
-    /// multi-line edit are its structure, not hidden content, so they do not set
-    /// [`DisplayModel::has_hidden_or_control_chars`]; anything else in a line (including a CR from
-    /// CRLF endings) does. Absent for every other surface, where a line feed in `raw` is content
-    /// and is escaped.
+    /// `raw` as multi-line content, present whenever `raw` is: split on line feeds, each line
+    /// escaped. Line feeds, TABs (shown as [`TAB_MARKER`]) and a CR directly before a line feed
+    /// (shown as [`CRLF_MARKER`]) are structure and do not set
+    /// [`DisplayModel::has_hidden_or_control_chars`]; anything else that is escaped does. This is
+    /// the field a surface prints as the full action (a multi-line command as continuation lines, a
+    /// file edit as its content).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_lines: Option<Vec<String>>,
 }
@@ -271,8 +429,9 @@ struct Escaper {
 
 impl Escaper {
     fn text(&mut self, s: &str) -> String {
-        self.found |= has_hidden_or_control_chars(s);
-        escape_for_display(s)
+        let mut out = String::with_capacity(s.len());
+        self.found |= escape_into(&mut out, s, Context::SingleLine);
+        out
     }
 
     fn opt(&mut self, s: Option<&String>) -> Option<String> {
@@ -301,7 +460,7 @@ impl Escaper {
         }
     }
 
-    fn substrate(&mut self, surface: Surface, s: &SyntacticSubstrate) -> DisplaySubstrate {
+    fn substrate(&mut self, s: &SyntacticSubstrate) -> DisplaySubstrate {
         let (params_json, params_json_lines) = match &s.params {
             Some(params) => {
                 self.scan_json(params);
@@ -319,13 +478,13 @@ impl Escaper {
             None => (None, None),
         };
 
-        let (raw, raw_lines) = match (&s.raw, surface) {
-            (Some(raw), Surface::FileEdit) => {
-                let lines = raw.split('\n').map(|line| self.text(line)).collect();
+        let (raw, raw_lines) = match &s.raw {
+            Some(raw) => {
+                let (lines, flagged) = content_lines(raw);
+                self.found |= flagged;
                 (Some(escape_for_display(raw)), Some(lines))
             }
-            (Some(raw), _) => (Some(self.text(raw)), None),
-            (None, _) => (None, None),
+            None => (None, None),
         };
 
         DisplaySubstrate {
@@ -360,7 +519,7 @@ pub fn display_model(context: &ApprovalContext) -> DisplayModel {
     let actor_id = esc.text(&context.actor.id);
     let actor_kind = esc.text(&context.actor.kind);
     let actor_label = format!("{actor_id} ({actor_kind})");
-    let syntactic = esc.substrate(context.action.surface, &context.action.syntactic);
+    let syntactic = esc.substrate(&context.action.syntactic);
     let chain = esc.list(context.chain.as_ref());
     DisplayModel {
         surface: context.action.surface,
@@ -518,19 +677,64 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_unicode_and_variation_selectors_pass_through() {
+    fn ordinary_unicode_and_legitimate_variation_sequences_pass_through() {
         for text in [
             "git status",
             "naïve café",
             "日本語",
             "שלום",
             "✅",
-            "⚠\u{FE0F}",
-            "a\u{E0100}",
+            // Emoji presentation: one VS-16 after a non-ASCII base.
+            "⚠\u{FE0F} careful",
+            // Keycap: ASCII digit/#/*, VS-16, combining enclosing keycap.
+            "1\u{FE0F}\u{20E3} #\u{FE0F}\u{20E3} *\u{FE0F}\u{20E3}",
+            // CJK ideographic variation sequence (葛 + VS-17).
+            "\u{845B}\u{E0100}",
+            // Mongolian free variation selector after a Mongolian letter.
+            "\u{1820}\u{180B}",
         ] {
             assert_eq!(escape_for_display(text), text);
             assert!(!has_hidden_or_control_chars(text), "{text:?}");
         }
+    }
+
+    #[test]
+    fn a_variation_selector_run_is_escaped_after_the_first() {
+        // "Emoji smuggling": bytes encoded as selectors after one emoji. Only the first is shown.
+        let text = "Looks fine \u{1F600}\u{FE0F}\u{FE01}\u{E0100}\u{E01EF}";
+        assert_eq!(
+            escape_for_display(text),
+            "Looks fine \u{1F600}\u{FE0F}⟨U+FE01⟩⟨U+E0100⟩⟨U+E01EF⟩"
+        );
+        assert!(has_hidden_or_control_chars(text));
+    }
+
+    #[test]
+    fn a_variation_selector_after_ascii_is_escaped() {
+        // `main` + VS-16 looks exactly like `main`.
+        assert_eq!(escape_for_display("main\u{FE0F}"), "main⟨U+FE0F⟩");
+        assert!(has_hidden_or_control_chars("main\u{FE0F}"));
+        // A selector with no base at all, and VS-15 inside a would-be keycap, are escaped too.
+        assert_eq!(escape_for_display("\u{FE0F}"), "⟨U+FE0F⟩");
+        assert_eq!(escape_for_display("1\u{FE0E}\u{20E3}"), "1⟨U+FE0E⟩\u{20E3}");
+        // VS-16 after a keycap digit without the enclosing keycap is just a selector after ASCII.
+        assert_eq!(escape_for_display("1\u{FE0F}"), "1⟨U+FE0F⟩");
+    }
+
+    #[test]
+    fn a_variation_selector_after_a_hidden_or_combining_character_is_escaped() {
+        assert_eq!(escape_for_display("\u{200B}\u{FE0F}"), "⟨U+200B⟩⟨U+FE0F⟩");
+        // A run of accents cannot each carry one hidden selector.
+        assert_eq!(escape_for_display("e\u{0301}\u{FE01}"), "e\u{0301}⟨U+FE01⟩");
+    }
+
+    #[test]
+    fn braille_pattern_blank_is_escaped() {
+        assert_eq!(
+            escape_for_display("rm\u{2800}-rf\u{2800}/"),
+            "rm⟨U+2800⟩-rf⟨U+2800⟩/"
+        );
+        assert!(has_hidden_or_control_chars("main\u{2800}"));
     }
 
     #[test]
@@ -582,7 +786,11 @@ mod tests {
             s.raw.as_deref(),
             Some("rm -rf ~/x; : \\x1b[2K\\rgit status")
         );
-        assert_eq!(s.raw_lines, None, "raw_lines is file_edit only");
+        assert_eq!(
+            s.raw_lines,
+            Some(vec!["rm -rf ~/x; : \\x1b[2K\\rgit status".to_string()]),
+            "a lone CR inside a line is escaped, not treated as a line ending"
+        );
     }
 
     #[test]
@@ -719,22 +927,101 @@ mod tests {
         assert!(model.has_hidden_or_control_chars);
         assert_eq!(
             model.syntactic.raw_lines,
-            Some(vec!["-old\\r".to_string(), "+ne⟨U+202E⟩w".to_string()])
+            Some(vec!["-old␍".to_string(), "+ne⟨U+202E⟩w".to_string()])
+        );
+    }
+
+    fn raw_model(surface: Surface, raw: &str) -> DisplayModel {
+        display_model(&context_with(
+            surface,
+            SyntacticSubstrate {
+                raw: Some(raw.into()),
+                ..empty_substrate()
+            },
+        ))
+    }
+
+    #[test]
+    fn a_go_file_edit_with_tabs_and_crlf_does_not_warn() {
+        let model = raw_model(
+            Surface::FileEdit,
+            "func main() {\r\n\tfmt.Println(\"hi\")\r\n}",
+        );
+        assert!(!model.has_hidden_or_control_chars);
+        assert_eq!(
+            model.syntactic.raw_lines,
+            Some(vec![
+                "func main() {␍".to_string(),
+                "→   fmt.Println(\"hi\")␍".to_string(),
+                "}".to_string(),
+            ])
         );
     }
 
     #[test]
-    fn command_raw_line_feed_is_content_and_sets_the_flag() {
-        let ctx = context_with(
-            Surface::Command,
-            SyntacticSubstrate {
-                raw: Some("echo hi\nrm -rf /".into()),
-                ..empty_substrate()
-            },
+    fn a_heredoc_commit_command_is_multi_line_content_and_does_not_warn() {
+        let raw = "git commit -m \"$(cat <<'EOF'\nfix: a thing\n\n\tdetail\nEOF\n)\"";
+        let model = raw_model(Surface::Command, raw);
+        assert!(!model.has_hidden_or_control_chars);
+        assert_eq!(
+            model.syntactic.raw_lines,
+            Some(vec![
+                "git commit -m \"$(cat <<'EOF'".to_string(),
+                "fix: a thing".to_string(),
+                String::new(),
+                "→   detail".to_string(),
+                "EOF".to_string(),
+                ")\"".to_string(),
+            ])
         );
-        let model = display_model(&ctx);
+        // The single-line form still shows every separator.
+        assert_eq!(
+            model.syntactic.raw.as_deref(),
+            Some("git commit -m \"$(cat <<'EOF'\\nfix: a thing\\n\\n\\tdetail\\nEOF\\n)\"")
+        );
+    }
+
+    #[test]
+    fn an_esc_cr_spoof_inside_multi_line_content_still_warns() {
+        for surface in [Surface::Command, Surface::FileEdit] {
+            let model = raw_model(surface, "echo ok\nrm -rf ~/x; : \u{1b}[2K\rgit status");
+            assert!(model.has_hidden_or_control_chars, "{surface:?}");
+            assert_eq!(
+                model.syntactic.raw_lines,
+                Some(vec![
+                    "echo ok".to_string(),
+                    "rm -rf ~/x; : \\x1b[2K\\rgit status".to_string(),
+                ])
+            );
+        }
+    }
+
+    #[test]
+    fn a_trailing_cr_with_no_line_feed_after_it_warns() {
+        let model = raw_model(Surface::Command, "ls\r");
         assert!(model.has_hidden_or_control_chars);
-        assert_eq!(model.syntactic.raw.as_deref(), Some("echo hi\\nrm -rf /"));
+        assert_eq!(model.syntactic.raw_lines, Some(vec!["ls\\r".to_string()]));
+    }
+
+    #[test]
+    fn tab_lf_and_cr_in_single_line_fields_still_warn() {
+        type Mutator = fn(&mut ApprovalContext);
+        let cases: [(&str, Mutator); 5] = [
+            ("argv", |c| {
+                c.action.syntactic.argv = Some(vec!["rm\t-rf".into()])
+            }),
+            ("bin", |c| c.action.syntactic.bin = Some("rm\n".into())),
+            ("flags", |c| {
+                c.action.syntactic.flags = Some(vec!["-f\r".into()])
+            }),
+            ("cwd", |c| c.action.syntactic.cwd = Some("/tmp\t".into())),
+            ("summary", |c| c.summary.push('\n')),
+        ];
+        for (name, mutate) in cases {
+            let mut ctx = context_with(Surface::Command, empty_substrate());
+            mutate(&mut ctx);
+            assert!(display_model(&ctx).has_hidden_or_control_chars, "{name}");
+        }
     }
 
     #[test]
