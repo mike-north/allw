@@ -37,6 +37,8 @@ import {
   HIDDEN_CHARS_WARNING,
   RAW_ARGV_DIVERGENCE_WARNING,
   WRAP_MARKER,
+  rawDivergesFromArgv,
+  reconstructCommand,
   renderRequest,
 } from "../dist/lib/render.js";
 import { runWatch } from "../dist/commands/watch.js";
@@ -341,6 +343,73 @@ test("without a divergence, the decision line is the raw headline and no diverge
   assert.ok(!rendered.includes(RAW_ARGV_DIVERGENCE_WARNING));
 });
 
+// ── PowerShell records (#298, review #316 B1) ─────────────────────────────────────────────────────
+//
+// The core records a PowerShell line's argv as a plain whitespace split of `raw`, so no byte of the
+// line hides inside a token. Records here are built by the real WASM builder, never by hand.
+
+/** The #316 B1 repro: PowerShell runs the `Remove-Item` (`\` is literal inside `"…"`). */
+const PS_HIDDEN_STATEMENT = String.raw`echo "a\" ; Remove-Item -Recurse -Force C:\Users ; echo \"b"`;
+
+async function renderPowerShell(line) {
+  const wasm = await loadWasm();
+  const ctx = context({ summary: `PowerShell: ${line}` });
+  ctx.action = JSON.parse(wasm.action_from_powershell_command(line, String.raw`C:\Users\me`));
+  ctx.risk = ctx.action.risk;
+  return render(ctx);
+}
+
+test("a PowerShell line can't hide a statement from the decision line (#316 B1)", async () => {
+  const { rendered } = await renderPowerShell(PS_HIDDEN_STATEMENT);
+  const lines = rendered.split("\n");
+  const deciding = lines.at(-1);
+  assert.equal(
+    deciding,
+    `  Deciding on: ${PS_HIDDEN_STATEMENT}`,
+    "the decision line is raw, verbatim",
+  );
+  assert.match(deciding, / ; Remove-Item -Recurse -Force /, "Remove-Item is its own word");
+  assert.ok(!rendered.includes(RAW_ARGV_DIVERGENCE_WARNING), "argv is raw's whitespace split");
+  assert.match(rendered, /^ {2}Risk:\s+high$/m, "a compound line fails upward");
+});
+
+test("a PowerShell Windows path renders verbatim with no divergence warning (#316 B1)", async () => {
+  const line = String.raw`Remove-Item C:\Users\me\proj\build -Recurse`;
+  const { rendered } = await renderPowerShell(line);
+  assert.equal(rendered.split("\n").at(-1), `  Deciding on: ${line}`);
+  assert.ok(!rendered.includes(RAW_ARGV_DIVERGENCE_WARNING));
+  assert.ok(!rendered.includes("C:Usersmeprojbuild"), "no backslash is stripped");
+});
+
+test("an argv that differs from raw's whitespace split still warns (#316 B1 negative)", async () => {
+  // Same words, but one token carries a space that raw splits on: a different command line.
+  const ctx = context();
+  ctx.action = {
+    ...ctx.action,
+    syntactic: { raw: String.raw`Remove-Item C:\a b`, argv: ["Remove-Item", String.raw`C:\a b`] },
+  };
+  const { rendered } = await render(ctx);
+  assert.equal(rendered.split("\n").at(-1), RAW_ARGV_DIVERGENCE_WARNING);
+});
+
+// Regression (#316 review round 2, R2-2): only shlex's ASCII whitespace counts. A Unicode space
+// separates argv tokens but reads as part of a word in raw, so it must still warn.
+test("an argv split on a Unicode space (U+00A0) inside a raw word still warns", async () => {
+  const ctx = context();
+  ctx.action = {
+    ...ctx.action,
+    syntactic: { raw: "rm\u00a0-rf /", argv: ["rm", "-rf", "/"] },
+  };
+  const { rendered } = await render(ctx);
+  assert.equal(rendered.split("\n").at(-1), RAW_ARGV_DIVERGENCE_WARNING);
+});
+
+test("a PowerShell line with an ideographic space (U+3000) still warns", async () => {
+  // The core's whitespace split cuts at U+3000; the approver's ASCII split does not.
+  const { rendered } = await renderPowerShell("Remove-Item\u3000build");
+  assert.equal(rendered.split("\n").at(-1), RAW_ARGV_DIVERGENCE_WARNING);
+});
+
 test("a variation selector after ASCII cannot make a divergent argv look identical", async () => {
   // `main` + VS-16 renders like `main`; the Argv divergence line must show the difference.
   const ctx = context();
@@ -631,4 +700,47 @@ test("list items (paths, env refs, chain) are quoted so one item cannot pose as 
   assert.ok(rendered.includes("  Paths:      'a, /etc/passwd'"));
   assert.ok(rendered.includes("  Env refs:   HOME, 'A B'"));
   assert.ok(rendered.includes("  Chain:      'gate-a, gate-b'"));
+});
+
+test("raw/argv divergence matches the shared CLI/web fixture", () => {
+  // One fixture for both approvers, so they decide divergence and reconstruct the command alike.
+  const fixture = JSON.parse(
+    readFileSync(
+      join(here, "..", "..", "web-approver", "test", "fixtures", "raw-argv-divergence.json"),
+      "utf8",
+    ),
+  );
+  for (const c of fixture.cases) {
+    assert.equal(
+      rawDivergesFromArgv({ syntactic: c.syntactic }),
+      c.diverges,
+      `${c.name}: diverges`,
+    );
+    assert.equal(reconstructCommand(c.syntactic) ?? null, c.reconstructed, `${c.name}: line`);
+  }
+});
+
+test("the Action and Deciding on lines match the shared CLI/web headline fixture", async () => {
+  // One fixture for both approvers, so a record that mixes substrates heads the same way on each.
+  const fixture = JSON.parse(
+    readFileSync(
+      join(here, "..", "..", "web-approver", "test", "fixtures", "action-headline.json"),
+      "utf8",
+    ),
+  );
+  assert.equal(fixture.cases.length, 12);
+  for (const [i, c] of fixture.cases.entries()) {
+    const ctx = context({
+      action: {
+        record_schema_version: 1,
+        surface: c.surface,
+        syntactic: c.syntactic,
+        risk: "high",
+      },
+    });
+    const { rendered } = await render(ctx, `req-headline-${String(i)}`);
+    const lines = unwrap(rendered).split("\n");
+    assert.ok(lines.includes(`  Action:     ${c.headline}`), `${c.name}: Action line`);
+    assert.ok(lines.includes(`  Deciding on: ${c.heading}`), `${c.name}: Deciding on line`);
+  }
 });

@@ -18,7 +18,12 @@ export interface PushWakeup {
   readonly accountId: string;
   readonly deviceId: string;
   readonly requestId: string;
-  /** The request's deadline (epoch ms). Transports use it to bound how long a wakeup is held. */
+  /**
+   * How long the wakeup stays useful (epoch ms): the latest deadline among the account's pending
+   * requests, not just this one's. A wakeup makes the device fetch every pending request, and with
+   * an RFC 8030 `Topic` a later wakeup replaces an earlier queued one, along with its `TTL`.
+   * Transports use it to bound how long a wakeup is held.
+   */
   readonly expiresAt: number;
   readonly token: string;
 }
@@ -34,9 +39,10 @@ export class UndeliverablePushTokenError extends Error {
   override readonly name = "UndeliverablePushTokenError";
 }
 
-/** Outcome of one fan-out: how many wakeups were accepted, and which tokens should be pruned. */
+/** Outcome of one fan-out: which tokens' wakeups the push services accepted, and which to prune. */
 export interface PushDispatchResult {
-  readonly delivered: number;
+  /** Tokens whose wakeup the push service accepted (a 2xx). */
+  readonly deliveredTokens: readonly StoredPushToken[];
   readonly undeliverableTokens: readonly StoredPushToken[];
 }
 
@@ -61,8 +67,8 @@ export const MAX_PUSH_TOKENS_PER_ACCOUNT = 32;
  * before the service worker's inbox fetch. A submit skipped by coalescing may land after that
  * fetch, so the relay sends one **trailing** wakeup when the window ends (see `AccountRelay`'s
  * `webpush_trailing_wakeup`). Every request then gets a wakeup sent after it was stored, still at
- * most one push per subscription per window (per instance; an evicted object forgets earlier
- * claims, #319).
+ * most one push per subscription per window. The relay keeps last claims in SQLite, so the bound
+ * holds across Durable Object eviction (#319).
  */
 export const WEB_PUSH_COALESCE_MS = 30_000;
 
@@ -150,7 +156,7 @@ export async function dispatchPushWakeups(
   },
 ): Promise<PushDispatchResult> {
   const queue = schedulablePushTokens(tokens, options.transports);
-  let delivered = 0;
+  const deliveredTokens: StoredPushToken[] = [];
   const undeliverableTokens: StoredPushToken[] = [];
 
   const sendOne = async (token: StoredPushToken): Promise<void> => {
@@ -164,7 +170,7 @@ export async function dispatchPushWakeups(
         expiresAt: options.expiresAt,
         token: token.token,
       });
-      delivered++;
+      deliveredTokens.push(token);
     } catch (error) {
       // Only an explicit "permanently undeliverable" prunes; everything else is transient.
       if (error instanceof UndeliverablePushTokenError) undeliverableTokens.push(token);
@@ -185,7 +191,7 @@ export async function dispatchPushWakeups(
     Math.min(options.concurrency ?? DEFAULT_PUSH_CONCURRENCY, queue.length),
   );
   await Promise.allSettled(Array.from({ length: width }, worker));
-  return { delivered, undeliverableTokens };
+  return { deliveredTokens, undeliverableTokens };
 }
 
 /** APNs token-auth transport. Credentials are supplied by Worker environment bindings. */
@@ -271,6 +277,61 @@ export class FcmPushTransport implements PushTransport {
   }
 }
 
+/** The coalescing key of one Web Push subscription: its device plus endpoint. */
+export function webPushCoalesceKey(deviceId: string, token: string): string {
+  return `${deviceId}\0${token}`;
+}
+
+/**
+ * The device id and endpoint a {@link webPushCoalesceKey} was built from. Neither contains a NUL:
+ * device ids are relay-generated, and an endpoint is a validated URL. Throws on a key with no
+ * separator: every key is built by {@link webPushCoalesceKey}, so one without it is a bug, and
+ * guessing would read or update the wrong subscription's claim.
+ */
+export function parseWebPushCoalesceKey(key: string): { deviceId: string; token: string } {
+  const split = key.indexOf("\0");
+  if (split < 0) throw new Error("not a Web Push coalescing key");
+  return { deviceId: key.slice(0, split), token: key.slice(split + 1) };
+}
+
+/**
+ * Where a {@link WakeupCoalescer} remembers each key's most recent claim.
+ *
+ * The coalescing bound is only as durable as this store. An in-memory store forgets every claim
+ * when its Durable Object is evicted, after which one more wakeup could go out inside the window.
+ * The relay therefore keeps claims in SQLite (#319).
+ */
+export interface WakeupClaimStore {
+  /** Epoch ms of `key`'s most recent claim, or `undefined` if none is remembered. */
+  lastClaimedAt(key: string): number | undefined;
+  /** Remember a claim of `key` at `atMs`. */
+  recordClaim(key: string, atMs: number): void;
+}
+
+/**
+ * A {@link WakeupClaimStore} in memory, forgetting claims once they can no longer coalesce. Used
+ * where durability does not matter: unit tests, and any coalescer outside a Durable Object.
+ */
+export class InMemoryWakeupClaimStore implements WakeupClaimStore {
+  private readonly windowMs: number;
+  private readonly claims = new Map<string, number>();
+
+  constructor(windowMs: number) {
+    this.windowMs = windowMs;
+  }
+
+  lastClaimedAt(key: string): number | undefined {
+    return this.claims.get(key);
+  }
+
+  recordClaim(key: string, atMs: number): void {
+    for (const [other, at] of this.claims) {
+      if (atMs - at > this.windowMs) this.claims.delete(other);
+    }
+    this.claims.set(key, atMs);
+  }
+}
+
 /**
  * Per-subscription wakeup coalescing for one account's Durable Object.
  *
@@ -280,29 +341,34 @@ export class FcmPushTransport implements PushTransport {
  * outbound volume per subscription regardless of how fast submits arrive or how the push service
  * answers.
  *
- * State is in memory and every method is synchronous: the Durable Object runs one event at a time,
- * so a check-and-claim cannot interleave with another submit (no TOCTOU). Losing the state when the
- * object is evicted only re-allows one wakeup, and eviction requires the account to go idle
- * (persisting the last claim is #319).
+ * Last claims live in a {@link WakeupClaimStore}, so the bound is as durable as that store. In-flight
+ * claims are kept in memory: a running fan-out keeps its Durable Object alive (`waitUntil`), so they
+ * cannot be lost mid-flight. Every method is synchronous, and the Durable Object runs one event at
+ * a time, so a check-and-claim cannot interleave with another submit (no TOCTOU).
  */
 export class WakeupCoalescer {
   private readonly windowMs: number;
-  /** Epoch ms of each key's most recent claim, kept only while it can still coalesce. */
-  private readonly lastClaimedAt = new Map<string, number>();
+  private readonly claims: WakeupClaimStore;
   /** Keys whose claimed wakeup has not finished yet. */
   private readonly inFlight = new Set<string>();
 
-  constructor(windowMs: number) {
+  constructor(windowMs: number, claims: WakeupClaimStore = new InMemoryWakeupClaimStore(windowMs)) {
     this.windowMs = windowMs;
+    this.claims = claims;
   }
 
   /** Claim a wakeup for `key` at `nowMs`: `true` (and recorded as in flight) or `false` if coalesced. */
   tryClaim(key: string, nowMs: number): boolean {
-    this.forgetExpired(nowMs);
     if (this.inFlight.has(key)) return false;
-    const last = this.lastClaimedAt.get(key);
-    if (last !== undefined && nowMs - last <= this.windowMs) return false;
-    this.lastClaimedAt.set(key, nowMs);
+    const stored = this.claims.lastClaimedAt(key);
+    if (stored !== undefined && stored > nowMs) {
+      // A claim from the future counts as one made now (see lastClaimAsOf). Store it as now, so
+      // the window ends one window from here rather than one window after each later look.
+      this.claims.recordClaim(key, nowMs);
+      return false;
+    }
+    if (stored !== undefined && nowMs - stored <= this.windowMs) return false;
+    this.claims.recordClaim(key, nowMs);
     this.inFlight.add(key);
     return true;
   }
@@ -314,19 +380,24 @@ export class WakeupCoalescer {
    * bound.
    */
   nextClaimableAt(key: string, nowMs: number): number {
-    const last = this.lastClaimedAt.get(key);
+    const last = this.lastClaimAsOf(key, nowMs);
     return last === undefined ? nowMs : Math.max(nowMs, last + this.windowMs + 1);
+  }
+
+  /**
+   * `key`'s last claim as seen at `nowMs`. A stored claim later than `nowMs` counts as `nowMs`. Such
+   * a claim can only come from a clock anomaly on whichever host wrote it. Because claims persist,
+   * it would otherwise silence the subscription, leading and trailing wakeups alike, until that
+   * future time. {@link tryClaim} also stores the clamped value, so the worst case is one normal
+   * window.
+   */
+  private lastClaimAsOf(key: string, nowMs: number): number | undefined {
+    const last = this.claims.lastClaimedAt(key);
+    return last === undefined ? undefined : Math.min(last, nowMs);
   }
 
   /** Mark a claimed wakeup finished. The window from its claim still applies. */
   release(key: string): void {
     this.inFlight.delete(key);
-  }
-
-  /** Drop claims that can no longer coalesce anything, so memory tracks only recent subscriptions. */
-  private forgetExpired(nowMs: number): void {
-    for (const [key, at] of this.lastClaimedAt) {
-      if (nowMs - at > this.windowMs) this.lastClaimedAt.delete(key);
-    }
   }
 }

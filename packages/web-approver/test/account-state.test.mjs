@@ -636,7 +636,7 @@ test("relay outage during prepare: origin downgrades to unverified without abort
     "context kind is still accessible on outage",
   );
   assert.deepEqual(
-    outagedPrepared.context.command?.argv,
+    outagedPrepared.context.substrate.argv,
     CONTEXT.action.syntactic.argv,
     "argv is still present for rendering after a resolver outage",
   );

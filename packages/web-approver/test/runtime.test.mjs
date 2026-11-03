@@ -150,7 +150,7 @@ test("valid envelope: prepare decrypts + recomputes the WYSIWYS hash; the signed
   );
   assert.equal(prepared.context.kind, "command", "the command surface maps to a command context");
   assert.deepEqual(
-    prepared.context.command?.argv,
+    prepared.context.substrate.argv,
     ["git", "push", "--force", "origin", "main"],
     "the decrypted argv round-trips into the view model",
   );
@@ -218,19 +218,54 @@ test("agent_tool_call surface: maps to its own kind, distinct from mcp, with (se
     "agent_tool_call",
     "the agent_tool_call surface must map to its own kind, not 'mcp'",
   );
-  assert.equal(prepared.context.mcp, undefined, "must not also populate the mcp action");
-  // No `params` on the wire ⇒ no `paramsDisplay` on the (core-escaped) view.
-  assert.deepEqual(prepared.context.agentToolCall, {
-    server: "deploy-plugin",
-    tool: "deploy_service",
-  });
+  assert.equal(prepared.context.substrate.server, "deploy-plugin");
+  assert.equal(prepared.context.substrate.tool, "deploy_service");
+  // No `params` on the wire ⇒ no `paramsLines` on the (core-escaped) view.
+  assert.equal(prepared.context.substrate.paramsLines, undefined);
 
-  assert.equal(actionSummary(prepared.context), "deploy-plugin :: deploy_service");
+  // The CLI's headline precedence puts `raw` first; the (server, tool) identity leads the plaintext.
+  assert.equal(actionSummary(prepared.context), "This plugin wants to deploy to production.");
   assert.match(
     exactPlaintext(prepared.context),
     /^agent_tool_call: deploy-plugin :: deploy_service/,
     "the exact plaintext explicitly shows the (server, tool) identity under its own label",
   );
+});
+
+// ── PowerShell records (#298, review #316 B1) ───────────────────────────────────────────────────
+//
+// The core records a PowerShell line's argv as a whitespace split of `raw`, so the card's `argv:` line
+// can't present a benign reading of a destructive line. Records come from the real WASM builder.
+
+/** Prepare a PowerShell request built by the core, as the hook would send it. */
+async function preparePowerShell(line) {
+  const wasm = await loadTestWasm();
+  const { identity, encryptTo } = pairedIdentity(wasm);
+  const action = JSON.parse(wasm.action_from_powershell_command(line, String.raw`C:\Users\me`));
+  const context = { ...CONTEXT, action, risk: action.risk, summary: `PowerShell: ${line}` };
+  return runtimeAt(wasm, identity).prepare(makeEnvelope(encryptTo(JSON.stringify(context))));
+}
+
+test("PowerShell: a statement hidden from POSIX quoting is its own argv token on the card (#316 B1)", async () => {
+  // PowerShell runs the Remove-Item: inside "…" its escape is the backtick and `\` is literal.
+  const line = String.raw`echo "a\" ; Remove-Item -Recurse -Force C:\Users ; echo \"b"`;
+  const prepared = await preparePowerShell(line);
+  const lines = exactPlaintext(prepared.context).split("\n");
+  const argvLine = lines.find((l) => l.startsWith("argv: "));
+  assert.match(argvLine ?? "", /^argv: echo .* ';' Remove-Item -Recurse -Force /);
+  assert.ok(lines.includes(`raw: ${line}`));
+  assert.equal(actionSummary(prepared.context), line);
+  assert.equal(prepared.context.divergentArgv, undefined, "argv is raw's whitespace split");
+});
+
+test("PowerShell: a Windows path keeps its backslashes on the card (#316 B1)", async () => {
+  const line = String.raw`Remove-Item C:\Users\me\proj\build -Recurse`;
+  const prepared = await preparePowerShell(line);
+  const text = exactPlaintext(prepared.context);
+  assert.ok(text.includes(String.raw`argv: Remove-Item 'C:\Users\me\proj\build' -Recurse`), text);
+  assert.ok(text.includes(`raw: ${line}`));
+  assert.ok(!text.includes("C:Usersmeprojbuild"));
+  assert.equal(prepared.context.divergentArgv, undefined, "quoting a path is not a divergence");
 });
 
 // ── Negative: already-expired request fails closed in prepare ────────────────────────────────
