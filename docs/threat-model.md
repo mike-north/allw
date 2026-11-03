@@ -197,6 +197,28 @@ Validation:
   shipped integrator (`@allw/hook`, `@allw/codex-hook`,
   `@allw/openclaw-bridge`) does yet**; without it the filter is a no-op and the
   recipient set is whatever the relay lists. Owner: #243.
+- Recipient keys come from the relay's device registry, so a small-order X25519 key (whose ECDH shared
+  secret is non-contributory and so predictable) is a runtime input, not a bug. `encrypt_context` returns
+  `EncryptError::LowOrderRecipientKey` naming the device instead of panicking, and refuses the whole
+  encryption rather than dropping that recipient. The SDK rethrows it, so the hook denies. The core also
+  exports its denylist (`X25519_SMALL_ORDER_POINTS`, libsodium's `has_small_order` list, matched with bit 255
+  masked) through WASM, so device-key registration can reject the same keys up front. A shared vector
+  (`crates/allw-core/tests/fixtures/x25519_small_order.json`) asserts the denylist and encryption agree in
+  Rust and through WASM (#248).
+- Relay-chosen text (device ids, error bodies, any response body) can reach SDK error messages, and the hooks
+  put those messages in the deny reason the agent reads. A hostile relay could therefore pose as an allw
+  diagnostic (prompt injection). The defence is layered:
+  - **The hooks are the choke point.** Both `decide()`s pass the error text through the core's
+    `escape_for_display` and cap it at 256 characters (`agentSafeErrorText` in `@allw/hook`), so no SDK path,
+    present or future, can put raw relay text into the agent's context. If the escape fails, the text is
+    withheld.
+  - **The SDK keeps relay text out of its messages.** A rejected `submit` reports only the HTTP status, not
+    the relay's `error` field. A body that isn't JSON reports only the call and status, not the parser's
+    message (which quotes the body). A relay device entry whose `device_id` doesn't match
+    `^[A-Za-z0-9_-]{1,64}$`, or whose `pubkey` isn't a string, fails the whole call closed, and the error
+    names only the entry's index.
+  - **The core renders device ids escaped and capped.** `EncryptError` shows a device id with `{:?}`, capped
+    at 64 characters, while the variant keeps the full id.
 
 ### R2. Verdict authenticity and binding
 

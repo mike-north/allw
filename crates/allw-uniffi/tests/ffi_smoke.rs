@@ -360,6 +360,7 @@ fn encrypt_to_prep_device(context: &ApprovalContext) -> String {
         public_key: &dev_pub,
     }];
     encrypt_context(context, &recipients, &mut prep_rng())
+        .expect("encrypting to a valid device key succeeds")
 }
 
 /// A root-signed account-state document enrolling the real actor key as active.
