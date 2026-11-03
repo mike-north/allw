@@ -4,7 +4,11 @@ import test from "node:test";
 import { JSDOM } from "jsdom";
 
 import { mountWebApprover } from "../dist/browser.js";
-import { WITHHELD_ERROR_TEXT, WebApproverController } from "../dist/index.js";
+import {
+  NO_ACTION_FIELDS_HEADLINE,
+  WITHHELD_ERROR_TEXT,
+  WebApproverController,
+} from "../dist/index.js";
 
 const NOW = Date.parse("2026-06-12T16:00:00.000Z");
 
@@ -368,9 +372,9 @@ test("malformed action contexts render as unknown actions without throwing", asy
 
   await controller.sync([missingCommand, missingMcp]);
 
-  assert.equal(controller.detail("req-missing-command")?.summary, "Unknown action");
+  assert.equal(controller.detail("req-missing-command")?.summary, NO_ACTION_FIELDS_HEADLINE);
   assert.equal(controller.detail("req-missing-command")?.exactPlaintext, "Unknown action");
-  assert.equal(controller.detail("req-missing-mcp")?.summary, "Unknown action");
+  assert.equal(controller.detail("req-missing-mcp")?.summary, NO_ACTION_FIELDS_HEADLINE);
   assert.equal(controller.detail("req-missing-mcp")?.exactPlaintext, "Unknown action");
 });
 

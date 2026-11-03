@@ -136,7 +136,8 @@ test("agent_tool_call: the plugin id, tool, params and raw are on the card", asy
     }),
   ]);
   const card = onlyCard(root);
-  assert.equal(card.querySelector("h3")?.textContent, "deploy-plugin :: deploy_service");
+  // The CLI's headline precedence: `raw` heads the card; the tool identity leads the plaintext.
+  assert.equal(card.querySelector("h3")?.textContent, "This plugin wants to deploy to production.");
   assert.equal(
     plaintextOf(card),
     [
@@ -320,4 +321,15 @@ test("the context summary is escaped, labelled, and not the card heading (#262)"
     `${CONTEXT_SUMMARY_LABEL}: just checking status\\x1b[2K`,
   );
   assert.ok(card.querySelector(".hidden-chars-warning"));
+});
+
+test("the card heading follows the CLI's precedence: shared CLI/web headline fixture", async () => {
+  // One fixture for both approvers (S1 of the #309 review): a record that mixes substrates heads
+  // with its command, never only the tool name.
+  const fixture = JSON.parse(readFileSync(join(here, "fixtures", "action-headline.json"), "utf8"));
+  assert.equal(fixture.cases.length, 12);
+  for (const c of fixture.cases) {
+    const card = onlyCard(await mountWith([context(c.surface, c.syntactic)]));
+    assert.equal(card.querySelector("h3")?.textContent, c.heading, c.name);
+  }
 });

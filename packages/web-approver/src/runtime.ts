@@ -282,8 +282,7 @@ type SubstrateDraft = { -readonly [K in keyof SubstrateView]: SubstrateView[K] }
 
 /**
  * Carry the core's display substrate into the view model whole: every field the core returned is
- * copied (renamed to camelCase), none dropped. `params_json` is not copied because
- * `params_json_lines` holds the same params, laid out for display.
+ * copied (renamed to camelCase), none dropped.
  */
 function toSubstrateView(s: CoreDisplaySubstrate): SubstrateView {
   const view: SubstrateDraft = {};
@@ -296,6 +295,7 @@ function toSubstrateView(s: CoreDisplaySubstrate): SubstrateView {
   if (s.env_refs !== undefined) view.envRefs = s.env_refs;
   if (s.server !== undefined) view.server = s.server;
   if (s.tool !== undefined) view.tool = s.tool;
+  if (s.params_json !== undefined) view.paramsJson = s.params_json;
   if (s.params_json_lines !== undefined) view.paramsLines = s.params_json_lines;
   if (s.operation !== undefined) view.operation = s.operation;
   if (s.paths !== undefined) view.paths = s.paths;

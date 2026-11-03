@@ -223,7 +223,8 @@ test("agent_tool_call surface: maps to its own kind, distinct from mcp, with (se
   // No `params` on the wire ⇒ no `paramsLines` on the (core-escaped) view.
   assert.equal(prepared.context.substrate.paramsLines, undefined);
 
-  assert.equal(actionSummary(prepared.context), "deploy-plugin :: deploy_service");
+  // The CLI's headline precedence puts `raw` first; the (server, tool) identity leads the plaintext.
+  assert.equal(actionSummary(prepared.context), "This plugin wants to deploy to production.");
   assert.match(
     exactPlaintext(prepared.context),
     /^agent_tool_call: deploy-plugin :: deploy_service/,

@@ -148,6 +148,8 @@ export interface SubstrateView {
   /** MCP server name, or the gating provider (plugin) id for an `agent_tool_call`. */
   readonly server?: string;
   readonly tool?: string;
+  /** The call's `params` as compact one-line JSON (the headline of a record with nothing else). */
+  readonly paramsJson?: string;
   /** The call's `params` as indented JSON, one entry per line. */
   readonly paramsLines?: readonly string[];
   /** File-edit operation (e.g. `patch`, `write`). */
@@ -610,31 +612,40 @@ export class WebApproverController {
   }
 }
 
+/** The headline of a record with no command, tool or file-edit fields (the CLI's wording). */
+export const NO_ACTION_FIELDS_HEADLINE = "(no command, tool, or file-edit fields)";
+
 /**
- * One-line headline for a list row and a card heading.
+ * One-line headline for a list row and a card heading. Uses the CLI's precedence
+ * (`renderActionHeadline` in `packages/approver/src/lib/render.ts`), whatever the surface, so a
+ * record that mixes substrates (an `mcp_tool_call` also carrying `argv`) heads with the command,
+ * not the benign-looking tool name. The shared fixture `test/fixtures/action-headline.json` keeps
+ * the two approvers in step.
  *
- * When raw and argv diverge this is the hash-bound argv form, never the possibly benign `raw` (the
- * card then shows a warning and both forms). Otherwise: a file edit's diff summary or
- * `operation paths`; a tool call's `server :: tool` (a `.` join would make server `fs.delete` +
- * tool `x` look like server `fs` + tool `delete.x`); a command's `raw`, or the command `bin`/`argv`
- * reconstruct to. Mirrors the CLI's headline (`packages/approver/src/lib/render.ts`).
+ * 1. When raw and argv diverge: the hash-bound argv form, never the possibly benign `raw` (the card
+ *    then shows a warning and both forms).
+ * 2. A file edit: its diff summary, else `operation paths`.
+ * 3. `raw`; else the command `bin`/`argv` reconstruct to.
+ * 4. A tool call: `server :: tool` (a `.` join would make server `fs.delete` + tool `x` look like
+ *    server `fs` + tool `delete.x`), or the tool alone.
+ * 5. `operation paths`; else the compact params; else {@link NO_ACTION_FIELDS_HEADLINE}.
  */
 export function actionSummary(context: ApprovalContext): string {
   if (context.divergentArgv !== undefined) return context.divergentArgv;
   const s = context.substrate;
-  const toolCall =
-    s.server !== undefined && s.tool !== undefined ? `${s.server} :: ${s.tool}` : undefined;
   const fileEdit =
     s.operation !== undefined && s.paths !== undefined && s.paths.length > 0
       ? `${s.operation} ${renderList(s.paths)}`
       : undefined;
-  const headline =
-    context.kind === "file_edit"
-      ? (s.diffSummary ?? fileEdit)
-      : context.kind === "mcp" || context.kind === "agent_tool_call"
-        ? toolCall
-        : (s.raw ?? reconstructCommand(s));
-  return headline ?? s.raw ?? reconstructCommand(s) ?? toolCall ?? fileEdit ?? "Unknown action";
+  if (context.kind === "file_edit") {
+    const headline = s.diffSummary ?? fileEdit;
+    if (headline !== undefined) return headline;
+  }
+  if (s.raw !== undefined) return s.raw;
+  const reconstructed = reconstructCommand(s);
+  if (reconstructed !== undefined) return reconstructed;
+  if (s.tool !== undefined) return s.server !== undefined ? `${s.server} :: ${s.tool}` : s.tool;
+  return fileEdit ?? s.paramsJson ?? NO_ACTION_FIELDS_HEADLINE;
 }
 
 /** Continuation marker for multi-line content, so no later line can pass for a field label. */

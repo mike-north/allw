@@ -652,3 +652,28 @@ test("raw/argv divergence matches the shared CLI/web fixture", () => {
     assert.equal(reconstructCommand(c.syntactic) ?? null, c.reconstructed, `${c.name}: line`);
   }
 });
+
+test("the Action and Deciding on lines match the shared CLI/web headline fixture", async () => {
+  // One fixture for both approvers, so a record that mixes substrates heads the same way on each.
+  const fixture = JSON.parse(
+    readFileSync(
+      join(here, "..", "..", "web-approver", "test", "fixtures", "action-headline.json"),
+      "utf8",
+    ),
+  );
+  assert.equal(fixture.cases.length, 12);
+  for (const [i, c] of fixture.cases.entries()) {
+    const ctx = context({
+      action: {
+        record_schema_version: 1,
+        surface: c.surface,
+        syntactic: c.syntactic,
+        risk: "high",
+      },
+    });
+    const { rendered } = await render(ctx, `req-headline-${String(i)}`);
+    const lines = unwrap(rendered).split("\n");
+    assert.ok(lines.includes(`  Action:     ${c.headline}`), `${c.name}: Action line`);
+    assert.ok(lines.includes(`  Deciding on: ${c.heading}`), `${c.name}: Deciding on line`);
+  }
+});
