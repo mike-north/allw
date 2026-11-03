@@ -54,6 +54,16 @@ Add the hook to `~/.codex/hooks.json` or a trusted project `.codex/hooks.json`:
 }
 ```
 
+Use the absolute path to `dist/cli.js`, or `npx --no-install allw-codex-hook`. Never plain
+`npx allw-codex-hook`: when no installed bin resolves, plain `npx` downloads and runs the registry
+package of that name, so a squatted package would run as the gate; `--no-install` exits 1 instead.
+
+If Codex can't start the hook (a wrong path, `node` missing from `PATH`, the package not
+installed), **the tool call goes ahead ungated**: Codex reports the hook as failed and continues, and
+it has no setting to block on hook failure. After wiring the hook, run one gated call and confirm it
+reaches your approver. See
+[`docs/codex-integration.md`](../../docs/codex-integration.md#if-the-hook-cant-start).
+
 Run `/hooks` in Codex and trust the hook definition. A gated Bash or MCP tool call then blocks on an
 allw approval; a verified approval returns Codex `allow`, while denial, timeout, malformed input, or
 relay failure returns `deny`.

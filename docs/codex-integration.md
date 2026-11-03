@@ -28,7 +28,7 @@ Recommended hook configuration:
         "hooks": [
           {
             "type": "command",
-            "command": "npx allw-codex-hook",
+            "command": "npx --no-install allw-codex-hook",
             "timeout": 480,
             "statusMessage": "Requesting allw approval"
           }
@@ -39,10 +39,25 @@ Recommended hook configuration:
 }
 ```
 
-> `npx allw-codex-hook` resolves the installed bin. If your Codex launch environment does not see
-> the project's `node_modules/.bin` on `PATH`, use the absolute path to the resolved bin instead
-> (find it with `node -e "console.log(require.resolve('@allw/codex-hook/package.json'))"` → the
-> `dist/cli.js` beside it), e.g. `"command": "node /abs/path/to/@allw/codex-hook/dist/cli.js"`.
+> **Use `npx --no-install allw-codex-hook`, never plain `npx allw-codex-hook`.** `--no-install` runs
+> the installed bin (project or global) and exits 1 if there is none; plain `npx` would download and
+> run whatever registry package has that name, so a squatted package would run as the gate (checked
+> on npm 10.9.4 and 11.21.1). If your Codex launch environment doesn't run from the project
+> directory, use the absolute path to the installed bin instead (find it with
+> `node -e "console.log(require.resolve('@allw/codex-hook/package.json'))"` → the `dist/cli.js`
+> beside it), e.g. `"command": "node /abs/path/to/@allw/codex-hook/dist/cli.js"`.
+
+### If the hook can't start
+
+If Codex can't start the hook (a wrong path, `node` missing from `PATH`, `npx --no-install` finding
+no installed bin), **the tool call goes ahead ungated.** Codex reports the hook run as failed and
+continues; it has no setting to block on hook failure (Claude Code's `onFailure: "block"` has no
+Codex equivalent). The [Codex hooks docs](https://learn.chatgpt.com/docs/hooks) don't spell out the
+spawn-failure case, so this was checked in the source: in
+[`pre_tool_use.rs`](https://github.com/openai/codex/blob/29eed280828d498fead76c3c5dedd9642836b571/codex-rs/hooks/src/events/pre_tool_use.rs#L211-L216)
+a run error marks the hook `Failed` and leaves `should_block` false (checked 2026-11-02). After any
+change to the hook command, run one gated call and confirm it reaches your approver; a hook error
+in the Codex transcript means nothing was gated. See [Fail-Open Residual](#fail-open-residual).
 
 ## Quickstart
 
@@ -59,7 +74,7 @@ This is the Codex-parallel install path for developers who already have a paired
    Confirm it's installed and which version you have (useful for bug reports):
 
    ```sh
-   npx allw-codex-hook --version
+   npx --no-install allw-codex-hook --version
    ```
 
 2. Write the integrator config file `~/.allw/config.json` (`0600`, in a `0700` `~/.allw`) with the
