@@ -25,6 +25,7 @@ import {
 } from "./relay.js";
 import { awaitVerdict, type WebSocketFactory } from "./wait.js";
 import { loadWasm, type AllwWasm } from "./wasm.js";
+import { parseSealedContext, type SealedContext } from "./sealed-context.js";
 
 export {
   CommandActionError,
@@ -692,12 +693,6 @@ async function loadAccountStateSet(
     : { accountStates: set.accountStates, minSequence: set.minSequence };
 }
 
-/** The core's sealed-context result (`seal_context_for_account_state`). */
-interface SealedContext {
-  readonly ciphertext: string;
-  readonly sequence: number;
-}
-
 /**
  * Encrypt the context to exactly the devices the loaded account state vouches for — selection and
  * encryption both run in the core, so recipient keys never pass through this package. Throws
@@ -728,14 +723,16 @@ function sealContext(
       { cause },
     );
   }
-  const sealed = JSON.parse(json) as Partial<SealedContext>;
-  if (typeof sealed.ciphertext !== "string" || !Number.isSafeInteger(sealed.sequence)) {
+  // Fail closed on anything a successful seal could not return: the sequence becomes the persisted
+  // floor and the ciphertext is what gets sent.
+  const sealed = parseSealedContext(json);
+  if (sealed === null) {
     throw new RecipientSelectionError(
       "seal",
       "seal_context_for_account_state returned a malformed result",
     );
   }
-  return sealed as SealedContext;
+  return sealed;
 }
 
 /**
