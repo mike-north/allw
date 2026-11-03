@@ -524,7 +524,9 @@ attestation, audit records, hook/SDK fail-closed behavior, or enrollment.
 - [ ] Network failures, hung reads, refused connections, and malformed relay responses deny or expire, never allow.
 - [ ] Any new endpoint states who may call it and what authentication/authorization is required.
 - [ ] Relay URLs are accepted only as `https:` (or `http:` on loopback) and are rejected at configuration time,
-      before any request is built (web approver `checkRelayUrl`, SDK `assertRelayUrlTransport`).
+      before any request is built (web approver `checkRelayUrl`, SDK `assertRelayUrlTransport`, approver CLI
+      `assertCliRelayUrl` for `pair --relay`, `watch --relay` and the keyfile's `relay_url`). Every copy of the rule
+      is tested against `packages/sdk/test/fixtures/relay-url-vectors.json`.
 - [ ] A paired web approver talks only to the relay pinned in its stored identity; no query parameter, link, or
       other page input can re-point it without re-pairing.
 - [ ] Web approver changes keep the `_headers` CSP intact: no inline script or `'unsafe-inline'`, and
