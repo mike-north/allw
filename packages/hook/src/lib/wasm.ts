@@ -39,9 +39,10 @@ export interface HookWasm {
   action_from_command(commandLine: string, cwd?: string | null): string;
   /**
    * Build an `ActionRecord` JSON for a **PowerShell** command line (the `command` surface, for
-   * Claude Code's `PowerShell` tool). `raw` is the exact line; risk is at least Medium, or at least
-   * High when the POSIX split fails and argv falls back to a whitespace split. Never throws for
-   * PowerShell syntax, so a valid PowerShell command is never denied for its quoting.
+   * Claude Code's `PowerShell` tool). `raw` is the exact line and argv is always its whitespace
+   * split (PowerShell quoting is never read with POSIX rules); risk is at least Medium, or at least
+   * High for a compound, escaped or dynamic-execution line. Never throws for PowerShell syntax, so a
+   * valid PowerShell command is never denied for its quoting.
    */
   action_from_powershell_command(commandLine: string, cwd?: string | null): string;
   /**

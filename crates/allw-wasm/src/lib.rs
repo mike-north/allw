@@ -1353,12 +1353,12 @@ pub fn action_from_command(command_line: &str, cwd: Option<String>) -> Result<St
 
 /// Builds an [`ActionRecord`](allw_core::ActionRecord) from a raw **PowerShell** command line,
 /// returning it as JSON (the `command` surface, for a host's PowerShell tool). `raw` is the exact
-/// line; argv is a POSIX split when it applies, else a whitespace split; risk is at least `Medium`,
-/// or at least `High` when the split had to fall back. See
+/// line; argv is always a plain whitespace split of it; risk is at least `Medium`, or at least
+/// `High` for a compound, escaped or dynamic-execution line. See
 /// [`allw_core::powershell`](allw_core::powershell) for the rules.
 ///
-/// Infallible by design: PowerShell syntax that POSIX splitting rejects is recorded (with the
-/// higher floor), never refused, so a valid PowerShell command is never denied for its quoting.
+/// Infallible by design: no PowerShell line is refused for its syntax, so a valid PowerShell
+/// command is never denied for its quoting.
 #[wasm_bindgen]
 pub fn action_from_powershell_command(
     command_line: &str,

