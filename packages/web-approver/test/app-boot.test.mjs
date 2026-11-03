@@ -18,7 +18,12 @@
  *   - unpaired + `?relay=http://relay.example.com` → rejected with the https-only reason;
  *   - an identity pinned to a relay the current rule rejects (`http://[::1]`) → a re-pair-required
  *     screen first; the identity is cleared only on confirmation (#286). A corrupt identity is
- *     still discarded by the pairing gate.
+ *     still discarded by the pairing gate;
+ *   - a core load that stalls (#308), on a mocked clock → the re-pair screen appears at
+ *     `DISPLAY_ESCAPE_LOAD_TIMEOUT_MS` with the pin withheld and the confirm still working, offline;
+ *     a core arriving after the deadline leaves the screen byte-identical; one arriving before it
+ *     is used and clears the deadline timer; and the ignored-relay notice reads "(checking…)" until
+ *     the deadline, then the withheld text.
  *
  * @see https://github.com/mike-north/allw/issues/249
  * @see ../src/app.ts
@@ -753,24 +758,47 @@ describe("boot — stored identity pinned to a relay this build rejects (#286)",
       const escape = await loadCoreDisplayEscape();
       let arrive;
 
-      void bootWith({
-        search: "",
-        storage,
-        loadDisplayEscape: () =>
-          new Promise((resolve) => {
-            arrive = () => resolve(escape);
-          }),
-      });
-      const root = dom.window.document.getElementById("app");
-      await settle();
-      mock.timers.tick(DISPLAY_ESCAPE_LOAD_TIMEOUT_MS - 1);
-      arrive();
-      await settle();
-      // crates/allw-core/src/display.rs: a bidi control is shown as ⟨U+XXXX⟩.
-      assert.equal(
-        root.querySelector(".pairing-relay-url").textContent,
-        "http://evil⟨U+202E⟩example.com",
-      );
+      // Spy on the (mocked) timer functions boot calls, to see the deadline timer cleared once the
+      // core wins the race. A stray timer would be inert, so only the spy can see it.
+      const mockedSetTimeout = globalThis.setTimeout;
+      const mockedClearTimeout = globalThis.clearTimeout;
+      const deadlineTimers = [];
+      const cleared = [];
+      globalThis.setTimeout = (fn, ms, ...args) => {
+        const handle = mockedSetTimeout(fn, ms, ...args);
+        if (ms === DISPLAY_ESCAPE_LOAD_TIMEOUT_MS) deadlineTimers.push(handle);
+        return handle;
+      };
+      globalThis.clearTimeout = (handle) => {
+        cleared.push(handle);
+        mockedClearTimeout(handle);
+      };
+      try {
+        void bootWith({
+          search: "",
+          storage,
+          loadDisplayEscape: () =>
+            new Promise((resolve) => {
+              arrive = () => resolve(escape);
+            }),
+        });
+        const root = dom.window.document.getElementById("app");
+        await settle();
+        mock.timers.tick(DISPLAY_ESCAPE_LOAD_TIMEOUT_MS - 1);
+        assert.equal(deadlineTimers.length, 1, "boot arms one deadline timer");
+        assert.ok(!cleared.includes(deadlineTimers[0]), "still armed while the core is loading");
+        arrive();
+        await settle();
+        // crates/allw-core/src/display.rs: a bidi control is shown as ⟨U+XXXX⟩.
+        assert.equal(
+          root.querySelector(".pairing-relay-url").textContent,
+          "http://evil⟨U+202E⟩example.com",
+        );
+        assert.ok(cleared.includes(deadlineTimers[0]), "the deadline timer is cleared on arrival");
+      } finally {
+        globalThis.setTimeout = mockedSetTimeout;
+        globalThis.clearTimeout = mockedClearTimeout;
+      }
     });
   });
 

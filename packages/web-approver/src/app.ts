@@ -134,8 +134,10 @@ export interface BootEnvironment {
   /**
    * Load the core's display escape (#246) for the re-pair screen (#286), which shows a stored relay
    * string before the inbox (and so before the runtime) loads. Production initializes the vendored
-   * WASM core, which is memoized and reused by the inbox. When omitted, or when it rejects, the
-   * re-pair screen withholds the pin text rather than print it unescaped.
+   * WASM core, which is memoized and reused by the inbox. The ignored-relay notice (#307) gets its
+   * escape from the same seam. When omitted, when it rejects, or when it does not resolve within
+   * {@link DISPLAY_ESCAPE_LOAD_TIMEOUT_MS} (#308), the re-pair screen withholds the pin text and
+   * the notice withholds the ignored link's name rather than print either unescaped.
    */
   readonly loadDisplayEscape?: () => Promise<DisplayEscape>;
   /**
@@ -306,6 +308,10 @@ async function loadDisplayEscape(env: BootEnvironment): Promise<DisplayEscape | 
     }
   })();
   try {
+    // A core that settles in the same macrotask as the deadline loses the race: `loaded` is two
+    // microtask hops behind the deadline's direct `resolve(null)`. That is fail-safe and intended:
+    // the text is withheld, not printed raw, and the screen is rendered once either way. Don't
+    // "fix" the tie in the core's favour.
     return await Promise.race([loaded, deadline]);
   } finally {
     clearTimeout(timer);
