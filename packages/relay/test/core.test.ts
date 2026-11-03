@@ -20,6 +20,8 @@ const DECLARED_GLUE_FUNCTIONS = [
   "check_account_id_for_root",
   "verify_pairing_start_authorization",
   "sign_pairing_start_authorization",
+  "verify_account_state",
+  "sign_account_state",
   "ed25519_public_key",
 ] as const;
 

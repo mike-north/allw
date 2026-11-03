@@ -101,3 +101,45 @@ export function pairingStartBody(
     ...(label === undefined ? {} : { label }),
   };
 }
+
+/** Options for a root-signed account-state document. */
+export interface AccountStateOptions {
+  /**
+   * The `sequence` claim. A `bigint` (or a decimal string) is written into the JSON verbatim, so a
+   * test can sign a sequence above 2^53-1 that a JS number cannot represent.
+   */
+  readonly sequence: number | bigint | string;
+  /** The `account_id` claim (default: the signing account's own id). */
+  readonly accountId?: string;
+  /** The `current_root` claim (default: the signing account's own root). */
+  readonly currentRoot?: string;
+  /** Device ids recorded as revoked in the document. */
+  readonly revokedDevices?: readonly string[];
+}
+
+/**
+ * Sign an `allw-account-state+jws` with `signer`'s root (the core's `sign_account_state`). The
+ * claims default to an honest document for `signer`'s own account; overrides build the forged or
+ * mismatched documents the relay must reject.
+ */
+export function signAccountState(signer: TestAccount, options: AccountStateOptions): string {
+  const claims = {
+    v: 1,
+    account_id: options.accountId ?? signer.id,
+    sequence: "__SEQUENCE__",
+    current_root: options.currentRoot ?? signer.rootPubkey,
+    previous_roots: [],
+    devices: [],
+    actors: [],
+    revocations: (options.revokedDevices ?? []).map((id) => ({
+      kind: "device",
+      id,
+      revoked_at: 1_700_000_000_000,
+    })),
+  };
+  const json = JSON.stringify(claims).replace(
+    '"__SEQUENCE__"',
+    typeof options.sequence === "string" ? options.sequence : String(options.sequence),
+  );
+  return glue.sign_account_state(json, signer.rootSeed);
+}
