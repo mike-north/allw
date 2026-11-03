@@ -436,6 +436,38 @@ describe("handleNotificationClick (#237)", () => {
 // ── Service worker: subscription change ──────────────────────────────────────────────────────────
 
 describe("handleSubscriptionChange — re-register when the browser replaces the subscription (#237)", () => {
+  test("a credential store that rejects is a failed result, never a rejected event", async () => {
+    const store = memoryPushStore({ credentials: CREDENTIALS });
+    store.readCredentials = async () => {
+      throw new Error("IndexedDB blocked");
+    };
+    const result = await handleSubscriptionChange({
+      store,
+      fetchImpl: () => assert.fail("no relay call without credentials"),
+      newSubscription: { endpoint: ENDPOINT },
+      resubscribe: async () => assert.fail("no resubscribe"),
+    });
+    assert.equal(result.status, "failed");
+    assert.match(result.reason, /could not read the notification credentials/);
+  });
+
+  test("a registration record that can't be written is a failed result, never a rejected event", async () => {
+    const store = memoryPushStore({ credentials: CREDENTIALS });
+    store.writeRegistration = async () => {
+      throw new Error("QuotaExceededError");
+    };
+    const result = await handleSubscriptionChange({
+      store,
+      fetchImpl: fakeFetch(() =>
+        json(200, { push_tokens: [{ transport: "webpush", token: ENDPOINT }] }),
+      ).impl,
+      newSubscription: { endpoint: ENDPOINT },
+      resubscribe: async () => assert.fail("no resubscribe"),
+    });
+    assert.equal(result.status, "failed");
+    assert.match(result.reason, /could not record the registration/);
+  });
+
   const NEW_ENDPOINT = "https://fcm.googleapis.com/fcm/send/replacement-237";
 
   test("registers the browser-provided new subscription and records it", async () => {

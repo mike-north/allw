@@ -24,7 +24,7 @@
  * @see ../../../docs/relay-api.md (§5 Web Push)
  */
 
-import type { PushCredentialStore } from "./push-credentials.js";
+import type { PushCredentialStore, PushCredentials } from "./push-credentials.js";
 import {
   RELAY_CALL_TIMEOUT_MS,
   fetchPendingCount,
@@ -185,12 +185,21 @@ export type SubscriptionChangeResult =
 /**
  * Handle `pushsubscriptionchange`: the browser replaced or expired the subscription, so register
  * the new endpoint with the relay (subscribing again first if the browser didn't). Without
- * mirrored credentials notifications were never enabled here, and nothing is done.
+ * mirrored credentials notifications were never enabled here, and nothing is done. Like the rest
+ * of the worker, it never rejects: storage and relay failures are reported as a `failed` result.
  */
 export async function handleSubscriptionChange(
   deps: SubscriptionChangeDeps,
 ): Promise<SubscriptionChangeResult> {
-  const credentials = await deps.store.readCredentials();
+  let credentials: PushCredentials | null;
+  try {
+    credentials = await deps.store.readCredentials();
+  } catch (error) {
+    return {
+      status: "failed",
+      reason: `could not read the notification credentials (${String(error)})`,
+    };
+  }
   if (credentials === null) return { status: "skipped", reason: "notifications not enabled" };
   const timeoutMs = deps.relayTimeoutMs ?? RELAY_CALL_TIMEOUT_MS;
 
@@ -207,11 +216,19 @@ export async function handleSubscriptionChange(
 
   const registered = await registerPushEndpoint(credentials, endpoint, deps.fetchImpl, timeoutMs);
   if (!registered.ok) return { status: "failed", reason: registered.detail };
-  await deps.store.writeRegistration({
-    relayUrl: credentials.relayUrl,
-    accountId: credentials.accountId,
-    deviceId: credentials.deviceId,
-    endpoint,
-  });
+  try {
+    await deps.store.writeRegistration({
+      relayUrl: credentials.relayUrl,
+      accountId: credentials.accountId,
+      deviceId: credentials.deviceId,
+      endpoint,
+    });
+  } catch (error) {
+    // The relay has the new endpoint; without the record, the page's next load re-registers it.
+    return {
+      status: "failed",
+      reason: `registered, but could not record the registration (${String(error)})`,
+    };
+  }
   return { status: "registered", endpoint };
 }
