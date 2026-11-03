@@ -15,7 +15,7 @@
  * fetched from a same-origin asset URL rather than read from a Node path. This module sequences
  * those steps explicitly: resolve the relay URL → run the first-run onboarding walkthrough
  * (pre-enrollment only, #151) → run the pairing gate → load WASM → build the runtime from the
- * paired identity → mount the live inbox.
+ * paired identity → mount the live inbox, and beside it the notification controls (#237).
  *
  * # Relay pinning (#249)
  * The relay URL is resolved differently depending on whether this browser is already paired:
@@ -58,6 +58,8 @@ import {
   readStoredRelayUrl,
   resolveRelayUrl,
 } from "./relay-config.js";
+import { createIndexedDbPushCredentialStore } from "./push-credentials.js";
+import { browserPushEnvironment, mountNotificationControls } from "./push-subscribe.js";
 import { createBrowserRuntime } from "./runtime.js";
 import { createLocalAccountStateFloorStore } from "./sequence-floor.js";
 import { createLocalSurfaceIdStore, resolveSurfaceId } from "./surface-id.js";
@@ -106,6 +108,11 @@ export interface BootEnvironment {
   readonly search: string;
   /** Load WASM and mount the live inbox for a paired identity, against its pinned relay. */
   readonly startInbox: (root: HTMLElement, identity: PinnedIdentity) => Promise<unknown>;
+  /**
+   * Mount the notification controls (#237) for a paired identity, outside the inbox. Called after
+   * `startInbox`, and never awaited: notifications can't delay or block the inbox. Omit to skip.
+   */
+  readonly startNotifications?: (identity: PinnedIdentity) => void;
 }
 
 /**
@@ -244,7 +251,9 @@ export async function boot(env: BootEnvironment): Promise<void> {
         if (identity.relayUrl === undefined) {
           throw new Error("allw web approver: paired identity has no pinned relay");
         }
-        void env.startInbox(root, { ...identity, relayUrl: identity.relayUrl });
+        const pinned: PinnedIdentity = { ...identity, relayUrl: identity.relayUrl };
+        void env.startInbox(root, pinned);
+        env.startNotifications?.(pinned);
       },
     });
   }
@@ -260,6 +269,18 @@ export async function boot(env: BootEnvironment): Promise<void> {
   });
 }
 
+/**
+ * Mount the notification controls (#237) into `#notifications`, against the browser's real
+ * service worker, Push API, Notifications API and IndexedDB.
+ */
+function startBrowserNotifications(identity: PinnedIdentity): void {
+  mountNotificationControls({
+    host: requireElement("notifications"),
+    identity,
+    env: browserPushEnvironment(window, createIndexedDbPushCredentialStore(window.indexedDB)),
+  });
+}
+
 if (typeof window !== "undefined" && typeof document !== "undefined") {
   void boot({
     root: requireElement("app"),
@@ -267,6 +288,7 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
     storage: window.localStorage,
     search: window.location.search,
     startInbox: bootInbox,
+    startNotifications: startBrowserNotifications,
   });
 }
 
