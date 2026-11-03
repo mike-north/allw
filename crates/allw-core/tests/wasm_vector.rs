@@ -38,17 +38,21 @@
 //! @see docs/enrollment.md §Model (account id derivation, pairing-start authorization)
 //! @see crates/allw-core/src/hash.rs (FROZEN_HASH_HEX — the same value)
 //! @see crates/allw-core/src/recipients.rs (the recipient-selection rules)
+//! @see crates/allw-core/src/sealing.rs (encrypting to the selected recipients)
 
 use std::path::PathBuf;
 
 use allw_core::{
-    account_id_for_root, action_from_agent_tool_call, compute_request_hash, issue_device_cert,
-    select_recipients, sign_account_state, sign_pairing_start_authorization, sign_verdict,
-    AccountState, AccountStateDevice, AccountStateRevocation, AccountStateRevocationKind,
-    ActionRecord, Actor, ApprovalContext, ApprovalRequest, Approver, Constraints, Decision,
-    PublicKey, Recipient, Risk, SigningKeyPair, Surface, SyntacticSubstrate, UnsignedVerdict,
+    account_id_for_root, action_from_agent_tool_call, compute_request_hash, decrypt_context,
+    issue_device_cert, seal_context_for_account_state, select_recipients, sign_account_state,
+    sign_pairing_start_authorization, sign_verdict, AccountState, AccountStateDevice,
+    AccountStateRevocation, AccountStateRevocationKind, ActionRecord, Actor, ApprovalContext,
+    ApprovalRequest, Approver, Constraints, Decision, JweError, PublicKey, Recipient, Risk,
+    SigningKeyPair, Surface, SyntacticSubstrate, UnsignedVerdict, X25519KeyPair,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use rand_chacha::rand_core::SeedableRng;
+use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
 
 // ── Fixed seeds / identities / timestamps (never rand / SystemTime) ───────────────
@@ -87,6 +91,15 @@ const RECIPIENT_REVOKED_AT: i64 = 1_700_000_500_000;
 const RECIPIENT_NOW_MS: i64 = 1_800_000_000_000;
 /// The caller's persisted floor for the recipient vector: the current sequence, so it is met.
 const RECIPIENT_MIN_SEQUENCE: u64 = 2;
+
+// Seal vector: devices whose X25519 keys come from known seeds, so both platforms can open the
+// sealed context and confirm a key the root never vouched for cannot.
+const SEAL_PHONE_SEED: [u8; 32] = [0x51; 32];
+const SEAL_LAPTOP_SEED: [u8; 32] = [0x52; 32];
+const SEAL_REVOKED_SEED: [u8; 32] = [0x53; 32];
+const SEAL_INJECTED_SEED: [u8; 32] = [0x5E; 32];
+/// The seal set's current sequence (and the floor the vector seals with).
+const SEAL_SEQUENCE: u64 = 3;
 
 /// Account id derived from the approver root (seed `[0x11; 32]`), computed independently of the
 /// core: `SHA-256("allw/account-id/v1" || 0x00 || root_pubkey)` via `shasum -a 256`, then
@@ -150,6 +163,16 @@ struct WasmVector {
     recipient_now_ms: i64,
     /// The `min_sequence` floor the recipient selection runs with.
     recipient_min_sequence: u64,
+
+    /// JSON array of root-signed account-state JWS for sealing (see [`seal_account_states`]).
+    seal_account_states_json: String,
+    /// JSON object `{ device_id: x25519_seed_b64 }` for every device in the seal set, including the
+    /// revoked `old` and the never-vouched `injected` (listed only in the stale sequence).
+    seal_x25519_seeds_json: String,
+    /// JSON array of the device ids the seal must encrypt to, written from the rules.
+    seal_expected_recipient_ids_json: String,
+    /// The sequence the seal must report (and the floor it runs with).
+    seal_sequence: u64,
 }
 
 // ── Builders (mirror hash::tests::make_minimal_context exactly) ───────────────────
@@ -321,6 +344,73 @@ fn expected_recipients() -> Vec<Recipient> {
     ]
 }
 
+fn x25519_device(id: &str, seed: &[u8; 32]) -> AccountStateDevice {
+    recipient_device(
+        id,
+        X25519KeyPair::from_seed(seed).public_key().to_bytes(),
+        "active",
+    )
+}
+
+/// The seal vector's account-state set:
+/// - sequence 2 (stale): lists `injected`, which must get no recipient entry;
+/// - sequence 3: `phone` and `laptop` active; `old` active but revoked (no entry).
+fn seal_account_states(root: &SigningKeyPair) -> Vec<String> {
+    let account_id = account_id_for_root(&root.public_key());
+    let state = |sequence: u64, devices: Vec<AccountStateDevice>, revoked: &[&str]| AccountState {
+        v: 1,
+        account_id: account_id.clone(),
+        sequence,
+        current_root: root.public_key().to_bytes(),
+        previous_roots: vec![],
+        devices,
+        actors: vec![],
+        revocations: revoked
+            .iter()
+            .map(|id| AccountStateRevocation {
+                kind: AccountStateRevocationKind::Device,
+                id: (*id).to_string(),
+                revoked_at: RECIPIENT_REVOKED_AT,
+                reason: None,
+            })
+            .collect(),
+    };
+    let stale = state(
+        SEAL_SEQUENCE - 1,
+        vec![
+            x25519_device("phone", &SEAL_PHONE_SEED),
+            x25519_device("injected", &SEAL_INJECTED_SEED),
+        ],
+        &[],
+    );
+    let current = state(
+        SEAL_SEQUENCE,
+        vec![
+            x25519_device("phone", &SEAL_PHONE_SEED),
+            x25519_device("laptop", &SEAL_LAPTOP_SEED),
+            x25519_device("old", &SEAL_REVOKED_SEED),
+        ],
+        &["old"],
+    );
+    [stale, current]
+        .iter()
+        .map(|s| sign_account_state(s, root))
+        .collect()
+}
+
+fn seal_x25519_seeds_json() -> String {
+    let seeds: serde_json::Map<String, serde_json::Value> = [
+        ("phone", SEAL_PHONE_SEED),
+        ("laptop", SEAL_LAPTOP_SEED),
+        ("old", SEAL_REVOKED_SEED),
+        ("injected", SEAL_INJECTED_SEED),
+    ]
+    .iter()
+    .map(|(id, seed)| ((*id).to_string(), URL_SAFE_NO_PAD.encode(seed).into()))
+    .collect();
+    serde_json::to_string(&seeds).expect("seeds serialize")
+}
+
 /// The WASM `select_recipients` wire shape for a recipient list.
 fn recipients_wire_json(recipients: &[Recipient]) -> String {
     let wire: Vec<serde_json::Value> = recipients
@@ -416,6 +506,13 @@ fn build_vector() -> WasmVector {
         expected_recipients_json: recipients_wire_json(&expected_recipients()),
         recipient_now_ms: RECIPIENT_NOW_MS,
         recipient_min_sequence: RECIPIENT_MIN_SEQUENCE,
+        seal_account_states_json: serde_json::to_string(&seal_account_states(&root))
+            .expect("account states serialize"),
+        seal_x25519_seeds_json: seal_x25519_seeds_json(),
+        // Spec (recipients.rs rules): the stale `injected` and the revoked `old` are excluded;
+        // recipients are sorted by device id.
+        seal_expected_recipient_ids_json: r#"["laptop","phone"]"#.to_string(),
+        seal_sequence: SEAL_SEQUENCE,
     }
 }
 
@@ -559,4 +656,65 @@ fn fixture_recipients_follow_the_selection_rules() {
         committed.expected_recipients_json,
         recipients_wire_json(&selected)
     );
+}
+
+/// Sealing the fixture's seal set encrypts to exactly `laptop` and `phone`, each of which can open
+/// it; the revoked `old` and the never-vouched `injected` get no recipient entry. The node test
+/// runs the same check through the WASM export.
+#[test]
+fn fixture_seal_encrypts_only_to_vouched_devices() {
+    let raw = std::fs::read_to_string(fixture_path()).expect("fixture must exist for this test");
+    let committed: WasmVector =
+        serde_json::from_str(&raw).expect("committed fixture is valid WasmVector JSON");
+    let docs: Vec<String> =
+        serde_json::from_str(&committed.seal_account_states_json).expect("seal states parse");
+    let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+    let root_bytes: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(&committed.approver_root_pubkey_b64)
+        .expect("root pubkey decodes")
+        .try_into()
+        .expect("root pubkey is 32 bytes");
+    let root = PublicKey::from_bytes(&root_bytes).expect("root pubkey is valid");
+    let context: ApprovalContext =
+        serde_json::from_str(&committed.context_json).expect("context parses");
+    assert_eq!(committed.seal_sequence, SEAL_SEQUENCE);
+
+    let sealed = seal_context_for_account_state(
+        &context,
+        &refs,
+        &committed.expected_account_id_for_root,
+        &root,
+        committed.recipient_now_ms,
+        Some(committed.seal_sequence),
+        &mut ChaCha20Rng::from_seed([0x42; 32]),
+    )
+    .expect("fixture seal set yields recipients");
+    assert_eq!(sealed.sequence, committed.seal_sequence);
+
+    let seeds: std::collections::BTreeMap<String, String> =
+        serde_json::from_str(&committed.seal_x25519_seeds_json).expect("seeds parse");
+    let key = |id: &str| -> X25519KeyPair {
+        let seed: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(&seeds[id])
+            .expect("seed decodes")
+            .try_into()
+            .expect("seed is 32 bytes");
+        X25519KeyPair::from_seed(&seed)
+    };
+    let expected: Vec<String> = serde_json::from_str(&committed.seal_expected_recipient_ids_json)
+        .expect("expected ids parse");
+    for id in &expected {
+        assert_eq!(
+            decrypt_context(&sealed.ciphertext, id, &key(id)).as_ref(),
+            Ok(&context),
+            "{id} must open the sealed context"
+        );
+    }
+    for id in ["old", "injected"] {
+        assert_eq!(
+            decrypt_context(&sealed.ciphertext, id, &key(id)),
+            Err(JweError::NoRecipientForDevice),
+            "{id} must get no recipient entry"
+        );
+    }
 }
