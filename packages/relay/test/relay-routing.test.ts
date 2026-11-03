@@ -770,6 +770,8 @@ describe("AccountRelay — cross-device coordination", () => {
       "dev-stale-flush",
       new Request(
         "https://relay.allw.test/acct/devices/dev-stale-flush/connect?surface_id=mac-screen&auth=stale-device-token",
+        // A real WebSocket client sends the upgrade header; the query token is accepted only then.
+        { headers: { Upgrade: "websocket" } },
       ),
     );
     expect(response.status).toBe(101);
@@ -1003,6 +1005,212 @@ describe("AccountRelay — endpoint authentication", () => {
     expect(okWait.status).toBe(101);
     okWait.webSocket?.accept();
     okWait.webSocket?.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Where a bearer token may be presented (#303)
+// ---------------------------------------------------------------------------
+
+/**
+ * One authenticated HTTP route, set up on a fresh account: the request to make and the token that
+ * authorizes it. `ok` is the status the route returns when that token is sent as a header, so each
+ * negative case also proves the 401 comes from where the token was presented, not from the request.
+ */
+interface QueryAuthCase {
+  route: string;
+  ok: number;
+  setUp(accountId: string): Promise<{
+    method: string;
+    subPath: string;
+    token: string;
+    body?: Record<string, unknown>;
+  }>;
+}
+
+const HTTP_QUERY_AUTH_CASES: readonly QueryAuthCase[] = [
+  {
+    route: "POST /pairing/complete",
+    ok: 201,
+    async setUp(acct) {
+      const start = await post<PairingStartResult>(acct, "/pairing/start", pairingStartBody(acct));
+      return {
+        method: "POST",
+        subPath: "/pairing/complete",
+        token: start.data.pairing_auth_token,
+        body: { code: start.data.code, pubkey: DEVICE_PUBKEY },
+      };
+    },
+  },
+  {
+    route: "POST /actors",
+    ok: 201,
+    async setUp(acct) {
+      const device = await pairDevice(acct);
+      return {
+        method: "POST",
+        subPath: "/actors",
+        token: device.device_auth_token,
+        body: { actor_id: "actor-query-auth", pubkey: DEVICE_PUBKEY },
+      };
+    },
+  },
+  {
+    route: "POST /devices/{id}/revoke",
+    ok: 200,
+    async setUp(acct) {
+      const device = await pairDevice(acct);
+      return {
+        method: "POST",
+        subPath: `/devices/${device.device_id}/revoke`,
+        token: device.device_auth_token,
+        body: {},
+      };
+    },
+  },
+  {
+    route: "PUT /devices/{id}/push-tokens",
+    ok: 200,
+    async setUp(acct) {
+      const device = await pairDevice(acct);
+      return {
+        method: "PUT",
+        subPath: `/devices/${device.device_id}/push-tokens`,
+        token: device.device_auth_token,
+        body: { push_tokens: [] },
+      };
+    },
+  },
+  {
+    route: "GET /devices/{id}/inbox",
+    ok: 200,
+    async setUp(acct) {
+      const device = await pairDevice(acct);
+      return {
+        method: "GET",
+        subPath: `/devices/${device.device_id}/inbox`,
+        token: device.device_auth_token,
+      };
+    },
+  },
+  {
+    route: "GET /requests/{id}",
+    ok: 200,
+    async setUp(acct) {
+      const submit = await post<SubmitResult>(acct, "/requests", makeEnvelope("req-query-get"));
+      return {
+        method: "GET",
+        subPath: `/requests/${submit.data.request_id}`,
+        token: submit.data.request_auth_token,
+      };
+    },
+  },
+  {
+    route: "POST /requests/{id}/retract",
+    ok: 200,
+    async setUp(acct) {
+      const submit = await post<SubmitResult>(acct, "/requests", makeEnvelope("req-query-retract"));
+      return {
+        method: "POST",
+        subPath: `/requests/${submit.data.request_id}/retract`,
+        token: submit.data.request_auth_token,
+        body: {},
+      };
+    },
+  },
+];
+
+/** Send one route's request with the given extra headers, bypassing the auto-auth helpers. */
+async function rawFetch(
+  accountId: string,
+  call: { method: string; subPath: string; body?: Record<string, unknown> },
+  headers: Record<string, string>,
+): Promise<Response> {
+  return SELF.fetch(relayUrl(accountId, call.subPath), {
+    method: call.method,
+    headers: call.body === undefined ? headers : { "Content-Type": "application/json", ...headers },
+    ...(call.body === undefined ? {} : { body: JSON.stringify(call.body) }),
+  });
+}
+
+describe("AccountRelay — ?auth= is accepted only on WebSocket upgrades (#303)", () => {
+  // A token in a URL lands in access, proxy and CDN logs, browser history and Referer. Browsers
+  // cannot set headers on a WebSocket, so only the two WebSocket routes accept the query form.
+  for (const c of HTTP_QUERY_AUTH_CASES) {
+    it(`rejects a query-only token on ${c.route} with 401, and accepts the same token as a header`, async () => {
+      const acct = testAccount(`acct-query-auth-${c.route.replace(/[^a-z]+/gi, "-")}`);
+      const call = await c.setUp(acct);
+      const withQuery = { ...call, subPath: appendAuthQuery(call.subPath, call.token) };
+
+      const queryOnly = await rawFetch(acct, withQuery, {});
+      expect(queryOnly.status).toBe(401);
+
+      // Even a request claiming to be an upgrade does not unlock the query form on an HTTP route.
+      // (Only GET routes can carry one: the runtime sends every upgrade request as a GET.)
+      if (call.method === "GET") {
+        const queryWithUpgrade = await rawFetch(acct, withQuery, { Upgrade: "websocket" });
+        expect(queryWithUpgrade.status).toBe(401);
+      }
+
+      const header = await rawFetch(acct, call, bearer(call.token));
+      expect(header.status).toBe(c.ok);
+    });
+  }
+
+  it("still accepts ?auth= (or the header) on the device connect upgrade", async () => {
+    const acct = testAccount("acct-query-auth-ws-connect");
+    const device = await pairDevice(acct);
+    const path = `/devices/${device.device_id}/connect`;
+
+    for (const init of [
+      { url: appendAuthQuery(path, device.device_auth_token), headers: {} },
+      { url: path, headers: bearer(device.device_auth_token) },
+    ]) {
+      const resp = await SELF.fetch(relayUrl(acct, init.url), {
+        headers: { Upgrade: "websocket", ...init.headers },
+      });
+      expect(resp.status).toBe(101);
+      resp.webSocket?.accept();
+      resp.webSocket?.close();
+    }
+  });
+
+  it("still accepts ?auth= (or the header) on the request wait upgrade", async () => {
+    const acct = testAccount("acct-query-auth-ws-wait");
+    const submit = await post<SubmitResult>(acct, "/requests", makeEnvelope("req-query-wait"));
+    const path = `/requests/${submit.data.request_id}/wait`;
+
+    for (const init of [
+      { url: appendAuthQuery(path, submit.data.request_auth_token), headers: {} },
+      { url: path, headers: bearer(submit.data.request_auth_token) },
+    ]) {
+      const resp = await SELF.fetch(relayUrl(acct, init.url), {
+        headers: { Upgrade: "websocket", ...init.headers },
+      });
+      expect(resp.status).toBe(101);
+      resp.webSocket?.accept();
+      resp.webSocket?.close();
+    }
+  });
+
+  it("treats a header plus a query token as the header alone", async () => {
+    const acct = testAccount("acct-query-auth-header-wins");
+    const device = await pairDevice(acct);
+    const path = appendAuthQuery(`/devices/${device.device_id}/connect`, device.device_auth_token);
+
+    // A wrong bearer header is judged on its own: the valid query token does not rescue it.
+    const wrongHeader = await SELF.fetch(relayUrl(acct, path), {
+      headers: { Upgrade: "websocket", ...bearer("wrong-device-token") },
+    });
+    expect(wrongHeader.status).toBe(403);
+
+    // Nor does it rescue a header that is malformed or of another scheme.
+    for (const authorization of ["Basic dXNlcjpwYXNz", "Bearer", "Bearer not a token"]) {
+      const resp = await SELF.fetch(relayUrl(acct, path), {
+        headers: { Upgrade: "websocket", Authorization: authorization },
+      });
+      expect(resp.status).toBe(401);
+    }
   });
 });
 

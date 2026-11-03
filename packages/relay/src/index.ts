@@ -270,10 +270,30 @@ function timingSafeEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
-function bearerToken(request: Request): string | null {
-  const auth = request.headers.get("Authorization") ?? "";
-  const match = /^Bearer ([A-Za-z0-9_-]+)$/.exec(auth);
-  if (match) return match[1] ?? null;
+/**
+ * Where a route accepts its bearer token from.
+ *
+ * - `header`: only `Authorization: Bearer …`. This is every HTTP route.
+ * - `header-or-websocket-query`: also `?auth=<token>`, but only on a WebSocket upgrade request and
+ *   only when no `Authorization` header is present. Browsers cannot set headers on a WebSocket, so
+ *   the two WebSocket routes (`…/connect`, `…/wait`) need the query form.
+ *
+ * A token in a URL leaks where a header does not: access, proxy and CDN logs, browser history,
+ * `Referer`, error reports. So the query form exists only where it is needed (#303).
+ */
+type BearerSource = "header" | "header-or-websocket-query";
+
+/**
+ * The bearer token a request presents for a route accepting `source`, or `null` if none.
+ * An `Authorization` header, when present, is the only credential considered. The query is never
+ * a fallback for a header that is malformed or of another scheme.
+ */
+function bearerToken(request: Request, source: BearerSource): string | null {
+  const auth = request.headers.get("Authorization");
+  if (auth !== null) {
+    return /^Bearer ([A-Za-z0-9_-]+)$/.exec(auth)?.[1] ?? null;
+  }
+  if (source !== "header-or-websocket-query" || !isWebSocketUpgrade(request)) return null;
   const queryToken = new URL(request.url).searchParams.get("auth");
   return queryToken && /^[A-Za-z0-9_-]+$/.test(queryToken) ? queryToken : null;
 }
@@ -828,17 +848,18 @@ export class AccountRelay implements DurableObject {
   private async authorizeStoredHash(
     request: Request,
     storedHash: string | null | undefined,
+    source: BearerSource = "header",
   ): Promise<Response | null> {
     // A missing hash is a legacy/migration row, not proof of authorization. Fail closed and require
     // re-pairing or re-submission so no endpoint silently falls back to unauthenticated access.
     if (storedHash === null || storedHash === undefined) return authError(401);
-    const token = bearerToken(request);
+    const token = bearerToken(request, source);
     if (token === null) return authError(401);
     return (await tokenMatches(storedHash, token)) ? null : authError(403);
   }
 
   private async authorizedDeviceId(request: Request): Promise<string | Response> {
-    const token = bearerToken(request);
+    const token = bearerToken(request, "header");
     if (token === null) return authError(401);
     const tokenHash = await hashAuthToken(token);
     const rows = [
@@ -1514,7 +1535,11 @@ export class AccountRelay implements DurableObject {
     if (!device) {
       return json({ error: "device not enrolled" }, 404);
     }
-    const authFailure = await this.authorizeStoredHash(request, device.auth_token_hash);
+    const authFailure = await this.authorizeStoredHash(
+      request,
+      device.auth_token_hash,
+      "header-or-websocket-query",
+    );
     if (authFailure) return authFailure;
     const surfaceId = parseSurfaceId(request);
     if (surfaceId === null) {
@@ -1644,6 +1669,7 @@ export class AccountRelay implements DurableObject {
   private async authorizeRequestRead(
     requestId: string,
     request: Request,
+    source: BearerSource = "header",
   ): Promise<{ row: RequestRow; status: string } | Response> {
     const rows = [
       ...this.sql.exec<RequestRow>(
@@ -1653,7 +1679,7 @@ export class AccountRelay implements DurableObject {
     ];
     const req = rows[0];
     if (!req) return json({ error: "request not found" }, 404);
-    const authFailure = await this.authorizeStoredHash(request, req.auth_token_hash);
+    const authFailure = await this.authorizeStoredHash(request, req.auth_token_hash, source);
     if (authFailure) return authFailure;
     return {
       row: req,
@@ -1981,7 +2007,11 @@ export class AccountRelay implements DurableObject {
    * will come for either of the latter two).
    */
   private async handleIntegratorWait(requestId: string, request: Request): Promise<Response> {
-    const authorized = await this.authorizeRequestRead(requestId, request);
+    const authorized = await this.authorizeRequestRead(
+      requestId,
+      request,
+      "header-or-websocket-query",
+    );
     if (authorized instanceof Response) return authorized;
     const status = authorized.status;
 

@@ -506,6 +506,9 @@ attestation, audit records, hook/SDK fail-closed behavior, or enrollment.
 - [ ] Pending requests expire fail-closed; expired requests cannot later resolve approved.
 - [ ] Network failures, hung reads, refused connections, and malformed relay responses deny or expire, never allow.
 - [ ] Any new endpoint states who may call it and what authentication/authorization is required.
+- [ ] Bearer tokens stay out of URLs: HTTP routes read them only from the `Authorization` header. The
+      `?auth=` query form is accepted only on the WebSocket upgrade routes, where browsers cannot set headers
+      (`docs/relay-api.md` §1, #303). A new route never opts into it unless it is a WebSocket upgrade.
 - [ ] Relay URLs are accepted only as `https:` (or `http:` on loopback) and are rejected at configuration time,
       before any request is built (web approver `checkRelayUrl`, SDK `assertRelayUrlTransport`).
 - [ ] A paired web approver talks only to the relay pinned in its stored identity; no query parameter, link, or
