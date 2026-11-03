@@ -48,7 +48,6 @@ import { buildPairedApprover } from "../dist/lib/identity.js";
 // ── Fixed, deterministic timeline (fixed-dates rule: never Date.now() in fixtures) ──────────────
 const NOW_MS = 1_700_000_000_000;
 const TIMEOUT_MS = 300_000;
-const ACCOUNT_ID = "acct-walking-skeleton";
 const DEVICE_ID = "dev-walking-skeleton";
 const RELAY_URL = "https://relay.allw.test";
 const DESTRUCTIVE_COMMAND = "git push --force origin main";
@@ -60,8 +59,8 @@ const now = () => NOW_MS;
 /** Stand up a relay + paired approver + attached auto-decider, all on the shared fixed clock. */
 async function harness(mode) {
   const wasm = await loadWasm();
+  // No accountId: the id is the self-certifying one the core derives from the generated root.
   const identity = buildPairedApprover(wasm, {
-    accountId: ACCOUNT_ID,
     deviceId: DEVICE_ID,
     relayUrl: RELAY_URL,
     issuedAt: NOW_MS - 1000,
@@ -113,7 +112,7 @@ function bashStdin(command, cwd) {
 function hookEnv(identity) {
   return {
     ALLW_RELAY_URL: RELAY_URL,
-    ALLW_ACCOUNT_ID: ACCOUNT_ID,
+    ALLW_ACCOUNT_ID: identity.keyfile.account_id,
     ALLW_APPROVER_ROOT_KEY: identity.keyfile.account_root_pubkey,
     ALLW_TIMEOUT_MS: String(TIMEOUT_MS),
   };
@@ -211,7 +210,7 @@ test("integrator independently re-verifies the verdict: request_id AND request_h
 
   const client = createClient({
     relayUrl: RELAY_URL,
-    accountId: ACCOUNT_ID,
+    accountId: identity.keyfile.account_id,
     approverRootKey: identity.keyfile.account_root_pubkey,
     ...sdkOverrides(relay),
   });
@@ -259,7 +258,7 @@ test("zero-knowledge: the relay stores only the opaque ciphertext envelope + sig
 
   const client = createClient({
     relayUrl: RELAY_URL,
-    accountId: ACCOUNT_ID,
+    accountId: identity.keyfile.account_id,
     approverRootKey: identity.keyfile.account_root_pubkey,
     ...sdkOverrides(relay),
   });

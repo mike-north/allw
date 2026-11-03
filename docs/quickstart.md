@@ -191,14 +191,47 @@ protection against the agent (see the warning in §2).
 > For the full integration contract (matcher set, decision mapping, fail-closed analysis,
 > permission-mode interactions) see [`docs/claude-code-integration.md`](./claude-code-integration.md).
 
-The hook reads its config from the environment. Export these in the shell where Claude Code runs
-(using the values from step 2):
+The hook (like `@allw/sdk`'s `loadClientConfig` and every other integrator surface) reads its
+coordinates from **one non-secret config file**, `~/.allw/config.json`. Create it with the values
+from step 2, user-only:
 
 ```sh
-export ALLW_RELAY_URL="<RELAY_URL>"
-export ALLW_ACCOUNT_ID="<ACCOUNT_ID_FROM_STEP_2>"
-export ALLW_APPROVER_ROOT_KEY="<ACCOUNT_ROOT_PUBLIC_KEY_FROM_STEP_2>"
+mkdir -p -m 700 ~/.allw
+cat > ~/.allw/config.json <<'JSON'
+{
+  "version": 1,
+  "relay_url": "<RELAY_URL>",
+  "account_id": "<ACCOUNT_ID_FROM_STEP_2>",
+  "approver_root_key": "<ACCOUNT_ROOT_PUBLIC_KEY_FROM_STEP_2>"
+}
+JSON
+chmod 600 ~/.allw/config.json
 ```
+
+> Automatic writing of this file by `allw-approver pair` is tracked in
+> [#230](https://github.com/mike-north/allw/issues/230); until it lands, write it by hand as above.
+> If the agent runs on a different machine from the one that ran `pair`, copy the file there.
+
+The file holds no secrets (never put the approver keyfile's seeds or tokens in it), but it is your
+**trust anchor**: `approver_root_key` decides whose signatures the hook accepts, so anyone who can
+rewrite it can redirect approvals. Keep it `0600` in a `0700` directory. On macOS/Linux the loader
+enforces this on read: a file that is not owned by you, or is group- or world-writable, is rejected
+(fix it with `chmod 600 ~/.allw/config.json`).
+
+The loader fails closed — the hook **denies** — if the file is missing and no env vars are set, is
+not a regular file (a FIFO, device or directory), is over 64 KiB, fails the ownership/permission
+check above, is not valid JSON, has an unknown `version`, is missing a key or has an unknown one, holds a malformed
+`approver_root_key`, or holds an `account_id` that does not derive from `approver_root_key`.
+
+**Overrides.** Each field can be overridden by an env var, field by field (env wins over the file).
+You don't need any of these if the file is in place:
+
+| Env var                  | Overrides                                                                                                                                                                                                 |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ALLW_CONFIG`            | the file's location (default `~/.allw/config.json`); must be an **absolute** path (a leading `~/` is expanded; a relative path is rejected, since it would resolve against the agent's working directory) |
+| `ALLW_RELAY_URL`         | `relay_url`                                                                                                                                                                                               |
+| `ALLW_ACCOUNT_ID`        | `account_id`                                                                                                                                                                                              |
+| `ALLW_APPROVER_ROOT_KEY` | `approver_root_key`                                                                                                                                                                                       |
 
 Then register the hook in your project's (or user's) `.claude/settings.json` as a **PreToolUse**
 hook. The matcher `Bash|mcp__.*` gates shell commands and any MCP tool call:
@@ -285,14 +318,15 @@ agent, that decision is only as trustworthy as the machine: the agent can read t
 
 ## Troubleshooting
 
-| Symptom                                      | Cause / fix                                                                                                                    |
-| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| Hook always denies with "ALLW\_… is not set" | The hook env vars (step 4) aren't visible to Claude Code's shell. Export them where Claude Code launches.                      |
-| Hook denies with "vendored wasm not found"   | You're running an unbuilt checkout, not the installed package. `npm install @allw/hook` (it bundles the WASM via `@allw/sdk`). |
-| No prompt appears in the watch terminal      | The account id / `--relay` printed by `pair` must match the hook's `ALLW_ACCOUNT_ID` / `ALLW_RELAY_URL`.                       |
-| Request times out immediately                | Check the relay is running (step 0) and reachable at `ALLW_RELAY_URL`.                                                         |
-| Transcript shows `PreToolUse:… hook error`   | The hook couldn't start (bad path, or not installed). See [If the hook can't start](#if-the-hook-cant-start).                  |
-| `git status` runs without prompting          | Only `Bash` and `mcp__*` are gated. Reads/edits/greps pass through by design (v0 conservative matcher).                        |
+| Symptom                                                                  | Cause / fix                                                                                                                                                          |
+| ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Hook denies with "group- or world-writable" or "not by the current user" | Run `chmod 600 ~/.allw/config.json` (and `chown` it to the user Claude Code runs as).                                                                                |
+| Hook always denies with "no allw config found"                           | `~/.allw/config.json` (step 4) doesn't exist for the user Claude Code runs as, and no `ALLW_*` overrides are set. Write the file (or set `ALLW_CONFIG` to its path). |
+| Hook denies with "vendored wasm not found"                               | You're running an unbuilt checkout, not the installed package. `npm install @allw/hook` (it bundles the WASM via `@allw/sdk`).                                       |
+| No prompt appears in the watch terminal                                  | The account id / `--relay` printed by `pair` must match `account_id` / `relay_url` in `~/.allw/config.json` (or their `ALLW_*` overrides).                           |
+| Request times out immediately                                            | Check the relay is running (step 0) and reachable at the configured `relay_url`.                                                                                     |
+| Transcript shows `PreToolUse:… hook error`                               | The hook couldn't start (bad path, or not installed). See [If the hook can't start](#if-the-hook-cant-start).                                                        |
+| `git status` runs without prompting                                      | Only `Bash` and `mcp__*` are gated. Reads/edits/greps pass through by design (v0 conservative matcher).                                                              |
 
 ---
 
