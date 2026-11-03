@@ -50,7 +50,9 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   query token alone is **401** (#303). A token in a URL ends up in access, proxy and CDN logs, browser
   history and `Referer`, so it is kept out of URLs everywhere else. When an `Authorization` header is
   present it is the only credential considered, even on a WebSocket route: a wrong one is **403**, and
-  a malformed one or another scheme is **401**, whatever the query says.
+  a malformed one or another scheme is **401**, whatever the query says. An empty or whitespace-only
+  `Authorization` header is dropped by the Workers runtime before the relay sees it, so it counts as
+  absent: on a WebSocket upgrade route, the `?auth=` token then applies.
   The relay stores only `SHA-256(token)`; the plaintext is returned **once** at issuance — cache it.
   Missing token ⇒ **401**; wrong/expired/cross-scope token ⇒ **403**.
 - **No existence answers before auth (#357).** A request id and a pairing code are each guarded by

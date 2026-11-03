@@ -1684,6 +1684,43 @@ describe("AccountRelay — ?auth= is accepted only on WebSocket upgrades (#303)"
     }
   });
 
+  // The router answers a non-upgrade request on a WebSocket route with 426 before the Durable
+  // Object sees it, so this drives the handler directly: bearerToken's own upgrade check is what
+  // keeps a valid query token from authenticating a plain HTTP request there.
+  it("refuses a valid ?auth= token on the connect handler when the request is not an upgrade", async () => {
+    const acct = testAccount("acct-query-auth-no-upgrade");
+    const device = await pairDevice(acct);
+    const url = relayUrl(
+      acct,
+      appendAuthQuery(`/devices/${device.device_id}/connect`, device.device_auth_token),
+    );
+    const status = await runInDurableObject(
+      env.ACCOUNT.get(env.ACCOUNT.idFromName(acct)),
+      async (relay: AccountRelay) =>
+        (await relay["handleDeviceConnect"](device.device_id, new Request(url))).status,
+    );
+    expect(status).toBe(401);
+  });
+
+  // workerd drops an empty Authorization header before the Durable Object, so it counts as absent
+  // and the WebSocket route's query token applies (docs/relay-api.md §1).
+  it("treats an empty or whitespace-only Authorization header as absent on a WebSocket upgrade", async () => {
+    const acct = testAccount("acct-query-auth-empty-header");
+    const device = await pairDevice(acct);
+    const url = relayUrl(
+      acct,
+      appendAuthQuery(`/devices/${device.device_id}/connect`, device.device_auth_token),
+    );
+    for (const authorization of ["", "   "]) {
+      const resp = await SELF.fetch(url, {
+        headers: { Upgrade: "websocket", Authorization: authorization },
+      });
+      expect(resp.status, JSON.stringify(authorization)).toBe(101);
+      resp.webSocket?.accept();
+      resp.webSocket?.close();
+    }
+  });
+
   it("still accepts ?auth= (or the header) on the request wait upgrade", async () => {
     const acct = testAccount("acct-query-auth-ws-wait");
     const submit = await post<SubmitResult>(acct, "/requests", makeEnvelope(rid("req-query-wait")));
