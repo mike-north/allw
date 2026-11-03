@@ -195,7 +195,7 @@ test("malformed config file → not ok (even with full env)", (t) => {
 test("unknown config version → not ok", (t) => {
   const result = readConfig({ ALLW_CONFIG: writeConfig(t, { ...FILE, version: 9 }) });
   assert.equal(result.ok, false);
-  assert.match(result.reason, /unsupported version 9/);
+  assert.match(result.reason, /unsupported version \(got number\)/);
 });
 
 test("config file missing a field → not ok", (t) => {
