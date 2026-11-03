@@ -49,6 +49,16 @@ declare module "@allw/sdk/vendor/allw-wasm/allw_wasm.js" {
     jti: string,
   ): string;
 
+  /** Verify an `allw-account-state+jws`; returns the verified `AccountState` JSON. */
+  export function verify_account_state(
+    account_state_jws: string,
+    expected_account_id: string,
+    account_root_pubkey_b64: string,
+  ): string;
+
+  /** Sign a root-authored `AccountState` JSON (tests act as the root holder). */
+  export function sign_account_state(state_json: string, account_root_seed_b64: string): string;
+
   /** Ed25519 public key for a 32-byte signing seed (base64url). */
   export function ed25519_public_key(seed_b64: string): string;
 }

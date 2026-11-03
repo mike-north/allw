@@ -20,7 +20,8 @@
  * verifies against a root that derives to the path's account id; the first verified root is then
  * bound to the account's Durable Object. Root verification runs in the audited core (`./core.ts`).
  *
- * The first bind requires an account with no prior device, pairing, actor or account-state rows:
+ * The first bind requires an account with no prior device, pairing or actor rows (legacy
+ * unverified account state is dropped at schema init):
  * before roots were bound, anyone could create those under any id (including a derived one), so
  * such rows are attacker-seedable and binding over them would launder them under the root. The bind
  * is refused (409) instead of purging, so the condition is visible rather than silently repaired.
@@ -33,6 +34,7 @@ import {
   CoreUnavailableError,
   checkAccountIdForRoot,
   ensureCore,
+  verifyAccountState,
   verifyPairingStartAuthorization,
 } from "./core.js";
 import {
@@ -148,14 +150,9 @@ interface VerdictRow extends Record<string, string | number | null | ArrayBuffer
   received_at: number;
 }
 
-interface AccountStateRow extends Record<string, string | number | null | ArrayBuffer> {
-  ordinal: number;
+interface VerifiedAccountStateRow extends Record<string, string | number | null | ArrayBuffer> {
   state_jws: string;
-  created_at: number;
-}
-
-interface AccountStateMetaRow extends Record<string, string | number | null | ArrayBuffer> {
-  max_sequence: number;
+  sequence: number;
 }
 
 // Public shape returned to callers — only public key material + metadata.
@@ -412,8 +409,14 @@ function requiredAccountStates(body: Record<string, unknown>): string[] | null {
   return states;
 }
 
-function requiredAccountStateMaxSequence(body: Record<string, unknown>): number | null {
+/**
+ * The optional `max_sequence` a publisher may assert. `undefined` when absent; `null` when present
+ * but not a non-negative safe integer. The relay never trusts it: when present it must equal the
+ * highest *verified* sequence in the publish.
+ */
+function optionalAccountStateMaxSequence(body: Record<string, unknown>): number | null | undefined {
   const raw = body.max_sequence;
+  if (raw === undefined) return undefined;
   return typeof raw === "number" && Number.isSafeInteger(raw) && raw >= 0 ? raw : null;
 }
 
@@ -589,23 +592,22 @@ export class AccountRelay implements DurableObject {
         received_at INTEGER NOT NULL
       );
 
-      -- Opaque root-signed account-state documents. The relay distributes these compact JWS
-      -- strings but cannot author, inspect, or make them trusted; approvers verify the account-root
-      -- signature locally before rendering any actor origin as verified.
-      CREATE TABLE IF NOT EXISTS account_state (
-        ordinal    INTEGER PRIMARY KEY,
-        state_jws  TEXT    NOT NULL,
-        created_at INTEGER NOT NULL
+      -- Root-signed account-state documents the relay itself verified (core verify_account_state)
+      -- against the account's bound root and id. Only the highest verified sequence is kept: a
+      -- publish replaces these rows only with verified documents at a strictly higher sequence.
+      -- Normally one row; more than one only if the root signed distinct documents at the same
+      -- sequence, which verifiers resolve fail-closed (union of revocations).
+      CREATE TABLE IF NOT EXISTS verified_account_state (
+        state_jws   TEXT    PRIMARY KEY,
+        sequence    INTEGER NOT NULL,
+        verified_at INTEGER NOT NULL
       );
 
-      -- Zero-knowledge monotonicity metadata for the opaque account-state cache. The relay never
-      -- parses signed state JWS payloads, but it can reject a publish whose caller asserts a lower
-      -- max_sequence than the highest one previously accepted for this account.
-      CREATE TABLE IF NOT EXISTS account_state_meta (
-        id           INTEGER PRIMARY KEY CHECK (id = 1),
-        max_sequence INTEGER NOT NULL,
-        updated_at   INTEGER NOT NULL
-      );
+      -- The pre-#242 opaque cache stored unverified strings and a caller-asserted max_sequence (one
+      -- junk publish at 2^53-1 blocked every later honest publish). Nothing in it can be trusted,
+      -- so it is dropped; the root holder republishes verified state.
+      DROP TABLE IF EXISTS account_state;
+      DROP TABLE IF EXISTS account_state_meta;
     `);
     try {
       this.sql.exec(`ALTER TABLE request ADD COLUMN terminal_at INTEGER`);
@@ -672,14 +674,15 @@ export class AccountRelay implements DurableObject {
       return this.handleActorList();
     }
 
-    // POST /account-states — enrolled device publishes root-signed account-state docs.
+    // POST /account-states — anyone may publish; only documents verified against the bound root
+    // are stored.
     if (method === "POST" && path0 === "account-states" && !path1) {
-      return this.handleAccountStatePublish(request);
+      return this.handleAccountStatePublish(request, segments[0] ?? "");
     }
 
-    // GET /account-states — enrolled device fetches root-signed account-state docs.
+    // GET /account-states — unauthenticated: the documents are public and relay-verified.
     if (method === "GET" && path0 === "account-states" && !path1) {
-      return this.handleAccountStateList(request);
+      return this.handleAccountStateList();
     }
 
     // GET /devices
@@ -804,11 +807,14 @@ export class AccountRelay implements DurableObject {
 
   /**
    * Whether this unbound account already holds rows that, under the pre-binding relay, anyone could
-   * create for any account id: devices, pairing codes, actors, or account state. Binding a root over
-   * them would make them look root-authorized, so the first bind refuses (see the module doc).
+   * create for any account id: devices, pairing codes, or actors. Binding a root over them would
+   * make them look root-authorized, so the first bind refuses (see the module doc). The legacy
+   * unverified account-state tables are dropped at schema init instead (nothing in them is
+   * trusted); `verified_account_state` can only be written once a root is bound, so it is checked
+   * here as defense in depth.
    */
   private hasPreBindingState(): boolean {
-    for (const table of ["device", "pairing", "actor", "account_state", "account_state_meta"]) {
+    for (const table of ["device", "pairing", "actor", "verified_account_state"]) {
       if ([...this.sql.exec(`SELECT 1 FROM ${table} LIMIT 1`)].length > 0) return true;
     }
     return false;
@@ -827,8 +833,8 @@ export class AccountRelay implements DurableObject {
    * - 403: the core rejects `authorization` (bad signature, wrong `typ`, wrong `account_id`,
    *        expired / not-yet-valid / overlong window), its `jti` was already used, or the presented
    *        root differs from the root already bound to this account
-   * - 409: no root is bound yet but the account already holds devices, pairing codes, actors or
-   *        account state from before root binding (refused, never purged — see the module doc)
+   * - 409: no root is bound yet but the account already holds devices, pairing codes or actors
+   *        from before root binding (refused, never purged — see the module doc)
    * - 500: the relay's core wasm failed to initialize (logged; nothing about the request is judged)
    *
    * On success the root is bound to the account (first time only) and a short pairing code plus its
@@ -889,7 +895,7 @@ export class AccountRelay implements DurableObject {
       return json(
         {
           error:
-            "account has devices, pairing codes, actors or account state from before root binding; " +
+            "account has devices, pairing codes or actors from before root binding; " +
             "refusing to bind a root over them (use a new account root)",
         },
         409,
@@ -1123,97 +1129,139 @@ export class AccountRelay implements DurableObject {
     return json({ actors });
   }
 
+  /** The stored relay-verified account-state documents and their (shared) highest sequence. */
+  private verifiedAccountStates(): { states: string[]; sequence: number | null } {
+    const rows = [
+      ...this.sql.exec<VerifiedAccountStateRow>(
+        `SELECT state_jws, sequence FROM verified_account_state ORDER BY state_jws ASC`,
+      ),
+    ];
+    let sequence: number | null = null;
+    for (const row of rows)
+      sequence = sequence === null ? row.sequence : Math.max(sequence, row.sequence);
+    return { states: rows.map((row) => row.state_jws), sequence };
+  }
+
   /**
    * POST /account-states
-   * Body: { account_states: string[], max_sequence: number }
-   * Response: { account_states: string[] }
+   * Body: { account_states: string[] (1–16 compact JWS), max_sequence?: number }
+   * Response: { account_states: string[], max_sequence: number }
    *
-   * Replaces the account's current root-signed account-state document set when the asserted
-   * max_sequence is monotonic. The relay treats the docs as opaque compact JWS strings: it is a
-   * distribution cache, never the trust anchor.
+   * No device token: authority comes from the account root's signature, which the core verifies
+   * (`verify_account_state`) for every submitted document against the root bound to this account
+   * and the path's account id. Fail-closed and all-or-nothing — any rejection leaves the stored
+   * state unchanged:
+   * - 400: malformed body, a string that is not a compact JWS, a non-integer `max_sequence`, an
+   *        asserted `max_sequence` that differs from the highest verified sequence, or a verified
+   *        sequence outside the exactly-representable range (> 2^53-1)
+   * - 403: any document fails verification (other signer, wrong account id, wrong root, wrong
+   *        `typ`, unsupported version, junk)
+   * - 409: no root is bound yet (start a root-signed pairing first), or the highest verified
+   *        sequence is not strictly above the stored one
+   * - 500: the relay's core wasm failed to initialize (logged; no document is judged)
+   *
+   * On success the stored documents are replaced by the submitted documents at the highest verified
+   * sequence. See `docs/relay-api.md` §3 Account state.
    */
-  private async handleAccountStatePublish(request: Request): Promise<Response> {
-    const authorizedDevice = await this.authorizedDeviceId(request);
-    if (authorizedDevice instanceof Response) return authorizedDevice;
+  private async handleAccountStatePublish(request: Request, accountId: string): Promise<Response> {
+    // A broken core must not surface as a 403 that blames the caller's documents.
+    try {
+      ensureCore();
+    } catch (err) {
+      return coreUnavailable(err);
+    }
 
     const body = await parseJsonBody(request);
     if (!body) return json({ error: "invalid JSON body" }, 400);
 
     const accountStates = requiredAccountStates(body);
-    if (accountStates === null) {
+    if (accountStates === null || accountStates.length === 0) {
       return json(
         {
-          error: `'account_states' must be an array of up to ${String(MAX_ACCOUNT_STATE_DOCS)} compact JWS strings`,
+          error: `'account_states' must be an array of 1 to ${String(MAX_ACCOUNT_STATE_DOCS)} compact JWS strings`,
+        },
+        400,
+      );
+    }
+    const assertedMaxSequence = optionalAccountStateMaxSequence(body);
+    if (assertedMaxSequence === null) {
+      return json({ error: "'max_sequence' must be a non-negative safe integer" }, 400);
+    }
+
+    const boundRoot = this.boundRootPubkey();
+    if (boundRoot === null) {
+      return json(
+        { error: "account root not bound; start a root-signed pairing for this account first" },
+        409,
+      );
+    }
+
+    // Verify every document before touching storage; nothing below awaits.
+    const verified: { stateJws: string; sequence: number }[] = [];
+    for (const stateJws of accountStates) {
+      let sequence: number;
+      try {
+        sequence = verifyAccountState(stateJws, accountId, boundRoot).sequence;
+      } catch {
+        return json(
+          { error: "an account-state document did not verify against the account root" },
+          403,
+        );
+      }
+      if (!Number.isSafeInteger(sequence)) {
+        return json({ error: "account-state sequence exceeds 2^53-1" }, 400);
+      }
+      verified.push({ stateJws, sequence });
+    }
+    const highest = Math.max(...verified.map((doc) => doc.sequence));
+    if (assertedMaxSequence !== undefined && assertedMaxSequence !== highest) {
+      return json(
+        {
+          error: `'max_sequence' ${String(assertedMaxSequence)} does not equal the highest verified sequence ${String(highest)}`,
         },
         400,
       );
     }
 
-    const maxSequence = requiredAccountStateMaxSequence(body);
-    if (maxSequence === null) {
-      return json({ error: "'max_sequence' must be a non-negative safe integer" }, 400);
-    }
-
-    const currentMeta = [
-      ...this.sql.exec<AccountStateMetaRow>(
-        `SELECT max_sequence FROM account_state_meta WHERE id = 1`,
-      ),
-    ][0];
-    const currentMaxSequence = currentMeta?.max_sequence;
-    if (currentMaxSequence !== undefined && maxSequence < currentMaxSequence) {
+    const stored = this.verifiedAccountStates().sequence;
+    if (stored !== null && highest <= stored) {
       return json(
         {
-          error: `max_sequence regression: ${String(maxSequence)} is below current ${String(currentMaxSequence)}`,
+          error: `account-state sequence ${String(highest)} is not above the current ${String(stored)}`,
         },
         409,
       );
     }
 
     const now = Date.now();
-    this.sql.exec(`DELETE FROM account_state`);
-    for (const [ordinal, stateJws] of accountStates.entries()) {
-      this.sql.exec(
-        `INSERT INTO account_state (ordinal, state_jws, created_at) VALUES (?, ?, ?)`,
-        ordinal,
-        stateJws,
-        now,
-      );
-    }
-    this.sql.exec(
-      `INSERT OR REPLACE INTO account_state_meta (id, max_sequence, updated_at) VALUES (1, ?, ?)`,
-      maxSequence,
-      now,
-    );
+    const current = verified.filter((doc) => doc.sequence === highest).map((doc) => doc.stateJws);
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec(`DELETE FROM verified_account_state`);
+      for (const stateJws of current) {
+        this.sql.exec(
+          `INSERT INTO verified_account_state (state_jws, sequence, verified_at) VALUES (?, ?, ?)`,
+          stateJws,
+          highest,
+          now,
+        );
+      }
+    });
 
-    return json({ account_states: accountStates, max_sequence: maxSequence });
+    return json({ account_states: [...current].sort(), max_sequence: highest });
   }
 
   /**
    * GET /account-states
-   * Response: { account_states: string[] }
+   * Response: { account_states: string[], max_sequence: number }
    *
-   * Returns relay-distributed account-state docs for local root-signature verification. A malicious
-   * relay can omit or tamper with these strings, but the monotonic publish guard prevents enrolled
-   * devices from rolling the relay cache back to a lower asserted sequence.
+   * Unauthenticated: the documents are public, root-signed, and only ever stored after the relay
+   * verified them against the bound root (so integrators, which hold no device token, can read
+   * them — #243). `max_sequence` is the highest verified sequence (0 when none is stored).
+   * Consumers still verify the root signature themselves; the relay is not the trust anchor.
    */
-  private async handleAccountStateList(request: Request): Promise<Response> {
-    const authorizedDevice = await this.authorizedDeviceId(request);
-    if (authorizedDevice instanceof Response) return authorizedDevice;
-
-    const rows = [
-      ...this.sql.exec<AccountStateRow>(
-        `SELECT ordinal, state_jws, created_at FROM account_state ORDER BY ordinal ASC`,
-      ),
-    ];
-    const currentMeta = [
-      ...this.sql.exec<AccountStateMetaRow>(
-        `SELECT max_sequence FROM account_state_meta WHERE id = 1`,
-      ),
-    ][0];
-    return json({
-      account_states: rows.map((row) => row.state_jws),
-      max_sequence: currentMeta?.max_sequence ?? 0,
-    });
+  private handleAccountStateList(): Response {
+    const { states, sequence } = this.verifiedAccountStates();
+    return json({ account_states: states, max_sequence: sequence ?? 0 });
   }
 
   /**
