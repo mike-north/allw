@@ -309,6 +309,16 @@ describe("WakeupCoalescer — at most one wakeup per subscription per window", (
     expect(after.tryClaim(KEY, T0 + WEB_PUSH_COALESCE_MS + 1)).toBe(true);
   });
 
+  it("counts a stored claim from the future as now, so it blocks for one window at most (review-330 S1)", () => {
+    const store = new InMemoryWakeupClaimStore(WEB_PUSH_COALESCE_MS);
+    store.recordClaim(KEY, T0 + 24 * 60 * 60 * 1000);
+    const coalescer = new WakeupCoalescer(WEB_PUSH_COALESCE_MS, store);
+
+    expect(coalescer.nextClaimableAt(KEY, T0)).toBe(T0 + WEB_PUSH_COALESCE_MS + 1);
+    expect(coalescer.tryClaim(KEY, T0)).toBe(false);
+    expect(coalescer.tryClaim(KEY, T0 + WEB_PUSH_COALESCE_MS + 1)).toBe(true);
+  });
+
   it("round-trips a subscription through its coalescing key", () => {
     const key = webPushCoalesceKey("dev-a", "https://fcm.googleapis.com/fcm/send/a?x=1");
     expect(parseWebPushCoalesceKey(key)).toEqual({

@@ -674,6 +674,14 @@ async function endWindowAndRunAlarm(
 /**
  * Move every persisted claim, and every skipped submit, far into the past: the state once the
  * window has passed. Claims live in SQLite (#319), so a fresh instance sees the same.
+ *
+ * The `last_skipped_at` rewrite matters because a covering wakeup clears an owed row only when
+ * `last_skipped_at < claimedAt`. In a fast test, a skip and the next claim can share a millisecond.
+ * Two tests depend on it:
+ * - "clears the owed wakeup when a later submit claims a fresh one after the window" needs the
+ *   clear to happen at all.
+ * - "keeps an earlier owed wakeup when another submit is skipped while the accepted wakeup is in
+ *   flight" needs the earlier skip to predate the claim, so only the in-flight skip keeps it owed.
  */
 function letWindowPass(relay: RelayInternals): void {
   relay.sql.exec(
@@ -1063,6 +1071,44 @@ describe("submit — the coalescing bound survives eviction (#319)", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]?.last_wakeup_at).toBeGreaterThanOrEqual(before);
     expect(rows[0]?.last_wakeup_at).toBeLessThanOrEqual(Date.now());
+  });
+});
+
+describe("submit — a future-dated stored claim blocks for one window at most (review-330 S1)", () => {
+  it("coalesces into a trailing wakeup due one window out, not at the claim's future time", async () => {
+    // Claims persist (#319), so a claim stamped by a skewed clock would otherwise silence the
+    // subscription, leading and trailing wakeups alike, until that future time.
+    const acct = testAccount("acct-webpush-future-claim");
+    await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
+    const fetcher = await installWebPush(acct, () => 201);
+    const dayAhead = Date.now() + 24 * 60 * 60 * 1000;
+    await runInDurableObject(relayStub(acct), (instance: AccountRelay) => {
+      (instance as unknown as RelayInternals).sql.exec(
+        `UPDATE device_push_token SET last_wakeup_at = ?`,
+        dayAhead,
+      );
+    });
+
+    const before = Date.now();
+    expect(await submitRequest(acct, envelope("req-future-claim-1"))).toBe(0);
+    const [row] = await readTrailingRows(acct);
+    expect(row?.due_at).toBeGreaterThanOrEqual(before + WEB_PUSH_COALESCE_MS + 1);
+    expect(row?.due_at).toBeLessThanOrEqual(Date.now() + WEB_PUSH_COALESCE_MS + 1);
+
+    // At the window's end the trailing wakeup goes out: the future claim no longer blocks it.
+    await runInDurableObject(relayStub(acct), async (instance: AccountRelay) => {
+      const relay = instance as unknown as RelayInternals;
+      makeTrailingWakeupsDue(relay);
+      // Exactly one window passes; the claim is not aged past it.
+      relay.sql.exec(
+        `UPDATE device_push_token SET last_wakeup_at = last_wakeup_at - ?`,
+        WEB_PUSH_COALESCE_MS + 1,
+      );
+      await relay.alarm();
+      await relay.pushFanOut;
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(await readTrailingRows(acct)).toHaveLength(0);
   });
 });
 

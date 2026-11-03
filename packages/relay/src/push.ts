@@ -357,8 +357,14 @@ export class WakeupCoalescer {
   /** Claim a wakeup for `key` at `nowMs`: `true` (and recorded as in flight) or `false` if coalesced. */
   tryClaim(key: string, nowMs: number): boolean {
     if (this.inFlight.has(key)) return false;
-    const last = this.claims.lastClaimedAt(key);
-    if (last !== undefined && nowMs - last <= this.windowMs) return false;
+    const stored = this.claims.lastClaimedAt(key);
+    if (stored !== undefined && stored > nowMs) {
+      // A claim from the future counts as one made now (see lastClaimAsOf). Store it as now, so
+      // the window ends one window from here rather than one window after each later look.
+      this.claims.recordClaim(key, nowMs);
+      return false;
+    }
+    if (stored !== undefined && nowMs - stored <= this.windowMs) return false;
     this.claims.recordClaim(key, nowMs);
     this.inFlight.add(key);
     return true;
@@ -371,8 +377,20 @@ export class WakeupCoalescer {
    * bound.
    */
   nextClaimableAt(key: string, nowMs: number): number {
-    const last = this.claims.lastClaimedAt(key);
+    const last = this.lastClaimAsOf(key, nowMs);
     return last === undefined ? nowMs : Math.max(nowMs, last + this.windowMs + 1);
+  }
+
+  /**
+   * `key`'s last claim as seen at `nowMs`. A stored claim later than `nowMs` counts as `nowMs`. Such
+   * a claim can only come from a clock anomaly on whichever host wrote it. Because claims persist,
+   * it would otherwise silence the subscription, leading and trailing wakeups alike, until that
+   * future time. {@link tryClaim} also stores the clamped value, so the worst case is one normal
+   * window.
+   */
+  private lastClaimAsOf(key: string, nowMs: number): number | undefined {
+    const last = this.claims.lastClaimedAt(key);
+    return last === undefined ? undefined : Math.min(last, nowMs);
   }
 
   /** Mark a claimed wakeup finished. The window from its claim still applies. */

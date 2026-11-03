@@ -1867,8 +1867,8 @@ export class AccountRelay implements DurableObject {
    *
    * - The send goes through the coalescer like any other, so the per-window bound holds. Claims
    *   are stored, so this also holds after eviction.
-   * - Claiming the send consumes the row. A failed trailing wakeup is therefore not owed again, and
-   *   a failed wakeup gets at most this one retry.
+   * - Claiming the send consumes the row, so a failed trailing wakeup is not owed again: the
+   *   trailing send itself is never retried.
    * - A subscription still blocked (a wakeup in flight, or claimed again since) is retried at its
    *   next claimable time, at least {@link WEB_PUSH_TRAILING_RETRY_MS} away.
    * - Rows are dropped without sending when there is nothing left to fetch (no pending, unexpired
