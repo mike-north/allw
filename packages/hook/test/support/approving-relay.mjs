@@ -27,7 +27,8 @@ const CERT_ISSUED_AT_MS = 1_700_000_000_000;
  * Start the double. Resolves `{ url, accountId, accountRootPub, seen, close }`: point the hook at
  * `url` with `ALLW_ACCOUNT_ID = accountId` and `ALLW_APPROVER_ROOT_KEY = accountRootPub`. `seen`
  * counts the request submits and verdict fetches the double has served, so a test can prove the
- * hook actually went through the relay.
+ * hook actually went through the relay, and keeps each decrypted approval context (what the human
+ * was shown) in `seen.contexts`.
  */
 export async function startApprovingRelay({ wasm, decision }) {
   const accountSeed = Buffer.alloc(32, 11).toString("base64url");
@@ -45,7 +46,7 @@ export async function startApprovingRelay({ wasm, decision }) {
   );
 
   let envelope = null;
-  const seen = { submits: 0, verdictFetches: 0 };
+  const seen = { submits: 0, verdictFetches: 0, contexts: [] };
   const server = createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
@@ -84,6 +85,7 @@ export async function startApprovingRelay({ wasm, decision }) {
         DEVICE_ID,
         deviceEncryptionSeed,
       );
+      seen.contexts.push(JSON.parse(contextJson));
       const unsigned = {
         v: envelope.v,
         request_id: envelope.id,

@@ -34,6 +34,7 @@ pub mod hash;
 pub mod jwe;
 pub mod mcp;
 pub mod policy;
+pub mod powershell;
 pub mod recipients;
 pub mod sealing;
 
@@ -86,6 +87,7 @@ pub use policy::{
     PolicyRuleBuildError, PolicyRuleError, PolicyRuleScope, PolicyTier, UnsignedPolicyRule,
     VerifiedPolicyRule,
 };
+pub use powershell::action_from_powershell_command;
 pub use recipients::{
     select_recipients, Recipient, RecipientSelectionError, DEVICE_STATUS_ACTIVE,
     MAX_ACCOUNT_STATES, MAX_RECIPIENTS,

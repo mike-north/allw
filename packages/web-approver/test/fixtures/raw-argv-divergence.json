@@ -1,83 +1,177 @@
 {
-  "description": "Shared by the CLI approver and the web approver: both must decide raw/argv divergence the same way and reconstruct the same command line. Each case gives a wire syntactic substrate, whether raw and the hash-bound bin/argv describe different commands, and the command line bin/argv reconstruct to (null when there is no command form). Expected values are written by hand from the rules in packages/approver/src/lib/render.ts and packages/web-approver/src/command-line.ts: bin is prepended unless argv starts with it; with no argv, bin and positionals are used; a token is single-quoted when it is empty or contains whitespace, a quote, a backslash or one of $`&|;<>(){}[]*?#~!.",
+  "description": "Shared by the CLI approver and the web approver: both must decide raw/argv divergence the same way and reconstruct the same command line. Each case gives a wire syntactic substrate, whether raw and the hash-bound bin/argv describe different commands, and the command line bin/argv reconstruct to (null when there is no command form). Tokens that are exactly raw split at ASCII whitespace (space, tab, line feed) never diverge; any other difference is compared on the reconstructed line. Expected values are written by hand from the rules in packages/approver/src/lib/render.ts and packages/web-approver/src/command-line.ts: bin is prepended unless argv starts with it; with no argv, bin and positionals are used; a token is single-quoted when it is empty or contains whitespace, a quote, a backslash or one of $`&|;<>(){}[]*?#~!.",
   "cases": [
     {
       "name": "raw matches argv",
-      "syntactic": { "argv": ["git", "status"], "raw": "git status" },
+      "syntactic": {
+        "argv": ["git", "status"],
+        "raw": "git status"
+      },
       "diverges": false,
       "reconstructed": "git status"
     },
     {
       "name": "bin is prepended when argv omits it",
-      "syntactic": { "bin": "git", "argv": ["status"], "raw": "git status" },
+      "syntactic": {
+        "bin": "git",
+        "argv": ["status"],
+        "raw": "git status"
+      },
       "diverges": false,
       "reconstructed": "git status"
     },
     {
       "name": "bin is not repeated when argv starts with it",
-      "syntactic": { "bin": "git", "argv": ["git", "push"], "raw": "git push" },
+      "syntactic": {
+        "bin": "git",
+        "argv": ["git", "push"],
+        "raw": "git push"
+      },
       "diverges": false,
       "reconstructed": "git push"
     },
     {
       "name": "a benign raw paired with a dangerous argv",
-      "syntactic": { "argv": ["rm", "-rf", "~"], "raw": "git status" },
+      "syntactic": {
+        "argv": ["rm", "-rf", "~"],
+        "raw": "git status"
+      },
       "diverges": true,
       "reconstructed": "rm -rf '~'"
     },
     {
       "name": "single-quoted raw matches a token with a space",
-      "syntactic": { "argv": ["git", "commit", "-m", "a b"], "raw": "git commit -m 'a b'" },
+      "syntactic": {
+        "argv": ["git", "commit", "-m", "a b"],
+        "raw": "git commit -m 'a b'"
+      },
       "diverges": false,
       "reconstructed": "git commit -m 'a b'"
     },
     {
       "name": "double-quoted raw counts as divergent (fails safe)",
-      "syntactic": { "argv": ["git", "commit", "-m", "a b"], "raw": "git commit -m \"a b\"" },
+      "syntactic": {
+        "argv": ["git", "commit", "-m", "a b"],
+        "raw": "git commit -m \"a b\""
+      },
       "diverges": true,
       "reconstructed": "git commit -m 'a b'"
     },
     {
       "name": "an embedded single quote is escaped POSIX-style",
-      "syntactic": { "argv": ["echo", "it's"], "raw": "echo 'it'\\''s'" },
+      "syntactic": {
+        "argv": ["echo", "it's"],
+        "raw": "echo 'it'\\''s'"
+      },
       "diverges": false,
       "reconstructed": "echo 'it'\\''s'"
     },
     {
       "name": "an empty token is shown as ''",
-      "syntactic": { "argv": ["printf", ""], "raw": "printf" },
+      "syntactic": {
+        "argv": ["printf", ""],
+        "raw": "printf"
+      },
       "diverges": true,
       "reconstructed": "printf ''"
     },
     {
       "name": "a hidden byte in argv that raw lacks",
-      "syntactic": { "argv": ["ls", "a\u001b"], "raw": "ls a" },
+      "syntactic": {
+        "argv": ["ls", "a\u001b"],
+        "raw": "ls a"
+      },
       "diverges": true,
       "reconstructed": "ls a\u001b"
     },
     {
       "name": "bin and positionals with no argv",
-      "syntactic": { "bin": "ls", "positionals": ["-la", "/tmp"], "raw": "ls -la /tmp" },
+      "syntactic": {
+        "bin": "ls",
+        "positionals": ["-la", "/tmp"],
+        "raw": "ls -la /tmp"
+      },
       "diverges": false,
       "reconstructed": "ls -la /tmp"
     },
     {
       "name": "no raw: nothing to diverge from",
-      "syntactic": { "argv": ["rm", "-rf", "/"] },
+      "syntactic": {
+        "argv": ["rm", "-rf", "/"]
+      },
       "diverges": false,
       "reconstructed": "rm -rf /"
     },
     {
       "name": "no command form: raw only",
-      "syntactic": { "raw": "rm -rf /" },
+      "syntactic": {
+        "raw": "rm -rf /"
+      },
       "diverges": false,
       "reconstructed": null
     },
     {
       "name": "an empty argv with no bin has no command form",
-      "syntactic": { "argv": [], "raw": "anything" },
+      "syntactic": {
+        "argv": [],
+        "raw": "anything"
+      },
       "diverges": false,
       "reconstructed": null
+    },
+    {
+      "name": "a PowerShell Windows path: argv is raw's whitespace split, so no divergence despite quoting",
+      "syntactic": {
+        "argv": ["Remove-Item", "C:\\Users\\me\\build", "-Recurse"],
+        "raw": "Remove-Item C:\\Users\\me\\build -Recurse"
+      },
+      "diverges": false,
+      "reconstructed": "Remove-Item 'C:\\Users\\me\\build' -Recurse"
+    },
+    {
+      "name": "a glob token that display quoting wraps is still raw's own word",
+      "syntactic": {
+        "argv": ["ls", "*.txt"],
+        "raw": "ls *.txt"
+      },
+      "diverges": false,
+      "reconstructed": "ls '*.txt'"
+    },
+    {
+      "name": "runs of ASCII whitespace in raw are not a divergence",
+      "syntactic": {
+        "argv": ["git", "status"],
+        "raw": "git \t status"
+      },
+      "diverges": false,
+      "reconstructed": "git status"
+    },
+    {
+      "name": "an argv cut at U+00A0, which raw keeps inside a word, diverges",
+      "syntactic": {
+        "argv": ["rm", "-rf", "/"],
+        "raw": "rm -rf /"
+      },
+      "diverges": true,
+      "reconstructed": "rm -rf /"
+    },
+    {
+      "name": "an argv cut at U+3000 diverges",
+      "syntactic": {
+        "argv": ["Remove-Item", "build"],
+        "raw": "Remove-Item　build"
+      },
+      "diverges": true,
+      "reconstructed": "Remove-Item build"
+    },
+    {
+      "name": "an argv cut at a carriage return diverges",
+      "syntactic": {
+        "argv": ["git", "status"],
+        "raw": "git\rstatus"
+      },
+      "diverges": true,
+      "reconstructed": "git status"
     }
   ]
 }

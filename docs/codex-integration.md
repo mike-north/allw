@@ -181,7 +181,12 @@ is the remaining product acceptance proof that Codex itself invokes the hook and
 
 The matcher intentionally matches the hook's v1 surfaces:
 
-- `Bash` commands are converted to command `ActionRecord`s through the WASM core.
+- `Bash` commands are converted to command `ActionRecord`s through the WASM core. Codex reports
+  **every** shell exec to `PreToolUse` as `Bash`, including `shell`, `exec_command` and unified exec
+  (each handler's `pre_tool_use_payload` names it `HookToolName::bash()` in `codex-rs/core`, checked
+  2026-11-03). So Codex has no separately named exec tool to match, unlike Claude Code's `Monitor` and
+  `PowerShell`. Input typed into a running session is the exception; see
+  [Interactive exec sessions](#interactive-exec-sessions-write_stdin).
 - `apply_patch` calls are converted to file-edit `ActionRecord`s through the WASM core.
 - `mcp__<server>__<tool>` calls are converted to MCP `ActionRecord`s through the WASM core.
 - Other Codex tools pass through when they do not map to a supported allw approval surface.
@@ -446,6 +451,16 @@ The CLI catch-all still converts internal throws into a `deny`, so in-process fa
    [#191](https://github.com/mike-north/allw/issues/191): the hook now encodes "allw did not block"
    as **empty stdout and exit 0** — which is also the encoding `docs/contract.md` §6 requires,
    since the primitive never returns "allow."
+
+### Interactive exec sessions (`write_stdin`)
+
+Unified exec can start a long-running interactive process (`exec_command`) and later write more input
+into it (`write_stdin`). Only the start is gated: `write_stdin` emits **no** `PreToolUse`, because
+Codex treats the initial exec, already gated as `Bash`, as covering the session
+(`codex-rs/core/src/tools/handlers/unified_exec/write_stdin.rs`). So approving an interactive
+command such as `bash`, `python` or `node` approves whatever the agent types into it afterwards,
+with no further prompt. **Treat approving an interactive shell or REPL as approving everything that
+runs inside it**, and deny it when you wouldn't approve that.
 
 ### What is _not_ residual
 
