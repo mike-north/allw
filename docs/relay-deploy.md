@@ -150,13 +150,15 @@ creates all tables. When it reactivates after a code deploy that adds columns, i
 `ALTER TABLE` migrations automatically.
 
 Verification: The full Vitest test suite (`pnpm --filter @allw/relay test`) exercises the DO via
-`@cloudflare/vitest-pool-workers` against a real `workerd` runtime and confirms all 83 test cases
+`@cloudflare/vitest-pool-workers` against a real `workerd` runtime and confirms the test cases
 pass against the current schema. Run this locally before deploying to confirm no regression.
 
 **[OPERATOR]** Run the tests locally before deploying:
 
 ```sh
-# From the repo root:
+# From the repo root. The relay verifies root signatures through the allw-core wasm build,
+# so build it first (needs the Rust toolchain from rust-toolchain.toml + wasm-pack):
+pnpm run build:wasm
 pnpm --filter @allw/relay test
 ```
 
@@ -166,7 +168,8 @@ All tests must pass. If any fail, do not deploy until they are fixed.
 
 ## 5. Deploy
 
-**[OPERATOR]** Deploy the production environment:
+**[OPERATOR]** Deploy the production environment. The worker bundles the `allw-core` wasm from
+`packages/sdk/vendor/allw-wasm`, so `pnpm run build:wasm` (step 4) must have run in this checkout:
 
 ```sh
 cd packages/relay
@@ -297,13 +300,13 @@ deployed via this runbook without a rebuild), and deploying to Cloudflare Pages 
 
 ## Appendix: what this runbook has and has not verified
 
-| Item                                                             | Status                                                                        |
-| ---------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| `wrangler deploy --env production --dry-run` passes locally      | Verified (67 KiB upload, DO binding listed correctly)                         |
-| All 83 relay Vitest tests pass (DO migration + full API surface) | Verified                                                                      |
-| TypeScript type-check passes                                     | Verified                                                                      |
-| Push no-op default when credentials absent                       | Verified (`buildPushTransports` at `src/index.ts:1602`)                       |
-| Actual deploy to a real Cloudflare account                       | Verified — live at `https://allw-relay.mnorth.workers.dev` (production `env`) |
-| APNs / FCM push wakeup with live credentials                     | **Not verified** — requires real APNs/FCM account                             |
-| Custom domain DNS propagation                                    | **Not verified** — depends on operator's zone config                          |
-| APNs JWT rotation strategy                                       | **Not implemented** — tokens expire hourly; tracked as a follow-up            |
+| Item                                                          | Status                                                                                 |
+| ------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `wrangler deploy --env production --dry-run` passes locally   | Verified (~995 KiB / ~358 KiB gzip upload incl. the allw-core wasm; DO binding listed) |
+| All relay Vitest tests pass (DO migration + full API surface) | Verified                                                                               |
+| TypeScript type-check passes                                  | Verified                                                                               |
+| Push no-op default when credentials absent                    | Verified (`buildPushTransports` at `src/index.ts:1602`)                                |
+| Actual deploy to a real Cloudflare account                    | Verified — live at `https://allw-relay.mnorth.workers.dev` (production `env`)          |
+| APNs / FCM push wakeup with live credentials                  | **Not verified** — requires real APNs/FCM account                                      |
+| Custom domain DNS propagation                                 | **Not verified** — depends on operator's zone config                                   |
+| APNs JWT rotation strategy                                    | **Not implemented** — tokens expire hourly; tracked as a follow-up                     |
