@@ -5,9 +5,27 @@
   "compatibility_date": "2026-01-01",
   "compatibility_flags": ["nodejs_compat"],
   "durable_objects": {
-    "bindings": [{ "name": "ACCOUNT", "class_name": "AccountRelay" }]
+    "bindings": [{ "name": "ACCOUNT", "class_name": "AccountRelay" }],
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccountRelay"] }],
+  // Rate limits for the unauthenticated routes (#248), keyed by account id + client IP
+  // (src/limits.ts). Workers rate limiting is per Cloudflare location and eventually consistent;
+  // the per-account pending cap and the request horizon are the hard storage bounds. `period` is 10
+  // or 60 seconds. Missing bindings make these routes fail closed (503).
+  "ratelimits": [
+    // POST /{acct}/pairing/start and /{acct}/pairing/complete.
+    {
+      "name": "RATE_LIMIT_PAIRING",
+      "namespace_id": "2481",
+      "simple": { "limit": 10, "period": 60 },
+    },
+    // POST /{acct}/requests.
+    {
+      "name": "RATE_LIMIT_REQUESTS",
+      "namespace_id": "2482",
+      "simple": { "limit": 60, "period": 60 },
+    },
+  ],
 
   // ---------------------------------------------------------------------------
   // Production environment
@@ -37,7 +55,7 @@
 
       // Durable Object binding — must reference the same class as the dev environment.
       "durable_objects": {
-        "bindings": [{ "name": "ACCOUNT", "class_name": "AccountRelay" }]
+        "bindings": [{ "name": "ACCOUNT", "class_name": "AccountRelay" }],
       },
 
       // Pin the migration tag so Cloudflare applies the DO schema exactly once on first deploy.
@@ -45,12 +63,31 @@
       // To add future schema changes, append a new migration entry with a new tag, e.g. "v2".
       "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccountRelay"] }],
 
+      // Rate limits are NOT inherited from the top level: repeat them per environment. Keep the
+      // binding names; tune `limit` here for production traffic.
+      "ratelimits": [
+        {
+          "name": "RATE_LIMIT_PAIRING",
+          "namespace_id": "2481",
+          "simple": { "limit": 10, "period": 60 },
+        },
+        {
+          "name": "RATE_LIMIT_REQUESTS",
+          "namespace_id": "2482",
+          "simple": { "limit": 60, "period": 60 },
+        },
+      ],
+
       // Production resource limits: a per-request CPU cap ("limits": { "cpu_ms": 30 })
       // requires the Workers Paid plan — Cloudflare rejects it on Free (error 100328).
       // Re-add the cap when the account moves to a paid plan; the relay is I/O-bound
       // and 30 ms is generous.
 
       // Optional plaintext env vars (non-secret):
+      //
+      //   MAX_REQUEST_TTL_MS — request horizon in ms (default 900000 = 15 min). A submit whose
+      //                    expires_at is further out gets 400. Keep it above the hooks' 420 s
+      //                    timeout, or hook requests fail closed.
       //
       //   APNS_ENDPOINT  — e.g. "https://api.push.apple.com" (production) or
       //                         "https://api.development.push.apple.com" (sandbox).
@@ -64,6 +101,6 @@
       //   FCM_ENDPOINT       — FCM HTTP v1 send endpoint (includes your project id).
       //
       // See docs/relay-deploy.md §Secrets for the full inventory and setup commands.
-    }
-  }
+    },
+  },
 }

@@ -26,6 +26,7 @@ import { AccountRelay } from "../src/index.js";
 import type { PushTransportRegistry } from "../src/push.js";
 import type { SqlStorage } from "@cloudflare/workers-types";
 import { pairingStartBody, testAccount } from "./support/accounts.js";
+import { pinRelayClock } from "./support/relay-clock.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures (deterministic; never `Date.now()` in data — see fixed-dates rule)
@@ -36,6 +37,11 @@ const DEVICE_PUBKEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 /** Far-future expiry (2100-01-01Z, ms) — deterministic AND always > the relay's real `Date.now()`. */
 const FUTURE_EXPIRES_AT = 4102444800000;
+/**
+ * The relay's injected clock for accounts that submit requests: five minutes before
+ * {@link FUTURE_EXPIRES_AT}, so that fixed expiry is inside the request horizon (#248).
+ */
+const RELAY_NOW = FUTURE_EXPIRES_AT - 5 * 60 * 1000;
 /** A past expiry (1970-01-01T00:00:01Z, ms) — always < the relay's real `Date.now()` (fail-closed tests). */
 const PAST_EXPIRES_AT = 1000;
 /** A fixed creation timestamp (2023-11-14Z, ms). */
@@ -82,6 +88,9 @@ function relayUrl(accountId: string, subPath: string): string {
   return `https://relay.allw.test/${accountId}${subPath}`;
 }
 
+/** Accounts whose relay clock has been pinned to {@link RELAY_NOW}. */
+const clockPinned = new Set<string>();
+
 async function post<T>(
   accountId: string,
   subPath: string,
@@ -102,6 +111,10 @@ async function post<T>(
       tokenKey(accountId, decodeURIComponent(retractMatch[1] ?? "")),
     );
     if (token !== undefined) finalHeaders.Authorization = `Bearer ${token}`;
+  }
+  if (subPath === "/requests" && !clockPinned.has(accountId)) {
+    await pinRelayClock(accountId, RELAY_NOW);
+    clockPinned.add(accountId);
   }
   const resp = await SELF.fetch(relayUrl(accountId, subPath), {
     method: "POST",

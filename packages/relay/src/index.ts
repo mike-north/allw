@@ -27,13 +27,27 @@
  * `pairing/complete` likewise refuses (403) on an unbound account.
  */
 
-import { PAIRING_TTL_MS } from "./constants.js";
+import {
+  MAX_CONTEXT_CIPHERTEXT_BYTES,
+  MAX_PENDING_REQUESTS_PER_ACCOUNT,
+  MAX_REQUEST_BODY_BYTES,
+  PAIRING_TTL_MS,
+} from "./constants.js";
 import {
   CoreUnavailableError,
   checkAccountIdForRoot,
   ensureCore,
   verifyPairingStartAuthorization,
 } from "./core.js";
+import {
+  enforceRateLimit,
+  parseMaxRequestTtlMs,
+  rateLimitKey,
+  rateLimitedRoute,
+  readBodyCapped,
+  utf8ByteLength,
+  type RateLimiter,
+} from "./limits.js";
 import {
   ApnsPushTransport,
   FcmPushTransport,
@@ -52,6 +66,15 @@ export interface Env {
   readonly APNS_BEARER_TOKEN?: string;
   readonly FCM_ENDPOINT?: string;
   readonly FCM_BEARER_TOKEN?: string;
+  /**
+   * Cloudflare rate-limiting bindings for the unauthenticated routes (`wrangler.jsonc`
+   * `ratelimits`): `pairing/start` + `pairing/complete`, and `requests`. Missing ⇒ those routes
+   * fail closed with 503. See `./limits.ts`.
+   */
+  readonly RATE_LIMIT_PAIRING?: RateLimiter;
+  readonly RATE_LIMIT_REQUESTS?: RateLimiter;
+  /** Optional request-horizon override in ms (default 15 min). See `parseMaxRequestTtlMs`. */
+  readonly MAX_REQUEST_TTL_MS?: string;
 }
 
 export default {
@@ -60,6 +83,13 @@ export default {
     // Route by account id → its Durable Object.
     const accountId = url.pathname.split("/")[1] ?? "";
     if (!accountId) return new Response("missing account", { status: 400 });
+    // Rate-limit the unauthenticated routes at the edge, before the account's Durable Object.
+    const route = rateLimitedRoute(request.method, url.pathname);
+    if (route !== null) {
+      const limiter = route === "pairing" ? env.RATE_LIMIT_PAIRING : env.RATE_LIMIT_REQUESTS;
+      const refused = await enforceRateLimit(limiter, rateLimitKey(accountId, request));
+      if (refused) return refused;
+    }
     const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
     return stub.fetch(request);
   },
@@ -456,11 +486,19 @@ export class AccountRelay implements DurableObject {
   private readonly sql: SqlStorage;
   private readonly ctx: DurableObjectState;
   private readonly pushTransports: PushTransportRegistry;
+  /** Request horizon: `expires_at - now` above this is refused at submit (#248). */
+  private readonly maxRequestTtlMs: number;
+  /**
+   * Clock for the submit limits and the expiry alarm/sweep. Tests replace it on the instance (via
+   * `runInDurableObject`) to probe exact boundaries; production always reads the real time.
+   */
+  private now: () => number = () => Date.now();
 
   constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
     this.sql = ctx.storage.sql;
     this.pushTransports = buildPushTransports(env);
+    this.maxRequestTtlMs = parseMaxRequestTtlMs(env.MAX_REQUEST_TTL_MS);
     this.initSchema();
     // On reactivation, restore the alarm from persisted pending rows in case the previous
     // isolate exited after a write but before the scheduled alarm was durably restored.
@@ -1328,12 +1366,30 @@ export class AccountRelay implements DurableObject {
    *
    * Stores the request and fans the ciphertext out to every online device. If no device is
    * connected it stays queued and is delivered on the next `…/connect` (see handleDeviceConnect).
-   * - 400: not exactly the contract's envelope fields, or already expired.
+   * - 400: not exactly the contract's envelope fields, already expired, or `expires_at - now`
+   *        beyond the request horizon (`maxRequestTtlMs`, default 15 min).
    * - 409: a request with this `id` was already submitted.
+   * - 413: the body exceeds `MAX_REQUEST_BODY_BYTES` (checked before parsing) or
+   *        `context_ciphertext` exceeds `MAX_CONTEXT_CIPHERTEXT_BYTES`.
+   * - 429: the account already holds `MAX_PENDING_REQUESTS_PER_ACCOUNT` live pending requests.
+   * (The Worker's rate limiter may also answer 429/503 before this handler runs.)
    */
   private async handleSubmit(request: Request, accountId: string): Promise<Response> {
-    const envelope = await parseJsonBody(request);
-    if (!envelope) return json({ error: "invalid JSON body" }, 400);
+    // Size-check the body BEFORE parsing it: an unauthenticated caller must not make the relay
+    // buffer or parse an arbitrarily large document.
+    const body = await readBodyCapped(request, MAX_REQUEST_BODY_BYTES);
+    if (body.kind === "too_large") {
+      return json({ error: `request body exceeds ${String(MAX_REQUEST_BODY_BYTES)} bytes` }, 413);
+    }
+    if (body.kind === "unreadable") return json({ error: "invalid JSON body" }, 400);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(body.text);
+    } catch {
+      return json({ error: "invalid JSON body" }, 400);
+    }
+    if (!isPlainObject(parsed)) return json({ error: "invalid JSON body" }, 400);
+    const envelope = parsed;
 
     // SECURITY (zero-knowledge): the ApprovalRequest envelope must be EXACTLY the contract's
     // routing/lifecycle fields wrapping the opaque ciphertext (contract.md §Messages). Rejecting
@@ -1355,15 +1411,31 @@ export class AccountRelay implements DurableObject {
     if (!requiredString(envelope, "approver")) {
       return json({ error: "'approver' is required (string)" }, 400);
     }
-    // The ciphertext is opaque to the relay — present and a string is all we check.
-    if (!requiredString(envelope, "context_ciphertext")) {
+    // The ciphertext is opaque to the relay — present, a string, and within the size cap is all
+    // we check.
+    const contextCiphertext = requiredString(envelope, "context_ciphertext");
+    if (!contextCiphertext) {
       return json({ error: "'context_ciphertext' is required (opaque JWE string)" }, 400);
+    }
+    if (utf8ByteLength(contextCiphertext) > MAX_CONTEXT_CIPHERTEXT_BYTES) {
+      return json(
+        { error: `'context_ciphertext' exceeds ${String(MAX_CONTEXT_CIPHERTEXT_BYTES)} bytes` },
+        413,
+      );
     }
     const expiresAt = requiredNumber(envelope, "expires_at");
     if (expiresAt === null) return json({ error: "'expires_at' is required (i64 ms)" }, 400);
 
-    const now = Date.now();
+    const now = this.now();
     if (expiresAt <= now) return json({ error: "request already expired" }, 400);
+    // Horizon: a far-future `expires_at` would otherwise keep a request pending (stored, counted,
+    // shown to devices) indefinitely.
+    if (expiresAt - now > this.maxRequestTtlMs) {
+      return json(
+        { error: `'expires_at' is more than ${String(this.maxRequestTtlMs)} ms in the future` },
+        400,
+      );
+    }
     const requestAuthToken = generateAuthToken();
     const requestAuthTokenHash = await hashAuthToken(requestAuthToken);
 
@@ -1374,6 +1446,13 @@ export class AccountRelay implements DurableObject {
       ...this.sql.exec<RequestRow>(`SELECT request_id FROM request WHERE request_id = ?`, id),
     ];
     if (existing.length > 0) return json({ error: "request already submitted" }, 409);
+
+    // Pending cap. Counted in the same synchronous section as the INSERT below (nothing awaits in
+    // between), so concurrent submits cannot overshoot it. Only live requests count: resolved,
+    // expired and retracted rows, and pending rows already past their deadline, do not.
+    if (this.livePendingCount(now) >= MAX_PENDING_REQUESTS_PER_ACCOUNT) {
+      return json({ error: "too many pending requests for this account" }, 429);
+    }
 
     // SECURITY: the whole envelope is routing/lifecycle + the opaque ciphertext — no plaintext.
     try {
@@ -1397,6 +1476,23 @@ export class AccountRelay implements DurableObject {
     const pushWakeups = await this.sendPushWakeups(accountId, id);
 
     return this.requestSubmitResponse(id, delivered, pushWakeups, requestAuthToken);
+  }
+
+  /**
+   * Live pending requests: status `pending`, not yet past `expires_at`, and within the horizon of
+   * when the relay received them (a pre-horizon row with a far-future `expires_at` stops counting —
+   * and is expired by the alarm — once it is older than `maxRequestTtlMs`).
+   */
+  private livePendingCount(now: number): number {
+    const row = [
+      ...this.sql.exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM request
+         WHERE status = 'pending' AND expires_at > ? AND created_at > ?`,
+        now,
+        now - this.maxRequestTtlMs,
+      ),
+    ][0];
+    return row?.n ?? 0;
   }
 
   private async authorizeRequestRead(
@@ -1822,7 +1918,7 @@ export class AccountRelay implements DurableObject {
    * connected devices, wakes live integrator waiters, and then schedules the next pending expiry.
    */
   async alarm(): Promise<void> {
-    const now = Date.now();
+    const now = this.now();
     const expired = this.expirePendingDue(now);
     for (const request of expired) {
       this.notifyExpiredRequest(request.request_id);
@@ -1831,27 +1927,41 @@ export class AccountRelay implements DurableObject {
     await this.armExpiryAlarm();
   }
 
-  /** Schedule the alarm to the nearest pending expiry, or clear it when no pending request remains. */
+  /**
+   * Schedule the alarm to the nearest pending deadline, or clear it when no pending request
+   * remains. A pending row's deadline is its `expires_at`, capped at `created_at + maxRequestTtlMs`
+   * so a row stored before the horizon existed (far-future `expires_at`) is still expired and swept.
+   */
   private async armExpiryAlarm(): Promise<void> {
     const next = [
-      ...this.sql.exec<{ expires_at: number }>(
-        `SELECT expires_at FROM request WHERE status = 'pending' ORDER BY expires_at ASC LIMIT 1`,
+      ...this.sql.exec<{ deadline: number }>(
+        `SELECT MIN(expires_at, created_at + ?) AS deadline FROM request
+         WHERE status = 'pending' ORDER BY deadline ASC LIMIT 1`,
+        this.maxRequestTtlMs,
       ),
     ][0];
     if (!next) {
       await this.ctx.storage.deleteAlarm();
       return;
     }
-    await this.ctx.storage.setAlarm(Math.max(next.expires_at, Date.now()));
+    await this.ctx.storage.setAlarm(Math.max(next.deadline, Date.now()));
   }
 
-  /** Mark every overdue pending request expired and return the rows that changed state. */
+  /**
+   * Mark every overdue pending request expired and return the rows that changed state. Overdue
+   * means past `expires_at`, or older than the horizon (`created_at + maxRequestTtlMs <= now`) —
+   * the latter only happens to rows stored before the horizon was enforced. Once expired, a row is
+   * removed by {@link sweepTerminalRows} after the retention window, so no pending row is stored
+   * forever.
+   */
   private expirePendingDue(now: number): RequestRow[] {
     const overdue = [
       ...this.sql.exec<RequestRow>(
         `SELECT request_id, envelope, created_at, expires_at, status, terminal_at FROM request
-         WHERE status = 'pending' AND expires_at <= ? ORDER BY expires_at ASC`,
+         WHERE status = 'pending' AND (expires_at <= ? OR created_at <= ?)
+         ORDER BY expires_at ASC`,
         now,
+        now - this.maxRequestTtlMs,
       ),
     ];
     for (const request of overdue) {
@@ -1900,7 +2010,12 @@ export class AccountRelay implements DurableObject {
     }
   }
 
-  /** Bound storage growth by removing old terminal request rows and their stored verdicts. */
+  /**
+   * Bound storage growth by removing old terminal request rows and their stored verdicts. Pending
+   * rows reach this sweep through {@link expirePendingDue}, which the alarm runs first: every
+   * pending row past its deadline (including the horizon cap) is expired there, so no pending row
+   * outlives `deadline + REQUEST_RETENTION_MS`.
+   */
   private sweepTerminalRows(now: number): void {
     const cutoff = now - REQUEST_RETENTION_MS;
     this.sql.exec(
@@ -1908,6 +2023,7 @@ export class AccountRelay implements DurableObject {
        WHERE status IN ('expired', 'resolved', 'retracted') AND terminal_at IS NOT NULL AND terminal_at < ?`,
       cutoff,
     );
+
     this.sql.exec(`DELETE FROM verdict WHERE request_id NOT IN (SELECT request_id FROM request)`);
   }
 }
