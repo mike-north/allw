@@ -525,7 +525,13 @@ cut off at once.
 
 Integrator submission fans out **request-id-only** wakeups (no context, not E2EE) to registered
 tokens. APNs payload: `{ "aps": { "content-available": 1 }, "request_id": "…" }`. The device wakes,
-then fetches the full envelope via the socket or `/inbox`.
+then fetches its **whole inbox** via the socket or `/inbox`, which returns every pending request
+with its full envelope.
+
+**A wakeup's `request_id` is advisory.** It names a request that prompted the wakeup, not the only
+one to show: one wakeup can stand for several submits (see Coalescing below), and the request it
+names may already have ended. A device must not resolve a wakeup by its id alone (for example, by
+fetching only that request); it fetches its inbox and shows every pending request there.
 
 **Fan-out is off the response path.** The submit returns as soon as the request is stored; wakeups
 are sent afterwards (at most 4 in flight, each push-service request bounded by a 5 s timeout), so a
@@ -588,11 +594,11 @@ and timeouts are transient and not logged.
   token: a Web Push subscription endpoint, an APNs device token or an FCM registration token) is sent
   per **30 s** (`PUSH_COALESCE_MS`): a submit that finds a wakeup to that token in flight, or sent
   within the window, skips it. This bounds push volume per token however fast unauthenticated
-  submits arrive, and so per account to the 32-token budget × one wakeup per window (#248). The time of each subscription's last wakeup is stored on its token row, so
-  the bound also holds when the Durable Object hibernates or is evicted inside the window (#319).
-  Removing the subscription removes its claim too. A stored claim dated in the future (a clock
-  anomaly on the host that wrote it) counts as made now, so it blocks the subscription for one
-  window at most.
+  submits arrive, and so per account to the 32-token budget × one wakeup per window (#248). The
+  time of each token's last wakeup is stored on its token row, so the bound also holds when the
+  Durable Object hibernates or is evicted inside the window (#319). Removing the token removes its
+  claim too. A stored claim dated in the future (a clock anomaly on the host that wrote it) counts as
+  made now, so it blocks the token for one window at most.
 - **Trailing wakeup.** A skipped submit may have landed after the service worker already fetched its
   inbox for the earlier wakeup, so the skip alone could leave that request with no push at all
   (#313). The relay therefore records the subscription as owed a wakeup. A request whose submit was
@@ -611,10 +617,12 @@ and timeouts are transient and not logged.
 
   The same holds for APNs and FCM tokens, which are owed trailing wakeups exactly as subscriptions
   are. Because a native wakeup carries a `request_id`, its trailing wakeup carries the id of the
-  **latest** submit the window skipped (ties go to the newer submit). A row owed before the relay
-  recorded that id carries the longest-lived pending request's id instead. The device fetches its
-  whole inbox on any wakeup, so the id only says which request prompted it. An owed wakeup is dropped
-  without sending when its token is unregistered or its transport is no longer configured.
+  **latest** submit the window skipped (ties go to the newer submit), as long as that request is
+  still pending and unexpired when the wakeup is sent. Otherwise, and for a row owed before the
+  relay recorded that id, it carries the longest-lived pending request's id. Either way the id is
+  advisory (above). Owed wakeups are kept per transport, so one string registered under two
+  transports owes each its own. An owed wakeup is dropped without sending when its token is
+  unregistered or its transport is no longer configured.
 
 - **VAPID public key.** Clients subscribe with the key from `GET /.well-known/allw/vapid-public-key`
   (§3).
