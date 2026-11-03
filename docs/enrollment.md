@@ -44,20 +44,34 @@ relay account object
 ```
 
 The relay device registry and the signed account-state document are deliberately separate. The registry is the
-online routing/encryption view the relay enforces; signed account state is the verifier/device trust view that
-includes revocation, device signing keys, actor keys, and root rotation state. The relay may store the latest
-account state, but it cannot author it.
+online routing view the relay enforces (presence sockets, push fan-out); today it is also where `requestApproval`
+gets its encryption recipients, which the recipient selection rule below replaces. Signed account state is the
+verifier/device trust view that includes revocation, device signing keys, actor keys, and root rotation state. The
+relay may store the latest account state, but it cannot author it.
 
-**Recipient selection rule.** The devices a request may be encrypted to are defined by root-signed account state,
-never by the registry: the core's `select_recipients(account_states, account_id, account_root_pub)` returns
-`{ device_id, encryption_pubkey }` for each device that is `active` and not revoked in the highest-sequence
-documents that verify against the root. It is fail-closed throughout:
+**Recipient selection rule.** This is the core rule the SDK is adopting for who may read a request: the devices a
+request may be encrypted to are defined by root-signed account state, never by the registry. The core's
+`select_recipients(account_states, account_id, account_root_pub, now_ms, min_sequence)` implements it; the SDK
+adopts it in #243, and until then `requestApproval` still encrypts to every device in the registry. It returns
+`{ device_id, encryption_pubkey }` for each device that is `active`, not revoked, and whose signed
+`cert_expires_at` (when present) is after `now_ms`, in the highest-sequence documents that verify against the root.
+It is fail-closed throughout:
 
+- more than `MAX_ACCOUNT_STATES` (64) documents is an error, checked before any signature work;
 - every supplied document must verify, or the selection fails (a bad document is never skipped);
 - lower-sequence documents contribute nothing;
+- a caller that persists the highest sequence it has accepted passes it as `min_sequence`; a highest supplied
+  sequence below that floor is an error, never a fallback to the older state;
+- a device whose `cert_expires_at` is at or before `now_ms` is not a recipient;
 - when several verified documents share the highest sequence, a device counts only if all of them list it active,
-  unrevoked, and with the same encryption key (a conflict can only remove readers);
+  unrevoked, unexpired, and with the same encryption key (a conflict can only remove readers);
+- an empty `device_id` in a highest-sequence document, or an all-zero encryption key on a selected device, is an
+  error;
 - no document, no remaining device, or more than `MAX_RECIPIENTS` (16) is an error, never an empty list.
+
+Revocation is not permanent across sequences. Only the highest sequence counts, so a later root-signed document
+that lists a previously revoked device as active, with no revocation entry, makes it a recipient again. That is
+root-authorized: the root holder can always re-enroll a device, and the signed sequence is the authority.
 
 The approval primitive has two independent device keys:
 
@@ -112,7 +126,9 @@ account_id = base64url-unpadded( SHA-256( "allw/account-id/v1" || 0x00 || accoun
 ## Requirements
 
 1. Private keys and seeds must never cross the relay boundary.
-2. A device may receive encrypted requests only while it is enrolled in the relay device registry.
+2. A device may receive encrypted requests only while it is enrolled in the relay device registry. Under the
+   recipient selection rule (§Model; adopted by the SDK in #243) it must also be listed `active`, unrevoked and
+   unexpired in the highest root-signed account state.
 3. A device may resolve a request only while it is still enrolled.
 4. A verifier must accept a verdict only if its `device_cert` chains to an acceptable account root and the verdict
    itself verifies under the certified device signing key.
@@ -131,8 +147,9 @@ account_id = base64url-unpadded( SHA-256( "allw/account-id/v1" || 0x00 || accoun
 
 Device enrollment binds an approver device to an account in two places:
 
-1. **Relay device registry:** `device_id -> device_encryption_pubkey`, used by integrators to encrypt
-   `ApprovalContext` JWE recipients and by the relay to route presence sockets.
+1. **Relay device registry:** `device_id -> device_encryption_pubkey`, used by the relay to route presence sockets
+   and, until the SDK adopts the recipient selection rule (§Model, #243), by integrators to encrypt
+   `ApprovalContext` JWE recipients.
 2. **Device certificate:** `device_cert`, an EdDSA compact JWS signed by the account root, binding
    `device_id -> device_signing_pubkey` for verdict verification.
 
