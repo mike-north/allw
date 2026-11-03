@@ -137,7 +137,8 @@ function parseEnvelope(value: unknown): ApprovalRequest {
  * @param nowMs current time in Unix ms — injected so expiry is deterministic/testable (no
  *   wall-clock read inside).
  * @throws on a malformed envelope, an **already-expired** request, a JWE the device key cannot
- *   decrypt, or a malformed context.
+ *   decrypt, a malformed context, or one the core refuses (a non-null reserved field or a hidden
+ *   risk downgrade, docs/contract.md §Device-side context checks).
  */
 export function prepareRequest(
   wasm: AllwWasm,
@@ -164,7 +165,8 @@ export function prepareRequest(
     throw new Error("keyfile has no device_id — pair the approver before watching");
   }
 
-  // Decrypt via the core. A wrong key / tampered ciphertext / malformed JWE throws here.
+  // Decrypt via the core. A wrong key / tampered ciphertext / malformed JWE throws here, and so does
+  // a context that breaks a v1 device-side check (docs/contract.md §Device-side context checks).
   const contextJson = wasm.decrypt_context(ciphertext, deviceId, keyfile.device_encryption_seed);
 
   let context: unknown;

@@ -316,6 +316,31 @@ test("fail-closed: a ciphertext encrypted to a DIFFERENT device key cannot be de
   );
 });
 
+test("fail-closed (#296): a context with a non-null reserved field or a hidden risk downgrade is refused", async () => {
+  const wasm = await loadWasm();
+  // docs/contract.md §Device-side context checks: the core refuses these in decrypt_context, so the
+  // approver can't show (or sign) them, and its error is the core's text naming the field or tiers.
+  const cases = [
+    [
+      { ...CONTEXT, action: { ...CONTEXT.action, capabilities: [{ grant: "WRITE_EVERYTHING" }] } },
+      "action.capabilities",
+    ],
+    [{ ...CONTEXT, action: { ...CONTEXT.action, scope: { paths: ["/etc"] } } }, "action.scope"],
+    [{ ...CONTEXT, risk: "low" }, "context risk low is lower than action.risk high"],
+  ];
+  for (const [context, named] of cases) {
+    const { keyfile, jwe } = pairedApprover(wasm, JSON.stringify(context));
+    assert.throws(
+      () => prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS),
+      (err) => err instanceof Error && err.message.includes(named),
+      `the refusal must name ${named}`,
+    );
+  }
+  // A context that raises the shown risk above the record's still opens.
+  const { keyfile, jwe } = pairedApprover(wasm, JSON.stringify({ ...CONTEXT, risk: "critical" }));
+  assert.equal(prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS).context.risk, "critical");
+});
+
 test("fail-closed: an envelope missing context_ciphertext is rejected before any crypto", async () => {
   const wasm = await loadWasm();
   const { keyfile } = pairedApprover(wasm);
