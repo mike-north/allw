@@ -870,7 +870,8 @@ describe("rate limiting on unauthenticated routes", () => {
     const acct = testAccount("limits-rl-uncovered");
     const overrides = { RATE_LIMIT_PAIRING: limiter, RATE_LIMIT_REQUESTS: limiter };
     expect((await workerFetch(acct, "/devices", overrides, { method: "GET" })).status).toBe(200);
-    expect((await workerFetch(acct, "/requests/x", overrides, { method: "GET" })).status).toBe(404);
+    // No bearer: an unknown request id answers like a missing token (401), never 404 (#357).
+    expect((await workerFetch(acct, "/requests/x", overrides, { method: "GET" })).status).toBe(401);
     expect((await workerFetch(acct, "/account-states", overrides, { method: "GET" })).status).toBe(
       200,
     );
