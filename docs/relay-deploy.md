@@ -67,7 +67,9 @@ put its origin here: scheme, host and port only, with no path or trailing slash,
 host, punycode for an internationalized host, default port dropped), so `https://Approver.example.com:443`
 works too. An entry that is not an origin (a path or trailing slash, a query or fragment,
 credentials, a non-http(s) scheme, a wildcard host, `null`) is ignored and logged once
-(`wrangler tail`); it never widens the list. Matching is exact: Cloudflare Pages preview and branch
+(`wrangler tail`); it never widens the list. That is judged on the entry as written, before any
+normalization: nothing may follow the host and port, so a dot segment (`/.`, `/..`, `/%2e`), a
+backslash or whitespace anywhere in the entry also drops it, including in a `:*` entry. Matching is exact: Cloudflare Pages preview and branch
 origins (`<hash>.allw-web-approver.pages.dev`) are not admitted by the hosted origin and there is no
 suffix wildcard. A port of `*` matches any port and is meant for loopback dev only
 (the top-level dev config allows `http://localhost:*` and `http://127.0.0.1:*`). Setting the var

@@ -559,8 +559,39 @@ describe("parseCorsAllowedOrigins / isCorsOriginAllowed", () => {
     ["embedded credentials", "https://user:pw@approver.example.com"],
     ["a wildcard host", "https://*.example.com"],
     ["a bare wildcard", "*"],
+    // Path-like spellings that URL parsing would fold into a bare origin (#305).
+    ["a trailing dot segment", "https://a.example/."],
+    ["a trailing double-dot segment", "https://a.example/.."],
+    ["a path climbing back to the root", "https://a.example/app/.."],
+    ["a percent-encoded dot segment", "https://a.example/%2e"],
+    ["a trailing backslash", "https://a.example\\"],
+    ["a tab inside the host", "https://a.ex\tample"],
+    ["a newline inside the host", "https://a.ex\nample"],
+    ["an any-port host with a backslash", "http://localhost\\.evil.example:*"],
+    ["an any-port host with a backslash path", "https://approver.example.com\\app:*"],
+    ["an any-port host with a tab", "http://local\thost:*"],
+    ["an any-port host with a path", "http://localhost/app:*"],
   ])("drops %s rather than widening the allowlist", (_name, entry) => {
     expect(parseCorsAllowedOrigins(entry)).toEqual([]);
+  });
+
+  it.each(["http://localhost:*", "http://127.0.0.1:*"])(
+    "still accepts the loopback any-port entry %s",
+    (entry) => {
+      const [rule] = parseCorsAllowedOrigins(entry);
+
+      expect(rule?.kind).toBe("any-port");
+      expect(isCorsOriginAllowed(entry.replace("*", "5173"), parseCorsAllowedOrigins(entry))).toBe(
+        true,
+      );
+    },
+  );
+
+  it("drops a backslash any-port entry without granting its host prefix (#305)", () => {
+    // Before #305, `localhost\.evil.example:*` became any-port `localhost`.
+    const rules = parseCorsAllowedOrigins("http://localhost\\.evil.example:*");
+
+    expect(isCorsOriginAllowed("http://localhost:1234", rules)).toBe(false);
   });
 
   it("matches an any-port entry only on its scheme and host", () => {

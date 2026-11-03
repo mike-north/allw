@@ -70,6 +70,9 @@ const parsedAllowlists = new Map<string, readonly OriginRule[]>();
  * Malformed entries are dropped, never widened, and each dropped entry is logged once
  * (`console.warn`, visible in `wrangler tail`): an entry with a path or trailing slash, a query or
  * fragment, credentials, a non-http(s) scheme, a wildcard host, or the opaque `null` origin.
+ * Path-like syntax is judged on the entry as written, before URL normalization, so a dot segment
+ * (`/.`, `/..`, `/%2e`), a backslash or embedded whitespace drops the entry too, rather than being
+ * folded into a bare origin.
  */
 export function parseCorsAllowedOrigins(value: string | undefined): readonly OriginRule[] {
   const raw = value ?? DEFAULT_CORS_ALLOWED_ORIGINS;
@@ -91,7 +94,10 @@ export function parseCorsAllowedOrigins(value: string | undefined): readonly Ori
 }
 
 function parseOriginRule(entry: string): OriginRule | null {
-  const anyPort = /^(https?):\/\/([^/:@?#*]+):\*$/.exec(entry);
+  // The host may not contain a backslash or whitespace either: URL parsing would read `\` as `/`
+  // and strip tabs and newlines, so `http://localhost\.evil.example:*` would become any-port
+  // `localhost` (#305).
+  const anyPort = /^(https?):\/\/([^/\\:@?#*\s]+):\*$/.exec(entry);
   if (anyPort) {
     const [, scheme = "", hostname = ""] = anyPort;
     const probe = parseOrigin(`${scheme}://${hostname}`);
@@ -101,7 +107,10 @@ function parseOriginRule(entry: string): OriginRule | null {
   if (entry.includes("*")) return null;
   // A path, a trailing slash, a query or a fragment means the entry is not an origin; it is
   // rejected rather than silently trimmed, since the operator may have pasted the wrong value.
-  if (entry.endsWith("/") || entry.includes("?") || entry.includes("#")) return null;
+  // Checked on the raw text, before URL parsing: the parser folds dot segments (`/.`, `/..`,
+  // `/%2e`), reads `\` as `/` and strips tabs and newlines, so those spellings would otherwise
+  // come out as a bare origin (#305). Nothing but the scheme and authority may follow `://`.
+  if (!/^https?:\/\/[^/\\?#\s]+$/i.test(entry)) return null;
   const exact = parseOrigin(entry);
   if (exact?.pathname !== "/") return null;
   return { kind: "exact", origin: exact.origin };
