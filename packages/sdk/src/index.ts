@@ -261,7 +261,10 @@ export interface EvaluatePolicyWithAccountStatesInput extends AccountStateOption
 
 /** Configuration for {@link createClient}. */
 export interface ClientConfig {
-  /** Base URL of the relay (e.g. `https://relay.allw.example`). */
+  /**
+   * Base URL of the relay (e.g. `https://relay.allw.example`). Must be `https:`, or `http:` on a
+   * loopback host for local development; {@link createClient} throws on anything else.
+   */
   readonly relayUrl: string;
   /** The approver's relay account id (routes to the per-account Durable Object). */
   readonly accountId: string;

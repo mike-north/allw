@@ -99,6 +99,36 @@ export class RelayTimeoutError extends Error {
 }
 
 /**
+ * Hosts on which a plaintext `http:` relay is tolerated: a local-development relay
+ * (`wrangler dev`) never leaves the machine. `[::1]` is the bracketed form `URL.hostname` reports
+ * for the IPv6 loopback. Mirrors `packages/web-approver/src/relay-config.ts`.
+ */
+const LOOPBACK_HOSTNAMES: ReadonlySet<string> = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+/**
+ * Reject a relay URL that would carry bearer tokens and ciphertext without TLS (issue #249,
+ * `docs/threat-model.md` §Relay and Transport). Accepts `https:`, or `http:` on a loopback host;
+ * throws an actionable `Error` for anything else — including an unparseable URL — so a
+ * misconfigured client fails at construction, before any request is built.
+ */
+export function assertRelayUrlTransport(relayUrl: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(relayUrl);
+  } catch {
+    throw new Error(
+      `allw: relayUrl '${relayUrl}' is not an absolute URL; expected e.g. https://relay.example.com`,
+    );
+  }
+  if (parsed.protocol === "https:") return;
+  if (parsed.protocol === "http:" && LOOPBACK_HOSTNAMES.has(parsed.hostname)) return;
+  throw new Error(
+    `allw: relayUrl '${relayUrl}' must use https:// — plain http:// is allowed only for a local ` +
+      "relay on localhost, 127.0.0.1, or [::1]",
+  );
+}
+
+/**
  * Build the per-account base URL: `<relayUrl>/<accountId>`. Trailing slashes on `relayUrl` are
  * normalized so a caller passing `https://relay.test/` or `https://relay.test` behaves identically.
  */
@@ -137,6 +167,7 @@ export class RelayClient {
     fetchImpl: FetchImpl,
     options: RelayClientOptions = {},
   ) {
+    assertRelayUrlTransport(relayUrl);
     this.base = accountBase(relayUrl, accountId);
     this.fetchImpl = fetchImpl;
     this.fetchTimeoutMs = options.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
