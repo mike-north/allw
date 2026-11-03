@@ -26,6 +26,7 @@ export {
 export {
   MAX_ERROR_TEXT_CHARS,
   agentSafeErrorText,
+  agentSafeText,
   decide,
   type ApprovalVerdict,
   type DecideDeps,

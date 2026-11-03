@@ -17,7 +17,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { MAX_ERROR_TEXT_CHARS, agentSafeErrorText, decide } from "../dist/lib/decide.js";
+import {
+  MAX_ERROR_TEXT_CHARS,
+  agentSafeErrorText,
+  agentSafeText,
+  decide,
+} from "../dist/lib/decide.js";
 import { loadWasm } from "../dist/lib/wasm.js";
 
 const HOSTNAME = "test-host";
@@ -170,6 +175,25 @@ test("(#274 review) relay text in a thrown error is escaped and capped in the de
   const shown = Array.from(reason.slice(DENY_PREFIX.length));
   assert.equal(shown.length, MAX_ERROR_TEXT_CHARS + 1, "capped, plus the … marker");
   assert.equal(shown.at(-1), "…");
+});
+
+test("(#364) agentSafeText escapes and caps any text the same way, and withholds on failure", async () => {
+  const wasm = await loadWasm();
+  assert.equal(
+    agentSafeText(wasm, `srv\u001b[2J\nX${String.fromCharCode(0x202e)}`),
+    String.raw`srv\x1b[2J\nX⟨U+202E⟩`,
+  );
+  const capped = Array.from(agentSafeText(wasm, "y".repeat(MAX_ERROR_TEXT_CHARS + 10)));
+  assert.equal(capped.length, MAX_ERROR_TEXT_CHARS + 1, "capped, plus the … marker");
+  const broken = {
+    escape_for_display() {
+      throw new Error("core unavailable");
+    },
+  };
+  assert.equal(
+    agentSafeText(broken, "srv"),
+    "details withheld (the display-escaping core is unavailable)",
+  );
 });
 
 test("agentSafeErrorText withholds the text when the core escape throws", () => {
