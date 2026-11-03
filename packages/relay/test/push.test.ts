@@ -3,18 +3,23 @@
  *
  * The relay must keep routing independent from vendor-specific push APIs: routing emits a
  * request-id-only wakeup, while APNs/FCM/Web Push transports decide how to deliver it.
+ *
+ * @see ../../../docs/relay-api.md (§5 Push wakeups)
  */
 
 import { describe, expect, it, vi } from "vitest";
 import {
   ApnsPushTransport,
   FcmPushTransport,
-  WebPushStubTransport,
+  PushTokenGoneError,
   buildPushWakeupPayload,
   dispatchPushWakeups,
   type PushTransport,
   type StoredPushToken,
 } from "../src/push.js";
+
+/** A fixed request deadline (2100-01-01Z, ms); never `Date.now()` in test data. */
+const EXPIRES_AT = 4102444800000;
 
 describe("push fan-out", () => {
   it("builds a wakeup payload containing only the request id", () => {
@@ -46,19 +51,21 @@ describe("push fan-out", () => {
       { device_id: "dev-b", transport: "fcm", token: "fcm-token" },
     ];
 
-    const delivered = await dispatchPushWakeups(tokens, {
+    const result = await dispatchPushWakeups(tokens, {
       accountId: "acct-push-swap",
       requestId: "req-push-swap",
+      expiresAt: EXPIRES_AT,
       transports: { apns, fcm },
     });
 
-    expect(delivered).toBe(2);
+    expect(result).toEqual({ delivered: 2, goneTokens: [] });
     expect(sent).toEqual([
       {
         kind: "apns",
         accountId: "acct-push-swap",
         deviceId: "dev-a",
         requestId: "req-push-swap",
+        expiresAt: EXPIRES_AT,
         token: "apns-token",
       },
       {
@@ -66,6 +73,7 @@ describe("push fan-out", () => {
         accountId: "acct-push-swap",
         deviceId: "dev-b",
         requestId: "req-push-swap",
+        expiresAt: EXPIRES_AT,
         token: "fcm-token",
       },
     ]);
@@ -89,12 +97,14 @@ describe("push fan-out", () => {
       accountId: "acct",
       deviceId: "dev-ios",
       requestId: "req-format",
+      expiresAt: EXPIRES_AT,
       token: "apns-token",
     });
     await fcm.sendWakeup({
       accountId: "acct",
       deviceId: "dev-android",
       requestId: "req-format",
+      expiresAt: EXPIRES_AT,
       token: "fcm-token",
     });
 
@@ -134,22 +144,31 @@ describe("push fan-out", () => {
         {
           accountId: "acct-push-provider-failure",
           requestId: "req-push-provider-failure",
+          expiresAt: EXPIRES_AT,
           transports: { apns, fcm },
         },
       ),
-    ).resolves.toBe(1);
+    ).resolves.toEqual({ delivered: 1, goneTokens: [] });
   });
 
-  it("keeps Web Push behind the same interface as an explicit stub", async () => {
-    const webPush = new WebPushStubTransport();
+  it("reports only tokens whose transport signalled PushTokenGoneError for pruning", async () => {
+    const gone: StoredPushToken = { device_id: "dev-a", transport: "webpush", token: "gone" };
+    const transient: StoredPushToken = { device_id: "dev-b", transport: "webpush", token: "flaky" };
+    const webpush: PushTransport = {
+      kind: "webpush",
+      async sendWakeup(wakeup) {
+        if (wakeup.token === "gone") throw new PushTokenGoneError("HTTP 410");
+        throw new Error("HTTP 503");
+      },
+    };
 
     await expect(
-      webPush.sendWakeup({
-        accountId: "acct",
-        deviceId: "dev-web",
-        requestId: "req-web",
-        token: "web-token",
+      dispatchPushWakeups([gone, transient], {
+        accountId: "acct-push-prune",
+        requestId: "req-push-prune",
+        expiresAt: EXPIRES_AT,
+        transports: { webpush },
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ delivered: 0, goneTokens: [gone] });
   });
 });

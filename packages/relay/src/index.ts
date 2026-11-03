@@ -20,14 +20,21 @@ import {
   ApnsPushTransport,
   FcmPushTransport,
   NoopPushTransport,
-  WebPushStubTransport,
   dispatchPushWakeups,
   isPushTransportKind,
   type PushTransportRegistry,
   type PushTransportKind,
 } from "./push.js";
+import {
+  VAPID_PUBLIC_KEY_PATH,
+  WebPushTransport,
+  handleVapidPublicKey,
+  parseWebPushEndpoint,
+  vapidConfigFromEnv,
+  type VapidEnv,
+} from "./web-push.js";
 
-export interface Env {
+export interface Env extends VapidEnv {
   readonly ACCOUNT: DurableObjectNamespace;
   readonly APNS_ENDPOINT?: string;
   readonly APNS_TOPIC?: string;
@@ -39,6 +46,8 @@ export interface Env {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    // Relay-level routes (not per-account) are matched before account routing.
+    if (url.pathname === VAPID_PUBLIC_KEY_PATH) return handleVapidPublicKey(request, env);
     // Route by account id → its Durable Object.
     const accountId = url.pathname.split("/")[1] ?? "";
     if (!accountId) return new Response("missing account", { status: 400 });
@@ -302,6 +311,8 @@ function optionalPushTokens(body: Record<string, unknown>): IncomingPushToken[] 
     if (typeof token !== "string" || token.length < 1 || token.length > 4096) return null;
     if (transport === "apns" && !/^[0-9a-fA-F]{64}$/.test(token)) return null;
     if (transport === "fcm" && !/^[A-Za-z0-9:_-]{1,4096}$/.test(token)) return null;
+    // SECURITY (SSRF): a webpush token is the subscription endpoint the relay will POST to.
+    if (transport === "webpush" && !parseWebPushEndpoint(token)) return null;
     // Duplicate registrations are idempotent for one device; collapse them before DB mutation so
     // a repeated token cannot half-complete pairing by tripping the push-token primary key.
     const tokenKey = `${transport}\0${token}`;
@@ -1214,7 +1225,7 @@ export class AccountRelay implements DurableObject {
     await this.armExpiryAlarm();
 
     const delivered = this.sendRequestToOneSocketPerSurface(id, envelope);
-    const pushWakeups = await this.sendPushWakeups(accountId, id);
+    const pushWakeups = await this.sendPushWakeups(accountId, id, expiresAt);
 
     return this.requestSubmitResponse(id, delivered, pushWakeups, requestAuthToken);
   }
@@ -1257,18 +1268,35 @@ export class AccountRelay implements DurableObject {
     );
   }
 
-  /** Send request-id-only push wakeups to every registered device push token. */
-  private async sendPushWakeups(accountId: string, requestId: string): Promise<number> {
+  /**
+   * Send request-id-only push wakeups to every registered device push token, then prune tokens the
+   * push service reported as gone (404/410). Returns the number of accepted wakeups.
+   */
+  private async sendPushWakeups(
+    accountId: string,
+    requestId: string,
+    expiresAt: number,
+  ): Promise<number> {
     const tokens = [
       ...this.sql.exec<DevicePushTokenRow>(
         `SELECT device_id, transport, token, created_at FROM device_push_token ORDER BY created_at ASC`,
       ),
     ];
-    return dispatchPushWakeups(tokens, {
+    const { delivered, goneTokens } = await dispatchPushWakeups(tokens, {
       accountId,
       requestId,
+      expiresAt,
       transports: this.pushTransports,
     });
+    for (const gone of goneTokens) {
+      this.sql.exec(
+        `DELETE FROM device_push_token WHERE device_id = ? AND transport = ? AND token = ?`,
+        gone.device_id,
+        gone.transport,
+        gone.token,
+      );
+    }
+    return delivered;
   }
 
   /**
@@ -1736,7 +1764,7 @@ function buildPushTransports(env: Env): PushTransportRegistry {
   const transports: PushTransportRegistry = {
     apns: new NoopPushTransport("apns"),
     fcm: new NoopPushTransport("fcm"),
-    webpush: new WebPushStubTransport(),
+    webpush: new NoopPushTransport("webpush"),
   };
   if (env.APNS_ENDPOINT && env.APNS_TOPIC && env.APNS_BEARER_TOKEN) {
     transports.apns = new ApnsPushTransport({
@@ -1751,5 +1779,7 @@ function buildPushTransports(env: Env): PushTransportRegistry {
       bearerToken: env.FCM_BEARER_TOKEN,
     });
   }
+  const vapid = vapidConfigFromEnv(env);
+  if (vapid) transports.webpush = new WebPushTransport({ vapid });
   return transports;
 }
