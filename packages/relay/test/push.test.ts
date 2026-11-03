@@ -13,14 +13,14 @@ import {
   FcmPushTransport,
   InMemoryWakeupClaimStore,
   UndeliverablePushTokenError,
-  WEB_PUSH_COALESCE_MS,
+  PUSH_COALESCE_MS,
   WakeupCoalescer,
   buildPushWakeupPayload,
   diffPushTokenSet,
   dispatchPushWakeups,
   isClientErrorStatus,
-  parseWebPushCoalesceKey,
-  webPushCoalesceKey,
+  parsePushCoalesceKey,
+  pushCoalesceKey,
   type Fetcher,
   type PushTransport,
   type StoredPushToken,
@@ -544,42 +544,42 @@ describe("WakeupCoalescer — at most one wakeup per subscription per window", (
   const OTHER = "dev-b\0https://fcm.googleapis.com/fcm/send/b";
 
   it("uses a 30-second window", () => {
-    expect(WEB_PUSH_COALESCE_MS).toBe(30_000);
+    expect(PUSH_COALESCE_MS).toBe(30_000);
   });
 
   it("coalesces a second claim inside the window, through the boundary, and allows one just past it", () => {
-    const coalescer = new WakeupCoalescer(WEB_PUSH_COALESCE_MS);
+    const coalescer = new WakeupCoalescer(PUSH_COALESCE_MS);
     expect(coalescer.tryClaim(KEY, T0)).toBe(true);
     coalescer.release(KEY);
 
     expect(coalescer.tryClaim(KEY, T0 + 1)).toBe(false);
-    expect(coalescer.tryClaim(KEY, T0 + WEB_PUSH_COALESCE_MS - 1)).toBe(false);
+    expect(coalescer.tryClaim(KEY, T0 + PUSH_COALESCE_MS - 1)).toBe(false);
     // The boundary itself is still inside the window.
-    expect(coalescer.tryClaim(KEY, T0 + WEB_PUSH_COALESCE_MS)).toBe(false);
+    expect(coalescer.tryClaim(KEY, T0 + PUSH_COALESCE_MS)).toBe(false);
     // Just past it, the subscription may be woken again, and that claim opens a new window.
-    expect(coalescer.tryClaim(KEY, T0 + WEB_PUSH_COALESCE_MS + 1)).toBe(true);
+    expect(coalescer.tryClaim(KEY, T0 + PUSH_COALESCE_MS + 1)).toBe(true);
     coalescer.release(KEY);
-    expect(coalescer.tryClaim(KEY, T0 + WEB_PUSH_COALESCE_MS + 2)).toBe(false);
+    expect(coalescer.tryClaim(KEY, T0 + PUSH_COALESCE_MS + 2)).toBe(false);
   });
 
   it("coalesces while a wakeup is still in flight, even past the window", () => {
-    const coalescer = new WakeupCoalescer(WEB_PUSH_COALESCE_MS);
+    const coalescer = new WakeupCoalescer(PUSH_COALESCE_MS);
     expect(coalescer.tryClaim(KEY, T0)).toBe(true);
 
-    const pastWindow = T0 + WEB_PUSH_COALESCE_MS + 1;
+    const pastWindow = T0 + PUSH_COALESCE_MS + 1;
     expect(coalescer.tryClaim(KEY, pastWindow)).toBe(false);
     coalescer.release(KEY);
     expect(coalescer.tryClaim(KEY, pastWindow)).toBe(true);
   });
 
   it("reports the first instant a claim can succeed again: just past the window", () => {
-    const coalescer = new WakeupCoalescer(WEB_PUSH_COALESCE_MS);
+    const coalescer = new WakeupCoalescer(PUSH_COALESCE_MS);
     // Never claimed: claimable now.
     expect(coalescer.nextClaimableAt(KEY, T0)).toBe(T0);
 
     expect(coalescer.tryClaim(KEY, T0)).toBe(true);
     coalescer.release(KEY);
-    const reopensAt = T0 + WEB_PUSH_COALESCE_MS + 1;
+    const reopensAt = T0 + PUSH_COALESCE_MS + 1;
     expect(coalescer.nextClaimableAt(KEY, T0 + 1)).toBe(reopensAt);
     // The reported instant agrees with tryClaim at the boundary and just past it.
     expect(coalescer.tryClaim(KEY, reopensAt - 1)).toBe(false);
@@ -587,9 +587,9 @@ describe("WakeupCoalescer — at most one wakeup per subscription per window", (
   });
 
   it("never reports a time before now, even while a claim is still in flight past its window", () => {
-    const coalescer = new WakeupCoalescer(WEB_PUSH_COALESCE_MS);
+    const coalescer = new WakeupCoalescer(PUSH_COALESCE_MS);
     expect(coalescer.tryClaim(KEY, T0)).toBe(true);
-    const late = T0 + 10 * WEB_PUSH_COALESCE_MS;
+    const late = T0 + 10 * PUSH_COALESCE_MS;
     expect(coalescer.nextClaimableAt(KEY, late)).toBe(late);
     // It is a lower bound: the in-flight claim still blocks until released.
     expect(coalescer.tryClaim(KEY, late)).toBe(false);
@@ -598,43 +598,60 @@ describe("WakeupCoalescer — at most one wakeup per subscription per window", (
   it("remembers claims through its store, so a second coalescer on the same store still coalesces (#319)", () => {
     // Models a Durable Object evicted and recreated over the same SQLite: in-flight state is new,
     // but the last claim is read back from the store.
-    const store = new InMemoryWakeupClaimStore(WEB_PUSH_COALESCE_MS);
-    const before = new WakeupCoalescer(WEB_PUSH_COALESCE_MS, store);
+    const store = new InMemoryWakeupClaimStore(PUSH_COALESCE_MS);
+    const before = new WakeupCoalescer(PUSH_COALESCE_MS, store);
     expect(before.tryClaim(KEY, T0)).toBe(true);
     before.release(KEY);
 
-    const after = new WakeupCoalescer(WEB_PUSH_COALESCE_MS, store);
+    const after = new WakeupCoalescer(PUSH_COALESCE_MS, store);
     expect(after.tryClaim(KEY, T0 + 1)).toBe(false);
-    expect(after.nextClaimableAt(KEY, T0 + 1)).toBe(T0 + WEB_PUSH_COALESCE_MS + 1);
-    expect(after.tryClaim(KEY, T0 + WEB_PUSH_COALESCE_MS + 1)).toBe(true);
+    expect(after.nextClaimableAt(KEY, T0 + 1)).toBe(T0 + PUSH_COALESCE_MS + 1);
+    expect(after.tryClaim(KEY, T0 + PUSH_COALESCE_MS + 1)).toBe(true);
   });
 
   it("counts a stored claim from the future as now, so it blocks for one window at most (review-330 S1)", () => {
-    const store = new InMemoryWakeupClaimStore(WEB_PUSH_COALESCE_MS);
+    const store = new InMemoryWakeupClaimStore(PUSH_COALESCE_MS);
     store.recordClaim(KEY, T0 + 24 * 60 * 60 * 1000);
-    const coalescer = new WakeupCoalescer(WEB_PUSH_COALESCE_MS, store);
+    const coalescer = new WakeupCoalescer(PUSH_COALESCE_MS, store);
 
-    expect(coalescer.nextClaimableAt(KEY, T0)).toBe(T0 + WEB_PUSH_COALESCE_MS + 1);
+    expect(coalescer.nextClaimableAt(KEY, T0)).toBe(T0 + PUSH_COALESCE_MS + 1);
     expect(coalescer.tryClaim(KEY, T0)).toBe(false);
-    expect(coalescer.tryClaim(KEY, T0 + WEB_PUSH_COALESCE_MS + 1)).toBe(true);
+    expect(coalescer.tryClaim(KEY, T0 + PUSH_COALESCE_MS + 1)).toBe(true);
   });
 
-  it("round-trips a subscription through its coalescing key", () => {
-    const key = webPushCoalesceKey("dev-a", "https://fcm.googleapis.com/fcm/send/a?x=1");
-    expect(parseWebPushCoalesceKey(key)).toEqual({
-      deviceId: "dev-a",
-      token: "https://fcm.googleapis.com/fcm/send/a?x=1",
-    });
+  it("round-trips a push token of each transport through its coalescing key", () => {
+    for (const token of [
+      {
+        device_id: "dev-a",
+        transport: "webpush",
+        token: "https://fcm.googleapis.com/fcm/send/a?x=1",
+      },
+      { device_id: "dev-a", transport: "apns", token: "a".repeat(64) },
+      { device_id: "dev-a", transport: "fcm", token: "fcm:token_A-1" },
+    ] as const) {
+      expect(parsePushCoalesceKey(pushCoalesceKey(token))).toEqual(token);
+    }
   });
 
-  it("refuses to parse a coalescing key with no separator", () => {
-    expect(() => parseWebPushCoalesceKey("dev-a-https://fcm.googleapis.com/fcm/send/a")).toThrow(
-      "not a Web Push coalescing key",
+  it("keys one token string separately per transport", () => {
+    const token = "a".repeat(64);
+    expect(pushCoalesceKey({ device_id: "dev-a", transport: "apns", token })).not.toBe(
+      pushCoalesceKey({ device_id: "dev-a", transport: "fcm", token }),
     );
   });
 
+  it("refuses to parse a key without both separators or with an unknown transport", () => {
+    for (const bad of [
+      "dev-a-https://fcm.googleapis.com/fcm/send/a",
+      "webpush\0dev-a-https://fcm.googleapis.com/fcm/send/a",
+      "smtp\0dev-a\0token",
+    ]) {
+      expect(() => parsePushCoalesceKey(bad)).toThrow("not a push coalescing key");
+    }
+  });
+
   it("keeps subscriptions independent", () => {
-    const coalescer = new WakeupCoalescer(WEB_PUSH_COALESCE_MS);
+    const coalescer = new WakeupCoalescer(PUSH_COALESCE_MS);
     expect(coalescer.tryClaim(KEY, T0)).toBe(true);
     expect(coalescer.tryClaim(OTHER, T0)).toBe(true);
     expect(coalescer.tryClaim(KEY, T0 + 1)).toBe(false);
