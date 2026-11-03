@@ -34,6 +34,12 @@
 //! And a root-signed account-state set with the recipients the selection rules allow, so the WASM
 //! `select_recipients` is checked against the same hand-derived answer as the core.
 //!
+//! And the verified-non-approval cases (#311): genuinely signed `denied` / `expired` / `aborted`
+//! verdicts, which must verify to `NotApproved` with the **signed** decision, and forged verdicts
+//! whose outer `decision` was rewritten and whose fields echo the old message marker, which must
+//! never classify as a verified non-approval. The WASM side checks the structured
+//! `kind: "not_approved"` error for each.
+//!
 //! @see docs/contract.md §Wire encoding, §Verification checklist
 //! @see docs/enrollment.md §Model (account id derivation, pairing-start authorization)
 //! @see crates/allw-core/src/hash.rs (FROZEN_HASH_HEX — the same value)
@@ -116,6 +122,17 @@ const NONCE: &[u8] = &[0xA1, 0xB2, 0xC3, 0xD4];
 const NOTED_NONCE: &[u8] = &[0xE5, 0xF6, 0x07, 0x18];
 const NOTE: &str = "ok for staging only — not prod";
 
+// Verified-non-approval verdicts (#311): one signed per non-approving decision, each with its own
+// nonce.
+const DENIED_NONCE: &[u8] = &[0x31, 0x32, 0x33, 0x34];
+const EXPIRED_NONCE: &[u8] = &[0x41, 0x42, 0x43, 0x44];
+const ABORTED_NONCE: &[u8] = &[0x51, 0x52, 0x53, 0x54];
+
+/// The text the SDK once matched in a verify error's message to decide a failure was a verified
+/// non-approval (the core's `NotApproved` `Display` prefix). Forged cases echo it through fields
+/// serde quotes back in its parse error, so a message-matching classifier is fooled.
+const NOT_APPROVED_MESSAGE_MARKER: &str = "verified human decision was not 'approved'";
+
 // ── The committed fixture shape ───────────────────────────────────────────────────
 
 /// The on-disk fixture. All JSON-typed members are serialized contract wire types (as compact
@@ -188,6 +205,38 @@ struct WasmVector {
     seal_expected_recipient_ids_json: String,
     /// The sequence the seal must report (and the floor it runs with).
     seal_sequence: u64,
+
+    /// Genuinely signed non-approvals, bound to `context_json` / `request_json`. Each must verify
+    /// to `NotApproved` carrying `signed_decision`; WASM throws `kind: "not_approved"` with it.
+    not_approved_verdicts: Vec<NotApprovedCase>,
+    /// Verdicts derived from the signed `denied` one by rewriting the outer `decision` and echoing
+    /// [`NOT_APPROVED_MESSAGE_MARKER`] through other fields. None may classify as a verified
+    /// non-approval: each fails to parse or fails verification with some other error, and WASM
+    /// throws an error with no `kind`.
+    forged_not_approved_verdicts: Vec<ForgedNotApprovedCase>,
+}
+
+/// A signed verdict whose human decision is not `approved`.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct NotApprovedCase {
+    name: String,
+    /// JSON `Verdict` signed by the fixture device.
+    verdict_json: String,
+    /// The non-approving decision in the **signed claims** (wire form: `denied`/`expired`/`aborted`).
+    signed_decision: String,
+}
+
+/// A relay-forged verdict that must be unclassified (never a verified decision).
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct ForgedNotApprovedCase {
+    name: String,
+    /// JSON for the forged verdict. Not always a valid `Verdict` (some fields have the wrong type).
+    verdict_json: String,
+    /// The outer `decision` the forger wrote (what a classifier reading the outer verdict sees).
+    outer_decision: String,
+    /// Whether the verify error message contains [`NOT_APPROVED_MESSAGE_MARKER`], i.e. a
+    /// message-substring classifier would be fooled. Written by hand from serde's error format.
+    message_echoes_marker: bool,
 }
 
 // ── Builders (mirror hash::tests::make_minimal_context exactly) ───────────────────
@@ -498,6 +547,28 @@ fn build_vector() -> WasmVector {
     };
     let noted_verdict = sign_verdict(&noted_unsigned, &device, NOTED_NONCE, Some(cert.clone()))
         .expect("note within cap");
+    let sign_non_approval = |decision: Decision, nonce: &[u8]| {
+        let non_approval = UnsignedVerdict {
+            decision,
+            ..clone_unsigned(&unsigned)
+        };
+        sign_verdict(&non_approval, &device, nonce, Some(cert.clone())).expect("note within cap")
+    };
+    let denied = sign_non_approval(Decision::Denied, DENIED_NONCE);
+    let not_approved_verdicts = vec![
+        not_approved_case("signed denied", &denied, "denied"),
+        not_approved_case(
+            "signed expired",
+            &sign_non_approval(Decision::Expired, EXPIRED_NONCE),
+            "expired",
+        ),
+        not_approved_case(
+            "signed aborted",
+            &sign_non_approval(Decision::Aborted, ABORTED_NONCE),
+            "aborted",
+        ),
+    ];
+    let forged_not_approved_verdicts = forged_not_approved_cases(&denied);
     let verdict = sign_verdict(&unsigned, &device, NONCE, Some(cert)).expect("note within cap");
 
     let agent_tool_call_context = make_agent_tool_call_context();
@@ -543,7 +614,71 @@ fn build_vector() -> WasmVector {
         // device are excluded; recipients are sorted by device id.
         seal_expected_recipient_ids_json: r#"["laptop","phone"]"#.to_string(),
         seal_sequence: SEAL_SEQUENCE,
+        not_approved_verdicts,
+        forged_not_approved_verdicts,
     }
+}
+
+fn not_approved_case(name: &str, verdict: &Verdict, signed_decision: &str) -> NotApprovedCase {
+    NotApprovedCase {
+        name: name.to_string(),
+        verdict_json: serde_json::to_string(verdict).expect("verdict serializes"),
+        signed_decision: signed_decision.to_string(),
+    }
+}
+
+/// The forged cases: the signed `denied` verdict with its outer `decision` rewritten and the
+/// marker echoed via `v`, `request_id`, `decided_at` or `decision` itself, plus a rewrite with no
+/// marker at all.
+fn forged_not_approved_cases(denied: &Verdict) -> Vec<ForgedNotApprovedCase> {
+    let base = serde_json::to_value(denied).expect("verdict serializes");
+    let forge = |name: &str, outer: &str, field: Option<&str>, echoes: bool| {
+        let mut value = base.clone();
+        value["decision"] = outer.into();
+        if let Some(field) = field {
+            value[field] = NOT_APPROVED_MESSAGE_MARKER.into();
+        }
+        ForgedNotApprovedCase {
+            name: name.to_string(),
+            verdict_json: serde_json::to_string(&value).expect("forged verdict serializes"),
+            outer_decision: value["decision"].as_str().expect("string").to_string(),
+            message_echoes_marker: echoes,
+        }
+    };
+    vec![
+        // serde: `invalid type: string "…", expected u32` quotes the value.
+        forge("outer approved, marker in v", "approved", Some("v"), true),
+        forge("outer aborted, marker in v", "aborted", Some("v"), true),
+        forge("outer expired, marker in v", "expired", Some("v"), true),
+        // serde: `invalid type: string "…", expected i64` quotes the value.
+        forge(
+            "outer approved, marker in decided_at",
+            "approved",
+            Some("decided_at"),
+            true,
+        ),
+        // serde: `unknown variant `…`` quotes the value. The outer decision *is* the marker.
+        forge(
+            "marker as the decision",
+            NOT_APPROVED_MESSAGE_MARKER,
+            None,
+            true,
+        ),
+        // Parses; the core rejects the request id (its message does not quote it).
+        forge(
+            "outer approved, marker in request_id",
+            "approved",
+            Some("request_id"),
+            false,
+        ),
+        // Parses; the core rejects the outer decision as disagreeing with the signed one.
+        forge(
+            "outer approved over a signed denial",
+            "approved",
+            None,
+            false,
+        ),
+    ]
 }
 
 /// `UnsignedVerdict` is not `Clone`; copy it field-by-field for the noted variant.
@@ -827,5 +962,77 @@ fn fixture_seal_encrypts_only_to_vouched_devices() {
         )
         .expect("a lower floor still seals");
         assert_eq!(resealed.sequence, SEAL_SEQUENCE, "floor {floor:?}");
+    }
+}
+
+/// The verified-non-approval vector (#311): each genuinely signed non-approval verifies to
+/// `NotApproved` carrying the signed decision, and no forged case does, whatever its outer
+/// `decision` or echoed text. The WASM side (`packages/sdk/test/wasm.test.mjs`) checks the
+/// structured `kind: "not_approved"` error for the same cases.
+///
+/// @see docs/contract.md §Verification checklist (step 8: a verified non-approval)
+#[test]
+fn fixture_not_approved_cases_follow_the_signed_claims() {
+    let raw = std::fs::read_to_string(fixture_path()).expect("fixture must exist for this test");
+    let v: WasmVector =
+        serde_json::from_str(&raw).expect("committed fixture is valid WasmVector JSON");
+    let request: ApprovalRequest = serde_json::from_str(&v.request_json).unwrap();
+    let context: ApprovalContext = serde_json::from_str(&v.context_json).unwrap();
+    let root = SigningKeyPair::from_seed(&ROOT_SEED).public_key();
+    let verify = |verdict: &Verdict| {
+        verify_verdict(
+            verdict,
+            &request,
+            &context,
+            &root,
+            &mut InMemoryNonceStore::new(),
+            v.now_ms,
+        )
+    };
+
+    let signed: Vec<(&str, Decision)> = v
+        .not_approved_verdicts
+        .iter()
+        .map(|case| {
+            let verdict: Verdict = serde_json::from_str(&case.verdict_json).unwrap();
+            match verify(&verdict) {
+                Err(VerifyError::NotApproved { decision }) => {
+                    (case.signed_decision.as_str(), decision)
+                }
+                other => panic!("{}: expected NotApproved, got {other:?}", case.name),
+            }
+        })
+        .collect();
+    assert_eq!(
+        signed,
+        vec![
+            ("denied", Decision::Denied),
+            ("expired", Decision::Expired),
+            ("aborted", Decision::Aborted),
+        ]
+    );
+
+    assert_eq!(v.forged_not_approved_verdicts.len(), 7);
+    for case in &v.forged_not_approved_verdicts {
+        match serde_json::from_str::<Verdict>(&case.verdict_json) {
+            Err(parse_error) => assert_eq!(
+                parse_error
+                    .to_string()
+                    .contains(NOT_APPROVED_MESSAGE_MARKER),
+                case.message_echoes_marker,
+                "{}: does the parse error echo the marker",
+                case.name
+            ),
+            Ok(verdict) => {
+                assert!(!case.message_echoes_marker, "{}: parsed", case.name);
+                let error = verify(&verdict).expect_err("a forged verdict never verifies");
+                assert!(
+                    !matches!(error, VerifyError::NotApproved { .. }),
+                    "{}: must not be a verified non-approval, got {error:?}",
+                    case.name
+                );
+                assert!(!error.to_string().contains(NOT_APPROVED_MESSAGE_MARKER));
+            }
+        }
     }
 }

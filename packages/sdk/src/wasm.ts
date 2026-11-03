@@ -47,9 +47,11 @@ export interface AllwWasm {
   /**
    * Verifies a `Verdict` JSON against the request, the human-shown context, and the approver's
    * account-root Ed25519 public key (base64url). Returns
-   * `{ approved: true, device_id, decided_at, nonce_b64 }` JSON on success; **throws** on any
-   * verification failure — including an authenticated non-approval (the message names the verified
-   * decision).
+   * `{ approved: true, device_id, decided_at, nonce_b64, note? }` JSON on success; **throws** on any
+   * verification failure. An authenticated non-approval throws an `Error` with own properties
+   * `kind: "not_approved"` and `decision` (`denied`/`expired`/`aborted`, from the signed claims);
+   * every other failure throws an `Error` with no `kind`. Never classify by the message: untrusted
+   * input is echoed into it.
    */
   verify_verdict(
     verdictJson: string,
@@ -62,7 +64,8 @@ export interface AllwWasm {
   /**
    * Verifies a verdict and rejects it when the signing device appears revoked in the
    * highest-sequence valid account state. `accountStatesJson` is a JSON array of compact
-   * root-signed account-state JWS strings.
+   * root-signed account-state JWS strings. Throws exactly like {@link AllwWasm.verify_verdict},
+   * including the structured `kind: "not_approved"` error.
    */
   verify_verdict_with_account_states(
     verdictJson: string,

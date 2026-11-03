@@ -82,8 +82,10 @@ function nonce() {
  * (capturing the envelope), and answers `GET /:acct/requests/:id` with a signed verdict of the
  * requested `decision`. The verdict is bound to the captured envelope + the decrypted context, so
  * the SDK's verification (against `approverRootPub`) genuinely passes/round-trips.
+ *
+ * `forge` lets a test play a hostile relay: it rewrites the signed verdict before delivery.
  */
-function relayDouble(wasm, approver, decision) {
+function relayDouble(wasm, approver, decision, forge = (verdict) => verdict) {
   /** @type {Record<string, unknown> | null} */
   let captured = null;
   let requestAuthToken = null;
@@ -162,7 +164,7 @@ function relayDouble(wasm, approver, decision) {
           approver.cert,
         ),
       );
-      return json({ status: "resolved", verdict });
+      return json({ status: "resolved", verdict: forge(verdict) });
     }
 
     throw new Error(`relayDouble: unexpected ${method} ${url}`);
@@ -364,3 +366,40 @@ test("end-to-end: a non-gated tool (Read) yields no decision without dialing the
   assert.equal(output, null);
   assert.equal(dialed, false, "a non-gated tool never contacts the relay");
 });
+
+/**
+ * A relay can't forge a verified decision through the verify error's message (#311). The device
+ * signs `denied`; the relay rewrites the outer `decision` and puts the text the SDK once matched
+ * ("verified human decision was not 'approved'") in a field serde quotes back in its parse error.
+ * Through the real SDK and `decide()`, the hook must deny.
+ */
+for (const [name, outer, field] of [
+  ["outer approved, marker in v", "approved", "v"],
+  ["outer approved, marker in decided_at", "approved", "decided_at"],
+  ["outer aborted, marker in v", "aborted", "v"],
+  ["outer expired, marker in v", "expired", "v"],
+]) {
+  test(`end-to-end (fail-closed, #311): a forged verdict (${name}) is denied`, async () => {
+    const wasm = await loadWasm();
+    const approver = await pairedApprover(wasm);
+    const { fetchImpl } = relayDouble(wasm, approver, "denied", (verdict) => ({
+      ...verdict,
+      decision: outer,
+      [field]: "verified human decision was not 'approved'",
+    }));
+
+    const output = await runHook(
+      bashStdin("rm -rf build", "/workspace/project"),
+      env(approver, TIMEOUT_MS),
+      overrides(fetchImpl),
+    );
+
+    assert.equal(
+      output.hookSpecificOutput.permissionDecision,
+      "deny",
+      "a relay-forged verdict never opens the gate",
+    );
+    // Unverifiable ⇒ synthesized `denied`, never the forged `aborted`/`expired` as verified.
+    assert.match(output.hookSpecificOutput.permissionDecisionReason, /\(verdict: denied\)$/);
+  });
+}
