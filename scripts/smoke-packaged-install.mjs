@@ -153,22 +153,61 @@ try {
   assert.equal(run("node", [importProbe], { cwd: projectDir }).stdout.trim(), "imports-ok");
   ok("every package imports from the installed copy; @allw/sdk exposes createClient");
 
-  // 3c. The hook loads the BUNDLED wasm and decides a non-gated tool call as `allow`, with no relay
-  // and no config. A `Read` tool passes through without dialing the relay, so this exercises the
-  // installed wasm-resolution path (`@allw/sdk/vendor/...`) end-to-end against the real tarballs.
+  // 3c. The installed hook bin runs and makes no decision (empty stdout, exit 0) for a non-gated
+  // tool call, with no relay and no config: allw never emits `allow` (#247). A `Read` passes through
+  // without dialing the relay. The bundled-wasm path is exercised by the gated call in 3c-ii.
   const nonGatedStdin = JSON.stringify({
     hook_event_name: "PreToolUse",
     cwd: projectDir,
     tool_name: "Read",
     tool_input: { file_path: "/etc/hostname" },
   });
-  const hookOut = run(join(binDir, "allw-hook"), [], {
+  const hookBin = join(binDir, "allw-hook");
+  const hookOut = run(hookBin, [], { cwd: projectDir, input: nonGatedStdin }).stdout;
+  assert.equal(hookOut, "", "the hook should make no decision (empty stdout) for a non-gated Read");
+  ok("allw-hook makes no decision for a non-gated tool call (no relay)");
+
+  // 3c-ii. A gated call loads the BUNDLED wasm (`@allw/sdk/vendor/...`) to build its ActionRecord,
+  // then fails closed: the relay URL points at a closed loopback port, so the approval can't be
+  // obtained and the hook prints a deny whose summary was rendered by the wasm core.
+  const gatedStdin = JSON.stringify({
+    hook_event_name: "PreToolUse",
     cwd: projectDir,
-    input: nonGatedStdin,
+    tool_name: "Bash",
+    tool_input: { command: "rm -rf build" },
+  });
+  // Accounts are self-certifying, so derive a valid root key and its account id with the installed
+  // package's own core; the config loader rejects anything else before the gate runs.
+  const coordinates = JSON.parse(
+    run(
+      "node",
+      [
+        "--input-type=module",
+        "-e",
+        [
+          'import { loadWasm } from "@allw/hook";',
+          "const wasm = await loadWasm();",
+          'const root = wasm.ed25519_public_key(Buffer.alloc(32, 7).toString("base64url"));',
+          "console.log(JSON.stringify({ root, account: wasm.account_id_for_root(root) }));",
+        ].join("\n"),
+      ],
+      { cwd: projectDir },
+    ).stdout,
+  );
+  const gatedOut = run(hookBin, [], {
+    cwd: projectDir,
+    input: gatedStdin,
+    env: {
+      ...process.env,
+      ALLW_RELAY_URL: "http://127.0.0.1:9",
+      ALLW_ACCOUNT_ID: coordinates.account,
+      ALLW_APPROVER_ROOT_KEY: coordinates.root,
+    },
   }).stdout;
-  const decision = JSON.parse(hookOut).hookSpecificOutput.permissionDecision;
-  assert.equal(decision, "allow", "the hook should pass through a non-gated Read as allow");
-  ok("allw-hook decides a non-gated tool call as allow (bundled wasm loaded, no relay)");
+  const gated = JSON.parse(gatedOut).hookSpecificOutput;
+  assert.equal(gated.permissionDecision, "deny", "a gated call with no reachable relay must deny");
+  assert.match(gated.permissionDecisionReason, /rm -rf build/, "the wasm core built the summary");
+  ok("allw-hook denies a gated call it cannot get approved (bundled wasm loaded)");
 
   console.log("\nPASS: packaged install works with no Rust toolchain.");
 } catch (err) {

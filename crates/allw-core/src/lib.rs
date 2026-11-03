@@ -35,6 +35,7 @@ pub mod jwe;
 pub mod mcp;
 pub mod policy;
 pub mod recipients;
+pub mod sealing;
 
 pub use account::{
     account_id_for_root, check_account_id_for_root, sign_pairing_start_authorization,
@@ -61,8 +62,8 @@ pub use crypto::{
     verify_verdict_with_account_states_for_account, AccountState, AccountStateActor,
     AccountStateDevice, AccountStateError, AccountStatePreviousRoot, AccountStateRevocation,
     AccountStateRevocationKind, DeviceCertClaims, InMemoryNonceStore, JwsError, KeyError,
-    NonceStore, PublicKey, SigningKeyPair, UnsignedVerdict, VerdictClaims, VerifiedVerdict,
-    VerifyError,
+    NonceStore, PublicKey, SignVerdictError, SigningKeyPair, UnsignedVerdict, VerdictClaims,
+    VerifiedVerdict, VerifyError, MAX_NOTE_BYTES,
 };
 pub use display::{
     display_model, escape_for_display, has_hidden_or_control_chars, is_hidden_or_control_char,
@@ -89,3 +90,4 @@ pub use recipients::{
     select_recipients, Recipient, RecipientSelectionError, DEVICE_STATUS_ACTIVE,
     MAX_ACCOUNT_STATES, MAX_RECIPIENTS,
 };
+pub use sealing::{seal_context_for_account_state, SealContextError, SealedContext};

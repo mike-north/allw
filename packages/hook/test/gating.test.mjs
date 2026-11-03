@@ -47,7 +47,7 @@ test("Bash, MCP, and file-edit tools are gated; read-only tools are not", () => 
 
 // ── Regression (#49 review, Copilot): fail-open gap on malformed mcp__-prefixed names ────────────
 //
-// The recommended .claude/settings.json matcher is `mcp__.*`, so Claude Code routes EVERY
+// The recommended .claude/settings.json matcher includes `^mcp__`, so Claude Code routes EVERY
 // mcp__-prefixed name to the hook — including malformed ones that don't parse as
 // `mcp__<server>__<tool>` (e.g. `mcp__server__`, `mcp__onlytwo`). Before the fix, `isGatedTool`
 // returned false for these (→ pass-through allow) and `gateToolCall` fell through to pass-through —

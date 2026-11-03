@@ -12,8 +12,9 @@
  *   built from the operation kind, target paths, a compact summary, and a hash of the full edit
  *   bytes.
  * - **everything else** (`Read`, `Glob`, `Grep`, `WebFetch`, …) — **not gated**. These either
- *   don't run shell/MCP/file-edit side effects or are out of v0 scope; they pass through as
- *   `allow` without prompting. Widening the matcher is a future, additive change.
+ *   don't run shell/MCP/file-edit side effects or are out of v0 scope; allw makes no decision for
+ *   them (empty stdout), so Claude Code's own permission rules and mode decide. Widening the set of
+ *   gated tools is a future, additive change.
  *
  * Gating is intentionally separate from risk: *whether* to ask the human is a matcher decision
  * here; *how risky* the action is, is the `ActionRecord.risk` the core assigns. A finer policy tier
@@ -45,7 +46,7 @@ const CLAUDE_FILE_EDIT_TOOLS = new Set(["Edit", "MultiEdit", "Write"]);
 /**
  * The outcome of classifying + reducing a tool call:
  * - `gated`: build succeeded; `actionRecord` (JSON) + a one-line `summary` are ready to submit.
- * - `pass-through`: not a gated tool; allow without prompting (`reason` explains why).
+ * - `pass-through`: not a gated tool; allw makes no decision (`reason` explains why).
  * - `build-error`: gated, but the `ActionRecord` could not be built; deny (`reason` explains why).
  */
 export type GateOutcome =
@@ -104,10 +105,10 @@ function isFileEditTool(toolName: string): boolean {
  * `mcp__`-prefixed name.
  *
  * Crucially, gating an MCP name does NOT require it to fully parse as `mcp__<server>__<tool>`. The
- * recommended `.claude/settings.json` matcher is `mcp__.*`, so Claude Code routes every
+ * recommended `.claude/settings.json` matcher includes `^mcp__`, so Claude Code routes every
  * `mcp__`-prefixed name — including malformed ones like `mcp__server__` or `mcp__onlytwo` — to this
- * hook. Treating a malformed MCP name as non-gated would pass it through as `allow`, breaking
- * fail-closed for MCP calls. So the prefix alone gates; `gateToolCall` then denies the ones that
+ * hook. Treating a malformed MCP name as non-gated would make no decision for it, leaving it to
+ * Claude Code's own rules and breaking fail-closed for MCP calls. So the prefix alone gates; `gateToolCall` then denies the ones that
  * cannot be reduced to an `ActionRecord`.
  */
 export function isGatedTool(toolName: string): boolean {
@@ -321,7 +322,7 @@ export function gateToolCall(
   if (hasMcpPrefix(toolName)) {
     const mcp = parseMcpToolName(toolName);
     if (mcp === null) {
-      // The name is `mcp__`-prefixed (so the `mcp__.*` matcher routed it here) but does NOT parse
+      // The name is `mcp__`-prefixed (so the `^mcp__` matcher routed it here) but does NOT parse
       // as `mcp__<server>__<tool>` (e.g. `mcp__server__`, `mcp__onlytwo`). It is still an MCP call;
       // we cannot build a record for it, so we DENY rather than pass through (fail-closed).
       return {

@@ -29,6 +29,11 @@ const ACCOUNT_SEED: [u8; 32] = [11; 32];
 /// Build a complete sign→verify fixture and return (verdict_json, request_json, context_json,
 /// account_root_pubkey_b64, now_ms).
 fn build_signed_verdict() -> (String, String, String, String, i64) {
+    build_signed_verdict_with_note(None)
+}
+
+/// [`build_signed_verdict`], with `note` (when `Some`) passed to the UniFFI signer.
+fn build_signed_verdict_with_note(note: Option<&str>) -> (String, String, String, String, i64) {
     let device_seed = URL_SAFE_NO_PAD.encode(DEVICE_SEED);
     let account_seed = URL_SAFE_NO_PAD.encode(ACCOUNT_SEED);
 
@@ -72,7 +77,7 @@ fn build_signed_verdict() -> (String, String, String, String, i64) {
         "context_ciphertext": "opaque-jwe"
     });
     let nonce = URL_SAFE_NO_PAD.encode([9_u8; 16]);
-    let unsigned = json!({
+    let mut unsigned = json!({
         "v": 1,
         "request_id": "req-1",
         "request_hash": request_hash,
@@ -81,6 +86,9 @@ fn build_signed_verdict() -> (String, String, String, String, i64) {
         "approver": { "account_id": "acct-1", "device_id": "dev-1" },
         "device_cert": device_cert
     });
+    if let Some(note) = note {
+        unsigned["note"] = json!(note);
+    }
 
     let verdict = sign_verdict_json(unsigned.to_string(), device_seed, nonce).unwrap();
     (
@@ -804,6 +812,60 @@ fn action_from_agent_tool_call_with_raw_json_rejects_malformed_params() {
     );
 }
 
+/// The UniFFI signer (the iOS approver's path) signs the note through the core, so a noted
+/// verdict verifies and a tampered, stripped, or injected note is rejected (S15, #251).
+///
+/// @see docs/contract.md §Wire encoding → verdict signature
+#[test]
+fn uniffi_signed_note_is_bound_to_the_verdict() {
+    let (noted, request_json, context_json, root, now_ms) =
+        build_signed_verdict_with_note(Some("only on the feature branch"));
+    let verify = |verdict: &serde_json::Value| {
+        verify_verdict_json(
+            verdict.to_string(),
+            request_json.clone(),
+            context_json.clone(),
+            root.clone(),
+            now_ms,
+        )
+    };
+
+    let noted: serde_json::Value = serde_json::from_str(&noted).unwrap();
+    assert_eq!(noted["note"], "only on the feature branch");
+    let verified: serde_json::Value =
+        serde_json::from_str(&verify(&noted).expect("an untampered noted verdict must verify"))
+            .unwrap();
+    assert_eq!(
+        verified["note"], "only on the feature branch",
+        "verify returns the note from the signed claims"
+    );
+
+    let mut tampered = noted.clone();
+    tampered["note"] = json!("anywhere");
+    let err = verify(&tampered).expect_err("a rewritten note must fail");
+    assert!(
+        format!("{err:?}").contains("outer verdict field 'note' disagrees with the signed claim"),
+        "got {err:?}"
+    );
+
+    let mut removed = noted;
+    removed.as_object_mut().unwrap().remove("note");
+    let err = verify(&removed).expect_err("a stripped note must fail");
+    assert!(
+        format!("{err:?}").contains("outer verdict field 'note' disagrees with the signed claim"),
+        "got {err:?}"
+    );
+
+    let (plain, ..) = build_signed_verdict();
+    let mut added: serde_json::Value = serde_json::from_str(&plain).unwrap();
+    added["note"] = json!("injected");
+    let err = verify(&added).expect_err("an injected note must fail");
+    assert!(
+        format!("{err:?}").contains("outer verdict field 'note' disagrees with the signed claim"),
+        "got {err:?}"
+    );
+}
+
 // ── Display safety (#246) ─────────────────────────────────────────────────────
 
 /// The native surface gets the same escaped display model as WASM: the #246 ESC/CR spoof and a
@@ -847,5 +909,32 @@ fn escape_for_display_matches_core_notation() {
     assert_eq!(
         allw_uniffi::escape_for_display("a\u{1b}b\u{200B}".to_string()),
         "a\\x1bb⟨U+200B⟩"
+    );
+}
+
+/// The UniFFI signer enforces the core note cap: 2048 bytes of UTF-8 signs, 2049 is an error.
+#[test]
+fn uniffi_sign_refuses_note_over_cap() {
+    let sign = |note: String| {
+        let unsigned = json!({
+            "v": 1,
+            "request_id": "req-1",
+            "request_hash": URL_SAFE_NO_PAD.encode([0xAB_u8; 32]),
+            "decision": "approved",
+            "decided_at": 1_700_000_001_000_i64,
+            "approver": { "account_id": "acct-1", "device_id": "dev-1" },
+            "note": note
+        });
+        sign_verdict_json(
+            unsigned.to_string(),
+            URL_SAFE_NO_PAD.encode(DEVICE_SEED),
+            URL_SAFE_NO_PAD.encode([9_u8; 16]),
+        )
+    };
+    sign("a".repeat(2048)).expect("a note at the cap signs");
+    let err = sign("a".repeat(2049)).expect_err("one byte over the cap must not sign");
+    assert!(
+        format!("{err:?}").contains("verdict note is 2049 bytes of UTF-8; the maximum is 2048"),
+        "got {err:?}"
     );
 }

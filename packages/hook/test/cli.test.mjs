@@ -1,6 +1,7 @@
 /**
  * UAT-layer test: drive the real `allw-hook` executable as a `node` subprocess, exactly as Claude
- * Code invokes it — JSON on stdin, a permission-decision JSON on stdout, exit 0. This proves the
+ * Code invokes it — JSON on stdin, exit 0, and on stdout either nothing (no decision) or a `deny`
+ * decision JSON (#247: deny-only). This proves the
  * acceptance criterion that the hook "runs entirely under node (no binary to allowlist)" and that
  * the process boundary is fail-closed.
  *
@@ -8,6 +9,7 @@
  * relay; the full crypto round-trip is covered deterministically in integration.test.mjs.
  *
  * @see https://code.claude.com/docs/en/hooks (the stdin/stdout/exit-code contract)
+ * @see https://github.com/mike-north/allw/issues/247 (deny-only output)
  * @see ../../../docs/architecture.md (WASM-local: node entrypoint, never a native binary)
  */
 
@@ -141,7 +143,7 @@ async function hungRelay() {
   };
 }
 
-test("subprocess: a non-gated tool (Read) emits allow and exits 0 (no config needed)", async () => {
+test("subprocess: a non-gated tool (Read) prints nothing and exits 0 (no config needed; #247)", async () => {
   const stdin = JSON.stringify({
     hook_event_name: "PreToolUse",
     tool_name: "Read",
@@ -149,7 +151,9 @@ test("subprocess: a non-gated tool (Read) emits allow and exits 0 (no config nee
   });
   const { code, stdout } = await runCli(stdin);
   assert.equal(code, 0, "the hook always exits 0 (it speaks in decisions, not error codes)");
-  assert.equal(decisionOf(stdout), "allow");
+  // Empty stdout = no decision: Claude Code applies its own permission rules. Never an `allow`,
+  // so widening the matcher can only add gating.
+  assert.equal(stdout, "");
 });
 
 test("subprocess: a gated Bash command with no config fails closed → deny, exit 0", async () => {

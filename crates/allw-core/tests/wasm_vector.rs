@@ -38,17 +38,22 @@
 //! @see docs/enrollment.md §Model (account id derivation, pairing-start authorization)
 //! @see crates/allw-core/src/hash.rs (FROZEN_HASH_HEX — the same value)
 //! @see crates/allw-core/src/recipients.rs (the recipient-selection rules)
+//! @see crates/allw-core/src/sealing.rs (encrypting to the selected recipients)
 
 use std::path::PathBuf;
 
 use allw_core::{
-    account_id_for_root, action_from_agent_tool_call, compute_request_hash, issue_device_cert,
-    select_recipients, sign_account_state, sign_pairing_start_authorization, sign_verdict,
-    AccountState, AccountStateDevice, AccountStateRevocation, AccountStateRevocationKind,
-    ActionRecord, Actor, ApprovalContext, ApprovalRequest, Approver, Constraints, Decision,
-    PublicKey, Recipient, Risk, SigningKeyPair, Surface, SyntacticSubstrate, UnsignedVerdict,
+    account_id_for_root, action_from_agent_tool_call, compute_request_hash, decrypt_context,
+    issue_device_cert, seal_context_for_account_state, select_recipients, sign_account_state,
+    sign_pairing_start_authorization, sign_verdict, verify_verdict, AccountState,
+    AccountStateDevice, AccountStateRevocation, AccountStateRevocationKind, ActionRecord, Actor,
+    ApprovalContext, ApprovalRequest, Approver, Constraints, Decision, InMemoryNonceStore,
+    JweError, PublicKey, Recipient, Risk, SigningKeyPair, Surface, SyntacticSubstrate,
+    UnsignedVerdict, Verdict, VerifyError, X25519KeyPair,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use rand_chacha::rand_core::SeedableRng;
+use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
 
 // ── Fixed seeds / identities / timestamps (never rand / SystemTime) ───────────────
@@ -88,6 +93,16 @@ const RECIPIENT_NOW_MS: i64 = 1_800_000_000_000;
 /// The caller's persisted floor for the recipient vector: the current sequence, so it is met.
 const RECIPIENT_MIN_SEQUENCE: u64 = 2;
 
+// Seal vector: devices whose X25519 keys come from known seeds, so both platforms can open the
+// sealed context and confirm a key the root never vouched for cannot.
+const SEAL_PHONE_SEED: [u8; 32] = [0x51; 32];
+const SEAL_LAPTOP_SEED: [u8; 32] = [0x52; 32];
+const SEAL_REVOKED_SEED: [u8; 32] = [0x53; 32];
+const SEAL_INJECTED_SEED: [u8; 32] = [0x5E; 32];
+const SEAL_EXPIRED_SEED: [u8; 32] = [0x54; 32];
+/// The seal set's current sequence (and the floor the vector seals with).
+const SEAL_SEQUENCE: u64 = 3;
+
 /// Account id derived from the approver root (seed `[0x11; 32]`), computed independently of the
 /// core: `SHA-256("allw/account-id/v1" || 0x00 || root_pubkey)` via `shasum -a 256`, then
 /// base64url-unpadded. Matches `account::tests::FROZEN_ACCOUNT_ID_0X11`.
@@ -95,6 +110,11 @@ const FROZEN_ACCOUNT_ID: &str = "hUes5Gso3s5hHMmZjDI-P0tyaD905KSl1B97nsp2VIo";
 
 // Fixed anti-replay nonce (deterministic fixture).
 const NONCE: &[u8] = &[0xA1, 0xB2, 0xC3, 0xD4];
+
+// Signed-note verdict (S15, #251): its own nonce and a note with non-ASCII text, so the vector
+// proves the note is signed as exact UTF-8 on both surfaces.
+const NOTED_NONCE: &[u8] = &[0xE5, 0xF6, 0x07, 0x18];
+const NOTE: &str = "ok for staging only — not prod";
 
 // ── The committed fixture shape ───────────────────────────────────────────────────
 
@@ -140,6 +160,14 @@ struct WasmVector {
     /// A verifier time inside the authorization's validity window.
     pairing_start_now_ms: i64,
 
+    /// JSON `Verdict` identical in shape to `verdict_json` but carrying an approver `note`, signed
+    /// into the claims (S15, #251) with nonce `noted_verdict_nonce_b64`. The WASM `sign_verdict`
+    /// must reproduce it byte-for-byte from the same seed, and rewriting the note must fail verify.
+    noted_verdict_json: String,
+    /// The `note` signed into `noted_verdict_json`.
+    noted_verdict_note: String,
+    /// The anti-replay nonce signed into `noted_verdict_json`, base64url-unpadded.
+    noted_verdict_nonce_b64: String,
     /// JSON array of root-signed account-state JWS for `expected_account_id_for_root` (see
     /// [`recipient_account_states`]): a stale sequence-1 document plus two sequence-2 siblings.
     recipient_account_states_json: String,
@@ -150,6 +178,16 @@ struct WasmVector {
     recipient_now_ms: i64,
     /// The `min_sequence` floor the recipient selection runs with.
     recipient_min_sequence: u64,
+
+    /// JSON array of root-signed account-state JWS for sealing (see [`seal_account_states`]).
+    seal_account_states_json: String,
+    /// JSON object `{ device_id: x25519_seed_b64 }` for every device in the seal set, including the
+    /// revoked `old`, the `expired` one and the never-vouched `injected` (stale sequence only).
+    seal_x25519_seeds_json: String,
+    /// JSON array of the device ids the seal must encrypt to, written from the rules.
+    seal_expected_recipient_ids_json: String,
+    /// The sequence the seal must report (and the floor it runs with).
+    seal_sequence: u64,
 }
 
 // ── Builders (mirror hash::tests::make_minimal_context exactly) ───────────────────
@@ -321,6 +359,79 @@ fn expected_recipients() -> Vec<Recipient> {
     ]
 }
 
+fn x25519_device(id: &str, seed: &[u8; 32]) -> AccountStateDevice {
+    recipient_device(
+        id,
+        X25519KeyPair::from_seed(seed).public_key().to_bytes(),
+        "active",
+    )
+}
+
+/// The seal vector's account-state set:
+/// - sequence 2 (stale): lists `injected`, which must get no recipient entry;
+/// - sequence 3: `phone` and `laptop` active; `old` active but revoked, and `expired` whose cert
+///   expires at [`RECIPIENT_NOW_MS`] (neither gets an entry).
+fn seal_account_states(root: &SigningKeyPair) -> Vec<String> {
+    let account_id = account_id_for_root(&root.public_key());
+    let state = |sequence: u64, devices: Vec<AccountStateDevice>, revoked: &[&str]| AccountState {
+        v: 1,
+        account_id: account_id.clone(),
+        sequence,
+        current_root: root.public_key().to_bytes(),
+        previous_roots: vec![],
+        devices,
+        actors: vec![],
+        revocations: revoked
+            .iter()
+            .map(|id| AccountStateRevocation {
+                kind: AccountStateRevocationKind::Device,
+                id: (*id).to_string(),
+                revoked_at: RECIPIENT_REVOKED_AT,
+                reason: None,
+            })
+            .collect(),
+    };
+    let stale = state(
+        SEAL_SEQUENCE - 1,
+        vec![
+            x25519_device("phone", &SEAL_PHONE_SEED),
+            x25519_device("injected", &SEAL_INJECTED_SEED),
+        ],
+        &[],
+    );
+    let current = state(
+        SEAL_SEQUENCE,
+        vec![
+            x25519_device("phone", &SEAL_PHONE_SEED),
+            x25519_device("laptop", &SEAL_LAPTOP_SEED),
+            x25519_device("old", &SEAL_REVOKED_SEED),
+            AccountStateDevice {
+                cert_expires_at: Some(RECIPIENT_NOW_MS),
+                ..x25519_device("expired", &SEAL_EXPIRED_SEED)
+            },
+        ],
+        &["old"],
+    );
+    [stale, current]
+        .iter()
+        .map(|s| sign_account_state(s, root))
+        .collect()
+}
+
+fn seal_x25519_seeds_json() -> String {
+    let seeds: serde_json::Map<String, serde_json::Value> = [
+        ("phone", SEAL_PHONE_SEED),
+        ("laptop", SEAL_LAPTOP_SEED),
+        ("old", SEAL_REVOKED_SEED),
+        ("injected", SEAL_INJECTED_SEED),
+        ("expired", SEAL_EXPIRED_SEED),
+    ]
+    .iter()
+    .map(|(id, seed)| ((*id).to_string(), URL_SAFE_NO_PAD.encode(seed).into()))
+    .collect();
+    serde_json::to_string(&seeds).expect("seeds serialize")
+}
+
 /// The WASM `select_recipients` wire shape for a recipient list.
 fn recipients_wire_json(recipients: &[Recipient]) -> String {
     let wire: Vec<serde_json::Value> = recipients
@@ -381,7 +492,13 @@ fn build_vector() -> WasmVector {
         note: None,
         challenge_response: None,
     };
-    let verdict = sign_verdict(&unsigned, &device, NONCE, Some(cert));
+    let noted_unsigned = UnsignedVerdict {
+        note: Some(NOTE.to_string()),
+        ..clone_unsigned(&unsigned)
+    };
+    let noted_verdict = sign_verdict(&noted_unsigned, &device, NOTED_NONCE, Some(cert.clone()))
+        .expect("note within cap");
+    let verdict = sign_verdict(&unsigned, &device, NONCE, Some(cert)).expect("note within cap");
 
     let agent_tool_call_context = make_agent_tool_call_context();
     let agent_tool_call_request_hash = compute_request_hash(&agent_tool_call_context, TS_EXPIRES);
@@ -411,11 +528,35 @@ fn build_vector() -> WasmVector {
         pairing_start_expires_at: TS_PAIRING_EXPIRES,
         pairing_start_jti: PAIRING_JTI.to_string(),
         pairing_start_now_ms: PAIRING_NOW_MS,
+        noted_verdict_json: serde_json::to_string(&noted_verdict).expect("verdict serializes"),
+        noted_verdict_note: NOTE.to_string(),
+        noted_verdict_nonce_b64: URL_SAFE_NO_PAD.encode(NOTED_NONCE),
         recipient_account_states_json: serde_json::to_string(&recipient_account_states(&root))
             .expect("account states serialize"),
         expected_recipients_json: recipients_wire_json(&expected_recipients()),
         recipient_now_ms: RECIPIENT_NOW_MS,
         recipient_min_sequence: RECIPIENT_MIN_SEQUENCE,
+        seal_account_states_json: serde_json::to_string(&seal_account_states(&root))
+            .expect("account states serialize"),
+        seal_x25519_seeds_json: seal_x25519_seeds_json(),
+        // Spec (recipients.rs rules): the stale `injected`, the revoked `old` and the `expired`
+        // device are excluded; recipients are sorted by device id.
+        seal_expected_recipient_ids_json: r#"["laptop","phone"]"#.to_string(),
+        seal_sequence: SEAL_SEQUENCE,
+    }
+}
+
+/// `UnsignedVerdict` is not `Clone`; copy it field-by-field for the noted variant.
+fn clone_unsigned(u: &UnsignedVerdict) -> UnsignedVerdict {
+    UnsignedVerdict {
+        v: u.v,
+        request_id: u.request_id.clone(),
+        request_hash: u.request_hash,
+        decision: u.decision,
+        decided_at: u.decided_at,
+        approver: u.approver.clone(),
+        note: u.note.clone(),
+        challenge_response: u.challenge_response.clone(),
     }
 }
 
@@ -526,6 +667,48 @@ fn fixture_account_id_equals_frozen_vector() {
     assert_eq!(committed.expected_account_id_for_root, FROZEN_ACCOUNT_ID);
 }
 
+/// The committed noted verdict verifies under the fixture's root, and rewriting, stripping, or
+/// adding a note on the shared vector is rejected as a claims mismatch (S15, #251). The WASM side
+/// replays the same checks in `packages/sdk/test/wasm.test.mjs`.
+///
+/// @see docs/contract.md §Wire encoding → verdict signature
+#[test]
+fn fixture_noted_verdict_binds_its_note() {
+    let raw = std::fs::read_to_string(fixture_path()).expect("fixture must exist for this test");
+    let v: WasmVector =
+        serde_json::from_str(&raw).expect("committed fixture is valid WasmVector JSON");
+    let request: ApprovalRequest = serde_json::from_str(&v.request_json).unwrap();
+    let context: ApprovalContext = serde_json::from_str(&v.context_json).unwrap();
+    let root = SigningKeyPair::from_seed(&ROOT_SEED).public_key();
+    let verify = |verdict: &Verdict| {
+        verify_verdict(
+            verdict,
+            &request,
+            &context,
+            &root,
+            &mut InMemoryNonceStore::new(),
+            v.now_ms,
+        )
+    };
+
+    let noted: Verdict = serde_json::from_str(&v.noted_verdict_json).unwrap();
+    assert_eq!(noted.note.as_deref(), Some(v.noted_verdict_note.as_str()));
+    verify(&noted).expect("the committed noted verdict must verify");
+
+    let note_mismatch = VerifyError::ClaimsMismatch { field: "note" };
+    let mut tampered = noted.clone();
+    tampered.note = Some("ok for prod".to_string());
+    assert_eq!(verify(&tampered).unwrap_err(), note_mismatch);
+
+    let mut removed = noted;
+    removed.note = None;
+    assert_eq!(verify(&removed).unwrap_err(), note_mismatch);
+
+    let mut added: Verdict = serde_json::from_str(&v.verdict_json).unwrap();
+    added.note = Some("injected".to_string());
+    assert_eq!(verify(&added).unwrap_err(), note_mismatch);
+}
+
 /// The core's `select_recipients` over the fixture's account-state set returns exactly the
 /// recipients the rules allow (`dev-a`, `dev-d`, `dev-g`); the node test checks the WASM surface returns
 /// the fixture's `expected_recipients_json` for the same set.
@@ -559,4 +742,90 @@ fn fixture_recipients_follow_the_selection_rules() {
         committed.expected_recipients_json,
         recipients_wire_json(&selected)
     );
+}
+
+/// Sealing the fixture's seal set encrypts to exactly `laptop` and `phone`, each of which can open
+/// it; the revoked `old`, the `expired` device and the never-vouched `injected` get no recipient
+/// entry, and the reported sequence is the selected one whatever floor is passed. The node test
+/// runs the same check through the WASM export.
+#[test]
+fn fixture_seal_encrypts_only_to_vouched_devices() {
+    let raw = std::fs::read_to_string(fixture_path()).expect("fixture must exist for this test");
+    let committed: WasmVector =
+        serde_json::from_str(&raw).expect("committed fixture is valid WasmVector JSON");
+    let docs: Vec<String> =
+        serde_json::from_str(&committed.seal_account_states_json).expect("seal states parse");
+    let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+    let root_bytes: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(&committed.approver_root_pubkey_b64)
+        .expect("root pubkey decodes")
+        .try_into()
+        .expect("root pubkey is 32 bytes");
+    let root = PublicKey::from_bytes(&root_bytes).expect("root pubkey is valid");
+    let context: ApprovalContext =
+        serde_json::from_str(&committed.context_json).expect("context parses");
+    assert_eq!(committed.seal_sequence, SEAL_SEQUENCE);
+
+    let sealed = seal_context_for_account_state(
+        &context,
+        &refs,
+        &committed.expected_account_id_for_root,
+        &root,
+        committed.recipient_now_ms,
+        Some(committed.seal_sequence),
+        &mut ChaCha20Rng::from_seed([0x42; 32]),
+    )
+    .expect("fixture seal set yields recipients");
+    assert_eq!(sealed.sequence, committed.seal_sequence);
+
+    let seeds: std::collections::BTreeMap<String, String> =
+        serde_json::from_str(&committed.seal_x25519_seeds_json).expect("seeds parse");
+    let key = |id: &str| -> X25519KeyPair {
+        let seed: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(&seeds[id])
+            .expect("seed decodes")
+            .try_into()
+            .expect("seed is 32 bytes");
+        X25519KeyPair::from_seed(&seed)
+    };
+    let expected: Vec<String> = serde_json::from_str(&committed.seal_expected_recipient_ids_json)
+        .expect("expected ids parse");
+    for id in &expected {
+        assert_eq!(
+            decrypt_context(&sealed.ciphertext, id, &key(id)).as_ref(),
+            Ok(&context),
+            "{id} must open the sealed context"
+        );
+    }
+    // RFC 7516 §7.2.1: exactly one `recipients[]` entry per selected device, nothing else.
+    let jwe: serde_json::Value = serde_json::from_str(&sealed.ciphertext).expect("JWE is JSON");
+    let kids: Vec<&str> = jwe["recipients"]
+        .as_array()
+        .expect("General JWE has a recipients array")
+        .iter()
+        .map(|r| r["header"]["kid"].as_str().expect("kid"))
+        .collect();
+    assert_eq!(kids, expected);
+    for id in ["old", "injected", "expired"] {
+        assert_eq!(
+            decrypt_context(&sealed.ciphertext, id, &key(id)),
+            Err(JweError::NoRecipientForDevice),
+            "{id} must get no recipient entry"
+        );
+    }
+
+    // The sequence is the selected one, never the caller's floor: same with a lower floor or none.
+    for floor in [Some(1), None] {
+        let resealed = seal_context_for_account_state(
+            &context,
+            &refs,
+            &committed.expected_account_id_for_root,
+            &root,
+            committed.recipient_now_ms,
+            floor,
+            &mut ChaCha20Rng::from_seed([0x42; 32]),
+        )
+        .expect("a lower floor still seals");
+        assert_eq!(resealed.sequence, SEAL_SEQUENCE, "floor {floor:?}");
+    }
 }

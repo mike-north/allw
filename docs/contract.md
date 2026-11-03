@@ -133,7 +133,8 @@ wire to the relay.
 ### Verdict — _one-shot and scope-free_
 
 `v` · `request_id` · `request_hash`(echoed/bound) · `decision`(approved|denied|expired|aborted) · `decided_at` ·
-`approver` { account_id, device_id } · `note`? (optional freeform) · `challenge_response`? ·
+`approver` { account_id, device_id } · `note`? (optional freeform, at most 2048 bytes of UTF-8; signed) ·
+`challenge_response`? ·
 `sig` (device key) · `device_cert`? (chains device key → account root, so verifiers need only the root).
 
 > No `scope`/reuse field — standing autonomy lives in the policy layer ([policy-seam.md](./policy-seam.md)), not the verdict.
@@ -144,6 +145,10 @@ wire to the relay.
 `decided_at` · `action`(ActionRecord) ·
 `policy` { decision, rule_id?, tier, schema_version } (reserved; v1 writes `escalate`) · `note`? ·
 verdict `sig` (+ optional integrator counter-sign). Periodically anchor the head hash for non-repudiation.
+
+> The audit `note` MUST come from the **verified** verdict — the note the core returns from the signed claims
+> (`VerifiedVerdict.note`; the `note` member of the WASM/UniFFI verify result) — never from the unverified outer
+> `Verdict.note` or the relay message ([#251](https://github.com/mike-north/allw/issues/251), S15).
 
 > No `context_digest` — `request_hash` (the hash of the canonical `ApprovalContext`) **is** the
 > "prove-what-was-shown-without-storing-plaintext" proof, so a second digest is redundant
@@ -387,9 +392,18 @@ compiles to `wasm32` (josekit/jsonwebtoken are OpenSSL/ring-based and cannot —
 Two JWS types, domain-separated by the `typ` header:
 
 - **Verdict JWS** — `typ: "allw-verdict+jws"`, `kid: <device_id>`, signed by the **device** key. Payload claims:
-  `request_id`, `request_hash` (b64url), `decision`, `decided_at`, `nonce` (b64url), and `challenge_response`?
-  (signed only when present). These signed claims are authoritative; the outer `Verdict` plaintext fields are a
-  decoded convenience and are cross-checked against the claims on verify.
+  `request_id`, `request_hash` (b64url), `decision`, `decided_at`, `nonce` (b64url), `challenge_response`?, and
+  `note`? (the approver's note, verbatim). Each optional claim is signed only when present and omitted (never
+  `null`) when absent. These signed claims are authoritative; the outer `Verdict` plaintext fields are a decoded
+  convenience and are cross-checked against the claims on verify — every outer field, including `note`, must equal
+  its claim, and an optional field present on one side but absent on the other is a mismatch, so the relay cannot
+  rewrite, strip, or inject the human's note ([#251](https://github.com/mike-north/allw/issues/251), S15). The note
+  is signed as-is rather than as a `note_hash`: the outer `note` is already plaintext beside the JWS, so a hash
+  would hide nothing and would only add a second canonicalization rule to the contract.
+  The note is capped at **2048 bytes of UTF-8** (`MAX_NOTE_BYTES`; bytes, not characters). The core enforces the cap
+  at both ends: `sign_verdict` refuses an over-cap note with a typed `NoteTooLong` error and signs nothing, and
+  `verify_verdict` rejects an over-cap outer note (`NoteTooLong`) before any crypto. The note check runs before the
+  decision gate, so a signed denial whose note was rewritten is unverifiable, never a verified "no".
 - **Device-cert JWS** — `typ: "allw-device-cert+jws"`, `kid: <account_id>`, signed by the **account root** key.
   Payload: `account_id`, `device_id`, `device_pubkey` (b64url Ed25519 verifying key), `issued_at`, `expires_at`?.
   Binds a device key to the account so verifiers need only the root.

@@ -154,6 +154,96 @@ test("verify_verdict rejects a verdict whose request_hash was mutated", async ()
   );
 });
 
+// ── signed note (S15, #251) ─────────────────────────────────────────────────────────
+
+/**
+ * The note is signed into the verdict claims, so the relay cannot rewrite, strip, or inject it.
+ *
+ * @see docs/contract.md §Wire encoding → verdict signature
+ */
+test("sign_verdict reproduces the Rust noted verdict byte-for-byte", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  const noted = JSON.parse(v.noted_verdict_json);
+  const { sig: _sig, device_cert: deviceCert, ...unsigned } = noted;
+  const deviceSeed = Buffer.alloc(32, 0x22).toString("base64url"); // DEVICE_SEED in wasm_vector.rs
+  assert.equal(
+    wasm.sign_verdict(JSON.stringify(unsigned), deviceSeed, v.noted_verdict_nonce_b64, deviceCert),
+    v.noted_verdict_json,
+    "the WASM signer must sign the note into the same claim bytes as the Rust core",
+  );
+  const claims = JSON.parse(Buffer.from(noted.sig.split(".")[1], "base64url").toString("utf8"));
+  assert.equal(claims.note, v.noted_verdict_note, "the note is carried verbatim in the claims");
+});
+
+test("verify_verdict accepts the noted vector and rejects a tampered, removed, or added note", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  const verify = (verdict) =>
+    wasm.verify_verdict(
+      JSON.stringify(verdict),
+      v.request_json,
+      v.context_json,
+      v.approver_root_pubkey_b64,
+      v.now_ms,
+    );
+
+  const noted = JSON.parse(v.noted_verdict_json);
+  const verified = JSON.parse(verify(noted));
+  assert.equal(verified.approved, true, "the untampered noted verdict verifies");
+  assert.equal(
+    verified.note,
+    v.noted_verdict_note,
+    "verify returns the note from the signed claims",
+  );
+  assert.equal(
+    "note" in JSON.parse(verify(JSON.parse(v.verdict_json))),
+    false,
+    "a note-less verdict's verify result has no note",
+  );
+
+  const tampered = { ...noted, note: "ok for prod" };
+  assert.throws(
+    () => verify(tampered),
+    /field 'note' disagrees with the signed claim/,
+    "a rewritten note must fail verification",
+  );
+
+  const { note: _note, ...removed } = noted;
+  assert.throws(
+    () => verify(removed),
+    /field 'note' disagrees with the signed claim/,
+    "a stripped note must fail verification",
+  );
+
+  const added = { ...JSON.parse(v.verdict_json), note: "injected" };
+  assert.throws(
+    () => verify(added),
+    /field 'note' disagrees with the signed claim/,
+    "an injected note must fail verification",
+  );
+});
+
+test("sign_verdict signs a note at the 2048-byte cap and refuses one byte over", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  const { sig: _sig, device_cert: deviceCert, ...unsigned } = JSON.parse(v.noted_verdict_json);
+  const deviceSeed = Buffer.alloc(32, 0x22).toString("base64url");
+  const sign = (note) =>
+    wasm.sign_verdict(
+      JSON.stringify({ ...unsigned, note }),
+      deviceSeed,
+      v.noted_verdict_nonce_b64,
+      deviceCert,
+    );
+  assert.equal(JSON.parse(sign("a".repeat(2048))).note.length, 2048, "at the cap signs");
+  assert.throws(
+    () => sign("a".repeat(2049)),
+    /sign_verdict failed: verdict note is 2049 bytes of UTF-8; the maximum is 2048/,
+    "one byte over the cap must not sign",
+  );
+});
+
 test("compute_request_hash throws on invalid context JSON", async () => {
   const wasm = await loadWasm();
   assert.throws(
@@ -2337,4 +2427,112 @@ test("select_recipients throws — never returns [] — when no recipient set is
       `floor ${floor}`,
     );
   }
+});
+
+// ── Sealing to root-vouched recipients (#243) ───────────────────────────────────────
+// @see crates/allw-core/src/sealing.rs (one core call: select, then encrypt)
+// @see https://www.rfc-editor.org/rfc/rfc7516 §7.2 (General JWE JSON Serialization)
+
+/** The JWE recipient `kid`s, in order (RFC 7516 §7.2.1 `recipients[].header.kid`). */
+function recipientKids(ciphertext) {
+  return JSON.parse(ciphertext).recipients.map((r) => r.header.kid);
+}
+
+test("seal_context_for_account_state encrypts only to the vouched devices in the Rust vector", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  const sealed = JSON.parse(
+    wasm.seal_context_for_account_state(
+      v.context_json,
+      v.seal_account_states_json,
+      v.expected_account_id_for_root,
+      v.approver_root_pubkey_b64,
+      v.recipient_now_ms,
+      v.seal_sequence,
+    ),
+  );
+  // Spec: the seal reports the sequence it selected from, and its recipients are the selection.
+  assert.equal(sealed.sequence, v.seal_sequence);
+  const expected = JSON.parse(v.seal_expected_recipient_ids_json);
+  assert.deepEqual(recipientKids(sealed.ciphertext), expected);
+  assert.deepEqual(expected, ["laptop", "phone"]);
+
+  const seeds = JSON.parse(v.seal_x25519_seeds_json);
+  for (const id of expected) {
+    assert.deepEqual(
+      JSON.parse(wasm.decrypt_context(sealed.ciphertext, id, seeds[id])),
+      JSON.parse(v.context_json),
+      `${id} opens the sealed context`,
+    );
+  }
+  // The revoked device, the expired one, and a key the root never vouched for (listed only in a
+  // stale sequence) get no recipient entry.
+  for (const id of ["old", "injected", "expired"]) {
+    assert.throws(
+      () => wasm.decrypt_context(sealed.ciphertext, id, seeds[id]),
+      /no recipient header kid matches/,
+      id,
+    );
+  }
+});
+
+test("seal_context_for_account_state reports the selected sequence, not the caller's floor", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  // Spec (sealing.rs): `sequence` is the highest verified sequence the recipients came from; the
+  // caller persists it as its floor, so returning the floor itself would let a rollback through.
+  for (const floor of [1, undefined]) {
+    const sealed = JSON.parse(
+      wasm.seal_context_for_account_state(
+        v.context_json,
+        v.seal_account_states_json,
+        v.expected_account_id_for_root,
+        v.approver_root_pubkey_b64,
+        v.recipient_now_ms,
+        floor,
+      ),
+    );
+    assert.equal(sealed.sequence, 3, `floor ${String(floor)}`);
+  }
+});
+
+test("seal_context_for_account_state throws, encrypting nothing, when no recipient set is allowed", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  const seal = (states, floor = undefined, nowMs = v.recipient_now_ms, ctx = v.context_json) =>
+    wasm.seal_context_for_account_state(
+      ctx,
+      states,
+      v.expected_account_id_for_root,
+      v.approver_root_pubkey_b64,
+      nowMs,
+      floor,
+    );
+  assert.throws(() => seal("[]"), /no account-state document/);
+  assert.throws(
+    () => seal(v.seal_account_states_json, v.seal_sequence + 1),
+    /highest account-state sequence 3 is below the required floor 4/,
+  );
+  assert.throws(
+    () => seal(v.seal_account_states_json, undefined, -1),
+    /now_ms must be a non-negative/,
+  );
+  assert.throws(() => seal(v.seal_account_states_json, -1), /min_sequence must be a non-negative/);
+  assert.throws(
+    () => seal(v.seal_account_states_json, undefined, v.recipient_now_ms, "{}"),
+    /ApprovalContext/,
+  );
+  const otherRoot = wasm.ed25519_public_key(Buffer.alloc(32, 0x33).toString("base64url"));
+  assert.throws(
+    () =>
+      wasm.seal_context_for_account_state(
+        v.context_json,
+        v.seal_account_states_json,
+        v.expected_account_id_for_root,
+        otherRoot,
+        v.recipient_now_ms,
+        undefined,
+      ),
+    /did not verify/,
+  );
 });

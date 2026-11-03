@@ -15,6 +15,7 @@ import {
   WEB_PUSH_COALESCE_MS,
   WakeupCoalescer,
   buildPushWakeupPayload,
+  diffPushTokenSet,
   dispatchPushWakeups,
   type Fetcher,
   type PushTransport,
@@ -258,5 +259,28 @@ describe("WakeupCoalescer — at most one wakeup per subscription per window", (
     expect(coalescer.tryClaim(KEY, T0)).toBe(true);
     expect(coalescer.tryClaim(OTHER, T0)).toBe(true);
     expect(coalescer.tryClaim(KEY, T0 + 1)).toBe(false);
+  });
+});
+
+describe("diffPushTokenSet — replace a device's set with minimal row changes", () => {
+  const A = { transport: "webpush", token: "https://fcm.googleapis.com/fcm/send/a" } as const;
+  const B = { transport: "webpush", token: "https://fcm.googleapis.com/fcm/send/b" } as const;
+  const APNS_SAME_TEXT = { transport: "apns", token: A.token } as const;
+
+  it("changes nothing when the set is unchanged", () => {
+    expect(diffPushTokenSet([A, B], [B, A])).toEqual({ remove: [], add: [] });
+  });
+
+  it("removes what is gone and adds what is new, keeping the overlap", () => {
+    expect(diffPushTokenSet([A], [B])).toEqual({ remove: [A], add: [B] });
+    expect(diffPushTokenSet([A], [A, B])).toEqual({ remove: [], add: [B] });
+  });
+
+  it("clears everything for an empty desired set", () => {
+    expect(diffPushTokenSet([A, B], [])).toEqual({ remove: [A, B], add: [] });
+  });
+
+  it("treats the same token text under another transport as a different entry", () => {
+    expect(diffPushTokenSet([A], [APNS_SAME_TEXT])).toEqual({ remove: [A], add: [APNS_SAME_TEXT] });
   });
 });
