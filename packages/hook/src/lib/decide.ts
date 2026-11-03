@@ -163,15 +163,26 @@ async function commandApprovalRequest(
 }
 
 /**
- * The error to quote when a command request could not be built. For invalid shell syntax the SDK
- * wraps the core's own error, which names the problem; quoting that keeps the reason the agent sees
- * the same as before #269. Otherwise the SDK's message is used, without its `allw: ` prefix (the
- * deny reason already carries one).
+ * The deny reason for a command whose request could not be built: the SDK refused it (a
+ * `CommandActionError`) or anything else failed while building it. Both hooks use this, so the same
+ * command is denied with the same reason in each (#372).
+ *
+ * For invalid shell syntax the SDK wraps the core's own error, which names the problem; quoting that
+ * keeps the reason the same as before #269. Otherwise the SDK's message is used, without its
+ * `allw: ` prefix (the reason already carries one). Either way the text goes through the core escape
+ * and cap before the agent reads it.
  */
-function commandBuildError(err: unknown): unknown {
-  if (!(err instanceof CommandActionError)) return err;
-  if (err.cause instanceof Error) return err.cause;
-  return err.message.replace(/^allw: /u, "");
+export function commandBuildFailureReason(wasm: HookWasm, err: unknown): string {
+  const quoted =
+    err instanceof CommandActionError
+      ? err.cause instanceof Error
+        ? err.cause
+        : err.message.replace(/^allw: /u, "")
+      : err;
+  return `allw: could not build an ActionRecord for the command (fail-closed deny): ${agentSafeErrorText(
+    wasm,
+    quoted,
+  )}`;
 }
 
 /**
@@ -246,13 +257,7 @@ async function prepareCall(
     } catch (err) {
       // A command the SDK refuses, or any other failure to build the request (the SDK's WASM
       // loader, say), is never submitted; the human is not asked (fail-closed).
-      return {
-        kind: "build-error",
-        reason: `allw: could not build an ActionRecord for the command (fail-closed deny): ${agentSafeErrorText(
-          wasm,
-          commandBuildError(err),
-        )}`,
-      };
+      return { kind: "build-error", reason: commandBuildFailureReason(wasm, err) };
     }
   }
 

@@ -435,8 +435,9 @@ function reduceFileEdit(toolName: string, toolInput: unknown): FileEditReduction
  * - `pass-through`: a `Monitor` WebSocket watch, which runs no command.
  * - `build-error`: the `tool_input` has the wrong shape; deny (`reason` is a constant).
  *
- * The Claude Code hook builds the request for a `command` through `@allw/sdk`'s `commandRequest`
- * (#269); {@link gateToolCall} builds it through the core directly, for the codex-hook.
+ * Both hooks build the request for a `command` through `@allw/sdk`'s `commandRequest` (#269,
+ * #372), which also refuses a blank command or program. {@link gateToolCall} still builds a core
+ * record for one directly, for a caller that uses it on its own.
  */
 export type PosixCommandCall =
   | { readonly kind: "command"; readonly command: string; readonly summary: string }

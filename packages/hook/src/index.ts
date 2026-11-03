@@ -27,6 +27,7 @@ export {
   MAX_ERROR_TEXT_CHARS,
   agentSafeErrorText,
   agentSafeText,
+  commandBuildFailureReason,
   decide,
   type ApprovalVerdict,
   type CommandRequestFn,
@@ -48,7 +49,14 @@ export {
   type PreToolUseOutput,
 } from "./lib/hook-io.js";
 
-export { gateToolCall, isGatedTool, parseMcpToolName, type GateOutcome } from "./lib/gating.js";
+export {
+  gateToolCall,
+  isGatedTool,
+  parseMcpToolName,
+  posixCommandCall,
+  type GateOutcome,
+  type PosixCommandCall,
+} from "./lib/gating.js";
 
 export {
   DEFAULT_TIMEOUT_MS,
