@@ -41,7 +41,12 @@
  * weakening the production timeout-ordering margin.
  */
 
-import { ClientConfigError, loadClientConfig, type IntegratorConfig } from "@allw/sdk";
+import {
+  ClientConfigError,
+  escapeToPrintableAscii,
+  loadClientConfig,
+  type IntegratorConfig,
+} from "@allw/sdk";
 
 /** The fully-resolved hook config. */
 export interface HookConfig {
@@ -92,7 +97,7 @@ export const MAX_FETCH_TIMEOUT_MS = 30_000;
 /** An environment map (injectable for tests; defaults to `process.env`). */
 export type Env = Record<string, string | undefined>;
 
-/** Read an optional positive-integer millisecond env var. */
+/** Read an optional positive-integer millisecond env var. A rejected value is quoted escaped (#358). */
 function optionalMs(
   env: Env,
   key: string,
@@ -105,7 +110,7 @@ function optionalMs(
   if (!Number.isInteger(parsed) || parsed <= 0) {
     return {
       ok: false,
-      reason: `allw: ${key} must be a positive integer number of milliseconds, got '${raw}' (fail-closed deny)`,
+      reason: `allw: ${key} must be a positive integer number of milliseconds, got '${escapeToPrintableAscii(raw)}' (fail-closed deny)`,
     };
   }
   return { ok: true, value: parsed };
@@ -135,7 +140,12 @@ export function readConfig(env: Env, options: ReadConfigOptions = {}): ConfigRes
     const message = err instanceof Error ? err.message : String(err);
     return {
       ok: false,
-      reason: err instanceof ClientConfigError ? message : `allw: ${message} (fail-closed deny)`,
+      // The loader escapes the env-sourced text it quotes (#358); anything else it throws is escaped
+      // here, since config loading runs before the WASM core's display escape is available.
+      reason:
+        err instanceof ClientConfigError
+          ? message
+          : `allw: ${escapeToPrintableAscii(message)} (fail-closed deny)`,
     };
   }
   const { relayUrl, accountId, approverRootKey } = coordinates;

@@ -261,6 +261,9 @@ You don't need any of these if the file is in place:
 | `ALLW_ACCOUNT_ID`        | `account_id`                                                                                                                                                                                              |
 | `ALLW_APPROVER_ROOT_KEY` | `approver_root_key`                                                                                                                                                                                       |
 
+The default location must be absolute too: if `HOME` is a relative path, the loader refuses to
+guess (it would resolve against the agent's working directory); set `ALLW_CONFIG` instead.
+
 Then register the hook in your project's (or user's) `.claude/settings.json` as a **PreToolUse**
 hook. The matcher sends exactly the shell tools (`Bash`, `PowerShell`, `Monitor`), the file-edit
 tools (`Edit`, `MultiEdit`, `Write`, `NotebookEdit`) and every MCP tool (`mcp__…`) to allw: every

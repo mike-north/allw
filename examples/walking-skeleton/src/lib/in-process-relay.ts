@@ -292,12 +292,15 @@ export class InProcessRelay {
   /**
    * `GET /requests/:id` — poll status, lazy-expiring a past-deadline pending request (fail-closed).
    * Returns the verdict only when `resolved`.
+   *
+   * Auth comes first, as in the real relay (`docs/relay-api.md` §1, #357): an unknown id answers
+   * exactly as a wrong token does (401 without a bearer token, 403 with one), never "not found", so
+   * the reply does not say whether the id exists.
    */
   private handlePoll(requestId: string, authorization: string | null): Response {
+    if (authorization === null) return this.json({ error: "authorization required" }, 401);
     const req = this.requests.get(requestId);
-    if (!req) return this.json({ error: "request not found" }, 404);
-    if (authorization === null) return this.json({ error: "missing bearer token" }, 401);
-    if (authorization !== `Bearer ${req.authToken}`) {
+    if (!req || authorization !== `Bearer ${req.authToken}`) {
       return this.json({ error: "authorization denied" }, 403);
     }
     const status = this.expireIfDue(req);

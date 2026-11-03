@@ -33,10 +33,11 @@ import {
   pairedIdentity,
 } from "./support/real-runtime.mjs";
 
-const RLO = "‮";
-const ZWSP = "​";
+const RLO = "\u202e";
+const ZWSP = "\u200b";
 // eslint-disable-next-line no-control-regex
-const RAW_HIDDEN = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f؜​-‏‪-‮⁠⁦-⁩﻿]/;
+const RAW_HIDDEN =
+  /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/;
 
 function context(syntactic, overrides = {}) {
   return {
@@ -51,7 +52,7 @@ function context(syntactic, overrides = {}) {
 }
 
 test("a U+202E bidi override renders escaped in the DOM with the warning badge (#246)", async () => {
-  // Trojan-Source-style filename: displayed raw, `invoice‮fdp.exe` reads as `invoiceexe.pdf`.
+  // Trojan-Source-style filename: displayed raw, `invoice\u202efdp.exe` reads as `invoiceexe.pdf`.
   const root = await mountWith([
     context({ argv: ["open", `invoice${RLO}fdp.exe`], raw: `open invoice${RLO}fdp.exe` }),
   ]);

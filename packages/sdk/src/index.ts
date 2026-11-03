@@ -41,6 +41,7 @@ export {
   loadClientConfig,
 } from "./config.js";
 export type { ConfigEnv, IntegratorConfig, LoadClientConfigOptions } from "./config.js";
+export { MAX_ESCAPED_DIAGNOSTIC_CHARS, escapeToPrintableAscii } from "./printable-ascii.js";
 export {
   defaultStateDir,
   fileSequenceFloorStore,
@@ -63,6 +64,7 @@ export type {
   CommandActionOptions,
   CommandRequestInput,
 } from "./command-request.js";
+export { RelayError } from "./relay.js";
 
 /**
  * A verdict decision. `requestApproval` *resolves* to `approved` (verified), `denied` (a verified

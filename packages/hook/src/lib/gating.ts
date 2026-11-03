@@ -29,6 +29,7 @@
  * @see https://code.claude.com/docs/en/hooks (tool_name / tool_input; mcp__server__tool naming)
  */
 
+import { agentSafeErrorText, agentSafeText } from "./agent-text.js";
 import type { HookWasm } from "./wasm.js";
 
 /** The `mcp__<server>__<tool>` prefix Claude Code uses for every MCP tool name. */
@@ -62,6 +63,11 @@ const CLAUDE_FILE_EDIT_TOOLS = new Set(["Edit", "MultiEdit", "Write", "NotebookE
  * - `pass-through`: not a gated tool, or a call that runs nothing (a `Monitor` WebSocket watch);
  *   allw makes no decision (`reason` explains why).
  * - `build-error`: gated, but the `ActionRecord` could not be built; deny (`reason` explains why).
+ *
+ * A `reason` is safe to hand the agent as is: every third-party segment it quotes (a tool or server
+ * name, tool input, a core error) has been through the core escape (#364). The `summary` is raw: it
+ * goes to the approver, which applies its own display escape, and a deny reason that quotes it must
+ * escape it first.
  */
 export type GateOutcome =
   | {
@@ -423,45 +429,27 @@ function reduceFileEdit(toolName: string, toolInput: unknown): FileEditReduction
 }
 
 /**
- * Build a `command` record for a POSIX shell command (Bash, or Monitor's `command`) through the core.
- * A core error (invalid shell syntax) is a `build-error`, so the caller denies.
+ * A POSIX shell command call (`Bash`, or `Monitor` with a `command`), read from its `tool_input`
+ * but not yet built into a record:
+ * - `command`: the command line to record, and the one-line `summary` the human is shown.
+ * - `pass-through`: a `Monitor` WebSocket watch, which runs no command.
+ * - `build-error`: the `tool_input` has the wrong shape; deny (`reason` is a constant).
+ *
+ * Both hooks build the request for a `command` through `@allw/sdk`'s `commandRequest` (#269,
+ * #372), which also refuses a blank command or program. {@link gateToolCall} still builds a core
+ * record for one directly, for a caller that uses it on its own, and refuses the same commands with
+ * the same reason.
  */
-function gatePosixCommand(
-  wasm: HookWasm,
-  command: string,
-  cwd: string | undefined,
-  summary: string,
-): GateOutcome {
-  try {
-    // Pass cwd through to the core only when present; the FFI maps `undefined` → `None`.
-    const actionRecord =
-      cwd === undefined
-        ? wasm.action_from_command(command)
-        : wasm.action_from_command(command, cwd);
-    return { kind: "gated", actionRecord, summary: oneLine(summary) };
-  } catch (err) {
-    return {
-      kind: "build-error",
-      reason: `allw: could not build an ActionRecord for the command (fail-closed deny): ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    };
-  }
-}
+export type PosixCommandCall =
+  | { readonly kind: "command"; readonly command: string; readonly summary: string }
+  | { readonly kind: "pass-through"; readonly reason: string }
+  | { readonly kind: "build-error"; readonly reason: string };
 
 /**
- * Classify a tool call and, when gated, build its `ActionRecord` through the WASM core.
- *
- * All `ActionRecord` construction is delegated to the core — the hook never reimplements the
- * syntactic substrate. A thrown core error (invalid shell syntax, unparseable params) is caught and
- * returned as a `build-error` so the caller fails closed.
+ * Read a POSIX shell command call (`Bash`, or `Monitor`'s `command`) from its `tool_input`.
+ * Returns `null` for any other tool. This only reads the input; the record is built by the caller.
  */
-export function gateToolCall(
-  wasm: HookWasm,
-  toolName: string,
-  toolInput: unknown,
-  cwd: string | undefined,
-): GateOutcome {
+export function posixCommandCall(toolName: string, toolInput: unknown): PosixCommandCall | null {
   if (toolName === BASH_TOOL_NAME) {
     const command = readBashCommand(toolInput);
     if (command === null) {
@@ -470,7 +458,7 @@ export function gateToolCall(
         reason: "allw: Bash tool_input missing a string 'command' (fail-closed deny)",
       };
     }
-    return gatePosixCommand(wasm, command, cwd, `Run command: ${command}`);
+    return { kind: "command", command, summary: oneLine(`Run command: ${command}`) };
   }
 
   if (toolName === MONITOR_TOOL_NAME) {
@@ -488,12 +476,116 @@ export function gateToolCall(
           "string 'url' (fail-closed deny)",
       };
     }
-    return gatePosixCommand(
-      wasm,
-      request.command,
-      cwd,
-      `Run command (Monitor): ${request.command}`,
-    );
+    return {
+      kind: "command",
+      command: request.command,
+      summary: oneLine(`Run command (Monitor): ${request.command}`),
+    };
+  }
+
+  return null;
+}
+
+/**
+ * True if `err` is `@allw/sdk`'s `CommandActionError`. Checked by its name and `reason` field, not
+ * `instanceof`: a published install can hold two copies of the SDK (the codex-hook's and this
+ * package's), and an error from one copy is not an instance of the other's class.
+ */
+function isCommandActionError(err: unknown): err is Error & { readonly reason: string } {
+  return (
+    err instanceof Error &&
+    err.name === "CommandActionError" &&
+    typeof (err as { reason?: unknown }).reason === "string"
+  );
+}
+
+/**
+ * The deny reason for a command whose request could not be built: the SDK refused it (a
+ * `CommandActionError`), the core refused it, or anything else failed while building it. Both hooks
+ * and {@link gateToolCall} use this, so the same command is denied with the same reason everywhere
+ * (#372).
+ *
+ * For invalid shell syntax the SDK wraps the core's own error, which names the problem; quoting that
+ * keeps the reason the same as before #269. Otherwise the SDK's message is used, without its
+ * `allw: ` prefix (the reason already carries one). Either way the text goes through the core escape
+ * and cap before the agent reads it.
+ */
+export function commandBuildFailureReason(wasm: HookWasm, err: unknown): string {
+  const quoted = isCommandActionError(err)
+    ? err.cause instanceof Error
+      ? err.cause
+      : err.message.replace(/^allw: /u, "")
+    : err;
+  return `allw: could not build an ActionRecord for the command (fail-closed deny): ${agentSafeErrorText(
+    wasm,
+    quoted,
+  )}`;
+}
+
+/**
+ * Why a core `command` record has no program to show the human, worded exactly as `@allw/sdk`'s
+ * `commandActionFromLine` words its refusal, or `null` when it has one. A blank or whitespace-only
+ * line has no `argv` at all; `'' rm …` has an empty first word. This reads the core's record; it does
+ * not re-tokenize. A record that cannot be read is refused too (fail-closed).
+ */
+function noProgramRefusal(actionRecord: string): string | null {
+  let argv: unknown;
+  try {
+    argv = (JSON.parse(actionRecord) as { syntactic?: { argv?: unknown } }).syntactic?.argv;
+  } catch {
+    return "the core returned an unreadable command record";
+  }
+  if (!Array.isArray(argv) || argv.length === 0) return "commandLine contains no command";
+  if (argv[0] === "") return "commandLine's first word (the program) must be non-empty";
+  return null;
+}
+
+/**
+ * Build a `command` record for a POSIX shell command (Bash, or Monitor's `command`) through the core.
+ * A core error (invalid shell syntax), or a record with no program (a blank command, or an empty
+ * first word), is a `build-error`, so the caller denies, exactly as the hooks' `commandRequest` path
+ * does.
+ */
+function gatePosixCommand(
+  wasm: HookWasm,
+  command: string,
+  cwd: string | undefined,
+  summary: string,
+): GateOutcome {
+  try {
+    // Pass cwd through to the core only when present; the FFI maps `undefined` → `None`.
+    const actionRecord =
+      cwd === undefined
+        ? wasm.action_from_command(command)
+        : wasm.action_from_command(command, cwd);
+    const refusal = noProgramRefusal(actionRecord);
+    if (refusal !== null) {
+      return { kind: "build-error", reason: commandBuildFailureReason(wasm, refusal) };
+    }
+    return { kind: "gated", actionRecord, summary };
+  } catch (err) {
+    return { kind: "build-error", reason: commandBuildFailureReason(wasm, err) };
+  }
+}
+
+/**
+ * Classify a tool call and, when gated, build its `ActionRecord` through the WASM core.
+ *
+ * All `ActionRecord` construction is delegated to the core — the hook never reimplements the
+ * syntactic substrate. A thrown core error (invalid shell syntax, unparseable params) is caught and
+ * returned as a `build-error` so the caller fails closed.
+ */
+export function gateToolCall(
+  wasm: HookWasm,
+  toolName: string,
+  toolInput: unknown,
+  cwd: string | undefined,
+): GateOutcome {
+  const posix = posixCommandCall(toolName, toolInput);
+  if (posix !== null) {
+    return posix.kind === "command"
+      ? gatePosixCommand(wasm, posix.command, cwd, posix.summary)
+      : posix;
   }
 
   if (toolName === POWERSHELL_TOOL_NAME) {
@@ -513,9 +605,10 @@ export function gateToolCall(
     } catch (err) {
       return {
         kind: "build-error",
-        reason: `allw: could not build an ActionRecord for the PowerShell command (fail-closed deny): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
+        reason: `allw: could not build an ActionRecord for the PowerShell command (fail-closed deny): ${agentSafeErrorText(
+          wasm,
+          err,
+        )}`,
       };
     }
   }
@@ -525,7 +618,8 @@ export function gateToolCall(
     if ("error" in fileEdit) {
       return {
         kind: "build-error",
-        reason: `allw: ${fileEdit.error} (fail-closed deny)`,
+        // The error can quote tool input (a key or an edit mode), so it is escaped (#364).
+        reason: `allw: ${agentSafeText(wasm, fileEdit.error)} (fail-closed deny)`,
       };
     }
 
@@ -544,9 +638,10 @@ export function gateToolCall(
     } catch (err) {
       return {
         kind: "build-error",
-        reason: `allw: could not build an ActionRecord for the file edit (fail-closed deny): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
+        reason: `allw: could not build an ActionRecord for the file edit (fail-closed deny): ${agentSafeErrorText(
+          wasm,
+          err,
+        )}`,
       };
     }
   }
@@ -559,7 +654,8 @@ export function gateToolCall(
       // we cannot build a record for it, so we DENY rather than pass through (fail-closed).
       return {
         kind: "build-error",
-        reason: `allw: MCP tool name '${toolName}' is not a well-formed 'mcp__<server>__<tool>' (fail-closed deny)`,
+        // The name comes from a third-party MCP server, so it is escaped (#364).
+        reason: `allw: MCP tool name '${agentSafeText(wasm, toolName)}' is not a well-formed 'mcp__<server>__<tool>' (fail-closed deny)`,
       };
     }
     // The MCP tool params are the raw `tool_input` object; serialize verbatim for the core.
@@ -574,9 +670,10 @@ export function gateToolCall(
     } catch (err) {
       return {
         kind: "build-error",
-        reason: `allw: could not build an ActionRecord for the MCP tool call (fail-closed deny): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
+        reason: `allw: could not build an ActionRecord for the MCP tool call (fail-closed deny): ${agentSafeErrorText(
+          wasm,
+          err,
+        )}`,
       };
     }
   }
@@ -584,6 +681,6 @@ export function gateToolCall(
   // A genuinely non-Bash, non-MCP, non-file-edit tool (Read/Grep/…) is not gated.
   return {
     kind: "pass-through",
-    reason: `allw: tool '${toolName}' is not gated by allw; passing through`,
+    reason: `allw: tool '${agentSafeText(wasm, toolName)}' is not gated by allw; passing through`,
   };
 }

@@ -18,15 +18,19 @@ import { testAccount } from "./support/accounts.js";
 
 type Purpose = "first" | "second";
 
-/** Run `body` against a fresh multiplexer on one account Durable Object's storage. */
+/**
+ * Run `body` against a fresh multiplexer on one account Durable Object's storage, on the real
+ * clock unless `now` is given.
+ */
 async function withMultiplexer<T>(
   name: string,
   body: (mux: AlarmMultiplexer<Purpose>, storage: DurableObjectStorage) => Promise<T>,
+  now?: () => number,
 ): Promise<T> {
   const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(testAccount(name)));
   return runInDurableObject(stub, async (_instance: AccountRelay, state) => {
     const storage = state.storage as unknown as DurableObjectStorage;
-    return body(new AlarmMultiplexer<Purpose>(storage), storage);
+    return body(new AlarmMultiplexer<Purpose>(storage, now), storage);
   });
 }
 
@@ -273,5 +277,20 @@ describe("AlarmMultiplexer — running", () => {
       await mux.schedule("first", 1);
       expect(await storage.getAlarm()).toBeGreaterThanOrEqual(before);
     });
+  });
+
+  it("clamps a past due time to the injected clock's now, not the real time (#292)", async () => {
+    const pinned = future(0);
+    await withMultiplexer(
+      "alarms-past-injected",
+      async (mux, storage) => {
+        await mux.schedule("first", pinned - 5_000);
+        expect(await storage.getAlarm()).toBe(pinned);
+        // A due time after the clock's now is kept as is.
+        await mux.schedule("first", pinned + 5_000);
+        expect(await storage.getAlarm()).toBe(pinned + 5_000);
+      },
+      () => pinned,
+    );
   });
 });

@@ -61,4 +61,47 @@ declare module "@allw/sdk/vendor/allw-wasm/allw_wasm.js" {
 
   /** Ed25519 public key for a 32-byte signing seed (base64url). */
   export function ed25519_public_key(seed_b64: string): string;
+
+  /**
+   * Check a verdict's provenance without the plaintext (#245); returns `{ device_id, decided_at }`
+   * JSON. `created_at` / `expires_at` are the request window (integer Unix ms) the signed
+   * `decided_at` must fall in. `account_states_json` is a JSON array of compact account-state JWS
+   * (`[]` for none).
+   */
+  export function verify_verdict_provenance(
+    verdict_json: string,
+    request_id: string,
+    created_at: number,
+    expires_at: number,
+    account_id: string,
+    account_root_pubkey_b64: string,
+    account_states_json: string,
+  ): string;
+
+  /** Issue a root-signed device certificate (tests act as the root holder). */
+  export function issue_device_cert(
+    account_root_seed_b64: string,
+    account_id: string,
+    device_id: string,
+    device_pubkey_b64: string,
+    issued_at: number,
+    expires_at?: number | null,
+  ): string;
+
+  /** Sign an unsigned verdict JSON with a device seed; returns the `Verdict` JSON (tests only). */
+  export function sign_verdict(
+    unsigned_json: string,
+    device_seed_b64: string,
+    nonce_b64: string,
+    device_cert: string,
+  ): string;
+
+  /**
+   * Whether a base64url 32-byte X25519 public key is one of the core's small-order points
+   * (`X25519_SMALL_ORDER_POINTS`, bit 255 masked). Throws unless it is 32 base64url bytes.
+   */
+  export function is_small_order_x25519_public_key(public_key_b64: string): boolean;
+
+  /** The core's small-order X25519 denylist as a JSON array of base64url strings (tests). */
+  export function x25519_small_order_points(): string;
 }

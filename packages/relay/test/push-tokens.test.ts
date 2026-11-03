@@ -11,16 +11,18 @@
 
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import type { SqlStorage } from "@cloudflare/workers-types";
 import { AccountRelay, type Env } from "../src/index.js";
-import type { PushTransportRegistry } from "../src/push.js";
 import { WebPushTransport, type VapidConfig } from "../src/web-push.js";
-import { pairingStartBody, testAccount } from "./support/accounts.js";
+import { pairingStartBody, testAccount, testRequestId } from "./support/accounts.js";
+import { pinRelayClock } from "./support/relay-state.js";
+import { DEVICE_X25519_PUBKEY } from "./support/keys.js";
 
-/** A 32-byte base64url-unpadded device key (32 × 0x00). */
-const DEVICE_PUBKEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+/** A full-order X25519 device key (pairing rejects small-order keys, #248). */
+const DEVICE_PUBKEY = DEVICE_X25519_PUBKEY;
 /** Far-future expiry (2100-01-01Z, ms) — deterministic and always after the relay's clock. */
 const FUTURE_EXPIRES_AT = 4102444800000;
+/** The relay's injected clock for the submit test: two minutes before {@link FUTURE_EXPIRES_AT}. */
+const RELAY_NOW = FUTURE_EXPIRES_AT - 2 * 60 * 1000;
 /** A fixed creation timestamp (2023-11-14Z, ms) for seeded rows. */
 const SEEDED_AT = 1700000000000;
 
@@ -105,7 +107,7 @@ function accountStub(accountId: string) {
 
 async function readRows(accountId: string, deviceId?: string): Promise<StoredRow[]> {
   return runInDurableObject(accountStub(accountId), (instance: AccountRelay) => {
-    const { sql } = instance as unknown as { sql: SqlStorage };
+    const sql = instance["sql"];
     const rows =
       deviceId === undefined
         ? sql.exec<StoredRow>(
@@ -126,7 +128,7 @@ async function seedRows(
   rows: ReadonlyArray<{ device_id: string; transport: string; token: string; created_at?: number }>,
 ): Promise<void> {
   await runInDurableObject(accountStub(accountId), (instance: AccountRelay) => {
-    const { sql } = instance as unknown as { sql: SqlStorage };
+    const sql = instance["sql"];
     for (const row of rows) {
       sql.exec(
         `INSERT INTO device_push_token (device_id, transport, token, created_at) VALUES (?, ?, ?, ?)`,
@@ -301,23 +303,22 @@ describe("PUT /devices/{id}/push-tokens — replace the device's own set", () =>
     );
     const fetcher = vi.fn<typeof fetch>(async () => new Response(null, { status: 201 }));
     await runInDurableObject(accountStub(acct), async (instance: AccountRelay) => {
-      (instance as unknown as { pushTransports: PushTransportRegistry }).pushTransports = {
+      instance["pushTransports"] = {
         webpush: new WebPushTransport({ vapid: await makeVapid(), fetcher }),
       };
     });
 
+    // Pin the clock so the fixed expiry sits inside the request horizon (#248).
+    await pinRelayClock(acct, RELAY_NOW);
     const submit = await post<{ push_wakeups: number }>(acct, "/requests", {
       v: 1,
-      id: "req-push-tokens-rotated",
-      created_at: SEEDED_AT,
+      id: testRequestId("req-push-tokens-rotated"),
+      created_at: RELAY_NOW - 60_000,
       expires_at: FUTURE_EXPIRES_AT,
       approver: "acct-approver-routing-id",
       context_ciphertext: "eyJhbGciOiJFQ0RILUVTK0EyNTZLVyJ9.FAKE.JWE",
     });
-    await runInDurableObject(
-      accountStub(acct),
-      (instance: AccountRelay) => (instance as unknown as { pushFanOut: Promise<void> }).pushFanOut,
-    );
+    await runInDurableObject(accountStub(acct), (instance: AccountRelay) => instance["pushFanOut"]);
 
     expect(submit.data.push_wakeups).toBe(1);
     expect(fetcher.mock.calls.map(([input]) => String(input))).toEqual([ROTATED_FCM_ENDPOINT]);
