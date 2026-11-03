@@ -541,9 +541,10 @@ test("UAT: the fatal error line is withheld, not printed raw, when the core cann
     assert.equal(result.status, 1);
     assert.equal(result.stderr.indexOf(0x1b), -1, "stderr contains no raw ESC");
     assert.equal(result.stdout.indexOf(0x1b), -1, "stdout contains no raw ESC");
+    // The last stderr line is the fatal error (fixed notices such as the demo-only banner may precede it).
     assert.equal(
-      result.stderr.toString("utf8"),
-      "allw-approver: fatal error (details withheld: the display-escaping core could not be loaded)\n",
+      result.stderr.toString("utf8").trimEnd().split("\n").at(-1),
+      "allw-approver: fatal error (details withheld: the display-escaping core could not be loaded)",
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
