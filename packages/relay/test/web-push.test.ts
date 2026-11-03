@@ -422,6 +422,147 @@ async function offCurveVapid(): Promise<VapidConfig> {
   return { ...config, publicKey: b64url(point) };
 }
 
+describe("WebPushTransport — a push-service rejection is logged with its reason (#326)", () => {
+  const APPLE_ENDPOINT = "https://web.push.apple.com/QGFwcGxlLXN1YnNjcmlwdGlvbi1zZWNyZXQ";
+  const APPLE_PATH = "/QGFwcGxlLXN1YnNjcmlwdGlvbi1zZWNyZXQ";
+
+  /** Run one wakeup to `endpoint` answered by `response`; the relay's push-rejection warnings. */
+  async function warningsFor(
+    response: () => Response,
+    endpoint = APPLE_ENDPOINT,
+  ): Promise<{ warnings: string[]; failure: unknown; authorization: string }> {
+    const { config } = await makeVapid();
+    const fetcher = vi.fn<typeof fetch>(async () => response());
+    const transport = new WebPushTransport({ vapid: config, fetcher, now: () => NOW_MS });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const failure = await transport.sendWakeup(wakeup(endpoint)).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      const init = fetcher.mock.calls[0]?.[1];
+      return {
+        warnings: warn.mock.calls
+          .map((call) => String(call[0]))
+          .filter((message) => message.startsWith("push:")),
+        failure,
+        authorization: new Headers(init?.headers).get("Authorization") ?? "",
+      };
+    } finally {
+      warn.mockRestore();
+    }
+  }
+
+  it("logs Apple's 400 BadWebPushTopic with host, status and reason, and keeps the token", async () => {
+    const { warnings, failure, authorization } = await warningsFor(
+      () => new Response(JSON.stringify({ reason: "BadWebPushTopic" }), { status: 400 }),
+    );
+
+    expect(warnings).toEqual([
+      "push: webpush push service web.push.apple.com rejected a wakeup with HTTP 400 (reason BadWebPushTopic); token kept",
+    ]);
+    // Transient: the token is not pruned.
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(UndeliverablePushTokenError);
+    // The subscription path is a bearer capability; the JWT and the request id stay out too.
+    for (const secret of [APPLE_PATH, APPLE_ENDPOINT, authorization, "req-web-push"]) {
+      expect(warnings[0]).not.toContain(secret);
+    }
+  });
+
+  it("logs a 4xx without a reason when the body has none, or one that is not an identifier", async () => {
+    for (const body of [
+      "Forbidden",
+      JSON.stringify({ error: "x" }),
+      JSON.stringify({ reason: 42 }),
+      JSON.stringify(["BadJwtToken"]),
+      // A reason echoing the endpoint would put the capability in the log; it is dropped.
+      JSON.stringify({ reason: APPLE_ENDPOINT }),
+      JSON.stringify({ reason: "Bad reason\nwith a forged log line" }),
+    ]) {
+      const { warnings } = await warningsFor(() => new Response(body, { status: 403 }));
+
+      expect(warnings).toEqual([
+        "push: webpush push service web.push.apple.com rejected a wakeup with HTTP 403; token kept",
+      ]);
+    }
+  });
+
+  it("reads only a bounded prefix of an endless body, then releases it", async () => {
+    const cancelled = vi.fn();
+    let pulls = 0;
+    const chunk = new TextEncoder().encode(" ".repeat(4096));
+    const { warnings } = await warningsFor(
+      () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            pull(controller) {
+              pulls++;
+              controller.enqueue(chunk);
+            },
+            cancel: cancelled,
+          }),
+          { status: 400 },
+        ),
+    );
+
+    expect(warnings).toHaveLength(1);
+    expect(cancelled).toHaveBeenCalledTimes(1);
+    // One 4 KiB chunk already exceeds the 1 KiB cap; the stream's read-ahead may add a pull or two.
+    expect(pulls).toBeLessThanOrEqual(3);
+  });
+
+  it("gives up on a stalled body after a bounded wait, then releases it", async () => {
+    const cancelled = vi.fn();
+    const started = Date.now();
+    const { warnings } = await warningsFor(
+      () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('{"reason":'));
+            },
+            cancel: cancelled,
+          }),
+          { status: 400 },
+        ),
+    );
+
+    expect(warnings).toEqual([
+      "push: webpush push service web.push.apple.com rejected a wakeup with HTTP 400; token kept",
+    ]);
+    expect(cancelled).toHaveBeenCalledTimes(1);
+    expect(Date.now() - started).toBeLessThan(4_000);
+  });
+
+  it.each([201, 301, 404, 410, 500, 503])("does not log HTTP %i as a rejection", async (status) => {
+    const { warnings } = await warningsFor(
+      () => new Response(JSON.stringify({ reason: "Whatever" }), { status }),
+    );
+
+    expect(warnings).toEqual([]);
+  });
+
+  it("does not log a timeout or network failure as a rejection", async () => {
+    const { config } = await makeVapid();
+    const transport = new WebPushTransport({
+      vapid: config,
+      // No response at all, as when the AbortSignal fires or the connection fails.
+      fetcher: () => {
+        throw new Error("The operation was aborted due to timeout");
+      },
+      now: () => NOW_MS,
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await expect(transport.sendWakeup(wakeup(APPLE_ENDPOINT))).rejects.toBeInstanceOf(Error);
+      expect(warn.mock.calls.filter((call) => String(call[0]).startsWith("push:"))).toEqual([]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
 describe("loadVapidSigningKey — the keypair must actually match", () => {
   it("accepts a genuine keypair", async () => {
     const { config } = await makeVapid();

@@ -485,11 +485,15 @@ number delivered.
 - **VAPID public key.** Clients subscribe with the key from `GET /.well-known/allw/vapid-public-key`
   (§3).
 - **Pruning.** When the push service answers **404 or 410** (the subscription is gone), the relay
-  deletes that token row. That is the only pruning. Every other failure (401/403, other 4xx, 5xx, 3xx,
-  a timeout, a network error) leaves the token in place; in particular an auth error is a relay-side
-  VAPID problem, not a dead device, and never unregisters anyone. A stored row that fails the endpoint
-  allowlist at send time (e.g. one registered before validation existed, or after the allowlist
-  narrows) is refused, logged, and kept, never requested.
+  deletes that token row. That is the only pruning. Every other failure (401/403, other 4xx, 5xx,
+  3xx, a timeout, a network error) leaves the token in place; in particular an auth error is a
+  relay-side VAPID problem, not a dead device, and never unregisters anyone. A stored row that fails
+  the endpoint allowlist at send time (e.g. one registered before validation existed, or after the
+  allowlist narrows) is refused, logged, and kept, never requested. A 4xx other than 404/410 is
+  logged once per answer (`console.warn`): the transport, the push-service host, the status and, for
+  Web Push, a JSON body's `reason` when it is a short identifier (Apple: `BadWebPushTopic`). The
+  body is read only up to 1 KiB and 1 s, then released. The token, the endpoint path, credentials
+  and request ids are never logged (#326).
 - **Enablement.** Web Push is active only when the relay has a complete VAPID configuration whose
   keypair actually matches (`docs/relay-deploy.md` §3d); otherwise `webpush` tokens are stored but no
   wakeup is sent, and the public-key endpoint is 404.

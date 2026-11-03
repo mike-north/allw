@@ -39,7 +39,49 @@ export class UndeliverablePushTokenError extends Error {
   override readonly name = "UndeliverablePushTokenError";
 }
 
-/** Outcome of one fan-out: which tokens' wakeups the push services accepted, and which to prune. */
+/**
+ * Whether a push-service response is a **rejection worth an operator's attention**: a 4xx other
+ * than 404/410. 404/410 mean the subscription is gone and prune the token instead (see
+ * {@link UndeliverablePushTokenError}). A 4xx is otherwise kept as transient, so the token stays
+ * registered. It usually means the relay sent something the push service refuses for *every*
+ * device: a bad header such as Apple's `400 BadWebPushTopic`, a VAPID or credential mismatch, a
+ * bad payload. That is invisible unless it is logged (#326). 2xx, 5xx, redirects and timeouts are
+ * not rejections in this sense.
+ */
+export function isPushServiceRejection(status: number): boolean {
+  return status >= 400 && status < 500 && status !== 404 && status !== 410;
+}
+
+/**
+ * The host of a push-service URL, the only part of it the relay logs. For Web Push the path is the
+ * subscription itself (a bearer capability); for APNs it carries the device token.
+ */
+export function pushServiceHost(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "(invalid endpoint)";
+  }
+}
+
+/**
+ * Log one push-service rejection ({@link isPushServiceRejection}) for `wrangler tail`. Only the
+ * transport, the push-service host, the status and an optional short `reason` are logged: never
+ * the token, the endpoint path, credentials (VAPID JWT, bearer) or request ids.
+ */
+export function warnPushServiceRejection(
+  transport: PushTransportKind,
+  host: string,
+  status: number,
+  reason?: string,
+): void {
+  const detail = reason === undefined ? "" : ` (reason ${reason})`;
+  console.warn(
+    `push: ${transport} push service ${host} rejected a wakeup with HTTP ${String(status)}${detail}; token kept`,
+  );
+}
+
+/** Outcome of one fan-out: which tokens' wakeups the push services accepted, and which to prune. */ /** Outcome of one fan-out: which tokens' wakeups the push services accepted, and which to prune. */
 export interface PushDispatchResult {
   /** Tokens whose wakeup the push service accepted (a 2xx). */
   readonly deliveredTokens: readonly StoredPushToken[];
@@ -234,6 +276,9 @@ export class ApnsPushTransport implements PushTransport {
       },
     );
     if (!response.ok) {
+      if (isPushServiceRejection(response.status)) {
+        warnPushServiceRejection("apns", pushServiceHost(this.endpoint), response.status);
+      }
       throw new Error(`APNs wakeup failed with HTTP ${String(response.status)}`);
     }
   }
@@ -272,6 +317,9 @@ export class FcmPushTransport implements PushTransport {
       }),
     });
     if (!response.ok) {
+      if (isPushServiceRejection(response.status)) {
+        warnPushServiceRejection("fcm", pushServiceHost(this.endpoint), response.status);
+      }
       throw new Error(`FCM wakeup failed with HTTP ${String(response.status)}`);
     }
   }
