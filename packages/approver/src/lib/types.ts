@@ -87,9 +87,12 @@ export interface DisplaySubstrate {
   readonly paths?: readonly string[];
   readonly diff_summary?: string;
   readonly diff_hash?: string;
-  /** `raw` as one escaped line (a line feed shows as `\n`). */
+  /** `raw` as one escaped line (TAB, LF and CR show as `\t`, `\n`, `\r`). */
   readonly raw?: string;
-  /** `file_edit` only: `raw` split on line feeds, each line escaped. */
+  /**
+   * `raw` as multi-line content, present whenever `raw` is: one escaped entry per line. TAB shows
+   * as `→   ` and a CRLF ending as `␍`; neither raises the warning.
+   */
   readonly raw_lines?: readonly string[];
 }
 

@@ -119,7 +119,13 @@ export interface ApprovalRisk {
 export interface CommandAction {
   readonly cwd?: string;
   readonly argv: readonly string[];
+  /** `raw` as one core-escaped line (TAB, LF and CR show as `\t`, `\n`, `\r`) — for list rows. */
   readonly raw?: string;
+  /**
+   * `raw` as multi-line content, one core-escaped entry per line (a heredoc command spans several).
+   * TAB and CRLF endings are shown as structure markers and do not raise the warning.
+   */
+  readonly rawLines?: readonly string[];
 }
 
 export interface McpCallAction {
@@ -201,7 +207,17 @@ export interface WebApproverRuntime {
    * The controller validates UI state first, but signing remains delegated to core.
    */
   signDecision(input: SignDecisionInput): Promise<SignedVerdict>;
+
+  /**
+   * Renders untrusted text (an error message that can embed a relay-supplied id or HTTP body) for
+   * display through the core's escape (`escape_for_display`). Optional: when a runtime has no
+   * core, the controller withholds such text rather than showing it unescaped.
+   */
+  escapeForDisplay?(text: string): string;
 }
+
+/** Shown in place of untrusted error text when no core escape is available to render it safely. */
+export const WITHHELD_ERROR_TEXT = "details withheld (no display escaper available)";
 
 export interface WebApproverControllerOptions {
   readonly runtime: WebApproverRuntime;
@@ -270,6 +286,13 @@ export class WebApproverController {
   constructor(options: WebApproverControllerOptions) {
     this.#runtime = options.runtime;
     this.#nowMs = options.nowMs ?? Date.now;
+  }
+  /**
+   * Render untrusted text (an error message, which can embed a relay-supplied id or HTTP body) for
+   * the DOM through the runtime's core escape, or withhold it when the runtime has none (#246).
+   */
+  escapeForDisplay(text: string): string {
+    return this.#runtime.escapeForDisplay?.(text) ?? WITHHELD_ERROR_TEXT;
   }
 
   /**
@@ -434,7 +457,9 @@ export class WebApproverController {
         envelope,
         expiresAt: envelope.expires_at,
         status: "unverified",
-        verificationError: error instanceof Error ? error.message : String(error),
+        verificationError: this.escapeForDisplay(
+          error instanceof Error ? error.message : String(error),
+        ),
       };
     }
   }
@@ -556,10 +581,13 @@ export function exactPlaintext(context: ApprovalContext): string {
   if (context.kind === "command" && context.command) {
     // argv is shown token-by-token with boundary quoting rather than as JSON: the tokens are
     // already core-escaped, and JSON would double their backslashes (`\\x1b`), misstating them.
+    // A multi-line `raw` (e.g. a heredoc) prints its further lines behind a `│` marker, so no line
+    // of it can pass for a `cwd:`/`argv:` line of its own.
     const cwd = context.command.cwd ? `cwd: ${context.command.cwd}\n` : "";
-    return `${cwd}argv: ${shellQuote(context.command.argv)}\nraw: ${
-      context.command.raw ?? shellQuote(context.command.argv)
-    }`;
+    const raw = context.command.rawLines
+      ? context.command.rawLines.join("\n   │ ")
+      : (context.command.raw ?? shellQuote(context.command.argv));
+    return `${cwd}argv: ${shellQuote(context.command.argv)}\nraw: ${raw}`;
   }
   if (context.kind === "mcp" && context.mcp) {
     return `mcp: ${context.mcp.server}.${context.mcp.tool}\nparams: ${

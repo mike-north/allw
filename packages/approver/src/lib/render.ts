@@ -22,8 +22,13 @@
  * `prepared.display` — the core's `display_model`, in which every control, bidi, and zero-width
  * character is already a visible escape (`\x1b`, `\r`, `⟨U+202E⟩`). This module never escapes
  * anything itself (thin-shell rule). It reads the raw `prepared.context` only to *decide* layout
- * (whether `raw` and the argv reconstruction diverge), never to produce printed text. When the
- * model reports hidden/control characters, a warning line is printed directly under the header.
+ * (whether `raw` and the argv reconstruction diverge), never to produce printed text.
+ *
+ * # The decision point
+ * A long block (a file edit, a multi-line command) can scroll the header and the `Action:` line off
+ * screen before the human answers. So the block ends with a one-line escaped headline and, when the
+ * model reports hidden/control characters, the warning — the last lines printed before the prompt.
+ * The warning is also printed directly under the header.
  */
 
 import type { RenderableRequest } from "./approver-core.js";
@@ -271,6 +276,21 @@ function substrateDetailLines(action: ActionRecord, display: DisplayModel): stri
   return lines;
 }
 
+/**
+ * The `Action:` lines of the block. A command's `raw` is multi-line content (e.g. a heredoc), so it
+ * is printed from the core's `raw_lines`: the first line after the label, every further line as a
+ * `│`-marked continuation, so no line of it can pass for a field label of its own. A file edit's
+ * content is printed separately ({@link substrateDetailLines}), so its headline stays one line.
+ */
+function actionLines(display: DisplayModel): string[] {
+  const lines = display.syntactic.raw_lines;
+  if (display.surface === "file_edit" || display.syntactic.raw === undefined || !lines) {
+    return [`  Action:     ${renderActionHeadline(display)}`];
+  }
+  const [first = "", ...rest] = lines;
+  return [`  Action:     ${first}`, ...rest.map((line) => `            │ ${line}`)];
+}
+
 /** Shown under the header whenever the core escaped at least one character (#246). */
 export const HIDDEN_CHARS_WARNING =
   "  ⚠ WARNING: contains hidden/control characters — shown escaped below (e.g. \\x1b, \\r, ⟨U+202E⟩). Review carefully.";
@@ -297,7 +317,7 @@ export function renderRequest(prepared: RenderableRequest): string {
   }
   lines.push(`  Request:    ${prepared.displayRequestId}`);
   lines.push(`  Summary:    ${display.summary}`);
-  lines.push(`  Action:     ${renderActionHeadline(display)}`);
+  lines.push(...actionLines(display));
   lines.push(`  Surface:    ${display.surface}`);
   // Meaning-changing substrate fields (cwd/host/env_refs/params) — bound into request_hash, so
   // shown explicitly. A human must never sign over a cwd/params they could not see.
@@ -328,6 +348,12 @@ export function renderRequest(prepared: RenderableRequest): string {
   }
   lines.push(`  request_hash (WYSIWYS): ${requestHash}`);
   lines.push(rule);
+  // Repeated at the decision point: the prompt follows these lines directly, so the human answers
+  // with the action (one escaped line) and any warning on screen however long the block was.
+  lines.push(`  Deciding on: ${renderActionHeadline(display)}`);
+  if (display.has_hidden_or_control_chars) {
+    lines.push(HIDDEN_CHARS_WARNING);
+  }
 
   return lines.join("\n");
 }

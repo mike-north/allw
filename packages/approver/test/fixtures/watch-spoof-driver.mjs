@@ -47,7 +47,13 @@ const context = {
   action: {
     record_schema_version: 1,
     surface: "command",
-    syntactic: { raw: "rm -rf ~/x; : \u001b[2K\rgit status" },
+    // The spoof, then 100 more lines, so the block is far taller than a terminal.
+    syntactic: {
+      raw: [
+        "rm -rf ~/x; : \u001b[2K\rgit status",
+        ...Array.from({ length: 100 }, (_, i) => `echo line ${String(i)}`),
+      ].join("\n"),
+    },
     risk: "critical",
   },
   summary: "check git status",

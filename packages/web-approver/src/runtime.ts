@@ -252,6 +252,7 @@ interface CoreDisplayModel {
     readonly argv?: readonly string[];
     readonly cwd?: string;
     readonly raw?: string;
+    readonly raw_lines?: readonly string[];
     readonly server?: string;
     readonly tool?: string;
     readonly params_json_lines?: readonly string[];
@@ -266,7 +267,10 @@ interface CoreDisplayModel {
 function toCommandAction(syntactic: CoreDisplayModel["syntactic"]): CommandAction {
   const command: CommandAction = { argv: syntactic.argv ?? [] };
   const withCwd = syntactic.cwd !== undefined ? { ...command, cwd: syntactic.cwd } : command;
-  return syntactic.raw !== undefined ? { ...withCwd, raw: syntactic.raw } : withCwd;
+  const withRaw = syntactic.raw !== undefined ? { ...withCwd, raw: syntactic.raw } : withCwd;
+  return syntactic.raw_lines !== undefined
+    ? { ...withRaw, rawLines: syntactic.raw_lines }
+    : withRaw;
 }
 
 /** Map the core display model's substrate onto a `(server, tool, params)` action — shared by
@@ -575,7 +579,11 @@ export function createWasmRuntime(options: WasmRuntimeOptions): WebApproverRunti
     };
   }
 
-  return { prepare, signDecision };
+  return {
+    prepare,
+    signDecision,
+    escapeForDisplay: (text: string): string => wasm.escape_for_display(text),
+  };
 }
 
 /** Options for {@link createBrowserRuntime}. */

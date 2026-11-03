@@ -172,7 +172,8 @@ async function mountWebApproverInbox(config: BrowserConfig): Promise<WebApprover
       onPollResult: (result) => {
         if (!result.ok) {
           // Preserve last-known inbox but show an outage banner — never fail-open.
-          lastError = result.error;
+          // The error text can carry relay-supplied bytes: render it through the core escape.
+          lastError = controller.escapeForDisplay(result.error);
         } else {
           // Successful poll — clear any outage banner.
           lastError = null;

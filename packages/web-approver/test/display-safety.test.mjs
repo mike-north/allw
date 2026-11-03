@@ -173,3 +173,87 @@ test("a clean request renders without the warning badge", async () => {
   assert.ok((root.textContent ?? "").includes("git status"));
   assert.equal(root.querySelector(".hidden-chars-warning"), null);
 });
+
+/** Run `fn` with jsdom globals installed for its whole (async) duration. */
+async function withDom(fn) {
+  const dom = new JSDOM('<div id="app"></div>', { url: "https://approver.local/" });
+  const saved = {
+    document: globalThis.document,
+    window: globalThis.window,
+    HTMLButtonElement: globalThis.HTMLButtonElement,
+  };
+  globalThis.document = dom.window.document;
+  globalThis.window = dom.window;
+  globalThis.HTMLButtonElement = dom.window.HTMLButtonElement;
+  try {
+    return await fn(dom.window.document.getElementById("app"));
+  } finally {
+    globalThis.document = saved.document;
+    globalThis.window = saved.window;
+    globalThis.HTMLButtonElement = saved.HTMLButtonElement;
+  }
+}
+
+const ESC = "\u001b";
+
+test("a multi-line (heredoc) command shows its lines behind a continuation marker, no badge", async () => {
+  const raw = "git commit -m \"$(cat <<'EOF'\nfix: a thing\n\n\tdetail\nEOF\n)\"";
+  const root = await mountWith([context({ argv: ["git", "commit"], raw })]);
+  const pre = root.querySelector("pre");
+  assert.ok(pre);
+  assert.ok(
+    (pre.textContent ?? "").includes(
+      "raw: git commit -m \"$(cat <<'EOF'\n   │ fix: a thing\n   │ \n   │ →   detail\n   │ EOF\n   │ )\"",
+    ),
+  );
+  assert.equal(root.querySelector(".hidden-chars-warning"), null);
+});
+
+test("a relay-supplied envelope id in the verification-failed banner is escaped (#246)", async () => {
+  // Already expired: the runtime refuses it with an error that names the (relay-supplied) id.
+  const wasm = await loadTestWasm();
+  const { identity, encryptTo } = pairedIdentity(wasm);
+  const id = `req-${RLO}evil${ESC}[2J`;
+  const stale = { ...envelope(id, encryptTo(context({ argv: ["ls"], raw: "ls" }))) };
+  const expired = { ...stale, expires_at: NOW_MS - 1 };
+  const text = await withDom(async (root) => {
+    await mountWebApprover({
+      root,
+      nowMs: () => NOW_MS,
+      fetchInbox: async () => [expired],
+      runtime: createWasmRuntime({ wasm, identity, nowMs: () => NOW_MS }),
+    });
+    return root.textContent ?? "";
+  });
+  assert.doesNotMatch(text, RAW_HIDDEN, "no raw bidi/control character reaches the DOM");
+  assert.ok(text.includes("Verification failed:"), "the card shows why it is unverified");
+  assert.ok(text.includes("req-⟨U+202E⟩evil\\x1b[2J"), "the id is shown escaped");
+});
+
+test("the relay-outage banner escapes the relay error text (#246)", async () => {
+  const wasm = await loadTestWasm();
+  const { identity } = pairedIdentity(wasm);
+  const text = await withDom(async (root) => {
+    const mounted = await mountWebApprover({
+      root,
+      nowMs: () => NOW_MS,
+      runtime: createWasmRuntime({ wasm, identity, nowMs: () => NOW_MS }),
+      relay: {
+        relayUrl: "https://relay.allw.test",
+        accountId: ACCOUNT_ID,
+        deviceId: DEVICE_ID,
+        deviceAuthToken: "relay-bearer-test-token",
+        fetchImpl: async () => {
+          throw new Error(`relay down${ESC}[2J${RLO}evil`);
+        },
+      },
+    });
+    // Let the immediate first poll tick settle and re-render.
+    for (let i = 0; i < 5; i += 1) await new Promise((r) => setTimeout(r, 0));
+    mounted.stop();
+    return root.querySelector(".relay-outage-banner")?.textContent ?? "";
+  });
+  assert.ok(text.includes("Relay unavailable"), "the outage banner is shown");
+  assert.doesNotMatch(text, RAW_HIDDEN);
+  assert.ok(text.includes("relay down\\x1b[2J⟨U+202E⟩evil"));
+});
