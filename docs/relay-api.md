@@ -47,6 +47,10 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   **WebSocket** upgrades (which can't easily set headers), pass `?auth=<token>` as a query param.
   The relay stores only `SHA-256(token)`; the plaintext is returned **once** at issuance — cache it.
   Missing token ⇒ **401**; wrong/expired/cross-scope token ⇒ **403**.
+- **Public keys.** Every key field the relay accepts (`root_pubkey`, a device or actor `pubkey`) is
+  the **canonical** base64url-unpadded encoding of 32 bytes: 43 characters, with the 2 unused low bits
+  of the last one zero, so re-encoding the bytes gives back the same string. Anything else is a **400**,
+  never stored. A stray-bit key such as `…AAAB` decodes leniently, but the core rejects it.
 - **Token scopes** (three implemented; `enrollment_auth_token` is specified only):
 
   | Token                   | Issued by                     | Used for                                                            | Lifetime                  |
@@ -209,12 +213,14 @@ Errors:
 
 - 403 when no root is bound to the account (a code on an unbound account predates root binding and is
   never honored);
-- 400 (bad body, pubkey shape, small-order pubkey, push_token, unexpected key, or over budget);
+- 400 (bad body, a pubkey that isn't the canonical encoding of 32 bytes (§1), small-order pubkey,
+  push_token, unexpected key, or over budget);
 - 401/403 (token);
 - 404 (code unknown);
 - 409 (code already used, or account push-token budget full);
 - 410 (code expired);
-- 500 (the relay's verification core failed to initialize).
+- 500 only when the relay's verification core failed to initialize (logged). A key the core rejects
+  is the 400 above, never a 500.
 
 Atomic — no half-enrollment.
 
