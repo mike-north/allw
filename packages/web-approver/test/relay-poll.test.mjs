@@ -59,7 +59,7 @@ function envelope(id, overrides = {}) {
 function context() {
   return {
     kind: "command",
-    command: { cwd: "/repo", argv: ["git", "status"], raw: "git status" },
+    substrate: { cwd: "/repo", argv: ["git", "status"], raw: "git status" },
     actor: { id: "claude-code:local", display: "Claude Code", attestation: "verified" },
     risk: { level: "low", reversible: true, summary: "checks git status" },
     allowed_decisions: ["approved", "denied"],

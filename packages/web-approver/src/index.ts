@@ -1,3 +1,5 @@
+import { quoteToken, reconstructCommand, renderArgv, renderList } from "./command-line.js";
+
 export type { AllwWasm, WasmModuleSource } from "./wasm.js";
 export { initWasm, initWasmSync, resetWasmForTests } from "./wasm.js";
 
@@ -107,47 +109,46 @@ export interface ApprovalActor {
 export interface ApprovalRisk {
   readonly level: "low" | "medium" | "high" | "critical";
   readonly reversible: boolean;
+  /** The context `summary`: the integrator's description of the action, escaped by the core. */
   readonly summary: string;
 }
 
 /**
- * The view model's action and actor strings are **display text produced by the core**
- * (`display_model`, #246): every control, bidi, and zero-width character is already a visible
- * escape (`\x1b`, `⟨U+202E⟩`). The renderers below lay them out but never escape anything
- * themselves, and must never be handed raw decrypted strings.
+ * The action's complete syntactic substrate as the core displays it (Rust
+ * `allw_core::DisplaySubstrate`, from `display_model`, #246): every field the core binds into
+ * `request_hash`, each already escaped (`\x1b`, `⟨U+202E⟩`, …). Renderers lay these out but never
+ * escape anything themselves, and must never be handed raw decrypted strings.
+ *
+ * The substrate is one generic record for every surface, so the view keeps it whole rather than a
+ * per-surface subset: a renderer that shows every present field can never omit a hash-bound one,
+ * and whenever the hidden-character warning shows, the escaped character is somewhere on screen.
  */
-export interface CommandAction {
+export interface SubstrateView {
+  readonly bin?: string;
+  readonly argv?: readonly string[];
+  readonly flags?: readonly string[];
+  readonly positionals?: readonly string[];
   readonly cwd?: string;
-  readonly argv: readonly string[];
-  /** `raw` as one core-escaped line (TAB, LF and CR show as `\t`, `\n`, `\r`) — for list rows. */
+  readonly host?: string;
+  readonly envRefs?: readonly string[];
+  /** MCP server name, or the gating provider (plugin) id for an `agent_tool_call`. */
+  readonly server?: string;
+  readonly tool?: string;
+  /** The call's `params` as indented JSON, one entry per line. */
+  readonly paramsLines?: readonly string[];
+  /** File-edit operation (e.g. `patch`, `write`). */
+  readonly operation?: string;
+  readonly paths?: readonly string[];
+  readonly diffSummary?: string;
+  readonly diffHash?: string;
+  /** `raw` as one line (TAB, LF and CR show as `\t`, `\n`, `\r`) — for one-line headlines. */
   readonly raw?: string;
   /**
-   * `raw` as multi-line content, one core-escaped entry per line (a heredoc command spans several).
-   * TAB and CRLF endings are shown as structure markers and do not raise the warning.
+   * `raw` as multi-line content, one entry per line: a heredoc command, or a file edit's content.
+   * TAB, and a CR before LF in a file edit, are shown as structure markers and do not raise the
+   * warning.
    */
   readonly rawLines?: readonly string[];
-}
-
-export interface McpCallAction {
-  readonly server: string;
-  readonly tool: string;
-  /** The call's `params` as indented JSON (core-escaped); absent when the call has none. */
-  readonly paramsDisplay?: string;
-}
-
-/**
- * An agent-runtime/plugin-owned tool call (`agent_tool_call` surface,
- * `docs/openclaw-integration.md` §5.2) — e.g. an OpenClaw plugin permission request. Shares the
- * `(server, tool, params)` shape with {@link McpCallAction}, but `server` holds a gating provider
- * id (a plugin id), never an MCP server name. Kept as its own type/`ApprovalContext.kind` branch
- * (not folded into `"mcp"`) so the view model — and every renderer built on it — can never label a
- * plugin-owned call as an MCP call it never was.
- */
-export interface AgentToolCallAction {
-  readonly server: string;
-  readonly tool: string;
-  /** The call's `params` as indented JSON (core-escaped); absent when the call has none. */
-  readonly paramsDisplay?: string;
 }
 
 export interface NumberMatchChallenge {
@@ -157,10 +158,22 @@ export interface NumberMatchChallenge {
 }
 
 export interface ApprovalContext {
-  readonly kind: "command" | "mcp" | "agent_tool_call";
-  readonly command?: CommandAction;
-  readonly mcp?: McpCallAction;
-  readonly agentToolCall?: AgentToolCallAction;
+  /**
+   * The action's surface. `agent_tool_call` (an agent-runtime/plugin-owned tool call,
+   * `docs/openclaw-integration.md` §5.2) shares the `(server, tool)` shape with `mcp` but is its own
+   * kind, so a plugin-owned call is never labelled as an MCP call it never was.
+   */
+  readonly kind: "command" | "mcp" | "agent_tool_call" | "file_edit";
+  /** Every hash-bound action field, escaped by the core. */
+  readonly substrate: SubstrateView;
+  /**
+   * Set only when the hash-bound `bin`/`argv` describes a different command than `raw` (decided on
+   * the unescaped bytes): the escaped command line `bin`/`argv` reconstruct to. Renderers show it
+   * as the headline with a warning, so a benign `raw` can never be the only half on screen.
+   */
+  readonly divergentArgv?: string;
+  /** Escaped ids of the upstream gates this request passed through. */
+  readonly chain?: readonly string[];
   readonly actor: ApprovalActor;
   readonly risk: ApprovalRisk;
   readonly allowed_decisions: readonly ApprovalDecision[];
@@ -216,6 +229,16 @@ export interface WebApproverRuntime {
   escapeForDisplay?(text: string): string;
 }
 
+/**
+ * Shown with a request whose raw and hash-bound argv describe different commands. The heading then
+ * shows the argv form, and the plaintext block shows both, so neither half is hidden (#295).
+ */
+export const RAW_ARGV_DIVERGENCE_WARNING =
+  "⚠ raw and argv differ — the heading shows the hash-bound argv; the raw line below is what the agent wrote. Review both.";
+
+/** Label for the context summary: the integrator's own description, not the action itself (#262). */
+export const CONTEXT_SUMMARY_LABEL = "Agent's description";
+
 /** Shown in place of untrusted error text when no core escape is available to render it safely. */
 export const WITHHELD_ERROR_TEXT = "details withheld (no display escaper available)";
 
@@ -245,6 +268,13 @@ export interface ApprovalDetail extends ApprovalListItem {
   readonly challenge?: NumberMatchChallenge;
   /** True when the core escaped hidden/control characters in this request (#246). */
   readonly hasHiddenOrControlChars: boolean;
+  /**
+   * The context `summary` (the integrator's description, escaped), absent when the request could
+   * not be prepared. It is hash-bound, so it is shown; it is not the action, which stays primary.
+   */
+  readonly contextSummary?: string;
+  /** True when raw and the hash-bound argv describe different commands; see `divergentArgv`. */
+  readonly rawArgvDiverges: boolean;
 }
 
 /**
@@ -498,6 +528,7 @@ export class WebApproverController {
       ...item,
       exactPlaintext: context ? exactPlaintext(context) : "Context could not be verified.",
       hasHiddenOrControlChars: context?.hasHiddenOrControlChars === true,
+      rawArgvDiverges: context?.divergentArgv !== undefined,
     };
 
     if (!prepared) {
@@ -509,6 +540,7 @@ export class WebApproverController {
 
     const detail: ApprovalDetail = {
       ...base,
+      contextSummary: prepared.context.risk.summary,
       requestHash: prepared.requestHash,
       actorId: prepared.context.actor.id,
       attestation: prepared.context.actor.attestation,
@@ -565,54 +597,80 @@ export class WebApproverController {
 }
 
 /**
- * One-line headline for a list row. A tool call is `server :: tool` (as in the CLI): a `.` join
- * would make server `fs.delete` + tool `x` look like server `fs` + tool `delete.x`.
+ * One-line headline for a list row and a card heading.
+ *
+ * When raw and argv diverge this is the hash-bound argv form, never the possibly benign `raw` (the
+ * card then shows a warning and both forms). Otherwise: a file edit's diff summary or
+ * `operation paths`; a tool call's `server :: tool` (a `.` join would make server `fs.delete` +
+ * tool `x` look like server `fs` + tool `delete.x`); a command's `raw`, or the command `bin`/`argv`
+ * reconstruct to. Mirrors the CLI's headline (`packages/approver/src/lib/render.ts`).
  */
 export function actionSummary(context: ApprovalContext): string {
-  if (context.kind === "command" && context.command) {
-    return context.command.raw ?? shellQuote(context.command.argv);
-  }
-  if (context.kind === "mcp" && context.mcp) {
-    return `${context.mcp.server} :: ${context.mcp.tool}`;
-  }
-  if (context.kind === "agent_tool_call" && context.agentToolCall) {
-    return `${context.agentToolCall.server} :: ${context.agentToolCall.tool}`;
-  }
-  return "Unknown action";
+  if (context.divergentArgv !== undefined) return context.divergentArgv;
+  const s = context.substrate;
+  const toolCall =
+    s.server !== undefined && s.tool !== undefined ? `${s.server} :: ${s.tool}` : undefined;
+  const fileEdit =
+    s.operation !== undefined && s.paths !== undefined && s.paths.length > 0
+      ? `${s.operation} ${renderList(s.paths)}`
+      : undefined;
+  const headline =
+    context.kind === "file_edit"
+      ? (s.diffSummary ?? fileEdit)
+      : context.kind === "mcp" || context.kind === "agent_tool_call"
+        ? toolCall
+        : (s.raw ?? reconstructCommand(s));
+  return headline ?? s.raw ?? reconstructCommand(s) ?? toolCall ?? fileEdit ?? "Unknown action";
 }
 
+/** Continuation marker for multi-line content, so no later line can pass for a field label. */
+const CONTINUATION = "\n   │ ";
+
+/**
+ * The full hash-bound action as labelled plain-text lines (the card's and audit receipt's exact
+ * plaintext). Every substrate field that is present is shown, whatever the surface, in the order
+ * the CLI shows them; the first line names a tool call or file edit. Values come from the core's
+ * escaped substrate; this only lays them out (token and list quoting via `command-line.ts`).
+ */
 export function exactPlaintext(context: ApprovalContext): string {
-  if (context.kind === "command" && context.command) {
-    // argv is shown token-by-token with boundary quoting rather than as JSON: the tokens are
-    // already core-escaped, and JSON would double their backslashes (`\\x1b`), misstating them.
-    // A multi-line `raw` (e.g. a heredoc) prints its further lines behind a `│` marker, so no line
-    // of it can pass for a `cwd:`/`argv:` line of its own.
-    const cwd = context.command.cwd ? `cwd: ${context.command.cwd}\n` : "";
-    const raw = context.command.rawLines
-      ? context.command.rawLines.join("\n   │ ")
-      : (context.command.raw ?? shellQuote(context.command.argv));
-    return `${cwd}argv: ${shellQuote(context.command.argv)}\nraw: ${raw}`;
+  const s = context.substrate;
+  const lines: string[] = [];
+  const toolCallFirst =
+    (context.kind === "mcp" || context.kind === "agent_tool_call") &&
+    s.server !== undefined &&
+    s.tool !== undefined;
+  if (toolCallFirst) {
+    lines.push(`${context.kind}: ${s.server ?? ""} :: ${s.tool ?? ""}`);
   }
-  if (context.kind === "mcp" && context.mcp) {
-    return `mcp: ${context.mcp.server} :: ${context.mcp.tool}\nparams: ${
-      context.mcp.paramsDisplay ?? "(none)"
-    }`;
-  }
-  if (context.kind === "agent_tool_call" && context.agentToolCall) {
-    return `agent_tool_call: ${context.agentToolCall.server} :: ${context.agentToolCall.tool}\nparams: ${
-      context.agentToolCall.paramsDisplay ?? "(none)"
-    }`;
-  }
-  return "Unknown action";
-}
+  const operationFirst = context.kind === "file_edit" && s.operation !== undefined;
+  if (operationFirst) lines.push(`file_edit: ${s.operation ?? ""}`);
 
-function shellQuote(argv: readonly string[]): string {
-  return argv
-    .map((part) => {
-      if (/^[A-Za-z0-9_./:=@+-]+$/.test(part)) {
-        return part;
-      }
-      return `'${part.replaceAll("'", "'\\''")}'`;
-    })
-    .join(" ");
+  if (s.cwd !== undefined) lines.push(`cwd: ${s.cwd}`);
+  if (s.host !== undefined) lines.push(`host: ${s.host}`);
+  if (s.bin !== undefined) lines.push(`bin: ${quoteToken(s.bin)}`);
+  if (s.argv !== undefined) lines.push(`argv: ${renderArgv(s.argv)}`);
+  if (s.flags !== undefined) lines.push(`flags: ${renderArgv(s.flags)}`);
+  if (s.positionals !== undefined) lines.push(`positionals: ${renderArgv(s.positionals)}`);
+  if (s.envRefs !== undefined) lines.push(`env_refs: ${renderList(s.envRefs)}`);
+  if (!toolCallFirst) {
+    if (s.server !== undefined) lines.push(`server: ${s.server}`);
+    if (s.tool !== undefined) lines.push(`tool: ${s.tool}`);
+  }
+  if (s.paramsLines !== undefined) {
+    lines.push(`params: ${s.paramsLines.join("\n")}`);
+  } else if (toolCallFirst) {
+    lines.push("params: (none)");
+  }
+  if (!operationFirst && s.operation !== undefined) lines.push(`operation: ${s.operation}`);
+  if (s.paths !== undefined) lines.push(`paths: ${renderList(s.paths)}`);
+  if (s.diffSummary !== undefined) lines.push(`diff_summary: ${s.diffSummary}`);
+  if (s.diffHash !== undefined) lines.push(`diff_hash: ${s.diffHash}`);
+  const content = s.rawLines ?? (s.raw !== undefined ? [s.raw] : undefined);
+  if (content !== undefined) {
+    lines.push(
+      `${context.kind === "file_edit" ? "content" : "raw"}: ${content.join(CONTINUATION)}`,
+    );
+  }
+  if (context.chain !== undefined) lines.push(`chain: ${renderList(context.chain)}`);
+  return lines.length > 0 ? lines.join("\n") : "Unknown action";
 }

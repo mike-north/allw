@@ -21,7 +21,12 @@
  * @see packages/web-approver/src/index.ts (AuditHistoryItem, WebApproverController)
  */
 
-import type { AuditHistoryItem, WebApproverController } from "./index.js";
+import {
+  CONTEXT_SUMMARY_LABEL,
+  RAW_ARGV_DIVERGENCE_WARNING,
+  type AuditHistoryItem,
+  type WebApproverController,
+} from "./index.js";
 
 /**
  * Mount the audit-history view into `root`. Returns a disposer that tears down all DOM children
@@ -188,6 +193,23 @@ function detailPane(
   );
 
   pane.append(statusGrid);
+
+  // The hash-bound context summary and any raw/argv divergence, as on the inbox card (#262, #295).
+  if (detail.contextSummary !== undefined) {
+    const summary = document.createElement("p");
+    summary.className = "audit-context-summary";
+    summary.append(
+      textElement("strong", `${CONTEXT_SUMMARY_LABEL}: `),
+      document.createTextNode(detail.contextSummary),
+    );
+    pane.append(summary);
+  }
+  if (detail.rawArgvDiverges) {
+    const divergence = textElement("p", RAW_ARGV_DIVERGENCE_WARNING);
+    divergence.className = "audit-raw-argv-divergence";
+    divergence.setAttribute("role", "alert");
+    pane.append(divergence);
+  }
 
   // WYSIWYS receipt — plain text, no innerHTML
   const wysiwys = document.createElement("div");

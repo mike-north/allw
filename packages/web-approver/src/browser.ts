@@ -1,4 +1,6 @@
 import {
+  CONTEXT_SUMMARY_LABEL,
+  RAW_ARGV_DIVERGENCE_WARNING,
   WebApproverController,
   type ApprovalDecision,
   type ApprovalEnvelope,
@@ -355,6 +357,19 @@ function card(
     article.append(badge);
   }
   article.append(textElement("h3", detail.summary));
+  if (detail.rawArgvDiverges) {
+    const divergence = textElement("p", RAW_ARGV_DIVERGENCE_WARNING);
+    divergence.className = "raw-argv-divergence-warning verification-warning";
+    divergence.setAttribute("role", "alert");
+    article.append(divergence);
+  }
+  if (detail.contextSummary !== undefined) {
+    // Hash-bound, so shown — but labelled as the integrator's description and kept below the
+    // action heading, which stays the primary thing the human reads.
+    const summary = metaLine(CONTEXT_SUMMARY_LABEL, detail.contextSummary);
+    summary.classList.add("approval-context-summary");
+    article.append(summary);
+  }
   article.append(metaLine("Actor", detail.actor));
   article.append(
     metaLine("Risk", `${detail.riskLevel}${detail.reversible === false ? " · irreversible" : ""}`),

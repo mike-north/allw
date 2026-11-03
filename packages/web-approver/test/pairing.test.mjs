@@ -86,7 +86,7 @@ function fakeRuntime() {
         requestHash: `hash-${envelope.id}`,
         context: {
           kind: "command",
-          command: { cwd: "/", argv: ["echo", "hi"], raw: "echo hi" },
+          substrate: { cwd: "/", argv: ["echo", "hi"], raw: "echo hi" },
           actor: { id: "test-actor", display: "Test Actor", attestation: "unverified" },
           risk: { level: "low", reversible: true, summary: "test" },
           allowed_decisions: ["approved", "denied"],

@@ -23,7 +23,7 @@ function envelope(id, overrides = {}) {
 function context(overrides = {}) {
   return {
     kind: "command",
-    command: {
+    substrate: {
       cwd: "/repo",
       argv: ["git", "push", "origin", "main"],
       raw: "git push origin main",
@@ -351,14 +351,14 @@ test("malformed action contexts render as unknown actions without throwing", asy
           missingCommand.id,
           {
             requestHash: "hash-missing-command",
-            context: context({ kind: "command", command: undefined }),
+            context: context({ kind: "command", substrate: {} }),
           },
         ],
         [
           missingMcp.id,
           {
             requestHash: "hash-missing-mcp",
-            context: context({ kind: "mcp", command: undefined, mcp: undefined }),
+            context: context({ kind: "mcp", substrate: {} }),
           },
         ],
       ]),
@@ -400,7 +400,7 @@ test("browser rendering treats attacker argv as inert text", async () => {
             {
               requestHash: "hash-xss",
               context: context({
-                command: {
+                substrate: {
                   cwd: "/repo",
                   argv: ["echo", attackArg],
                 },
