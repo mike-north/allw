@@ -32,6 +32,14 @@ export {
   commandActionFromLine,
   commandRequest,
 } from "./command-request.js";
+export {
+  CLIENT_CONFIG_PATH_ENV,
+  CLIENT_CONFIG_VERSION,
+  ClientConfigError,
+  defaultClientConfigPath,
+  loadClientConfig,
+} from "./config.js";
+export type { ConfigEnv, IntegratorConfig, LoadClientConfigOptions } from "./config.js";
 export type {
   CommandActionErrorReason,
   CommandActionFromLineOptions,
