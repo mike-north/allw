@@ -61,6 +61,12 @@ export {
   type PairingStartResult,
 } from "./lib/relay-client.js";
 
+export {
+  MAX_ECHOED_RELAY_URL_CODE_POINTS,
+  assertCliRelayUrl,
+  type RelayUrlSource,
+} from "./lib/relay-url.js";
+
 export { runPair, type PairOptions, type Logger } from "./commands/pair.js";
 export { runKeygen, type KeygenOptions } from "./commands/keygen.js";
 export {

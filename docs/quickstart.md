@@ -155,7 +155,8 @@ npx --no-install allw-approver pair \
 ```
 
 - `<RELAY_URL>` is from step 0 — `https://allw-relay.mnorth.workers.dev` by default, or your own
-  URL if you chose to self-host.
+  URL if you chose to self-host. It must be `https://`; `pair` and `watch` refuse plain `http://`
+  except for a local relay on `localhost` or `127.0.0.1`.
 - The **account id is derived from the account-root key** in your keyfile (a 43-character
   base64url string) — you don't choose it. Only the holder of that key can add devices to the
   account. `--account <id>` is optional and only checks that you got the id you expected.
