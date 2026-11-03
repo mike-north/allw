@@ -63,12 +63,19 @@ Open `packages/relay/wrangler.jsonc` and replace every `REPLACE_ME` value under 
 the origins a browser approver may call the relay from. It ships as the hosted web approver,
 `https://allw-web-approver.pages.dev`. If you serve your own web approver (`docs/web-approver-deploy.md`),
 put its origin here: scheme, host and port only, with no path or trailing slash, e.g.
-`https://approver.example.com`. A port of `*` matches any port and is meant for loopback dev only
+`https://approver.example.com`. Each entry is normalized to the origin a browser sends (lowercase
+host, punycode for an internationalized host, default port dropped), so `https://Approver.example.com:443`
+works too. An entry that is not an origin (a path or trailing slash, a query or fragment,
+credentials, a non-http(s) scheme, a wildcard host, `null`) is ignored and logged once
+(`wrangler tail`); it never widens the list. Matching is exact: Cloudflare Pages preview and branch
+origins (`<hash>.allw-web-approver.pages.dev`) are not admitted by the hosted origin and there is no
+suffix wildcard. A port of `*` matches any port and is meant for loopback dev only
 (the top-level dev config allows `http://localhost:*` and `http://127.0.0.1:*`). Setting the var
 replaces the default, and an empty value allows no browser origin. This is not a secret and not an
 access control: non-browser clients are unaffected, and every request is still authorized by its
-bearer token. Other plain vars (`APNS_*`, `FCM_ENDPOINT`) go in the same `vars` block, because
-Wrangler does not inherit top-level vars into an environment.
+bearer token. Other plain vars (`APNS_*`, `FCM_ENDPOINT`, `VAPID_PUBLIC_KEY`, `VAPID_SUBJECT`) go in
+the same `vars` block, because Wrangler does not inherit top-level vars into an environment, and a
+second `"vars"` key in `env.production` silently replaces the first (dropping `CORS_ALLOWED_ORIGINS`).
 
 **[OPERATOR]** Commit the filled-in placeholders (no secrets — they go in the next step):
 
@@ -122,7 +129,8 @@ Required only if you want push wakeups to Android devices.
 ```sh
 # FCM_ENDPOINT is the FCM HTTP v1 send URL for your Firebase project:
 #   https://fcm.googleapis.com/v1/projects/<YOUR_PROJECT_ID>/messages:send
-# Add it to wrangler.jsonc under env.production as a plain var (it contains your project id, not a secret).
+# Add it to the existing "vars" block under env.production in wrangler.jsonc (it contains your
+# project id, not a secret).
 
 # FCM_BEARER_TOKEN is an OAuth 2.0 access token for a service account with Firebase Cloud Messaging
 # API enabled. Generate one with: gcloud auth print-access-token --scopes=https://www.googleapis.com/auth/firebase.messaging
@@ -149,9 +157,9 @@ subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign"]).then(
   console.log("VAPID_PRIVATE_KEY=" + (await subtle.exportKey("jwk", k.privateKey)).d);
 });'
 
-# The public key and subject are plain vars. Add them to wrangler.jsonc under env.production:
-#   "vars": { "VAPID_PUBLIC_KEY": "<the printed public key>",
-#             "VAPID_SUBJECT": "mailto:ops@yourcompany.example" }
+# The public key and subject are plain vars. Add them to the existing "vars" block under
+# env.production in wrangler.jsonc (a second "vars" key would silently drop CORS_ALLOWED_ORIGINS):
+#   "VAPID_PUBLIC_KEY": "<the printed public key>", "VAPID_SUBJECT": "mailto:ops@yourcompany.example"
 # VAPID_SUBJECT is the operator contact push services may use; it must be mailto: or https:.
 
 node_modules/.bin/wrangler secret put VAPID_PRIVATE_KEY --env production
@@ -230,7 +238,12 @@ All tests must pass. If any fail, do not deploy until they are fixed.
 ```sh
 cd packages/relay
 node_modules/.bin/wrangler deploy --env production
+# equivalently, from the repo root: pnpm --filter @allw/relay run deploy
 ```
+
+The package's `deploy` script always passes `--env production`. A bare `wrangler deploy` would
+publish the top-level dev config under the same worker name, replacing production's vars (with
+loopback CORS origins) and routes, so the script never does that. Use `wrangler dev` for local work.
 
 Wrangler will print the deployed URL, e.g.:
 
