@@ -28,6 +28,8 @@
 
 import {
   UndeliverablePushTokenError,
+  isPushServiceRejection,
+  warnPushServiceRejection,
   type Fetcher,
   type PushTransport,
   type PushWakeup,
@@ -299,9 +301,20 @@ export class WebPushTransport implements PushTransport {
       // Bound each push: a slow or hung push service must not hold a fan-out slot indefinitely.
       signal: AbortSignal.timeout(this.timeoutMs),
     });
-    // The relay never reads push-service bodies; release the connection rather than leaving an
-    // unconsumed body holding one of the Worker's few outbound connection slots.
-    await response.body?.cancel();
+    if (isPushServiceRejection(response.status)) {
+      // A rejection is logged with its reason, read from a bounded prefix of the body (which is
+      // then released). Every other body is never read.
+      warnPushServiceRejection(
+        "webpush",
+        endpoint.host,
+        response.status,
+        await readPushServiceReason(response, endpoint),
+      );
+    } else {
+      // Release the connection rather than leaving an unconsumed body holding one of the Worker's
+      // few outbound connection slots.
+      releaseBody(response.body);
+    }
     if (response.ok) return;
     if (response.status === 404 || response.status === 410) {
       throw new UndeliverablePushTokenError(
@@ -309,6 +322,83 @@ export class WebPushTransport implements PushTransport {
       );
     }
     throw new Error(`Web Push wakeup failed with HTTP ${String(response.status)}`);
+  }
+}
+
+/** At most this much of a rejection's body is read, looking for its `reason`. */
+const PUSH_REASON_MAX_BYTES = 1024;
+/** Reading a rejection's body gives up after this long; a stalled body never holds a send. */
+const PUSH_REASON_READ_MS = 1_000;
+/**
+ * A logged reason must look like a short identifier (Apple's are `BadWebPushTopic`, `BadJwtToken`,
+ * …; the longest documented one, `TooManyProviderTokenUpdates`, is 27 characters), so a push service
+ * cannot put arbitrary text in the log, and a realistic subscription token is too long to pass.
+ */
+const PUSH_REASON_PATTERN = /^[A-Za-z0-9_.-]{1,32}$/;
+
+/**
+ * Release a response body without waiting for it. Cancelling is how the relay frees the outbound
+ * connection, but a body whose `cancel()` never settles must not hold the send, so the cancel is
+ * fired and its outcome ignored.
+ */
+function releaseBody(body: ReadableStream | null): void {
+  void body?.cancel().catch(() => undefined);
+}
+
+/**
+ * The `reason` of a push service's JSON error body (Apple: `{"reason":"BadWebPushTopic"}`), or
+ * `undefined` when there is none. Reads at most {@link PUSH_REASON_MAX_BYTES} for at most
+ * {@link PUSH_REASON_READ_MS}, then always cancels the body without waiting for the cancel, so a
+ * large or stalled body can neither hold the send nor leave the connection unreleased.
+ *
+ * A reason that occurs anywhere in the subscription `endpoint` is dropped: the endpoint's path is a
+ * bearer capability, and a push service echoing it (or part of it) must not put it in the log.
+ */
+async function readPushServiceReason(
+  response: Response,
+  endpoint: URL,
+): Promise<string | undefined> {
+  const body = response.body;
+  if (!body) return undefined;
+  // Response bodies are byte streams; the Workers types leave the chunk type open.
+  const reader = (body as ReadableStream<Uint8Array>).getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const deadline = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => {
+      resolve("timeout");
+    }, PUSH_REASON_READ_MS);
+  });
+  try {
+    while (size < PUSH_REASON_MAX_BYTES) {
+      const next = await Promise.race([reader.read(), deadline]);
+      if (next === "timeout" || next.done) break;
+      chunks.push(next.value);
+      size += next.value.byteLength;
+    }
+  } catch {
+    // A body that fails mid-read just has no reason to report.
+  } finally {
+    clearTimeout(timer);
+    void reader.cancel().catch(() => undefined);
+  }
+  const bytes = new Uint8Array(Math.min(size, PUSH_REASON_MAX_BYTES));
+  let offset = 0;
+  for (const chunk of chunks) {
+    if (offset >= bytes.length) break;
+    const part = chunk.subarray(0, bytes.length - offset);
+    bytes.set(part, offset);
+    offset += part.length;
+  }
+  try {
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+    const reason = (parsed as Record<string, unknown>).reason;
+    if (typeof reason !== "string" || !PUSH_REASON_PATTERN.test(reason)) return undefined;
+    return endpoint.href.includes(reason) ? undefined : reason;
+  } catch {
+    return undefined;
   }
 }
 
