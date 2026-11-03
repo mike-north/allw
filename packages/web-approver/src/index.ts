@@ -110,6 +110,12 @@ export interface ApprovalRisk {
   readonly summary: string;
 }
 
+/**
+ * The view model's action and actor strings are **display text produced by the core**
+ * (`display_model`, #246): every control, bidi, and zero-width character is already a visible
+ * escape (`\x1b`, `⟨U+202E⟩`). The renderers below lay them out but never escape anything
+ * themselves, and must never be handed raw decrypted strings.
+ */
 export interface CommandAction {
   readonly cwd?: string;
   readonly argv: readonly string[];
@@ -119,7 +125,8 @@ export interface CommandAction {
 export interface McpCallAction {
   readonly server: string;
   readonly tool: string;
-  readonly params: unknown;
+  /** The call's `params` as indented JSON (core-escaped); absent when the call has none. */
+  readonly paramsDisplay?: string;
 }
 
 /**
@@ -133,7 +140,8 @@ export interface McpCallAction {
 export interface AgentToolCallAction {
   readonly server: string;
   readonly tool: string;
-  readonly params: unknown;
+  /** The call's `params` as indented JSON (core-escaped); absent when the call has none. */
+  readonly paramsDisplay?: string;
 }
 
 export interface NumberMatchChallenge {
@@ -151,6 +159,11 @@ export interface ApprovalContext {
   readonly risk: ApprovalRisk;
   readonly allowed_decisions: readonly ApprovalDecision[];
   readonly challenge?: NumberMatchChallenge;
+  /**
+   * The core found (and escaped) hidden or control characters somewhere in the request (#246).
+   * Renderers must show a prominent warning when this is true.
+   */
+  readonly hasHiddenOrControlChars: boolean;
 }
 
 export interface PreparedApproval {
@@ -214,6 +227,8 @@ export interface ApprovalDetail extends ApprovalListItem {
   readonly reversible?: boolean;
   readonly verificationError?: string;
   readonly challenge?: NumberMatchChallenge;
+  /** True when the core escaped hidden/control characters in this request (#246). */
+  readonly hasHiddenOrControlChars: boolean;
 }
 
 /**
@@ -457,6 +472,7 @@ export class WebApproverController {
     const base = {
       ...item,
       exactPlaintext: context ? exactPlaintext(context) : "Context could not be verified.",
+      hasHiddenOrControlChars: context?.hasHiddenOrControlChars === true,
     };
 
     if (!prepared) {
@@ -538,24 +554,22 @@ export function actionSummary(context: ApprovalContext): string {
 
 export function exactPlaintext(context: ApprovalContext): string {
   if (context.kind === "command" && context.command) {
+    // argv is shown token-by-token with boundary quoting rather than as JSON: the tokens are
+    // already core-escaped, and JSON would double their backslashes (`\\x1b`), misstating them.
     const cwd = context.command.cwd ? `cwd: ${context.command.cwd}\n` : "";
-    return `${cwd}argv: ${JSON.stringify(context.command.argv)}\nraw: ${
+    return `${cwd}argv: ${shellQuote(context.command.argv)}\nraw: ${
       context.command.raw ?? shellQuote(context.command.argv)
     }`;
   }
   if (context.kind === "mcp" && context.mcp) {
-    return `mcp: ${context.mcp.server}.${context.mcp.tool}\nparams: ${JSON.stringify(
-      context.mcp.params,
-      null,
-      2,
-    )}`;
+    return `mcp: ${context.mcp.server}.${context.mcp.tool}\nparams: ${
+      context.mcp.paramsDisplay ?? "(none)"
+    }`;
   }
   if (context.kind === "agent_tool_call" && context.agentToolCall) {
-    return `agent_tool_call: ${context.agentToolCall.server}.${context.agentToolCall.tool}\nparams: ${JSON.stringify(
-      context.agentToolCall.params,
-      null,
-      2,
-    )}`;
+    return `agent_tool_call: ${context.agentToolCall.server}.${context.agentToolCall.tool}\nparams: ${
+      context.agentToolCall.paramsDisplay ?? "(none)"
+    }`;
   }
   return "Unknown action";
 }

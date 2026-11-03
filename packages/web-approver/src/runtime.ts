@@ -240,32 +240,53 @@ function toAllowedDecisions(values: readonly string[]): readonly ApprovalDecisio
 }
 
 /**
- * Map an untrusted, decrypted wire syntactic substrate onto the controller's {@link CommandAction}.
- * The substrate is opaque plaintext (`docs/policy-seam.md`); we read only the display-relevant
- * fields the renderer surfaces and default the rest, never interpreting the structure.
+ * The core's escaped display model of a decrypted context (Rust `allw_core::DisplayModel`, from the
+ * WASM `display_model`, #246). Only the fields this runtime maps are declared. Every string is
+ * already escaped by the core — this is the only source of context text the view model may carry.
  */
-function toCommandAction(syntactic: unknown): CommandAction | undefined {
-  if (!isRecord(syntactic)) return undefined;
-  const argv = Array.isArray(syntactic.argv)
-    ? syntactic.argv.filter((a): a is string => typeof a === "string")
-    : [];
-  const command: CommandAction = { argv };
-  const withCwd = typeof syntactic.cwd === "string" ? { ...command, cwd: syntactic.cwd } : command;
-  return typeof syntactic.raw === "string" ? { ...withCwd, raw: syntactic.raw } : withCwd;
-}
-
-/** Map an untrusted, decrypted wire syntactic substrate onto a `(server, tool, params)` action —
- * shared by `mcp_tool_call` ({@link McpCallAction}) and `agent_tool_call`
- * ({@link AgentToolCallAction}), which reduce to the identical wire shape (spec §5.2). */
-function toToolCallAction(syntactic: unknown): McpCallAction | AgentToolCallAction | undefined {
-  if (!isRecord(syntactic)) return undefined;
-  if (typeof syntactic.server !== "string" || typeof syntactic.tool !== "string") return undefined;
-  return { server: syntactic.server, tool: syntactic.tool, params: syntactic.params };
+interface CoreDisplayModel {
+  readonly summary: string;
+  readonly actor_id: string;
+  readonly actor_label: string;
+  readonly syntactic: {
+    readonly argv?: readonly string[];
+    readonly cwd?: string;
+    readonly raw?: string;
+    readonly server?: string;
+    readonly tool?: string;
+    readonly params_json_lines?: readonly string[];
+  };
+  readonly has_hidden_or_control_chars: boolean;
 }
 
 /**
- * Map the decrypted wire context + verified attestation + (optional) derived challenge onto the
- * controller's {@link ApprovalContext} view model. Surfaces other than `command`/`mcp_tool_call`/
+ * Map the core display model's substrate onto the controller's {@link CommandAction}. Reads only
+ * the display-relevant fields the renderer surfaces, all already escaped by the core.
+ */
+function toCommandAction(syntactic: CoreDisplayModel["syntactic"]): CommandAction {
+  const command: CommandAction = { argv: syntactic.argv ?? [] };
+  const withCwd = syntactic.cwd !== undefined ? { ...command, cwd: syntactic.cwd } : command;
+  return syntactic.raw !== undefined ? { ...withCwd, raw: syntactic.raw } : withCwd;
+}
+
+/** Map the core display model's substrate onto a `(server, tool, params)` action — shared by
+ * `mcp_tool_call` ({@link McpCallAction}) and `agent_tool_call` ({@link AgentToolCallAction}),
+ * which reduce to the identical wire shape (spec §5.2). */
+function toToolCallAction(
+  syntactic: CoreDisplayModel["syntactic"],
+): McpCallAction | AgentToolCallAction | undefined {
+  if (syntactic.server === undefined || syntactic.tool === undefined) return undefined;
+  const action = { server: syntactic.server, tool: syntactic.tool };
+  return syntactic.params_json_lines !== undefined
+    ? { ...action, paramsDisplay: syntactic.params_json_lines.join("\n") }
+    : action;
+}
+
+/**
+ * Map the decrypted wire context + the core's escaped display model + verified attestation +
+ * (optional) derived challenge onto the controller's {@link ApprovalContext} view model. Every
+ * string in the result comes from `display` (escaped by the core, #246); `wire` supplies only the
+ * non-text fields (surface, risk level, reversibility, allowed decisions). Surfaces other than `command`/`mcp_tool_call`/
  * `agent_tool_call` (e.g. `file_edit`) render as `command` with an empty action so the controller
  * shows them as an "Unknown action" rather than fabricating structure — the WYSIWYS hash still
  * binds the full plaintext regardless of this display mapping.
@@ -280,18 +301,19 @@ function toToolCallAction(syntactic: unknown): McpCallAction | AgentToolCallActi
  */
 function toApprovalContext(
   wire: WireApprovalContext,
+  display: CoreDisplayModel,
   attestation: ApprovalActor["attestation"],
   challenge: NumberMatchChallenge | undefined,
 ): ApprovalContext {
   const actor: ApprovalActor = {
-    id: wire.actor.id,
-    display: `${wire.actor.id} (${wire.actor.kind})`,
+    id: display.actor_id,
+    display: display.actor_label,
     attestation,
   };
   const risk: ApprovalRisk = {
     level: toRiskLevel(wire.risk),
     reversible: wire.reversible,
-    summary: wire.summary,
+    summary: display.summary,
   };
   const allowed = toAllowedDecisions(wire.constraints.allowed_decisions);
   const kind: ApprovalContext["kind"] =
@@ -303,17 +325,22 @@ function toApprovalContext(
 
   // Spread the surface-specific action only when present so `exactOptionalPropertyTypes` keeps the
   // optional `command`/`mcp`/`agentToolCall`/`challenge` keys absent (not explicitly `undefined`).
-  const base = { kind, actor, risk, allowed_decisions: allowed } as const;
+  const base = {
+    kind,
+    actor,
+    risk,
+    allowed_decisions: allowed,
+    hasHiddenOrControlChars: display.has_hidden_or_control_chars,
+  } as const;
   let withAction: ApprovalContext;
   if (kind === "mcp") {
-    const mcp = toToolCallAction(wire.action.syntactic);
+    const mcp = toToolCallAction(display.syntactic);
     withAction = mcp ? { ...base, mcp } : base;
   } else if (kind === "agent_tool_call") {
-    const agentToolCall = toToolCallAction(wire.action.syntactic);
+    const agentToolCall = toToolCallAction(display.syntactic);
     withAction = agentToolCall ? { ...base, agentToolCall } : base;
   } else {
-    const command = toCommandAction(wire.action.syntactic);
-    withAction = command ? { ...base, command } : base;
+    withAction = { ...base, command: toCommandAction(display.syntactic) };
   }
   return challenge ? { ...withAction, challenge } : withAction;
 }
@@ -454,6 +481,9 @@ export function createWasmRuntime(options: WasmRuntimeOptions): WebApproverRunti
     // context tampered between encrypt and render yields a different hash than the integrator's, so
     // the eventual verify_verdict (bound to the integrator's hash) fails closed — WYSIWYS.
     const requestHash = wasm.compute_request_hash(contextJson, envelope.expires_at);
+    // The core builds the display model from the same plaintext it just hashed: every string the
+    // view shows is escaped there, never here (#246; thin-shell rule).
+    const display = JSON.parse(wasm.display_model(contextJson)) as CoreDisplayModel;
 
     const challenge: NumberMatchChallenge | undefined = wire.constraints.challenge_required
       ? {
@@ -492,7 +522,7 @@ export function createWasmRuntime(options: WasmRuntimeOptions): WebApproverRunti
       // The core-verified expiry IS the envelope's expires_at, the value bound into request_hash.
       // The controller must not trust a relay-visible timestamp that is not hash-bound; this one is.
       expiresAt: envelope.expires_at,
-      context: toApprovalContext(wire, attestation, challenge),
+      context: toApprovalContext(wire, display, attestation, challenge),
     };
   }
 

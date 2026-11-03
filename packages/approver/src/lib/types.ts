@@ -66,6 +66,55 @@ export interface ApprovalContext {
 }
 
 /**
+ * The escaped syntactic substrate (Rust `allw_core::DisplaySubstrate`). Each field is present
+ * exactly when the hashed substrate field is; every string has already been escaped by the core.
+ */
+export interface DisplaySubstrate {
+  readonly bin?: string;
+  readonly argv?: readonly string[];
+  readonly flags?: readonly string[];
+  readonly positionals?: readonly string[];
+  readonly cwd?: string;
+  readonly host?: string;
+  readonly env_refs?: readonly string[];
+  readonly server?: string;
+  readonly tool?: string;
+  /** `params` as compact, escaped JSON (sorted keys). */
+  readonly params_json?: string;
+  /** `params` as indented JSON, one escaped line per entry. */
+  readonly params_json_lines?: readonly string[];
+  readonly operation?: string;
+  readonly paths?: readonly string[];
+  readonly diff_summary?: string;
+  readonly diff_hash?: string;
+  /** `raw` as one escaped line (a line feed shows as `\n`). */
+  readonly raw?: string;
+  /** `file_edit` only: `raw` split on line feeds, each line escaped. */
+  readonly raw_lines?: readonly string[];
+}
+
+/**
+ * The core's display model of an {@link ApprovalContext} (Rust `allw_core::DisplayModel`, built by
+ * the WASM `display_model`). It is the only source of context text the approver may print: every
+ * string is escaped with the core notation (`\x1b`, `\r`, `⟨U+202E⟩`, …), and
+ * `has_hidden_or_control_chars` reports whether any escape was needed (#246). Display only — never
+ * hashed, signed, or sent.
+ */
+export interface DisplayModel {
+  readonly surface: Surface;
+  readonly risk: Risk;
+  readonly reversible: boolean;
+  readonly summary: string;
+  readonly actor_id: string;
+  readonly actor_kind: string;
+  /** `"<id> (<kind>)"`, both parts escaped. */
+  readonly actor_label: string;
+  readonly syntactic: DisplaySubstrate;
+  readonly chain?: readonly string[];
+  readonly has_hidden_or_control_chars: boolean;
+}
+
+/**
  * The relay-visible envelope wrapping the ciphertext (`docs/contract.md` §Messages →
  * ApprovalRequest). The approver reads `expires_at` from here (bound into `request_hash`) and
  * decrypts `context_ciphertext`.
