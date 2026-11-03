@@ -18,7 +18,12 @@
  *   - unpaired + `?relay=http://relay.example.com` → rejected with the https-only reason;
  *   - an identity pinned to a relay the current rule rejects (`http://[::1]`) → a re-pair-required
  *     screen first; the identity is cleared only on confirmation (#286). A corrupt identity is
- *     still discarded by the pairing gate.
+ *     still discarded by the pairing gate;
+ *   - a core load that stalls (#308), on a mocked clock → the re-pair screen appears at
+ *     `DISPLAY_ESCAPE_LOAD_TIMEOUT_MS` with the pin withheld and the confirm still working, offline;
+ *     a core arriving after the deadline leaves the screen byte-identical; one arriving before it
+ *     is used and clears the deadline timer; and the ignored-relay notice reads "(checking…)" until
+ *     the deadline, then the withheld text.
  *
  * @see https://github.com/mike-north/allw/issues/249
  * @see ../src/app.ts
@@ -28,15 +33,17 @@
 
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
-import test, { afterEach, beforeEach, describe } from "node:test";
+import test, { afterEach, beforeEach, describe, mock } from "node:test";
 
 import { JSDOM } from "jsdom";
 
-import { boot, bootInbox } from "../dist/app.js";
+import { DISPLAY_ESCAPE_LOAD_TIMEOUT_MS, boot, bootInbox } from "../dist/app.js";
 import {
   INSECURE_RELAY_URL_REASON,
+  PENDING_IGNORED_RELAY_TEXT,
   RELAY_URL_STORAGE_KEY,
   WITHHELD_PIN_TEXT,
+  WITHHELD_UNTRUSTED_TEXT,
 } from "../dist/index.js";
 
 import { loadTestWasm } from "./wasm-helper.mjs";
@@ -118,14 +125,26 @@ async function loadCoreDisplayEscape() {
 }
 
 /**
- * Boot with `search` + `storage`, recording every identity handed to the inbox. The re-pair
- * screen's display escape comes from the real core unless `loadDisplayEscape` overrides it.
+ * Boot with `search` + `storage`, recording every identity handed to the inbox or to the
+ * notification controls, and counting requests to forget notifications (`onForget` sees each). The
+ * re-pair screen's display escape comes from the real core unless `loadDisplayEscape` overrides it.
  */
-async function bootWith({ search, storage, loadDisplayEscape = loadCoreDisplayEscape }) {
+async function bootWith({
+  search,
+  storage,
+  loadDisplayEscape = loadCoreDisplayEscape,
+  onForget = () => undefined,
+}) {
   const document = dom.window.document;
   const root = document.getElementById("app");
   const noticeHost = document.getElementById("notices");
   const inboxStarts = [];
+  const notificationStarts = [];
+  /**
+   * How many times boot asked to forget notifications (clear the credential mirror), and the
+   * forgotten relay credentials each request carried.
+   */
+  const forgets = { count: 0, forgotten: [] };
   await boot({
     root,
     noticeHost,
@@ -134,9 +153,30 @@ async function bootWith({ search, storage, loadDisplayEscape = loadCoreDisplayEs
     startInbox: async (_root, identity) => {
       inboxStarts.push(identity);
     },
+    startNotifications: (identity) => {
+      notificationStarts.push(identity);
+    },
+    forgetNotifications: async (forgotten) => {
+      forgets.count += 1;
+      forgets.forgotten.push(forgotten);
+      onForget(forgets.count);
+    },
     loadDisplayEscape,
   });
-  return { root, noticeHost, inboxStarts };
+  return { root, noticeHost, inboxStarts, notificationStarts, forgets };
+}
+
+/**
+ * Wait until the ignored-relay notice's name satisfies `done`. Boot renders the notice at once and
+ * fills the name in when the core escape settles (#307), without awaiting it.
+ */
+async function waitForNoticeName(noticeHost, done) {
+  for (let tick = 0; tick < 500; tick++) {
+    const name = noticeHost.querySelector(".relay-pin-notice-origin")?.textContent;
+    if (name !== undefined && done(name)) return name;
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  assert.fail("the notice's name was never filled in");
 }
 
 function click(root, label) {
@@ -169,7 +209,201 @@ async function waitFor(probe, ticks = 100) {
   assert.fail("condition not met within the tick budget");
 }
 
+describe("boot — notification controls (#237)", () => {
+  test("mount only once the human unlocks, with the pinned identity, after the inbox starts", async () => {
+    const storage = memoryStorage();
+    storage.setItem(PAIRING_KEY, JSON.stringify(PINNED_IDENTITY));
+
+    const { root, inboxStarts, notificationStarts } = await bootWith({ search: "", storage });
+    assert.equal(notificationStarts.length, 0, "nothing before the returning-device unlock");
+
+    click(root, "Unlock inbox");
+    assert.equal(inboxStarts.length, 1);
+    assert.equal(notificationStarts.length, 1);
+    assert.equal(notificationStarts[0].relayUrl, PINNED_RELAY);
+    assert.equal(notificationStarts[0].deviceId, PINNED_IDENTITY.deviceId);
+    assert.deepEqual(networkAttempts, []);
+  });
+
+  test("an unpaired browser gets no notification controls until it pairs", async () => {
+    const storage = memoryStorage();
+    storage.setItem(ONBOARDING_KEY, "1");
+    const { root, notificationStarts } = await bootWith({
+      search: relayQuery("https://relay.selfhost.example"),
+      storage,
+    });
+    assert.equal(notificationStarts.length, 0);
+    submitPairingForm(root, LEGACY_IDENTITY);
+    assert.equal(notificationStarts.length, 1);
+    assert.equal(notificationStarts[0].relayUrl, "https://relay.selfhost.example");
+  });
+
+  test("a paired browser keeps its notification credentials", async () => {
+    const storage = memoryStorage();
+    storage.setItem(PAIRING_KEY, JSON.stringify(PINNED_IDENTITY));
+    const { root, forgets } = await bootWith({ search: "", storage });
+    click(root, "Unlock inbox");
+    assert.equal(forgets.count, 0);
+  });
+
+  test("a browser with no usable identity forgets any mirrored credentials at boot", async () => {
+    const storage = memoryStorage();
+    storage.setItem(ONBOARDING_KEY, "1");
+    storage.setItem(PAIRING_KEY, "{not json");
+    storage.setItem(RELAY_URL_STORAGE_KEY, PINNED_RELAY);
+    const { forgets } = await bootWith({ search: "", storage });
+    assert.ok(forgets.count >= 1, "a corrupt identity's notification credentials are forgotten");
+  });
+
+  test("a browser with no stored identity forgets at boot, before onboarding or any action", async () => {
+    // No identity and onboarding not done: the walkthrough comes first, so boot's own forget is
+    // the only one that runs before the human does anything (review of #315, finding 4). A relay
+    // is already persisted, so boot runs through to the walkthrough without prompting.
+    const storage = memoryStorage();
+    storage.setItem(RELAY_URL_STORAGE_KEY, PINNED_RELAY);
+    const { root, forgets } = await bootWith({ search: "", storage });
+    assert.equal(root.querySelector("form.pairing-form"), null, "the walkthrough is showing");
+    assert.equal(forgets.count, 1);
+    assert.deepEqual(forgets.forgotten, [null], "there is no identity to take a token from");
+  });
+
+  test("'Use another device' forgets the notification credentials with the pairing", async () => {
+    const storage = memoryStorage();
+    storage.setItem(PAIRING_KEY, JSON.stringify(PINNED_IDENTITY));
+    const { root, forgets } = await bootWith({ search: "", storage });
+    assert.equal(forgets.count, 0);
+    click(root, "Use another device");
+    assert.equal(storage.getItem(PAIRING_KEY), null);
+    // The confirm forgets; the pairing gate's own clear before its form may forget again, which is
+    // harmless (forgetting is idempotent).
+    assert.ok(forgets.count >= 1, "the confirmed re-pair forgets the notification credentials");
+    // The forgotten identity's four relay fields travel with the forget, so its registration can be
+    // withdrawn even when the mirror is already empty (review of #315, round 2). Never the seeds.
+    assert.deepEqual(forgets.forgotten[0], {
+      relayUrl: PINNED_RELAY,
+      accountId: PINNED_IDENTITY.accountId,
+      deviceId: PINNED_IDENTITY.deviceId,
+      deviceAuthToken: PINNED_IDENTITY.deviceAuthToken,
+    });
+  });
+
+  test("confirming a re-pair forgets the notification credentials; showing the screen does not", async () => {
+    const storage = memoryStorage();
+    storage.setItem(ONBOARDING_KEY, "1");
+    storage.setItem(
+      PAIRING_KEY,
+      JSON.stringify({ ...PINNED_IDENTITY, relayUrl: "http://[::1]:8787" }),
+    );
+    storage.setItem(RELAY_URL_STORAGE_KEY, "http://127.0.0.1:8787");
+    const forgetsSeen = [];
+    const bootPromise = bootWith({ search: "", storage, onForget: (n) => forgetsSeen.push(n) });
+    const root = dom.window.document.getElementById("app");
+    await waitFor(() => root.querySelector(".pairing-kicker"));
+    assert.deepEqual(forgetsSeen, [], "nothing is forgotten before the human confirms");
+
+    click(root, "Forget this pairing and pair again");
+    const { forgets } = await bootPromise;
+    assert.equal(storage.getItem(PAIRING_KEY), null);
+    // The confirm forgets; the pairing gate's own clear before its form may forget again, which is
+    // harmless (forgetting is idempotent).
+    assert.ok(forgets.count >= 1, "the confirmed re-pair forgets the notification credentials");
+  });
+
+  test("a stale tab's re-pair confirm that keeps a newer identity forgets nothing (B1)", async () => {
+    const storage = memoryStorage();
+    storage.setItem(ONBOARDING_KEY, "1");
+    storage.setItem(
+      PAIRING_KEY,
+      JSON.stringify({ ...PINNED_IDENTITY, relayUrl: "http://[::1]:8787" }),
+    );
+    storage.setItem(RELAY_URL_STORAGE_KEY, "http://127.0.0.1:8787");
+    const bootPromise = bootWith({ search: "", storage });
+    const root = dom.window.document.getElementById("app");
+    await waitFor(() => root.querySelector(".pairing-kicker"));
+
+    // Another tab re-pairs (and may have enabled notifications for the new identity) meanwhile.
+    storage.setItem(
+      PAIRING_KEY,
+      JSON.stringify({
+        ...PINNED_IDENTITY,
+        deviceId: "dev-newer",
+        relayUrl: "http://127.0.0.1:8787",
+      }),
+    );
+    click(root, "Forget this pairing and pair again");
+    const { forgets } = await bootPromise;
+    assert.equal(JSON.parse(storage.getItem(PAIRING_KEY)).deviceId, "dev-newer");
+    assert.equal(forgets.count, 0, "the newer identity's notification credentials are kept");
+  });
+});
+
 describe("boot — paired device with a ?relay= link to another origin (#249)", () => {
+  /**
+   * #307: the ignored link is attacker-chosen. Through the real boot path, it reaches the DOM only
+   * as the core's escape (RLO and ZWSP as `⟨U+XXXX⟩`, ESC as `\x1b`, per
+   * `crates/allw-core/src/display.rs`), or not at all.
+   */
+  test("a spoofing ?relay= value is shown only core-escaped (#307)", async () => {
+    const storage = memoryStorage();
+    storage.setItem(PAIRING_KEY, JSON.stringify(PINNED_IDENTITY));
+    storage.setItem(RELAY_URL_STORAGE_KEY, PINNED_RELAY);
+    const { noticeHost } = await bootWith({
+      search: relayQuery("evil\u202Etxt.exe\u001B[31m\u200Bok"),
+      storage,
+    });
+    assert.ok(noticeHost.querySelector(".relay-pin-notice"), "the notice appears");
+    const name = await waitForNoticeName(noticeHost, (n) => n !== PENDING_IGNORED_RELAY_TEXT);
+    assert.equal(name, "evil⟨U+202E⟩txt.exe\\x1b[31m⟨U+200B⟩ok");
+    for (const raw of ["\u202E", "\u001B", "\u200B"]) {
+      assert.ok(!noticeHost.innerHTML.includes(raw));
+    }
+  });
+
+  test("when the core load stalls, the link is withheld at the deadline (#308)", async () => {
+    mock.timers.enable({ apis: ["setTimeout"] });
+    try {
+      const storage = memoryStorage();
+      storage.setItem(PAIRING_KEY, JSON.stringify(PINNED_IDENTITY));
+      storage.setItem(RELAY_URL_STORAGE_KEY, PINNED_RELAY);
+      const { noticeHost } = await bootWith({
+        search: relayQuery("evil\u202Etxt.exe"),
+        storage,
+        loadDisplayEscape: () => new Promise(() => undefined),
+      });
+      const name = () => noticeHost.querySelector(".relay-pin-notice-origin").textContent;
+      assert.equal(name(), PENDING_IGNORED_RELAY_TEXT, "the notice is shown while the core loads");
+      mock.timers.tick(DISPLAY_ESCAPE_LOAD_TIMEOUT_MS);
+      for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(name(), WITHHELD_UNTRUSTED_TEXT);
+      assert.ok(!noticeHost.innerHTML.includes("evil"));
+    } finally {
+      mock.timers.reset();
+    }
+  });
+
+  test("when the core fails to load, the link is withheld and the notice still appears (#307)", async () => {
+    const storage = memoryStorage();
+    storage.setItem(PAIRING_KEY, JSON.stringify(PINNED_IDENTITY));
+    storage.setItem(RELAY_URL_STORAGE_KEY, PINNED_RELAY);
+    const { root, noticeHost } = await bootWith({
+      search: relayQuery("evil\u202Etxt.exe"),
+      storage,
+      loadDisplayEscape: async () => {
+        throw new Error("wasm fetch failed");
+      },
+    });
+    const notice = noticeHost.querySelector(".relay-pin-notice");
+    assert.match(notice.textContent, /^Relay link ignored\./);
+    const name = await waitForNoticeName(noticeHost, (n) => n !== PENDING_IGNORED_RELAY_TEXT);
+    assert.equal(name, WITHHELD_UNTRUSTED_TEXT);
+    assert.ok(!noticeHost.innerHTML.includes("evil"));
+    assert.equal(
+      root.querySelector(".pairing-kicker").textContent,
+      "Already paired",
+      "boot goes on",
+    );
+  });
+
   test("nothing reaches the other origin, the stored identity is unchanged, and a notice names it", async () => {
     const storage = memoryStorage();
     const storedRaw = JSON.stringify(PINNED_IDENTITY);
@@ -184,6 +418,8 @@ describe("boot — paired device with a ?relay= link to another origin (#249)", 
     // The notice names the ignored origin, and lives outside #app so it survives screen changes.
     const notice = noticeHost.querySelector(".relay-pin-notice");
     assert.ok(notice, "a visible notice must name the ignored relay");
+    // The name is filled in once the core escape loads (#307); an origin has nothing to escape.
+    await waitForNoticeName(noticeHost, (name) => name !== PENDING_IGNORED_RELAY_TEXT);
     assert.equal(notice.querySelector(".relay-pin-notice-origin").textContent, EVIL_RELAY);
 
     click(root, "Unlock inbox");
@@ -432,6 +668,138 @@ describe("boot — stored identity pinned to a relay this build rejects (#286)",
     assert.equal(root.querySelector(".pairing-relay-url").textContent, LOOPBACK_CANDIDATE);
     assert.equal(inboxStarts.length, 0);
     assert.deepEqual(networkAttempts, []);
+  });
+
+  /**
+   * #308: the core load before the re-pair screen is bounded. These control `setTimeout` (only), so
+   * the deadline passes exactly when the test ticks it; `setImmediate` still drains the boot's
+   * promise chain.
+   */
+  describe("a core load that stalls (#308)", () => {
+    const HOSTILE_PIN = "http://evil\u202Eexample.com";
+
+    /** Let every pending promise callback run. */
+    async function settle() {
+      for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
+    }
+
+    beforeEach(() => {
+      mock.timers.enable({ apis: ["setTimeout"] });
+    });
+
+    afterEach(() => {
+      mock.timers.reset();
+    });
+
+    test("the re-pair screen appears at the deadline with the pin withheld, and the confirm re-pairs", async () => {
+      const storage = memoryStorage();
+      storage.setItem(ONBOARDING_KEY, "1");
+      storage.setItem(PAIRING_KEY, JSON.stringify({ ...PINNED_IDENTITY, relayUrl: HOSTILE_PIN }));
+      storage.setItem(RELAY_URL_STORAGE_KEY, LOOPBACK_CANDIDATE);
+
+      const bootPromise = bootWith({
+        search: "",
+        storage,
+        loadDisplayEscape: () => new Promise(() => undefined),
+      });
+      const root = dom.window.document.getElementById("app");
+      await settle();
+      mock.timers.tick(DISPLAY_ESCAPE_LOAD_TIMEOUT_MS - 1);
+      await settle();
+      assert.equal(
+        root.querySelector(".pairing-kicker"),
+        null,
+        "still waiting before the deadline",
+      );
+
+      mock.timers.tick(1);
+      await settle();
+      assert.equal(root.querySelector(".pairing-kicker").textContent, "Re-pair required");
+      assert.equal(root.querySelector(".pairing-relay-url").textContent, WITHHELD_PIN_TEXT);
+      assert.ok(!root.textContent.includes("evil"), "no part of the pin is printed");
+
+      click(root, confirmLabel);
+      const { inboxStarts } = await bootPromise;
+      assert.equal(storage.getItem(PAIRING_KEY), null, "cleared on confirmation");
+      assert.ok(root.querySelector("form.pairing-form"), "then the browser pairs again");
+      assert.equal(inboxStarts.length, 0);
+      assert.deepEqual(networkAttempts, []);
+    });
+
+    test("a core that arrives after the deadline changes nothing on screen", async () => {
+      const storage = memoryStorage();
+      storage.setItem(ONBOARDING_KEY, "1");
+      storage.setItem(PAIRING_KEY, JSON.stringify({ ...PINNED_IDENTITY, relayUrl: HOSTILE_PIN }));
+      storage.setItem(RELAY_URL_STORAGE_KEY, LOOPBACK_CANDIDATE);
+      let arrive;
+      const late = new Promise((resolve) => {
+        arrive = resolve;
+      });
+
+      void bootWith({ search: "", storage, loadDisplayEscape: () => late });
+      const root = dom.window.document.getElementById("app");
+      await settle();
+      mock.timers.tick(DISPLAY_ESCAPE_LOAD_TIMEOUT_MS);
+      await settle();
+      const shown = root.innerHTML;
+      assert.equal(root.querySelector(".pairing-relay-url").textContent, WITHHELD_PIN_TEXT);
+
+      arrive(await loadCoreDisplayEscape());
+      await settle();
+      assert.equal(root.innerHTML, shown, "the late core does not re-render the screen");
+      assert.deepEqual(networkAttempts, []);
+    });
+
+    test("a core that arrives before the deadline is used", async () => {
+      const storage = memoryStorage();
+      storage.setItem(ONBOARDING_KEY, "1");
+      storage.setItem(PAIRING_KEY, JSON.stringify({ ...PINNED_IDENTITY, relayUrl: HOSTILE_PIN }));
+      storage.setItem(RELAY_URL_STORAGE_KEY, LOOPBACK_CANDIDATE);
+      const escape = await loadCoreDisplayEscape();
+      let arrive;
+
+      // Spy on the (mocked) timer functions boot calls, to see the deadline timer cleared once the
+      // core wins the race. A stray timer would be inert, so only the spy can see it.
+      const mockedSetTimeout = globalThis.setTimeout;
+      const mockedClearTimeout = globalThis.clearTimeout;
+      const deadlineTimers = [];
+      const cleared = [];
+      globalThis.setTimeout = (fn, ms, ...args) => {
+        const handle = mockedSetTimeout(fn, ms, ...args);
+        if (ms === DISPLAY_ESCAPE_LOAD_TIMEOUT_MS) deadlineTimers.push(handle);
+        return handle;
+      };
+      globalThis.clearTimeout = (handle) => {
+        cleared.push(handle);
+        mockedClearTimeout(handle);
+      };
+      try {
+        void bootWith({
+          search: "",
+          storage,
+          loadDisplayEscape: () =>
+            new Promise((resolve) => {
+              arrive = () => resolve(escape);
+            }),
+        });
+        const root = dom.window.document.getElementById("app");
+        await settle();
+        mock.timers.tick(DISPLAY_ESCAPE_LOAD_TIMEOUT_MS - 1);
+        assert.equal(deadlineTimers.length, 1, "boot arms one deadline timer");
+        assert.ok(!cleared.includes(deadlineTimers[0]), "still armed while the core is loading");
+        arrive();
+        await settle();
+        // crates/allw-core/src/display.rs: a bidi control is shown as ⟨U+XXXX⟩.
+        assert.equal(
+          root.querySelector(".pairing-relay-url").textContent,
+          "http://evil⟨U+202E⟩example.com",
+        );
+        assert.ok(cleared.includes(deadlineTimers[0]), "the deadline timer is cleared on arrival");
+      } finally {
+        globalThis.setTimeout = mockedSetTimeout;
+        globalThis.clearTimeout = mockedClearTimeout;
+      }
+    });
   });
 
   test("a corrupt identity keeps today's behaviour: boots unpaired and is cleared by the gate", async () => {

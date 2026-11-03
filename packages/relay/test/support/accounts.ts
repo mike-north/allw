@@ -149,3 +149,93 @@ export function signAccountState(signer: TestAccount, options: AccountStateOptio
   const json = JSON.stringify(claims).replace('"__SEQUENCE__"', sequence);
   return glue.sign_account_state(json, signer.rootSeed);
 }
+
+/**
+ * A deterministic, canonical UUIDv4-shaped request id for a readable test name. `POST /requests`
+ * accepts only canonical UUID ids (#248, contract §Transport), so tests keep human-readable names
+ * and submit `testRequestId(name)`; the same name always yields the same id.
+ */
+export function testRequestId(name: string): string {
+  const h = createHash("sha256").update(`allw-relay-test-request/${name}`).digest("hex");
+  const variant = ((parseInt(h.charAt(16), 16) & 0x3) | 0x8).toString(16);
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-${variant}${h.slice(17, 20)}-${h.slice(20, 32)}`;
+}
+
+/** Test device certificates are issued at this fixed time (Unix ms), with no expiry by default. */
+export const TEST_CERT_ISSUED_AT = 1_700_000_000_000;
+/**
+ * The fixed `decided_at` of test verdicts (Unix ms, 2099-12-31T23:55Z, after
+ * {@link TEST_CERT_ISSUED_AT}). The relay judges the certificate's expiry at `decided_at`, not its
+ * own clock, so fixtures stay deterministic. It sits inside the request window the relay tests
+ * submit (#248): created a minute before their pinned relay clock, which is five minutes before the
+ * 2100-01-01Z expiry, and the relay accepts a decision only inside `[created_at, expires_at]`.
+ */
+export const TEST_DECIDED_AT = 4_102_444_500_000;
+
+/** Options for a device-signed verdict. */
+export interface VerdictOptions {
+  /** The signed decision (default `approved`). */
+  readonly decision?: "approved" | "denied" | "expired" | "aborted";
+  /**
+   * The signed `decided_at` (default {@link TEST_DECIDED_AT}). The relay accepts it only inside the
+   * request envelope's `[created_at, expires_at]`, and the certificate must be valid at it.
+   */
+  readonly decidedAt?: number;
+  /**
+   * The root that certifies the device key (default: the account's own root). Another account's
+   * root yields a certificate the relay must not accept.
+   */
+  readonly certifiedBy?: TestAccount;
+  /** Sign with a key the certificate does not vouch for (an uncertified key). */
+  readonly uncertifiedKey?: boolean;
+  /** The certificate's `expires_at` (default: none). */
+  readonly certExpiresAt?: number;
+}
+
+/** A test device's deterministic Ed25519 signing seed. */
+function deviceSeed(accountId: string, deviceId: string, salt = "device"): string {
+  return createHash("sha256")
+    .update(`allw-relay-test-${salt}/${accountId}/${deviceId}`)
+    .digest("base64url");
+}
+
+/**
+ * A genuinely signed `Verdict` (the core's `sign_verdict`) from `deviceId` of `accountId` for
+ * `requestId`, with a device certificate issued by the account's root, as a real approver device
+ * sends it. The `request_hash` is a fixed placeholder: the relay never sees the plaintext, and its
+ * provenance check does not bind the hash. Options build the verdicts the relay must refuse.
+ */
+export function signTestVerdict(
+  accountId: string,
+  deviceId: string,
+  requestId: string,
+  options: VerdictOptions = {},
+): Record<string, unknown> {
+  const root = options.certifiedBy ?? rootFor(accountId);
+  const seed = deviceSeed(accountId, deviceId);
+  const cert = glue.issue_device_cert(
+    root.rootSeed,
+    accountId,
+    deviceId,
+    glue.ed25519_public_key(seed),
+    TEST_CERT_ISSUED_AT,
+    options.certExpiresAt ?? null,
+  );
+  const unsigned = {
+    v: 1,
+    request_id: requestId,
+    request_hash: "ZmFrZS1yZXF1ZXN0LWhhc2gtMzItYnl0ZXMtYjY0dXI",
+    decision: options.decision ?? "approved",
+    decided_at: options.decidedAt ?? TEST_DECIDED_AT,
+    approver: { account_id: accountId, device_id: deviceId },
+  };
+  const signingSeed = options.uncertifiedKey ? deviceSeed(accountId, deviceId, "rogue") : seed;
+  return JSON.parse(
+    glue.sign_verdict(
+      JSON.stringify(unsigned),
+      signingSeed,
+      createHash("sha256").update(crypto.randomUUID()).digest("base64url"),
+      cert,
+    ),
+  ) as Record<string, unknown>;
+}

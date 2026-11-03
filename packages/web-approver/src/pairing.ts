@@ -45,6 +45,7 @@
  * @see docs/contract.md §Invariants #6 (fail-closed)
  */
 
+import { displayUntrusted, WITHHELD_UNTRUSTED_TEXT, type DisplayEscape } from "./display-escape.js";
 import { checkRelayUrl, relayOrigin } from "./relay-config.js";
 import type { ApproverIdentity } from "./runtime.js";
 
@@ -97,8 +98,9 @@ const REQUIRED_IDENTITY_FIELDS: readonly (keyof ApproverIdentity)[] = [
  *   does not accept as stored (#286). The identity is unusable (fail-closed: nothing is sent to
  *   that relay), but it is a distinct state from `corrupt` so the gate can tell the human why and
  *   ask before clearing it. `pinnedRelayUrl` is the stored text, unvalidated: render it only
- *   through the core escape ({@link DisplayEscape}), or withhold it. `snapshot` identifies exactly what was stored, so the clear the human
- *   confirms can be limited to that value ({@link PairingStore.clearIfUnchanged}).
+ *   through the core escape ({@link DisplayEscape}), or withhold it. `snapshot` identifies exactly
+ *   what was stored, so when the human confirms, only that value is cleared
+ *   ({@link PairingStore.clearIfUnchanged}).
  * - `corrupt` — anything else: unparseable JSON, a missing or empty field, a non-string pin.
  */
 export type StoredPairing =
@@ -183,17 +185,13 @@ function classifyIdentity(value: unknown): ClassifiedIdentity {
   return { status: "paired", identity: record as unknown as PairedIdentity };
 }
 
-/**
- * Escapes one untrusted string for display: the core's `escape_for_display` (#246), reached through
- * WASM. Every surface prints untrusted text only through the core (`docs/threat-model.md` R3).
- */
-export type DisplayEscape = (text: string) => string;
+export type { DisplayEscape } from "./display-escape.js";
 
 /**
  * Shown in place of a rejected pin when the core escape is unavailable (the WASM core did not
  * load): untrusted text is withheld rather than printed unescaped or escaped by this surface.
  */
-export const WITHHELD_PIN_TEXT = "(hidden: the approver core did not load)";
+export const WITHHELD_PIN_TEXT = WITHHELD_UNTRUSTED_TEXT;
 
 /**
  * Injectable storage seam for the paired-device identity.
@@ -558,12 +556,7 @@ export type RejectedRelayPin = Extract<StoredPairing, { status: "relay-pin-rejec
  */
 function displayedPin(pin: string, escapeForDisplay: DisplayEscape | null): string {
   if (pin === "") return "(empty)";
-  if (escapeForDisplay === null) return WITHHELD_PIN_TEXT;
-  try {
-    return escapeForDisplay(pin);
-  } catch {
-    return WITHHELD_PIN_TEXT;
-  }
+  return displayUntrusted(pin, escapeForDisplay);
 }
 
 /**

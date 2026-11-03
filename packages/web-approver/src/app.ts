@@ -15,7 +15,7 @@
  * fetched from a same-origin asset URL rather than read from a Node path. This module sequences
  * those steps explicitly: resolve the relay URL → run the first-run onboarding walkthrough
  * (pre-enrollment only, #151) → run the pairing gate → load WASM → build the runtime from the
- * paired identity → mount the live inbox.
+ * paired identity → mount the live inbox, and beside it the notification controls (#237).
  *
  * # Relay pinning (#249)
  * The relay URL is resolved differently depending on whether this browser is already paired:
@@ -72,6 +72,17 @@ import {
   readStoredRelayUrl,
   resolveRelayUrl,
 } from "./relay-config.js";
+import {
+  createIndexedDbPushCredentialStore,
+  pushCredentialsFrom,
+  type PushCredentials,
+} from "./push-credentials.js";
+import {
+  browserForgetNotificationsDeps,
+  browserPushEnvironment,
+  forgetNotifications,
+  mountNotificationControls,
+} from "./push-subscribe.js";
 import { createBrowserRuntime } from "./runtime.js";
 import { createLocalAccountStateFloorStore } from "./sequence-floor.js";
 import { createLocalSurfaceIdStore, resolveSurfaceId } from "./surface-id.js";
@@ -123,10 +134,65 @@ export interface BootEnvironment {
   /**
    * Load the core's display escape (#246) for the re-pair screen (#286), which shows a stored relay
    * string before the inbox (and so before the runtime) loads. Production initializes the vendored
-   * WASM core, which is memoized and reused by the inbox. When omitted, or when it rejects, the
-   * re-pair screen withholds the pin text rather than print it unescaped.
+   * WASM core, which is memoized and reused by the inbox. The ignored-relay notice (#307) gets its
+   * escape from the same seam. When omitted, when it rejects, or when it does not resolve within
+   * {@link DISPLAY_ESCAPE_LOAD_TIMEOUT_MS} (#308), the re-pair screen withholds the pin text and
+   * the notice withholds the ignored link's name rather than print either unescaped.
    */
   readonly loadDisplayEscape?: () => Promise<DisplayEscape>;
+  /**
+   * Mount the notification controls (#237) for a paired identity, outside the inbox. Called after
+   * `startInbox`, and never awaited: notifications can't delay or block the inbox. Omit to skip.
+   * `isStillPaired` reports whether that identity is still this browser's pairing (another tab may
+   * forget or replace it), so the controls never re-mirror or re-register a forgotten identity.
+   */
+  readonly startNotifications?: (identity: PinnedIdentity, isStillPaired: () => boolean) => void;
+  /**
+   * Undo notifications for a forgotten pairing (#237): clear the service worker's credential
+   * mirror, then best-effort clear the browser's subscription and the relay's push tokens. Called
+   * whenever the pairing store clears an identity, and at boot when no identity is stored (absent or
+   * corrupt), so the mirrored bearer token never outlives the identity it came from. Never awaited.
+   * `forgotten` holds the relay credentials of the identity being cleared, when it was a pinned
+   * pairing: the token source for withdrawing its registration if the mirror is already empty.
+   */
+  readonly forgetNotifications?: (forgotten: PushCredentials | null) => Promise<void>;
+}
+
+/**
+ * `store`, except that clearing an identity also runs `forget` (not awaited). Every path that
+ * forgets the pairing ("Use another device", a corrupt identity, confirming a re-pair) goes through
+ * `clear` or a successful `clearIfUnchanged`, so none of them can leave a notification credential
+ * behind. A `clearIfUnchanged` that keeps a newer identity (another tab re-paired) forgets nothing.
+ */
+function clearingNotifications(
+  store: PairingStore,
+  forget: ((forgotten: PushCredentials | null) => Promise<void>) | undefined,
+): PairingStore {
+  if (forget === undefined) return store;
+  /** The relay credentials of the identity stored right now, if it is a pinned pairing. */
+  function storedCredentials(): PushCredentials | null {
+    const stored = store.load();
+    if (stored.status !== "paired") return null;
+    const { relayUrl } = stored.identity;
+    return relayUrl === undefined ? null : pushCredentialsFrom({ ...stored.identity, relayUrl });
+  }
+  return {
+    load: () => store.load(),
+    save: (identity) => {
+      store.save(identity);
+    },
+    clear: () => {
+      const forgotten = storedCredentials();
+      store.clear();
+      void forget(forgotten);
+    },
+    clearIfUnchanged: (snapshot) => {
+      const forgotten = storedCredentials();
+      const cleared = store.clearIfUnchanged(snapshot);
+      if (cleared) void forget(forgotten);
+      return cleared;
+    },
+  };
 }
 
 /**
@@ -209,13 +275,46 @@ function confirmRelayRepair(
   });
 }
 
-/** The core display escape from `env`, or `null` when it is not provided or fails to load. */
+/**
+ * How long boot waits for the core's display escape before it shows untrusted text withheld
+ * (#308): the re-pair screen's stored pin (#286) and the ignored-relay notice's link (#307).
+ *
+ * The core is a ~1 MB WASM fetch. Without a bound, a stalled fetch (a slow or captive network)
+ * left the re-pair screen blank with no explanation. Five seconds is long enough for a normal
+ * connection and short enough that a human isn't left looking at an empty page. Missing it only
+ * withholds that text: the re-pair confirm and the notice are shown either way, and a core that
+ * arrives later still serves the inbox (`initWasm` is memoized) without changing what was shown.
+ */
+export const DISPLAY_ESCAPE_LOAD_TIMEOUT_MS = 5_000;
+
+/**
+ * The core display escape from `env`, or `null` when it is not provided, fails to load, or does
+ * not load within {@link DISPLAY_ESCAPE_LOAD_TIMEOUT_MS}. Never rejects.
+ */
 async function loadDisplayEscape(env: BootEnvironment): Promise<DisplayEscape | null> {
-  if (env.loadDisplayEscape === undefined) return null;
+  const load = env.loadDisplayEscape;
+  if (load === undefined) return null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<null>((resolve) => {
+    timer = setTimeout(() => {
+      resolve(null);
+    }, DISPLAY_ESCAPE_LOAD_TIMEOUT_MS);
+  });
+  const loaded = (async () => {
+    try {
+      return await load();
+    } catch {
+      return null;
+    }
+  })();
   try {
-    return await env.loadDisplayEscape();
-  } catch {
-    return null;
+    // A core that settles in the same macrotask as the deadline loses the race: `loaded` is two
+    // microtask hops behind the deadline's direct `resolve(null)`. That is fail-safe and intended:
+    // the text is withheld, not printed raw, and the screen is rendered once either way. Don't
+    // "fix" the tie in the core's favour.
+    return await Promise.race([loaded, deadline]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -278,8 +377,15 @@ export async function bootInbox(
  */
 export async function boot(env: BootEnvironment): Promise<void> {
   const { root, storage } = env;
-  const pairingStore = createLocalPairingStore(storage);
+  const pairingStore = clearingNotifications(
+    createLocalPairingStore(storage),
+    env.forgetNotifications,
+  );
   let loaded = pairingStore.load();
+  // No identity stored (absent or corrupt): whatever a previous pairing mirrored for notifications
+  // is stale. A rejected pin is forgotten only if the human confirms (via `clearIfUnchanged`).
+  if (loaded.status === "absent" || loaded.status === "corrupt")
+    void env.forgetNotifications?.(null);
   let repairing = false;
   let escapeForDisplay: DisplayEscape | null = null;
   if (loaded.status === "relay-pin-rejected") {
@@ -300,11 +406,15 @@ export async function boot(env: BootEnvironment): Promise<void> {
         : await resolveRepairRelayUrl(env);
     const ignored = describeIgnoredRelayOverride(env.search, relayUrl);
     if (ignored !== null) {
-      mountIgnoredRelayNotice({
+      // Rendered now, never awaited: the ignored link's name is filled in once the core escape is
+      // available (#307). A re-pair visit already tried to load it; otherwise start the load here
+      // (`initWasm` shares it with the inbox's).
+      void mountIgnoredRelayNotice({
         host: env.noticeHost,
         ignored,
         pinnedRelayUrl: relayUrl,
         repairing: stored === null,
+        escapeForDisplay: repairing ? Promise.resolve(escapeForDisplay) : loadDisplayEscape(env),
       });
     }
   } else {
@@ -326,7 +436,17 @@ export async function boot(env: BootEnvironment): Promise<void> {
         if (identity.relayUrl === undefined) {
           throw new Error("allw web approver: paired identity has no pinned relay");
         }
-        void env.startInbox(root, { ...identity, relayUrl: identity.relayUrl });
+        const pinned: PinnedIdentity = { ...identity, relayUrl: identity.relayUrl };
+        void env.startInbox(root, pinned);
+        env.startNotifications?.(pinned, () => {
+          // Another tab may forget or replace the pairing while this one stays open.
+          const now = pairingStore.load();
+          return (
+            now.status === "paired" &&
+            now.identity.deviceId === pinned.deviceId &&
+            now.identity.deviceAuthToken === pinned.deviceAuthToken
+          );
+        });
       },
     });
   }
@@ -342,6 +462,19 @@ export async function boot(env: BootEnvironment): Promise<void> {
   });
 }
 
+/**
+ * Mount the notification controls (#237) into `#notifications`, against the browser's real
+ * service worker, Push API, Notifications API and IndexedDB.
+ */
+function startBrowserNotifications(identity: PinnedIdentity, isStillPaired: () => boolean): void {
+  mountNotificationControls({
+    host: requireElement("notifications"),
+    identity,
+    isStillPaired,
+    env: browserPushEnvironment(window, createIndexedDbPushCredentialStore(window.indexedDB)),
+  });
+}
+
 if (typeof window !== "undefined" && typeof document !== "undefined") {
   void boot({
     root: requireElement("app"),
@@ -349,6 +482,15 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
     storage: window.localStorage,
     search: window.location.search,
     startInbox: bootInbox,
+    startNotifications: startBrowserNotifications,
+    forgetNotifications: (forgotten) =>
+      forgetNotifications(
+        browserForgetNotificationsDeps(
+          window,
+          createIndexedDbPushCredentialStore(window.indexedDB),
+        ),
+        forgotten,
+      ),
     loadDisplayEscape: loadVendoredDisplayEscape,
   });
 }

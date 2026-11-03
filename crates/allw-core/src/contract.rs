@@ -107,13 +107,30 @@ pub enum Decision {
 ///
 /// v1: coarse heuristic assigned by the integrator/SDK.
 /// Later (T3): capability-derived from the semantic `ActionRecord` fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Tiers are ordered by severity, `Low < Medium < High < Critical`. The ordering follows the
+/// declaration order, so keep the variants in ascending severity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Risk {
     Low,
     Medium,
     High,
     Critical,
+}
+
+impl Risk {
+    /// The tier's wire name (`"low"`, `"medium"`, `"high"`, `"critical"`), the same string serde
+    /// writes. Error messages use it so they name the tier exactly as the JSON does.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        }
+    }
 }
 
 // ── SyntacticSubstrate ────────────────────────────────────────────────────────
@@ -344,6 +361,113 @@ pub struct ApprovalContext {
     /// Upstream-gate IDs for audit-chain correlation. Omitted when absent.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub chain: Option<Vec<String>>,
+}
+
+// ── v1 device-side conformance ────────────────────────────────────────────────
+
+/// A semantic `ActionRecord` field reserved for the T3 tier, which v1 requires to be null
+/// (`docs/policy-seam.md` §forward-compat). The hash binds these fields, but no approver shows
+/// them, so a device refuses a context that sets one (see [`ContextViolation`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservedField {
+    /// `action.capabilities`.
+    Capabilities,
+    /// `action.scope`.
+    Scope,
+}
+
+impl ReservedField {
+    /// The field's JSON path inside the `ApprovalContext`, e.g. `"action.capabilities"`.
+    #[must_use]
+    pub const fn path(self) -> &'static str {
+        match self {
+            Self::Capabilities => "action.capabilities",
+            Self::Scope => "action.scope",
+        }
+    }
+}
+
+/// Why a decrypted [`ApprovalContext`] breaks a v1 rule that the device enforces before it
+/// shows the request (`docs/contract.md` §Device-side context checks).
+///
+/// Each variant names content that the request hash binds but the human can't see or would
+/// misread. The device fails closed: it can't approve the request, so the caller is denied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContextViolation {
+    /// One or more reserved semantic fields are non-null. Any non-null JSON value counts,
+    /// including `[]`, `{}`, `""`, `0` and `false`. `fields` lists each one, in field order.
+    ReservedFieldsSet {
+        /// The non-null reserved fields (never empty).
+        fields: Vec<ReservedField>,
+    },
+    /// The context's `risk`, which approvers show, is lower than the record's `action.risk`,
+    /// which they don't. That would hide the record's tier behind a milder one. A context may
+    /// *raise* the risk above the record's; only a downgrade is refused.
+    RiskDowngrade {
+        /// The context's (shown) `risk`.
+        context: Risk,
+        /// The record's (unshown) `action.risk`.
+        action: Risk,
+    },
+}
+
+impl std::fmt::Display for ContextViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReservedFieldsSet { fields } => {
+                let paths: Vec<&str> = fields.iter().map(|field| field.path()).collect();
+                let verb = if paths.len() == 1 { "is" } else { "are" };
+                write!(
+                    f,
+                    "{} {verb} reserved and must be null in v1",
+                    paths.join(" and ")
+                )
+            }
+            Self::RiskDowngrade { context, action } => write!(
+                f,
+                "context risk {} is lower than action.risk {}",
+                context.as_str(),
+                action.as_str()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ContextViolation {}
+
+impl ApprovalContext {
+    /// Checks the v1 rules a device enforces on a decrypted context before showing it. It checks
+    /// the reserved semantic fields first, then for a risk downgrade, and reports the first rule
+    /// broken.
+    ///
+    /// [`crate::decrypt_context`] runs this, so every device surface (WASM approvers, UniFFI
+    /// native apps) gets the check from the one audited place and only renders the error.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextViolation`] naming the offending field(s) or both risk tiers.
+    pub fn check_v1_conformance(&self) -> Result<(), ContextViolation> {
+        let fields: Vec<ReservedField> = [
+            (
+                ReservedField::Capabilities,
+                self.action.capabilities.is_some(),
+            ),
+            (ReservedField::Scope, self.action.scope.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(field, set)| set.then_some(field))
+        .collect();
+        if !fields.is_empty() {
+            return Err(ContextViolation::ReservedFieldsSet { fields });
+        }
+        if self.risk < self.action.risk {
+            return Err(ContextViolation::RiskDowngrade {
+                context: self.risk,
+                action: self.action.risk,
+            });
+        }
+        Ok(())
+    }
 }
 
 // ── ApprovalRequest ───────────────────────────────────────────────────────────

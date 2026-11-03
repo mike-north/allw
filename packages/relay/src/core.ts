@@ -94,6 +94,16 @@ export function verifyAccountState(
 }
 
 /**
+ * Whether `pubkey` (base64url-unpadded, 32 bytes) is one of the core's small-order X25519 points
+ * (`allw_core::X25519_SMALL_ORDER_POINTS`, matched with bit 255 masked). Every ECDH with such a key
+ * yields a publicly known shared secret, so it can never be an encryption target. The relay keeps
+ * no copy of the list; the core is the single source. A key that is not 32 base64url bytes throws.
+ */
+export function isSmallOrderX25519PublicKey(pubkey: string): boolean {
+  return core().is_small_order_x25519_public_key(pubkey);
+}
+
+/**
  * Throws unless `accountId` is exactly the id the core derives from `rootPubkey` (base64url
  * Ed25519). A malformed key also throws.
  */
@@ -119,4 +129,49 @@ export function verifyPairingStartAuthorization(
     nowMs,
   );
   return JSON.parse(json) as PairingStartClaims;
+}
+
+/**
+ * Who signed a verdict, per the core's provenance check (mirrors `allw_core::VerdictProvenance`).
+ * **Not** a verified human decision: the request hash, replay and the decision itself are
+ * unchecked. Only the integrator's full verification decides what a verdict means.
+ */
+export interface VerdictProvenance {
+  /** The certified device that signed the verdict (equal to the JWS `kid`). */
+  readonly device_id: string;
+  /** The signed decision time, Unix ms. */
+  readonly decided_at: number;
+}
+
+/**
+ * Check a device verdict's provenance without the plaintext (`verify_verdict_provenance`): it was
+ * signed for `requestId` by a device of `accountId` certified by `rootPubkey`, and that device is
+ * not revoked in `accountStates` (the relay's verified account-state documents). Throws on any
+ * failed check or on input that is not a `Verdict`.
+ */
+export function verifyVerdictProvenance(
+  verdictJson: string,
+  requestId: string,
+  createdAt: number,
+  expiresAt: number,
+  accountId: string,
+  rootPubkey: string,
+  accountStates: readonly string[],
+): VerdictProvenance {
+  return JSON.parse(
+    core().verify_verdict_provenance(
+      verdictJson,
+      requestId,
+      createdAt,
+      expiresAt,
+      accountId,
+      rootPubkey,
+      JSON.stringify(accountStates),
+    ),
+  ) as VerdictProvenance;
+}
+
+/** The self-certifying account id of `rootPubkey` (base64url Ed25519). Throws on a malformed key. */
+export function accountIdForRoot(rootPubkey: string): string {
+  return core().account_id_for_root(rootPubkey);
 }

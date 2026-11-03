@@ -98,7 +98,7 @@ export interface RelayPoller {
  * Build the per-account, per-device inbox URL:
  * `<relayUrl>/<accountId>/devices/<deviceId>/inbox`.
  */
-function inboxUrl(relayUrl: string, accountId: string, deviceId: string): string {
+export function inboxUrl(relayUrl: string, accountId: string, deviceId: string): string {
   const base = relayUrl.replace(/\/+$/, "");
   return `${base}/${encodeURIComponent(accountId)}/devices/${encodeURIComponent(deviceId)}/inbox`;
 }

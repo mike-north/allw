@@ -29,26 +29,41 @@
  */
 
 import { AlarmMultiplexer } from "./alarms.js";
-import { PAIRING_TTL_MS } from "./constants.js";
+import { matchesStoredHash, timingSafeEqual } from "./auth-token.js";
+import {
+  MAX_CONTEXT_CIPHERTEXT_BYTES,
+  MAX_CREATED_AT_SKEW_MS,
+  MAX_PAIRING_BODY_BYTES,
+  MAX_REQUEST_BODY_BYTES,
+  PAIRING_TTL_MS,
+  REQUEST_RETENTION_MS,
+} from "./constants.js";
 import { withCors, type CorsEnv } from "./cors.js";
 import {
   CoreUnavailableError,
+  accountIdForRoot,
   checkAccountIdForRoot,
   ensureCore,
+  isSmallOrderX25519PublicKey,
   verifyAccountState,
   verifyPairingStartAuthorization,
+  verifyVerdictProvenance,
 } from "./core.js";
+import { parseMaxRequestTtlMs, readJsonObjectCapped, utf8ByteLength } from "./limits.js";
 import {
   ApnsPushTransport,
   FcmPushTransport,
   MAX_PUSH_TOKENS_PER_ACCOUNT,
   MAX_PUSH_TOKENS_PER_REGISTRATION,
   MAX_PUSH_TOKENS_PER_TRANSPORT,
-  WEB_PUSH_COALESCE_MS,
-  WEB_PUSH_TRAILING_RETRY_MS,
+  PUSH_COALESCE_MS,
+  PUSH_TRAILING_RETRY_MS,
   diffPushTokenSet,
   WakeupCoalescer,
   dispatchPushWakeups,
+  parsePushCoalesceKey,
+  pushCoalesceKey,
+  type WakeupClaimStore,
   isPushTransportKind,
   schedulablePushTokens,
   type PushTransportRegistry,
@@ -61,6 +76,8 @@ import {
   vapidConfigFromEnv,
   type VapidEnv,
 } from "./web-push.js";
+import { DEADLINE_SQL, deadlineOf } from "./request-deadline.js";
+import { accountSubPathSegments, resolveAccountRoute, routeParam } from "./routes.js";
 import { handleWellKnown, isWellKnownPath } from "./well-known.js";
 
 export interface Env extends VapidEnv, CorsEnv {
@@ -70,6 +87,8 @@ export interface Env extends VapidEnv, CorsEnv {
   readonly APNS_BEARER_TOKEN?: string;
   readonly FCM_ENDPOINT?: string;
   readonly FCM_BEARER_TOKEN?: string;
+  /** Optional request-horizon override in ms (default 15 min). See `parseMaxRequestTtlMs`. */
+  readonly MAX_REQUEST_TTL_MS?: string;
 }
 
 export default {
@@ -111,12 +130,15 @@ interface DevicePushTokenRow extends Record<string, string | number | null | Arr
   created_at: number;
 }
 
-/** A row of `webpush_trailing_wakeup`: a subscription owed one wakeup once its window ends. */
+/** A row of `webpush_trailing_wakeup`: a push token owed one wakeup once its window ends. */
 interface TrailingWakeupRow extends Record<string, string | number | null | ArrayBuffer> {
   account_id: string;
   device_id: string;
+  transport: PushTransportKind;
   token: string;
   due_at: number;
+  /** The latest skipped submit's request id; `null` on rows owed before it was recorded. */
+  last_skipped_request_id: string | null;
 }
 
 /**
@@ -152,6 +174,11 @@ interface AccountMetaRow extends Record<string, string | number | null | ArrayBu
 
 interface RequestRow extends Record<string, string | number | null | ArrayBuffer> {
   request_id: string;
+  /**
+   * The submitted envelope while `pending`; blanked to `''` on every terminal transition (expired,
+   * retracted, resolved) — only pending requests are ever delivered, and status/verdict reads do
+   * not need it — so a retained terminal row costs a small residue, not its ciphertext (#248).
+   */
   envelope: string;
   created_at: number;
   expires_at: number;
@@ -204,7 +231,6 @@ if (PAIRING_ALPHABET.length !== 32) {
 }
 
 const PAIRING_CODE_LENGTH = 8;
-const REQUEST_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const AUTH_TOKEN_BYTES = 32;
 const MAX_ACCOUNT_STATE_DOCS = 16;
 const MAX_ACCOUNT_STATE_JWS_BYTES = 32 * 1024;
@@ -261,15 +287,6 @@ async function hashAuthToken(token: string): Promise<string> {
   return base64UrlEncode(new Uint8Array(digest));
 }
 
-function timingSafeEqual(a: string, b: string): boolean {
-  let diff = a.length ^ b.length;
-  const max = Math.max(a.length, b.length);
-  for (let i = 0; i < max; i++) {
-    diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
-  }
-  return diff === 0;
-}
-
 /**
  * Where a route accepts its bearer token from.
  *
@@ -317,16 +334,24 @@ function coreUnavailable(err: unknown): Response {
   return json({ error: "relay verification core unavailable" }, 500);
 }
 
+/**
+ * Whether `token` hashes to `storedHash`. A presented token is always hashed and compared in
+ * constant time, even when there is no stored hash ({@link matchesStoredHash}), so a missing row
+ * costs the same work as a mismatch (#357).
+ */
 async function tokenMatches(storedHash: string | null, token: string | null): Promise<boolean> {
-  if (storedHash === null) return false;
   if (token === null) return false;
-  return timingSafeEqual(storedHash, await hashAuthToken(token));
+  return matchesStoredHash(storedHash, await hashAuthToken(token));
 }
 
 /**
- * Validate that `pubkey` is a valid base64url-unpadded string that decodes to exactly 32 bytes.
+ * Validate that `pubkey` is the canonical base64url-unpadded encoding of exactly 32 bytes.
  * This covers both Ed25519 verifying keys and X25519 public keys, which are both 32-byte.
  * Returns the decoded bytes on success, or `null` on failure.
+ *
+ * Canonical means re-encoding the bytes gives back `pubkey` exactly. The 43rd symbol carries 2
+ * unused low bits, which `atob` silently drops but the core's decoder rejects. Without this check a
+ * key with stray bits would be stored here and then fail in the core on every use.
  */
 function validatePubkey(pubkey: string): Uint8Array | null {
   // 32 bytes encode to exactly 43 base64url-unpadded chars (ceil(32*4/3)). Reject by length
@@ -348,11 +373,46 @@ function validatePubkey(pubkey: string): Uint8Array | null {
   }
   if (binary.length !== 32) return null;
 
+  const canonical = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  if (canonical !== pubkey) return null;
+
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {
     bytes[i] = binary.charCodeAt(i);
   }
   return bytes;
+}
+
+/**
+ * Validate a device's X25519 encryption key for enrollment (`POST /pairing/complete`). Integrators
+ * JWE-encrypt every request to this key, so beyond `validatePubkey`'s 32 base64url bytes it must not
+ * be a small-order point: ECDH with one yields a publicly known shared secret, and the core's
+ * `encrypt_context` refuses the whole request rather than encrypt to it (#248). Rejecting it here
+ * keeps such a key out of the device registry. The denylist is the core's, through WASM.
+ *
+ * Returns the 400 to send, a 500 only if the core failed to initialize, or `null` when the key is
+ * acceptable.
+ */
+function deviceEncryptionKeyFailure(pubkey: string): Response | null {
+  if (!validatePubkey(pubkey)) {
+    return json({ error: "'pubkey' must be a base64url-unpadded 32-byte public key" }, 400);
+  }
+  let smallOrder: boolean;
+  try {
+    smallOrder = isSmallOrderX25519PublicKey(pubkey);
+  } catch (err) {
+    // Only a core that failed to initialize is the relay's fault. Any other throw is the core
+    // rejecting the key's encoding, which is the caller's input: the same 400 as a bad shape.
+    if (err instanceof CoreUnavailableError) return coreUnavailable(err);
+    return json({ error: "'pubkey' must be a base64url-unpadded 32-byte public key" }, 400);
+  }
+  if (smallOrder) {
+    return json(
+      { error: "'pubkey' is a small-order X25519 key, which can never be an encryption target" },
+      400,
+    );
+  }
+  return null;
 }
 
 /** Parse a JSON body; returns null if the body is invalid JSON or not an object. */
@@ -398,7 +458,12 @@ function optionalPushTokens(body: Record<string, unknown>): IncomingPushToken[] 
     if (typeof transport !== "string" || !isPushTransportKind(transport)) return null;
     if (typeof rawToken !== "string" || rawToken.length < 1 || rawToken.length > 4096) return null;
     let token = rawToken;
-    if (transport === "apns" && !/^[0-9a-fA-F]{64}$/.test(token)) return null;
+    if (transport === "apns") {
+      if (!/^[0-9a-fA-F]{64}$/.test(token)) return null;
+      // Hex is case-insensitive: store one canonical spelling, so one device token spelled two ways
+      // is one row (and one wakeup), and re-sending it in another case is a no-op (#304).
+      token = token.toLowerCase();
+    }
     if (transport === "fcm" && !/^[A-Za-z0-9:_-]{1,4096}$/.test(token)) return null;
     if (transport === "webpush") {
       // SECURITY (SSRF): a webpush token is the subscription endpoint the relay will POST to.
@@ -488,9 +553,20 @@ const deviceTag = (deviceId: string): string => `device:${deviceId}`;
 const surfaceTag = (surfaceId: string): string => `surface:${surfaceId}`;
 const integratorTag = (requestId: string): string => `integrator:${requestId}`;
 
+/**
+ * Canonical UUID text form (RFC 9562 §4, which generators MUST emit in lowercase): 8-4-4-4-12
+ * lowercase hex digits. Only that one spelling is accepted, and ids are never normalized: the id is
+ * inside the envelope the device sees and binds to, so one UUID must have exactly one identity.
+ */
+const REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
 // The exact, exhaustive set of ApprovalRequest envelope keys the relay accepts (contract.md
 // §Messages). Anything else is rejected at submit time to keep plaintext out of the relay.
 const ENVELOPE_KEYS = ["v", "id", "created_at", "expires_at", "approver", "context_ciphertext"];
+
+function pairingBodyTooLarge(): Response {
+  return json({ error: `request body exceeds ${String(MAX_PAIRING_BODY_BYTES)} bytes` }, 413);
+}
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
@@ -507,9 +583,43 @@ function parseSurfaceId(request: Request): string | null | undefined {
   return value;
 }
 
-/** The coalescing key of one Web Push subscription: its device plus endpoint. */
-function webPushCoalesceKey(deviceId: string, token: string): string {
-  return `${deviceId}\0${token}`;
+/**
+ * The relay's {@link WakeupClaimStore}: each push token's last claim, whatever its transport, is the
+ * `last_wakeup_at` column of its own `device_push_token` row. It survives Durable Object eviction,
+ * so the one-per-window bound holds across it (#319). Removing the token removes its claim too.
+ */
+class DevicePushTokenClaimStore implements WakeupClaimStore {
+  private readonly sql: SqlStorage;
+
+  constructor(sql: SqlStorage) {
+    this.sql = sql;
+  }
+
+  lastClaimedAt(key: string): number | undefined {
+    const { device_id, transport, token } = parsePushCoalesceKey(key);
+    const row = [
+      ...this.sql.exec<{ last_wakeup_at: number | null }>(
+        `SELECT last_wakeup_at FROM device_push_token
+         WHERE device_id = ? AND transport = ? AND token = ?`,
+        device_id,
+        transport,
+        token,
+      ),
+    ][0];
+    return row?.last_wakeup_at ?? undefined;
+  }
+
+  recordClaim(key: string, atMs: number): void {
+    const { device_id, transport, token } = parsePushCoalesceKey(key);
+    this.sql.exec(
+      `UPDATE device_push_token SET last_wakeup_at = ?
+       WHERE device_id = ? AND transport = ? AND token = ?`,
+      atMs,
+      device_id,
+      transport,
+      token,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -533,9 +643,33 @@ function webPushCoalesceKey(deviceId: string, token: string): string {
 export class AccountRelay implements DurableObject {
   private readonly sql: SqlStorage;
   private readonly ctx: DurableObjectState;
-  private readonly pushTransports: PushTransportRegistry;
-  /** Spaces Web Push wakeups per subscription (`WEB_PUSH_COALESCE_MS`); see `schedulePushWakeups`. */
-  private readonly webPushCoalescer = new WakeupCoalescer(WEB_PUSH_COALESCE_MS);
+  /**
+   * Assigned only at construction in production; mutable so tests can inject through checked
+   * element access.
+   */
+  private pushTransports: PushTransportRegistry;
+  /**
+   * Request horizon: `expires_at - now` above this is refused at submit (#248), and a stored row's
+   * deadline is never later than `created_at + maxRequestTtlMs` ({@link deadlineOf}). Assigned only
+   * at construction in production; mutable so tests can inject through checked element access.
+   */
+  private maxRequestTtlMs: number;
+  /**
+   * The relay's one clock (#292). Every time-dependent decision reads it: the request lifecycle
+   * (submit, delivery, expiry, retract, verdict acceptance), the alarm clamp, push-wakeup
+   * scheduling and the Web Push TTL, and the pairing, actor, account-state and push-token
+   * timestamps. Tests replace it on the instance (via `runInDurableObject`) to probe exact
+   * boundaries; production always reads the real time. The relay's other clocks, in the alarm
+   * multiplexer and the Web Push transport, are handed this one; their `Date.now` defaults are only
+   * for standalone use. A guard test (`request-deadline.test.ts`) holds every relay source to that.
+   */
+  private now: () => number = () => Date.now();
+  /**
+   * Spaces wakeups per push token, every transport (`PUSH_COALESCE_MS`); see `schedulePushWakeups`.
+   * Last claims are kept in SQLite ({@link DevicePushTokenClaimStore}). Assigned only at
+   * construction in production; mutable so tests can inject through checked element access.
+   */
+  private pushCoalescer: WakeupCoalescer;
   /**
    * Settles once every push fan-out started so far has finished, pruning included. Never rejects.
    * Only tests read it (to assert on the outcome of background delivery without sleeping).
@@ -547,9 +681,15 @@ export class AccountRelay implements DurableObject {
   constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
     this.sql = ctx.storage.sql;
-    this.pushTransports = buildPushTransports(env);
+    // The Web Push TTL is derived from the same injectable clock as the submit limits.
+    this.pushTransports = buildPushTransports(env, () => this.now());
+    this.maxRequestTtlMs = parseMaxRequestTtlMs(env.MAX_REQUEST_TTL_MS);
     this.initSchema();
-    this.alarms = new AlarmMultiplexer(ctx.storage);
+    this.pushCoalescer = new WakeupCoalescer(
+      PUSH_COALESCE_MS,
+      new DevicePushTokenClaimStore(this.sql),
+    );
+    this.alarms = new AlarmMultiplexer(ctx.storage, () => this.now());
     // On reactivation, restore every alarm purpose from its persisted rows, in case the previous
     // isolate exited after a write but before the scheduled alarm was durably restored.
     this.ctx.waitUntil(this.armExpiryAlarm().then(() => this.armTrailingWakeupAlarm()));
@@ -558,6 +698,45 @@ export class AccountRelay implements DurableObject {
   // ---------------------------------------------------------------------------
   // Schema initialisation (idempotent)
   // ---------------------------------------------------------------------------
+
+  /**
+   * Rebuild `webpush_trailing_wakeup` with `transport` in its primary key, if it was created with
+   * the older `(device_id, token)` key. Every owed row is copied, so no wakeup is lost. Runs after
+   * the column migrations (so `transport` exists) in one transaction; a no-op once rekeyed.
+   */
+  private rekeyTrailingWakeupsByTransport(): void {
+    const keyColumns = [
+      ...this.sql.exec<{ name: string; pk: number }>(`PRAGMA table_info(webpush_trailing_wakeup)`),
+    ]
+      .filter((column) => column.pk > 0)
+      .map((column) => column.name);
+    if (keyColumns.includes("transport")) return;
+    this.ctx.storage.transactionSync(() => {
+      // Any column a future ALTER adds to webpush_trailing_wakeup must also be added to this CREATE
+      // and to both column lists of the INSERT … SELECT below, or the rebuild drops it.
+      this.sql.exec(`
+        -- A scratch table left by an earlier failed rebuild must not fail every start.
+        DROP TABLE IF EXISTS webpush_trailing_wakeup_rekeyed;
+        CREATE TABLE webpush_trailing_wakeup_rekeyed (
+          account_id              TEXT    NOT NULL,
+          device_id               TEXT    NOT NULL,
+          token                   TEXT    NOT NULL,
+          due_at                  INTEGER NOT NULL,
+          last_skipped_at         INTEGER NOT NULL DEFAULT 0,
+          transport               TEXT    NOT NULL DEFAULT 'webpush',
+          last_skipped_request_id TEXT,
+          PRIMARY KEY (device_id, transport, token)
+        );
+        -- Keep both column lists in step with the CREATE above (see the comment on the CREATE).
+        INSERT INTO webpush_trailing_wakeup_rekeyed
+          (account_id, device_id, token, due_at, last_skipped_at, transport, last_skipped_request_id)
+        SELECT account_id, device_id, token, due_at, last_skipped_at, transport, last_skipped_request_id
+        FROM webpush_trailing_wakeup;
+        DROP TABLE webpush_trailing_wakeup;
+        ALTER TABLE webpush_trailing_wakeup_rekeyed RENAME TO webpush_trailing_wakeup;
+      `);
+    });
+  }
 
   private initSchema(): void {
     // SECURITY: These tables store ONLY public keys + routing/lifecycle metadata.
@@ -571,24 +750,40 @@ export class AccountRelay implements DurableObject {
         auth_token_hash TEXT
       );
 
+      -- last_wakeup_at: when the token's most recent wakeup was claimed (epoch ms), any transport,
+      -- read by the coalescer so its one-per-window bound survives eviction (#319). NULL if never.
       CREATE TABLE IF NOT EXISTS device_push_token (
-        device_id  TEXT    NOT NULL,
-        transport  TEXT    NOT NULL,
-        token      TEXT    NOT NULL,
-        created_at INTEGER NOT NULL,
+        device_id      TEXT    NOT NULL,
+        transport      TEXT    NOT NULL,
+        token          TEXT    NOT NULL,
+        created_at     INTEGER NOT NULL,
+        last_wakeup_at INTEGER,
         PRIMARY KEY (device_id, transport, token)
       );
 
-      -- Web Push subscriptions owed one trailing wakeup: a submit was coalesced (skipped) while
-      -- the subscription's window was open, so it may have landed after the service worker's
-      -- inbox fetch. One row per subscription, sent when its window ends (due_at) via the alarm.
-      -- Routing metadata only. account_id is this DO's own account, kept for the wakeup payload.
+      -- Push tokens owed one trailing wakeup: a submit was coalesced (skipped) while the token's
+      -- window was open, so it may have landed after the device's inbox fetch. One row per token,
+      -- sent when its window ends (due_at) via the alarm. Routing metadata only. account_id is
+      -- this DO's own account, kept for the wakeup payload.
+      -- The table predates APNs/FCM coalescing (#248) and keeps its name: hosted Durable Objects
+      -- hold owed rows, and a rename would need a data migration that could drop one on deploy.
+      -- transport is the token's transport ('webpush' for rows owed before it was recorded), and is
+      -- part of the key: one string can be a valid token for two transports (a 64-hex string passes
+      -- both the APNs and the FCM pattern), and each owes its own wakeup. Tables created with the
+      -- older (device_id, token) key are rebuilt below.
+      -- last_skipped_at is the latest skipped submit: a later wakeup accepted by the push service
+      -- clears the row only if it was claimed after that submit (it then covers it).
+      -- last_skipped_request_id is that submit's request id, carried by an APNs/FCM trailing
+      -- wakeup (Web Push sends no payload). NULL on rows owed before it was recorded.
       CREATE TABLE IF NOT EXISTS webpush_trailing_wakeup (
-        account_id TEXT    NOT NULL,
-        device_id  TEXT    NOT NULL,
-        token      TEXT    NOT NULL,
-        due_at     INTEGER NOT NULL,
-        PRIMARY KEY (device_id, token)
+        account_id              TEXT    NOT NULL,
+        device_id               TEXT    NOT NULL,
+        token                   TEXT    NOT NULL,
+        due_at                  INTEGER NOT NULL,
+        last_skipped_at         INTEGER NOT NULL DEFAULT 0,
+        transport               TEXT    NOT NULL DEFAULT 'webpush',
+        last_skipped_request_id TEXT,
+        PRIMARY KEY (device_id, transport, token)
       );
 
       CREATE TABLE IF NOT EXISTS actor (
@@ -675,6 +870,10 @@ export class AccountRelay implements DurableObject {
       `ALTER TABLE device ADD COLUMN auth_token_hash TEXT`,
       `ALTER TABLE pairing ADD COLUMN auth_token_hash TEXT`,
       `ALTER TABLE request ADD COLUMN auth_token_hash TEXT`,
+      `ALTER TABLE device_push_token ADD COLUMN last_wakeup_at INTEGER`,
+      `ALTER TABLE webpush_trailing_wakeup ADD COLUMN last_skipped_at INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE webpush_trailing_wakeup ADD COLUMN transport TEXT NOT NULL DEFAULT 'webpush'`,
+      `ALTER TABLE webpush_trailing_wakeup ADD COLUMN last_skipped_request_id TEXT`,
     ]) {
       try {
         this.sql.exec(migration);
@@ -682,6 +881,7 @@ export class AccountRelay implements DurableObject {
         // Fresh schemas already have the column; older local DO state is migrated above.
       }
     }
+    this.rekeyTrailingWakeupsByTransport();
     this.sql.exec(`
       UPDATE request
       SET terminal_at = expires_at
@@ -694,9 +894,34 @@ export class AccountRelay implements DurableObject {
       )
       WHERE status = 'resolved' AND terminal_at IS NULL;
     `);
-    // Pending requests by deadline. Every submit and trailing wakeup reads the latest pending
-    // deadline (latestPendingRequest), and the expiry alarm the earliest (armExpiryAlarm). Partial,
-    // so terminal rows awaiting the retention sweep cost nothing. Idempotent, like the
+    // APNs tokens are stored lowercase (#304). Rows stored before that may be in any case: keep one
+    // row per device and token ignoring case (two spellings would collide once lowercased), then
+    // lowercase what is left. The survivor is the earliest registration (lowest created_at, rowid
+    // breaking ties), so the token keeps the created_at of when the device first registered it.
+    // Idempotent; on an already-canonical table both statements change nothing.
+    this.sql.exec(`
+      DELETE FROM device_push_token
+      WHERE transport = 'apns'
+        AND EXISTS (
+          SELECT 1 FROM device_push_token AS earlier
+          WHERE earlier.transport = 'apns'
+            AND earlier.device_id = device_push_token.device_id
+            AND lower(earlier.token) = lower(device_push_token.token)
+            AND (
+              earlier.created_at < device_push_token.created_at
+              OR (
+                earlier.created_at = device_push_token.created_at
+                AND earlier.rowid < device_push_token.rowid
+              )
+            )
+        );
+
+      UPDATE device_push_token SET token = lower(token)
+      WHERE transport = 'apns' AND token <> lower(token);
+    `);
+    // Pending requests by `expires_at`. Lifecycle queries filter and order by the full deadline
+    // (`DEADLINE_SQL`), which this index cannot order by; it still narrows them to pending rows.
+    // Partial, so terminal rows awaiting the retention sweep cost nothing. Idempotent, like the
     // migrations above; it runs after them, so the columns it names always exist.
     this.sql.exec(
       `CREATE INDEX IF NOT EXISTS request_pending_by_expiry
@@ -710,152 +935,128 @@ export class AccountRelay implements DurableObject {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    // Strip the leading "/<accountId>" segment forwarded by the Worker.
-    const segments = url.pathname.split("/").filter(Boolean);
-    // segments[0] is the accountId (stripped); the sub-path starts at [1].
-    const subSegments = segments.slice(1);
+    // The Worker forwards the full path; its first segment is the account id, and every route
+    // matches the rest exactly (`routes.ts`, #302).
+    const accountId = url.pathname.split("/")[1] ?? "";
     const method = request.method.toUpperCase();
-    const path0 = subSegments[0] ?? "";
-    const path1 = subSegments[1] ?? "";
-    const path2 = subSegments[2] ?? "";
-
-    // POST /pairing/start — root-signed; binds the account root on first success.
-    if (method === "POST" && path0 === "pairing" && path1 === "start") {
-      return this.handlePairingStart(request, segments[0] ?? "");
-    }
-
-    // POST /pairing/complete
-    if (method === "POST" && path0 === "pairing" && path1 === "complete") {
-      return this.handlePairingComplete(request);
-    }
-
-    // POST /actors
-    if (method === "POST" && path0 === "actors" && !path1) {
-      return this.handleActorEnroll(request);
-    }
-
-    // GET /actors
-    if (method === "GET" && path0 === "actors" && !path1) {
-      return this.handleActorList();
-    }
-
-    // POST /account-states — anyone may publish; only documents verified against the bound root
-    // are stored.
-    if (method === "POST" && path0 === "account-states" && !path1) {
-      return this.handleAccountStatePublish(request, segments[0] ?? "");
-    }
-
-    // GET /account-states — unauthenticated: the documents are public and relay-verified.
-    if (method === "GET" && path0 === "account-states" && !path1) {
-      return this.handleAccountStateList();
-    }
-
-    // GET /devices
-    if (method === "GET" && path0 === "devices" && !path1) {
-      return this.handleDeviceList();
-    }
-
-    // POST /devices/{device_id}/revoke
-    if (method === "POST" && path0 === "devices" && path1 !== "" && path2 === "revoke") {
-      return this.handleDeviceRevoke(path1, request);
-    }
-
-    // PUT /devices/{device_id}/push-tokens — the device replaces its own push-token set.
-    if (
-      method === "PUT" &&
-      path0 === "devices" &&
-      path1 !== "" &&
-      path2 === "push-tokens" &&
-      (subSegments[3] ?? "") === ""
-    ) {
-      return this.handleDevicePushTokens(path1, request);
-    }
-
-    // GET /devices/{device_id}/inbox — authenticated device polls its pending envelopes.
-    if (method === "GET" && path0 === "devices" && path1 !== "" && path2 === "inbox") {
-      return this.handleDeviceInbox(path1, request);
-    }
-
-    // GET /devices/{device_id}/connect (WebSocket) — device presence + offline-queue flush.
-    if (method === "GET" && path0 === "devices" && path1 !== "" && path2 === "connect") {
-      if (!isWebSocketUpgrade(request)) {
-        return json({ error: "WebSocket upgrade required" }, 426);
-      }
-      return this.handleDeviceConnect(path1, request);
-    }
-
-    // POST /requests — integrator submits an ApprovalRequest envelope (ciphertext + routing).
-    if (method === "POST" && path0 === "requests" && !path1) {
-      return this.handleSubmit(request, segments[0] ?? "");
-    }
-
-    // GET /requests/{request_id}/wait (WebSocket) — integrator awaits the verdict (pushed).
-    if (method === "GET" && path0 === "requests" && path1 !== "" && path2 === "wait") {
-      if (!isWebSocketUpgrade(request)) {
-        return json({ error: "WebSocket upgrade required" }, 426);
-      }
-      return this.handleIntegratorWait(path1, request);
-    }
-
-    // GET /requests/{request_id} — integrator polls request status / fetches the verdict.
-    if (method === "GET" && path0 === "requests" && path1 !== "" && path2 === "") {
-      return this.handleGetRequest(path1, request);
-    }
-
-    // POST /requests/{request_id}/retract — integrator cancels its own pending request (#195).
-    if (method === "POST" && path0 === "requests" && path1 !== "" && path2 === "retract") {
-      return this.handleRetract(path1, request);
-    }
+    const route = resolveAccountRoute(method, accountSubPathSegments(url.pathname));
 
     // 405 only for a KNOWN route path reached with an unsupported method; any other (unknown)
-    // sub-path is a 404 — e.g. `GET /devices/<id>` or `GET /pairing/unknown` are not routes.
-    const isKnownRoutePath =
-      (path0 === "pairing" && (path1 === "start" || path1 === "complete") && path2 === "") ||
-      (path0 === "actors" && path1 === "") ||
-      (path0 === "account-states" && path1 === "") ||
-      (path0 === "devices" && path1 === "") ||
-      (path0 === "devices" &&
-        path1 !== "" &&
-        path2 === "revoke" &&
-        (subSegments[3] ?? "") === "") ||
-      (path0 === "devices" && path1 !== "" && path2 === "inbox" && (subSegments[3] ?? "") === "") ||
-      (path0 === "devices" &&
-        path1 !== "" &&
-        path2 === "push-tokens" &&
-        (subSegments[3] ?? "") === "") ||
-      (path0 === "devices" &&
-        path1 !== "" &&
-        path2 === "connect" &&
-        (subSegments[3] ?? "") === "") ||
-      (path0 === "requests" && path1 === "") ||
-      (path0 === "requests" && path1 !== "" && path2 === "" && (subSegments[2] ?? "") === "") ||
-      (path0 === "requests" && path1 !== "" && path2 === "wait" && (subSegments[3] ?? "") === "") ||
-      (path0 === "requests" &&
-        path1 !== "" &&
-        path2 === "retract" &&
-        (subSegments[3] ?? "") === "");
-    if (isKnownRoutePath) {
-      return json({ error: "method not allowed" }, 405);
-    }
+    // sub-path is a 404 — e.g. `GET /devices/<id>`, `GET /pairing/unknown`, or any route with an
+    // extra segment or trailing slash.
+    if (route.kind === "method-not-allowed") return json({ error: "method not allowed" }, 405);
+    if (route.kind === "not-found") return json({ error: "not found" }, 404);
 
-    return json({ error: "not found" }, 404);
+    const { params } = route;
+    switch (route.name) {
+      // POST /pairing/start — root-signed; binds the account root on first success.
+      case "pairingStart":
+        return this.handlePairingStart(request, accountId);
+
+      // POST /pairing/complete
+      case "pairingComplete":
+        return this.handlePairingComplete(request);
+
+      // POST /actors
+      case "actorEnroll":
+        return this.handleActorEnroll(request);
+
+      // GET /actors
+      case "actorList":
+        return this.handleActorList();
+
+      // POST /account-states — anyone may publish; only documents verified against the bound
+      // root are stored.
+      case "accountStatePublish":
+        return this.handleAccountStatePublish(request, accountId);
+
+      // GET /account-states — unauthenticated: the documents are public and relay-verified.
+      case "accountStateList":
+        return this.handleAccountStateList();
+
+      // GET /devices
+      case "deviceList":
+        return this.handleDeviceList();
+
+      // POST /devices/{device_id}/revoke
+      case "deviceRevoke":
+        return this.handleDeviceRevoke(routeParam(params, "device_id"), request);
+
+      // PUT /devices/{device_id}/push-tokens — the device replaces its own push-token set.
+      case "devicePushTokens":
+        return this.handleDevicePushTokens(routeParam(params, "device_id"), request);
+
+      // GET /devices/{device_id}/inbox — authenticated device polls its pending envelopes.
+      case "deviceInbox":
+        return this.handleDeviceInbox(routeParam(params, "device_id"), request);
+
+      // GET /devices/{device_id}/connect (WebSocket) — device presence + offline-queue flush.
+      case "deviceConnect":
+        if (!isWebSocketUpgrade(request)) {
+          return json({ error: "WebSocket upgrade required" }, 426);
+        }
+        return this.handleDeviceConnect(routeParam(params, "device_id"), request);
+
+      // POST /requests — integrator submits an ApprovalRequest envelope (ciphertext + routing).
+      case "requestSubmit":
+        return this.handleSubmit(request, accountId);
+
+      // GET /requests/{request_id}/wait (WebSocket) — integrator awaits the verdict (pushed).
+      case "requestWait":
+        if (!isWebSocketUpgrade(request)) {
+          return json({ error: "WebSocket upgrade required" }, 426);
+        }
+        return this.handleIntegratorWait(routeParam(params, "request_id"), request);
+
+      // GET /requests/{request_id} — integrator polls request status / fetches the verdict.
+      case "requestGet":
+        return this.handleGetRequest(routeParam(params, "request_id"), request);
+
+      // POST /requests/{request_id}/retract — integrator cancels its own pending request (#195).
+      case "requestRetract":
+        return this.handleRetract(routeParam(params, "request_id"), request);
+    }
   }
 
   // ---------------------------------------------------------------------------
   // Route handlers
   // ---------------------------------------------------------------------------
 
+  /**
+   * Check the request's bearer token against a row's stored token hash: `null` when it matches,
+   * otherwise `401` (no bearer token) or `403` (a bearer token that does not match).
+   *
+   * The answer depends only on whether a bearer token was presented and whether it matches, never
+   * on why it does not match. So a row without a stored hash, and an identifier with no row at all
+   * ({@link unknownIdentifierAuthFailure}), answer exactly as a wrong token would (#357).
+   */
   private async authorizeStoredHash(
     request: Request,
     storedHash: string | null | undefined,
     source: BearerSource = "header",
   ): Promise<Response | null> {
-    // A missing hash is a legacy/migration row, not proof of authorization. Fail closed and require
-    // re-pairing or re-submission so no endpoint silently falls back to unauthenticated access.
-    if (storedHash === null || storedHash === undefined) return authError(401);
     const token = bearerToken(request, source);
     if (token === null) return authError(401);
-    return (await tokenMatches(storedHash, token)) ? null : authError(403);
+    // A missing hash is a legacy/migration row, not proof of authorization. Fail closed and require
+    // re-pairing or re-submission so no endpoint silently falls back to unauthenticated access.
+    // `tokenMatches` still hashes and compares the presented token, so the work matches a real
+    // comparison.
+    return (await tokenMatches(storedHash ?? null, token)) ? null : authError(403);
+  }
+
+  /**
+   * The answer for a token-guarded identifier (a request id, a pairing code) that has no row: the
+   * same `401` / `403` a wrong or missing token gets on an identifier that exists, so an
+   * unauthenticated caller cannot learn whether the identifier exists (#357). No caller can hold a
+   * valid token for a row that does not exist, so this never refuses a legitimate request.
+   */
+  private async unknownIdentifierAuthFailure(
+    request: Request,
+    source: BearerSource = "header",
+  ): Promise<Response> {
+    // The same `source` as the route's real check, so a WebSocket route's `?auth=` token is read
+    // for an unknown identifier exactly as for a known one.
+    return (await this.authorizeStoredHash(request, null, source)) ?? authError(403);
   }
 
   private async authorizedDeviceId(request: Request): Promise<string | Response> {
@@ -928,8 +1129,10 @@ export class AccountRelay implements DurableObject {
       return coreUnavailable(err);
     }
 
-    const body = await parseJsonBody(request);
-    if (!body) return json({ error: "invalid JSON body" }, 400);
+    const read = await readJsonObjectCapped(request, MAX_PAIRING_BODY_BYTES);
+    if (read.kind === "too_large") return pairingBodyTooLarge();
+    if (read.kind === "invalid") return json({ error: "invalid JSON body" }, 400);
+    const body = read.body;
 
     const rootPubkey = requiredString(body, "root_pubkey");
     if (rootPubkey === null || !validatePubkey(rootPubkey)) {
@@ -956,7 +1159,7 @@ export class AccountRelay implements DurableObject {
     const code = generatePairingCode();
     const pairingAuthToken = generateAuthToken();
     const pairingAuthTokenHash = await hashAuthToken(pairingAuthToken);
-    const now = Date.now();
+    const now = this.now();
 
     let jti: string;
     let jtiExpiresAt: number;
@@ -1029,10 +1232,13 @@ export class AccountRelay implements DurableObject {
    * Validates the pairing code and enrolls the device's public key.
    * - 403: no account root is bound (a pairing code on an unbound account predates root binding,
    *        so it was never root-authorized), or the pairing auth token is wrong
-   * - 404: code not found
+   * - 401 / 403: no / a wrong pairing auth token. An unknown code answers the same way, never "not
+   *        found" (#357); every check before it is independent of the code
    * - 409: code already used, or the account's push-token budget is full (code not consumed)
    * - 410: code expired
-   * - 400: invalid pubkey (not base64url or not 32 bytes), or invalid / over-budget push_tokens
+   * - 400: invalid pubkey (not base64url, not 32 bytes, or a small-order X25519 point), or
+   *        invalid / over-budget push_tokens
+   * - 500: the relay's verification core failed to initialize
    */
   private async handlePairingComplete(request: Request): Promise<Response> {
     // Every pairing row this relay issues is created together with (or after) the root bind, so a
@@ -1041,8 +1247,10 @@ export class AccountRelay implements DurableObject {
       return json({ error: "account root not bound; start a root-signed pairing first" }, 403);
     }
 
-    const body = await parseJsonBody(request);
-    if (!body) return json({ error: "invalid JSON body" }, 400);
+    const read = await readJsonObjectCapped(request, MAX_PAIRING_BODY_BYTES);
+    if (read.kind === "too_large") return pairingBodyTooLarge();
+    if (read.kind === "invalid") return json({ error: "invalid JSON body" }, 400);
+    const body = read.body;
 
     const code = requiredString(body, "code");
     if (!code) return json({ error: "'code' is required (string)" }, 400);
@@ -1050,9 +1258,8 @@ export class AccountRelay implements DurableObject {
     const pubkey = requiredString(body, "pubkey");
     if (!pubkey) return json({ error: "'pubkey' is required (string)" }, 400);
 
-    if (!validatePubkey(pubkey)) {
-      return json({ error: "'pubkey' must be a base64url-unpadded 32-byte public key" }, 400);
-    }
+    const pubkeyFailure = deviceEncryptionKeyFailure(pubkey);
+    if (pubkeyFailure) return pubkeyFailure;
 
     const label = optionalString(body, "label");
     const pushTokens = optionalPushTokens(body);
@@ -1068,18 +1275,20 @@ export class AccountRelay implements DurableObject {
       ),
     ];
     const pairing = rows[0];
-    if (!pairing) return json({ error: "pairing code not found" }, 404);
+    // An unknown code answers exactly as a wrong pairing token does (#357): existence is never
+    // revealed before the token is checked.
+    if (!pairing) return this.unknownIdentifierAuthFailure(request);
     const authFailure = await this.authorizeStoredHash(request, pairing.auth_token_hash);
     if (authFailure) return authFailure;
     if (pairing.used !== 0) return json({ error: "pairing code already used" }, 409);
-    if (Date.now() > pairing.expires_at) {
+    if (this.now() > pairing.expires_at) {
       return json({ error: "pairing code expired" }, 410);
     }
 
     const deviceId = crypto.randomUUID();
     const deviceAuthToken = generateAuthToken();
     const deviceAuthTokenHash = await hashAuthToken(deviceAuthToken);
-    const now = Date.now();
+    const now = this.now();
     // Checked after the last await so the count and the inserts below are one atomic step.
     const pushTokenBudget = this.pushTokenBudgetFailure(pushTokens.length);
     if (pushTokenBudget) return pushTokenBudget;
@@ -1138,7 +1347,7 @@ export class AccountRelay implements DurableObject {
     }
 
     const label = optionalString(body, "label");
-    const now = Date.now();
+    const now = this.now();
 
     // Reject duplicates: actor_id must be unique (the caller controls the namespace).
     const existing = [
@@ -1314,7 +1523,7 @@ export class AccountRelay implements DurableObject {
       );
     }
 
-    const now = Date.now();
+    const now = this.now();
     const current = verified.filter((doc) => doc.sequence === highest).map((doc) => doc.stateJws);
     this.ctx.storage.transactionSync(() => {
       this.sql.exec(`DELETE FROM verified_account_state`);
@@ -1437,7 +1646,7 @@ export class AccountRelay implements DurableObject {
       }
     }
     const { remove, add } = diffPushTokenSet(current, desired);
-    const now = Date.now();
+    const now = this.now();
     this.ctx.storage.transactionSync(() => {
       for (const gone of remove) {
         this.sql.exec(
@@ -1497,14 +1706,7 @@ export class AccountRelay implements DurableObject {
     const authFailure = await this.authorizeStoredHash(request, device.auth_token_hash);
     if (authFailure) return authFailure;
 
-    const now = Date.now();
-    const pending = [
-      ...this.sql.exec<RequestRow>(
-        `SELECT request_id, envelope FROM request
-         WHERE status = 'pending' AND expires_at > ? ORDER BY created_at ASC`,
-        now,
-      ),
-    ];
+    const pending = this.livePendingRequests(this.now());
 
     const envelopes = pending.map((p) => JSON.parse(p.envelope) as unknown);
     return json({ envelopes });
@@ -1558,18 +1760,11 @@ export class AccountRelay implements DurableObject {
 
     if (shouldFlushOfflineQueue) {
       // Flush the offline queue: every still-live pending request, oldest first. Fail-closed: a
-      // request that expired while queued is excluded (`expires_at > now`), so a dead request is
-      // never re-pushed to a reconnecting device. (Submit fan-out needs no such guard —
-      // `handleSubmit` rejects an already-expired `expires_at`, so a freshly stored request is
-      // always future-dated.)
-      const now = Date.now();
-      const pending = [
-        ...this.sql.exec<RequestRow>(
-          `SELECT request_id, envelope FROM request
-           WHERE status = 'pending' AND expires_at > ? ORDER BY created_at ASC`,
-          now,
-        ),
-      ];
+      // request past its deadline while queued is excluded ({@link livePendingRequests}), so a dead
+      // request is never re-pushed to a reconnecting device. (Submit fan-out needs no such guard —
+      // `handleSubmit` rejects a request whose deadline has passed, so a freshly stored request is
+      // always live.)
+      const pending = this.livePendingRequests(this.now());
       for (const p of pending) {
         trySendJson(server, {
           type: "request",
@@ -1590,12 +1785,28 @@ export class AccountRelay implements DurableObject {
    *
    * Stores the request and fans the ciphertext out to every online device. If no device is
    * connected it stays queued and is delivered on the next `…/connect` (see handleDeviceConnect).
-   * - 400: not exactly the contract's envelope fields, or already expired.
+   * - 404: the account has no bound root (`unknown account`): no device can have paired.
+   * - 400: not exactly the contract's envelope fields, an `id` that is not a lowercase canonical
+   *        UUID, an `expires_at` that is not an integer or is already past, `expires_at - now` beyond the request horizon (`maxRequestTtlMs`,
+   *        default 15 min), or a `created_at` that is not an integer, is after `expires_at`, is
+   *        more than the horizon in the past, or is more than `MAX_CREATED_AT_SKEW_MS` ahead.
    * - 409: a request with this `id` was already submitted.
+   * - 413: the body exceeds `MAX_REQUEST_BODY_BYTES` (checked before parsing) or
+   *        `context_ciphertext` exceeds `MAX_CONTEXT_CIPHERTEXT_BYTES`.
    */
   private async handleSubmit(request: Request, accountId: string): Promise<Response> {
-    const envelope = await parseJsonBody(request);
-    if (!envelope) return json({ error: "invalid JSON body" }, 400);
+    // No bound root ⇒ no device can have paired (#242), so nothing could ever decide this request.
+    // Refuse before reading the body rather than store requests for accounts nobody owns.
+    if (this.boundRootPubkey() === null) return json({ error: "unknown account" }, 404);
+
+    // Size-check the body BEFORE parsing it: an unauthenticated caller must not make the relay
+    // buffer or parse an arbitrarily large document.
+    const read = await readJsonObjectCapped(request, MAX_REQUEST_BODY_BYTES);
+    if (read.kind === "too_large") {
+      return json({ error: `request body exceeds ${String(MAX_REQUEST_BODY_BYTES)} bytes` }, 413);
+    }
+    if (read.kind === "invalid") return json({ error: "invalid JSON body" }, 400);
+    const envelope = read.body;
 
     // SECURITY (zero-knowledge): the ApprovalRequest envelope must be EXACTLY the contract's
     // routing/lifecycle fields wrapping the opaque ciphertext (contract.md §Messages). Rejecting
@@ -1608,24 +1819,53 @@ export class AccountRelay implements DurableObject {
 
     const id = requiredString(envelope, "id");
     if (!id) return json({ error: "'id' is required (string)" }, 400);
+    // Lowercase canonical UUID syntax only (contract §Transport: UUIDv4+). Bounds the id's size —
+    // it is a primary key, a WebSocket tag and part of every retained row — and its character set,
+    // and gives each UUID one spelling (never normalized: the device binds to the id as sent).
+    if (!REQUEST_ID_PATTERN.test(id)) {
+      return json({ error: "'id' must be a lowercase canonical UUID (8-4-4-4-12 hex)" }, 400);
+    }
     if (requiredNumber(envelope, "v") === null) {
       return json({ error: "'v' is required (number)" }, 400);
     }
-    if (requiredNumber(envelope, "created_at") === null) {
-      return json({ error: "'created_at' is required (i64 ms)" }, 400);
-    }
+    const createdAt = requiredNumber(envelope, "created_at");
+    if (createdAt === null) return json({ error: "'created_at' is required (i64 ms)" }, 400);
     if (!requiredString(envelope, "approver")) {
       return json({ error: "'approver' is required (string)" }, 400);
     }
-    // The ciphertext is opaque to the relay — present and a string is all we check.
-    if (!requiredString(envelope, "context_ciphertext")) {
+    // The ciphertext is opaque to the relay — present, a string, and within the size cap is all
+    // we check.
+    const contextCiphertext = requiredString(envelope, "context_ciphertext");
+    if (!contextCiphertext) {
       return json({ error: "'context_ciphertext' is required (opaque JWE string)" }, 400);
+    }
+    if (utf8ByteLength(contextCiphertext) > MAX_CONTEXT_CIPHERTEXT_BYTES) {
+      return json(
+        { error: `'context_ciphertext' exceeds ${String(MAX_CONTEXT_CIPHERTEXT_BYTES)} bytes` },
+        413,
+      );
     }
     const expiresAt = requiredNumber(envelope, "expires_at");
     if (expiresAt === null) return json({ error: "'expires_at' is required (i64 ms)" }, 400);
+    if (!Number.isInteger(expiresAt)) {
+      return json({ error: "'expires_at' must be an integer (i64 ms)" }, 400);
+    }
 
-    const now = Date.now();
-    if (expiresAt <= now) return json({ error: "request already expired" }, 400);
+    const now = this.now();
+    // The row this submit would store: `created_at` is the relay's receipt time (see deadlineOf).
+    if (now >= deadlineOf({ created_at: now, expires_at: expiresAt }, this.maxRequestTtlMs)) {
+      return json({ error: "request already expired" }, 400);
+    }
+    // Horizon: a far-future `expires_at` would otherwise keep a request pending (stored, counted,
+    // shown to devices) indefinitely.
+    if (expiresAt - now > this.maxRequestTtlMs) {
+      return json(
+        { error: `'expires_at' is more than ${String(this.maxRequestTtlMs)} ms in the future` },
+        400,
+      );
+    }
+    const createdAtFailure = this.createdAtFailure(createdAt, expiresAt, now);
+    if (createdAtFailure !== null) return json({ error: createdAtFailure }, 400);
     const requestAuthToken = generateAuthToken();
     const requestAuthTokenHash = await hashAuthToken(requestAuthToken);
 
@@ -1666,6 +1906,27 @@ export class AccountRelay implements DurableObject {
     return this.requestSubmitResponse(id, delivered, pushWakeups, requestAuthToken);
   }
 
+  /**
+   * Why a submitted `created_at` is not plausible, or `null` when it is. The window is the
+   * submitter's own, so this closes no attack: it turns a request the device would reject as
+   * unverifiable after the human taps into a 400 at submit. Each bound is inclusive:
+   * - an integer (contract §Transport: i64 ms);
+   * - no later than `expires_at`;
+   * - no further back than the request horizon (`now - maxRequestTtlMs`);
+   * - no further ahead than `MAX_CREATED_AT_SKEW_MS` (clock skew).
+   */
+  private createdAtFailure(createdAt: number, expiresAt: number, now: number): string | null {
+    if (!Number.isInteger(createdAt)) return "'created_at' must be an integer (i64 ms)";
+    if (createdAt > expiresAt) return "'created_at' is after 'expires_at'";
+    if (createdAt < now - this.maxRequestTtlMs) {
+      return `'created_at' is more than ${String(this.maxRequestTtlMs)} ms in the past`;
+    }
+    if (createdAt > now + MAX_CREATED_AT_SKEW_MS) {
+      return `'created_at' is more than ${String(MAX_CREATED_AT_SKEW_MS)} ms in the future`;
+    }
+    return null;
+  }
+
   private async authorizeRequestRead(
     requestId: string,
     request: Request,
@@ -1673,17 +1934,21 @@ export class AccountRelay implements DurableObject {
   ): Promise<{ row: RequestRow; status: string } | Response> {
     const rows = [
       ...this.sql.exec<RequestRow>(
-        `SELECT request_id, status, expires_at, auth_token_hash FROM request WHERE request_id = ?`,
+        `SELECT request_id, status, created_at, expires_at, auth_token_hash FROM request
+         WHERE request_id = ?`,
         requestId,
       ),
     ];
     const req = rows[0];
-    if (!req) return json({ error: "request not found" }, 404);
+    // An unknown id answers exactly as a wrong request token does (#357): existence is never
+    // revealed before the token is checked. A request swept after its retention window answers its
+    // old token the same way.
+    if (!req) return this.unknownIdentifierAuthFailure(request, source);
     const authFailure = await this.authorizeStoredHash(request, req.auth_token_hash, source);
     if (authFailure) return authFailure;
     return {
       row: req,
-      status: this.expireIfDue(requestId, req.status, req.expires_at, Date.now()),
+      status: this.expireIfDue(req, this.now()),
     };
   }
 
@@ -1711,20 +1976,23 @@ export class AccountRelay implements DurableObject {
    * first, up to the account budget. Each wakeup carries the latest deadline among the account's
    * pending requests (see `PushWakeup.expiresAt`), never just this request's.
    *
-   * Web Push coalescing: if a subscription has a wakeup in flight, or was woken within
-   * `WEB_PUSH_COALESCE_MS`, it is skipped. Submit needs no caller auth, so this is what bounds push
-   * volume per subscription. The check-and-claim runs synchronously here, before any `await`, so
-   * concurrent submits cannot both claim.
+   * Coalescing, every transport: if a token has a wakeup in flight, or was woken within
+   * `PUSH_COALESCE_MS`, it is skipped. Submit needs no caller auth, so this is what bounds push
+   * volume per token, and so per account (at most `MAX_PUSH_TOKENS_PER_ACCOUNT` per window). The
+   * check-and-claim runs synchronously here, before any `await`, so concurrent submits cannot both
+   * claim.
    *
-   * A skipped subscription is recorded in `webpush_trailing_wakeup` and woken once more when its
-   * window ends (see {@link sendTrailingWakeups}). The earlier wakeup may already have been fetched
-   * before this request was stored, so without that the request could get no push at all. A
-   * subscription that is claimed here has its trailing row cleared: this wakeup is dispatched after
-   * every request stored so far, so it covers them.
+   * A skipped token is recorded in `webpush_trailing_wakeup`, with this request's id, and woken
+   * once more when its window ends (see {@link sendTrailingWakeups}). The earlier wakeup may already
+   * have been fetched before this request was stored, so without that the request could get no push
+   * at all. A token that is claimed here keeps any owed trailing row until the push service accepts
+   * this wakeup. Only then is the row cleared, and only if every skipped submit came before this
+   * claim (see {@link clearCoveredTrailingWakeups}). A failed push therefore leaves the owed wakeup
+   * to retry once, when the new window ends.
    *
    * The fan-out runs **off the response path** under `waitUntil`, so a slow or hung push service can
-   * never delay or fail the submit. Returns how many wakeups were scheduled and how many Web Push
-   * subscriptions were coalesced. When the second is non-zero the caller arms the alarm with
+   * never delay or fail the submit. Returns how many wakeups were scheduled and how many tokens
+   * were coalesced. When the second is non-zero the caller arms the alarm with
    * {@link armTrailingWakeupAlarm}.
    */
   private schedulePushWakeups(
@@ -1732,8 +2000,8 @@ export class AccountRelay implements DurableObject {
     requestId: string,
     expiresAt: number,
   ): { scheduled: number; coalesced: number } {
-    const now = Date.now();
-    const claimedWebPushKeys: string[] = [];
+    const now = this.now();
+    const claimedKeys: string[] = [];
     let coalesced = 0;
     const tokens = schedulablePushTokens(
       [
@@ -1745,32 +2013,50 @@ export class AccountRelay implements DurableObject {
       ],
       this.pushTransports,
     ).filter((token) => {
-      if (token.transport !== "webpush") return true;
-      const key = webPushCoalesceKey(token.device_id, token.token);
-      if (!this.webPushCoalescer.tryClaim(key, now)) {
+      const key = pushCoalesceKey(token);
+      if (!this.pushCoalescer.tryClaim(key, now)) {
         coalesced++;
-        // The first skip in a window fixes the due time; later skips find the row already there.
+        // The first skip in a window fixes the due time; later skips only advance last_skipped_at
+        // and, on the latest skip (ties go to the newer submit), its request id.
         this.sql.exec(
-          `INSERT INTO webpush_trailing_wakeup (account_id, device_id, token, due_at)
-           VALUES (?, ?, ?, ?) ON CONFLICT (device_id, token) DO NOTHING`,
+          `INSERT INTO webpush_trailing_wakeup
+             (account_id, device_id, transport, token, due_at, last_skipped_at,
+              last_skipped_request_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (device_id, transport, token)
+           DO UPDATE SET
+             last_skipped_request_id = CASE
+               WHEN excluded.last_skipped_at >= last_skipped_at THEN excluded.last_skipped_request_id
+               ELSE last_skipped_request_id
+             END,
+             last_skipped_at = MAX(last_skipped_at, excluded.last_skipped_at)`,
           accountId,
           token.device_id,
+          token.transport,
           token.token,
-          this.webPushCoalescer.nextClaimableAt(key, now),
+          this.pushCoalescer.nextClaimableAt(key, now),
+          now,
+          requestId,
         );
         return false;
       }
+      // An owed trailing wakeup stays until this wakeup is accepted (see clearCoveredTrailingWakeups),
+      // so a failed push still gets its retry. It cannot be due inside the new window.
       this.sql.exec(
-        `DELETE FROM webpush_trailing_wakeup WHERE device_id = ? AND token = ?`,
+        `UPDATE webpush_trailing_wakeup SET due_at = MAX(due_at, ?)
+         WHERE device_id = ? AND transport = ? AND token = ?`,
+        this.pushCoalescer.nextClaimableAt(key, now),
         token.device_id,
+        token.transport,
         token.token,
       );
-      claimedWebPushKeys.push(key);
+      claimedKeys.push(key);
       return true;
     });
-    // The just-stored request is pending, so the latest pending deadline is never before its own.
-    const wakeupExpiresAt = Math.max(expiresAt, this.latestPendingRequest(now)?.expires_at ?? 0);
-    this.startPushFanOut(tokens, claimedWebPushKeys, accountId, requestId, wakeupExpiresAt);
+    // The just-stored request is pending, so the latest pending deadline is never before its own
+    // (stored with `created_at = now`, its deadline is `expiresAt`: submit refused anything later).
+    const wakeupExpiresAt = Math.max(expiresAt, this.latestPendingRequest(now)?.deadline ?? 0);
+    this.startPushFanOut(tokens, claimedKeys, accountId, requestId, wakeupExpiresAt, now);
     return { scheduled: tokens.length, coalesced };
   }
 
@@ -1780,35 +2066,71 @@ export class AccountRelay implements DurableObject {
    */
   private startPushFanOut(
     tokens: readonly StoredPushToken[],
-    claimedWebPushKeys: readonly string[],
+    claimedKeys: readonly string[],
     accountId: string,
     requestId: string,
     expiresAt: number,
+    claimedAt: number,
   ): void {
     if (tokens.length === 0) return;
-    const fanOut = this.deliverPushWakeups(tokens, accountId, requestId, expiresAt).finally(() => {
-      for (const key of claimedWebPushKeys) this.webPushCoalescer.release(key);
+    const fanOut = this.deliverPushWakeups(
+      tokens,
+      accountId,
+      requestId,
+      expiresAt,
+      claimedAt,
+    ).finally(() => {
+      for (const key of claimedKeys) this.pushCoalescer.release(key);
     });
     this.pushFanOut = Promise.all([this.pushFanOut, fanOut]).then(() => undefined);
     this.ctx.waitUntil(fanOut);
   }
 
   /**
-   * The pending, unexpired request with the latest deadline, or `undefined` if none. Its deadline
-   * is how long any wakeup stays useful: a wakeup leads to an inbox fetch that returns every pending
-   * request.
+   * The live pending request with the latest deadline ({@link deadlineOf}), or `undefined` if none.
+   * Its deadline is how long any wakeup stays useful: a wakeup leads to an inbox fetch that returns
+   * every live pending request.
    */
-  private latestPendingRequest(
-    now: number,
-  ): { request_id: string; expires_at: number } | undefined {
+  private latestPendingRequest(now: number): { request_id: string; deadline: number } | undefined {
     return [
-      ...this.sql.exec<{ request_id: string; expires_at: number }>(
-        `SELECT request_id, expires_at FROM request
-         WHERE status = 'pending' AND expires_at > ?
-         ORDER BY expires_at DESC LIMIT 1`,
+      ...this.sql.exec<{ request_id: string; deadline: number }>(
+        `SELECT request_id, ${DEADLINE_SQL} AS deadline FROM request
+         WHERE status = 'pending' AND ${DEADLINE_SQL} > ?
+         ORDER BY deadline DESC LIMIT 1`,
+        this.maxRequestTtlMs,
+        this.maxRequestTtlMs,
         now,
       ),
     ][0];
+  }
+
+  /** `requestId` if it names a live pending request at `now` ({@link deadlineOf}); otherwise `fallback`. */
+  private pendingRequestIdOr(requestId: string | null, now: number, fallback: string): string {
+    if (requestId === null) return fallback;
+    const live = [
+      ...this.sql.exec(
+        `SELECT 1 FROM request WHERE request_id = ? AND status = 'pending' AND ${DEADLINE_SQL} > ?`,
+        requestId,
+        this.maxRequestTtlMs,
+        now,
+      ),
+    ];
+    return live.length > 0 ? requestId : fallback;
+  }
+
+  /**
+   * Every live pending request at `now` ({@link deadlineOf}), oldest first: what the device inbox
+   * returns and the reconnect flush sends.
+   */
+  private livePendingRequests(now: number): Pick<RequestRow, "request_id" | "envelope">[] {
+    return [
+      ...this.sql.exec<Pick<RequestRow, "request_id" | "envelope">>(
+        `SELECT request_id, envelope FROM request
+         WHERE status = 'pending' AND ${DEADLINE_SQL} > ? ORDER BY created_at ASC`,
+        this.maxRequestTtlMs,
+        now,
+      ),
+    ];
   }
 
   /** Point the `webpush-trailing-wakeup` alarm purpose at the earliest owed trailing wakeup, if any. */
@@ -1822,32 +2144,39 @@ export class AccountRelay implements DurableObject {
   }
 
   /**
-   * Alarm purpose `webpush-trailing-wakeup`: send each subscription whose trailing wakeup is due its
-   * one owed wakeup.
+   * Alarm purpose `webpush-trailing-wakeup` (the name predates APNs/FCM coalescing and is kept,
+   * since due times are stored under it): send each token whose trailing wakeup is due its one owed
+   * wakeup, whatever its transport.
    *
-   * - The send goes through the coalescer like any other, so the per-window bound holds. This
-   *   includes a coalescer emptied by eviction.
-   * - A subscription still blocked (a wakeup in flight, or claimed again since) is retried at its
-   *   next claimable time, at least {@link WEB_PUSH_TRAILING_RETRY_MS} away.
+   * - The send goes through the coalescer like any other, so the per-window bound holds. Claims
+   *   are stored, so this also holds after eviction.
+   * - Claiming the send consumes the row, so a failed trailing wakeup is not owed again: the
+   *   trailing send itself is never retried.
+   * - A token still blocked (a wakeup in flight, or claimed again since) is retried at its next
+   *   claimable time, at least {@link PUSH_TRAILING_RETRY_MS} away.
    * - Rows are dropped without sending when there is nothing left to fetch (no pending, unexpired
-   *   request), when the subscription is no longer registered, or when Web Push is not configured.
+   *   request), when the token is no longer registered, or when its transport is not configured.
+   * - An APNs/FCM trailing wakeup carries the latest skipped submit's request id while that request
+   *   is still pending and unexpired, else the longest-lived pending request's (also for a row owed
+   *   before that id was recorded). The id is advisory: on any wakeup the device fetches its whole
+   *   inbox. Web Push sends no payload.
    * - The wakeup's deadline is that of the longest-lived pending request, so it lasts as long as
    *   anything it covers.
    */
   private async sendTrailingWakeups(now: number): Promise<void> {
-    if (this.pushTransports.webpush === undefined) {
-      this.sql.exec(`DELETE FROM webpush_trailing_wakeup`);
-      await this.armTrailingWakeupAlarm();
-      return;
-    }
+    const configured = (["apns", "fcm", "webpush"] as const).filter(
+      (transport) => this.pushTransports[transport] !== undefined,
+    );
     this.sql.exec(
       `DELETE FROM webpush_trailing_wakeup
-       WHERE NOT EXISTS (
-         SELECT 1 FROM device_push_token p
-         WHERE p.device_id = webpush_trailing_wakeup.device_id
-           AND p.transport = 'webpush'
-           AND p.token = webpush_trailing_wakeup.token
-       )`,
+       WHERE transport NOT IN (SELECT value FROM json_each(?))
+          OR NOT EXISTS (
+            SELECT 1 FROM device_push_token p
+            WHERE p.device_id = webpush_trailing_wakeup.device_id
+              AND p.transport = webpush_trailing_wakeup.transport
+              AND p.token = webpush_trailing_wakeup.token
+          )`,
+      JSON.stringify(configured),
     );
     const latest = this.latestPendingRequest(now);
     if (latest === undefined) {
@@ -1857,51 +2186,77 @@ export class AccountRelay implements DurableObject {
     }
     const due = [
       ...this.sql.exec<TrailingWakeupRow>(
-        `SELECT account_id, device_id, token, due_at FROM webpush_trailing_wakeup
-         WHERE due_at <= ? ORDER BY due_at ASC`,
+        `SELECT account_id, device_id, transport, token, due_at, last_skipped_request_id
+         FROM webpush_trailing_wakeup WHERE due_at <= ? ORDER BY due_at ASC`,
         now,
       ),
     ];
-    const tokens: StoredPushToken[] = [];
-    const claimedKeys: string[] = [];
+    // One fan-out per request id the wakeups carry: every Web Push wakeup (payload-less) goes with
+    // the longest-lived pending request, each APNs/FCM one with its latest skipped request.
+    const batches = new Map<string, { tokens: StoredPushToken[]; claimedKeys: string[] }>();
     let accountId = "";
     for (const row of due) {
-      const key = webPushCoalesceKey(row.device_id, row.token);
-      if (this.webPushCoalescer.tryClaim(key, now)) {
+      const token: StoredPushToken = {
+        device_id: row.device_id,
+        transport: row.transport,
+        token: row.token,
+      };
+      const key = pushCoalesceKey(token);
+      if (this.pushCoalescer.tryClaim(key, now)) {
         this.sql.exec(
-          `DELETE FROM webpush_trailing_wakeup WHERE device_id = ? AND token = ?`,
+          `DELETE FROM webpush_trailing_wakeup WHERE device_id = ? AND transport = ? AND token = ?`,
           row.device_id,
+          row.transport,
           row.token,
         );
-        tokens.push({ device_id: row.device_id, transport: "webpush", token: row.token });
-        claimedKeys.push(key);
+        const requestId =
+          row.transport === "webpush"
+            ? latest.request_id
+            : this.pendingRequestIdOr(row.last_skipped_request_id, now, latest.request_id);
+        const batch = batches.get(requestId) ?? { tokens: [], claimedKeys: [] };
+        batch.tokens.push(token);
+        batch.claimedKeys.push(key);
+        batches.set(requestId, batch);
         accountId = row.account_id;
       } else {
-        const claimableAt = this.webPushCoalescer.nextClaimableAt(key, now);
+        const claimableAt = this.pushCoalescer.nextClaimableAt(key, now);
         this.sql.exec(
-          `UPDATE webpush_trailing_wakeup SET due_at = ? WHERE device_id = ? AND token = ?`,
-          Math.max(claimableAt, now + WEB_PUSH_TRAILING_RETRY_MS),
+          `UPDATE webpush_trailing_wakeup SET due_at = ?
+           WHERE device_id = ? AND transport = ? AND token = ?`,
+          Math.max(claimableAt, now + PUSH_TRAILING_RETRY_MS),
           row.device_id,
+          row.transport,
           row.token,
         );
       }
     }
-    this.startPushFanOut(tokens, claimedKeys, accountId, latest.request_id, latest.expires_at);
+    for (const [requestId, batch] of batches) {
+      this.startPushFanOut(
+        batch.tokens,
+        batch.claimedKeys,
+        accountId,
+        requestId,
+        latest.deadline,
+        now,
+      );
+    }
     await this.armTrailingWakeupAlarm();
   }
 
   /**
-   * Run one fan-out, then prune the tokens a transport reported permanently undeliverable. Never
-   * rejects: push is best-effort, and devices still receive requests via WebSocket or polling.
+   * Run one fan-out, then prune the tokens a transport reported permanently undeliverable and clear
+   * the trailing wakeups the accepted ones cover. Never rejects: push is best-effort, and devices
+   * still receive requests via WebSocket or polling.
    */
   private async deliverPushWakeups(
     tokens: readonly StoredPushToken[],
     accountId: string,
     requestId: string,
     expiresAt: number,
+    claimedAt: number,
   ): Promise<void> {
     try {
-      const { undeliverableTokens } = await dispatchPushWakeups(tokens, {
+      const { deliveredTokens, undeliverableTokens } = await dispatchPushWakeups(tokens, {
         accountId,
         requestId,
         expiresAt,
@@ -1915,9 +2270,35 @@ export class AccountRelay implements DurableObject {
           gone.token,
         );
       }
+      await this.clearCoveredTrailingWakeups(deliveredTokens, claimedAt);
     } catch (error) {
       console.warn("push fan-out bookkeeping failed", error);
     }
+  }
+
+  /**
+   * A wakeup claimed at `claimedAt` was accepted by the push service, so the device will fetch every
+   * request stored before that claim. Clear each such token's owed trailing wakeup, unless a submit
+   * was skipped at or after the claim. That submit's request may postdate
+   * the inbox fetch, so it still needs the trailing wakeup.
+   */
+  private async clearCoveredTrailingWakeups(
+    deliveredTokens: readonly StoredPushToken[],
+    claimedAt: number,
+  ): Promise<void> {
+    let cleared = false;
+    for (const token of deliveredTokens) {
+      const result = this.sql.exec(
+        `DELETE FROM webpush_trailing_wakeup
+         WHERE device_id = ? AND transport = ? AND token = ? AND last_skipped_at < ?`,
+        token.device_id,
+        token.transport,
+        token.token,
+        claimedAt,
+      );
+      if (result.rowsWritten > 0) cleared = true;
+    }
+    if (cleared) await this.armTrailingWakeupAlarm();
   }
 
   /**
@@ -1934,7 +2315,8 @@ export class AccountRelay implements DurableObject {
   /**
    * GET /requests/{request_id}
    * Response: `{ request_id, status }` where status is `pending`, terminal `expired` (fail-closed,
-   *           past `expires_at`), or `resolved` (+ the signed `verdict`). 404 if unknown.
+   *           past `expires_at`), or `resolved` (+ the signed `verdict`). An unknown id gets the
+   *           same 401 / 403 as a wrong token, never "not found" (#357).
    *
    * The polling counterpart to `…/wait` — lets a disconnected integrator fetch a persisted verdict.
    * Lazy-expires a past-deadline request on read so it never reports a perpetual `pending`.
@@ -1982,9 +2364,9 @@ export class AccountRelay implements DurableObject {
       return json({ request_id: requestId, status: "retracted" });
     }
 
-    const now = Date.now();
+    const now = this.now();
     this.sql.exec(
-      `UPDATE request SET status = 'retracted', terminal_at = ?
+      `UPDATE request SET status = 'retracted', terminal_at = ?, envelope = ''
        WHERE request_id = ? AND status = 'pending'`,
       now,
       requestId,
@@ -1999,8 +2381,9 @@ export class AccountRelay implements DurableObject {
    *
    * A live waiting integrator: the verdict is pushed the instant a device decides (or immediately
    * if it already has), then the socket is closed. A past-deadline request is lazy-expired and the
-   * terminal status is pushed at once (fail-closed). Returns 404 for an unknown request (a request
-   * without a WebSocket upgrade header is rejected earlier, at the router, with 426).
+   * terminal status is pushed at once (fail-closed). An unknown request gets the same 401 / 403 as a
+   * wrong token, never "not found" (#357). A request without a WebSocket upgrade header is rejected
+   * earlier, at the router, with 426.
    *
    * Protocol (relay → integrator): `{ type: "verdict", request_id, verdict }`,
    * `{ type: "expired", request_id }`, or `{ type: "retracted", request_id }` (terminal, no verdict
@@ -2053,22 +2436,22 @@ export class AccountRelay implements DurableObject {
   }
 
   /**
-   * Fail-closed lazy expiry (contract §Invariants #6): if a `pending` request is past its
-   * `expires_at`, transition it to the terminal `expired` status. Returns the effective status so
-   * read paths report `expired` — never a perpetual `pending` — the first time anyone looks after
-   * the deadline. This shared transition also notifies live clients so a poll or late verdict cannot
-   * clear the alarm while leaving existing waiters/devices stuck on the stale pending request.
+   * Fail-closed lazy expiry (contract §Invariants #6): if a `pending` request has reached its
+   * deadline ({@link deadlineOf}), transition it to the terminal `expired` status. Returns the
+   * effective status so read paths report `expired` — never a perpetual `pending` — the first time
+   * anyone looks after the deadline. This shared transition also notifies live clients so a poll or
+   * late verdict cannot clear the alarm while leaving existing waiters/devices stuck on the stale
+   * pending request.
    */
   private expireIfDue(
-    requestId: string,
-    status: string,
-    expiresAt: number,
+    req: Pick<RequestRow, "request_id" | "status" | "created_at" | "expires_at">,
     now: number,
     options: { skipDeviceSocket?: WebSocket } = {},
   ): string {
-    if (status === "pending" && now > expiresAt) {
+    const { request_id: requestId, status } = req;
+    if (status === "pending" && now >= deadlineOf(req, this.maxRequestTtlMs)) {
       this.sql.exec(
-        `UPDATE request SET status = 'expired', terminal_at = ?
+        `UPDATE request SET status = 'expired', terminal_at = ?, envelope = ''
          WHERE request_id = ? AND status = 'pending'`,
         now,
         requestId,
@@ -2138,9 +2521,10 @@ export class AccountRelay implements DurableObject {
 
   /**
    * Hibernation message handler. The only inbound message that mutates state is a device verdict:
-   * `{ type: "verdict", request_id, verdict }`. On a fresh verdict the relay stores it, marks the
-   * request resolved, retracts it from the other devices, and pushes it to any waiting integrator.
-   * A verdict for an already-resolved request is ignored (dedupe / cross-device race).
+   * `{ type: "verdict", request_id, verdict }`. On a fresh verdict whose provenance verifies (#245)
+   * the relay stores it, marks the request resolved, retracts it from the other devices, and pushes
+   * it to any waiting integrator. A verdict for an already-resolved request is ignored (dedupe /
+   * cross-device race).
    */
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     const text = typeof message === "string" ? message : new TextDecoder().decode(message);
@@ -2182,12 +2566,17 @@ export class AccountRelay implements DurableObject {
   /**
    * Process a device verdict message. Idempotent: a second verdict for the same request (whether a
    * cross-device race or a retry) is acknowledged but does not overwrite the recorded decision.
+   *
+   * Only a verdict with valid provenance is recorded (#245): signed for this request by the
+   * socket's own device, certified by the bound account root and not revoked. Any other verdict
+   * gets an `error` frame and changes nothing, so the request stays answerable. Provenance is not a
+   * decision: the integrator still verifies the verdict in full and decides what it means.
    */
   private onDeviceVerdict(ws: WebSocket, msg: Record<string, unknown>): void {
     // SECURITY: only a device presence socket may submit a verdict. An integrator `…/wait` socket
     // (or any other non-device client) carries no `device:<id>` tag — it must NEVER be able to
-    // resolve a request by sending a forged verdict payload. Authenticity of the verdict body is
-    // additionally guaranteed by its JWS signature, verified downstream by the integrator.
+    // resolve a request by sending a forged verdict payload. The verdict body's provenance is checked
+    // below; the integrator still verifies it in full.
     const deviceId = this.deviceIdForSocket(ws);
     if (deviceId === null) {
       trySendJson(ws, { type: "error", error: "verdicts are only accepted from device sockets" });
@@ -2197,8 +2586,8 @@ export class AccountRelay implements DurableObject {
     // SECURITY (fail-closed): re-confirm the device is still enrolled. The socket tag proves which
     // device opened the connection, but a revoke may have removed the enrollment while a hibernation
     // socket survived the best-effort close — a de-enrolled device must not be able to drive a
-    // request to `resolved`. (The integrator's JWS verification is the real backstop; this keeps the
-    // relay's own state honest.)
+    // request to `resolved`. (The provenance check below also refuses a device revoked in the verified
+    // account state; this covers a de-enrollment the account state does not yet record.)
     const stillEnrolled = [
       ...this.sql.exec<DeviceRow>(`SELECT device_id FROM device WHERE device_id = ?`, deviceId),
     ];
@@ -2217,8 +2606,8 @@ export class AccountRelay implements DurableObject {
       trySendJson(ws, { type: "error", error: "'request_id' is required (string)" });
       return;
     }
-    // Require a JSON-object verdict (the contract Verdict shape). We never parse the JWS inside it,
-    // but a degenerate scalar (42, "x") could never be verified downstream — reject it outright.
+    // Require a JSON-object verdict (the contract Verdict shape): a degenerate scalar (42, "x") can
+    // never be a verdict, so it is refused before the provenance check.
     if (!isPlainObject(msg.verdict)) {
       trySendJson(ws, { type: "error", error: "'verdict' must be a JSON object" });
       return;
@@ -2226,7 +2615,8 @@ export class AccountRelay implements DurableObject {
 
     const reqRows = [
       ...this.sql.exec<RequestRow>(
-        `SELECT request_id, status, expires_at FROM request WHERE request_id = ?`,
+        `SELECT request_id, envelope, status, created_at, expires_at FROM request
+         WHERE request_id = ?`,
         requestId,
       ),
     ];
@@ -2248,17 +2638,64 @@ export class AccountRelay implements DurableObject {
       return;
     }
 
-    // Fail-closed (contract §Invariants #6): a request past its deadline must NEVER become
-    // approvable. Transition pending→expired and refuse to record the verdict.
-    const now = Date.now();
-    if (req.status === "expired" || (req.status === "pending" && now > req.expires_at)) {
-      this.expireIfDue(requestId, req.status, req.expires_at, now, { skipDeviceSocket: ws });
+    // Fail-closed (contract §Invariants #6): a request at or past its deadline must NEVER become
+    // approvable. Transition pending→expired and refuse to record the verdict. The same `now` is
+    // the verdict's received/terminal time below, so acceptance and recording read one instant.
+    const now = this.now();
+    if (this.expireIfDue(req, now, { skipDeviceSocket: ws }) === "expired") {
       trySendJson(ws, { type: "ack", request_id: requestId, status: "expired" });
       return;
     }
 
-    // SECURITY: the verdict is a JWS-signed decision, stored opaquely solely to route it back.
+    // The socket's device must be the device that answered: one device's token never carries
+    // another device's verdict, even a genuine one. The outer `approver.device_id` is checked here,
+    // before any crypto, so a mismatched verdict costs no signature work; the provenance check
+    // next ties it to the signature (`kid`) and the signed claims.
+    // Only a string `device_id` is compared: a malformed approver falls through to the provenance
+    // check and gets its error, not a claim about another device.
+    const approver = msg.verdict.approver;
+    if (
+      isPlainObject(approver) &&
+      typeof approver.device_id === "string" &&
+      approver.device_id !== deviceId
+    ) {
+      trySendJson(ws, {
+        type: "error",
+        request_id: requestId,
+        error: "verdict is signed by another device",
+      });
+      return;
+    }
+
+    // SECURITY (#245): only a verdict with valid provenance may become final. Any device could
+    // otherwise resolve every request instantly with junk, retracting the prompt from the human's
+    // other devices, so the relay, not the integrator, would decide which verdict counts. The core
+    // checks, without the plaintext, that the verdict was signed for this request, at a time inside
+    // the request's window, by a device the bound account root certified and has not revoked. A
+    // failed check records nothing, retracts nothing, and leaves the request pending for another
+    // device's verdict.
     const verdictJson = JSON.stringify(msg.verdict);
+    const signer = this.verdictSigner(verdictJson, requestId, req);
+    if (signer === null) {
+      trySendJson(ws, {
+        type: "error",
+        request_id: requestId,
+        error: "verdict failed provenance verification",
+      });
+      return;
+    }
+    // Defense in depth: the certified signer must be the socket's device too (the outer
+    // `approver.device_id` was compared above; the core ties it to the signed `kid`).
+    if (signer !== deviceId) {
+      trySendJson(ws, {
+        type: "error",
+        request_id: requestId,
+        error: "verdict is signed by another device",
+      });
+      return;
+    }
+
+    // The verdict is stored opaquely solely to route it back; its meaning is the integrator's call.
     try {
       this.sql.exec(
         `INSERT INTO verdict (request_id, verdict, device_id, received_at) VALUES (?, ?, ?, ?)`,
@@ -2274,7 +2711,7 @@ export class AccountRelay implements DurableObject {
       return;
     }
     this.sql.exec(
-      `UPDATE request SET status = 'resolved', terminal_at = ? WHERE request_id = ?`,
+      `UPDATE request SET status = 'resolved', terminal_at = ?, envelope = '' WHERE request_id = ?`,
       now,
       requestId,
     );
@@ -2302,6 +2739,41 @@ export class AccountRelay implements DurableObject {
   }
 
   /**
+   * The device that signed `verdictJson` for `req`, or `null` when its provenance does not verify
+   * against the request's window, the bound account root and the relay's verified account states
+   * (#245). Fails closed: no bound root, an envelope without an integer `created_at`, a core that
+   * cannot load, or any failed check is `null`.
+   *
+   * The window is the envelope's `created_at` and `expires_at`: the same values the integrator's
+   * `verify_verdict` step 5 checks `decided_at` against. (The row's `created_at` column is the
+   * relay's receive time, so it is not used here: a device clock slightly behind the relay's would
+   * otherwise be refused for a verdict the integrator accepts.)
+   */
+  private verdictSigner(
+    verdictJson: string,
+    requestId: string,
+    req: Pick<RequestRow, "envelope" | "expires_at">,
+  ): string | null {
+    const root = this.boundRootPubkey();
+    if (root === null) return null;
+    try {
+      const envelope = JSON.parse(req.envelope) as unknown;
+      if (!isPlainObject(envelope) || typeof envelope.created_at !== "number") return null;
+      return verifyVerdictProvenance(
+        verdictJson,
+        requestId,
+        envelope.created_at,
+        req.expires_at,
+        accountIdForRoot(root),
+        root,
+        this.verifiedAccountStates().states,
+      ).device_id;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Durable Object alarm: runs whichever purposes are due (see {@link RelayAlarmPurpose} and
    * `alarms.ts`). Expiry runs first, and on every firing: it recomputes everything from the request
    * table, so running it early is harmless, and an alarm left by an older deploy still expires and
@@ -2309,7 +2781,7 @@ export class AccountRelay implements DurableObject {
    */
   async alarm(): Promise<void> {
     await this.alarms.run(
-      Date.now(),
+      this.now(),
       {
         "request-expiry": (now) => this.expireDueRequests(now),
         "webpush-trailing-wakeup": (now) => this.sendTrailingWakeups(now),
@@ -2321,7 +2793,7 @@ export class AccountRelay implements DurableObject {
   /**
    * Alarm purpose `request-expiry`: fail-close expired pending requests, retract them from
    * connected devices, wake live integrator waiters, sweep old terminal rows, and then schedule the
-   * next pending expiry.
+   * next pending deadline.
    */
   private async expireDueRequests(now: number): Promise<void> {
     const expired = this.expirePendingDue(now);
@@ -2332,28 +2804,42 @@ export class AccountRelay implements DurableObject {
     await this.armExpiryAlarm();
   }
 
-  /** Point the `request-expiry` alarm purpose at the nearest pending expiry, or clear it when none remains. */
+  /**
+   * Point the `request-expiry` alarm purpose at the nearest pending deadline ({@link deadlineOf}),
+   * or clear it when no pending request remains. The horizon cap means a row stored before the
+   * horizon existed (far-future `expires_at`) is still expired and swept.
+   */
   private async armExpiryAlarm(): Promise<void> {
     const next = [
-      ...this.sql.exec<{ expires_at: number }>(
-        `SELECT expires_at FROM request WHERE status = 'pending' ORDER BY expires_at ASC LIMIT 1`,
+      ...this.sql.exec<{ deadline: number }>(
+        `SELECT ${DEADLINE_SQL} AS deadline FROM request
+         WHERE status = 'pending' ORDER BY deadline ASC LIMIT 1`,
+        this.maxRequestTtlMs,
       ),
     ][0];
-    await this.alarms.schedule("request-expiry", next?.expires_at ?? null);
+    await this.alarms.schedule("request-expiry", next?.deadline ?? null);
   }
 
-  /** Mark every overdue pending request expired and return the rows that changed state. */
+  /**
+   * Mark every overdue pending request expired and return the rows that changed state. Overdue
+   * means at or past its deadline ({@link deadlineOf}): past `expires_at`, or older than the
+   * horizon — the latter only happens to rows stored before the horizon was enforced or lowered.
+   * Once expired, a row is removed by {@link sweepTerminalRows} after the retention window, so no
+   * pending row is stored forever.
+   */
   private expirePendingDue(now: number): RequestRow[] {
     const overdue = [
       ...this.sql.exec<RequestRow>(
         `SELECT request_id, envelope, created_at, expires_at, status, terminal_at FROM request
-         WHERE status = 'pending' AND expires_at <= ? ORDER BY expires_at ASC`,
+         WHERE status = 'pending' AND ${DEADLINE_SQL} <= ?
+         ORDER BY expires_at ASC`,
+        this.maxRequestTtlMs,
         now,
       ),
     ];
     for (const request of overdue) {
       this.sql.exec(
-        `UPDATE request SET status = 'expired', terminal_at = ?
+        `UPDATE request SET status = 'expired', terminal_at = ?, envelope = ''
          WHERE request_id = ? AND status = 'pending'`,
         now,
         request.request_id,
@@ -2397,7 +2883,12 @@ export class AccountRelay implements DurableObject {
     }
   }
 
-  /** Bound storage growth by removing old terminal request rows and their stored verdicts. */
+  /**
+   * Bound storage growth by removing old terminal request rows and their stored verdicts. Pending
+   * rows reach this sweep through {@link expirePendingDue}, which the alarm runs first: every
+   * pending row past its deadline (including the horizon cap) is expired there, so no pending row
+   * outlives `deadline + REQUEST_RETENTION_MS`.
+   */
   private sweepTerminalRows(now: number): void {
     const cutoff = now - REQUEST_RETENTION_MS;
     this.sql.exec(
@@ -2405,7 +2896,10 @@ export class AccountRelay implements DurableObject {
        WHERE status IN ('expired', 'resolved', 'retracted') AND terminal_at IS NOT NULL AND terminal_at < ?`,
       cutoff,
     );
+
     this.sql.exec(`DELETE FROM verdict WHERE request_id NOT IN (SELECT request_id FROM request)`);
+    // Rows that went terminal before envelopes were blanked on transition: drop their ciphertext.
+    this.sql.exec(`UPDATE request SET envelope = '' WHERE status != 'pending' AND envelope != ''`);
   }
 }
 
@@ -2415,7 +2909,7 @@ export class AccountRelay implements DurableObject {
  * picks them up) but are neither sent nor counted in `push_wakeups`; devices then rely on WebSocket
  * presence and polling.
  */
-function buildPushTransports(env: Env): PushTransportRegistry {
+function buildPushTransports(env: Env, now: () => number): PushTransportRegistry {
   const transports: PushTransportRegistry = {};
   if (env.APNS_ENDPOINT && env.APNS_TOPIC && env.APNS_BEARER_TOKEN) {
     transports.apns = new ApnsPushTransport({
@@ -2431,6 +2925,6 @@ function buildPushTransports(env: Env): PushTransportRegistry {
     });
   }
   const vapid = vapidConfigFromEnv(env);
-  if (vapid) transports.webpush = new WebPushTransport({ vapid });
+  if (vapid) transports.webpush = new WebPushTransport({ vapid, now });
   return transports;
 }

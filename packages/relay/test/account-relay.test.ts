@@ -16,6 +16,7 @@
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import { pairingStartBody, testAccount } from "./support/accounts.js";
+import { DEVICE_X25519_PUBKEY } from "./support/keys.js";
 import { AccountRelay } from "../src/index.js";
 
 // ---------------------------------------------------------------------------
@@ -26,10 +27,10 @@ import { AccountRelay } from "../src/index.js";
  * Valid 32-byte Ed25519/X25519 public keys encoded as base64url-unpadded (43 chars each).
  * These are deterministic test vectors — not real key material.
  *
- * VALID_PUBKEY_1: 32 × 0x00 (all zero bytes)
- * VALID_PUBKEY_2: 32 × 0xFF (all 0xFF bytes)
+ * VALID_PUBKEY_1: a full-order X25519 key (RFC 7748 §6.1), since pairing rejects small-order keys
+ * VALID_PUBKEY_2: 32 × 0xFF (all 0xFF bytes; not small-order once bit 255 is masked)
  */
-const VALID_PUBKEY_1 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"; // 32 × 0x00, base64url-unpadded
+const VALID_PUBKEY_1 = DEVICE_X25519_PUBKEY;
 const VALID_PUBKEY_2 = "__________________________________________8"; // 32 × 0xFF, base64url-unpadded
 const VALID_APNS_TOKEN = "a".repeat(64);
 const VALID_FCM_TOKEN = "fcm-token_123:abc";
@@ -120,9 +121,8 @@ async function enrollDevice(accountId: string): Promise<PairingCompleteResult> {
 async function expirePairing(accountId: string, code: string): Promise<void> {
   const id = env.ACCOUNT.idFromName(accountId);
   const stub = env.ACCOUNT.get(id);
-  await runInDurableObject(stub, (instance: AccountRelay) => {
-    const relay = instance as unknown as { sql: SqlStorage };
-    relay.sql.exec(`UPDATE pairing SET expires_at = ? WHERE code = ?`, Date.now() - 1, code);
+  await runInDurableObject(stub, (relay: AccountRelay) => {
+    relay["sql"].exec(`UPDATE pairing SET expires_at = ? WHERE code = ?`, Date.now() - 1, code);
   });
 }
 
@@ -132,10 +132,9 @@ async function readPushTokens(
 ): Promise<Array<{ transport: string; token: string }>> {
   const id = env.ACCOUNT.idFromName(accountId);
   const stub = env.ACCOUNT.get(id);
-  return runInDurableObject(stub, (instance: AccountRelay) => {
-    const relay = instance as unknown as { sql: SqlStorage };
+  return runInDurableObject(stub, (relay: AccountRelay) => {
     return [
-      ...relay.sql.exec<{ transport: string; token: string }>(
+      ...relay["sql"].exec<{ transport: string; token: string }>(
         `SELECT transport, token FROM device_push_token
          WHERE device_id = ? ORDER BY created_at ASC`,
         deviceId,
@@ -235,10 +234,12 @@ describe("AccountRelay — pairing", () => {
     const acct = testAccount("acct-pairing-null-auth-hash");
     const start = await startPairing(acct);
 
-    await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(acct)), (instance) => {
-      const relay = instance as unknown as { sql: SqlStorage };
-      relay.sql.exec(`UPDATE pairing SET auth_token_hash = NULL WHERE code = ?`, start.code);
-    });
+    await runInDurableObject(
+      env.ACCOUNT.get(env.ACCOUNT.idFromName(acct)),
+      (relay: AccountRelay) => {
+        relay["sql"].exec(`UPDATE pairing SET auth_token_hash = NULL WHERE code = ?`, start.code);
+      },
+    );
 
     const noAuth = await post<{ error: string }>(acct, "/pairing/complete", {
       code: start.code,
@@ -338,7 +339,7 @@ describe("AccountRelay — pairing", () => {
     expect(goodComplete.status).toBe(201);
   });
 
-  it("rejects completing a pairing with an unknown code (404)", async () => {
+  it("rejects completing a pairing with an unknown code as unauthorized, never 'not found' (#357)", async () => {
     // Bind the root first: an unbound account refuses every completion (403) before code lookup.
     await startPairing(testAccount("acct-unknown-code"));
     const { status, data } = await post<{ error: string }>(
@@ -346,8 +347,8 @@ describe("AccountRelay — pairing", () => {
       "/pairing/complete",
       { code: "XXXXXXXX", pubkey: VALID_PUBKEY_1 },
     );
-    expect(status).toBe(404);
-    expect(typeof data.error).toBe("string");
+    expect(status).toBe(401);
+    expect(data.error).toBe("authorization required");
 
     // No device should have been added
     const listResp = await get<{ devices: unknown[] }>(

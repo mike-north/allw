@@ -56,7 +56,8 @@ and [enrollment.md](./enrollment.md) (account/device enrollment, rotation, revoc
 
 The payload being approved is an **`ActionRecord`** — defined in [policy-seam.md](./policy-seam.md). v1 carries the
 **syntactic substrate** (`surface` + tokenized command / MCP call); the semantic `capabilities`/`scope` fields are
-reserved and null. The contract is **action-agnostic**: it transports and binds whatever `ActionRecord` it's given.
+reserved and null, and a device refuses a context that sets one (§Device-side context checks). The contract is
+**action-agnostic**: it transports and binds whatever `ActionRecord` it's given.
 
 ---
 
@@ -129,6 +130,30 @@ one hash is the complete WYSIWYS binding. The actor's `attestation` is verified 
 (the relay never sees it); the integrator still holds the plaintext `ApprovalContext`
 locally (it builds it and runs its policy engine before escalating), so this split only changes what crosses the
 wire to the relay.
+
+#### Device-side context checks
+
+The hash binds the whole context, but approvers show only part of it. So when a device opens a context
+(`decrypt_context` in the core, used by every approver surface), it refuses one whose hidden part says something
+the shown part doesn't. The device can't approve a refused request, so the caller is denied (fail-closed). The
+error names what broke the rule; surfaces only render it. Decided 2026-11-03 (#296).
+
+1. **Reserved semantic fields must be null.** `action.capabilities` and `action.scope` are reserved for the T3 tier
+   ([policy-seam.md](./policy-seam.md) §Forward-compat). A context that sets either one is refused, whatever the
+   value: any `scope` value, including `{}`, `[]`, `""`, `0` and `false`, and any `capabilities` array, including
+   `[]`. A non-array `capabilities` is a malformed context and was already refused. Absent and `null` both pass.
+   The error names each field that is set, for example
+   `action.capabilities and action.scope are reserved and must be null in v1`. This is checked first.
+2. **No hidden risk downgrade.** Approvers show the context's `risk`, not `action.risk`. A context whose `risk` is
+   lower than `action.risk` would hide the record's tier behind a milder one, so it is refused. The error names
+   both tiers (`context risk low is lower than action.risk critical`). A context may **raise** the risk, since an
+   integrator can ask for more care than the record's tier, so `risk >= action.risk` passes. Showing both tiers
+   when they differ is a later display change ([#340](https://github.com/mike-north/allw/issues/340)). On the raw
+   SDK path both `risk` and `action.risk` are integrator inputs, so this is a consistency check: what is shown can't
+   be milder than what is recorded. It can't stop an integrator that writes `low` in both places.
+
+The integrator side doesn't check these today: an integrator that sends such a context gets a denial, not an
+error.
 
 ### Verdict — _one-shot and scope-free_
 
@@ -281,7 +306,12 @@ submit (#195).
 `{ type: "retract", request_id }` (another surface resolved it); device → relay
 `{ type: "verdict", request_id, verdict }` (the signed [`Verdict`](#verdict--one-shot-and-scope-free)), answered
 with `{ type: "ack", request_id, status }`. **First verdict wins** — a later verdict for a resolved request is
-acked as `already_resolved` and does not overwrite. A device that was offline when a request arrived receives it
+acked as `already_resolved` and does not overwrite. Only a verdict with valid provenance can win (#245): the relay
+checks in the core, without plaintext, that it was signed for this request by the socket's own device, with a
+`decided_at` inside the request's `[created_at, expires_at]`, certified by the bound account root and not revoked. Any other verdict is refused with an `error` frame and changes nothing, so
+the request stays pending. The relay only forwards provenance-valid verdicts; it never decides what a verdict
+means. The integrator runs the full [verification checklist](#verification-checklist-integrator-must) and decides
+finality ([relay-api.md](./relay-api.md) §4). A device that was offline when a request arrived receives it
 on its next `connect` (the queue), so delivery survives reconnect. If a device connection supplies `surface_id`,
 the relay fans out and flushes queued requests to at most one live socket per `surface_id`, preventing a single
 visible screen from showing both a native prompt and a mirrored prompt. Retractions still go to all live device
@@ -289,7 +319,12 @@ sockets so stale surfaces clear.
 `surface_id` is caller-asserted, account-global topology metadata; it is trusted only from a
 connection authenticated with that enrolled device's relay bearer token (#89).
 
-**Fail-closed expiry** (§Invariants #6): once a request is past `expires_at` it can never become approvable. A
+**Fail-closed expiry** (§Invariants #6): once a request is past `expires_at` it can never become approvable. The
+relay refuses at `now >= deadline` on its own receipt clock (`docs/relay-api.md` §3, request deadline), so at
+exactly `expires_at` it already treats the request as expired, 1 ms before the window `verify_verdict` checks
+(`decided_at` in `[created_at, expires_at]`, inclusive) closes. This is intentional, not a mismatch to fix on
+either side: the two checks are in series, so the stricter relay rule only ever tightens, and it matches the SDK's own wait, which
+fails closed at `now >= deadline`. A
 verdict for an expired request is refused (acked `expired`, not stored); the offline-queue flush skips expired
 requests (no dead request is re-pushed); and a read after the deadline **lazy-expires** the row — poll returns the
 terminal `expired` status and `…/wait` is pushed `{ type: "expired", request_id }`. In addition, the relay's

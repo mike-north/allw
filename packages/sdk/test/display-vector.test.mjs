@@ -45,6 +45,64 @@ test("escape_for_display matches every class in the shared vector", async () => 
   }
 });
 
+/** The core's notation for an escaped code point: `⟨U+XXXX⟩`, uppercase hex, at least 4 digits. */
+function codepointNotation(cp) {
+  return `⟨U+${cp.toString(16).toUpperCase().padStart(4, "0")}⟩`;
+}
+
+test("canary: every combining mark in this runtime's Unicode is capped at two in a run", async () => {
+  // The core's mark table is generated from one Unicode version (`UNICODE_VERSION`,
+  // crates/allw-core/src/display/unicode_tables.rs), but approvers render on runtimes whose
+  // Unicode may be newer. For every code point this runtime's ICU calls a nonspacing or
+  // enclosing mark, three of them on one base must show the third escaped. A mark the core's
+  // version doesn't assign still passes, because an unassigned code point counts toward a run;
+  // a failure here means the core shows a known mark uncapped.
+  const wasm = await loadWasm();
+  const mark = /^[\p{Mn}\p{Me}]$/u;
+  let checked = 0;
+  const uncapped = [];
+  for (let cp = 0; cp <= 0x10ffff; cp += 1) {
+    if (cp >= 0xd800 && cp <= 0xdfff) continue;
+    const c = String.fromCodePoint(cp);
+    if (!mark.test(c)) continue;
+    checked += 1;
+    if (!wasm.escape_for_display(`o${c}${c}${c}`).endsWith(codepointNotation(cp))) {
+      uncapped.push(codepointNotation(cp));
+    }
+  }
+  assert.ok(checked > 2000, `the runtime's ICU knows ${String(checked)} marks`);
+  assert.deepEqual(uncapped, [], "a third stacked mark is shown raw");
+});
+
+/** `[major, minor]` of a `major.minor[.patch]` version string. */
+function majorMinor(version) {
+  const match = /^(\d+)\.(\d+)/.exec(version);
+  assert.ok(match, `a Unicode version: ${version}`);
+  return [Number(match[1]), Number(match[2])];
+}
+
+test("the core's Unicode tables are not older than this runtime's Unicode", () => {
+  // Safety under skew comes from the unassigned-code-point rule (the canary above). This is the
+  // prompt to regenerate: a runtime on a newer Unicode than the core's tables fails here. Equal or
+  // older passes.
+  const tables = readFileSync(
+    join(here, "..", "..", "..", "crates", "allw-core", "src", "display", "unicode_tables.rs"),
+    "utf8",
+  );
+  const core = /pub const UNICODE_VERSION: &str = "([^"]+)";/.exec(tables)?.[1];
+  assert.ok(core, "unicode_tables.rs declares UNICODE_VERSION");
+  const runtime = process.versions.unicode;
+  assert.ok(runtime, "this runtime reports process.versions.unicode");
+  const [coreMajor, coreMinor] = majorMinor(core);
+  const [runMajor, runMinor] = majorMinor(runtime);
+  const newer = runMajor > coreMajor || (runMajor === coreMajor && runMinor > coreMinor);
+  assert.ok(
+    !newer,
+    `this runtime's Unicode (${runtime}) is newer than the core's tables (${core}). Regenerate them: ` +
+      `node scripts/gen-unicode-tables.mjs ${String(runMajor)}.${String(runMinor)}.0`,
+  );
+});
+
 test("display_model matches the shared vector's full model case", async () => {
   const wasm = await loadWasm();
   const { display_model_case: dm } = loadVector();

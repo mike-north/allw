@@ -28,6 +28,10 @@
 
 import {
   UndeliverablePushTokenError,
+  isClientErrorStatus,
+  readBoundedJsonBody,
+  releaseBody,
+  warnPushServiceRejection,
   type Fetcher,
   type PushTransport,
   type PushWakeup,
@@ -299,17 +303,57 @@ export class WebPushTransport implements PushTransport {
       // Bound each push: a slow or hung push service must not hold a fan-out slot indefinitely.
       signal: AbortSignal.timeout(this.timeoutMs),
     });
-    // The relay never reads push-service bodies; release the connection rather than leaving an
-    // unconsumed body holding one of the Worker's few outbound connection slots.
-    await response.body?.cancel();
+    const gone = response.status === 404 || response.status === 410;
+    if (isClientErrorStatus(response.status) && !gone) {
+      // A rejection is logged with its reason, read from a bounded prefix of the body (which is
+      // then released). Every other body is never read.
+      warnPushServiceRejection(
+        "webpush",
+        endpoint.host,
+        response.status,
+        await readPushServiceReason(response, endpoint),
+      );
+    } else {
+      // Release the connection rather than leaving an unconsumed body holding one of the Worker's
+      // few outbound connection slots.
+      releaseBody(response.body);
+    }
     if (response.ok) return;
-    if (response.status === 404 || response.status === 410) {
+    if (gone) {
       throw new UndeliverablePushTokenError(
         `Web Push subscription is gone (HTTP ${String(response.status)})`,
       );
     }
     throw new Error(`Web Push wakeup failed with HTTP ${String(response.status)}`);
   }
+}
+
+/** At most this much of a rejection's body is read, looking for its `reason`. */
+const PUSH_REASON_MAX_BYTES = 1024;
+/**
+ * A logged reason must look like a short identifier (Apple's are `BadWebPushTopic`, `BadJwtToken`,
+ * …; the longest documented one, `TooManyProviderTokenUpdates`, is 27 characters), so a push service
+ * cannot put arbitrary text in the log, and a realistic subscription token is too long to pass.
+ */
+const PUSH_REASON_PATTERN = /^[A-Za-z0-9_.-]{1,32}$/;
+
+/**
+ * The `reason` of a push service's JSON error body (Apple: `{"reason":"BadWebPushTopic"}`), or
+ * `undefined` when there is none. The body is read through {@link readBoundedJsonBody}, so it is
+ * bounded in size and time and always released without waiting.
+ *
+ * A reason that occurs anywhere in the subscription `endpoint` is dropped: the endpoint's path is a
+ * bearer capability, and a push service echoing it (or part of it) must not put it in the log.
+ */
+async function readPushServiceReason(
+  response: Response,
+  endpoint: URL,
+): Promise<string | undefined> {
+  const parsed = await readBoundedJsonBody(response, PUSH_REASON_MAX_BYTES);
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+  const reason = (parsed as Record<string, unknown>).reason;
+  if (typeof reason !== "string" || !PUSH_REASON_PATTERN.test(reason)) return undefined;
+  return endpoint.href.includes(reason) ? undefined : reason;
 }
 
 /** Sign an RFC 8292 VAPID JWT for one push-service origin (ES256, raw `r || s` signature). */

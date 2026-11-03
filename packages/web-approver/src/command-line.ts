@@ -56,16 +56,35 @@ export interface CommandParts {
  * core-escaped substrate it gives the line that is shown.
  */
 export function reconstructCommand(parts: CommandParts): string | undefined {
+  const tokens = commandTokens(parts);
+  return tokens === undefined ? undefined : renderArgv(tokens);
+}
+
+/**
+ * The command-form tokens {@link reconstructCommand} renders, or `undefined` when there is no
+ * command form.
+ */
+function commandTokens(parts: CommandParts): readonly string[] | undefined {
   const { argv, bin } = parts;
   if (argv !== undefined && argv.length > 0) {
-    const tokens = bin !== undefined && argv[0] !== bin ? [bin, ...argv] : argv;
-    return renderArgv(tokens);
+    return bin !== undefined && argv[0] !== bin ? [bin, ...argv] : argv;
   }
   if (bin !== undefined) {
     const positionals = parts.positionals;
-    return renderArgv(positionals !== undefined ? [bin, ...positionals] : [bin]);
+    return positionals !== undefined ? [bin, ...positionals] : [bin];
   }
   return undefined;
+}
+
+/**
+ * Whether `tokens` are exactly `raw` split at ASCII whitespace (space, tab, line feed: the only
+ * characters `shlex` splits on). Such an argv carries raw's bytes in raw's order and can't say
+ * anything raw doesn't, so it is not a divergence. Any other separator, including a Unicode space or
+ * a carriage return, stays inside a token here, so an argv split on it still diverges.
+ */
+function isWhitespaceSplitOf(tokens: readonly string[], raw: string): boolean {
+  const words = raw.split(/[ \t\n]+/).filter((word) => word !== "");
+  return words.length === tokens.length && words.every((word, i) => word === tokens[i]);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -89,7 +108,9 @@ function readStringArray(record: Record<string, unknown>, key: string): string[]
  *
  * Both halves are bound into `request_hash`, so an integrator could pair a benign `raw` with a
  * dangerous `argv`. This compares the **raw** (unescaped) substrate, because distinct inputs can
- * escape to the same text. Returns false when there is no `raw` or no command form.
+ * escape to the same text. Returns false when there is no `raw` or no command form, and when the
+ * tokens are exactly `raw`'s ASCII-whitespace split (display quoting alone, such as a quoted
+ * `C:\Users` path, is not a different command).
  *
  * @param syntactic the decrypted wire `syntactic` substrate (untrusted; any shape is tolerated)
  */
@@ -97,10 +118,11 @@ export function rawDivergesFromArgv(syntactic: unknown): boolean {
   if (!isRecord(syntactic)) return false;
   const raw = readString(syntactic, "raw");
   if (raw === undefined) return false;
-  const reconstructed = reconstructCommand({
+  const tokens = commandTokens({
     bin: readString(syntactic, "bin"),
     argv: readStringArray(syntactic, "argv"),
     positionals: readStringArray(syntactic, "positionals"),
   });
-  return reconstructed !== undefined && reconstructed !== raw;
+  if (tokens === undefined || isWhitespaceSplitOf(tokens, raw)) return false;
+  return renderArgv(tokens) !== raw;
 }
