@@ -156,3 +156,8 @@ The PM keeps this scheme current; if a label is missing or ambiguous, ask rather
 28. **Never touch release/Version PRs** (e.g. an automated "Release packages" PR) — their blocked
     state is a deliberate human release gate. Never flip repo visibility, publish packages locally,
     or add/modify repo secrets; releases happen only through CI.
+29. **Agents never start or finish an npm release.** Never create or push a `v*` tag, never dispatch
+    the Release workflow (`release.yml`; rehearsals included), and never run `npm stage approve`,
+    `npm stage reject`, `npm publish`, `npm trust` or the npm bootstrap script. CI only _stages_ a
+    release; a human maintainer cuts the tag and approves each staged version with npm 2FA
+    (`docs/releasing.md`). Changing the release tooling in a PR is fine; running it is not.

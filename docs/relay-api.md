@@ -39,6 +39,10 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   `base64url-unpadded(SHA-256("allw/account-id/v1" || 0x00 || account_root_pub))` — 43 characters, derived from
   the account-root public key (`docs/enrollment.md` §Self-Certifying Account Id). Root-signed calls present the
   root key and the relay rejects an id it cannot re-derive from it.
+- **Relay-level namespace.** The one exception to the account prefix is `/.well-known/allw/…` (RFC 8615,
+  §3). The router claims the whole `/.well-known` segment before account routing, so it never reaches an
+  account; a leading `.` is outside the base64url alphabet account ids use, so it cannot collide with one.
+  Every relay-level route, present or future, lives there.
 - **Auth.** `Authorization: Bearer <token>` (token = base64url, `^[A-Za-z0-9_-]+$`, ~43 chars). For
   **WebSocket** upgrades (which can't easily set headers), pass `?auth=<token>` as a query param.
   The relay stores only `SHA-256(token)`; the plaintext is returned **once** at issuance — cache it.
@@ -164,10 +168,26 @@ Every rejection leaves the account unchanged (no root bound, no code issued, not
 }
 ```
 
-→ **201** `{ device_id: string, device_auth_token: string }`. APNs `token` = 64-char hex.
-Errors: 403 when no root is bound to the account (a code on an unbound account predates root binding and
-is never honored), 400 (bad body/pubkey/push_token/unexpected key), 401/403 (token), 404 (code unknown),
-409 (code already used), 410 (code expired). Atomic — no half-enrollment.
+→ **201** `{ device_id: string, device_auth_token: string }`. APNs `token` = 64-char hex. A `webpush`
+`token` is the browser subscription's `endpoint` URL, which must be `https:` on a push-service host
+allowlist (§5); it is stored in normalized form (`URL.href`), so two spellings of one subscription are
+one token. **Budgets:** at most **4** `push_tokens` entries per registration and **2** distinct tokens
+per transport (duplicates collapse first); over budget is a **400**, never a silent truncation. An
+account holds at most **32** push tokens across all devices; a registration that would exceed that is
+a **409** and the pairing code is not consumed (retry without tokens, or free some). Errors: 403 when
+no root is bound to the account (a code on an unbound account predates root binding and is never
+honored), 400 (bad body/pubkey/push_token/unexpected key/over budget), 401/403 (token), 404 (code
+unknown), 409 (code already used, or account push-token budget full), 410 (code expired). Atomic — no
+half-enrollment.
+
+### Relay-level (`/.well-known/allw/`, not per-account)
+
+**`GET /.well-known/allw/vapid-public-key`** (also `HEAD`): no auth. → **200**
+`{ "vapid_public_key": "<base64url>" }` with `Cache-Control: public, max-age=3600`: the relay's
+VAPID public key (an uncompressed P-256 point, 65 bytes), which a browser passes as
+`applicationServerKey` to `PushManager.subscribe()`. **404** when the relay has no VAPID keypair
+configured, or the configured pair fails validation (Web Push disabled); **405** for any other
+method. Any other `/.well-known/…` path is **404**.
 
 ### Enrollment courier (cross-device `device_cert` issuance, #175) — specified, not implemented (#199)
 
@@ -336,7 +356,47 @@ Only device sockets may submit verdicts. On the first valid verdict the relay ma
 
 Integrator submission fans out **request-id-only** wakeups (no context, not E2EE) to registered
 tokens. APNs payload: `{ "aps": { "content-available": 1 }, "request_id": "…" }`. The device wakes,
-then fetches the full envelope via the socket or `/inbox`. (WebPush reserved, not in v1.)
+then fetches the full envelope via the socket or `/inbox`.
+
+**Fan-out is off the response path.** The submit returns as soon as the request is stored; wakeups
+are sent afterwards (at most 4 in flight, each push-service request bounded by a 5 s timeout), so a
+slow, hung, or failing push service can never delay or fail a submit. Consequently `push_wakeups` in
+the submit response is the number of wakeups **scheduled** (tokens with a configured transport, up to
+the 32-token account budget, newest registrations first, minus coalesced Web Push wakeups), not the
+number delivered.
+
+**Web Push** (RFC 8030, browser approvers):
+
+- **Token format.** The `webpush` token is the `PushSubscription.endpoint` URL. It must be `https:`,
+  carry no credentials, explicit port, or fragment, and name a known push-service host:
+  `fcm.googleapis.com` (Chrome), `updates.push.services.mozilla.com` (Firefox), `web.push.apple.com`
+  (Safari), or a single-label subdomain of `notify.windows.com` such as `wns2-by3p.notify.windows.com`
+  (Edge/WNS). Anything else is a **400** at registration. The relay
+  POSTs to this URL, so the allowlist is its SSRF guard; it is re-checked before every send, and
+  redirects are not followed.
+- **Payload-less wakeup.** The push request has an **empty body** — not even the request id — with
+  `TTL` set to the request's remaining lifetime rounded **up** to one of 60 s, 5 min, 1 h, 1 d, or
+  28 days (so the push service learns the deadline only coarsely), `Urgency: high`, and
+  VAPID auth `Authorization: vapid t=<ES256 JWT>, k=<vapid_public_key>` (RFC 8292; the JWT's `aud`
+  is the endpoint's origin, `exp` one hour out, `sub` the operator contact). The subscription's
+  `p256dh`/`auth` keys are not needed and not sent to the relay. On a `push` event the service worker
+  fetches pending envelopes itself via `GET /{acct}/devices/{device_id}/inbox`.
+- **Coalescing.** At most one wakeup per subscription (device id + endpoint) is sent per
+  **30 s** (`WEB_PUSH_COALESCE_MS`): a submit that finds a wakeup to that subscription in flight, or
+  sent within the window, skips it. The wakeup carries nothing request-specific, and the service
+  worker's inbox fetch returns every pending request, so nothing is lost. This bounds push volume per
+  subscription however fast unauthenticated submits arrive (#248).
+- **VAPID public key.** Clients subscribe with the key from `GET /.well-known/allw/vapid-public-key`
+  (§3).
+- **Pruning.** When the push service answers **404 or 410** (the subscription is gone), the relay
+  deletes that token row. That is the only pruning. Every other failure (401/403, other 4xx, 5xx, 3xx,
+  a timeout, a network error) leaves the token in place; in particular an auth error is a relay-side
+  VAPID problem, not a dead device, and never unregisters anyone. A stored row that fails the endpoint
+  allowlist at send time (e.g. one registered before validation existed, or after the allowlist
+  narrows) is refused, logged, and kept, never requested.
+- **Enablement.** Web Push is active only when the relay has a complete VAPID configuration whose
+  keypair actually matches (`docs/relay-deploy.md` §3d); otherwise `webpush` tokens are stored but no
+  wakeup is sent, and the public-key endpoint is 404.
 
 ---
 

@@ -100,10 +100,11 @@ export class RelayTimeoutError extends Error {
 
 /**
  * Hosts on which a plaintext `http:` relay is tolerated: a local-development relay
- * (`wrangler dev`) never leaves the machine. `[::1]` is the bracketed form `URL.hostname` reports
- * for the IPv6 loopback. Mirrors `packages/web-approver/src/relay-config.ts`.
+ * (`wrangler dev`) never leaves the machine. The IPv6 loopback `[::1]` is deliberately absent so
+ * the rule is identical to the web approver's, where a CSP cannot express an IPv6 literal;
+ * `127.0.0.1` is the loopback to use. Mirrors `packages/web-approver/src/relay-config.ts`.
  */
-const LOOPBACK_HOSTNAMES: ReadonlySet<string> = new Set(["localhost", "127.0.0.1", "[::1]"]);
+const LOOPBACK_HOSTNAMES: ReadonlySet<string> = new Set(["localhost", "127.0.0.1"]);
 
 /**
  * Reject a relay URL that would carry bearer tokens and ciphertext without TLS, or that carries
@@ -134,7 +135,7 @@ export function assertRelayUrlTransport(relayUrl: string): void {
   if (!secure) {
     throw new Error(
       `allw: relayUrl '${relayUrl}' must use https:// — plain http:// is allowed only for a local ` +
-        "relay on localhost, 127.0.0.1, or [::1]",
+        "relay on localhost or 127.0.0.1 (use 127.0.0.1 rather than [::1])",
     );
   }
   const hasExtras =
