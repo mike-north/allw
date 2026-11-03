@@ -68,6 +68,31 @@ export interface PairingStartClaims {
   readonly jti: string;
 }
 
+/** The fields of a verified `AccountState` the relay reads (mirrors `allw_core::AccountState`). */
+export interface VerifiedAccountState {
+  readonly v: number;
+  readonly account_id: string;
+  /**
+   * Monotonic sequence. A `u64` in the core; JSON-parsed here, so a value above 2^53-1 is not
+   * exactly representable — callers must reject it (`Number.isSafeInteger`).
+   */
+  readonly sequence: number;
+}
+
+/**
+ * Verify a root-signed `allw-account-state+jws` for `accountId` against `rootPubkey`. Throws on a
+ * bad signature, wrong `typ`, wrong account id or `current_root`, unsupported version, or junk.
+ */
+export function verifyAccountState(
+  stateJws: string,
+  accountId: string,
+  rootPubkey: string,
+): VerifiedAccountState {
+  return JSON.parse(
+    core().verify_account_state(stateJws, accountId, rootPubkey),
+  ) as VerifiedAccountState;
+}
+
 /**
  * Throws unless `accountId` is exactly the id the core derives from `rootPubkey` (base64url
  * Ed25519). A malformed key also throws.

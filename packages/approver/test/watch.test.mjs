@@ -208,7 +208,7 @@ test("runWatch fetches relay account state and renders a verified actor origin (
   try {
     globalThis.fetch = async (url, init = {}) => {
       fetches.push({ url: String(url), authorization: init.headers?.Authorization });
-      return new Response(JSON.stringify({ account_states: [accountState] }), {
+      return new Response(JSON.stringify({ account_states: [accountState], max_sequence: 1 }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
       });
@@ -233,7 +233,8 @@ test("runWatch fetches relay account state and renders a verified actor origin (
     assert.deepEqual(fetches, [
       {
         url: `https://relay.allw.test/${ACCOUNT_ID}/account-states`,
-        authorization: "Bearer device-secret-token",
+        // GET account-states is unauthenticated (#242): the device token is not sent.
+        authorization: undefined,
       },
     ]);
     assert.match(
