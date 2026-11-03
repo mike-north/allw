@@ -149,3 +149,70 @@ export function signAccountState(signer: TestAccount, options: AccountStateOptio
   const json = JSON.stringify(claims).replace('"__SEQUENCE__"', sequence);
   return glue.sign_account_state(json, signer.rootSeed);
 }
+
+/** Options for a device-signed verdict. */
+export interface VerdictOptions {
+  /** The signed decision (default `approved`). */
+  readonly decision?: "approved" | "denied" | "expired" | "aborted";
+  /** The signed `decided_at` (default: now). The device certificate must be valid at it. */
+  readonly decidedAt?: number;
+  /**
+   * The root that certifies the device key (default: the account's own root). Another account's
+   * root yields a certificate the relay must not accept.
+   */
+  readonly certifiedBy?: TestAccount;
+  /** The device id the certificate names (default: the verdict's device id). */
+  readonly certifiedDeviceId?: string;
+  /** Sign with a key the certificate does not vouch for (an uncertified key). */
+  readonly uncertifiedKey?: boolean;
+  /** The certificate's `expires_at` (default: none). */
+  readonly certExpiresAt?: number;
+}
+
+/** A test device's deterministic Ed25519 signing seed. */
+function deviceSeed(accountId: string, deviceId: string, salt = "device"): string {
+  return createHash("sha256")
+    .update(`allw-relay-test-${salt}/${accountId}/${deviceId}`)
+    .digest("base64url");
+}
+
+/**
+ * A genuinely signed `Verdict` (the core's `sign_verdict`) from `deviceId` of `accountId` for
+ * `requestId`, with a device certificate issued by the account's root, as a real approver device
+ * sends it. The `request_hash` is a fixed placeholder: the relay never sees the plaintext, and its
+ * provenance check does not bind the hash. Options build the verdicts the relay must refuse.
+ */
+export function signTestVerdict(
+  accountId: string,
+  deviceId: string,
+  requestId: string,
+  options: VerdictOptions = {},
+): Record<string, unknown> {
+  const root = options.certifiedBy ?? rootFor(accountId);
+  const seed = deviceSeed(accountId, deviceId);
+  const cert = glue.issue_device_cert(
+    root.rootSeed,
+    accountId,
+    options.certifiedDeviceId ?? deviceId,
+    glue.ed25519_public_key(seed),
+    1_700_000_000_000,
+    options.certExpiresAt ?? null,
+  );
+  const unsigned = {
+    v: 1,
+    request_id: requestId,
+    request_hash: "ZmFrZS1yZXF1ZXN0LWhhc2gtMzItYnl0ZXMtYjY0dXI",
+    decision: options.decision ?? "approved",
+    decided_at: options.decidedAt ?? Date.now(),
+    approver: { account_id: accountId, device_id: deviceId },
+  };
+  const signingSeed = options.uncertifiedKey ? deviceSeed(accountId, deviceId, "rogue") : seed;
+  return JSON.parse(
+    glue.sign_verdict(
+      JSON.stringify(unsigned),
+      signingSeed,
+      createHash("sha256").update(crypto.randomUUID()).digest("base64url"),
+      cert,
+    ),
+  ) as Record<string, unknown>;
+}

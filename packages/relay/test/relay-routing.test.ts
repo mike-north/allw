@@ -30,7 +30,14 @@ import type {
   PushWakeup,
 } from "../src/push.js";
 import type { SqlStorage } from "@cloudflare/workers-types";
-import { pairingStartBody, testAccount } from "./support/accounts.js";
+import {
+  pairingStartBody,
+  rootFor,
+  signAccountState,
+  signTestVerdict,
+  testAccount,
+  testRoot,
+} from "./support/accounts.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures (deterministic; never `Date.now()` in data — see fixed-dates rule)
@@ -71,16 +78,16 @@ function makeEnvelope(
 }
 
 /** A stand-in signed Verdict — opaque to the relay; `sig` is a stand-in compact JWS string. */
-function makeVerdict(requestId: string, decision = "approved"): Record<string, unknown> {
-  return {
-    v: 1,
-    request_id: requestId,
-    request_hash: "ZmFrZS1yZXF1ZXN0LWhhc2gtMzItYnl0ZXMtYjY0dXJsLXBhZA",
-    decision,
-    decided_at: CREATED_AT,
-    approver: { account_id: "acct", device_id: "dev-1" },
-    sig: "eyJhbGciOiJFZERTQSJ9..FAKE_JWS_SIGNATURE",
-  };
+/**
+ * A genuinely signed verdict from the account's first enrolled device (#245: the relay records only
+ * verdicts whose provenance verifies, so the routing tests send real ones).
+ */
+async function makeVerdict(
+  accountId: string,
+  requestId: string,
+  decision: "approved" | "denied" = "approved",
+): Promise<Record<string, unknown>> {
+  return signTestVerdict(accountId, await firstDeviceId(accountId), requestId, { decision });
 }
 
 function relayUrl(accountId: string, subPath: string): string {
@@ -375,7 +382,7 @@ describe("AccountRelay — routing (device online)", () => {
     expect(pushed.envelope?.context_ciphertext).toBe(envelope.context_ciphertext);
 
     // Device returns a signed verdict over the same socket.
-    const verdict = makeVerdict("req-online-1");
+    const verdict = await makeVerdict(acct, "req-online-1");
     device.send({ type: "verdict", request_id: "req-online-1", verdict });
     const ack = await device.next();
     expect(ack.type).toBe("ack");
@@ -402,7 +409,7 @@ describe("AccountRelay — routing (device online)", () => {
     // Integrator opens a wait socket BEFORE the device decides.
     const integrator = await connectWs(acct, "/requests/req-wait-1/wait");
 
-    const verdict = makeVerdict("req-wait-1", "denied");
+    const verdict = await makeVerdict(acct, "req-wait-1", "denied");
     device.send({ type: "verdict", request_id: "req-wait-1", verdict });
 
     const pushed = await integrator.next();
@@ -418,7 +425,7 @@ describe("AccountRelay — routing (device online)", () => {
 
     await post(acct, "/requests", makeEnvelope("req-late-1"));
     await device.next();
-    const verdict = makeVerdict("req-late-1");
+    const verdict = await makeVerdict(acct, "req-late-1");
     device.send({ type: "verdict", request_id: "req-late-1", verdict });
     await device.next(); // ack
 
@@ -570,7 +577,11 @@ describe("AccountRelay — routing (device offline)", () => {
     const second = await d1.next();
     const ids = [first.request_id, second.request_id].sort();
     expect(ids).toEqual(["req-mixed-1", "req-mixed-2"]);
-    d1.send({ type: "verdict", request_id: "req-mixed-1", verdict: makeVerdict("req-mixed-1") });
+    d1.send({
+      type: "verdict",
+      request_id: "req-mixed-1",
+      verdict: await makeVerdict(acct, "req-mixed-1"),
+    });
     await d1.next(); // ack
 
     // A second device connecting later should receive ONLY the still-pending req-mixed-2.
@@ -605,7 +616,7 @@ describe("AccountRelay — cross-device coordination", () => {
     dA.send({
       type: "verdict",
       request_id: "req-retract-1",
-      verdict: makeVerdict("req-retract-1"),
+      verdict: await makeVerdict(acct, "req-retract-1"),
     });
 
     // Device B must receive a retract for that request.
@@ -623,7 +634,7 @@ describe("AccountRelay — cross-device coordination", () => {
     await post(acct, "/requests", makeEnvelope("req-dedupe-1"));
     await device.next();
 
-    const winning = makeVerdict("req-dedupe-1", "approved");
+    const winning = await makeVerdict(acct, "req-dedupe-1", "approved");
     device.send({ type: "verdict", request_id: "req-dedupe-1", verdict: winning });
     const ack1 = await device.next();
     expect(ack1.status).toBe("resolved");
@@ -632,7 +643,7 @@ describe("AccountRelay — cross-device coordination", () => {
     device.send({
       type: "verdict",
       request_id: "req-dedupe-1",
-      verdict: makeVerdict("req-dedupe-1", "denied"),
+      verdict: await makeVerdict(acct, "req-dedupe-1", "denied"),
     });
     const ack2 = await device.next();
     expect(ack2.type).toBe("ack");
@@ -806,7 +817,7 @@ describe("AccountRelay — zero-knowledge (routing)", () => {
     const envelope = makeEnvelope("req-zk-1");
     await post(acct, "/requests", envelope);
     await device.next();
-    const verdict = makeVerdict("req-zk-1");
+    const verdict = await makeVerdict(acct, "req-zk-1");
     device.send({ type: "verdict", request_id: "req-zk-1", verdict });
     await device.next();
 
@@ -873,7 +884,7 @@ describe("AccountRelay — verdict authenticity", () => {
     integrator.send({
       type: "verdict",
       request_id: "req-sec-1",
-      verdict: makeVerdict("req-sec-1"),
+      verdict: await makeVerdict(acct, "req-sec-1"),
     });
 
     const resp = await integrator.next();
@@ -882,6 +893,201 @@ describe("AccountRelay — verdict authenticity", () => {
     // The request must remain pending — the forged verdict did NOT resolve it.
     const polled = await get<{ status: string }>(acct, "/requests/req-sec-1");
     expect(polled.data.status).toBe("pending");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Verdict finality (issue #245): only provenance-valid verdicts are recorded
+// ---------------------------------------------------------------------------
+
+describe("AccountRelay — verdict finality (#245)", () => {
+  /** A second device's encryption pubkey (any valid 32-byte base64url value). */
+  const SECOND_DEVICE_PUBKEY = "E".repeat(43);
+
+  /**
+   * An account with two enrolled devices, both connected; a pending request delivered to both, and
+   * a live integrator waiter on it.
+   */
+  async function setUp(name: string, requestId: string) {
+    const acct = testAccount(name);
+    const first = await enrollDevice(acct);
+    const second = await enrollDevice(acct, SECOND_DEVICE_PUBKEY);
+    const d1 = await connectWs(acct, `/devices/${first}/connect`);
+    const d2 = await connectWs(acct, `/devices/${second}/connect`);
+    await post(acct, "/requests", makeEnvelope(requestId));
+    expect((await d1.next()).type).toBe("request");
+    expect((await d2.next()).type).toBe("request");
+    const integrator = await connectWs(acct, `/requests/${requestId}/wait`);
+    return { acct, first, second, d1, d2, integrator };
+  }
+
+  /**
+   * After a refused verdict: the request is still pending with nothing recorded, the other device
+   * got no retract, and the legitimate device's genuine verdict still resolves it. The integrator
+   * receives that genuine verdict only.
+   */
+  async function expectStillAnswerable(
+    ctx: Awaited<ReturnType<typeof setUp>>,
+    requestId: string,
+  ): Promise<void> {
+    const polled = await get<{ status: string; verdict?: unknown }>(
+      ctx.acct,
+      `/requests/${requestId}`,
+    );
+    expect(polled.data.status).toBe("pending");
+    expect(polled.data.verdict).toBeUndefined();
+
+    const genuine = signTestVerdict(ctx.acct, ctx.first, requestId);
+    ctx.d1.send({ type: "verdict", request_id: requestId, verdict: genuine });
+    expect(await ctx.d1.next()).toEqual({ type: "ack", request_id: requestId, status: "resolved" });
+    // The first message the other device sees is the retract for the genuine verdict.
+    expect(await ctx.d2.next()).toEqual({ type: "retract", request_id: requestId });
+    const pushed = await ctx.integrator.next();
+    expect(pushed.type).toBe("verdict");
+    expect(pushed.verdict).toEqual(genuine);
+  }
+
+  /** Send `verdict` from device 1 for `requestId`; expect the provenance error frame. */
+  async function expectRefused(
+    ctx: Awaited<ReturnType<typeof setUp>>,
+    requestId: string,
+    verdict: unknown,
+    error = "verdict failed provenance verification",
+    socket: WsClient = ctx.d1,
+  ): Promise<void> {
+    socket.send({ type: "verdict", request_id: requestId, verdict });
+    expect(await socket.next()).toEqual({ type: "error", request_id: requestId, error });
+  }
+
+  it("refuses a junk verdict (a JSON object that is not a signed verdict)", async () => {
+    const ctx = await setUp("acct-final-junk", "req-final-junk");
+    for (const junk of [
+      { decision: "denied" },
+      {
+        v: 1,
+        request_id: "req-final-junk",
+        request_hash: "ZmFrZS1yZXF1ZXN0LWhhc2gtMzItYnl0ZXMtYjY0dXI",
+        decision: "denied",
+        decided_at: CREATED_AT,
+        approver: { account_id: ctx.acct, device_id: ctx.first },
+        sig: "eyJhbGciOiJFZERTQSJ9..FAKE_JWS_SIGNATURE",
+      },
+    ]) {
+      await expectRefused(ctx, "req-final-junk", junk);
+    }
+    await expectStillAnswerable(ctx, "req-final-junk");
+  });
+
+  it("refuses a verdict signed by a key no certificate vouches for", async () => {
+    const ctx = await setUp("acct-final-uncertified", "req-final-uncertified");
+    await expectRefused(
+      ctx,
+      "req-final-uncertified",
+      signTestVerdict(ctx.acct, ctx.first, "req-final-uncertified", {
+        decision: "denied",
+        uncertifiedKey: true,
+      }),
+    );
+    await expectStillAnswerable(ctx, "req-final-uncertified");
+  });
+
+  it("refuses a device certificate issued by another account's root", async () => {
+    const ctx = await setUp("acct-final-foreign-root", "req-final-foreign-root");
+    await expectRefused(
+      ctx,
+      "req-final-foreign-root",
+      signTestVerdict(ctx.acct, ctx.first, "req-final-foreign-root", {
+        decision: "denied",
+        certifiedBy: testRoot("acct-final-foreign-root-attacker"),
+      }),
+    );
+    await expectStillAnswerable(ctx, "req-final-foreign-root");
+  });
+
+  it("refuses a genuine verdict replayed for a different request id", async () => {
+    const ctx = await setUp("acct-final-replay", "req-final-replay");
+    const forOther = signTestVerdict(ctx.acct, ctx.first, "req-final-other", {
+      decision: "denied",
+    });
+    await expectRefused(ctx, "req-final-replay", forOther);
+    // Rewriting only the outer request_id does not help: it no longer matches the signed one.
+    await expectRefused(ctx, "req-final-replay", { ...forOther, request_id: "req-final-replay" });
+    await expectStillAnswerable(ctx, "req-final-replay");
+  });
+
+  it("refuses a genuine verdict whose kid is another device than the socket's", async () => {
+    const ctx = await setUp("acct-final-kid", "req-final-kid");
+    await expectRefused(
+      ctx,
+      "req-final-kid",
+      signTestVerdict(ctx.acct, ctx.second, "req-final-kid", { decision: "denied" }),
+      "verdict is signed by another device",
+    );
+    await expectStillAnswerable(ctx, "req-final-kid");
+  });
+
+  it("refuses a verdict from a device revoked in the relay's verified account state", async () => {
+    const ctx = await setUp("acct-final-revoked", "req-final-revoked");
+    const published = await post(ctx.acct, "/account-states", {
+      account_states: [
+        signAccountState(rootFor(ctx.acct), { sequence: 1, revokedDevices: [ctx.second] }),
+      ],
+    });
+    expect(published.status).toBe(200);
+    await expectRefused(
+      ctx,
+      "req-final-revoked",
+      signTestVerdict(ctx.acct, ctx.second, "req-final-revoked", { decision: "denied" }),
+      "verdict failed provenance verification",
+      ctx.d2,
+    );
+    // The revoked device's socket got its error; the legitimate device still resolves.
+    const polled = await get<{ status: string }>(ctx.acct, "/requests/req-final-revoked");
+    expect(polled.data.status).toBe("pending");
+    const genuine = signTestVerdict(ctx.acct, ctx.first, "req-final-revoked");
+    ctx.d1.send({ type: "verdict", request_id: "req-final-revoked", verdict: genuine });
+    expect((await ctx.d1.next()).status).toBe("resolved");
+    expect((await ctx.integrator.next()).verdict).toEqual(genuine);
+  });
+
+  it("refuses a verdict whose certificate had expired at its decided_at", async () => {
+    const ctx = await setUp("acct-final-cert-expired", "req-final-cert-expired");
+    await expectRefused(
+      ctx,
+      "req-final-cert-expired",
+      signTestVerdict(ctx.acct, ctx.first, "req-final-cert-expired", {
+        decision: "denied",
+        certExpiresAt: Date.now() - 60_000,
+      }),
+    );
+    await expectStillAnswerable(ctx, "req-final-cert-expired");
+  });
+
+  it("refuses every verdict when the account has no bound root (fail-closed)", async () => {
+    const ctx = await setUp("acct-final-unbound", "req-final-unbound");
+    // A pre-binding leftover: the device rows exist but no root is bound to check against.
+    const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(ctx.acct));
+    await runInDurableObject(stub, (instance: AccountRelay) => {
+      (instance as unknown as { sql: SqlStorage }).sql.exec(`DELETE FROM account_meta`);
+    });
+    await expectRefused(
+      ctx,
+      "req-final-unbound",
+      signTestVerdict(ctx.acct, ctx.first, "req-final-unbound"),
+    );
+    const polled = await get<{ status: string }>(ctx.acct, "/requests/req-final-unbound");
+    expect(polled.data.status).toBe("pending");
+  });
+
+  it("records a genuine denial: provenance is not a decision, the integrator judges it", async () => {
+    const ctx = await setUp("acct-final-denial", "req-final-denial");
+    const denial = signTestVerdict(ctx.acct, ctx.first, "req-final-denial", {
+      decision: "denied",
+    });
+    ctx.d1.send({ type: "verdict", request_id: "req-final-denial", verdict: denial });
+    expect((await ctx.d1.next()).status).toBe("resolved");
+    expect(await ctx.d2.next()).toEqual({ type: "retract", request_id: "req-final-denial" });
+    expect((await ctx.integrator.next()).verdict).toEqual(denial);
   });
 });
 
@@ -1102,7 +1308,11 @@ describe("AccountRelay — routing negative paths", () => {
     const acct = testAccount("acct-neg-badverdict");
     const deviceId = await enrollDevice(acct);
     const device = await connectWs(acct, `/devices/${deviceId}/connect`);
-    device.send({ type: "verdict", request_id: "no-such-request", verdict: makeVerdict("x") });
+    device.send({
+      type: "verdict",
+      request_id: "no-such-request",
+      verdict: await makeVerdict(acct, "x"),
+    });
     const err = await device.next();
     expect(err.type).toBe("error");
     expect(typeof err.error).toBe("string");
@@ -1145,7 +1355,11 @@ describe("AccountRelay — fail-closed expiry", () => {
     await seedExpiredRequest(acct, "req-exp-v");
 
     const device = await connectWs(acct, `/devices/${deviceId}/connect`);
-    device.send({ type: "verdict", request_id: "req-exp-v", verdict: makeVerdict("req-exp-v") });
+    device.send({
+      type: "verdict",
+      request_id: "req-exp-v",
+      verdict: await makeVerdict(acct, "req-exp-v"),
+    });
 
     const ack = await device.next();
     expect(ack.type).toBe("ack");
@@ -1276,9 +1490,11 @@ describe("AccountRelay — fail-closed expiry", () => {
     await post(acct, "/requests", makeEnvelope("req-rev-1"));
     await device.next(); // request push
 
+    // A genuine verdict, signed while the device was still enrolled.
+    const verdict = await makeVerdict(acct, "req-rev-1");
     // Simulate a revoke whose hibernation socket outlived the best-effort close.
     await deleteDeviceRow(acct, deviceId);
-    device.send({ type: "verdict", request_id: "req-rev-1", verdict: makeVerdict("req-rev-1") });
+    device.send({ type: "verdict", request_id: "req-rev-1", verdict });
 
     const err = await device.next();
     expect(err.type).toBe("error");
@@ -1388,7 +1604,7 @@ describe("AccountRelay — retract (issue #195)", () => {
     device.send({
       type: "verdict",
       request_id: "req-retract-then-verdict",
-      verdict: makeVerdict("req-retract-then-verdict"),
+      verdict: await makeVerdict(acct, "req-retract-then-verdict"),
     });
     const ack = await device.next();
     expect(ack.type).toBe("ack");
@@ -1411,7 +1627,7 @@ describe("AccountRelay — retract (issue #195)", () => {
 
     await post(acct, "/requests", makeEnvelope("req-retract-vs-resolved"));
     await device.next();
-    const winning = makeVerdict("req-retract-vs-resolved", "approved");
+    const winning = await makeVerdict(acct, "req-retract-vs-resolved", "approved");
     device.send({ type: "verdict", request_id: "req-retract-vs-resolved", verdict: winning });
     expect((await device.next()).status).toBe("resolved");
 
@@ -1548,7 +1764,7 @@ describe("AccountRelay — device inbox (HTTP poll)", () => {
     wsDevice.send({
       type: "verdict",
       request_id: "req-exclude-resolved",
-      verdict: makeVerdict("req-exclude-resolved"),
+      verdict: await makeVerdict(acct, "req-exclude-resolved"),
     });
     await wsDevice.next(); // ack
 
@@ -1798,7 +2014,7 @@ async function seedOldTerminalRows(accountId: string): Promise<void> {
       `INSERT OR REPLACE INTO verdict (request_id, verdict, device_id, received_at)
        VALUES (?, ?, ?, ?)`,
       "req-old-resolved",
-      JSON.stringify(makeVerdict("req-old-resolved")),
+      JSON.stringify({ request_id: "req-old-resolved", sig: "stored-verdict" }),
       "dev-old",
       OLD_TERMINAL_AT,
     );
@@ -1806,7 +2022,7 @@ async function seedOldTerminalRows(accountId: string): Promise<void> {
       `INSERT OR REPLACE INTO verdict (request_id, verdict, device_id, received_at)
        VALUES (?, ?, ?, ?)`,
       "req-fresh-resolved",
-      JSON.stringify(makeVerdict("req-fresh-resolved")),
+      JSON.stringify({ request_id: "req-fresh-resolved", sig: "stored-verdict" }),
       "dev-fresh",
       FUTURE_EXPIRES_AT,
     );
