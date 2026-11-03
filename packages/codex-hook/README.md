@@ -49,8 +49,10 @@ Add the hook to `~/.codex/hooks.json` or a trusted project `.codex/hooks.json`:
 ```
 
 Run `/hooks` in Codex and trust the hook definition. A gated Bash or MCP tool call then blocks on an
-allw approval; a verified approval returns Codex `allow`, while denial, timeout, malformed input, or
-relay failure returns `deny`.
+allw approval. A verified approval writes **no decision** (empty stdout, exit 0), so Codex's normal
+flow continues; denial, timeout, malformed input, or relay failure writes an explicit `deny`. The hook
+never emits `permissionDecision: "allow"` — see
+[`docs/codex-integration.md`](../../docs/codex-integration.md) §Fail-Open Residual for why.
 
 ## Development
 

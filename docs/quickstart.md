@@ -16,15 +16,16 @@ stand-ins, called out inline. Where a step is **not yet wired**, it says so rath
 >   for the Codex-specific hook config; steps 0–3 below (relay, install, pairing, watch) are identical.
 > - A **second-device approver** (`@allw/approver`) that renders the exact action (WYSIWYS), prompts
 >   Approve / Deny, and returns a signed verdict.
-> - A **zero-knowledge relay** (`@allw/relay`) — this quickstart defaults to the hosted relay at
->   `https://allw-relay.mnorth.workers.dev`; you can also run your own (Cloudflare or locally via
->   `wrangler dev`).
+> - A **relay** (`@allw/relay`) designed to be zero-knowledge — this quickstart defaults to the hosted
+>   relay at `https://allw-relay.mnorth.workers.dev`; you can also run your own (Cloudflare or locally
+>   via `wrangler dev`). **Not yet zero-knowledge against a malicious relay operator:** see the caveat
+>   in step 0.
 >
 > **v0 stand-ins (not production):**
 >
-> - The "second device" is a **CLI** (`allw-approver`), not yet a phone/web app. The hosted web
->   inbox is designed but not shipped (see `design/` and issue tracker). The wire protocol does not
->   change when the phone/web surface lands.
+> - The "second device" in this walkthrough is a **CLI** (`allw-approver`). A hosted **web approver**
+>   is also live (see the browser option in step 2); the native phone app is not shipped yet. The wire
+>   protocol does not change when the phone surface lands.
 > - The approver holds its keys in a **software keyfile**, not hardware (Secure Enclave / StrongBox).
 >   Tracked by [#23](https://github.com/mike-north/allw/issues/23). The protocol is unchanged.
 > - The requesting **actor identity is unverified** in v0 ([#16](https://github.com/mike-north/allw/issues/16));
@@ -46,7 +47,7 @@ package, and `@allw/hook` / `@allw/approver` load it from there.
 
 ## 0. The relay endpoint
 
-`allw` routes encrypted requests through a **zero-knowledge relay**. This quickstart uses the
+`allw` routes encrypted requests through a relay designed to be **zero-knowledge**. This quickstart uses the
 **hosted relay** so you can start without standing up any infrastructure:
 
 ```
@@ -55,9 +56,16 @@ https://allw-relay.mnorth.workers.dev
 
 That's the `<RELAY_URL>` referenced in the steps below — no Cloudflare account or setup needed.
 
-> The relay only ever sees **ciphertext + signed verdicts** — never plaintext or any signing key
-> (`docs/architecture.md`, `docs/contract.md`). That's true whether you use the hosted relay above
-> or run your own.
+> The relay is only ever sent **ciphertext + signed verdicts** — never plaintext or any signing key
+> (`docs/architecture.md`, `docs/contract.md`).
+>
+> **Caveat — not yet zero-knowledge against the relay itself.** The SDK encrypts each request to the
+> device list the relay returns (`GET /{account}/devices`), and the shipped hooks do not yet check that
+> list against root-signed account state. A malicious or compromised relay operator could therefore
+> list a key it holds as a device and decrypt the action context. Until the fixes land
+> ([#243](https://github.com/mike-north/allw/issues/243): encrypt only to root-vouched devices;
+> [#242](https://github.com/mike-north/allw/issues/242): verified account state), only use a relay
+> whose operator you trust — or run your own. See `docs/threat-model.md` §Residual Risks.
 
 **Prefer to self-host?** Either option below gives you a `<RELAY_URL>` to use in place of the
 hosted one — everything else in this quickstart is unchanged.
