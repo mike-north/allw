@@ -12,7 +12,8 @@
  * @see ../../../docs/contract.md §Lifecycle (fail-closed expiry)
  */
 
-import { env, runInDurableObject } from "cloudflare:test";
+import { runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import type { AccountRelay } from "../src/index.js";
 import { DEADLINE_SQL, deadlineOf } from "../src/request-deadline.js";

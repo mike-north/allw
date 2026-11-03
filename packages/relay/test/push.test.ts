@@ -41,17 +41,19 @@ describe("push fan-out", () => {
   });
 
   it("dispatches through swappable transports without routing knowing vendor details", async () => {
-    const sent: Array<{ kind: string; deviceId: string; requestId: string; token: string }> = [];
+    const sent: { kind: string; deviceId: string; requestId: string; token: string }[] = [];
     const apns: PushTransport = {
       kind: "apns",
-      async sendWakeup(wakeup) {
+      sendWakeup(wakeup) {
         sent.push({ kind: "apns", ...wakeup });
+        return Promise.resolve();
       },
     };
     const fcm: PushTransport = {
       kind: "fcm",
-      async sendWakeup(wakeup) {
+      sendWakeup(wakeup) {
         sent.push({ kind: "fcm", ...wakeup });
+        return Promise.resolve();
       },
     };
     const tokens: StoredPushToken[] = [
@@ -89,7 +91,7 @@ describe("push fan-out", () => {
   });
 
   it("formats APNs and FCM requests while keeping only request_id in the logical wakeup", async () => {
-    const fetcher = vi.fn<Fetcher>(async () => new Response(null, { status: 202 }));
+    const fetcher = vi.fn<Fetcher>(() => Promise.resolve(new Response(null, { status: 202 })));
     const apns = new ApnsPushTransport({
       endpoint: "https://api.push.apple.test",
       topic: "com.example.allw",
@@ -133,8 +135,8 @@ describe("push fan-out", () => {
   it("does not fail the relay dispatch when one push provider rejects a wakeup", async () => {
     const apns: PushTransport = {
       kind: "apns",
-      async sendWakeup() {
-        throw new Error("provider unavailable");
+      sendWakeup() {
+        return Promise.reject(new Error("provider unavailable"));
       },
     };
     const fcm: PushTransport = {
@@ -168,7 +170,7 @@ describe("push fan-out", () => {
     let inFlight = 0;
     let peak = 0;
     const finished: string[] = [];
-    const releases: Array<() => void> = [];
+    const releases: (() => void)[] = [];
     const webpush: PushTransport = {
       kind: "webpush",
       async sendWakeup(wakeup) {
@@ -221,9 +223,10 @@ describe("push fan-out", () => {
     const transient: StoredPushToken = { device_id: "dev-b", transport: "webpush", token: "flaky" };
     const webpush: PushTransport = {
       kind: "webpush",
-      async sendWakeup(wakeup) {
-        if (wakeup.token === "gone") throw new UndeliverablePushTokenError("HTTP 410");
-        throw new Error("HTTP 503");
+      sendWakeup(wakeup) {
+        if (wakeup.token === "gone")
+          return Promise.reject(new UndeliverablePushTokenError("HTTP 410"));
+        return Promise.reject(new Error("HTTP 503"));
       },
     };
 
@@ -247,7 +250,8 @@ describe("push-service rejections are logged for operators (#326)", () => {
       endpoint: "https://api.push.apple.test",
       topic: "com.example.allw",
       bearerToken: "apns-bearer-secret",
-      fetcher: async () => new Response(JSON.stringify({ reason: "BadDeviceToken" }), { status }),
+      fetcher: () =>
+        Promise.resolve(new Response(JSON.stringify({ reason: "BadDeviceToken" }), { status })),
     });
   }
 
@@ -255,7 +259,7 @@ describe("push-service rejections are logged for operators (#326)", () => {
     return new FcmPushTransport({
       endpoint: "https://fcm.googleapis.test/v1/projects/allw-secret-project/messages:send",
       bearerToken: "fcm-bearer-secret",
-      fetcher: async () => new Response(null, { status }),
+      fetcher: () => Promise.resolve(new Response(null, { status })),
     });
   }
 
@@ -354,7 +358,7 @@ describe("APNs and FCM prune only on an unregistered answer (#260)", () => {
       endpoint: "https://api.push.apple.test",
       topic: "com.example.allw",
       bearerToken: "apns-bearer",
-      fetcher: async () => response(),
+      fetcher: () => Promise.resolve(response()),
     });
   }
 
@@ -362,7 +366,7 @@ describe("APNs and FCM prune only on an unregistered answer (#260)", () => {
     return new FcmPushTransport({
       endpoint: "https://fcm.googleapis.test/v1/projects/allw/messages:send",
       bearerToken: "fcm-bearer",
-      fetcher: async () => response(),
+      fetcher: () => Promise.resolve(response()),
     });
   }
 
@@ -478,7 +482,11 @@ describe("APNs and FCM prune only on an unregistered answer (#260)", () => {
       const sender = transport === "APNs" ? apns(response) : fcm(response);
       const result = await Promise.race([
         outcome(sender, transport === "APNs" ? APNS_TOKEN : "fcm-token").then((r) => r.failure),
-        new Promise((resolve) => setTimeout(() => resolve("hung"), 3_000)),
+        new Promise((resolve) =>
+          setTimeout(() => {
+            resolve("hung");
+          }, 3_000),
+        ),
       ]);
 
       if (expected === null) expect(result).toBeNull();

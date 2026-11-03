@@ -13,7 +13,8 @@
  * from `idFromName(accountId)`.
  */
 
-import { SELF, env, runInDurableObject } from "cloudflare:test";
+import { runInDurableObject } from "cloudflare:test";
+import { env, exports } from "cloudflare:workers";
 import { describe, it, expect } from "vitest";
 import { pairingStartBody, testAccount } from "./support/accounts.js";
 import { DEVICE_X25519_PUBKEY } from "./support/keys.js";
@@ -46,13 +47,14 @@ function relayUrl(accountId: string, subPath: string): string {
 /**
  * POST a JSON body to the relay and return the parsed response.
  */
+// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters -- T types the parsed body for the caller, as Response.json<T>() does.
 async function post<T>(
   accountId: string,
   subPath: string,
   body: unknown,
   headers: Record<string, string> = {},
 ): Promise<{ status: number; data: T }> {
-  const resp = await SELF.fetch(relayUrl(accountId, subPath), {
+  const resp = await exports.default.fetch(relayUrl(accountId, subPath), {
     method: "POST",
     headers: { "Content-Type": "application/json", ...headers },
     body: JSON.stringify(body),
@@ -64,8 +66,9 @@ async function post<T>(
 /**
  * GET a resource from the relay and return the parsed response.
  */
+// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters -- T types the parsed body for the caller, as Response.json<T>() does.
 async function get<T>(accountId: string, subPath: string): Promise<{ status: number; data: T }> {
-  const resp = await SELF.fetch(relayUrl(accountId, subPath), {
+  const resp = await exports.default.fetch(relayUrl(accountId, subPath), {
     method: "GET",
   });
   const data = (await resp.json()) as T;
@@ -129,7 +132,7 @@ async function expirePairing(accountId: string, code: string): Promise<void> {
 async function readPushTokens(
   accountId: string,
   deviceId: string,
-): Promise<Array<{ transport: string; token: string }>> {
+): Promise<{ transport: string; token: string }[]> {
   const id = env.ACCOUNT.idFromName(accountId);
   const stub = env.ACCOUNT.get(id);
   return runInDurableObject(stub, (relay: AccountRelay) => {
@@ -180,12 +183,12 @@ describe("AccountRelay — pairing", () => {
 
     // GET /devices
     const listResp = await get<{
-      devices: Array<{
+      devices: {
         device_id: string;
         pubkey: string;
         label: string | null;
         created_at: number;
-      }>;
+      }[];
     }>(acct, "/devices");
     expect(listResp.status).toBe(200);
 
@@ -266,7 +269,7 @@ describe("AccountRelay — pairing", () => {
       { transport: "fcm", token: VALID_FCM_TOKEN },
     ]);
 
-    const listResp = await get<{ devices: Array<Record<string, unknown>> }>(acct, "/devices");
+    const listResp = await get<{ devices: Record<string, unknown>[] }>(acct, "/devices");
     expect(listResp.data.devices[0]).not.toHaveProperty("push_tokens");
   });
 
@@ -469,12 +472,12 @@ describe("AccountRelay — actor enrollment", () => {
     expect(data.actor_id).toBe("claude-code-mbp");
 
     const listResp = await get<{
-      actors: Array<{
+      actors: {
         actor_id: string;
         pubkey: string;
         label: string | null;
         created_at: number;
-      }>;
+      }[];
     }>(acct, "/actors");
     expect(listResp.status).toBe(200);
 
@@ -566,7 +569,7 @@ describe("AccountRelay — device revocation", () => {
     const { device_id, device_auth_token } = await enrollDevice(acct);
 
     // Verify it is listed
-    const before = await get<{ devices: Array<{ device_id: string }> }>(acct, "/devices");
+    const before = await get<{ devices: { device_id: string }[] }>(acct, "/devices");
     expect(before.data.devices).toHaveLength(1);
 
     // Revoke it
@@ -684,7 +687,7 @@ describe("AccountRelay — zero-knowledge invariant", () => {
     await completePairing(acct, startData, { label: "Test device" });
 
     const { data } = await get<{
-      devices: Array<Record<string, unknown>>;
+      devices: Record<string, unknown>[];
     }>(acct, "/devices");
 
     expect(data.devices).toHaveLength(1);
@@ -711,7 +714,7 @@ describe("AccountRelay — zero-knowledge invariant", () => {
     );
 
     const { data } = await get<{
-      actors: Array<Record<string, unknown>>;
+      actors: Record<string, unknown>[];
     }>(acct, "/actors");
 
     expect(data.actors).toHaveLength(1);
@@ -725,16 +728,22 @@ describe("AccountRelay — zero-knowledge invariant", () => {
 
 describe("AccountRelay — routing edge cases", () => {
   it("returns 404 for an unknown path", async () => {
-    const resp = await SELF.fetch(relayUrl(testAccount("acct-routing"), "/unknown/path"), {
-      method: "GET",
-    });
+    const resp = await exports.default.fetch(
+      relayUrl(testAccount("acct-routing"), "/unknown/path"),
+      {
+        method: "GET",
+      },
+    );
     expect(resp.status).toBe(404);
   });
 
   it("returns 405 for an unsupported method on a known path", async () => {
-    const resp = await SELF.fetch(relayUrl(testAccount("acct-routing-405"), "/devices"), {
-      method: "DELETE",
-    });
+    const resp = await exports.default.fetch(
+      relayUrl(testAccount("acct-routing-405"), "/devices"),
+      {
+        method: "DELETE",
+      },
+    );
     expect(resp.status).toBe(405);
   });
 });

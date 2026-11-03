@@ -20,7 +20,8 @@
  * Each test uses a distinct account id so `idFromName(accountId)` yields a fresh DO instance.
  */
 
-import { SELF, env, runInDurableObject } from "cloudflare:test";
+import { runInDurableObject } from "cloudflare:test";
+import { env, exports } from "cloudflare:workers";
 import { describe, it, expect, vi } from "vitest";
 import { AccountRelay } from "../src/index.js";
 import type {
@@ -109,6 +110,7 @@ function relayUrl(accountId: string, subPath: string): string {
 /** Accounts whose root is bound and whose relay clock is pinned to {@link RELAY_NOW}. */
 const clockPinned = new Set<string>();
 
+// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters -- T types the parsed body for the caller, as Response.json<T>() does.
 async function post<T>(
   accountId: string,
   subPath: string,
@@ -136,7 +138,7 @@ async function post<T>(
     );
     if (token !== undefined) finalHeaders.Authorization = `Bearer ${token}`;
   }
-  const resp = await SELF.fetch(relayUrl(accountId, subPath), {
+  const resp = await exports.default.fetch(relayUrl(accountId, subPath), {
     method: "POST",
     headers: { "Content-Type": "application/json", ...finalHeaders },
     body: JSON.stringify(body),
@@ -148,6 +150,7 @@ async function post<T>(
   return { status: resp.status, data };
 }
 
+// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters -- T types the parsed body for the caller, as Response.json<T>() does.
 async function get<T>(
   accountId: string,
   subPath: string,
@@ -161,7 +164,7 @@ async function get<T>(
     );
     if (token !== undefined) finalHeaders.Authorization = `Bearer ${token}`;
   }
-  const resp = await SELF.fetch(relayUrl(accountId, subPath), {
+  const resp = await exports.default.fetch(relayUrl(accountId, subPath), {
     method: "GET",
     headers: finalHeaders,
   });
@@ -370,16 +373,16 @@ async function connectWs(accountId: string, subPath: string): Promise<WsClient> 
     );
     if (token !== undefined) authedSubPath = appendAuthQuery(subPath, token);
   }
-  const resp = await SELF.fetch(relayUrl(accountId, authedSubPath), {
+  const resp = await exports.default.fetch(relayUrl(accountId, authedSubPath), {
     headers: { Upgrade: "websocket" },
   });
   if (resp.status !== 101 || !resp.webSocket) {
-    throw new Error(`expected 101 WebSocket upgrade, got ${resp.status}`);
+    throw new Error(`expected 101 WebSocket upgrade, got ${String(resp.status)}`);
   }
   const ws = resp.webSocket;
 
   const queue: WsMessage[] = [];
-  const waiters: Array<(m: WsMessage) => void> = [];
+  const waiters: ((m: WsMessage) => void)[] = [];
   ws.addEventListener("message", (event: MessageEvent) => {
     const raw =
       typeof event.data === "string"
@@ -596,8 +599,8 @@ describe("AccountRelay — routing (device offline)", () => {
     await installPushTransports(acct, {
       apns: {
         kind: "apns",
-        async sendWakeup() {
-          throw new Error("provider unavailable");
+        sendWakeup() {
+          return Promise.reject(new Error("provider unavailable"));
         },
       },
     });
@@ -783,7 +786,7 @@ describe("AccountRelay — cross-device coordination", () => {
     await mirroredPhone.expectNothingPending();
   });
 
-  it("continues same-surface fan-out when the first tagged socket cannot be sent to", async () => {
+  it("continues same-surface fan-out when the first tagged socket cannot be sent to", () => {
     const staleMac = { send: () => void 0 } as unknown as WebSocket;
     const liveMacMessages: string[] = [];
     const liveMac = {
@@ -887,9 +890,12 @@ describe("AccountRelay — cross-device coordination", () => {
     expect(response.status).toBe(101);
     expect(response.webSocket).toBeDefined();
 
-    const client = response.webSocket as WebSocket;
+    const client = response.webSocket;
+    if (!client) throw new Error("expected a WebSocket on the 101 response");
     const queued = new Promise<WsMessage>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error("WebSocket message timeout")), 500);
+      const timeout = setTimeout(() => {
+        reject(new Error("WebSocket message timeout"));
+      }, 500);
       client.addEventListener("message", (event: MessageEvent) => {
         clearTimeout(timeout);
         resolve(JSON.parse(event.data as string) as WsMessage);
@@ -1386,18 +1392,21 @@ describe("AccountRelay — endpoint authentication", () => {
     const acct = testAccount("acct-auth-device-connect");
     const device = await pairDevice(acct);
 
-    const noAuth = await SELF.fetch(relayUrl(acct, `/devices/${device.device_id}/connect`), {
-      headers: { Upgrade: "websocket" },
-    });
+    const noAuth = await exports.default.fetch(
+      relayUrl(acct, `/devices/${device.device_id}/connect`),
+      {
+        headers: { Upgrade: "websocket" },
+      },
+    );
     expect(noAuth.status).toBe(401);
 
-    const wrongAuth = await SELF.fetch(
+    const wrongAuth = await exports.default.fetch(
       relayUrl(acct, appendAuthQuery(`/devices/${device.device_id}/connect`, "wrong-token")),
       { headers: { Upgrade: "websocket" } },
     );
     expect(wrongAuth.status).toBe(403);
 
-    const ok = await SELF.fetch(
+    const ok = await exports.default.fetch(
       relayUrl(
         acct,
         appendAuthQuery(`/devices/${device.device_id}/connect`, device.device_auth_token),
@@ -1414,7 +1423,7 @@ describe("AccountRelay — endpoint authentication", () => {
     const deviceA = await pairDevice(acct);
     const deviceB = await pairDevice(acct, "__________________________________________8");
 
-    const crossDevice = await SELF.fetch(
+    const crossDevice = await exports.default.fetch(
       relayUrl(
         acct,
         appendAuthQuery(`/devices/${deviceA.device_id}/connect`, deviceB.device_auth_token),
@@ -1448,17 +1457,23 @@ describe("AccountRelay — endpoint authentication", () => {
       },
     );
 
-    const connect = await SELF.fetch(relayUrl(acct, `/devices/${device.device_id}/connect`), {
-      headers: { Upgrade: "websocket" },
-    });
+    const connect = await exports.default.fetch(
+      relayUrl(acct, `/devices/${device.device_id}/connect`),
+      {
+        headers: { Upgrade: "websocket" },
+      },
+    );
     expect(connect.status).toBe(401);
 
-    const poll = await SELF.fetch(relayUrl(acct, `/requests/${submit.data.request_id}`));
+    const poll = await exports.default.fetch(relayUrl(acct, `/requests/${submit.data.request_id}`));
     expect(poll.status).toBe(401);
 
-    const wait = await SELF.fetch(relayUrl(acct, `/requests/${submit.data.request_id}/wait`), {
-      headers: { Upgrade: "websocket" },
-    });
+    const wait = await exports.default.fetch(
+      relayUrl(acct, `/requests/${submit.data.request_id}/wait`),
+      {
+        headers: { Upgrade: "websocket" },
+      },
+    );
     expect(wait.status).toBe(401);
   });
 
@@ -1467,25 +1482,36 @@ describe("AccountRelay — endpoint authentication", () => {
     const submit = await post<SubmitResult>(acct, "/requests", makeEnvelope(rid("req-auth-token")));
     expect(submit.status).toBe(202);
 
-    const noAuthPoll = await SELF.fetch(relayUrl(acct, `/requests/${rid("req-auth-token")}`));
+    const noAuthPoll = await exports.default.fetch(
+      relayUrl(acct, `/requests/${rid("req-auth-token")}`),
+    );
     expect(noAuthPoll.status).toBe(401);
 
-    const wrongAuthPoll = await SELF.fetch(relayUrl(acct, `/requests/${rid("req-auth-token")}`), {
-      headers: bearer("wrong-request-token"),
-    });
+    const wrongAuthPoll = await exports.default.fetch(
+      relayUrl(acct, `/requests/${rid("req-auth-token")}`),
+      {
+        headers: bearer("wrong-request-token"),
+      },
+    );
     expect(wrongAuthPoll.status).toBe(403);
 
-    const okPoll = await SELF.fetch(relayUrl(acct, `/requests/${rid("req-auth-token")}`), {
-      headers: bearer(submit.data.request_auth_token),
-    });
+    const okPoll = await exports.default.fetch(
+      relayUrl(acct, `/requests/${rid("req-auth-token")}`),
+      {
+        headers: bearer(submit.data.request_auth_token),
+      },
+    );
     expect(okPoll.status).toBe(200);
 
-    const noAuthWait = await SELF.fetch(relayUrl(acct, `/requests/${rid("req-auth-token")}/wait`), {
-      headers: { Upgrade: "websocket" },
-    });
+    const noAuthWait = await exports.default.fetch(
+      relayUrl(acct, `/requests/${rid("req-auth-token")}/wait`),
+      {
+        headers: { Upgrade: "websocket" },
+      },
+    );
     expect(noAuthWait.status).toBe(401);
 
-    const wrongAuthWait = await SELF.fetch(
+    const wrongAuthWait = await exports.default.fetch(
       relayUrl(
         acct,
         appendAuthQuery(`/requests/${rid("req-auth-token")}/wait`, "wrong-request-token"),
@@ -1494,7 +1520,7 @@ describe("AccountRelay — endpoint authentication", () => {
     );
     expect(wrongAuthWait.status).toBe(403);
 
-    const okWait = await SELF.fetch(
+    const okWait = await exports.default.fetch(
       relayUrl(
         acct,
         appendAuthQuery(`/requests/${rid("req-auth-token")}/wait`, submit.data.request_auth_token),
@@ -1578,7 +1604,7 @@ describe("AccountRelay — routing negative paths", () => {
   });
 
   it("returns 404 connecting a WebSocket for an unenrolled device", async () => {
-    const resp = await SELF.fetch(
+    const resp = await exports.default.fetch(
       relayUrl(testAccount("acct-neg-wsdev"), "/devices/ghost/connect"),
       {
         headers: { Upgrade: "websocket" },
@@ -1590,12 +1616,17 @@ describe("AccountRelay — routing negative paths", () => {
   it("returns 426 hitting a WebSocket route without an upgrade header", async () => {
     const acct = testAccount("acct-neg-noupgrade");
     const deviceId = await enrollDevice(acct);
-    const connectResp = await SELF.fetch(relayUrl(acct, `/devices/${deviceId}/connect`), {
-      method: "GET",
-    });
+    const connectResp = await exports.default.fetch(
+      relayUrl(acct, `/devices/${deviceId}/connect`),
+      {
+        method: "GET",
+      },
+    );
     expect(connectResp.status).toBe(426);
 
-    const waitResp = await SELF.fetch(relayUrl(acct, "/requests/whatever/wait"), { method: "GET" });
+    const waitResp = await exports.default.fetch(relayUrl(acct, "/requests/whatever/wait"), {
+      method: "GET",
+    });
     expect(waitResp.status).toBe(426);
   });
 
@@ -1614,7 +1645,7 @@ describe("AccountRelay — routing negative paths", () => {
   });
 
   it("answers opening …/wait for an unknown request as unauthorized (#357)", async () => {
-    const resp = await SELF.fetch(
+    const resp = await exports.default.fetch(
       relayUrl(testAccount("acct-neg-waitunknown"), "/requests/nope/wait"),
       {
         headers: { Upgrade: "websocket" },
@@ -1932,7 +1963,7 @@ describe("AccountRelay — one deadline for every lifecycle path (#292)", () => 
     const deviceId = await enrollDevice(acct);
     await submitThenLowerHorizon(acct, rid("req-deadline-inbox"));
     const inboxIds = async (): Promise<unknown[]> => {
-      const resp = await get<{ envelopes: Array<Record<string, unknown>> }>(
+      const resp = await get<{ envelopes: Record<string, unknown>[] }>(
         acct,
         `/devices/${deviceId}/inbox`,
         bearer(deviceAuthTokens.get(tokenKey(acct, deviceId)) ?? ""),
@@ -2259,7 +2290,7 @@ describe("AccountRelay — retract (issue #195)", () => {
     expect(submitA.status).toBe(202);
     expect(submitB.status).toBe(202);
 
-    const noAuth = await SELF.fetch(
+    const noAuth = await exports.default.fetch(
       relayUrl(acct, `/requests/${rid("req-retract-auth-a")}/retract`),
       {
         method: "POST",
@@ -2267,7 +2298,7 @@ describe("AccountRelay — retract (issue #195)", () => {
     );
     expect(noAuth.status).toBe(401);
 
-    const wrongAuth = await SELF.fetch(
+    const wrongAuth = await exports.default.fetch(
       relayUrl(acct, `/requests/${rid("req-retract-auth-a")}/retract`),
       {
         method: "POST",
@@ -2278,7 +2309,7 @@ describe("AccountRelay — retract (issue #195)", () => {
 
     // An integrator holding a REAL, currently-valid token for a DIFFERENT request must not be able
     // to retract this one — the token is scoped to exactly the request it was issued for (#195).
-    const crossRequest = await SELF.fetch(
+    const crossRequest = await exports.default.fetch(
       relayUrl(acct, `/requests/${rid("req-retract-auth-a")}/retract`),
       {
         method: "POST",
@@ -2305,7 +2336,7 @@ describe("AccountRelay — retract (issue #195)", () => {
   it("returns 405 retracting via the wrong method", async () => {
     const acct = testAccount("acct-retract-method");
     await post(acct, "/requests", makeEnvelope(rid("req-retract-method")));
-    const resp = await SELF.fetch(
+    const resp = await exports.default.fetch(
       relayUrl(acct, `/requests/${rid("req-retract-method")}/retract`),
       {
         method: "GET",
@@ -2404,7 +2435,7 @@ describe("AccountRelay — device inbox (HTTP poll)", () => {
     const acct = testAccount("acct-inbox-noauth");
     const device = await pairDevice(acct);
 
-    const resp = await SELF.fetch(relayUrl(acct, `/devices/${device.device_id}/inbox`), {
+    const resp = await exports.default.fetch(relayUrl(acct, `/devices/${device.device_id}/inbox`), {
       method: "GET",
     });
     expect(resp.status).toBe(401);
@@ -2414,7 +2445,7 @@ describe("AccountRelay — device inbox (HTTP poll)", () => {
     const acct = testAccount("acct-inbox-wrongauth");
     const device = await pairDevice(acct);
 
-    const resp = await SELF.fetch(relayUrl(acct, `/devices/${device.device_id}/inbox`), {
+    const resp = await exports.default.fetch(relayUrl(acct, `/devices/${device.device_id}/inbox`), {
       method: "GET",
       headers: { Authorization: "Bearer wrong-token" },
     });
@@ -2425,7 +2456,7 @@ describe("AccountRelay — device inbox (HTTP poll)", () => {
     const acct = testAccount("acct-inbox-notfound");
     await pairDevice(acct);
 
-    const resp = await SELF.fetch(relayUrl(acct, `/devices/not-a-real-device/inbox`), {
+    const resp = await exports.default.fetch(relayUrl(acct, `/devices/not-a-real-device/inbox`), {
       method: "GET",
       headers: { Authorization: "Bearer any-token" },
     });
@@ -2437,7 +2468,7 @@ describe("AccountRelay — device inbox (HTTP poll)", () => {
     const device = await pairDevice(acct);
     const token = device.device_auth_token;
 
-    const resp = await SELF.fetch(relayUrl(acct, `/devices/${device.device_id}/inbox`), {
+    const resp = await exports.default.fetch(relayUrl(acct, `/devices/${device.device_id}/inbox`), {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -2469,7 +2500,7 @@ describe("AccountRelay — device inbox (HTTP poll)", () => {
 
 /** Read back the single enrolled device's id via the registry (used to build the connect URL). */
 async function firstDeviceId(accountId: string): Promise<string> {
-  const { data } = await get<{ devices: Array<{ device_id: string }> }>(accountId, "/devices");
+  const { data } = await get<{ devices: { device_id: string }[] }>(accountId, "/devices");
   const first = data.devices[0];
   if (!first) throw new Error(`no enrolled device for ${accountId}`);
   return first.device_id;

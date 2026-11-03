@@ -15,7 +15,7 @@
  * @see https://github.com/mike-north/allw/issues/302
  */
 
-import { SELF } from "cloudflare:test";
+import { exports } from "cloudflare:workers";
 import { describe, it, expect } from "vitest";
 import { ACCOUNT_ROUTES, matchRoutePath, resolveAccountRoute } from "../src/routes.js";
 
@@ -150,7 +150,7 @@ const DOCUMENTED_ROUTES: readonly DocumentedRoute[] = [
 ];
 
 async function call(method: string, subPath: string): Promise<{ status: number; body: unknown }> {
-  const resp = await SELF.fetch(`https://relay.allw.test/${ACCOUNT}${subPath}`, {
+  const resp = await exports.default.fetch(`https://relay.allw.test/${ACCOUNT}${subPath}`, {
     method,
     ...(method === "GET" ? {} : { headers: { "Content-Type": "application/json" }, body: "{}" }),
   });
@@ -208,8 +208,8 @@ describe.each(DOCUMENTED_ROUTES)("$method /$path", (route) => {
     const { status, body } = await call(route.method, `/${route.concrete}`);
     // The handler decides the status (often 400/401/404 for this junk input); the router's own
     // 404 and 405 bodies must not appear.
-    expect(body, `status ${status}`).not.toEqual(NOT_FOUND);
-    expect(body, `status ${status}`).not.toEqual(METHOD_NOT_ALLOWED);
+    expect(body, `status ${String(status)}`).not.toEqual(NOT_FOUND);
+    expect(body, `status ${String(status)}`).not.toEqual(METHOD_NOT_ALLOWED);
   });
 
   it.each(METHODS)("is not this route with an extra segment, by %s", async (method) => {

@@ -14,7 +14,8 @@
  * @see ../../../crates/allw-core/src/crypto.rs (`verify_account_state`)
  */
 
-import { SELF, env, runInDurableObject } from "cloudflare:test";
+import { runInDurableObject } from "cloudflare:test";
+import { env, exports } from "cloudflare:workers";
 import { describe, it, expect } from "vitest";
 import { AccountRelay } from "../src/index.js";
 import {
@@ -44,7 +45,7 @@ async function request(
   path: string,
   init: { method: "GET" | "POST"; body?: unknown; headers?: Record<string, string> },
 ): Promise<Result> {
-  const resp = await SELF.fetch(`https://relay.allw.test/${accountId}${path}`, {
+  const resp = await exports.default.fetch(`https://relay.allw.test/${accountId}${path}`, {
     method: init.method,
     headers: { "Content-Type": "application/json", ...init.headers },
     ...(init.body === undefined

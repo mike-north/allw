@@ -12,7 +12,8 @@
  * that does not match is `403 {"error":"authorization denied"}`. Each test also shows the right
  * token still works on the existing identifier, so "exists" is real and not a typo.
  */
-import { SELF, env, runInDurableObject } from "cloudflare:test";
+import { runInDurableObject } from "cloudflare:test";
+import { env, exports } from "cloudflare:workers";
 import { describe, it, expect } from "vitest";
 import type { AccountRelay } from "../src/index.js";
 import { pairingStartBody, testAccount, testRequestId as rid } from "./support/accounts.js";
@@ -53,7 +54,7 @@ async function call(
   if (options.token !== undefined) headers.Authorization = `Bearer ${options.token}`;
   if (options.websocket) headers.Upgrade = "websocket";
   if (options.body !== undefined) headers["Content-Type"] = "application/json";
-  const resp = await SELF.fetch(relayUrl(accountId, subPath), {
+  const resp = await exports.default.fetch(relayUrl(accountId, subPath), {
     method,
     headers,
     ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
@@ -88,7 +89,7 @@ async function expectIndistinguishable(
 async function submit(accountId: string, requestId: string): Promise<string> {
   await bindAccountRoot(accountId);
   await pinRelayClock(accountId, RELAY_NOW);
-  const resp = await SELF.fetch(relayUrl(accountId, "/requests"), {
+  const resp = await exports.default.fetch(relayUrl(accountId, "/requests"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -129,9 +130,12 @@ describe("request ids: an unknown id answers like a wrong token (#357)", () => {
       rid("req-oracle-wait"),
       rid("req-oracle-wait-unknown"),
     );
-    const owner = await SELF.fetch(relayUrl(acct, `/requests/${rid("req-oracle-wait")}/wait`), {
-      headers: { Upgrade: "websocket", Authorization: `Bearer ${token}` },
-    });
+    const owner = await exports.default.fetch(
+      relayUrl(acct, `/requests/${rid("req-oracle-wait")}/wait`),
+      {
+        headers: { Upgrade: "websocket", Authorization: `Bearer ${token}` },
+      },
+    );
     expect(owner.status).toBe(101);
     owner.webSocket?.accept();
     owner.webSocket?.close();
@@ -193,7 +197,7 @@ describe("pairing codes: an unknown code answers like a wrong token (#357)", () 
   }
 
   async function startPairing(accountId: string): Promise<PairingStart> {
-    const resp = await SELF.fetch(relayUrl(accountId, "/pairing/start"), {
+    const resp = await exports.default.fetch(relayUrl(accountId, "/pairing/start"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(pairingStartBody(accountId)),

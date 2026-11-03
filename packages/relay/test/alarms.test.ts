@@ -9,7 +9,8 @@
  * @see https://developers.cloudflare.com/durable-objects/api/alarms/
  */
 
-import { env, runInDurableObject } from "cloudflare:test";
+import { runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import type { DurableObjectStorage } from "@cloudflare/workers-types";
 import { ALARM_RETRY_MS, AlarmMultiplexer } from "../src/alarms.js";
@@ -29,7 +30,7 @@ async function withMultiplexer<T>(
 ): Promise<T> {
   const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(testAccount(name)));
   return runInDurableObject(stub, async (_instance: AccountRelay, state) => {
-    const storage = state.storage as unknown as DurableObjectStorage;
+    const storage = state.storage;
     return body(new AlarmMultiplexer<Purpose>(storage, now), storage);
   });
 }

@@ -9,13 +9,15 @@
  * @see https://www.rfc-editor.org/rfc/rfc9110#section-9.3.4 (PUT replaces the target's state)
  */
 
-import { SELF, env, runInDurableObject } from "cloudflare:test";
+import { runInDurableObject } from "cloudflare:test";
+import { env, exports } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
-import { AccountRelay, type Env } from "../src/index.js";
+import { AccountRelay } from "../src/index.js";
 import { WebPushTransport, type VapidConfig } from "../src/web-push.js";
 import { pairingStartBody, testAccount, testRequestId } from "./support/accounts.js";
 import { pinRelayClock } from "./support/relay-state.js";
 import { DEVICE_X25519_PUBKEY } from "./support/keys.js";
+import { urlOf } from "./support/fetch-input.js";
 
 /** A full-order X25519 device key (pairing rejects small-order keys, #248). */
 const DEVICE_PUBKEY = DEVICE_X25519_PUBKEY;
@@ -37,6 +39,7 @@ interface PairedDevice {
 }
 
 /** A `device_push_token` row. A type alias (not an interface) so it satisfies `SqlStorage.exec`'s row constraint. */
+// eslint-disable-next-line @typescript-eslint/consistent-type-definitions -- a type alias satisfies SqlStorage.exec's row constraint; an interface doesn't.
 type StoredRow = {
   device_id: string;
   transport: string;
@@ -52,13 +55,14 @@ function bearer(token: string): Record<string, string> {
   return { Authorization: `Bearer ${token}` };
 }
 
+// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters -- T types the parsed body for the caller, as Response.json<T>() does.
 async function post<T>(
   accountId: string,
   subPath: string,
   body: unknown,
   headers: Record<string, string> = {},
 ): Promise<{ status: number; data: T }> {
-  const resp = await SELF.fetch(relayUrl(accountId, subPath), {
+  const resp = await exports.default.fetch(relayUrl(accountId, subPath), {
     method: "POST",
     headers: { "Content-Type": "application/json", ...headers },
     body: JSON.stringify(body),
@@ -73,14 +77,17 @@ async function putPushTokens(
   body: unknown,
   headers: Record<string, string> = {},
 ): Promise<{ status: number; data: { push_tokens?: unknown; error?: string } }> {
-  const resp = await SELF.fetch(relayUrl(accountId, `/devices/${deviceId}/push-tokens`), {
-    method: "PUT",
-    headers: { "Content-Type": "application/json", ...headers },
-    body: typeof body === "string" ? body : JSON.stringify(body),
-  });
+  const resp = await exports.default.fetch(
+    relayUrl(accountId, `/devices/${deviceId}/push-tokens`),
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", ...headers },
+      body: typeof body === "string" ? body : JSON.stringify(body),
+    },
+  );
   return {
     status: resp.status,
-    data: (await resp.json()) as { push_tokens?: unknown; error?: string },
+    data: await resp.json<{ push_tokens?: unknown; error?: string }>(),
   };
 }
 
@@ -125,7 +132,7 @@ async function readRows(accountId: string, deviceId?: string): Promise<StoredRow
 
 async function seedRows(
   accountId: string,
-  rows: ReadonlyArray<{ device_id: string; transport: string; token: string; created_at?: number }>,
+  rows: readonly { device_id: string; transport: string; token: string; created_at?: number }[],
 ): Promise<void> {
   await runInDurableObject(accountStub(accountId), (instance: AccountRelay) => {
     const sql = instance["sql"];
@@ -301,7 +308,7 @@ describe("PUT /devices/{id}/push-tokens — replace the device's own set", () =>
       { push_tokens: [{ transport: "webpush", token: ROTATED_FCM_ENDPOINT }] },
       bearer(device.authToken),
     );
-    const fetcher = vi.fn<typeof fetch>(async () => new Response(null, { status: 201 }));
+    const fetcher = vi.fn<typeof fetch>(() => Promise.resolve(new Response(null, { status: 201 })));
     await runInDurableObject(accountStub(acct), async (instance: AccountRelay) => {
       instance["pushTransports"] = {
         webpush: new WebPushTransport({ vapid: await makeVapid(), fetcher }),
@@ -321,7 +328,7 @@ describe("PUT /devices/{id}/push-tokens — replace the device's own set", () =>
     await runInDurableObject(accountStub(acct), (instance: AccountRelay) => instance["pushFanOut"]);
 
     expect(submit.data.push_wakeups).toBe(1);
-    expect(fetcher.mock.calls.map(([input]) => String(input))).toEqual([ROTATED_FCM_ENDPOINT]);
+    expect(fetcher.mock.calls.map(([input]) => urlOf(input))).toEqual([ROTATED_FCM_ENDPOINT]);
   });
 
   it("never exposes push tokens through GET /devices", async () => {
@@ -334,7 +341,7 @@ describe("PUT /devices/{id}/push-tokens — replace the device's own set", () =>
       bearer(device.authToken),
     );
 
-    const list = await SELF.fetch(relayUrl(acct, "/devices"));
+    const list = await exports.default.fetch(relayUrl(acct, "/devices"));
     const text = await list.text();
 
     expect(list.status).toBe(200);
@@ -424,7 +431,7 @@ describe("APNs tokens are stored in one canonical, lowercase spelling (#304)", (
     // A fresh instance on the same storage runs the schema migrations, as after a deploy.
     const migrate = () =>
       runInDurableObject(accountStub(acct), (_instance: AccountRelay, state) => {
-        new AccountRelay(state, env as unknown as Env);
+        new AccountRelay(state, env);
       });
     await migrate();
     const once = await readRows(acct);
@@ -456,7 +463,7 @@ describe("APNs tokens are stored in one canonical, lowercase spelling (#304)", (
     ]);
 
     await runInDurableObject(accountStub(acct), (_instance: AccountRelay, state) => {
-      new AccountRelay(state, env as unknown as Env);
+      new AccountRelay(state, env);
     });
 
     expect(await readRows(acct, lowerFirst)).toEqual([
@@ -776,10 +783,13 @@ describe("/devices/{id}/push-tokens — routing", () => {
     const acct = testAccount(`acct-push-tokens-405-${method.toLowerCase()}`);
     const device = await pairDevice(acct);
 
-    const resp = await SELF.fetch(relayUrl(acct, `/devices/${device.deviceId}/push-tokens`), {
-      method,
-      headers: bearer(device.authToken),
-    });
+    const resp = await exports.default.fetch(
+      relayUrl(acct, `/devices/${device.deviceId}/push-tokens`),
+      {
+        method,
+        headers: bearer(device.authToken),
+      },
+    );
 
     expect(resp.status).toBe(405);
   });
@@ -788,11 +798,14 @@ describe("/devices/{id}/push-tokens — routing", () => {
     const acct = testAccount("acct-push-tokens-deeper");
     const device = await pairDevice(acct);
 
-    const resp = await SELF.fetch(relayUrl(acct, `/devices/${device.deviceId}/push-tokens/extra`), {
-      method: "PUT",
-      headers: bearer(device.authToken),
-      body: JSON.stringify({ push_tokens: [] }),
-    });
+    const resp = await exports.default.fetch(
+      relayUrl(acct, `/devices/${device.deviceId}/push-tokens/extra`),
+      {
+        method: "PUT",
+        headers: bearer(device.authToken),
+        body: JSON.stringify({ push_tokens: [] }),
+      },
+    );
     expect(resp.status).toBe(404);
   });
 });
