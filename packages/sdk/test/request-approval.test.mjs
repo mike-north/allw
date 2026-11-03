@@ -16,6 +16,9 @@
  *  (c) tampered / forged verdict → never approved (synthesized `denied`), `verify()` false;
  *  (c-sig) verdict from an uncertified key → never approved;
  *  (c') authenticated human "denied" → resolves `denied` (the verified decision), `verify()` false;
+ *  (f) a relay-forged outer decision whose fields echo the old message marker → synthesized
+ *      `denied`, `verify()` false; genuine signed non-approvals still report the signed decision
+ *      (#311);
  *  (d) negative: no devices, relay submit error;
  *  (i) integrator-initiated cancellation (`ApprovalRequest.signal`, issue #195) → rejects with
  *      `RequestRetractedError`, discovered via WS push, via poll fallback, or short-circuited
@@ -861,6 +864,139 @@ test("(c') authenticated human 'denied' → resolves denied (the verified decisi
     false,
     "verify() is true only for approved",
   );
+});
+
+/**
+ * The text the SDK once matched in a verify error's message to report a verified non-approval
+ * (#311). serde quotes a wrongly typed or unknown value back in its parse error, so a relay that
+ * puts this text in a verdict field controls whether the message contains it.
+ */
+const NOT_APPROVED_MARKER = "verified human decision was not 'approved'";
+
+/**
+ * Forged verdicts (#311): the device signs `signed`; the relay rewrites the outer `decision` to
+ * `outer` and sets `field` to the marker. Each must resolve a synthesized `denied` with `verify()`
+ * false: never `approved`, and never the forged `aborted`/`expired` reported as verified.
+ *
+ * `echoed` cases put the marker where serde quotes it back in the verify error, so classifying by
+ * the message is fooled; these failed before the fix. The others are controls: the error does not
+ * quote those fields, so they deny with or without it.
+ */
+const FORGED_NON_APPROVALS = [
+  {
+    name: "outer approved, marker in v",
+    signed: "denied",
+    outer: "approved",
+    field: "v",
+    echoed: true,
+  },
+  {
+    name: "outer approved, marker in decided_at",
+    signed: "denied",
+    outer: "approved",
+    field: "decided_at",
+    echoed: true,
+  },
+  {
+    name: "outer approved, marker in approver",
+    signed: "denied",
+    outer: "approved",
+    field: "approver",
+    echoed: true,
+  },
+  {
+    name: "outer aborted, marker in v",
+    signed: "denied",
+    outer: "aborted",
+    field: "v",
+    echoed: true,
+  },
+  {
+    name: "outer expired, marker in v",
+    signed: "denied",
+    outer: "expired",
+    field: "v",
+    echoed: true,
+  },
+  {
+    name: "outer approved over a signed expiry, marker in v",
+    signed: "expired",
+    outer: "approved",
+    field: "v",
+    echoed: true,
+  },
+  {
+    name: "outer approved, marker in request_id",
+    signed: "denied",
+    outer: "approved",
+    field: "request_id",
+    echoed: false,
+  },
+  {
+    name: "outer approved, marker in sig",
+    signed: "denied",
+    outer: "approved",
+    field: "sig",
+    echoed: false,
+  },
+  {
+    name: "outer approved, marker in note",
+    signed: "denied",
+    outer: "approved",
+    field: "note",
+    echoed: false,
+  },
+  {
+    name: "marker as the decision",
+    signed: "denied",
+    outer: NOT_APPROVED_MARKER,
+    field: null,
+    echoed: false,
+  },
+];
+
+for (const forged of FORGED_NON_APPROVALS) {
+  const kind = forged.echoed ? "marker echoed" : "control";
+  test(`(f) forged non-approval (${forged.name}; ${kind}) → synthesized denied, verify() false (#311)`, async () => {
+    const wasm = await loadWasm();
+    const approver = makeApprover(wasm);
+    const req = sampleRequest();
+
+    const relay = makeRelayDouble({
+      devices: [deviceRecord(approver)],
+      behavior: {
+        poll: (env) => {
+          if (!env) return null;
+          const verdict = signVerdict(wasm, approver, req, env, { decision: forged.signed });
+          verdict.decision = forged.outer;
+          if (forged.field !== null) verdict[forged.field] = NOT_APPROVED_MARKER;
+          return verdict;
+        },
+      },
+    });
+
+    const verdict = await pollClient(approver, relay).requestApproval(req);
+    assert.equal(verdict.decision, "denied", "an unverifiable verdict fails closed to denied");
+    assert.equal(await verdict.verify(approver.accountRootPub), false, "verify() rejects it");
+  });
+}
+
+test("(f') genuine signed non-approvals report the signed decision (#311)", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+
+  for (const decision of ["denied", "expired", "aborted"]) {
+    const req = sampleRequest();
+    const relay = makeRelayDouble({
+      devices: [deviceRecord(approver)],
+      behavior: {
+        poll: (env) => (env ? signVerdict(wasm, approver, req, env, { decision }) : null),
+      },
+    });
+    const verdict = await pollClient(approver, relay).requestApproval(req);
+    assert.equal(verdict.decision, decision, `a verified '${decision}' is reported as signed`);
+    assert.equal(await verdict.verify(approver.accountRootPub), false, "only approved verifies");
+  }
 });
 
 test("(d) no enrolled devices → requestApproval rejects (cannot encrypt)", async () => {
