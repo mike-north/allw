@@ -435,9 +435,10 @@ Limits on `POST /{acct}/requests` (#248; constants in `packages/relay/src/consta
 Each value is inclusive (exactly the limit is accepted). The `context_ciphertext` ceiling is the
 one integrators can hit with honest input: it caps the encrypted context, which is larger than the
 plaintext context the SDK encrypts. Over-size fails closed — the relay stores nothing, and the SDK's
-`requestApproval` rejects with a `RelayError` (`name` `"RelayError"`, `status` 413), which a caller must treat as deny. The
-SDK does no pre-check of its own. The 15-minute horizon covers the hooks'
-420 s maximum timeout; an operator who lowers it below that makes hook requests fail closed. A
+`requestApproval` rejects with a `RelayError` with `status` 413, which a caller must treat as deny.
+`RelayError` is exported from `@allw/sdk`, so a caller narrows with
+`err instanceof RelayError && err.status === 413` (#365). The SDK does no pre-check of its own. The
+15-minute horizon covers the hooks' 420 s maximum timeout; an operator who lowers it below that makes hook requests fail closed. A
 pending request older than the horizon (only possible for one stored before the horizon existed) is
 expired by the alarm; like every terminal request it is deleted 7 days after it ends. When a request
 ends (expired, retracted or resolved) the relay blanks its stored envelope: status and verdict reads

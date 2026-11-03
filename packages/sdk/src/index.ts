@@ -47,6 +47,7 @@ export type {
   CommandActionOptions,
   CommandRequestInput,
 } from "./command-request.js";
+export { RelayError } from "./relay.js";
 
 /**
  * A verdict decision. `requestApproval` *resolves* to `approved` (verified), `denied` (a verified

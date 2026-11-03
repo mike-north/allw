@@ -76,10 +76,20 @@ export interface ApprovalRequestEnvelope {
   readonly context_ciphertext: string;
 }
 
-/** A relay error carrying the HTTP status and the relay's error body (when present). */
+/**
+ * The relay answered, but not with a usable success: any non-2xx reply (for example 413 when
+ * `context_ciphertext` is over the 64 KiB ceiling, `docs/relay-api.md` §3), or a 2xx whose body is not
+ * JSON or not the expected shape. `requestApproval` rejects with it; treat it as deny, like every
+ * failure (fail-closed), and never retry it into an approval.
+ *
+ * Narrow with `err instanceof RelayError`. The message names the call and status only: it never
+ * quotes the relay's body, which is untrusted. A hung or unreachable relay is not a `RelayError`:
+ * no reply arrived, so the rejection is a timeout or the fetch's own network error.
+ */
 export class RelayError extends Error {
   constructor(
     message: string,
+    /** The relay reply's HTTP status (the 2xx status itself when the body was malformed). */
     readonly status: number,
   ) {
     super(message);
