@@ -67,8 +67,8 @@ It is fail-closed throughout:
   unrevoked, unexpired, and with the same encryption key (a conflict can only remove readers); likewise, within
   one document, a device id listed more than once counts only if every entry is active and unexpired with the
   same key;
-- an empty `device_id` in a highest-sequence document, or an all-zero encryption key on a selected device, is an
-  error;
+- an empty `device_id` in a highest-sequence document, or a small-order X25519 encryption key (the core's
+  `is_small_order_x25519_public_key` denylist) on a selected device, is an error;
 - no document, no remaining device, or more than `MAX_RECIPIENTS` (16) is an error, never an empty list.
 
 Revocation is not permanent across sequences. Only the highest sequence counts, so a later root-signed document
