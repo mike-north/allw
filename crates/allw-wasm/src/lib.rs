@@ -674,36 +674,61 @@ struct WasmSelectedRecipient<'a> {
     encryption_pubkey: String,
 }
 
+/// Converts an optional JS sequence floor to the core's `u64`. `undefined`/`null` arrive as `None`
+/// (no floor persisted yet); anything else must be a non-negative integer in JS safe-integer range,
+/// so a floor can never be rounded down into accepting an older state.
+fn sequence_floor_from_f64(min_sequence: Option<f64>) -> Result<Option<u64>, JsError> {
+    let Some(n) = min_sequence else {
+        return Ok(None);
+    };
+    if !n.is_finite() || n.fract() != 0.0 || n < 0.0 || n > JS_MAX_SAFE_INTEGER {
+        return Err(JsError::new(&format!(
+            "min_sequence must be a non-negative safe integer, got {n}"
+        )));
+    }
+    Ok(Some(n as u64))
+}
+
 /// Selects the devices an `ApprovalContext` may be encrypted to from root-signed account state
 /// (core [`select_recipients`](allw_core::select_recipients)), returned as a JSON array of
 /// `{ "device_id": string, "encryption_pubkey": string }` sorted by `device_id`.
 ///
-/// `account_states_json` is a JSON array of compact `allw-account-state+jws` documents. Only the
-/// highest-sequence documents count; recipients are their `active`, unrevoked devices, narrowed to
-/// the devices every same-sequence sibling agrees on.
+/// - `account_states_json`: a JSON array of compact `allw-account-state+jws` documents. Only the
+///   highest-sequence documents count; recipients are their `active`, unrevoked devices whose
+///   signed `cert_expires_at` is after `now_ms`, narrowed to the devices every same-sequence
+///   sibling agrees on.
+/// - `now_ms`: the current Unix time in integer milliseconds.
+/// - `min_sequence`: the caller's persisted sequence floor, or `undefined`/`null` for none.
 ///
 /// # Errors
 ///
 /// Throws — never returns an empty array — when `account_root_pubkey_b64` is not a valid Ed25519
-/// key, the array is malformed or empty, any document fails verification, no recipient remains,
-/// or more than `MAX_RECIPIENTS` (16) remain.
+/// key, `now_ms` or `min_sequence` is out of range, the array is malformed, empty or longer than
+/// `MAX_ACCOUNT_STATES` (64), any document fails verification, the highest sequence is below
+/// `min_sequence`, a device entry is malformed, no recipient remains, or more than
+/// `MAX_RECIPIENTS` (16) remain.
 #[wasm_bindgen]
 pub fn select_recipients(
     account_states_json: &str,
     expected_account_id: &str,
     account_root_pubkey_b64: &str,
+    now_ms: f64,
+    min_sequence: Option<f64>,
 ) -> Result<String, JsError> {
-    let root_bytes = decode_b64_32(account_root_pubkey_b64, "account_root_pubkey_b64")?;
-    let root = PublicKey::from_bytes(&root_bytes).map_err(|e| {
-        JsError::new(&format!(
-            "account_root_pubkey_b64 is not a valid Ed25519 key: {e}"
-        ))
-    })?;
+    let root = parse_account_root_pubkey(account_root_pubkey_b64)?;
+    let now_ms = ms_to_i64(now_ms, "now_ms")?;
+    let min_sequence = sequence_floor_from_f64(min_sequence)?;
     let account_states = parse_account_states_json(account_states_json)?;
     let account_state_refs: Vec<&str> = account_states.iter().map(String::as_str).collect();
 
-    let recipients = core_select_recipients(&account_state_refs, expected_account_id, &root)
-        .map_err(|e| JsError::new(&format!("select_recipients failed: {e}")))?;
+    let recipients = core_select_recipients(
+        &account_state_refs,
+        expected_account_id,
+        &root,
+        now_ms,
+        min_sequence,
+    )
+    .map_err(|e| JsError::new(&format!("select_recipients failed: {e}")))?;
     let wire: Vec<WasmSelectedRecipient<'_>> = recipients
         .iter()
         .map(|r| WasmSelectedRecipient {

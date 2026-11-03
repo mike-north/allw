@@ -79,7 +79,14 @@ const RECIPIENT_KEY_B: [u8; 32] = [0xB2; 32];
 const RECIPIENT_KEY_C: [u8; 32] = [0xC3; 32];
 const RECIPIENT_KEY_D: [u8; 32] = [0xD4; 32];
 const RECIPIENT_KEY_E: [u8; 32] = [0xE5; 32];
+const RECIPIENT_KEY_F: [u8; 32] = [0xF6; 32];
+const RECIPIENT_KEY_G: [u8; 32] = [0x17; 32];
 const RECIPIENT_REVOKED_AT: i64 = 1_700_000_500_000;
+/// The selection time for the recipient vector: `dev-f`'s cert expires exactly now (excluded),
+/// `dev-g`'s one millisecond later (still a recipient).
+const RECIPIENT_NOW_MS: i64 = 1_800_000_000_000;
+/// The caller's persisted floor for the recipient vector: the current sequence, so it is met.
+const RECIPIENT_MIN_SEQUENCE: u64 = 2;
 
 /// Account id derived from the approver root (seed `[0x11; 32]`), computed independently of the
 /// core: `SHA-256("allw/account-id/v1" || 0x00 || root_pubkey)` via `shasum -a 256`, then
@@ -139,6 +146,10 @@ struct WasmVector {
     /// JSON array of `{ device_id, encryption_pubkey }` the selection rules allow for that set,
     /// written from the rules (not captured from `select_recipients`).
     expected_recipients_json: String,
+    /// The `now_ms` the recipient selection runs at (cert-expiry boundary).
+    recipient_now_ms: i64,
+    /// The `min_sequence` floor the recipient selection runs with.
+    recipient_min_sequence: u64,
 }
 
 // ── Builders (mirror hash::tests::make_minimal_context exactly) ───────────────────
@@ -220,10 +231,19 @@ fn recipient_device(id: &str, key: [u8; 32], status: &str) -> AccountStateDevice
     }
 }
 
+fn expiring_recipient_device(id: &str, key: [u8; 32], cert_expires_at: i64) -> AccountStateDevice {
+    AccountStateDevice {
+        cert_expires_at: Some(cert_expires_at),
+        ..recipient_device(id, key, "active")
+    }
+}
+
 /// The recipient vector's account-state set, exercising each selection rule once:
 /// - sequence 1 (stale): lists `dev-old`, which must not be selected;
 /// - sequence 2: `dev-a` and `dev-d` active; `dev-b` active but revoked; `dev-c` not active;
-///   `dev-e` active in only one of the two sequence-2 siblings (a conflict, so excluded).
+///   `dev-e` active in only one of the two sequence-2 siblings (a conflict, so excluded);
+///   `dev-f` whose cert expires at [`RECIPIENT_NOW_MS`] (excluded) and `dev-g` whose cert expires
+///   one millisecond later (selected).
 fn recipient_account_states(root: &SigningKeyPair) -> Vec<String> {
     let account_id = account_id_for_root(&root.public_key());
     let state = |sequence: u64, devices: Vec<AccountStateDevice>, revoked: &[&str]| AccountState {
@@ -260,6 +280,8 @@ fn recipient_account_states(root: &SigningKeyPair) -> Vec<String> {
             recipient_device("dev-c", RECIPIENT_KEY_C, "revoked"),
             recipient_device("dev-d", RECIPIENT_KEY_D, "active"),
             recipient_device("dev-e", RECIPIENT_KEY_E, "active"),
+            expiring_recipient_device("dev-f", RECIPIENT_KEY_F, RECIPIENT_NOW_MS),
+            expiring_recipient_device("dev-g", RECIPIENT_KEY_G, RECIPIENT_NOW_MS + 1),
         ],
         &["dev-b"],
     );
@@ -269,6 +291,8 @@ fn recipient_account_states(root: &SigningKeyPair) -> Vec<String> {
             recipient_device("dev-a", RECIPIENT_KEY_A, "active"),
             recipient_device("dev-b", RECIPIENT_KEY_B, "active"),
             recipient_device("dev-d", RECIPIENT_KEY_D, "active"),
+            expiring_recipient_device("dev-f", RECIPIENT_KEY_F, RECIPIENT_NOW_MS),
+            expiring_recipient_device("dev-g", RECIPIENT_KEY_G, RECIPIENT_NOW_MS + 1),
         ],
         &["dev-b"],
     );
@@ -278,8 +302,8 @@ fn recipient_account_states(root: &SigningKeyPair) -> Vec<String> {
         .collect()
 }
 
-/// The recipients the rules allow for [`recipient_account_states`]: exactly `dev-a` and `dev-d`,
-/// sorted by device id.
+/// The recipients the rules allow for [`recipient_account_states`] at [`RECIPIENT_NOW_MS`]:
+/// exactly `dev-a`, `dev-d` and `dev-g`, sorted by device id.
 fn expected_recipients() -> Vec<Recipient> {
     vec![
         Recipient {
@@ -289,6 +313,10 @@ fn expected_recipients() -> Vec<Recipient> {
         Recipient {
             device_id: "dev-d".to_string(),
             encryption_pubkey: RECIPIENT_KEY_D,
+        },
+        Recipient {
+            device_id: "dev-g".to_string(),
+            encryption_pubkey: RECIPIENT_KEY_G,
         },
     ]
 }
@@ -386,6 +414,8 @@ fn build_vector() -> WasmVector {
         recipient_account_states_json: serde_json::to_string(&recipient_account_states(&root))
             .expect("account states serialize"),
         expected_recipients_json: recipients_wire_json(&expected_recipients()),
+        recipient_now_ms: RECIPIENT_NOW_MS,
+        recipient_min_sequence: RECIPIENT_MIN_SEQUENCE,
     }
 }
 
@@ -497,7 +527,7 @@ fn fixture_account_id_equals_frozen_vector() {
 }
 
 /// The core's `select_recipients` over the fixture's account-state set returns exactly the
-/// recipients the rules allow (`dev-a`, `dev-d`); the node test checks the WASM surface returns
+/// recipients the rules allow (`dev-a`, `dev-d`, `dev-g`); the node test checks the WASM surface returns
 /// the fixture's `expected_recipients_json` for the same set.
 #[test]
 fn fixture_recipients_follow_the_selection_rules() {
@@ -514,8 +544,16 @@ fn fixture_recipients_follow_the_selection_rules() {
         .expect("root pubkey is 32 bytes");
     let root = PublicKey::from_bytes(&root_bytes).expect("root pubkey is valid");
 
-    let selected = select_recipients(&refs, &committed.expected_account_id_for_root, &root)
-        .expect("fixture state yields recipients");
+    assert_eq!(committed.recipient_now_ms, RECIPIENT_NOW_MS);
+    assert_eq!(committed.recipient_min_sequence, RECIPIENT_MIN_SEQUENCE);
+    let selected = select_recipients(
+        &refs,
+        &committed.expected_account_id_for_root,
+        &root,
+        committed.recipient_now_ms,
+        Some(committed.recipient_min_sequence),
+    )
+    .expect("fixture state yields recipients");
     assert_eq!(selected, expected_recipients());
     assert_eq!(
         committed.expected_recipients_json,

@@ -78,5 +78,6 @@ pub use policy::{
     VerifiedPolicyRule,
 };
 pub use recipients::{
-    select_recipients, Recipient, RecipientSelectionError, DEVICE_STATUS_ACTIVE, MAX_RECIPIENTS,
+    select_recipients, Recipient, RecipientSelectionError, DEVICE_STATUS_ACTIVE,
+    MAX_ACCOUNT_STATES, MAX_RECIPIENTS,
 };
