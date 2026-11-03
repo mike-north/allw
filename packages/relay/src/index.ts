@@ -2085,9 +2085,9 @@ export class AccountRelay implements DurableObject {
    * Every live pending request at `now` ({@link deadlineOf}), oldest first: what the device inbox
    * returns and the reconnect flush sends.
    */
-  private livePendingRequests(now: number): RequestRow[] {
+  private livePendingRequests(now: number): Pick<RequestRow, "request_id" | "envelope">[] {
     return [
-      ...this.sql.exec<RequestRow>(
+      ...this.sql.exec<Pick<RequestRow, "request_id" | "envelope">>(
         `SELECT request_id, envelope FROM request
          WHERE status = 'pending' AND ${DEADLINE_SQL} > ? ORDER BY created_at ASC`,
         this.maxRequestTtlMs,
