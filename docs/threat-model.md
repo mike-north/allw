@@ -221,10 +221,18 @@ trust decision, and it lives in the core:
   (240 ideographic selectors), so a payload can still ride on a run of emoji or CJK text. Ordinary prose can no
   longer carry one. This is a deliberate trade-off against warning on every emoji and CJK variant form.
 - `raw` is multi-line content (a heredoc command, a file edit). In its `raw_lines` rendering a line feed is
-  structure, a TAB shows as `→   ` and a CR directly before a line feed shows as `␍`, without setting the flag:
-  once ESC and lone CRs are escaped they cannot overwrite or hide anything, and a warning on every Go edit or heredoc
-  commit would teach humans to ignore it. In single-line fields (argv tokens, `bin`, flags, `cwd`, ids, the summary)
-  TAB, LF and CR are escaped and set the flag.
+  structure and a TAB shows as `→   `, without setting the flag: once ESC and lone CRs are escaped, a TAB or a line
+  feed cannot overwrite or hide anything, and a warning on every Go edit or heredoc commit would teach humans to
+  ignore it. A CR directly before a line feed is structure **only in a file edit** (shown as `␍`, unflagged), where
+  CRLF endings are ordinary content. On every other surface `raw` is executed, and there a CR before LF is data that
+  changes behaviour: bash reads `cd ../scratch` + CR + LF + `rm -rf -- *` as a `cd` to `../scratch` + CR, which
+  fails, and then runs the `rm` in the original directory. So outside file edits that CR is escaped as `\r` and sets
+  the flag. In single-line fields (argv tokens, `bin`, flags, `cwd`, ids, the summary) TAB, LF and CR are escaped and
+  set the flag.
+- The structure markers are not injective: literal `→   ` text displays like a TAB, and a file-edit line ending in a
+  literal `␍` displays like a CRLF ending, and neither sets the flag (unlike `\x1b`, which is always paired with
+  it). This is accepted: neither substitution changes what the content does in a way the human could be misled
+  about, and the hash binds the real bytes.
 - `display_model(context)` returns every string a surface shows (summary, actor id/kind/label, every syntactic
   substrate field, params as JSON, chain) already escaped, plus `has_hidden_or_control_chars`. It is exported through
   WASM (`display_model`, `escape_for_display`) and UniFFI (`display_model_json`, `escape_for_display`).
@@ -235,7 +243,16 @@ trust decision, and it lives in the core:
   prompt; web: a badge on the card). The CLI ends every request block with a one-line escaped `Deciding on:` headline
   directly above the prompt, so the action and the warning are on screen when the human answers, however long the
   block is. When `raw` and the hash-bound argv diverge, `Deciding on:` shows the argv form and a "raw and argv
-  differ" warning is the last line before the prompt, so the decision point never shows only the benign half. A multi-line command prints its further lines behind a `│` marker, so none can pass for a field label.
+  differ" warning is the last line before the prompt, so the decision point never shows only the benign half. A
+  multi-line command prints its further lines behind a `│` marker. The CLI also hard-wraps every row that can carry
+  untrusted text to the terminal width (80 columns when stdout is not a TTY), with a `↪` marker on every wrapped row.
+  Spaces are printable and never escaped, so without this a padded field would soft-wrap its tail onto a row of its
+  own, where it could pose as a field label or a forged `✓ VERIFIED` origin row.
+- **The web approver shows less than the CLI.** Its card renders `argv`, `cwd`, `raw`, MCP/agent-tool
+  `server :: tool` and `params`, all from the core model, but not yet `bin`, `flags`, `positionals`, `host`,
+  `env_refs`, `chain`, a file edit's `operation`/`paths`/`diff_summary`/`diff_hash`, or a raw/argv divergence
+  warning, although all are bound into `request_hash`. Until the web parity follow-up lands, the CLI is the complete
+  view.
 - Relay-supplied text outside the context goes through `escape_for_display` too. The CLI approver escapes every
   `watch` log line (request ids, relay error strings, which could otherwise repaint the request block mid-prompt),
   every `pair` output line (the relay-issued pairing code and `device_id`), and the fatal error line (which can embed
@@ -419,6 +436,7 @@ attestation, audit records, hook/SDK fail-closed behavior, or enrollment.
 ### WYSIWYS and Approver UX
 
 - [ ] Every field covered by `request_hash` that matters to the decision is rendered or intentionally explained.
+      (Known gap: the web card omits several hash-bound fields the CLI shows; see R3.)
 - [ ] Every untrusted string reaches the screen through the core display model (`display_model` /
       `escape_for_display`); no surface prints a raw context, envelope, or relay string or escapes on its own (R3).
 - [ ] Control, bidi, and zero-width characters render as visible escapes, and the surface shows its
