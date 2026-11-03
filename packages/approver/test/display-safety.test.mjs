@@ -341,6 +341,55 @@ test("without a divergence, the decision line is the raw headline and no diverge
   assert.ok(!rendered.includes(RAW_ARGV_DIVERGENCE_WARNING));
 });
 
+// ── PowerShell records (#298, review #316 B1) ─────────────────────────────────────────────────────
+//
+// The core records a PowerShell line's argv as a plain whitespace split of `raw`, so no byte of the
+// line hides inside a token. Records here are built by the real WASM builder, never by hand.
+
+/** The #316 B1 repro: PowerShell runs the `Remove-Item` (`\` is literal inside `"…"`). */
+const PS_HIDDEN_STATEMENT = String.raw`echo "a\" ; Remove-Item -Recurse -Force C:\Users ; echo \"b"`;
+
+async function renderPowerShell(line) {
+  const wasm = await loadWasm();
+  const ctx = context({ summary: `PowerShell: ${line}` });
+  ctx.action = JSON.parse(wasm.action_from_powershell_command(line, String.raw`C:\Users\me`));
+  ctx.risk = ctx.action.risk;
+  return render(ctx);
+}
+
+test("a PowerShell line can't hide a statement from the decision line (#316 B1)", async () => {
+  const { rendered } = await renderPowerShell(PS_HIDDEN_STATEMENT);
+  const lines = rendered.split("\n");
+  const deciding = lines.at(-1);
+  assert.equal(
+    deciding,
+    `  Deciding on: ${PS_HIDDEN_STATEMENT}`,
+    "the decision line is raw, verbatim",
+  );
+  assert.match(deciding, / ; Remove-Item -Recurse -Force /, "Remove-Item is its own word");
+  assert.ok(!rendered.includes(RAW_ARGV_DIVERGENCE_WARNING), "argv is raw's whitespace split");
+  assert.match(rendered, /^ {2}Risk:\s+high$/m, "a compound line fails upward");
+});
+
+test("a PowerShell Windows path renders verbatim with no divergence warning (#316 B1)", async () => {
+  const line = String.raw`Remove-Item C:\Users\me\proj\build -Recurse`;
+  const { rendered } = await renderPowerShell(line);
+  assert.equal(rendered.split("\n").at(-1), `  Deciding on: ${line}`);
+  assert.ok(!rendered.includes(RAW_ARGV_DIVERGENCE_WARNING));
+  assert.ok(!rendered.includes("C:Usersmeprojbuild"), "no backslash is stripped");
+});
+
+test("an argv that differs from raw's whitespace split still warns (#316 B1 negative)", async () => {
+  // Same words, but one token carries a space that raw splits on: a different command line.
+  const ctx = context();
+  ctx.action = {
+    ...ctx.action,
+    syntactic: { raw: String.raw`Remove-Item C:\a b`, argv: ["Remove-Item", String.raw`C:\a b`] },
+  };
+  const { rendered } = await render(ctx);
+  assert.equal(rendered.split("\n").at(-1), RAW_ARGV_DIVERGENCE_WARNING);
+});
+
 test("a variation selector after ASCII cannot make a divergent argv look identical", async () => {
   // `main` + VS-16 renders like `main`; the Argv divergence line must show the difference.
   const ctx = context();

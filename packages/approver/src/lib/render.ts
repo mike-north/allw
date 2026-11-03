@@ -124,35 +124,59 @@ interface CommandParts {
  * the escaped display substrate it yields the printed line.
  */
 function reconstructCommand(parts: CommandParts): string | undefined {
+  const tokens = commandTokens(parts);
+  return tokens === undefined ? undefined : renderArgv(tokens);
+}
+
+/**
+ * The command-form tokens {@link reconstructCommand} renders: `argv` (with `bin` prepended unless it
+ * already leads), or `bin` plus any positionals when there is no argv; `undefined` when there is no
+ * command form.
+ */
+function commandTokens(parts: CommandParts): readonly string[] | undefined {
   const { argv, bin } = parts;
   if (argv !== undefined && argv.length > 0) {
-    const tokens = bin !== undefined && argv[0] !== bin ? [bin, ...argv] : argv;
-    return renderArgv(tokens);
+    return bin !== undefined && argv[0] !== bin ? [bin, ...argv] : argv;
   }
   // No argv: still show `bin` (+ any positionals) rather than dropping the program name.
   if (bin !== undefined) {
     const positionals = parts.positionals;
-    return renderArgv(positionals !== undefined ? [bin, ...positionals] : [bin]);
+    return positionals !== undefined ? [bin, ...positionals] : [bin];
   }
   return undefined;
 }
 
 /**
+ * Whether `tokens` are exactly `raw` split at whitespace: the same non-whitespace bytes, in the same
+ * order, cut only where `raw` has whitespace. Such an argv can't say anything `raw` doesn't (a
+ * PowerShell record's argv is always this split). The comparison is exact on raw bytes; a character
+ * the core and this split disagree on as whitespace only ever makes the two differ, so the warning
+ * still shows.
+ */
+function isWhitespaceSplitOf(tokens: readonly string[], raw: string): boolean {
+  const words = raw.split(/\s+/).filter((word) => word !== "");
+  return words.length === tokens.length && words.every((word, i) => word === tokens[i]);
+}
+
+/**
  * Whether the hash-bound `bin`/`argv` reconstructs to a different command than the `raw` headline.
  * Compared on the **raw** bytes (never on escaped text, where distinct inputs can render alike), so
- * the decision is exact. Returns false when there is no `raw` or no command form.
+ * the decision is exact. Returns false when there is no `raw` or no command form, and when the
+ * tokens are exactly `raw`'s whitespace split (display quoting alone, such as a quoted `C:\Users`
+ * path, is not a different command).
  */
 function rawDivergesFromArgv(action: ActionRecord): boolean {
   const syntactic = action.syntactic;
   if (!isRecord(syntactic)) return false;
   const raw = readString(syntactic, "raw");
   if (raw === undefined) return false;
-  const reconstructed = reconstructCommand({
+  const tokens = commandTokens({
     bin: readString(syntactic, "bin"),
     argv: readStringArray(syntactic, "argv"),
     positionals: readStringArray(syntactic, "positionals"),
   });
-  return reconstructed !== undefined && reconstructed !== raw;
+  if (tokens === undefined || isWhitespaceSplitOf(tokens, raw)) return false;
+  return renderArgv(tokens) !== raw;
 }
 
 /**

@@ -233,6 +233,39 @@ test("agent_tool_call surface: maps to its own kind, distinct from mcp, with (se
   );
 });
 
+// ── PowerShell records (#298, review #316 B1) ───────────────────────────────────────────────────
+//
+// The core records a PowerShell line's argv as a whitespace split of `raw`, so the card's `argv:` line
+// can't present a benign reading of a destructive line. Records come from the real WASM builder.
+
+/** Prepare a PowerShell request built by the core, as the hook would send it. */
+async function preparePowerShell(line) {
+  const wasm = await loadTestWasm();
+  const { identity, encryptTo } = pairedIdentity(wasm);
+  const action = JSON.parse(wasm.action_from_powershell_command(line, String.raw`C:\Users\me`));
+  const context = { ...CONTEXT, action, risk: action.risk, summary: `PowerShell: ${line}` };
+  return runtimeAt(wasm, identity).prepare(makeEnvelope(encryptTo(JSON.stringify(context))));
+}
+
+test("PowerShell: a statement hidden from POSIX quoting is its own argv token on the card (#316 B1)", async () => {
+  // PowerShell runs the Remove-Item: inside "…" its escape is the backtick and `\` is literal.
+  const line = String.raw`echo "a\" ; Remove-Item -Recurse -Force C:\Users ; echo \"b"`;
+  const prepared = await preparePowerShell(line);
+  const [, argvLine, rawLine] = exactPlaintext(prepared.context).split("\n");
+  assert.match(argvLine, /^argv: echo .* ';' Remove-Item -Recurse -Force /);
+  assert.equal(rawLine, `raw: ${line}`);
+  assert.equal(actionSummary(prepared.context), line);
+});
+
+test("PowerShell: a Windows path keeps its backslashes on the card (#316 B1)", async () => {
+  const line = String.raw`Remove-Item C:\Users\me\proj\build -Recurse`;
+  const prepared = await preparePowerShell(line);
+  const text = exactPlaintext(prepared.context);
+  assert.ok(text.includes(String.raw`argv: Remove-Item 'C:\Users\me\proj\build' -Recurse`), text);
+  assert.ok(text.includes(`raw: ${line}`));
+  assert.ok(!text.includes("C:Usersmeprojbuild"));
+});
+
 // ── Negative: already-expired request fails closed in prepare ────────────────────────────────
 
 test("expired request: prepare refuses a dead request before any decrypt (device-side fail-closed)", async () => {
