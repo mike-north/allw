@@ -293,7 +293,21 @@ trust decision, and it lives in the core:
   summary is labelled as the agent's description and sits below the action heading. Whenever the hidden-character
   badge shows, the escaped character is visible on the card. When `raw` and the hash-bound argv diverge, the card
   heading is the argv form and a "raw and argv differ" alert shows, as on the CLI; the two approvers decide divergence
-  with the same rule, tested against one shared fixture.
+  with the same rule, tested against one shared fixture. The card heading uses the CLI's headline precedence whatever
+  the surface (a file edit's summary, then `raw`, then the reconstructed argv, then `server :: tool`), so a record
+  that mixes substrates (a tool call that also carries `argv`) heads with the command on both; a second shared
+  fixture covers it.
+- **Nothing on the web card is clipped at any width.** Every value wraps (`overflow-wrap: anywhere`) and nothing is
+  hidden behind `overflow: hidden` or a sideways scroll. The card's grid track is `minmax(0, 1fr)`, so one long token
+  cannot widen the page past the viewport. The hidden-character badge is the card's first line, above the action. In
+  the exact plaintext (card and audit receipt), each logical line has a hanging indent, so a wrapped row of a long or
+  padded value starts indented and never in the label column, the web analogue of the CLI's `↪`. A headless-Chrome
+  test renders hostile cards at 360 px and checks that every tail is laid out inside the viewport. One layout
+  difference remains: the web shows tool-call `params` as indented JSON lines, while the CLI prints compact JSON on
+  one wrapped row. Pretty-printed continuation lines are always indented, quoted, or a bracket, so none can pose as a
+  label.
+- Neither approver shows the hash-bound `action.risk`, `capabilities` or `scope` (both show the context `risk`).
+  `capabilities` and `scope` must be null in v1 but are not yet rejected on the device. Owner: #296.
 - Relay-supplied text outside the context goes through `escape_for_display` too. The CLI approver escapes every
   `watch` log line (request ids, relay error strings, which could otherwise repaint the request block mid-prompt),
   every `pair` output line (the relay-issued pairing code and `device_id`), and the fatal error line (which can embed
