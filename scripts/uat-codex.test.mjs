@@ -64,13 +64,65 @@ test("Codex UAT helper prepares the gate without invoking Codex", async () => {
   assert.match(script, /codex exec/);
   assert.match(script, /codex:<hostname>/);
 
-  assert.doesNotMatch(
-    activeShell,
-    /^\s*(?:command\s+|exec\s+|env\s+[^#\n]*\s+)?codex(?:\s|$)/m,
-    "the helper must never run codex itself",
-  );
-  assert.doesNotMatch(activeShell, /\$\(\s*codex(?:\s|\))/);
-  assert.doesNotMatch(activeShell, /`\s*codex(?:\s|`)/);
+  assert.deepEqual(codexInvocations(activeShell), [], "the helper must never run codex itself");
+});
+
+/**
+ * Patterns that would run Codex from shell code. Each is applied per line, after heredoc bodies and comments are
+ * removed. `codex` may still appear inside a path or name (`.codex/`, `codex-hook`, `allw-codex-uat`).
+ */
+const CODEX_INVOCATION_PATTERNS = [
+  // `codex` as a word of its own: a direct call, `command`/`exec`/`env`/`xargs`/`eval codex`, `$(codex)`,
+  // backticks, `bash -c "codex …"`, or a variable assigned the name (`cmd=codex`).
+  /(?<![\w./-])codex(?![\w./-])/i,
+  // Variable indirection: a variable named for Codex (`$CODEX`, `${CODEX_BIN}`) whose value comes from elsewhere.
+  /\$\{?[A-Za-z_]*codex/i,
+  // Indirect execution of a computed string, which no static check can see through.
+  /(?:^|[;&|(\s])eval(?:\s|$)/,
+  /(?:^|[;&|(\s])(?:ba|z|da|k)?sh\s+(?:-\w+\s+)*-\w*c\b/,
+  /(?:^|[;&|(\s])xargs(?:\s|$)/,
+];
+
+/** The lines of `activeShell` (heredocs already removed) that match a Codex invocation pattern. */
+function codexInvocations(activeShell) {
+  return activeShell
+    .split("\n")
+    .map((line) => line.replace(/(?:^|\s)#.*$/, ""))
+    .filter((code) => CODEX_INVOCATION_PATTERNS.some((pattern) => pattern.test(code)));
+}
+
+test("The never-run-codex guard catches direct and indirect invocations", () => {
+  const forbidden = [
+    "codex exec 'hi'",
+    "  command codex",
+    "exec codex",
+    "env FOO=1 codex exec x",
+    'out="$(codex exec x)"',
+    "out=`codex exec x`",
+    'eval "$cmd"',
+    "bash -c 'codex exec x'",
+    'sh -c "echo hi"',
+    "zsh -ec 'true'",
+    "echo x | xargs codex exec",
+    "printf '%s' x | xargs -0 echo",
+    'CODEX=codex; "$CODEX" exec x',
+    'cmd="codex"',
+    '"${CODEX_BIN}" exec x',
+    "$codex_path exec x",
+  ];
+  for (const line of forbidden) {
+    assert.equal(codexInvocations(line).length, 1, `the guard must flag: ${line}`);
+  }
+
+  const allowed = [
+    'mkdir -p "$PROJECT_DIR/.codex/rules"',
+    'HOOK_CLI="$ROOT_DIR/packages/codex-hook/dist/cli.js"',
+    'UAT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/allw-codex-uat.XXXXXX")"',
+    '    --label "codex-uat-$(hostname -s 2>/dev/null || hostname)" \\',
+    "# The operator runs codex exec by hand.",
+    "require_command git # not codex",
+  ];
+  assert.deepEqual(codexInvocations(allowed.join("\n")), []);
 });
 
 test("Generated hooks.json uses self-contained wrapper approach, not unsupported env map", async () => {
@@ -116,13 +168,35 @@ function extractTomlHeredoc(source) {
   return match[1];
 }
 
-/** Parses TOML with Python's standard-library `tomllib` (TOML 1.0), so no parser dependency is added. */
+/**
+ * Python source that parses TOML from stdin with the standard-library `tomllib` (Python >= 3.11) and prints JSON.
+ * An older Python exits with a message naming `tomllib` instead of a bare `ModuleNotFoundError`.
+ */
+const PARSE_TOML_PY = [
+  "import json, sys",
+  "if sys.version_info < (3, 11):",
+  "    sys.exit('tomllib needs Python >= 3.11; python3 is ' + sys.version.split()[0])",
+  "import tomllib",
+  "print(json.dumps(tomllib.loads(sys.stdin.read())))",
+].join("\n");
+
+/**
+ * Parses TOML with Python's standard-library `tomllib` (TOML 1.0), so no parser dependency is added.
+ * A missing or too-old `python3` fails with a message that says so, rather than as a TOML error.
+ */
 function parseToml(text) {
-  const result = spawnSync(
-    "python3",
-    ["-I", "-c", "import json, sys, tomllib; print(json.dumps(tomllib.loads(sys.stdin.read())))"],
-    { input: text, encoding: "utf8" },
-  );
+  const result = spawnSync("python3", ["-I", "-c", PARSE_TOML_PY], {
+    input: text,
+    encoding: "utf8",
+  });
+  if (result.error) {
+    assert.fail(
+      `this test needs python3 >= 3.11 on PATH to parse config.toml with tomllib: ${result.error.message}`,
+    );
+  }
+  if (result.status !== 0 && result.stderr.includes("tomllib needs Python >= 3.11")) {
+    assert.fail(`this test parses config.toml with tomllib: ${result.stderr.trim()}`);
+  }
   assert.equal(result.status, 0, `config.toml must parse as TOML: ${result.stderr}`);
   return JSON.parse(result.stdout);
 }
