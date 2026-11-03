@@ -89,6 +89,7 @@ export type {
 } from "./relay-config.js";
 export {
   INSECURE_RELAY_URL_REASON,
+  NOT_A_RELAY_URL_TEXT,
   PENDING_IGNORED_RELAY_TEXT,
   RELAY_URL_EXTRAS_REASON,
   RELAY_URL_QUERY_PARAM,

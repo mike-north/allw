@@ -178,13 +178,36 @@ function readRelayQueryValue(search: string): string | null {
   return new URLSearchParams(search).get(RELAY_URL_QUERY_PARAM);
 }
 
-/** Longest raw `?relay=` text echoed back in a notice when it is not a parseable URL. */
+/** Longest text, in code points, the notice echoes back for an ignored `?relay=` value. */
 const MAX_ECHOED_RELAY_TEXT = 120;
 
 /**
+ * What the notice names for a `?relay=` value that parses as a URL without a network origin
+ * (`javascript:`, `data:`, `file:`, or prose such as `word: …`, whose origin is `"null"`).
+ */
+export const NOT_A_RELAY_URL_TEXT = "(not a relay URL)";
+
+/**
+ * `text` cut to {@link MAX_ECHOED_RELAY_TEXT} code points, with `…` when cut. It reads only up to
+ * the limit, so an attacker-sized value costs no more than a short one, and never splits a
+ * surrogate pair.
+ */
+function clipEchoedText(text: string): string {
+  let clipped = "";
+  let count = 0;
+  for (const codePoint of text) {
+    if (count === MAX_ECHOED_RELAY_TEXT) return `${clipped}…`;
+    clipped += codePoint;
+    count += 1;
+  }
+  return clipped;
+}
+
+/**
  * For a **paired** device: if the page was opened with a `?relay=` that differs from the pinned
- * relay, return the text naming what was ignored (the requested URL's origin, or the raw value
- * cut to {@link MAX_ECHOED_RELAY_TEXT} code points when it does not parse); otherwise `null`. Pure:
+ * relay, return the text naming what was ignored; otherwise `null`. The text is the requested URL's
+ * origin, {@link NOT_A_RELAY_URL_TEXT} for a URL with no network origin, or the raw value when it
+ * does not parse, each cut to {@link MAX_ECHOED_RELAY_TEXT} code points. Pure:
  * it never persists or contacts anything, so the override has no effect beyond the notice.
  *
  * The result is **untrusted** (anyone can send the human a link) and may hold bidi overrides,
@@ -199,15 +222,14 @@ export function describeIgnoredRelayOverride(
   if (requested === null) return null;
   const checked = checkRelayUrl(requested);
   if (checked.ok && checked.relayUrl === pinnedRelayUrl) return null;
+  let origin: string;
   try {
-    return new URL(requested.trim()).origin;
+    origin = new URL(requested.trim()).origin;
   } catch {
-    // Cut by code point, so a surrogate pair is never split.
-    const raw = Array.from(requested.trim());
-    return raw.length > MAX_ECHOED_RELAY_TEXT
-      ? `${raw.slice(0, MAX_ECHOED_RELAY_TEXT).join("")}…`
-      : raw.join("");
+    return clipEchoedText(requested.trim());
   }
+  // The URL parser enforces no host length, so an origin is clipped like any other echo.
+  return origin === "null" ? NOT_A_RELAY_URL_TEXT : clipEchoedText(origin);
 }
 
 /** The display origin of a canonical relay URL (falls back to the URL itself if unparseable). */

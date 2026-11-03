@@ -113,8 +113,10 @@ WebSocket, account-state resolution — goes to that pinned relay.
   This closes the phishing path where `…/?relay=https://evil.example` would re-point a paired device
   and hand its `deviceAuthToken` to the attacker's relay.
   - Anyone can send the link, so the notice names it only through the core's `escape_for_display`
-    (#307). It shows the link's origin, or for a value that isn't a URL, its first 120 characters.
-    Bidi overrides, zero-width and control characters appear as visible escapes such as `⟨U+202E⟩`.
+    (#307). It shows the link's origin; "(not a relay URL)" for a URL with no network origin
+    (`javascript:`, `data:`, `file:`, or prose like `word: …`); or, for a value that isn't a URL, the
+    value itself. Each is cut to its first 120 characters. Bidi overrides, zero-width and control
+    characters appear as visible escapes such as `⟨U+202E⟩`.
   - The notice appears at once. The name reads "(checking…)" until the core has loaded. If the core
     can't load, the name is withheld ("(hidden: the approver core did not load)"), and the notice
     still says a link was ignored.

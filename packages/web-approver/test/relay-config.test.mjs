@@ -24,6 +24,7 @@ import { JSDOM } from "jsdom";
 
 import {
   INSECURE_RELAY_URL_REASON,
+  NOT_A_RELAY_URL_TEXT,
   PENDING_IGNORED_RELAY_TEXT,
   RELAY_URL_EXTRAS_REASON,
   RELAY_URL_QUERY_PARAM,
@@ -263,6 +264,28 @@ describe("describeIgnoredRelayOverride", () => {
   test("an unparseable ?relay= is echoed back (truncated), never resolved", () => {
     const ignored = describeIgnoredRelayOverride(relayQuery("x".repeat(500)), PINNED);
     assert.equal(ignored, `${"x".repeat(120)}…`);
+  });
+
+  test("a parseable URL with a huge host is clipped like an unparseable value", () => {
+    // The WHATWG parser enforces no DNS length limit, so a 60k-character host parses.
+    const host = `${"a".repeat(60_000)}.example`;
+    const ignored = describeIgnoredRelayOverride(relayQuery(`https://${host}/x`), PINNED);
+    assert.equal(ignored, `${`https://${host}`.slice(0, 120)}…`);
+  });
+
+  test("a URL with no network origin is named as not a relay URL, never `null` or its text", () => {
+    for (const value of [
+      "javascript:alert(1)",
+      "data:text/html,<b>hi</b>",
+      "file:///etc/passwd",
+      "WARNING: your relay was compromised, pair again with relay.evil.example",
+    ]) {
+      assert.equal(
+        describeIgnoredRelayOverride(relayQuery(value), PINNED),
+        NOT_A_RELAY_URL_TEXT,
+        value,
+      );
+    }
   });
 
   test("truncation counts code points, so it never splits a surrogate pair", () => {
