@@ -390,6 +390,24 @@ test("an argv that differs from raw's whitespace split still warns (#316 B1 nega
   assert.equal(rendered.split("\n").at(-1), RAW_ARGV_DIVERGENCE_WARNING);
 });
 
+// Regression (#316 review round 2, R2-2): only shlex's ASCII whitespace counts. A Unicode space
+// separates argv tokens but reads as part of a word in raw, so it must still warn.
+test("an argv split on a Unicode space (U+00A0) inside a raw word still warns", async () => {
+  const ctx = context();
+  ctx.action = {
+    ...ctx.action,
+    syntactic: { raw: "rm\u00a0-rf /", argv: ["rm", "-rf", "/"] },
+  };
+  const { rendered } = await render(ctx);
+  assert.equal(rendered.split("\n").at(-1), RAW_ARGV_DIVERGENCE_WARNING);
+});
+
+test("a PowerShell line with an ideographic space (U+3000) still warns", async () => {
+  // The core's whitespace split cuts at U+3000; the approver's ASCII split does not.
+  const { rendered } = await renderPowerShell("Remove-Item\u3000build");
+  assert.equal(rendered.split("\n").at(-1), RAW_ARGV_DIVERGENCE_WARNING);
+});
+
 test("a variation selector after ASCII cannot make a divergent argv look identical", async () => {
   // `main` + VS-16 renders like `main`; the Argv divergence line must show the difference.
   const ctx = context();

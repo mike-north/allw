@@ -147,14 +147,15 @@ function commandTokens(parts: CommandParts): readonly string[] | undefined {
 }
 
 /**
- * Whether `tokens` are exactly `raw` split at whitespace: the same non-whitespace bytes, in the same
- * order, cut only where `raw` has whitespace. Such an argv can't say anything `raw` doesn't (a
- * PowerShell record's argv is always this split). The comparison is exact on raw bytes; a character
- * the core and this split disagree on as whitespace only ever makes the two differ, so the warning
- * still shows.
+ * Whether `tokens` are exactly `raw` split at ASCII whitespace (space, tab, line feed: the only
+ * characters `shlex` splits on): the same non-whitespace bytes, in the same order, cut only there.
+ * Such an argv can't say anything `raw` doesn't. Any other separator, including a Unicode space
+ * (U+00A0, U+3000, …) or a carriage return, is treated as part of a token, so an argv split on it
+ * differs from this split and the divergence warning still shows: an invisible separator is exactly
+ * what that warning is for.
  */
 function isWhitespaceSplitOf(tokens: readonly string[], raw: string): boolean {
-  const words = raw.split(/\s+/).filter((word) => word !== "");
+  const words = raw.split(/[ \t\n]+/).filter((word) => word !== "");
   return words.length === tokens.length && words.every((word, i) => word === tokens[i]);
 }
 
