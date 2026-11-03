@@ -47,6 +47,9 @@ function backstopCoordinates(wasm) {
   return { ALLW_ACCOUNT_ID: wasm.account_id_for_root(root), ALLW_APPROVER_ROOT_KEY: root };
 }
 
+/** A throwaway HOME for the child, so its sequence floor never lands in a real ~/.allw. */
+const CHILD_HOME = mkdtempSync(join(tmpdir(), "allw-codex-cli-home-"));
+
 /**
  * Run the hook bin with node flags + `stdin`; resolves `{ code, signal, stdout, stderr }`. With
  * `signalOnPending`, that signal is sent once the bin reports it is waiting on the relay.
@@ -55,7 +58,7 @@ function runCli(stdin, env, cwd, nodeArgs, { signalOnPending } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [...nodeArgs, CLI], {
       cwd,
-      env: { PATH: process.env.PATH, ...env },
+      env: { PATH: process.env.PATH, HOME: CHILD_HOME, ...env },
       stdio: ["pipe", "pipe", "pipe"],
     });
     const timer = setTimeout(() => {

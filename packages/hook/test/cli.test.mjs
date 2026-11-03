@@ -19,6 +19,8 @@ import { spawn } from "node:child_process";
 import { createServer } from "node:net";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { loadWasm } from "../dist/lib/wasm.js";
@@ -36,6 +38,9 @@ function bashStdin(command = "rm -rf build") {
   });
 }
 
+/** A throwaway HOME for the child, so its sequence floor never lands in a real ~/.allw. */
+const CHILD_HOME = mkdtempSync(join(tmpdir(), "allw-hook-cli-home-"));
+
 /**
  * Run the compiled hook bin under `node`, feeding `stdin`.
  *
@@ -48,7 +53,7 @@ function runCli(stdin, env = {}, options = {}) {
     const startedAt = performance.now();
     const child = spawn(process.execPath, [CLI], {
       // A clean, minimal env so an ambient ALLW_* on the dev machine can't leak into the test.
-      env: { PATH: process.env.PATH, ...env },
+      env: { PATH: process.env.PATH, HOME: CHILD_HOME, ...env },
       stdio: ["pipe", "pipe", "pipe"],
     });
     const timer = setTimeout(() => {
@@ -212,7 +217,8 @@ test("(#54) subprocess: connection-refused relay fails closed to deny within a b
 
   assert.equal(code, 0);
   assert.equal(decisionOf(stdout), "deny");
-  assert.match(reasonOf(stdout), /not approved \(verdict: expired\)/);
+  // The first relay call is the account-state fetch; it fails before anything is sealed (#243).
+  assert.match(reasonOf(stdout), /loading account state failed: fetch failed/);
   assert.ok(
     elapsedMs < 2000,
     `connection refusal should not approach Claude Code's 480s hook timeout, elapsed=${String(
@@ -230,7 +236,8 @@ test("(#54) subprocess: hung relay fetch fails closed to deny within a bounded t
 
     assert.equal(code, 0);
     assert.equal(decisionOf(stdout), "deny");
-    assert.match(reasonOf(stdout), /not approved \(verdict: expired\)/);
+    // The hung account-state fetch is bounded by the per-fetch timeout (#243 moved it first).
+    assert.match(reasonOf(stdout), /loading account state failed: .*timed out after/);
     assert.ok(
       elapsedMs < 2000,
       `hung relay must be bounded by the SDK fetch timeout, elapsed=${String(elapsedMs)}ms`,

@@ -3,7 +3,7 @@
  * drive the hook bin as a subprocess (stdin in, stdout out) end to end.
  *
  * It serves the integrator-facing relay routes over real HTTP on `127.0.0.1` (`docs/contract.md`
- * §Transport → Relay routing API): `GET /:acct/devices`, `POST /:acct/requests` and
+ * §Transport → Relay routing API): `GET /:acct/account-states`, `POST /:acct/requests` and
  * `GET /:acct/requests/:id`. It has no WebSocket endpoint, so the SDK falls back to polling. On the
  * first poll it plays the approver with software-held keys (as `@allw/approver` does): it decrypts
  * the human-shown context, recomputes the WYSIWYS `request_hash`, and signs a verdict with the given
@@ -44,6 +44,28 @@ export async function startApprovingRelay({ wasm, decision }) {
     CERT_ISSUED_AT_MS,
   );
 
+  // The root-signed account state that vouches for the device (the SDK encrypts only to it).
+  const accountState = wasm.sign_account_state(
+    JSON.stringify({
+      v: 1,
+      account_id: ACCOUNT_ID,
+      sequence: 1,
+      current_root: accountRootPub,
+      previous_roots: [],
+      devices: [
+        {
+          device_id: DEVICE_ID,
+          encryption_pubkey: wasm.x25519_public_key(deviceEncryptionSeed),
+          signing_pubkey: wasm.ed25519_public_key(deviceSigningSeed),
+          status: "active",
+        },
+      ],
+      actors: [],
+      revocations: [],
+    }),
+    accountSeed,
+  );
+
   let envelope = null;
   const seen = { submits: 0, verdictFetches: 0 };
   const server = createServer(async (req, res) => {
@@ -55,17 +77,8 @@ export async function startApprovingRelay({ wasm, decision }) {
     };
     const path = new URL(req.url, "http://127.0.0.1").pathname;
 
-    if (req.method === "GET" && path.endsWith("/devices")) {
-      return send(200, {
-        devices: [
-          {
-            device_id: DEVICE_ID,
-            pubkey: wasm.x25519_public_key(deviceEncryptionSeed),
-            label: null,
-            created_at: CERT_ISSUED_AT_MS,
-          },
-        ],
-      });
+    if (req.method === "GET" && path.endsWith("/account-states")) {
+      return send(200, { account_states: [accountState], max_sequence: 1 });
     }
     if (req.method === "POST" && path.endsWith("/requests")) {
       envelope = JSON.parse(Buffer.concat(chunks).toString("utf8"));

@@ -39,6 +39,9 @@ const NEVER_SETTLING_FETCH = join(here, "support", "never-settling-fetch.mjs");
 const STALLED_FETCH = join(here, "support", "stalled-fetch.mjs");
 const PARTIAL_WRITE_FAULT = join(here, "support", "partial-write-fault.mjs");
 
+/** A throwaway HOME for the child, so its sequence floor never lands in a real ~/.allw. */
+const CHILD_HOME = mkdtempSync(join(tmpdir(), "allw-hook-cli-home-"));
+
 /**
  * Run the hook bin (optionally with node flags first); resolves `{ code, signal, stdout, stderr }`.
  * With `signalOnPending`, that signal is sent once the bin reports it is waiting on the relay. With
@@ -47,7 +50,7 @@ const PARTIAL_WRITE_FAULT = join(here, "support", "partial-write-fault.mjs");
 function runCli(stdin, env, nodeArgs = [], { signalOnPending, stdoutFd } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [...nodeArgs, CLI], {
-      env: { PATH: process.env.PATH, ...env },
+      env: { PATH: process.env.PATH, HOME: CHILD_HOME, ...env },
       stdio: ["pipe", stdoutFd ?? "pipe", "pipe"],
     });
     const timer = setTimeout(() => {

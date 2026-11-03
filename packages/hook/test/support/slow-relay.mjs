@@ -3,11 +3,11 @@
  * than one poll interval.
  *
  * It serves the integrator-facing relay routes over real HTTP on `127.0.0.1` (`docs/contract.md`
- * §Transport → Relay routing API): `GET /:acct/devices`, `POST /:acct/requests`, and
+ * §Transport → Relay routing API): `GET /:acct/account-states`, `POST /:acct/requests`, and
  * `GET /:acct/requests/:id`. It has no WebSocket endpoint, so the SDK's `…/wait` upgrade fails and
  * the SDK falls back to polling. A submitted request stays `pending` until `answerAfterMs` has
- * passed, then reads as the relay's terminal `expired`, which the hook maps to a deny. Nothing here
- * signs or decrypts anything.
+ * passed, then reads as the relay's terminal `expired`, which the hook maps to a deny. It serves
+ * the root-signed account states it is given and never signs or decrypts anything itself.
  *
  * Kept in sync with the copy in `packages/codex-hook/test/support/slow-relay.mjs`.
  *
@@ -17,10 +17,10 @@
 import { createServer } from "node:http";
 
 /**
- * Start the double. `devicePubkey` must be a real X25519 public key (the SDK encrypts to it).
- * Resolves `{ url, polls, close }`; `polls()` counts status polls received.
+ * Start the double. `accountStates` are root-signed account-state documents naming the device the
+ * SDK encrypts to. Resolves `{ url, polls, close }`; `polls()` counts status polls received.
  */
-export async function startSlowRelay({ devicePubkey, answerAfterMs }) {
+export async function startSlowRelay({ accountStates, answerAfterMs }) {
   let submittedAt = null;
   let polls = 0;
   const server = createServer(async (req, res) => {
@@ -31,10 +31,8 @@ export async function startSlowRelay({ devicePubkey, answerAfterMs }) {
       res.end(JSON.stringify(body));
     };
     const path = new URL(req.url, "http://127.0.0.1").pathname;
-    if (req.method === "GET" && path.endsWith("/devices")) {
-      return send(200, {
-        devices: [{ device_id: "dev_slow", pubkey: devicePubkey, label: null, created_at: 0 }],
-      });
+    if (req.method === "GET" && path.endsWith("/account-states")) {
+      return send(200, { account_states: accountStates, max_sequence: accountStates.length });
     }
     if (req.method === "POST" && path.endsWith("/requests")) {
       const { id } = JSON.parse(Buffer.concat(chunks).toString("utf8"));

@@ -13,11 +13,19 @@
  */
 
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import { runCodexHook } from "../dist/cli.js";
 import { loadWasm } from "@allw/hook";
 import { assertConformsToPreToolUseOutputContract } from "./support/codex-schema.mjs";
+
+// The hook keeps a per-account sequence floor under ~/.allw/state: point HOME at a throwaway dir
+// for this whole file so a real ~/.allw is never read or written.
+process.env.HOME = mkdtempSync(join(tmpdir(), "allw-codex-integration-home-"));
+process.env.USERPROFILE = process.env.HOME;
 
 const NOW_MS = 1_700_000_000_000;
 const TIMEOUT_MS = 300_000;
@@ -30,7 +38,6 @@ const ACCOUNT_ID = await (async () => {
   );
 })();
 const DEVICE_ID = "dev-codex-integration";
-const DEVICE_LABEL = "codex test device";
 
 async function pairedApprover(wasm) {
   const accountSeed = Buffer.alloc(32, 41).toString("base64url");
@@ -49,12 +56,38 @@ async function pairedApprover(wasm) {
   );
 
   return {
+    accountSeed,
     deviceSigningSeed,
     deviceEncryptionSeed,
     accountRootPub,
+    deviceSigningPub,
     deviceEncryptionPub,
     cert,
   };
+}
+
+/** Root-sign an account state that vouches for the approver's one device. */
+function accountState(wasm, approver) {
+  return wasm.sign_account_state(
+    JSON.stringify({
+      v: 1,
+      account_id: ACCOUNT_ID,
+      sequence: 1,
+      current_root: approver.accountRootPub,
+      previous_roots: [],
+      devices: [
+        {
+          device_id: DEVICE_ID,
+          encryption_pubkey: approver.deviceEncryptionPub,
+          signing_pubkey: approver.deviceSigningPub,
+          status: "active",
+        },
+      ],
+      actors: [],
+      revocations: [],
+    }),
+    approver.accountSeed,
+  );
 }
 
 function nonce() {
@@ -75,17 +108,8 @@ function relayDouble(wasm, approver, decision, forge = (verdict) => verdict) {
     const url = typeof input === "string" ? input : input.url;
     const method = init?.method ?? "GET";
 
-    if (url.endsWith("/devices") && method === "GET") {
-      return json({
-        devices: [
-          {
-            device_id: DEVICE_ID,
-            pubkey: approver.deviceEncryptionPub,
-            label: DEVICE_LABEL,
-            created_at: NOW_MS - 10_000,
-          },
-        ],
-      });
+    if (url.endsWith("/account-states") && method === "GET") {
+      return json({ account_states: [accountState(wasm, approver)], max_sequence: 1 });
     }
 
     if (url.endsWith("/requests") && method === "POST") {
@@ -226,6 +250,35 @@ for (const [decision, category] of [
     assertConformsToPreToolUseOutputContract(output);
   });
 }
+
+test("end-to-end (#243): no published account state → schema-conformant deny naming allw-approver pair, nothing sent", async () => {
+  const wasm = await loadWasm();
+  const approver = await pairedApprover(wasm);
+  const { fetchImpl: inner } = relayDouble(wasm, approver, "approved");
+  let submitted = false;
+  const fetchImpl = async (input, init) => {
+    const url = typeof input === "string" ? input : input.url;
+    if (url.endsWith("/account-states")) {
+      return new Response(JSON.stringify({ account_states: [], max_sequence: 0 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url.endsWith("/requests")) submitted = true;
+    return inner(input, init);
+  };
+
+  const output = await runCodexHook(
+    codexBashStdin("rm -rf build", "/workspace/project"),
+    env(approver, TIMEOUT_MS),
+    overrides(fetchImpl),
+  );
+
+  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /allw-approver pair/);
+  assert.equal(submitted, false, "nothing is sealed or sent");
+  assertConformsToPreToolUseOutputContract(output);
+});
 
 test("end-to-end: no approver response makes Codex emit a schema-conformant fail-closed deny (category=timeout)", async () => {
   const wasm = await loadWasm();

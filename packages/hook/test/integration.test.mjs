@@ -5,7 +5,7 @@
  *
  * This exercises the full crypto round-trip end-to-end through the WASM core — there is NO verdict
  * stubbing. The relay double plays the approver's role with software-held keys (mirroring
- * `@allw/approver`): it serves the device list, captures the submitted ciphertext envelope,
+ * `@allw/approver`): it serves the root-signed account state that names the device, captures the submitted ciphertext envelope,
  * decrypts the human-shown context, recomputes the WYSIWYS `request_hash`, and signs a verdict the
  * SDK then verifies against the account-root key. The poll path is forced (no WebSocket) and the
  * clock is fixed, so the run is fully deterministic — no `Date.now()`, no real network.
@@ -21,12 +21,18 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { runHook } from "../dist/cli.js";
 import { loadWasm } from "../dist/lib/wasm.js";
+
+// The hook keeps a per-account sequence floor under ~/.allw/state: point HOME at a throwaway dir
+// for this whole file so a real ~/.allw is never read or written (tests that need their own HOME
+// override it again with `withConfigHome`).
+process.env.HOME = mkdtempSync(join(tmpdir(), "allw-hook-integration-home-"));
+process.env.USERPROFILE = process.env.HOME;
 
 // ── Fixed, deterministic timeline (no Date.now in fixtures) ─────────────────────────────────────
 const NOW_MS = 1_700_000_000_000;
@@ -40,7 +46,6 @@ const ACCOUNT_ID = await (async () => {
   );
 })();
 const DEVICE_ID = "dev-hook-integration";
-const DEVICE_LABEL = "test device";
 
 /** Build a paired software approver (account-root + device keys + device cert) via the WASM core. */
 async function pairedApprover(wasm) {
@@ -72,20 +77,47 @@ async function pairedApprover(wasm) {
   };
 }
 
+/** Root-sign an account state at `sequence` that vouches for the approver's one device. */
+function accountState(wasm, approver, sequence = 1) {
+  return wasm.sign_account_state(
+    JSON.stringify({
+      v: 1,
+      account_id: ACCOUNT_ID,
+      sequence,
+      current_root: approver.accountRootPub,
+      previous_roots: [],
+      devices: [
+        {
+          device_id: DEVICE_ID,
+          encryption_pubkey: approver.deviceEncryptionPub,
+          signing_pubkey: approver.deviceSigningPub,
+          status: "active",
+        },
+      ],
+      actors: [],
+      revocations: [],
+    }),
+    approver.accountSeed,
+  );
+}
+
 /** A 16-byte high-entropy nonce (fixed for determinism; entropy is irrelevant in a single-shot test). */
 function nonce() {
   return Buffer.alloc(16, 7).toString("base64url");
 }
 
 /**
- * Build a `fetchImpl` relay double. It serves `GET /:acct/devices`, accepts `POST /:acct/requests`
+ * Build a `fetchImpl` relay double. It serves `GET /:acct/account-states` (by default one
+ * root-signed state naming the device; `options.accountStates` overrides it), accepts `POST /:acct/requests`
  * (capturing the envelope), and answers `GET /:acct/requests/:id` with a signed verdict of the
  * requested `decision`. The verdict is bound to the captured envelope + the decrypted context, so
  * the SDK's verification (against `approverRootPub`) genuinely passes/round-trips.
  *
  * `forge` lets a test play a hostile relay: it rewrites the signed verdict before delivery.
  */
-function relayDouble(wasm, approver, decision, forge = (verdict) => verdict) {
+function relayDouble(wasm, approver, decision, forge = (verdict) => verdict, options = {}) {
+  const accountStates = options.accountStates ?? [accountState(wasm, approver)];
+  const state = { submitted: 0 };
   /** @type {Record<string, unknown> | null} */
   let captured = null;
   let requestAuthToken = null;
@@ -100,23 +132,15 @@ function relayDouble(wasm, approver, decision, forge = (verdict) => verdict) {
     const url = typeof input === "string" ? input : input.url;
     const method = init?.method ?? "GET";
 
-    // GET /:acct/devices — one enrolled device (the X25519 encryption pubkey is the JWE recipient).
-    if (url.endsWith("/devices") && method === "GET") {
-      return json({
-        devices: [
-          {
-            device_id: DEVICE_ID,
-            pubkey: approver.deviceEncryptionPub,
-            label: DEVICE_LABEL,
-            created_at: NOW_MS - 10_000,
-          },
-        ],
-      });
+    // GET /:acct/account-states — the root-signed states that decide who may read the request.
+    if (url.endsWith("/account-states") && method === "GET") {
+      return json({ account_states: accountStates, max_sequence: accountStates.length });
     }
 
     // POST /:acct/requests — capture the opaque envelope and issue the relay-scoped poll token.
     if (url.endsWith("/requests") && method === "POST") {
       captured = JSON.parse(String(init?.body));
+      state.submitted += 1;
       requestAuthToken = `token-${captured.id}`;
       return json(
         {
@@ -170,7 +194,7 @@ function relayDouble(wasm, approver, decision, forge = (verdict) => verdict) {
     throw new Error(`relayDouble: unexpected ${method} ${url}`);
   };
 
-  return { fetchImpl };
+  return { fetchImpl, state };
 }
 
 /** A realistic PreToolUse stdin payload for a Bash command. */
@@ -252,6 +276,77 @@ for (const decision of ["denied", "expired", "aborted"]) {
     );
   });
 }
+
+// ── Root-vouched recipients and the sequence floor (#243) ───────────────────────────────────────
+
+test("end-to-end (#243): the selected account-state sequence is recorded under ~/.allw/state", async (t) => {
+  const wasm = await loadWasm();
+  const approver = await pairedApprover(wasm);
+  const home = withConfigHome(t);
+  const { fetchImpl } = relayDouble(wasm, approver, "approved", undefined, {
+    accountStates: [accountState(wasm, approver, 1), accountState(wasm, approver, 2)],
+  });
+
+  const output = await runHook(
+    bashStdin("rm -rf build", "/w"),
+    env(approver, TIMEOUT_MS),
+    overrides(fetchImpl),
+  );
+  assert.equal(output, null);
+  const floorFile = join(home, ".allw", "state", `${ACCOUNT_ID}.floor.json`);
+  assert.deepEqual(JSON.parse(readFileSync(floorFile, "utf8")), {
+    v: 1,
+    account_id: ACCOUNT_ID,
+    sequence: 2,
+  });
+});
+
+test("end-to-end (#243, fail-closed): a relay that rolls back below the floor → deny, nothing sent", async (t) => {
+  const wasm = await loadWasm();
+  const approver = await pairedApprover(wasm);
+  withConfigHome(t);
+  const first = relayDouble(wasm, approver, "approved", undefined, {
+    accountStates: [accountState(wasm, approver, 3)],
+  });
+  assert.equal(
+    await runHook(bashStdin("ls", "/w"), env(approver, TIMEOUT_MS), overrides(first.fetchImpl)),
+    null,
+  );
+
+  // A later run sees only an older state (one that might still list a since-revoked device).
+  const rolledBack = relayDouble(wasm, approver, "approved", undefined, {
+    accountStates: [accountState(wasm, approver, 2)],
+  });
+  const output = await runHook(
+    bashStdin("rm -rf build", "/w"),
+    env(approver, TIMEOUT_MS),
+    overrides(rolledBack.fetchImpl),
+  );
+  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /sequence floor|below/i);
+  assert.equal(rolledBack.state.submitted, 0, "the request is never sent");
+});
+
+test("end-to-end (#243, fail-closed): no published account state → deny naming allw-approver pair", async (t) => {
+  const wasm = await loadWasm();
+  const approver = await pairedApprover(wasm);
+  const home = withConfigHome(t);
+  const relay = relayDouble(wasm, approver, "approved", undefined, { accountStates: [] });
+
+  const output = await runHook(
+    bashStdin("rm -rf build", "/w"),
+    env(approver, TIMEOUT_MS),
+    overrides(relay.fetchImpl),
+  );
+  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /allw-approver pair/);
+  assert.equal(relay.state.submitted, 0);
+  assert.equal(
+    existsSync(join(home, ".allw", "state")),
+    false,
+    "no floor without a sealed request",
+  );
+});
 
 test("end-to-end (fail-closed): missing config (no ALLW_RELAY_URL) → deny without dialing the relay", async () => {
   const wasm = await loadWasm();
