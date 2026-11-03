@@ -71,8 +71,8 @@ const parsedAllowlists = new Map<string, readonly OriginRule[]>();
  * (`console.warn`, visible in `wrangler tail`): an entry with a path or trailing slash, a query or
  * fragment, credentials, a non-http(s) scheme, a wildcard host, or the opaque `null` origin.
  * Path-like syntax is judged on the entry as written, before URL normalization, so a dot segment
- * (`/.`, `/..`, `/%2e`), a backslash or embedded whitespace drops the entry too, rather than being
- * folded into a bare origin.
+ * (`/.`, `/..`, `/%2e`), a backslash, an `@` (even with empty credentials) or embedded whitespace
+ * drops the entry too, rather than being folded into a bare origin. The scheme may be in any case.
  */
 export function parseCorsAllowedOrigins(value: string | undefined): readonly OriginRule[] {
   const raw = value ?? DEFAULT_CORS_ALLOWED_ORIGINS;
@@ -96,10 +96,12 @@ export function parseCorsAllowedOrigins(value: string | undefined): readonly Ori
 function parseOriginRule(entry: string): OriginRule | null {
   // The host may not contain a backslash or whitespace either: URL parsing would read `\` as `/`
   // and strip tabs and newlines, so `http://localhost\.evil.example:*` would become any-port
-  // `localhost` (#305).
-  const anyPort = /^(https?):\/\/([^/\\:@?#*\s]+):\*$/.exec(entry);
+  // `localhost` (#305). The scheme matches in any case, as it does for an exact entry, and is
+  // lowercased like the URL parser would.
+  const anyPort = /^(https?):\/\/([^/\\:@?#*\s]+):\*$/i.exec(entry);
   if (anyPort) {
-    const [, scheme = "", hostname = ""] = anyPort;
+    const [, rawScheme = "", hostname = ""] = anyPort;
+    const scheme = rawScheme.toLowerCase();
     const probe = parseOrigin(`${scheme}://${hostname}`);
     return probe ? { kind: "any-port", scheme: `${scheme}:`, hostname: probe.hostname } : null;
   }
@@ -109,9 +111,13 @@ function parseOriginRule(entry: string): OriginRule | null {
   // rejected rather than silently trimmed, since the operator may have pasted the wrong value.
   // Checked on the raw text, before URL parsing: the parser folds dot segments (`/.`, `/..`,
   // `/%2e`), reads `\` as `/` and strips tabs and newlines, so those spellings would otherwise
-  // come out as a bare origin (#305). Nothing but the scheme and authority may follow `://`.
-  if (!/^https?:\/\/[^/\\?#\s]+$/i.test(entry)) return null;
+  // come out as a bare origin (#305). Nothing but the scheme and the host and port may follow
+  // `://`. That excludes `@` too, so credentials are dropped as written, even empty ones
+  // (`https://@host`, `https://:@host`), which the URL parser would discard.
+  if (!/^https?:\/\/[^/\\?#@\s]+$/i.test(entry)) return null;
   const exact = parseOrigin(entry);
+  // Defence in depth only: after the raw-text check above, an http(s) URL always parses with the
+  // path `/`. The path rule lives in that check, not here.
   if (exact?.pathname !== "/") return null;
   return { kind: "exact", origin: exact.origin };
 }

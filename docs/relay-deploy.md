@@ -61,23 +61,26 @@ Open `packages/relay/wrangler.jsonc` and replace every `REPLACE_ME` value under 
 
 **Browser origins (CORS).** `env.production.vars.CORS_ALLOWED_ORIGINS` is a comma-separated list of
 the origins a browser approver may call the relay from. It ships as the hosted web approver,
-`https://allw-web-approver.pages.dev`. If you serve your own web approver (`docs/web-approver-deploy.md`),
-put its origin here: scheme, host and port only, with no path or trailing slash, e.g.
-`https://approver.example.com`. Each entry is normalized to the origin a browser sends (lowercase
-host, punycode for an internationalized host, default port dropped), so `https://Approver.example.com:443`
-works too. An entry that is not an origin (a path or trailing slash, a query or fragment,
-credentials, a non-http(s) scheme, a wildcard host, `null`) is ignored and logged once
-(`wrangler tail`); it never widens the list. That is judged on the entry as written, before any
-normalization: nothing may follow the host and port, so a dot segment (`/.`, `/..`, `/%2e`), a
-backslash or whitespace anywhere in the entry also drops it, including in a `:*` entry. Matching is exact: Cloudflare Pages preview and branch
-origins (`<hash>.allw-web-approver.pages.dev`) are not admitted by the hosted origin and there is no
-suffix wildcard. A port of `*` matches any port and is meant for loopback dev only
-(the top-level dev config allows `http://localhost:*` and `http://127.0.0.1:*`). Setting the var
-replaces the default, and an empty value allows no browser origin. This is not a secret and not an
-access control: non-browser clients are unaffected, and every request is still authorized by its
-bearer token. Other plain vars (`APNS_*`, `FCM_ENDPOINT`, `VAPID_PUBLIC_KEY`, `VAPID_SUBJECT`) go in
-the same `vars` block, because Wrangler does not inherit top-level vars into an environment, and a
-second `"vars"` key in `env.production` silently replaces the first (dropping `CORS_ALLOWED_ORIGINS`).
+`https://allw-web-approver.pages.dev`. If you serve your own web approver
+(`docs/web-approver-deploy.md`), put its origin here: scheme, host and port only, with no path or
+trailing slash, e.g. `https://approver.example.com`. Each entry is normalized to the origin a browser
+sends (lowercase host, punycode for an internationalized host, default port dropped), so
+`https://Approver.example.com:443` works too. An entry that is not an origin (a path or trailing
+slash, a query or fragment, credentials, a non-http(s) scheme, a wildcard host, `null`) is ignored and
+logged once (`wrangler tail`); it never widens the list. That is judged on the entry as written,
+before any normalization: nothing may follow the host and port, so a dot segment (`/.`, `/..`,
+`/%2e`), a backslash, an `@` (even with empty credentials, `https://@host`) or whitespace inside the
+entry also drops it, including in a `:*` entry. Whitespace around each comma-separated entry is
+trimmed first. The scheme may be in any case and is lowercased, as the host is. Matching is exact:
+Cloudflare Pages preview and branch origins (`<hash>.allw-web-approver.pages.dev`) are not admitted by
+the hosted origin and there is no suffix wildcard. A port of `*` matches any port and is meant for
+loopback dev only (the top-level dev config allows `http://localhost:*` and `http://127.0.0.1:*`).
+Setting the var replaces the default, and an empty value allows no browser origin. This is not a
+secret and not an access control: non-browser clients are unaffected, and every request is still
+authorized by its bearer token. Other plain vars (`APNS_*`, `FCM_ENDPOINT`, `VAPID_PUBLIC_KEY`,
+`VAPID_SUBJECT`) go in the same `vars` block, because Wrangler does not inherit top-level vars into an
+environment, and a second `"vars"` key in `env.production` silently replaces the first (dropping
+`CORS_ALLOWED_ORIGINS`).
 
 **[OPERATOR]** Commit the filled-in placeholders (no secrets — they go in the next step):
 
