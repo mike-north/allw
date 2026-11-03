@@ -8,7 +8,7 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy --env production",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
-    "lint": "eslint src",
+    "lint": "eslint .",
     "test": "vitest run",
     "build": "echo \"relay builds via wrangler\" && exit 0"
   },
