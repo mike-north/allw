@@ -66,6 +66,33 @@ export interface PushCredentialStore {
    * leaves the origin together with the identity it belongs to.
    */
   clear(): Promise<void>;
+  /**
+   * Delete the credentials record only if it still holds exactly `credentials`, and the
+   * registration record only if it still holds exactly `registration`, as one atomic step. A page
+   * that wrote these records for a pairing another tab has since forgotten uses this to take back
+   * its own write without touching records a newer pairing wrote meanwhile.
+   */
+  removeIfUnchanged(credentials: PushCredentials, registration: PushRegistration): Promise<void>;
+}
+
+/** Whether two credential records hold the same four values. */
+export function sameCredentials(a: PushCredentials, b: PushCredentials): boolean {
+  return (
+    a.relayUrl === b.relayUrl &&
+    a.accountId === b.accountId &&
+    a.deviceId === b.deviceId &&
+    a.deviceAuthToken === b.deviceAuthToken
+  );
+}
+
+/** Whether two registration records hold the same four values. */
+export function sameRegistration(a: PushRegistration, b: PushRegistration): boolean {
+  return (
+    a.relayUrl === b.relayUrl &&
+    a.accountId === b.accountId &&
+    a.deviceId === b.deviceId &&
+    a.endpoint === b.endpoint
+  );
 }
 
 /**
@@ -219,6 +246,37 @@ export function createIndexedDbPushCredentialStore(factory: IDBFactory): PushCre
     }
   }
 
+  /**
+   * Read both records and delete each one that still equals ours, inside one readwrite
+   * transaction: IndexedDB runs readwrite transactions on a store one at a time, so no other
+   * page's write can land between the comparison and the delete.
+   */
+  async function removeIfUnchanged(
+    credentials: PushCredentials,
+    registration: PushRegistration,
+  ): Promise<void> {
+    const db = await openDatabase(factory);
+    try {
+      const transaction = db.transaction(OBJECT_STORE, "readwrite");
+      const store = transaction.objectStore(OBJECT_STORE);
+      const storedCredentials = store.get(CREDENTIALS_KEY);
+      storedCredentials.onsuccess = () => {
+        const stored = parsePushCredentials(storedCredentials.result);
+        if (stored !== null && sameCredentials(stored, credentials)) store.delete(CREDENTIALS_KEY);
+      };
+      const storedRegistration = store.get(REGISTRATION_KEY);
+      storedRegistration.onsuccess = () => {
+        const stored = parsePushRegistration(storedRegistration.result);
+        if (stored !== null && sameRegistration(stored, registration)) {
+          store.delete(REGISTRATION_KEY);
+        }
+      };
+      await transactionDone(transaction);
+    } finally {
+      db.close();
+    }
+  }
+
   return {
     async readCredentials() {
       return parsePushCredentials(await read(CREDENTIALS_KEY));
@@ -238,5 +296,6 @@ export function createIndexedDbPushCredentialStore(factory: IDBFactory): PushCre
       });
     },
     clear: clearAll,
+    removeIfUnchanged,
   };
 }

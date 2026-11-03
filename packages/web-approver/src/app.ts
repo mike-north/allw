@@ -72,7 +72,11 @@ import {
   readStoredRelayUrl,
   resolveRelayUrl,
 } from "./relay-config.js";
-import { createIndexedDbPushCredentialStore } from "./push-credentials.js";
+import {
+  createIndexedDbPushCredentialStore,
+  pushCredentialsFrom,
+  type PushCredentials,
+} from "./push-credentials.js";
 import {
   browserForgetNotificationsDeps,
   browserPushEnvironment,
@@ -146,8 +150,10 @@ export interface BootEnvironment {
    * mirror, then best-effort clear the browser's subscription and the relay's push tokens. Called
    * whenever the pairing store clears an identity, and at boot when no identity is stored (absent or
    * corrupt), so the mirrored bearer token never outlives the identity it came from. Never awaited.
+   * `forgotten` holds the relay credentials of the identity being cleared, when it was a pinned
+   * pairing: the token source for withdrawing its registration if the mirror is already empty.
    */
-  readonly forgetNotifications?: () => Promise<void>;
+  readonly forgetNotifications?: (forgotten: PushCredentials | null) => Promise<void>;
 }
 
 /**
@@ -158,21 +164,30 @@ export interface BootEnvironment {
  */
 function clearingNotifications(
   store: PairingStore,
-  forget: (() => Promise<void>) | undefined,
+  forget: ((forgotten: PushCredentials | null) => Promise<void>) | undefined,
 ): PairingStore {
   if (forget === undefined) return store;
+  /** The relay credentials of the identity stored right now, if it is a pinned pairing. */
+  function storedCredentials(): PushCredentials | null {
+    const stored = store.load();
+    if (stored.status !== "paired") return null;
+    const { relayUrl } = stored.identity;
+    return relayUrl === undefined ? null : pushCredentialsFrom({ ...stored.identity, relayUrl });
+  }
   return {
     load: () => store.load(),
     save: (identity) => {
       store.save(identity);
     },
     clear: () => {
+      const forgotten = storedCredentials();
       store.clear();
-      void forget();
+      void forget(forgotten);
     },
     clearIfUnchanged: (snapshot) => {
+      const forgotten = storedCredentials();
       const cleared = store.clearIfUnchanged(snapshot);
-      if (cleared) void forget();
+      if (cleared) void forget(forgotten);
       return cleared;
     },
   };
@@ -334,7 +349,8 @@ export async function boot(env: BootEnvironment): Promise<void> {
   let loaded = pairingStore.load();
   // No identity stored (absent or corrupt): whatever a previous pairing mirrored for notifications
   // is stale. A rejected pin is forgotten only if the human confirms (via `clearIfUnchanged`).
-  if (loaded.status === "absent" || loaded.status === "corrupt") void env.forgetNotifications?.();
+  if (loaded.status === "absent" || loaded.status === "corrupt")
+    void env.forgetNotifications?.(null);
   let repairing = false;
   let escapeForDisplay: DisplayEscape | null = null;
   if (loaded.status === "relay-pin-rejected") {
@@ -428,12 +444,13 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
     search: window.location.search,
     startInbox: bootInbox,
     startNotifications: startBrowserNotifications,
-    forgetNotifications: () =>
+    forgetNotifications: (forgotten) =>
       forgetNotifications(
         browserForgetNotificationsDeps(
           window,
           createIndexedDbPushCredentialStore(window.indexedDB),
         ),
+        forgotten,
       ),
     loadDisplayEscape: loadVendoredDisplayEscape,
   });

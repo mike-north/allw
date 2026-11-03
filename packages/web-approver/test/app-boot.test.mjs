@@ -133,8 +133,11 @@ async function bootWith({
   const noticeHost = document.getElementById("notices");
   const inboxStarts = [];
   const notificationStarts = [];
-  /** How many times boot asked to forget notifications (clear the credential mirror). */
-  const forgets = { count: 0 };
+  /**
+   * How many times boot asked to forget notifications (clear the credential mirror), and the
+   * forgotten relay credentials each request carried.
+   */
+  const forgets = { count: 0, forgotten: [] };
   await boot({
     root,
     noticeHost,
@@ -146,8 +149,9 @@ async function bootWith({
     startNotifications: (identity) => {
       notificationStarts.push(identity);
     },
-    forgetNotifications: async () => {
+    forgetNotifications: async (forgotten) => {
       forgets.count += 1;
+      forgets.forgotten.push(forgotten);
       onForget(forgets.count);
     },
     loadDisplayEscape,
@@ -240,6 +244,7 @@ describe("boot — notification controls (#237)", () => {
     const { root, forgets } = await bootWith({ search: "", storage });
     assert.equal(root.querySelector("form.pairing-form"), null, "the walkthrough is showing");
     assert.equal(forgets.count, 1);
+    assert.deepEqual(forgets.forgotten, [null], "there is no identity to take a token from");
   });
 
   test("'Use another device' forgets the notification credentials with the pairing", async () => {
@@ -252,6 +257,14 @@ describe("boot — notification controls (#237)", () => {
     // The confirm forgets; the pairing gate's own clear before its form may forget again, which is
     // harmless (forgetting is idempotent).
     assert.ok(forgets.count >= 1, "the confirmed re-pair forgets the notification credentials");
+    // The forgotten identity's four relay fields travel with the forget, so its registration can be
+    // withdrawn even when the mirror is already empty (review of #315, round 2). Never the seeds.
+    assert.deepEqual(forgets.forgotten[0], {
+      relayUrl: PINNED_RELAY,
+      accountId: PINNED_IDENTITY.accountId,
+      deviceId: PINNED_IDENTITY.deviceId,
+      deviceAuthToken: PINNED_IDENTITY.deviceAuthToken,
+    });
   });
 
   test("confirming a re-pair forgets the notification credentials; showing the screen does not", async () => {

@@ -138,7 +138,23 @@ function memoryPushStore({ credentials = null, registration = null } = {}) {
       state.credentials = null;
       state.registration = null;
     },
+    // Compare-and-delete, as the IndexedDB store does in one readwrite transaction.
+    async removeIfUnchanged(credentials, registration) {
+      writes.push(["removeIfUnchanged"]);
+      if (state.credentials !== null && sameFields(state.credentials, credentials)) {
+        state.credentials = null;
+      }
+      if (state.registration !== null && sameFields(state.registration, registration)) {
+        state.registration = null;
+      }
+    },
   };
+}
+
+/** Whether two flat records hold the same keys and values. */
+function sameFields(a, b) {
+  const keys = Object.keys(a);
+  return keys.length === Object.keys(b).length && keys.every((key) => a[key] === b[key]);
 }
 
 /** A recording `showNotification`. */
@@ -810,6 +826,29 @@ describe("forgetNotifications — the mirror never outlives the pairing (#237)",
     assert.equal(store.state.credentials, null);
   });
 
+  test("with nothing mirrored, the forgotten identity's token still withdraws the registration", async () => {
+    // Another tab may have registered with the relay and not yet committed its mirror write
+    // (review of #315, round 2): the forget must still clear the relay's push tokens.
+    const store = memoryPushStore();
+    const { impl, calls } = fakeFetch(() => json(200, { push_tokens: [] }));
+    await forgetNotifications({ store, fetchImpl: impl, getSubscription: null }, IDENTITY);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, PUSH_TOKENS_URL);
+    assert.equal(calls[0].init.method, "PUT");
+    assert.equal(calls[0].init.headers.authorization, `Bearer ${CREDENTIALS.deviceAuthToken}`);
+    assert.deepEqual(JSON.parse(calls[0].init.body), { push_tokens: [] });
+  });
+
+  test("the mirrored token is preferred over the forgotten identity's", async () => {
+    const store = memoryPushStore({ credentials: CREDENTIALS });
+    const { impl, calls } = fakeFetch(() => json(200, { push_tokens: [] }));
+    const other = { ...IDENTITY, deviceId: "dev_other", deviceAuthToken: "tok-other" };
+    await forgetNotifications({ store, fetchImpl: impl, getSubscription: null }, other);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, PUSH_TOKENS_URL);
+    assert.equal(calls[0].init.headers.authorization, `Bearer ${CREDENTIALS.deviceAuthToken}`);
+  });
+
   test("an unreadable mirror is still cleared", async () => {
     const store = memoryPushStore({ credentials: CREDENTIALS });
     store.readCredentials = async () => {
@@ -1024,6 +1063,142 @@ describe("mountNotificationControls (#237)", () => {
       "the registration is withdrawn",
     );
     assert.deepEqual(t.store.writes, [], "nothing was mirrored");
+  });
+
+  /**
+   * Review of #315, round 2, probe R1: the forget runs after the second pairing check but before
+   * the mirror write commits, so it finds the mirror empty and the write lands after it. The
+   * post-commit check must take the write back and withdraw the registration.
+   */
+  test("a forget that lands before the mirror write commits: the records are removed and the registration withdrawn", async () => {
+    const t = environment();
+    let paired = true;
+    let commitWrite = null;
+    const writeCredentials = t.store.writeCredentials;
+    t.store.writeCredentials = (value) =>
+      new Promise((resolve) => {
+        commitWrite = async () => {
+          await writeCredentials(value);
+          resolve();
+        };
+      });
+    const controls = mountNotificationControls({
+      host,
+      identity: IDENTITY,
+      env: t.env,
+      isStillPaired: () => paired,
+    });
+    await controls.ready;
+    const enabling = controls.enable();
+    await waitFor(() => commitWrite !== null);
+
+    // Both pairing checks have passed. Tab B forgets now; the mirror is still empty.
+    paired = false;
+    await forgetNotifications({
+      store: t.store,
+      fetchImpl: t.env.fetchImpl,
+      getSubscription: null,
+    });
+    await commitWrite();
+
+    assert.deepEqual(await enabling, { kind: "off", note: PAIRING_CHANGED_NOTE });
+    assert.equal(t.store.state.credentials, null, "the forgotten token is not left in the mirror");
+    assert.equal(t.store.state.registration, null);
+    const puts = t.calls.filter((call) => call.init.method === "PUT");
+    assert.deepEqual(
+      puts.map((call) => [call.url, call.init.headers.authorization, JSON.parse(call.init.body)]),
+      [
+        [
+          PUSH_TOKENS_URL,
+          `Bearer ${CREDENTIALS.deviceAuthToken}`,
+          { push_tokens: [{ transport: "webpush", token: ENDPOINT }] },
+        ],
+        [PUSH_TOKENS_URL, `Bearer ${CREDENTIALS.deviceAuthToken}`, { push_tokens: [] }],
+      ],
+      "the registration is withdrawn with the forgotten device's own token",
+    );
+    assert.equal(text(), PAIRING_CHANGED_NOTE);
+  });
+
+  test("taking back a late mirror write never removes a newer pairing's records", async () => {
+    const t = environment();
+    let paired = true;
+    const NEWER = { ...CREDENTIALS, deviceId: "dev_newer", deviceAuthToken: "tok-newer" };
+    const NEWER_REGISTRATION = {
+      ...pick(NEWER),
+      endpoint: "https://fcm.googleapis.com/fcm/send/newer",
+    };
+    const writeRegistration = t.store.writeRegistration;
+    let repaired = false;
+    t.store.writeRegistration = async (value) => {
+      await writeRegistration(value);
+      if (repaired) return;
+      repaired = true;
+      // After this tab's writes commit and before its last check, tab B forgets the pairing,
+      // pairs a new device and enables notifications for it.
+      paired = false;
+      await forgetNotifications({
+        store: t.store,
+        fetchImpl: async () => json(200, { push_tokens: [] }),
+        getSubscription: null,
+      });
+      await t.store.writeCredentials(NEWER);
+      await writeRegistration(NEWER_REGISTRATION);
+    };
+    const controls = mountNotificationControls({
+      host,
+      identity: IDENTITY,
+      env: t.env,
+      isStillPaired: () => paired,
+    });
+    await controls.ready;
+
+    assert.deepEqual(await controls.enable(), { kind: "off", note: PAIRING_CHANGED_NOTE });
+    assert.deepEqual(t.store.state.credentials, NEWER, "the newer pairing's mirror survives");
+    assert.deepEqual(t.store.state.registration, NEWER_REGISTRATION);
+    const puts = t.calls.filter((call) => call.init.method === "PUT");
+    assert.ok(puts.length > 0);
+    assert.ok(
+      puts.every(
+        (call) =>
+          call.url === PUSH_TOKENS_URL &&
+          call.init.headers.authorization === `Bearer ${CREDENTIALS.deviceAuthToken}`,
+      ),
+      "every PUT from this tab targets the forgotten device, never the newer one",
+    );
+    assert.deepEqual(JSON.parse(puts.at(-1).init.body), { push_tokens: [] });
+  });
+
+  test("on load, a refresh whose pairing is forgotten before it commits is taken back", async () => {
+    const registration = { ...pick(CREDENTIALS), endpoint: ENDPOINT };
+    const store = memoryPushStore({ registration });
+    let paired = true;
+    const writeCredentials = store.writeCredentials;
+    store.writeCredentials = async (value) => {
+      // Tab B forgets while this refresh is writing (it finds the mirror empty).
+      paired = false;
+      await forgetNotifications({
+        store,
+        fetchImpl: async () => json(200, { push_tokens: [] }),
+        getSubscription: null,
+      });
+      await writeCredentials(value);
+    };
+    const t = environment({ permission: "granted", existing: subscriptionFor(ENDPOINT), store });
+    const controls = mountNotificationControls({
+      host,
+      identity: IDENTITY,
+      env: t.env,
+      isStillPaired: () => paired,
+    });
+    assert.deepEqual(await controls.ready, { kind: "off", note: PAIRING_CHANGED_NOTE });
+    assert.equal(store.state.credentials, null);
+    assert.equal(store.state.registration, null);
+    const puts = t.calls.filter((call) => call.init.method === "PUT");
+    assert.deepEqual(
+      puts.map((call) => [call.url, JSON.parse(call.init.body)]),
+      [[PUSH_TOKENS_URL, { push_tokens: [] }]],
+    );
   });
 
   test("on load, a pairing forgotten elsewhere is not re-mirrored", async () => {

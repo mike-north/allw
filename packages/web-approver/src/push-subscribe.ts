@@ -13,8 +13,8 @@
  *    mirror is refreshed and the subscription is re-registered when it differs from the last one
  *    registered for this device (new endpoint, new pairing).
  * 3. **Enable** (a user gesture): request permission → fetch the relay's VAPID public key →
- *    `pushManager.subscribe({ userVisibleOnly: true, applicationServerKey })` → mirror the four
- *    credential fields to IndexedDB → `PUT` the endpoint as the device's push token.
+ *    `pushManager.subscribe({ userVisibleOnly: true, applicationServerKey })` → `PUT` the endpoint
+ *    as the device's push token → mirror the four credential fields to IndexedDB.
  *
  * # Never in the way of approving
  * Every outcome, including denied, unsupported and failed, is a visible state in this control's
@@ -135,8 +135,9 @@ export interface NotificationControlsOptions {
   /**
    * Whether `identity` is still this browser's pairing (same device and bearer token). Another tab
    * can forget or replace the pairing while these controls are mounted; the controls check this
-   * right before registering with the relay and again before writing the credential mirror, so a
-   * forgotten identity is never re-mirrored or re-registered. Defaults to always true.
+   * before registering with the relay, before writing the credential mirror, and after that write
+   * commits, so a forgotten identity is never left in the mirror or registered with the relay.
+   * Defaults to always true.
    */
   readonly isStillPaired?: () => boolean;
 }
@@ -170,11 +171,63 @@ function isCurrentRegistration(
 export const PAIRING_CHANGED_NOTE =
   "This browser's pairing changed in another tab. Reload the page to set up notifications.";
 
+/** The registration record for `credentials`' device and `endpoint`. */
+function registrationFor(credentials: PushCredentials, endpoint: string): PushRegistration {
+  return {
+    relayUrl: credentials.relayUrl,
+    accountId: credentials.accountId,
+    deviceId: credentials.deviceId,
+    endpoint,
+  };
+}
+
+/**
+ * Write the mirror with `write`, then check the pairing again. Another tab's forget can run
+ * between the last check and the moment the write commits: it then finds the mirror still empty,
+ * clears nothing, and the write lands after it. So once the write has committed (or failed), a
+ * pairing that is no longer this one is undone here:
+ * 1. our own records are removed, each only if it still holds what we wrote, so a newer
+ *    pairing's records are never touched;
+ * 2. the registration is withdrawn from the relay with the forgotten device's own token (best
+ *    effort);
+ * 3. the controls end in "off" with {@link PAIRING_CHANGED_NOTE}.
+ *
+ * A write error is rethrown only when the pairing is still current.
+ */
+async function writeMirrorWhilePaired(
+  env: PushEnvironment,
+  credentials: PushCredentials,
+  registration: PushRegistration,
+  isStillPaired: () => boolean,
+  write: () => Promise<void>,
+): Promise<NotificationControlState> {
+  let writeError: { readonly error: unknown } | null = null;
+  try {
+    await write();
+  } catch (error) {
+    writeError = { error };
+  }
+  if (!isStillPaired()) {
+    try {
+      await env.store.removeIfUnchanged(credentials, registration);
+    } catch {
+      // IndexedDB unavailable: nothing more can be done here. The relay withdrawal below still
+      // stops pushes to this endpoint for the forgotten device.
+    }
+    await clearPushTokens(credentials, env.fetchImpl);
+    return { kind: "off", note: PAIRING_CHANGED_NOTE };
+  }
+  if (writeError !== null) throw writeError.error;
+  return { kind: "on" };
+}
+
 /**
  * Register `endpoint` with the relay, then mirror the credentials and record the registration.
- * The pairing is re-checked before the relay call and again before anything is written: if it was
- * forgotten meanwhile, nothing is mirrored, and a registration already sent is withdrawn (best
- * effort), so a forgotten identity's token never returns to the mirror or the relay.
+ * The pairing is checked before the relay call, again before anything is written, and once more
+ * after the writes commit. If it was forgotten before the writes, nothing is mirrored and a
+ * registration already sent is withdrawn (best effort); if it was forgotten while they were in
+ * flight, they are taken back ({@link writeMirrorWhilePaired}). Either way a forgotten identity's
+ * token never stays in the mirror or on the relay.
  */
 async function registerSubscription(
   env: PushEnvironment,
@@ -189,14 +242,11 @@ async function registerSubscription(
     await clearPushTokens(credentials, env.fetchImpl);
     return { kind: "off", note: PAIRING_CHANGED_NOTE };
   }
-  await env.store.writeCredentials(credentials);
-  await env.store.writeRegistration({
-    relayUrl: credentials.relayUrl,
-    accountId: credentials.accountId,
-    deviceId: credentials.deviceId,
-    endpoint,
+  const registration = registrationFor(credentials, endpoint);
+  return writeMirrorWhilePaired(env, credentials, registration, isStillPaired, async () => {
+    await env.store.writeCredentials(credentials);
+    await env.store.writeRegistration(registration);
   });
-  return { kind: "on" };
 }
 
 /** A message for an unexpected rejection. */
@@ -315,8 +365,15 @@ export function mountNotificationControls(
       }
       if (isCurrentRegistration(last, credentials, subscription.endpoint)) {
         if (!isStillPaired()) return show({ kind: "off", note: PAIRING_CHANGED_NOTE });
-        await env.store.writeCredentials(credentials);
-        return show({ kind: "on" });
+        return show(
+          await writeMirrorWhilePaired(
+            env,
+            credentials,
+            registrationFor(credentials, subscription.endpoint),
+            isStillPaired,
+            () => env.store.writeCredentials(credentials),
+          ),
+        );
       }
       return show(
         await registerSubscription(env, credentials, subscription.endpoint, isStillPaired),
@@ -387,15 +444,24 @@ export interface ForgetNotificationsDeps {
  * the browser's subscription is dropped so no further pushes arrive. Both are local and quick, and
  * finish before the network step, so a slow relay can't make this undo a subscription the human
  * creates after re-pairing. Last, the relay is told to drop this device's push tokens, using the
- * token read just before the clear. Never throws.
+ * token read just before the clear.
+ *
+ * `forgotten` is the identity being forgotten, when the caller still has it. It is the token
+ * source when the mirror is empty or unreadable: another tab may be mid-enable, with its
+ * registration already sent and its mirror write not yet committed, and the relay call must still
+ * withdraw that registration. Never throws.
  */
-export async function forgetNotifications(deps: ForgetNotificationsDeps): Promise<void> {
+export async function forgetNotifications(
+  deps: ForgetNotificationsDeps,
+  forgotten: PushCredentials | null = null,
+): Promise<void> {
   let credentials: PushCredentials | null = null;
   try {
     credentials = await deps.store.readCredentials();
   } catch {
     // Unreadable: clear below regardless.
   }
+  credentials ??= forgotten === null ? null : pushCredentialsFrom(forgotten);
   try {
     await deps.store.clear();
   } catch {

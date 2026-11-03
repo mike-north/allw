@@ -331,7 +331,9 @@ corrupt identity, the page:
    worker has no token to use;
 2. drops the browser's push subscription;
 3. asks the relay to clear this device's push tokens (`PUT …/push-tokens` with
-   `{ "push_tokens": [] }`, using the token read in step 1).
+   `{ "push_tokens": [] }`, using the token read in step 1). If the mirror was empty or unreadable,
+   it uses the token of the identity being forgotten instead, so a registration that another tab
+   sent but hadn't yet mirrored is still withdrawn.
 
 Steps 2 and 3 are **best effort**. If the relay call fails (offline, or the token was already
 revoked), the relay keeps the endpoint until the device is revoked, or until the push service
@@ -343,10 +345,17 @@ An identity pinned to a relay this build rejects (§2, _Relay pinning_) is forgo
 human confirms the re-pair. Until then its mirrored credentials stay, but they are inert: the worker
 re-validates the relay on every read and makes no call to one this build rejects.
 
-Another tab can forget or replace the pairing while this one shows the strip. Before registering
-with the relay, and again before writing the mirror, the strip checks that the identity it was
-mounted for is still the stored one. If it isn't, nothing is mirrored, a registration already sent
-is withdrawn (best effort), and the strip asks for a reload.
+Another tab can forget or replace the pairing while this one shows the strip. The strip checks that
+the identity it was mounted for is still the stored one three times: before registering with the
+relay, before writing the mirror, and after the write commits. A forget can land between the second
+check and the commit; it then finds the mirror empty, and the write lands after it. So whenever a
+check fails:
+
+- nothing more is mirrored;
+- records this tab already wrote are deleted, each only if it still holds what this tab wrote, so a
+  newer pairing's records survive. The compare and the delete run in one IndexedDB transaction;
+- a registration already sent is withdrawn with the forgotten device's token (best effort);
+- the strip asks for a reload.
 
 **Files.** `scripts/build-site.mjs` bundles the worker to `sw.js` at the site root (a worker's scope
 can't be wider than its directory), and ships `manifest.webmanifest` (name, `start_url`,
