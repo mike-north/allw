@@ -75,6 +75,14 @@ Revocation is not permanent across sequences. Only the highest sequence counts, 
 that lists a previously revoked device as active, with no revocation entry, makes it a recipient again. That is
 root-authorized: the root holder can always re-enroll a device, and the signed sequence is the authority.
 
+**Sealing and the sequence floor.** Integrators never handle the selected keys. The core's
+`seal_context_for_account_state(context, account_states, account_id, account_root_pub, now_ms, min_sequence)`
+applies the selection rule above and encrypts the `ApprovalContext` to exactly that set, returning the ciphertext
+and the `sequence` it selected from — the highest verified sequence, never the caller's `min_sequence`. A caller
+that keeps a floor records that `sequence` (as `max(floor, sequence)`) **before** it sends the request, and passes
+the stored floor as `min_sequence` on every later seal, so a relay that later serves an older state is refused
+rather than trusted. If recording the floor fails, the request is not sent.
+
 The approval primitive has two independent device keys:
 
 | Key                   | Algorithm | Purpose                                        | Relay-visible?                        |
