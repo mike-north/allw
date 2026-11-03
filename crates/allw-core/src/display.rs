@@ -44,8 +44,9 @@
 //! - **U+180B–U+180D, U+180F** after a Mongolian-block character (U+1800–U+18AF).
 //!
 //! U+FE00–U+FE0D are always escaped, and so is every selector anywhere else — after ASCII, after
-//! punctuation or a letter outside those tables, after a combining mark, or after another selector.
-//! An escaped selector sets the flag.
+//! punctuation or a letter outside those tables, after any combining mark (General_Category `Mn` or
+//! `Me`, including the Mongolian-block marks), or after another selector. An escaped selector sets
+//! the flag.
 //!
 //! **Accepted residual.** A shown selector still carries a little information, because a base may
 //! take more than one selector: about 1 bit per listed emoji (U+FE0E or U+FE0F), and up to about one
@@ -53,6 +54,21 @@
 //! of emoji or CJK text in the request; plain prose with bullets, dashes, quotes or non-CJK letters
 //! can no longer carry one. This residual is a deliberate trade-off against warning on every emoji
 //! and every CJK variant form (`docs/threat-model.md` R3).
+//!
+//! ## Stacked combining marks
+//!
+//! A combining mark (General_Category `Mn` or `Me`, [`is_combining_mark`]) draws on the character
+//! before it. A few are ordinary (`é` decomposed is `e` + U+0301), but dozens stacked on one base
+//! ("zalgo" text) overflow the line box and can paint over the line above or below, such as the
+//! `cwd:` or origin line of an approval card. So at most [`MAX_STACKED_COMBINING_MARKS`] (2)
+//! consecutive combining marks are shown; the third and every later mark of the same run render as
+//! `⟨U+XXXX⟩` and set the flag. A run is counted over the input: any character that is not a
+//! combining mark ends it, and a variation selector (also `Mn`) counts toward it.
+//!
+//! **Accepted false positives.** A few scripts legitimately stack three or more marks on one base:
+//! Tibetan stacks with vowel signs (`ཧཱུྃ`), Hebrew with points and cantillation marks, and some
+//! Indic clusters. These warn and show their later marks escaped. That fails safe (the human is
+//! warned and still sees every code point), and such text is rare in commands and tool calls.
 //!
 //! # Structure inside multi-line content
 //!
@@ -181,6 +197,28 @@ pub fn is_variation_selector(c: char) -> bool {
     )
 }
 
+/// How many combining marks in a row one base may carry before the rest are escaped. Two covers
+/// ordinary accented text, including Vietnamese letters with two diacritics (`ệ` decomposed is `e`
+/// U+0323 U+0302); more lets a stack of marks overflow its line (see the module docs, "Stacked
+/// combining marks").
+pub const MAX_STACKED_COMBINING_MARKS: usize = 2;
+
+/// Whether `c` is a combining mark: General_Category `Mn` or `Me` (Unicode 16.0.0), which draws on
+/// the character before it instead of taking its own cell.
+pub fn is_combining_mark(c: char) -> bool {
+    COMBINING_MARK_RANGES
+        .binary_search_by(|&(lo, hi)| {
+            if hi < c {
+                std::cmp::Ordering::Less
+            } else if lo > c {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
+}
+
 /// Whether `c` is a `Unified_Ideograph` (Unicode 16.0.0 `PropList.txt`): the only bases after
 /// which an ideographic variation selector (U+E0100–U+E01EF) is shown.
 ///
@@ -210,11 +248,12 @@ fn is_unified_ideograph(c: char) -> bool {
 
 /// Whether the variation selector `c`, between `prev` and `next`, is shown as-is rather than
 /// escaped. Each selector range has its own allowed bases (see the module docs, "Variation
-/// selectors"); a base is never itself a selector or a hidden character, so a selector directly
-/// after another selector is always escaped.
+/// selectors"); a base is never itself a selector, a combining mark or a hidden character, so a
+/// selector directly after another selector or after any combining mark is always escaped.
 fn selector_is_shown(c: char, prev: Option<char>, next: Option<char>) -> bool {
-    let Some(base) = prev.filter(|&p| !is_variation_selector(p) && !is_hidden_or_control_char(p))
-    else {
+    let Some(base) = prev.filter(|&p| {
+        !is_variation_selector(p) && !is_combining_mark(p) && !is_hidden_or_control_char(p)
+    }) else {
         return false;
     };
     match c {
@@ -256,12 +295,22 @@ pub const CRLF_MARKER: &str = "␍";
 fn escape_into(out: &mut String, text: &str, context: Context) -> bool {
     let mut flagged = false;
     let mut prev: Option<char> = None;
+    // Consecutive combining marks in the input so far, this one included (0 for any other char).
+    let mut marks_in_run = 0usize;
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
+        marks_in_run = if is_combining_mark(c) {
+            marks_in_run + 1
+        } else {
+            0
+        };
         if c == '\t' && context == Context::ContentLine {
             out.push_str(TAB_MARKER);
         } else if is_hidden_or_control_char(c) {
             push_escaped(out, c);
+            flagged = true;
+        } else if marks_in_run > MAX_STACKED_COMBINING_MARKS {
+            push_codepoint(out, c);
             flagged = true;
         } else if is_variation_selector(c) {
             if selector_is_shown(c, prev, chars.peek().copied()) {
@@ -649,6 +698,134 @@ const EMOJI_VARIATION_BASES: [char; 359] = [
     '\u{1F6F0}', '\u{1F6F3}',
 ];
 
+/// The code points whose General_Category is `Mn` (nonspacing mark) or `Me` (enclosing mark), as
+/// inclusive ranges, from Unicode **16.0.0** `extracted/DerivedGeneralCategory.txt` (dated
+/// 2024-04-30), with adjacent ranges merged. Sorted for binary search. Includes the variation
+/// selectors, which are `Mn`.
+///
+/// @see https://www.unicode.org/Public/16.0.0/ucd/extracted/DerivedGeneralCategory.txt
+#[rustfmt::skip]
+const COMBINING_MARK_RANGES: [(char, char); 354] = [
+    ('\u{0300}', '\u{036F}'), ('\u{0483}', '\u{0489}'), ('\u{0591}', '\u{05BD}'),
+    ('\u{05BF}', '\u{05BF}'), ('\u{05C1}', '\u{05C2}'), ('\u{05C4}', '\u{05C5}'),
+    ('\u{05C7}', '\u{05C7}'), ('\u{0610}', '\u{061A}'), ('\u{064B}', '\u{065F}'),
+    ('\u{0670}', '\u{0670}'), ('\u{06D6}', '\u{06DC}'), ('\u{06DF}', '\u{06E4}'),
+    ('\u{06E7}', '\u{06E8}'), ('\u{06EA}', '\u{06ED}'), ('\u{0711}', '\u{0711}'),
+    ('\u{0730}', '\u{074A}'), ('\u{07A6}', '\u{07B0}'), ('\u{07EB}', '\u{07F3}'),
+    ('\u{07FD}', '\u{07FD}'), ('\u{0816}', '\u{0819}'), ('\u{081B}', '\u{0823}'),
+    ('\u{0825}', '\u{0827}'), ('\u{0829}', '\u{082D}'), ('\u{0859}', '\u{085B}'),
+    ('\u{0897}', '\u{089F}'), ('\u{08CA}', '\u{08E1}'), ('\u{08E3}', '\u{0902}'),
+    ('\u{093A}', '\u{093A}'), ('\u{093C}', '\u{093C}'), ('\u{0941}', '\u{0948}'),
+    ('\u{094D}', '\u{094D}'), ('\u{0951}', '\u{0957}'), ('\u{0962}', '\u{0963}'),
+    ('\u{0981}', '\u{0981}'), ('\u{09BC}', '\u{09BC}'), ('\u{09C1}', '\u{09C4}'),
+    ('\u{09CD}', '\u{09CD}'), ('\u{09E2}', '\u{09E3}'), ('\u{09FE}', '\u{09FE}'),
+    ('\u{0A01}', '\u{0A02}'), ('\u{0A3C}', '\u{0A3C}'), ('\u{0A41}', '\u{0A42}'),
+    ('\u{0A47}', '\u{0A48}'), ('\u{0A4B}', '\u{0A4D}'), ('\u{0A51}', '\u{0A51}'),
+    ('\u{0A70}', '\u{0A71}'), ('\u{0A75}', '\u{0A75}'), ('\u{0A81}', '\u{0A82}'),
+    ('\u{0ABC}', '\u{0ABC}'), ('\u{0AC1}', '\u{0AC5}'), ('\u{0AC7}', '\u{0AC8}'),
+    ('\u{0ACD}', '\u{0ACD}'), ('\u{0AE2}', '\u{0AE3}'), ('\u{0AFA}', '\u{0AFF}'),
+    ('\u{0B01}', '\u{0B01}'), ('\u{0B3C}', '\u{0B3C}'), ('\u{0B3F}', '\u{0B3F}'),
+    ('\u{0B41}', '\u{0B44}'), ('\u{0B4D}', '\u{0B4D}'), ('\u{0B55}', '\u{0B56}'),
+    ('\u{0B62}', '\u{0B63}'), ('\u{0B82}', '\u{0B82}'), ('\u{0BC0}', '\u{0BC0}'),
+    ('\u{0BCD}', '\u{0BCD}'), ('\u{0C00}', '\u{0C00}'), ('\u{0C04}', '\u{0C04}'),
+    ('\u{0C3C}', '\u{0C3C}'), ('\u{0C3E}', '\u{0C40}'), ('\u{0C46}', '\u{0C48}'),
+    ('\u{0C4A}', '\u{0C4D}'), ('\u{0C55}', '\u{0C56}'), ('\u{0C62}', '\u{0C63}'),
+    ('\u{0C81}', '\u{0C81}'), ('\u{0CBC}', '\u{0CBC}'), ('\u{0CBF}', '\u{0CBF}'),
+    ('\u{0CC6}', '\u{0CC6}'), ('\u{0CCC}', '\u{0CCD}'), ('\u{0CE2}', '\u{0CE3}'),
+    ('\u{0D00}', '\u{0D01}'), ('\u{0D3B}', '\u{0D3C}'), ('\u{0D41}', '\u{0D44}'),
+    ('\u{0D4D}', '\u{0D4D}'), ('\u{0D62}', '\u{0D63}'), ('\u{0D81}', '\u{0D81}'),
+    ('\u{0DCA}', '\u{0DCA}'), ('\u{0DD2}', '\u{0DD4}'), ('\u{0DD6}', '\u{0DD6}'),
+    ('\u{0E31}', '\u{0E31}'), ('\u{0E34}', '\u{0E3A}'), ('\u{0E47}', '\u{0E4E}'),
+    ('\u{0EB1}', '\u{0EB1}'), ('\u{0EB4}', '\u{0EBC}'), ('\u{0EC8}', '\u{0ECE}'),
+    ('\u{0F18}', '\u{0F19}'), ('\u{0F35}', '\u{0F35}'), ('\u{0F37}', '\u{0F37}'),
+    ('\u{0F39}', '\u{0F39}'), ('\u{0F71}', '\u{0F7E}'), ('\u{0F80}', '\u{0F84}'),
+    ('\u{0F86}', '\u{0F87}'), ('\u{0F8D}', '\u{0F97}'), ('\u{0F99}', '\u{0FBC}'),
+    ('\u{0FC6}', '\u{0FC6}'), ('\u{102D}', '\u{1030}'), ('\u{1032}', '\u{1037}'),
+    ('\u{1039}', '\u{103A}'), ('\u{103D}', '\u{103E}'), ('\u{1058}', '\u{1059}'),
+    ('\u{105E}', '\u{1060}'), ('\u{1071}', '\u{1074}'), ('\u{1082}', '\u{1082}'),
+    ('\u{1085}', '\u{1086}'), ('\u{108D}', '\u{108D}'), ('\u{109D}', '\u{109D}'),
+    ('\u{135D}', '\u{135F}'), ('\u{1712}', '\u{1714}'), ('\u{1732}', '\u{1733}'),
+    ('\u{1752}', '\u{1753}'), ('\u{1772}', '\u{1773}'), ('\u{17B4}', '\u{17B5}'),
+    ('\u{17B7}', '\u{17BD}'), ('\u{17C6}', '\u{17C6}'), ('\u{17C9}', '\u{17D3}'),
+    ('\u{17DD}', '\u{17DD}'), ('\u{180B}', '\u{180D}'), ('\u{180F}', '\u{180F}'),
+    ('\u{1885}', '\u{1886}'), ('\u{18A9}', '\u{18A9}'), ('\u{1920}', '\u{1922}'),
+    ('\u{1927}', '\u{1928}'), ('\u{1932}', '\u{1932}'), ('\u{1939}', '\u{193B}'),
+    ('\u{1A17}', '\u{1A18}'), ('\u{1A1B}', '\u{1A1B}'), ('\u{1A56}', '\u{1A56}'),
+    ('\u{1A58}', '\u{1A5E}'), ('\u{1A60}', '\u{1A60}'), ('\u{1A62}', '\u{1A62}'),
+    ('\u{1A65}', '\u{1A6C}'), ('\u{1A73}', '\u{1A7C}'), ('\u{1A7F}', '\u{1A7F}'),
+    ('\u{1AB0}', '\u{1ACE}'), ('\u{1B00}', '\u{1B03}'), ('\u{1B34}', '\u{1B34}'),
+    ('\u{1B36}', '\u{1B3A}'), ('\u{1B3C}', '\u{1B3C}'), ('\u{1B42}', '\u{1B42}'),
+    ('\u{1B6B}', '\u{1B73}'), ('\u{1B80}', '\u{1B81}'), ('\u{1BA2}', '\u{1BA5}'),
+    ('\u{1BA8}', '\u{1BA9}'), ('\u{1BAB}', '\u{1BAD}'), ('\u{1BE6}', '\u{1BE6}'),
+    ('\u{1BE8}', '\u{1BE9}'), ('\u{1BED}', '\u{1BED}'), ('\u{1BEF}', '\u{1BF1}'),
+    ('\u{1C2C}', '\u{1C33}'), ('\u{1C36}', '\u{1C37}'), ('\u{1CD0}', '\u{1CD2}'),
+    ('\u{1CD4}', '\u{1CE0}'), ('\u{1CE2}', '\u{1CE8}'), ('\u{1CED}', '\u{1CED}'),
+    ('\u{1CF4}', '\u{1CF4}'), ('\u{1CF8}', '\u{1CF9}'), ('\u{1DC0}', '\u{1DFF}'),
+    ('\u{20D0}', '\u{20F0}'), ('\u{2CEF}', '\u{2CF1}'), ('\u{2D7F}', '\u{2D7F}'),
+    ('\u{2DE0}', '\u{2DFF}'), ('\u{302A}', '\u{302D}'), ('\u{3099}', '\u{309A}'),
+    ('\u{A66F}', '\u{A672}'), ('\u{A674}', '\u{A67D}'), ('\u{A69E}', '\u{A69F}'),
+    ('\u{A6F0}', '\u{A6F1}'), ('\u{A802}', '\u{A802}'), ('\u{A806}', '\u{A806}'),
+    ('\u{A80B}', '\u{A80B}'), ('\u{A825}', '\u{A826}'), ('\u{A82C}', '\u{A82C}'),
+    ('\u{A8C4}', '\u{A8C5}'), ('\u{A8E0}', '\u{A8F1}'), ('\u{A8FF}', '\u{A8FF}'),
+    ('\u{A926}', '\u{A92D}'), ('\u{A947}', '\u{A951}'), ('\u{A980}', '\u{A982}'),
+    ('\u{A9B3}', '\u{A9B3}'), ('\u{A9B6}', '\u{A9B9}'), ('\u{A9BC}', '\u{A9BD}'),
+    ('\u{A9E5}', '\u{A9E5}'), ('\u{AA29}', '\u{AA2E}'), ('\u{AA31}', '\u{AA32}'),
+    ('\u{AA35}', '\u{AA36}'), ('\u{AA43}', '\u{AA43}'), ('\u{AA4C}', '\u{AA4C}'),
+    ('\u{AA7C}', '\u{AA7C}'), ('\u{AAB0}', '\u{AAB0}'), ('\u{AAB2}', '\u{AAB4}'),
+    ('\u{AAB7}', '\u{AAB8}'), ('\u{AABE}', '\u{AABF}'), ('\u{AAC1}', '\u{AAC1}'),
+    ('\u{AAEC}', '\u{AAED}'), ('\u{AAF6}', '\u{AAF6}'), ('\u{ABE5}', '\u{ABE5}'),
+    ('\u{ABE8}', '\u{ABE8}'), ('\u{ABED}', '\u{ABED}'), ('\u{FB1E}', '\u{FB1E}'),
+    ('\u{FE00}', '\u{FE0F}'), ('\u{FE20}', '\u{FE2F}'), ('\u{101FD}', '\u{101FD}'),
+    ('\u{102E0}', '\u{102E0}'), ('\u{10376}', '\u{1037A}'), ('\u{10A01}', '\u{10A03}'),
+    ('\u{10A05}', '\u{10A06}'), ('\u{10A0C}', '\u{10A0F}'), ('\u{10A38}', '\u{10A3A}'),
+    ('\u{10A3F}', '\u{10A3F}'), ('\u{10AE5}', '\u{10AE6}'), ('\u{10D24}', '\u{10D27}'),
+    ('\u{10D69}', '\u{10D6D}'), ('\u{10EAB}', '\u{10EAC}'), ('\u{10EFC}', '\u{10EFF}'),
+    ('\u{10F46}', '\u{10F50}'), ('\u{10F82}', '\u{10F85}'), ('\u{11001}', '\u{11001}'),
+    ('\u{11038}', '\u{11046}'), ('\u{11070}', '\u{11070}'), ('\u{11073}', '\u{11074}'),
+    ('\u{1107F}', '\u{11081}'), ('\u{110B3}', '\u{110B6}'), ('\u{110B9}', '\u{110BA}'),
+    ('\u{110C2}', '\u{110C2}'), ('\u{11100}', '\u{11102}'), ('\u{11127}', '\u{1112B}'),
+    ('\u{1112D}', '\u{11134}'), ('\u{11173}', '\u{11173}'), ('\u{11180}', '\u{11181}'),
+    ('\u{111B6}', '\u{111BE}'), ('\u{111C9}', '\u{111CC}'), ('\u{111CF}', '\u{111CF}'),
+    ('\u{1122F}', '\u{11231}'), ('\u{11234}', '\u{11234}'), ('\u{11236}', '\u{11237}'),
+    ('\u{1123E}', '\u{1123E}'), ('\u{11241}', '\u{11241}'), ('\u{112DF}', '\u{112DF}'),
+    ('\u{112E3}', '\u{112EA}'), ('\u{11300}', '\u{11301}'), ('\u{1133B}', '\u{1133C}'),
+    ('\u{11340}', '\u{11340}'), ('\u{11366}', '\u{1136C}'), ('\u{11370}', '\u{11374}'),
+    ('\u{113BB}', '\u{113C0}'), ('\u{113CE}', '\u{113CE}'), ('\u{113D0}', '\u{113D0}'),
+    ('\u{113D2}', '\u{113D2}'), ('\u{113E1}', '\u{113E2}'), ('\u{11438}', '\u{1143F}'),
+    ('\u{11442}', '\u{11444}'), ('\u{11446}', '\u{11446}'), ('\u{1145E}', '\u{1145E}'),
+    ('\u{114B3}', '\u{114B8}'), ('\u{114BA}', '\u{114BA}'), ('\u{114BF}', '\u{114C0}'),
+    ('\u{114C2}', '\u{114C3}'), ('\u{115B2}', '\u{115B5}'), ('\u{115BC}', '\u{115BD}'),
+    ('\u{115BF}', '\u{115C0}'), ('\u{115DC}', '\u{115DD}'), ('\u{11633}', '\u{1163A}'),
+    ('\u{1163D}', '\u{1163D}'), ('\u{1163F}', '\u{11640}'), ('\u{116AB}', '\u{116AB}'),
+    ('\u{116AD}', '\u{116AD}'), ('\u{116B0}', '\u{116B5}'), ('\u{116B7}', '\u{116B7}'),
+    ('\u{1171D}', '\u{1171D}'), ('\u{1171F}', '\u{1171F}'), ('\u{11722}', '\u{11725}'),
+    ('\u{11727}', '\u{1172B}'), ('\u{1182F}', '\u{11837}'), ('\u{11839}', '\u{1183A}'),
+    ('\u{1193B}', '\u{1193C}'), ('\u{1193E}', '\u{1193E}'), ('\u{11943}', '\u{11943}'),
+    ('\u{119D4}', '\u{119D7}'), ('\u{119DA}', '\u{119DB}'), ('\u{119E0}', '\u{119E0}'),
+    ('\u{11A01}', '\u{11A0A}'), ('\u{11A33}', '\u{11A38}'), ('\u{11A3B}', '\u{11A3E}'),
+    ('\u{11A47}', '\u{11A47}'), ('\u{11A51}', '\u{11A56}'), ('\u{11A59}', '\u{11A5B}'),
+    ('\u{11A8A}', '\u{11A96}'), ('\u{11A98}', '\u{11A99}'), ('\u{11C30}', '\u{11C36}'),
+    ('\u{11C38}', '\u{11C3D}'), ('\u{11C3F}', '\u{11C3F}'), ('\u{11C92}', '\u{11CA7}'),
+    ('\u{11CAA}', '\u{11CB0}'), ('\u{11CB2}', '\u{11CB3}'), ('\u{11CB5}', '\u{11CB6}'),
+    ('\u{11D31}', '\u{11D36}'), ('\u{11D3A}', '\u{11D3A}'), ('\u{11D3C}', '\u{11D3D}'),
+    ('\u{11D3F}', '\u{11D45}'), ('\u{11D47}', '\u{11D47}'), ('\u{11D90}', '\u{11D91}'),
+    ('\u{11D95}', '\u{11D95}'), ('\u{11D97}', '\u{11D97}'), ('\u{11EF3}', '\u{11EF4}'),
+    ('\u{11F00}', '\u{11F01}'), ('\u{11F36}', '\u{11F3A}'), ('\u{11F40}', '\u{11F40}'),
+    ('\u{11F42}', '\u{11F42}'), ('\u{11F5A}', '\u{11F5A}'), ('\u{13440}', '\u{13440}'),
+    ('\u{13447}', '\u{13455}'), ('\u{1611E}', '\u{16129}'), ('\u{1612D}', '\u{1612F}'),
+    ('\u{16AF0}', '\u{16AF4}'), ('\u{16B30}', '\u{16B36}'), ('\u{16F4F}', '\u{16F4F}'),
+    ('\u{16F8F}', '\u{16F92}'), ('\u{16FE4}', '\u{16FE4}'), ('\u{1BC9D}', '\u{1BC9E}'),
+    ('\u{1CF00}', '\u{1CF2D}'), ('\u{1CF30}', '\u{1CF46}'), ('\u{1D167}', '\u{1D169}'),
+    ('\u{1D17B}', '\u{1D182}'), ('\u{1D185}', '\u{1D18B}'), ('\u{1D1AA}', '\u{1D1AD}'),
+    ('\u{1D242}', '\u{1D244}'), ('\u{1DA00}', '\u{1DA36}'), ('\u{1DA3B}', '\u{1DA6C}'),
+    ('\u{1DA75}', '\u{1DA75}'), ('\u{1DA84}', '\u{1DA84}'), ('\u{1DA9B}', '\u{1DA9F}'),
+    ('\u{1DAA1}', '\u{1DAAF}'), ('\u{1E000}', '\u{1E006}'), ('\u{1E008}', '\u{1E018}'),
+    ('\u{1E01B}', '\u{1E021}'), ('\u{1E023}', '\u{1E024}'), ('\u{1E026}', '\u{1E02A}'),
+    ('\u{1E08F}', '\u{1E08F}'), ('\u{1E130}', '\u{1E136}'), ('\u{1E2AE}', '\u{1E2AE}'),
+    ('\u{1E2EC}', '\u{1E2EF}'), ('\u{1E4EC}', '\u{1E4EF}'), ('\u{1E5EE}', '\u{1E5EF}'),
+    ('\u{1E8D0}', '\u{1E8D6}'), ('\u{1E944}', '\u{1E94A}'), ('\u{E0100}', '\u{E01EF}'),
+];
+
 #[cfg(test)]
 mod tests {
     //! Unit tests for display escaping. Expected strings are written by hand from the notation in
@@ -880,6 +1057,105 @@ mod tests {
         assert!(has_hidden_or_control_chars(&text));
         assert!(!escaped.chars().any(is_variation_selector), "{escaped}");
         assert_eq!(escaped.matches("⟨U+E01").count(), secret.len());
+    }
+
+    /// Regression (#271): dozens of combining marks stacked on one base overflow the line and can
+    /// paint over neighbouring lines. Only the first two are shown; the rest are escaped and warn.
+    #[test]
+    fn stacked_combining_marks_beyond_two_are_escaped_and_warn() {
+        let text = format!("ok{}{}", "\u{0336}".repeat(5), "\u{0301}".repeat(50));
+        let expected = format!(
+            "ok\u{0336}\u{0336}{}{}",
+            "⟨U+0336⟩".repeat(3),
+            "⟨U+0301⟩".repeat(50)
+        );
+        assert_eq!(escape_for_display(&text), expected);
+        assert!(has_hidden_or_control_chars(&text));
+        // Escaping is idempotent: the output's runs are already within the limit.
+        assert_eq!(escape_for_display(&expected), expected);
+        assert!(!has_hidden_or_control_chars(&expected));
+    }
+
+    #[test]
+    fn ordinary_accented_text_does_not_warn() {
+        // Decomposed é (one mark) and Vietnamese ệ (two marks), each on its own base.
+        for text in [
+            "cafe\u{0301}",
+            "Vi\u{0323}\u{0302}t Nam",
+            "a\u{0301}\u{0301}b\u{0301}\u{0301}",
+        ] {
+            assert_eq!(escape_for_display(text), text);
+            assert!(!has_hidden_or_control_chars(text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_selector_after_any_combining_mark_is_escaped() {
+        // U+18A9 is a Mongolian-block combining mark: inside U+1800–U+18AF, but not a base.
+        assert_eq!(
+            escape_for_display("\u{1820}\u{18A9}\u{180B}"),
+            "\u{1820}\u{18A9}⟨U+180B⟩"
+        );
+        // A combining mark outside the combining-diacritic blocks (Thai, Hebrew, Devanagari).
+        for mark in ['\u{0E48}', '\u{05B4}', '\u{093C}'] {
+            let text = format!("x{mark}\u{FE0F}");
+            assert_eq!(escape_for_display(&text), format!("x{mark}⟨U+FE0F⟩"));
+        }
+    }
+
+    /// The table is sorted, non-overlapping and merged, so the binary search is exact.
+    #[test]
+    fn combining_mark_ranges_are_sorted_and_disjoint() {
+        for (lo, hi) in COMBINING_MARK_RANGES {
+            assert!(lo <= hi, "{lo:?}..={hi:?}");
+        }
+        for pair in COMBINING_MARK_RANGES.windows(2) {
+            let (_, prev_hi) = pair[0];
+            let (next_lo, _) = pair[1];
+            assert!(
+                u32::from(prev_hi) + 1 < u32::from(next_lo),
+                "{pair:?} overlap or touch"
+            );
+        }
+    }
+
+    /// Spot checks against General_Category in Unicode 16.0.0 `UnicodeData.txt`.
+    #[test]
+    fn is_combining_mark_matches_the_general_category() {
+        // Mn or Me.
+        for c in [
+            '\u{0300}',
+            '\u{036F}',
+            '\u{0483}',
+            '\u{0489}',
+            '\u{05B4}',
+            '\u{093C}',
+            '\u{0E48}',
+            '\u{1885}',
+            '\u{18A9}',
+            '\u{20DD}',
+            '\u{20E3}',
+            '\u{3099}',
+            '\u{FE0F}',
+            '\u{FE20}',
+            '\u{1E944}',
+            '\u{E0100}',
+            '\u{E01EF}',
+        ] {
+            assert!(is_combining_mark(c), "{c:?} is Mn/Me");
+        }
+        // Not marks: letters, a spacing mark (Mc), an emoji modifier (Sk), a format control (Cf).
+        for c in [
+            'e',
+            '\u{0903}',
+            '\u{0E33}',
+            '\u{1F3FB}',
+            '\u{200D}',
+            '\u{2022}',
+            '\u{FFFD}',
+        ] {
+            assert!(!is_combining_mark(c), "{c:?} is not Mn/Me");
+        }
     }
 
     #[test]

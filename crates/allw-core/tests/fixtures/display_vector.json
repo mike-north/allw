@@ -150,6 +150,66 @@
       "input": "葛︀",
       "escaped": "葛⟨U+FE00⟩",
       "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "stacked combining marks: the third and later on one base are escaped (zalgo)",
+      "input": "o\u0336\u0336\u0301\u0301",
+      "escaped": "o\u0336\u0336⟨U+0301⟩⟨U+0301⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "one combining mark (decomposed é) is shown",
+      "input": "cafe\u0301",
+      "escaped": "cafe\u0301",
+      "has_hidden_or_control_chars": false
+    },
+    {
+      "class": "two combining marks (Vietnamese ệ decomposed) are shown",
+      "input": "e\u0323\u0302",
+      "escaped": "e\u0323\u0302",
+      "has_hidden_or_control_chars": false
+    },
+    {
+      "class": "a new base starts a new run of combining marks",
+      "input": "a\u0301\u0301b\u0301\u0301",
+      "escaped": "a\u0301\u0301b\u0301\u0301",
+      "has_hidden_or_control_chars": false
+    },
+    {
+      "class": "enclosing marks (Me) count toward the run",
+      "input": "x\u20dd\u20dd\u20dd",
+      "escaped": "x\u20dd\u20dd⟨U+20DD⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "combining marks with no base are counted from the start",
+      "input": "\u0301\u0301\u0301",
+      "escaped": "\u0301\u0301⟨U+0301⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "an escaped grapheme joiner does not end a run of combining marks",
+      "input": "a\u0301\u034f\u0301",
+      "escaped": "a\u0301⟨U+034F⟩⟨U+0301⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "variation selector after a combining mark",
+      "input": "a\u0301\ufe0f",
+      "escaped": "a\u0301⟨U+FE0F⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "Mongolian variation selector after a Mongolian combining mark",
+      "input": "ᠠ\u18a9\u180b",
+      "escaped": "ᠠ\u18a9⟨U+180B⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "emoji keycap (U+FE0F then the enclosing keycap) stays within the run limit",
+      "input": "1\ufe0f\u20e3",
+      "escaped": "1\ufe0f\u20e3",
+      "has_hidden_or_control_chars": false
     }
   ],
   "display_model_case": {
@@ -222,6 +282,13 @@
       "surface": "command",
       "raw": "echo ok\nrm -rf ~/x; : \u001b[2K\rgit status",
       "raw_lines": ["echo ok", "rm -rf ~/x; : \\x1b[2K\\rgit status"],
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "stacked combining marks inside file content are escaped and flagged",
+      "surface": "file_edit",
+      "raw": "a\u0301\u0301\u0301\u000ab",
+      "raw_lines": ["a\u0301\u0301⟨U+0301⟩", "b"],
       "has_hidden_or_control_chars": true
     }
   ]

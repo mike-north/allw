@@ -66,8 +66,9 @@ pub use crypto::{
     VerifiedVerdict, VerifyError, MAX_NOTE_BYTES,
 };
 pub use display::{
-    display_model, escape_for_display, has_hidden_or_control_chars, is_hidden_or_control_char,
-    is_variation_selector, DisplayModel, DisplaySubstrate, CRLF_MARKER, TAB_MARKER,
+    display_model, escape_for_display, has_hidden_or_control_chars, is_combining_mark,
+    is_hidden_or_control_char, is_variation_selector, DisplayModel, DisplaySubstrate, CRLF_MARKER,
+    MAX_STACKED_COMBINING_MARKS, TAB_MARKER,
 };
 pub use file_edit::action_from_file_edit;
 pub use hash::{canonical_request_bytes, compute_request_hash};
