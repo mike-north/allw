@@ -52,7 +52,8 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   as a wrong token does: **401** `{"error":"authorization required"}` without a bearer token, **403**
   `{"error":"authorization denied"}` with one. So these routes never say "not found", and an
   unauthenticated caller cannot tell a live identifier from a guess. A row with no stored token hash
-  (a pre-auth leftover) answers the same way. The relay hashes a presented token either way, so the
+  (a pre-auth leftover) answers the same way. The relay hashes a presented token and compares it in
+  constant time either way (against a same-length stand-in when there is no stored hash), so the
   work does not depend on whether the row exists.
   Account existence is outside this rule. Account ids are self-certifying, `GET /devices` answers for
   any id, and `pairing/complete` answers 403 "root not bound" before any credential. A route with no

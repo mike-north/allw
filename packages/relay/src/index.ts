@@ -29,6 +29,7 @@
  */
 
 import { AlarmMultiplexer } from "./alarms.js";
+import { matchesStoredHash, timingSafeEqual } from "./auth-token.js";
 import {
   MAX_CONTEXT_CIPHERTEXT_BYTES,
   MAX_CREATED_AT_SKEW_MS,
@@ -282,15 +283,6 @@ async function hashAuthToken(token: string): Promise<string> {
   return base64UrlEncode(new Uint8Array(digest));
 }
 
-function timingSafeEqual(a: string, b: string): boolean {
-  let diff = a.length ^ b.length;
-  const max = Math.max(a.length, b.length);
-  for (let i = 0; i < max; i++) {
-    diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
-  }
-  return diff === 0;
-}
-
 function bearerToken(request: Request): string | null {
   const auth = request.headers.get("Authorization") ?? "";
   const match = /^Bearer ([A-Za-z0-9_-]+)$/.exec(auth);
@@ -319,13 +311,13 @@ function coreUnavailable(err: unknown): Response {
 }
 
 /**
- * Whether `token` hashes to `storedHash`. A presented token is always hashed, even when there is no
- * stored hash to compare it with, so a missing row costs the same work as a mismatch (#357).
+ * Whether `token` hashes to `storedHash`. A presented token is always hashed and compared in
+ * constant time, even when there is no stored hash ({@link matchesStoredHash}), so a missing row
+ * costs the same work as a mismatch (#357).
  */
 async function tokenMatches(storedHash: string | null, token: string | null): Promise<boolean> {
   if (token === null) return false;
-  const presented = await hashAuthToken(token);
-  return storedHash !== null && timingSafeEqual(storedHash, presented);
+  return matchesStoredHash(storedHash, await hashAuthToken(token));
 }
 
 /**
@@ -955,7 +947,8 @@ export class AccountRelay implements DurableObject {
     if (token === null) return authError(401);
     // A missing hash is a legacy/migration row, not proof of authorization. Fail closed and require
     // re-pairing or re-submission so no endpoint silently falls back to unauthenticated access.
-    // `tokenMatches` still hashes the presented token, so the work matches a real comparison.
+    // `tokenMatches` still hashes and compares the presented token, so the work matches a real
+    // comparison.
     return (await tokenMatches(storedHash ?? null, token)) ? null : authError(403);
   }
 
