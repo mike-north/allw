@@ -58,8 +58,8 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   from an allowed origin get **204** with `Access-Control-Allow-Methods: GET, POST`,
   `Access-Control-Allow-Headers: Authorization, Content-Type` and `Access-Control-Max-Age: 600`.
   Responses to an allowed origin echo it in `Access-Control-Allow-Origin`. A disallowed origin,
-  method or header gets a **403** preflight with no CORS headers. Every response carries
-  `Vary: Origin`. There is no credentials mode (`Access-Control-Allow-Credentials` is never sent):
+  method or header gets a **403** preflight with no CORS headers. Every response except a WebSocket
+  upgrade (101, returned untouched) carries `Vary: Origin`, including a 500 when a handler fails. There is no credentials mode (`Access-Control-Allow-Credentials` is never sent):
   auth is the bearer header, never a cookie. CORS does not apply to WebSocket upgrades, and the relay
   does not check `Origin` there, since the socket authenticates with `?auth=`. Non-browser clients
   send no `Origin` and are unaffected.
