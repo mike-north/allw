@@ -22,7 +22,7 @@
  * - deny → a non-approved decision, exit 1 (fail-closed);
  * - timeout → `expired`, exit 1 (fail-closed);
  * - the human-shown action is exactly the core's `action_from_argv` record for the script's argv
- *   (WYSIWYS), with the documented `commandRequest` defaults (`actor`, `reversible`, `risk`);
+ *   (WYSIWYS), with the documented `commandRequest` defaults (`cwd`, `actor`, `reversible`, `risk`);
  * - a malformed argv (missing argument) rejects before anything is submitted.
  *
  * @see ../../../docs/contract.md §Invariants (fail-closed; never returns "allow"; WYSIWYS)
@@ -33,7 +33,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { createServer } from "node:http";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
@@ -146,10 +146,14 @@ test("approve: the script's command is shown exactly and the script proceeds", a
   assert.equal(h.log[0].decision, "approved");
   const context = h.log[0].context;
   // WYSIWYS: the decrypted, human-shown action is exactly the core's record for the script's argv.
+  // commandRequest binds the script's working directory by default (where execFile would run it).
   assert.deepEqual(
     context.action,
-    JSON.parse(h.wasm.action_from_argv(JSON.stringify(SCRIPT_ARGV), null, null)),
+    JSON.parse(
+      h.wasm.action_from_argv(JSON.stringify(SCRIPT_ARGV), null, realpathSync(packageRoot)),
+    ),
   );
+  assert.equal(context.action.syntactic.cwd, realpathSync(packageRoot));
   assert.equal(context.action.surface, "command", "no new surface: a script action is a command");
   assert.equal(context.summary, `Refund charge ${CHARGE_ID}`);
   // commandRequest defaults (#231): script actor on this machine, irreversible, core-derived risk.

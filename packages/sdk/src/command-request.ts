@@ -37,11 +37,12 @@ import { loadWasm } from "./wasm.js";
  * - `argv_not_array` — `argv` was not an array.
  * - `argv_empty` — `argv` had no elements (there is no program to show the human).
  * - `argv_element_not_string` — an `argv` element was not a string.
- * - `argv_program_empty` — `argv[0]` (the program) was the empty string.
+ * - `argv_program_empty` — the program (`argv[0]`, or a command line's first word) was empty.
  * - `command_line_not_string` — `commandLine` was not a string.
  * - `command_line_unparseable` — the core could not tokenize `commandLine` (e.g. an unmatched quote).
  * - `command_line_empty` — `commandLine` tokenized to no command at all (blank or whitespace).
- * - `invalid_option` — an option (`cwd`, `raw`, `summary`, …) had the wrong type or was blank.
+ * - `invalid_option` — an option (`cwd`, `raw`, `summary`, `actor`, `timeoutMs`, …) had the wrong
+ *   type or was blank, or `raw` was passed to {@link commandRequest}.
  * - `ambiguous_command` — {@link commandRequest} got both or neither of `argv` / `commandLine`.
  * - `core_record_invalid` — the core returned a record that is not a v1 `command` `ActionRecord`
  *   (defense in depth; the SDK refuses to forward a record it cannot faithfully represent).
@@ -79,13 +80,18 @@ export class CommandActionError extends Error {
 export interface CommandActionOptions {
   /**
    * The working directory the command will run in, bound into `syntactic.cwd` so the human sees
-   * where it runs. Omitted ⇒ the record is not bound to a directory.
+   * where it runs. Must be non-blank. Omitted ⇒ the record is not bound to a directory.
    */
   readonly cwd?: string;
   /**
-   * The original command text, if the caller has one. The core records it verbatim in
-   * `syntactic.raw` and extracts `env_refs` names from it; it is **never** re-tokenized, so the
-   * bound tokens are always exactly `argv`. Omitted ⇒ no `raw` and no `env_refs`.
+   * The original command text, for an upstream gate that already renders the command as text
+   * (e.g. an agent runtime's own display string). The core records it verbatim in `syntactic.raw`
+   * and extracts `env_refs` names from it; it is **never** re-tokenized, so the bound tokens are
+   * always exactly `argv`. Omitted ⇒ no `raw` and no `env_refs`.
+   *
+   * It **must be the exact text of `argv`**. Some approvers display `raw` in place of `argv`, so a
+   * `raw` that differs from `argv` shows the human a different command than the one the verdict
+   * binds. Leave it out unless you hold that exact text.
    */
   readonly raw?: string;
 }
@@ -100,10 +106,17 @@ export interface CommandActionFromLineOptions {
 interface CommandRequestCommon {
   /** One-line, human-readable summary shown in the notification. Must be non-blank. */
   readonly summary: string;
-  /** The working directory the command will run in (see {@link CommandActionOptions.cwd}). */
-  readonly cwd?: string;
   /**
-   * The automation requesting approval.
+   * The working directory the command will run in, bound into `syntactic.cwd` so the human sees
+   * where it runs. Must be non-blank when given.
+   *
+   * @defaultValue `process.cwd()`, which is where `execFile` / `spawn` run the command unless told
+   * otherwise. **If you run the command somewhere else, pass that directory**, or the human is
+   * shown the wrong one. Pass `null` to leave the record unbound to any directory.
+   */
+  readonly cwd?: string | null;
+  /**
+   * The automation requesting approval. `id` and `kind` must be non-blank strings.
    *
    * @defaultValue `{ id: "machine:<os.hostname()>", kind: "script" }` — the local machine, as a
    * script. (The agent hooks use their own `kind`, e.g. `"claude-code"`.)
@@ -116,7 +129,9 @@ interface CommandRequestCommon {
    * unless the caller says otherwise.
    */
   readonly reversible?: boolean;
-  /** Fail-closed deadline (ms from now); see {@link ApprovalRequest.timeoutMs}. */
+  /**
+   * Fail-closed deadline (ms from now, a positive integer); see {@link ApprovalRequest.timeoutMs}.
+   */
   readonly timeoutMs?: number;
   /** Integrator-initiated cancellation; see {@link ApprovalRequest.signal}. */
   readonly signal?: AbortSignal;
@@ -130,20 +145,24 @@ interface CommandRequestCommon {
  * Input to {@link commandRequest}: exactly one of `argv` (a pre-tokenized argument vector — the
  * tokens that will actually run) or `commandLine` (shell-style text the core tokenizes).
  *
- * Prefer `argv` when the script holds the exact token vector it will execute: re-tokenizing text
- * could bind different tokens than the ones that run (`docs/openclaw-integration.md` §5.1).
+ * Prefer `argv`, and run exactly that `argv` with `execFile` / `spawn`: re-tokenizing text could
+ * bind different tokens than the ones that run (`docs/openclaw-integration.md` §5.1). There is no
+ * `raw` here; a pre-rendered display string belongs only on {@link commandAction}.
  */
 export type CommandRequestInput = CommandRequestCommon &
   (
     | {
         /** The exact argument vector that will run (`argv[0]` is the program). */
         readonly argv: readonly string[];
-        /** Original command text, recorded verbatim (see {@link CommandActionOptions.raw}). */
-        readonly raw?: string;
         readonly commandLine?: never;
+        readonly raw?: never;
       }
     | {
-        /** A shell-style command line; the core tokenizes it (quotes respected, no expansion). */
+        /**
+         * A shell-style command line, split into words by the core. Operators, substitutions and
+         * newlines are not parsed and the record describes only the first program, so never run
+         * the line through a shell (see {@link commandActionFromLine}).
+         */
         readonly commandLine: string;
         readonly argv?: never;
         readonly raw?: never;
@@ -163,7 +182,7 @@ export async function commandAction(
   options: CommandActionOptions = {},
 ): Promise<ActionRecord> {
   const tokens = validateArgv(argv);
-  const cwd = optionalString(options.cwd, "cwd");
+  const cwd = optionalCwd(options.cwd);
   const raw = optionalString(options.raw, "raw");
   const wasm = await loadWasm();
   // The core only fails here on a non-string-array argv, which `validateArgv` already ruled out;
@@ -178,11 +197,18 @@ export async function commandAction(
 
 /**
  * Build a `command` {@link ActionRecord} from a shell-style command line, using the core's
- * `action_from_command` (which tokenizes it; quotes are respected and nothing is expanded). The
- * result is exactly the core's record (top-level keys camelCased, `syntactic` passed through).
+ * `action_from_command`. The result is exactly the core's record (top-level keys camelCased,
+ * `syntactic` passed through).
+ *
+ * The core only splits the line into words (quotes and backslash escapes respected, nothing
+ * expanded). Shell operators (`&&`, `||`, `;`, `|`, `&`, redirections), substitutions (`$(…)`,
+ * backticks) and newlines are **not** parsed: they become ordinary words, and the record describes
+ * only the first program, so `ls && rm -rf /` is recorded as `ls`. **Never run the line through a
+ * shell** (`sh -c`, `execSync(line)`): the shell would run more than the human approved. Build
+ * `argv` and run it with `execFile` / `spawn` (no shell) instead.
  *
  * @throws {@link CommandActionError} (as a rejection) if `commandLine` is not a string, cannot be
- * tokenized (e.g. an unmatched quote), or contains no command.
+ * tokenized (e.g. an unmatched quote), contains no command, or its program is the empty string.
  */
 export async function commandActionFromLine(
   commandLine: string,
@@ -194,7 +220,7 @@ export async function commandActionFromLine(
       `commandLine must be a string (got ${describe(commandLine)})`,
     );
   }
-  const cwd = optionalString(options.cwd, "cwd");
+  const cwd = optionalCwd(options.cwd);
   const wasm = await loadWasm();
   const json = callCore(
     () => wasm.action_from_command(commandLine, cwd ?? null),
@@ -209,6 +235,13 @@ export async function commandActionFromLine(
   if (!Array.isArray(syntacticArgv) || syntacticArgv.length === 0) {
     throw new CommandActionError("command_line_empty", "commandLine contains no command");
   }
+  // `''` or `'' rm …` tokenizes to an empty first word: there is no program to show the human.
+  if (syntacticArgv[0] === "") {
+    throw new CommandActionError(
+      "argv_program_empty",
+      "commandLine's first word (the program) must be non-empty",
+    );
+  }
   return action;
 }
 
@@ -219,6 +252,8 @@ export async function commandActionFromLine(
  * Defaults (each overridable):
  * - `action` — built by the core from `argv` ({@link commandAction}) or `commandLine`
  *   ({@link commandActionFromLine}).
+ * - `cwd` — `process.cwd()`. Pass the directory you will run the command in if it differs, or
+ *   `null` to leave the record unbound.
  * - `risk` — **taken from the core-built `action.risk`**, so the caller never states it twice and
  *   cannot contradict the core's classification. (Not overridable.)
  * - `actor` — `{ id: "machine:<os.hostname()>", kind: "script" }`.
@@ -232,7 +267,8 @@ export async function commandActionFromLine(
  *
  * @throws {@link CommandActionError} (as a rejection) if both or neither of `argv` / `commandLine`
  * is given, the command input is malformed (see {@link commandAction} /
- * {@link commandActionFromLine}), `summary` is blank, or an option has the wrong type.
+ * {@link commandActionFromLine}), `summary` is blank, `raw` is given, or an option has the wrong
+ * type or is blank (`cwd`, `actor`, `timeoutMs`, `reversible`).
  */
 export async function commandRequest(input: CommandRequestInput): Promise<ApprovalRequest> {
   const hasArgv = input.argv !== undefined;
@@ -255,20 +291,34 @@ export async function commandRequest(input: CommandRequestInput): Promise<Approv
       `reversible must be a boolean (got ${describe(input.reversible)})`,
     );
   }
+  // `raw` is a commandAction-only display string (it must be argv's exact text); refuse it here
+  // rather than silently dropping or forwarding something the human might be shown instead.
+  if ((input as { raw?: unknown }).raw !== undefined) {
+    throw new CommandActionError(
+      "invalid_option",
+      "commandRequest does not take `raw`; pass `argv` (or use commandAction for a display string)",
+    );
+  }
+  const actor = input.actor === undefined ? defaultActor() : validateActor(input.actor);
+  if (input.timeoutMs !== undefined && !isPositiveInteger(input.timeoutMs)) {
+    throw new CommandActionError(
+      "invalid_option",
+      `timeoutMs must be a positive integer (got ${describe(input.timeoutMs)})`,
+    );
+  }
 
-  const cwdOption = input.cwd !== undefined ? { cwd: input.cwd } : {};
+  // `undefined` ⇒ where execFile/spawn run by default; `null` ⇒ explicitly unbound.
+  const cwd = input.cwd === undefined ? process.cwd() : input.cwd;
+  const cwdOption = cwd === null ? {} : { cwd };
   const action =
     input.argv !== undefined
-      ? await commandAction(input.argv, {
-          ...cwdOption,
-          ...(input.raw !== undefined ? { raw: input.raw } : {}),
-        })
+      ? await commandAction(input.argv, cwdOption)
       : await commandActionFromLine(input.commandLine, cwdOption);
 
   return {
     action,
     summary: input.summary,
-    actor: input.actor ?? defaultActor(),
+    actor,
     risk: action.risk,
     reversible: input.reversible ?? false,
     // Optional fields are spread only when present so absent values omit the key
@@ -319,6 +369,47 @@ function validateArgv(argv: unknown): string[] {
     );
   }
   return tokens;
+}
+
+/** Validate an optional `cwd`: a non-blank string, or `undefined`. */
+function optionalCwd(value: unknown): string | undefined {
+  const cwd = optionalString(value, "cwd");
+  if (cwd?.trim() === "") {
+    throw new CommandActionError("invalid_option", "cwd must be a non-blank string");
+  }
+  return cwd;
+}
+
+/** Validate a caller-supplied actor: a plain object with non-blank string `id` and `kind`. */
+function validateActor(value: unknown): Actor {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new CommandActionError(
+      "invalid_option",
+      `actor must be an object with id and kind (got ${describe(value)})`,
+    );
+  }
+  const actor = value as Record<string, unknown>;
+  for (const field of ["id", "kind"] as const) {
+    const v = actor[field];
+    if (typeof v !== "string" || v.trim() === "") {
+      throw new CommandActionError(
+        "invalid_option",
+        `actor.${field} must be a non-blank string (got ${describe(v)})`,
+      );
+    }
+  }
+  if (actor.attestation !== undefined && typeof actor.attestation !== "string") {
+    throw new CommandActionError(
+      "invalid_option",
+      `actor.attestation must be a string (got ${describe(actor.attestation)})`,
+    );
+  }
+  return value as Actor;
+}
+
+/** Is `value` a positive safe integer? */
+function isPositiveInteger(value: unknown): boolean {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
 /** Validate an optional string option, returning it (or `undefined`). */

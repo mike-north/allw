@@ -113,10 +113,12 @@ test("commandRequest fills the documented defaults around the core-built action"
   const core = await loadCore();
   const req = await commandRequest({ argv: REFUND_ARGV, summary: "Refund charge ch_123" });
 
+  // #231 review: cwd defaults to process.cwd() (where execFile/spawn run by default).
   assert.deepEqual(
     req.action,
-    camel(core.action_from_argv(JSON.stringify(REFUND_ARGV), null, null)),
+    camel(core.action_from_argv(JSON.stringify(REFUND_ARGV), null, process.cwd())),
   );
+  assert.equal(req.action.syntactic.cwd, process.cwd());
   assert.equal(req.summary, "Refund charge ch_123");
   // #231: top-level risk is taken from the core-built action, never stated twice.
   assert.equal(req.risk, req.action.risk);
@@ -136,7 +138,6 @@ test("commandRequest honors overrides and passes optional fields through", async
   const constraints = { allowedDecisions: ["approved", "denied"], challengeRequired: true };
   const req = await commandRequest({
     argv: REFUND_ARGV,
-    raw: "stripe refunds create --charge ch_123",
     cwd: CWD,
     summary: "Refund",
     actor,
@@ -153,7 +154,17 @@ test("commandRequest honors overrides and passes optional fields through", async
   assert.deepEqual(req.constraints, constraints);
   assert.deepEqual(req.chain, ["gate-1"]);
   assert.equal(req.action.syntactic.cwd, CWD);
-  assert.equal(req.action.syntactic.raw, "stripe refunds create --charge ch_123");
+  assert.equal("raw" in req.action.syntactic, false, "commandRequest never sets raw on argv");
+});
+
+test("commandRequest with cwd: null leaves the record unbound to any directory", async () => {
+  const core = await loadCore();
+  const req = await commandRequest({ argv: REFUND_ARGV, summary: "Refund", cwd: null });
+  assert.deepEqual(
+    req.action,
+    camel(core.action_from_argv(JSON.stringify(REFUND_ARGV), null, null)),
+  );
+  assert.equal("cwd" in req.action.syntactic, false);
 });
 
 test("commandRequest accepts a commandLine and builds it with action_from_command", async () => {
@@ -236,6 +247,31 @@ test("rejects a blank command line (no command to show the human)", async () => 
   await rejectsWith(commandActionFromLine("   "), "command_line_empty", /no command/);
 });
 
+test("rejects a command line whose program is the empty string", async () => {
+  await rejectsWith(commandActionFromLine("''"), "argv_program_empty", /program/);
+  await rejectsWith(commandActionFromLine("'' rm -rf /"), "argv_program_empty", /program/);
+  await rejectsWith(
+    commandRequest({ commandLine: "'' rm -rf /", summary: "s" }),
+    "argv_program_empty",
+    /program/,
+  );
+});
+
+test("rejects a blank cwd", async () => {
+  await rejectsWith(
+    commandAction(["ls"], { cwd: "" }),
+    "invalid_option",
+    /cwd must be a non-blank string/,
+  );
+  await rejectsWith(commandAction(["ls"], { cwd: "  " }), "invalid_option", /non-blank/);
+  await rejectsWith(commandActionFromLine("ls", { cwd: "" }), "invalid_option", /non-blank/);
+  await rejectsWith(
+    commandRequest({ argv: ["ls"], summary: "s", cwd: "" }),
+    "invalid_option",
+    /non-blank/,
+  );
+});
+
 test("rejects a non-string cwd and a non-string raw", async () => {
   await rejectsWith(commandAction(["ls"], { cwd: 7 }), "invalid_option", /cwd must be a string/);
   await rejectsWith(commandAction(["ls"], { raw: {} }), "invalid_option", /raw must be a string/);
@@ -258,6 +294,46 @@ test("commandRequest rejects both argv and commandLine, and neither", async () =
 test("commandRequest rejects a blank or missing summary", async () => {
   await rejectsWith(commandRequest({ argv: ["ls"], summary: "  " }), "invalid_option", /summary/);
   await rejectsWith(commandRequest({ argv: ["ls"] }), "invalid_option", /summary/);
+});
+
+test("commandRequest rejects raw on either form (raw belongs only on commandAction)", async () => {
+  await rejectsWith(
+    commandRequest({ argv: ["rm", "-rf", "/"], raw: "ls", summary: "s" }),
+    "invalid_option",
+    /does not take `raw`/,
+  );
+  await rejectsWith(
+    commandRequest({ commandLine: "ls", raw: "something", summary: "s" }),
+    "invalid_option",
+    /does not take `raw`/,
+  );
+});
+
+test("commandRequest rejects a malformed actor", async () => {
+  for (const [actor, pattern] of [
+    ["evil", /actor must be an object/],
+    [null, /actor must be an object/],
+    [["x"], /actor must be an object/],
+    [{ id: "", kind: "script" }, /actor\.id must be a non-blank string/],
+    [{ id: "m:1" }, /actor\.kind must be a non-blank string \(got undefined\)/],
+    [{ id: "m:1", kind: "script", attestation: 5 }, /actor\.attestation must be a string/],
+  ]) {
+    await rejectsWith(
+      commandRequest({ argv: ["ls"], summary: "s", actor }),
+      "invalid_option",
+      pattern,
+    );
+  }
+});
+
+test("commandRequest rejects a non-positive or non-integer timeoutMs", async () => {
+  for (const timeoutMs of [Number.NaN, 0, -1000, 1.5, "100", Number.POSITIVE_INFINITY]) {
+    await rejectsWith(
+      commandRequest({ argv: ["ls"], summary: "s", timeoutMs }),
+      "invalid_option",
+      /timeoutMs must be a positive integer/,
+    );
+  }
 });
 
 test("commandRequest rejects a non-boolean reversible", async () => {

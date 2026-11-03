@@ -36,22 +36,31 @@ if (verdict.decision !== "approved") process.exit(1); // fail-closed: only a ver
 
 `commandRequest({ argv | commandLine, summary, ... })` fills in the request like this:
 
-| Field        | Value                                                                                   |
-| ------------ | --------------------------------------------------------------------------------------- |
-| `action`     | Built by the core from `argv` (exact tokens) or `commandLine` (tokenized by the core).  |
-| `risk`       | Taken from the core-built `action.risk`. You never state it twice.                      |
-| `actor`      | Default `{ id: "machine:<os.hostname()>", kind: "script" }`.                            |
-| `reversible` | Default `false`. The human is told the action can't be undone unless you say otherwise. |
-| `cwd`, `raw` | Optional. Bound into `action.syntactic` so the human sees them.                         |
-| others       | `timeoutMs`, `signal`, `constraints` and `chain` are passed through when given.         |
+| Field        | Value                                                                                                                                        |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `action`     | Built by the core from `argv` (exact tokens) or `commandLine` (tokenized by the core).                                                       |
+| `risk`       | Taken from the core-built `action.risk`. You never state it twice.                                                                           |
+| `actor`      | Default `{ id: "machine:<os.hostname()>", kind: "script" }`.                                                                                 |
+| `reversible` | Default `false`. The human is told the action can't be undone unless you say otherwise.                                                      |
+| `cwd`        | Default `process.cwd()`, where `execFile` / `spawn` run the command. If you run it elsewhere, pass that directory. `null` leaves it unbound. |
+| others       | `timeoutMs`, `signal`, `constraints` and `chain` are passed through when given.                                                              |
 
-Pass `argv` when you hold the exact tokens that will run. Re-tokenizing text could bind different
-tokens than the ones that execute.
+Prefer `argv`, and run exactly that `argv` with `execFile` or `spawn` (no shell). Re-tokenizing text
+could bind different tokens than the ones that execute.
+
+`commandLine` is only split into words. Shell operators (`&&`, `;`, `|`, redirections), substitutions
+(`$(…)`, backticks) and newlines are not parsed, and the record describes only the first program:
+`ls && rm -rf /` is recorded as `ls`. **Never run a `commandLine` through a shell** (`sh -c`,
+`execSync`), because the shell would run more than the human approved.
 
 For just the `ActionRecord`, use `commandAction(argv, { cwd?, raw? })` or
-`commandActionFromLine(line, { cwd? })`. Both return exactly the record the core builds. The SDK does
-no tokenizing or risk classification of its own.
+`commandActionFromLine(line, { cwd? })`. Both return exactly the record the core builds, and neither
+binds a `cwd` unless you pass one. The SDK does no tokenizing or risk classification of its own.
+`raw` is for an upstream gate that already holds the command's display text. It must be the exact text
+of `argv`, because some approvers show `raw` in place of `argv`. `commandRequest` does not take it.
 
 All three reject with a `CommandActionError` (with a machine-readable `reason`) when the input is
 malformed, so nothing is submitted. That covers an empty `argv`, a non-string element, a blank or
-unparseable command line (for example an unmatched quote), or a blank `summary`.
+unparseable command line (for example an unmatched quote), an empty program, a blank `summary` or
+`cwd`, a malformed `actor`, a non-positive or non-integer `timeoutMs`, or `raw` passed to
+`commandRequest`.

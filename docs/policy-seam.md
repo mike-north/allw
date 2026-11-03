@@ -127,8 +127,11 @@ ActionRecord {
 separate "generic" or "script" surface (decided 2026-11-02, #231). What differs is the `actor`, not the
 surface. Integrators build the record with `@allw/sdk`'s `commandAction` / `commandActionFromLine`, which
 return the core's `action_from_argv` / `action_from_command` record unchanged. `commandRequest` wraps that
-record into a full request with `actor: { id: "machine:<hostname>", kind: "script" }` and `reversible: false`
-by default, and takes the top-level `risk` from the record's.
+record into a full request. By default it sets `actor: { id: "machine:<hostname>", kind: "script" }`,
+`reversible: false` and `cwd: process.cwd()` (an explicit `cwd: null` leaves the record unbound). It copies the
+record's `risk` into the request's top-level `risk`, which the caller cannot override. A command line is only split
+into words: shell operators, substitutions and newlines are not parsed and the record describes only the first
+program, so callers must run `argv` without a shell.
 
 ### Forward-compat requirements on `allw-core` v1 (cheap now, painful later)
 
