@@ -147,12 +147,15 @@ fn has_compound_construct(raw: &str, argv: &[String]) -> bool {
 /// Whether `raw` contains a [`NESTED_EXECUTION_COMMANDS`] word, as written or with every quote
 /// character deleted. PowerShell removes quotes from a bareword command name, so `i''ex` runs `iex`.
 /// Both spellings are checked, because deleting quotes can also join a word to its neighbour
-/// (`x'iex` → `xiex`). Only the check reads the de-quoted copy; `raw` and argv keep the quotes.
+/// (`x'iex` → `xiex`). Only the check reads the de-quoted copy; `raw` and argv keep the quotes. A
+/// line with no quote character is its own de-quoted copy, so it is checked once.
 fn has_nested_execution_command(raw: &str) -> bool {
-    let dequoted = without_quotes(raw);
-    NESTED_EXECUTION_COMMANDS
-        .iter()
-        .any(|name| contains_command_word(raw, name) || contains_command_word(&dequoted, name))
+    let matches = |line: &str| {
+        NESTED_EXECUTION_COMMANDS
+            .iter()
+            .any(|name| contains_command_word(line, name))
+    };
+    matches(raw) || (raw.contains(QUOTE_CHARS) && matches(&without_quotes(raw)))
 }
 
 /// Whether the command word names a PowerShell executable: its last path segment, with every quote
