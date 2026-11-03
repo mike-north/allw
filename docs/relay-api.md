@@ -86,6 +86,14 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   (see `docs/relay-deploy.md` §3d). Over a limit ⇒ **429**; binding missing or failing ⇒ **503**.
 - **Pairing body cap.** `POST /pairing/start` and `POST /pairing/complete` bodies above
   `MAX_PAIRING_BODY_BYTES` (16 KiB) are refused with **413** before parsing.
+- **Exact paths.** An account route answers only on its exact path, compared segment by segment as the URL
+  parser yields them (percent-encoding preserved, `.` and `..` segments resolved): the same number of segments, every literal equal, and every `{param}` non-empty
+  (#302). Anything else is **404** `{ "error": "not found" }`, whatever the method: an extra segment
+  (`…/revoke/extra`), a trailing slash (`/devices/`), an empty segment (`/devices//revoke`) or a missing
+  one. A path that is exactly a route's, reached with a method the route doesn't serve, is **405**
+  `{ "error": "method not allowed" }`. Dropping or adding a segment can still land exactly on _another_
+  route: `/requests/r1` is `GET /requests/{request_id}`, and `/requests/extra` is the same route with
+  `request_id = extra`. The route table is `packages/relay/src/routes.ts`.
 
 ---
 
