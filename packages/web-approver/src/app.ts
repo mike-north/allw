@@ -273,13 +273,42 @@ function confirmRelayRepair(
   });
 }
 
-/** The core display escape from `env`, or `null` when it is not provided or fails to load. */
+/**
+ * How long boot waits for the core's display escape before it shows untrusted text withheld
+ * (#308): the re-pair screen's stored pin (#286) and the ignored-relay notice's link (#307).
+ *
+ * The core is a ~1 MB WASM fetch. Without a bound, a stalled fetch (a slow or captive network)
+ * left the re-pair screen blank with no explanation. Five seconds is long enough for a normal
+ * connection and short enough that a human isn't left looking at an empty page. Missing it only
+ * withholds that text: the re-pair confirm and the notice are shown either way, and a core that
+ * arrives later still serves the inbox (`initWasm` is memoized) without changing what was shown.
+ */
+export const DISPLAY_ESCAPE_LOAD_TIMEOUT_MS = 5_000;
+
+/**
+ * The core display escape from `env`, or `null` when it is not provided, fails to load, or does
+ * not load within {@link DISPLAY_ESCAPE_LOAD_TIMEOUT_MS}. Never rejects.
+ */
 async function loadDisplayEscape(env: BootEnvironment): Promise<DisplayEscape | null> {
-  if (env.loadDisplayEscape === undefined) return null;
+  const load = env.loadDisplayEscape;
+  if (load === undefined) return null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<null>((resolve) => {
+    timer = setTimeout(() => {
+      resolve(null);
+    }, DISPLAY_ESCAPE_LOAD_TIMEOUT_MS);
+  });
+  const loaded = (async () => {
+    try {
+      return await load();
+    } catch {
+      return null;
+    }
+  })();
   try {
-    return await env.loadDisplayEscape();
-  } catch {
-    return null;
+    return await Promise.race([loaded, deadline]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 

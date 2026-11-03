@@ -116,8 +116,8 @@ WebSocket, account-state resolution — goes to that pinned relay.
     (#307). It shows the link's origin, or for a value that isn't a URL, its first 120 characters.
     Bidi overrides, zero-width and control characters appear as visible escapes such as `⟨U+202E⟩`.
   - The notice appears at once. The name reads "(checking…)" until the core has loaded. If the core
-    can't load, the name is withheld ("(hidden: the approver core did not load)"), and the notice
-    still says a link was ignored.
+    can't load within 5 seconds (`DISPLAY_ESCAPE_LOAD_TIMEOUT_MS`, #308), the name is withheld
+    ("(hidden: the approver core did not load)"), and the notice still says a link was ignored.
   - The pinned relay in the notice is printed as is: `checkRelayUrl` accepts it only in canonical
     form, and its origin is ASCII (punycode for an internationalized host).
 - **To change relays**, pair the browser again. "Use another device" on the returning-device screen
@@ -132,8 +132,10 @@ WebSocket, account-state resolution — goes to that pinned relay.
   any relay is resolved or asked for, a screen shows the pinned relay and says why it is rejected.
   The pin is untrusted stored text, so the screen loads the approver core first (the same WASM the
   inbox reuses) and shows the pin only as the core's `escape_for_display` renders it (an empty pin
-  as `(empty)`). If the core does not load, the pin is withheld as
-  `(hidden: the approver core did not load)`, and the screen still offers the choice below. The stored identity is cleared only when the human chooses **Forget this pairing and
+  as `(empty)`). If the core does not load, or hasn't loaded within 5 seconds
+  (`DISPLAY_ESCAPE_LOAD_TIMEOUT_MS`, #308; the core is about 1 MB), the pin is withheld as
+  `(hidden: the approver core did not load)`, and the screen still offers the choice below. A core
+  that arrives later doesn't change the screen. The stored identity is cleared only when the human chooses **Forget this pairing and
   pair again**, and only if it is still the identity the screen showed: a newer identity saved
   since, for example by another tab, is kept, and the browser routes to it instead. Closing the
   page leaves it in storage. After the confirmation the browser pairs again, but on that re-pair

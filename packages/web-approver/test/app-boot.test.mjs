@@ -28,11 +28,11 @@
 
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
-import test, { afterEach, beforeEach, describe } from "node:test";
+import test, { afterEach, beforeEach, describe, mock } from "node:test";
 
 import { JSDOM } from "jsdom";
 
-import { boot, bootInbox } from "../dist/app.js";
+import { DISPLAY_ESCAPE_LOAD_TIMEOUT_MS, boot, bootInbox } from "../dist/app.js";
 import {
   INSECURE_RELAY_URL_REASON,
   PENDING_IGNORED_RELAY_TEXT,
@@ -354,6 +354,28 @@ describe("boot — paired device with a ?relay= link to another origin (#249)", 
     }
   });
 
+  test("when the core load stalls, the link is withheld at the deadline (#308)", async () => {
+    mock.timers.enable({ apis: ["setTimeout"] });
+    try {
+      const storage = memoryStorage();
+      storage.setItem(PAIRING_KEY, JSON.stringify(PINNED_IDENTITY));
+      storage.setItem(RELAY_URL_STORAGE_KEY, PINNED_RELAY);
+      const { noticeHost } = await bootWith({
+        search: relayQuery("evil\u202Etxt.exe"),
+        storage,
+        loadDisplayEscape: () => new Promise(() => undefined),
+      });
+      const name = () => noticeHost.querySelector(".relay-pin-notice-origin").textContent;
+      assert.equal(name(), PENDING_IGNORED_RELAY_TEXT, "the notice is shown while the core loads");
+      mock.timers.tick(DISPLAY_ESCAPE_LOAD_TIMEOUT_MS);
+      for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(name(), WITHHELD_UNTRUSTED_TEXT);
+      assert.ok(!noticeHost.innerHTML.includes("evil"));
+    } finally {
+      mock.timers.reset();
+    }
+  });
+
   test("when the core fails to load, the link is withheld and the notice still appears (#307)", async () => {
     const storage = memoryStorage();
     storage.setItem(PAIRING_KEY, JSON.stringify(PINNED_IDENTITY));
@@ -641,6 +663,115 @@ describe("boot — stored identity pinned to a relay this build rejects (#286)",
     assert.equal(root.querySelector(".pairing-relay-url").textContent, LOOPBACK_CANDIDATE);
     assert.equal(inboxStarts.length, 0);
     assert.deepEqual(networkAttempts, []);
+  });
+
+  /**
+   * #308: the core load before the re-pair screen is bounded. These control `setTimeout` (only), so
+   * the deadline passes exactly when the test ticks it; `setImmediate` still drains the boot's
+   * promise chain.
+   */
+  describe("a core load that stalls (#308)", () => {
+    const HOSTILE_PIN = "http://evil\u202Eexample.com";
+
+    /** Let every pending promise callback run. */
+    async function settle() {
+      for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
+    }
+
+    beforeEach(() => {
+      mock.timers.enable({ apis: ["setTimeout"] });
+    });
+
+    afterEach(() => {
+      mock.timers.reset();
+    });
+
+    test("the re-pair screen appears at the deadline with the pin withheld, and the confirm re-pairs", async () => {
+      const storage = memoryStorage();
+      storage.setItem(ONBOARDING_KEY, "1");
+      storage.setItem(PAIRING_KEY, JSON.stringify({ ...PINNED_IDENTITY, relayUrl: HOSTILE_PIN }));
+      storage.setItem(RELAY_URL_STORAGE_KEY, LOOPBACK_CANDIDATE);
+
+      const bootPromise = bootWith({
+        search: "",
+        storage,
+        loadDisplayEscape: () => new Promise(() => undefined),
+      });
+      const root = dom.window.document.getElementById("app");
+      await settle();
+      mock.timers.tick(DISPLAY_ESCAPE_LOAD_TIMEOUT_MS - 1);
+      await settle();
+      assert.equal(
+        root.querySelector(".pairing-kicker"),
+        null,
+        "still waiting before the deadline",
+      );
+
+      mock.timers.tick(1);
+      await settle();
+      assert.equal(root.querySelector(".pairing-kicker").textContent, "Re-pair required");
+      assert.equal(root.querySelector(".pairing-relay-url").textContent, WITHHELD_PIN_TEXT);
+      assert.ok(!root.textContent.includes("evil"), "no part of the pin is printed");
+
+      click(root, confirmLabel);
+      const { inboxStarts } = await bootPromise;
+      assert.equal(storage.getItem(PAIRING_KEY), null, "cleared on confirmation");
+      assert.ok(root.querySelector("form.pairing-form"), "then the browser pairs again");
+      assert.equal(inboxStarts.length, 0);
+      assert.deepEqual(networkAttempts, []);
+    });
+
+    test("a core that arrives after the deadline changes nothing on screen", async () => {
+      const storage = memoryStorage();
+      storage.setItem(ONBOARDING_KEY, "1");
+      storage.setItem(PAIRING_KEY, JSON.stringify({ ...PINNED_IDENTITY, relayUrl: HOSTILE_PIN }));
+      storage.setItem(RELAY_URL_STORAGE_KEY, LOOPBACK_CANDIDATE);
+      let arrive;
+      const late = new Promise((resolve) => {
+        arrive = resolve;
+      });
+
+      void bootWith({ search: "", storage, loadDisplayEscape: () => late });
+      const root = dom.window.document.getElementById("app");
+      await settle();
+      mock.timers.tick(DISPLAY_ESCAPE_LOAD_TIMEOUT_MS);
+      await settle();
+      const shown = root.innerHTML;
+      assert.equal(root.querySelector(".pairing-relay-url").textContent, WITHHELD_PIN_TEXT);
+
+      arrive(await loadCoreDisplayEscape());
+      await settle();
+      assert.equal(root.innerHTML, shown, "the late core does not re-render the screen");
+      assert.deepEqual(networkAttempts, []);
+    });
+
+    test("a core that arrives before the deadline is used", async () => {
+      const storage = memoryStorage();
+      storage.setItem(ONBOARDING_KEY, "1");
+      storage.setItem(PAIRING_KEY, JSON.stringify({ ...PINNED_IDENTITY, relayUrl: HOSTILE_PIN }));
+      storage.setItem(RELAY_URL_STORAGE_KEY, LOOPBACK_CANDIDATE);
+      const escape = await loadCoreDisplayEscape();
+      let arrive;
+
+      void bootWith({
+        search: "",
+        storage,
+        loadDisplayEscape: () =>
+          new Promise((resolve) => {
+            arrive = () => resolve(escape);
+          }),
+      });
+      const root = dom.window.document.getElementById("app");
+      await settle();
+      mock.timers.tick(DISPLAY_ESCAPE_LOAD_TIMEOUT_MS - 1);
+      arrive();
+      await settle();
+      // crates/allw-core/src/display.rs: a bidi control is shown as ⟨U+XXXX⟩.
+      assert.equal(
+        root.querySelector(".pairing-relay-url").textContent,
+        "http://evil⟨U+202E⟩example.com",
+      );
+    });
   });
 
   test("a corrupt identity keeps today's behaviour: boots unpaired and is cleared by the gate", async () => {
