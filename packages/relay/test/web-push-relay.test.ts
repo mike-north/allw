@@ -656,7 +656,7 @@ async function readAlarmSchedule(
  *
  * Time is not faked inside the Durable Object, so "the window ends" is modelled directly: every
  * owed trailing wakeup (and its alarm purpose) becomes due now. Unless `keepClaims` is set, the
- * coalescer also forgets its claims, which is its state once the window has passed.
+ * window has also passed for every claim ({@link letWindowPass}).
  */
 async function endWindowAndRunAlarm(
   accountId: string,
@@ -665,11 +665,34 @@ async function endWindowAndRunAlarm(
   await runInDurableObject(relayStub(accountId), async (instance: AccountRelay) => {
     const relay = instance as unknown as RelayInternals;
     makeTrailingWakeupsDue(relay);
-    if (options.keepClaims !== true) {
-      relay.webPushCoalescer = new WakeupCoalescer(WEB_PUSH_COALESCE_MS);
-    }
+    if (options.keepClaims !== true) letWindowPass(relay);
     await relay.alarm();
     await relay.pushFanOut;
+  });
+}
+
+/**
+ * Move every persisted claim, and every skipped submit, far into the past: the state once the
+ * window has passed. Claims live in SQLite (#319), so a fresh instance sees the same.
+ *
+ * The `last_skipped_at` rewrite matters because a covering wakeup clears an owed row only when
+ * `last_skipped_at < claimedAt`. In a fast test, a skip and the next claim can share a millisecond.
+ * Two tests depend on it:
+ * - "clears the owed wakeup when a later submit claims a fresh one after the window" needs the
+ *   clear to happen at all.
+ * - "keeps an earlier owed wakeup when another submit is skipped while the accepted wakeup is in
+ *   flight" needs the earlier skip to predate the claim, so only the in-flight skip keeps it owed.
+ */
+function letWindowPass(relay: RelayInternals): void {
+  relay.sql.exec(
+    `UPDATE device_push_token SET last_wakeup_at = 1 WHERE last_wakeup_at IS NOT NULL`,
+  );
+  relay.sql.exec(`UPDATE webpush_trailing_wakeup SET last_skipped_at = 1`);
+}
+
+async function letWindowPassFor(accountId: string): Promise<void> {
+  await runInDurableObject(relayStub(accountId), (instance: AccountRelay) => {
+    letWindowPass(instance as unknown as RelayInternals);
   });
 }
 
@@ -866,11 +889,7 @@ describe("submit — a coalesced submit gets a trailing wakeup when the window e
 
     // The window passes and a third submit is woken directly: that wakeup is sent after request 2
     // was stored, so it covers it and nothing more is owed.
-    await runInDurableObject(relayStub(acct), (instance: AccountRelay) => {
-      (instance as unknown as RelayInternals).webPushCoalescer = new WakeupCoalescer(
-        WEB_PUSH_COALESCE_MS,
-      );
-    });
+    await letWindowPassFor(acct);
     expect(await submitRequest(acct, envelope("req-trailing-superseded-3"))).toBe(1);
     await pushFanOutSettled(acct);
     expect(await readTrailingRows(acct)).toEqual([]);
@@ -893,6 +912,7 @@ describe("submit — a coalesced submit gets a trailing wakeup when the window e
       const fresh = new AccountRelay(state, env as unknown as Env) as unknown as RelayInternals;
       fresh.pushTransports = (instance as unknown as RelayInternals).pushTransports;
       makeTrailingWakeupsDue(fresh);
+      letWindowPass(fresh);
       await fresh.alarm();
       await fresh.pushFanOut;
     });
@@ -926,15 +946,6 @@ describe("submit — a coalesced submit gets a trailing wakeup when the window e
 });
 
 describe("submit — a wakeup's TTL covers every pending request, not just its own (#261)", () => {
-  /** The window has passed: the coalescer forgets its claims, so the next submit is woken directly. */
-  async function forgetCoalescerClaims(accountId: string): Promise<void> {
-    await runInDurableObject(relayStub(accountId), (instance: AccountRelay) => {
-      (instance as unknown as RelayInternals).webPushCoalescer = new WakeupCoalescer(
-        WEB_PUSH_COALESCE_MS,
-      );
-    });
-  }
-
   it("uses the latest pending deadline, and only pending requests count", async () => {
     // With an RFC 8030 Topic, a later wakeup replaces a queued earlier one along with its TTL, so a
     // short-lived request must not cut short the wakeup a long-lived pending one still needs.
@@ -944,7 +955,7 @@ describe("submit — a wakeup's TTL covers every pending request, not just its o
 
     await submitRequest(acct, envelope("req-ttl-long"));
     await pushFanOutSettled(acct);
-    await forgetCoalescerClaims(acct);
+    await letWindowPassFor(acct);
     await submitRequest(acct, {
       ...envelope("req-ttl-short-1"),
       expires_at: Date.now() + 90_000,
@@ -958,7 +969,7 @@ describe("submit — a wakeup's TTL covers every pending request, not just its o
         CREATED_AT,
       );
     });
-    await forgetCoalescerClaims(acct);
+    await letWindowPassFor(acct);
     await submitRequest(acct, {
       ...envelope("req-ttl-short-2"),
       expires_at: Date.now() + 90_000,
@@ -990,5 +1001,260 @@ describe("request table — the latest pending deadline is read through an index
     const details = plan.map((row) => row.detail).join(" | ");
     expect(details).toContain("request_pending_by_expiry");
     expect(details).not.toContain("USE TEMP B-TREE FOR ORDER BY");
+  });
+});
+
+describe("submit — the coalescing bound survives eviction (#319)", () => {
+  /** Submit through a brand-new `AccountRelay` on the same storage, as after an eviction. */
+  async function submitViaFreshInstance(
+    accountId: string,
+    body: Record<string, unknown>,
+  ): Promise<number> {
+    return runInDurableObject(relayStub(accountId), async (instance: AccountRelay, state) => {
+      const fresh = new AccountRelay(state, env as unknown as Env) as unknown as RelayInternals & {
+        fetch(request: Request): Promise<Response>;
+      };
+      fresh.pushTransports = (instance as unknown as RelayInternals).pushTransports;
+      const response = await fresh.fetch(
+        new Request(relayUrl(accountId, "/requests"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+      );
+      expect(response.status).toBe(202);
+      await fresh.pushFanOut;
+      return ((await response.json()) as { push_wakeups: number }).push_wakeups;
+    });
+  }
+
+  it("still coalesces a submit inside the window on a fresh instance, and owes it a trailing wakeup", async () => {
+    // Before #319 the last claim lived only in memory: a fresh instance claimed again at once.
+    const acct = testAccount("acct-webpush-claims-evicted");
+    await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
+    const fetcher = await installWebPush(acct, () => 201);
+
+    expect(await submitRequest(acct, envelope("req-claims-evicted-1"))).toBe(1);
+    await pushFanOutSettled(acct);
+    expect(await submitViaFreshInstance(acct, envelope("req-claims-evicted-2"))).toBe(0);
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(await readTrailingRows(acct)).toHaveLength(1);
+  });
+
+  it("lets a fresh instance claim once the window has passed", async () => {
+    const acct = testAccount("acct-webpush-claims-evicted-later");
+    await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
+    const fetcher = await installWebPush(acct, () => 201);
+
+    await submitRequest(acct, envelope("req-claims-later-1"));
+    await pushFanOutSettled(acct);
+    await letWindowPassFor(acct);
+    expect(await submitViaFreshInstance(acct, envelope("req-claims-later-2"))).toBe(1);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the claim on the subscription's own token row, so removing the token removes it", async () => {
+    const acct = testAccount("acct-webpush-claims-row");
+    await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
+    await installWebPush(acct, () => 201);
+    const before = Date.now();
+    await submitRequest(acct, envelope("req-claims-row-1"));
+    await pushFanOutSettled(acct);
+
+    const rows = await runInDurableObject(relayStub(acct), (instance: AccountRelay) => [
+      ...(instance as unknown as RelayInternals).sql.exec<{
+        token: string;
+        last_wakeup_at: number | null;
+      }>(`SELECT token, last_wakeup_at FROM device_push_token`),
+    ]);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.last_wakeup_at).toBeGreaterThanOrEqual(before);
+    expect(rows[0]?.last_wakeup_at).toBeLessThanOrEqual(Date.now());
+  });
+});
+
+describe("submit — a future-dated stored claim blocks for one window at most (review-330 S1)", () => {
+  it("coalesces into a trailing wakeup due one window out, not at the claim's future time", async () => {
+    // Claims persist (#319), so a claim stamped by a skewed clock would otherwise silence the
+    // subscription, leading and trailing wakeups alike, until that future time.
+    const acct = testAccount("acct-webpush-future-claim");
+    await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
+    const fetcher = await installWebPush(acct, () => 201);
+    const dayAhead = Date.now() + 24 * 60 * 60 * 1000;
+    await runInDurableObject(relayStub(acct), (instance: AccountRelay) => {
+      (instance as unknown as RelayInternals).sql.exec(
+        `UPDATE device_push_token SET last_wakeup_at = ?`,
+        dayAhead,
+      );
+    });
+
+    const before = Date.now();
+    expect(await submitRequest(acct, envelope("req-future-claim-1"))).toBe(0);
+    const [row] = await readTrailingRows(acct);
+    expect(row?.due_at).toBeGreaterThanOrEqual(before + WEB_PUSH_COALESCE_MS + 1);
+    expect(row?.due_at).toBeLessThanOrEqual(Date.now() + WEB_PUSH_COALESCE_MS + 1);
+
+    // At the window's end the trailing wakeup goes out: the future claim no longer blocks it.
+    await runInDurableObject(relayStub(acct), async (instance: AccountRelay) => {
+      const relay = instance as unknown as RelayInternals;
+      makeTrailingWakeupsDue(relay);
+      // Exactly one window passes; the claim is not aged past it.
+      relay.sql.exec(
+        `UPDATE device_push_token SET last_wakeup_at = last_wakeup_at - ?`,
+        WEB_PUSH_COALESCE_MS + 1,
+      );
+      await relay.alarm();
+      await relay.pushFanOut;
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(await readTrailingRows(acct)).toHaveLength(0);
+  });
+});
+
+describe("submit — an owed trailing wakeup is cleared only by an accepted wakeup (review-317 N2)", () => {
+  it("keeps the owed wakeup when the next wakeup fails, and sends it once when that window ends", async () => {
+    const acct = testAccount("acct-webpush-n2-retry");
+    await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
+    let status = 201;
+    const fetcher = await installWebPush(acct, () => status);
+
+    await submitRequest(acct, envelope("req-n2-retry-1"));
+    await pushFanOutSettled(acct);
+    await submitRequest(acct, envelope("req-n2-retry-2"));
+    expect(await readTrailingRows(acct)).toHaveLength(1);
+
+    // The window passes; the next submit is woken directly, but the push service fails it.
+    await letWindowPassFor(acct);
+    status = 503;
+    const claimed = Date.now();
+    expect(await submitRequest(acct, envelope("req-n2-retry-3"))).toBe(1);
+    await pushFanOutSettled(acct);
+
+    // The owed wakeup is kept, and is not due inside the new window.
+    const [row] = await readTrailingRows(acct);
+    expect(row?.due_at).toBeGreaterThanOrEqual(claimed + WEB_PUSH_COALESCE_MS + 1);
+
+    status = 201;
+    await endWindowAndRunAlarm(acct);
+    // Leading 201, the failed 503, then the one retry.
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    expect(await readTrailingRows(acct)).toEqual([]);
+  });
+
+  it("retries a failed wakeup only once: a failed trailing send is not owed again", async () => {
+    const acct = testAccount("acct-webpush-n2-once");
+    await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
+    let status = 201;
+    const fetcher = await installWebPush(acct, () => status);
+
+    await submitRequest(acct, envelope("req-n2-once-1"));
+    await pushFanOutSettled(acct);
+    await submitRequest(acct, envelope("req-n2-once-2"));
+    status = 503;
+    await endWindowAndRunAlarm(acct);
+
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(await readTrailingRows(acct)).toEqual([]);
+  });
+
+  it("keeps an earlier owed wakeup when another submit is skipped while the accepted wakeup is in flight", async () => {
+    // The row predates the claim, but a later skip during the flight must keep it owed: the
+    // accepted wakeup covers only submits stored before its claim.
+    const acct = testAccount("acct-webpush-n2-in-flight-existing");
+    await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
+    await installWebPush(acct, () => 201);
+    await submitRequest(acct, envelope("req-n2-existing-1"));
+    await pushFanOutSettled(acct);
+    await submitRequest(acct, envelope("req-n2-existing-2"));
+    expect(await readTrailingRows(acct)).toHaveLength(1);
+    await letWindowPassFor(acct);
+    const vapid = await makeVapid();
+
+    const owed = await runInDurableObject(relayStub(acct), async (instance: AccountRelay) => {
+      const relay = instance as unknown as RelayInternals & {
+        fetch(request: Request): Promise<Response>;
+      };
+      let release: () => void = () => undefined;
+      const blocked = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      relay.pushTransports = {
+        webpush: new WebPushTransport({
+          vapid,
+          fetcher: async () => {
+            await blocked;
+            return new Response(null, { status: 201 });
+          },
+        }),
+      };
+      for (const id of ["req-n2-existing-3", "req-n2-existing-4"]) {
+        await relay.fetch(
+          new Request(relayUrl(acct, "/requests"), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(envelope(id)),
+          }),
+        );
+      }
+      release();
+      await relay.pushFanOut;
+      return [...relay.sql.exec<{ token: string }>(`SELECT token FROM webpush_trailing_wakeup`)]
+        .length;
+    });
+
+    expect(owed).toBe(1);
+  });
+
+  it("keeps the owed wakeup for a submit skipped while the accepted wakeup was in flight", async () => {
+    // That submit's request may postdate the device's inbox fetch, so the accepted wakeup (claimed
+    // before it) does not cover it. The whole race runs inside the Durable Object: workerd forbids
+    // resolving the blocked push from another context.
+    const acct = testAccount("acct-webpush-n2-in-flight");
+    await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
+    const vapid = await makeVapid();
+
+    const outcome = await runInDurableObject(relayStub(acct), async (instance: AccountRelay) => {
+      const relay = instance as unknown as RelayInternals & {
+        fetch(request: Request): Promise<Response>;
+      };
+      let release: () => void = () => undefined;
+      const blocked = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let calls = 0;
+      relay.pushTransports = {
+        webpush: new WebPushTransport({
+          vapid,
+          fetcher: async () => {
+            calls++;
+            await blocked;
+            return new Response(null, { status: 201 });
+          },
+        }),
+      };
+      const submit = async (id: string): Promise<number> => {
+        const response = await relay.fetch(
+          new Request(relayUrl(acct, "/requests"), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(envelope(id)),
+          }),
+        );
+        return ((await response.json()) as { push_wakeups: number }).push_wakeups;
+      };
+
+      const first = await submit("req-n2-in-flight-1");
+      // Skipped while the first wakeup is still in flight.
+      const second = await submit("req-n2-in-flight-2");
+      release();
+      await relay.pushFanOut;
+      const owed = [
+        ...relay.sql.exec<{ token: string }>(`SELECT token FROM webpush_trailing_wakeup`),
+      ];
+      return { first, second, calls, owed: owed.length };
+    });
+
+    expect(outcome).toEqual({ first: 1, second: 0, calls: 1, owed: 1 });
   });
 });
