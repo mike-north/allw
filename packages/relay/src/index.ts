@@ -304,10 +304,14 @@ function coreUnavailable(err: unknown): Response {
   return json({ error: "relay verification core unavailable" }, 500);
 }
 
+/**
+ * Whether `token` hashes to `storedHash`. A presented token is always hashed, even when there is no
+ * stored hash to compare it with, so a missing row costs the same work as a mismatch (#357).
+ */
 async function tokenMatches(storedHash: string | null, token: string | null): Promise<boolean> {
-  if (storedHash === null) return false;
   if (token === null) return false;
-  return timingSafeEqual(storedHash, await hashAuthToken(token));
+  const presented = await hashAuthToken(token);
+  return storedHash !== null && timingSafeEqual(storedHash, presented);
 }
 
 /**
@@ -900,16 +904,34 @@ export class AccountRelay implements DurableObject {
   // Route handlers
   // ---------------------------------------------------------------------------
 
+  /**
+   * Check the request's bearer token against a row's stored token hash: `null` when it matches,
+   * otherwise `401` (no bearer token) or `403` (a bearer token that does not match).
+   *
+   * The answer depends only on whether a bearer token was presented and whether it matches, never
+   * on why it does not match. So a row without a stored hash, and an identifier with no row at all
+   * ({@link unknownIdentifierAuthFailure}), answer exactly as a wrong token would (#357).
+   */
   private async authorizeStoredHash(
     request: Request,
     storedHash: string | null | undefined,
   ): Promise<Response | null> {
-    // A missing hash is a legacy/migration row, not proof of authorization. Fail closed and require
-    // re-pairing or re-submission so no endpoint silently falls back to unauthenticated access.
-    if (storedHash === null || storedHash === undefined) return authError(401);
     const token = bearerToken(request);
     if (token === null) return authError(401);
-    return (await tokenMatches(storedHash, token)) ? null : authError(403);
+    // A missing hash is a legacy/migration row, not proof of authorization. Fail closed and require
+    // re-pairing or re-submission so no endpoint silently falls back to unauthenticated access.
+    // `tokenMatches` still hashes the presented token, so the work matches a real comparison.
+    return (await tokenMatches(storedHash ?? null, token)) ? null : authError(403);
+  }
+
+  /**
+   * The answer for a token-guarded identifier (a request id, a pairing code) that has no row: the
+   * same `401` / `403` a wrong or missing token gets on an identifier that exists, so an
+   * unauthenticated caller cannot learn whether the identifier exists (#357). No caller can hold a
+   * valid token for a row that does not exist, so this never refuses a legitimate request.
+   */
+  private async unknownIdentifierAuthFailure(request: Request): Promise<Response> {
+    return (await this.authorizeStoredHash(request, null)) ?? authError(403);
   }
 
   private async authorizedDeviceId(request: Request): Promise<string | Response> {
@@ -1083,7 +1105,8 @@ export class AccountRelay implements DurableObject {
    * Validates the pairing code and enrolls the device's public key.
    * - 403: no account root is bound (a pairing code on an unbound account predates root binding,
    *        so it was never root-authorized), or the pairing auth token is wrong
-   * - 404: code not found
+   * - 401 / 403: no / a wrong pairing auth token. An unknown code answers the same way, never "not
+   *        found" (#357); every check before it is independent of the code
    * - 409: code already used, or the account's push-token budget is full (code not consumed)
    * - 410: code expired
    * - 400: invalid pubkey (not base64url, not 32 bytes, or a small-order X25519 point), or
@@ -1123,7 +1146,9 @@ export class AccountRelay implements DurableObject {
       ),
     ];
     const pairing = rows[0];
-    if (!pairing) return json({ error: "pairing code not found" }, 404);
+    // An unknown code answers exactly as a wrong pairing token does (#357): existence is never
+    // revealed before the token is checked.
+    if (!pairing) return this.unknownIdentifierAuthFailure(request);
     const authFailure = await this.authorizeStoredHash(request, pairing.auth_token_hash);
     if (authFailure) return authFailure;
     if (pairing.used !== 0) return json({ error: "pairing code already used" }, 409);
@@ -1728,7 +1753,10 @@ export class AccountRelay implements DurableObject {
       ),
     ];
     const req = rows[0];
-    if (!req) return json({ error: "request not found" }, 404);
+    // An unknown id answers exactly as a wrong request token does (#357): existence is never
+    // revealed before the token is checked. A request swept after its retention window answers its
+    // old token the same way.
+    if (!req) return this.unknownIdentifierAuthFailure(request);
     const authFailure = await this.authorizeStoredHash(request, req.auth_token_hash);
     if (authFailure) return authFailure;
     return {
@@ -2030,7 +2058,8 @@ export class AccountRelay implements DurableObject {
   /**
    * GET /requests/{request_id}
    * Response: `{ request_id, status }` where status is `pending`, terminal `expired` (fail-closed,
-   *           past `expires_at`), or `resolved` (+ the signed `verdict`). 404 if unknown.
+   *           past `expires_at`), or `resolved` (+ the signed `verdict`). An unknown id gets the
+   *           same 401 / 403 as a wrong token, never "not found" (#357).
    *
    * The polling counterpart to `…/wait` — lets a disconnected integrator fetch a persisted verdict.
    * Lazy-expires a past-deadline request on read so it never reports a perpetual `pending`.
@@ -2095,8 +2124,9 @@ export class AccountRelay implements DurableObject {
    *
    * A live waiting integrator: the verdict is pushed the instant a device decides (or immediately
    * if it already has), then the socket is closed. A past-deadline request is lazy-expired and the
-   * terminal status is pushed at once (fail-closed). Returns 404 for an unknown request (a request
-   * without a WebSocket upgrade header is rejected earlier, at the router, with 426).
+   * terminal status is pushed at once (fail-closed). An unknown request gets the same 401 / 403 as a
+   * wrong token, never "not found" (#357). A request without a WebSocket upgrade header is rejected
+   * earlier, at the router, with 426.
    *
    * Protocol (relay → integrator): `{ type: "verdict", request_id, verdict }`,
    * `{ type: "expired", request_id }`, or `{ type: "retracted", request_id }` (terminal, no verdict

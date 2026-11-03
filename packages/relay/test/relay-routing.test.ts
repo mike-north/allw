@@ -1364,9 +1364,9 @@ describe("AccountRelay — routing negative paths", () => {
     expect(second.status).toBe(409);
   });
 
-  it("returns 404 polling an unknown request", async () => {
+  it("answers polling an unknown request as unauthorized, never 'not found' (#357)", async () => {
     const { status } = await get(testAccount("acct-neg-poll"), "/requests/does-not-exist");
-    expect(status).toBe(404);
+    expect(status).toBe(401);
   });
 
   it("returns 404 connecting a WebSocket for an unenrolled device", async () => {
@@ -1405,14 +1405,14 @@ describe("AccountRelay — routing negative paths", () => {
     expect(typeof err.error).toBe("string");
   });
 
-  it("returns 404 opening …/wait for an unknown request", async () => {
+  it("answers opening …/wait for an unknown request as unauthorized (#357)", async () => {
     const resp = await SELF.fetch(
       relayUrl(testAccount("acct-neg-waitunknown"), "/requests/nope/wait"),
       {
         headers: { Upgrade: "websocket" },
       },
     );
-    expect(resp.status).toBe(404);
+    expect(resp.status).toBe(401);
   });
 
   it("rejects a degenerate (non-object) verdict value", async () => {
@@ -1749,13 +1749,13 @@ describe("AccountRelay — retract (issue #195)", () => {
     expect(polled.data.status).toBe("expired");
   });
 
-  it("SECURITY: returns 404 retracting an unknown request", async () => {
+  it("SECURITY: refuses retracting an unknown request as unauthorized (#357)", async () => {
     const { status } = await post(
       testAccount("acct-retract-unknown"),
       "/requests/does-not-exist/retract",
       {},
     );
-    expect(status).toBe(404);
+    expect(status).toBe(401);
   });
 
   it("SECURITY: requires the per-request token, scoped to exactly that request (no cross-request retract)", async () => {

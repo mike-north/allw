@@ -119,18 +119,19 @@ const DOCUMENTED_ROUTES: readonly DocumentedRoute[] = [
     concrete: "requests",
     missingLast: { status: 404, body: NOT_FOUND },
     extraSegment: {
-      GET: { status: 404, body: { error: "request not found" } },
+      GET: { status: 401, body: { error: "authorization required" } },
       POST: { status: 405, body: METHOD_NOT_ALLOWED },
       PUT: { status: 405, body: METHOD_NOT_ALLOWED },
       DELETE: { status: 405, body: METHOD_NOT_ALLOWED },
     },
   },
-  // `requests/r1` is exactly `GET /requests/{request_id}`, whose handler 404s an unknown request.
+  // `requests/r1` is exactly `GET /requests/{request_id}`, whose handler answers an unknown request
+  // with no token as unauthorized (#357).
   {
     method: "GET",
     path: "requests/{request_id}/wait",
     concrete: "requests/r1/wait",
-    missingLast: { status: 404, body: { error: "request not found" } },
+    missingLast: { status: 401, body: { error: "authorization required" } },
   },
   // `requests` is exactly `POST /requests`; GET is not a method there.
   {
