@@ -122,6 +122,14 @@ ActionRecord {
 }
 ```
 
+**Every caller that runs a command uses the `command` surface.** A plain script or CLI about to run a command
+(for example `stripe refunds create …`) is a `command` caller, exactly like the agent hooks. There is no
+separate "generic" or "script" surface (decided 2026-11-02, #231). What differs is the `actor`, not the
+surface. Integrators build the record with `@allw/sdk`'s `commandAction` / `commandActionFromLine`, which
+return the core's `action_from_argv` / `action_from_command` record unchanged. `commandRequest` wraps that
+record into a full request with `actor: { id: "machine:<hostname>", kind: "script" }` and `reversible: false`
+by default, and takes the top-level `risk` from the record's.
+
 ### Forward-compat requirements on `allw-core` v1 (cheap now, painful later)
 
 1. **Capture the syntactic substrate** (tokenized command / MCP call) for every action — the durable base all
