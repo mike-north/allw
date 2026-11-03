@@ -1,6 +1,7 @@
 /**
- * UAT: `allw-approver pair` and `allw-approver watch` (and its `serve` alias) print the same-machine
- * demo warning to stderr on every run (#241).
+ * UAT: `allw-approver pair`, `watch` (and its `serve` alias) and `keygen` print the same-machine
+ * demo warning to stderr on every run (#241). `keygen` writes the same root and signing seeds, so it
+ * carries the same warning.
  *
  * The CLI approver keeps the account-root seed and device signing seed in a keyfile on the machine it
  * runs on, so a gated agent running as the same user can read them and approve its own requests.
@@ -10,8 +11,8 @@
  * program output.
  *
  * The commands are driven as a real subprocess against inputs that make them fail fast (an
- * unreachable relay, a missing keyfile): the warning must appear before any work, so it shows even
- * when the command then fails.
+ * unreachable relay, a missing keyfile, an unknown flag): the warning must appear before argument
+ * parsing or any other work, so it shows even when the command then fails.
  *
  * @see https://github.com/mike-north/allw/issues/241 (acceptance criteria: demo warning)
  * @see ../../../docs/threat-model.md (R8: the same-machine keyfile is the walking-skeleton exception)
@@ -122,6 +123,26 @@ test("serve (the watch alias) prints the demo warning too", async () => {
     const { code, stderr } = await runCli(["serve", "--keyfile", join(dir, "absent.json")], dir);
     assert.notEqual(code, 0);
     assertDemoWarning(stderr, "serve");
+  });
+});
+
+test("keygen prints the demo warning (it writes the same root and signing seeds)", async () => {
+  await withTempDir(async (dir) => {
+    const { code, stdout, stderr } = await runCli(
+      ["keygen", "--keyfile", join(dir, "keyfile.json")],
+      dir,
+    );
+    assert.equal(code, 0, `stderr: ${stderr}`);
+    assertDemoWarning(stderr, "keygen");
+    assert.doesNotMatch(stdout, /DEMO ONLY/);
+  });
+});
+
+test("the warning is printed even when argument parsing fails", async () => {
+  await withTempDir(async (dir) => {
+    const { code, stderr } = await runCli(["pair", "--relay", "http://x", "--bogus"], dir);
+    assert.notEqual(code, 0, "an unknown flag is rejected");
+    assertDemoWarning(stderr, "pair --bogus");
   });
 });
 

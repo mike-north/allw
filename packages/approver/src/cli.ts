@@ -59,7 +59,7 @@ keygen OPTIONS:
 ⚠ v0 stand-in: device keys are held in software in the keyfile. Production custody is hardware-
   backed (Secure Enclave / StrongBox) — see issue #23. The wire protocol is unchanged either way.
 
-⚠ DEMO ONLY: pair and watch print a warning on every run. The keyfile holds the account root and
+⚠ DEMO ONLY: pair, watch and keygen print a warning on every run. The keyfile holds the account root and
   device signing keys, so any process running as this user (including a gated agent) can read them
   and approve its own requests. Keep the keyfile off the machine the agent runs on.
 `;
@@ -79,6 +79,9 @@ function requireOption(value: string | undefined, flag: string): string {
   return value;
 }
 
+/** Commands that create or use the keyfile's account-root and signing seeds (`serve` = `watch`). */
+const DEMO_WARNING_COMMANDS: ReadonlySet<string> = new Set(["pair", "watch", "serve", "keygen"]);
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const command = argv[0];
@@ -93,6 +96,13 @@ async function main(): Promise<void> {
 
   if (command === undefined || command === "help" || command === "--help" || command === "-h") {
     printUsageAndExit(command === undefined ? 1 : 0);
+  }
+
+  // `pair`, `watch` and `keygen` hold or create the account root and signing seeds on this machine.
+  // Label the setup as demo-only on every run, before argument parsing or any other work, so the
+  // warning shows even when the command then fails (including on a bad flag).
+  if (DEMO_WARNING_COMMANDS.has(command)) {
+    printSameMachineDemoWarning();
   }
 
   const { values } = parseArgs({
@@ -116,12 +126,6 @@ async function main(): Promise<void> {
     process.exit(0);
   }
   if (values.help) printUsageAndExit(0);
-
-  // `pair` and `watch` hold or create the account root and signing seeds on this machine. Label the
-  // setup as demo-only on every run, before any work, so the warning shows even if the command fails.
-  if (command === "pair" || command === "watch" || command === "serve") {
-    printSameMachineDemoWarning();
-  }
 
   const keyfilePath = values.keyfile ?? defaultKeyfilePath();
   const wasm = await loadWasm();

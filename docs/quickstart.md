@@ -1,7 +1,8 @@
 # Quickstart: zero → first approval
 
-Goal: install `allw`, pair a second device, wire the Claude Code hook, and get a real shell command
-**blocked until you approve it from a second surface** — cryptographically verified, end to end.
+Goal: install `allw`, pair an approver, wire the Claude Code hook, and get a real shell command
+**blocked until you approve it from a separate approver** — cryptographically verified, end to end.
+(The CLI approver this guide uses is a demo when it runs on the agent's machine; see §2.)
 
 This is the v0 "walking skeleton" experience. Read it honestly: some pieces are deliberate v0
 stand-ins, called out inline. Where a step is **not yet wired**, it says so rather than pretending.
@@ -14,8 +15,9 @@ stand-ins, called out inline. Where a step is **not yet wired**, it says so rath
 >   approval request and only emits `allow` for a verified human "yes".
 > - The same gate for **Codex** (`@allw/codex-hook`) — see [`docs/codex-integration.md`](./codex-integration.md)
 >   for the Codex-specific hook config; steps 0–3 below (relay, install, pairing, watch) are identical.
-> - A **second-device approver** (`@allw/approver`) that renders the exact action (WYSIWYS), prompts
->   Approve / Deny, and returns a signed verdict.
+> - An **approver** (`@allw/approver`, a CLI stand-in for a second device; demo-only when run on the
+>   agent's machine, see §2) that renders the exact action (WYSIWYS), prompts Approve / Deny, and
+>   returns a signed verdict.
 > - A **zero-knowledge relay** (`@allw/relay`) — this quickstart defaults to the hosted relay at
 >   `https://allw-relay.mnorth.workers.dev`; you can also run your own (Cloudflare or locally via
 >   `wrangler dev`).
@@ -82,6 +84,12 @@ hosted one — everything else in this quickstart is unchanged.
 
 ## 1. Install the CLIs
 
+> **Not on npm yet.** The `@allw/*` packages on npm are only `0.0.0-bootstrap` name reservations with
+> no bin, so `npm install` below gives you nothing to run. Until the first release, install from a
+> checkout: `pnpm install && pnpm run build:wasm && pnpm -r build` (needs Rust and `wasm-pack`), then
+> `pnpm pack` in `packages/sdk`, `packages/hook` and `packages/approver` and `npm install` the three
+> tarballs (as `scripts/smoke-packaged-install.mjs` does).
+
 In the project where you run Claude Code (or globally):
 
 ```sh
@@ -108,7 +116,7 @@ npx --no-install allw-approver --version
 
 ---
 
-## 2. Pair a second device (the approver)
+## 2. Pair an approver
 
 The approver is the surface where **you** see and decide the request.
 
@@ -120,8 +128,8 @@ The approver is the surface where **you** see and decide the request.
 > **⚠ The CLI approver is for demos only.** It keeps the account root key and the device signing key
 > in a keyfile on the machine where you run it. Any process running as the same user, including the
 > AI agent you are gating, can read that file and approve its own requests. The signatures still
-> verify; you are just no longer the one deciding. `allw-approver pair` and `watch` print this
-> warning every time they run.
+> verify; you are just no longer the one deciding. `allw-approver pair`, `watch` and `keygen` print
+> this warning every time they run.
 >
 > For real use, approve from a device the agent can't reach: the
 > [hosted web approver](https://allw-web-approver.pages.dev) on your phone. Today the web approver is
@@ -165,7 +173,8 @@ you Approve / Deny for each incoming request:
 npx --no-install allw-approver watch
 ```
 
-Leave this running. This is your "phone" for now.
+Leave this running. It stands in for your phone in this demo; on the agent's machine it offers no
+protection against the agent (see the warning in §2).
 
 ---
 
@@ -231,7 +240,9 @@ to start, or exits with any code other than 0 or 2, as a _non-blocking error_: i
 `"onFailure": "block"` in the config above reverses that: if the hook fails to start, exits with a
 code other than 0 or 2, or times out, Claude Code
 [blocks the tool call](https://code.claude.com/docs/en/hooks#block-the-action-when-a-hook-fails)
-instead. It needs **Claude Code v2.1.295 or later** (check with `claude --version`). `@allw/hook`
+instead. It needs **Claude Code v2.1.295 or later**. On older versions Claude Code ignores the key
+without warning, so a hook that can't start still lets the call through. Check `claude --version`.
+`@allw/hook`
 exits 0 on every decision it makes, deny included, so the setting only changes what happens when
 the hook never gets to decide.
 
@@ -258,8 +269,9 @@ What happens:
 5. Press **`d`** to deny (or just wait for the timeout): the hook emits `deny` and Claude Code is
    blocked. **Fail-closed both ways.**
 
-That's the full loop: a real agent action, gated by a human decision on a second device,
-end-to-end-encrypted and cryptographically verified.
+That's the full loop: a real agent action, gated by a human decision in a separate approver,
+end-to-end-encrypted and cryptographically verified. With the CLI approver on the same machine as the
+agent, that decision is only as trustworthy as the machine: the agent can read the keyfile (§2).
 
 ---
 

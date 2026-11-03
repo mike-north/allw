@@ -54,7 +54,9 @@ supported, evaluated install path this doc documents:
   `--no-install` makes `npx` exit 1 instead and downloads nothing (checked on npm 10.9.4 and
   11.21.1; it still makes a metadata request to the registry before giving up). See
   [`npm exec`](https://docs.npmjs.com/cli/commands/npm-exec).
-- **Set `"onFailure": "block"`** (Claude Code v2.1.295 or later). Without it, a hook that can't
+- **Set `"onFailure": "block"`** (Claude Code v2.1.295 or later; older versions ignore the key
+  without warning, so a hook that can't start still lets the call through — check
+  `claude --version`). Without it, a hook that can't
   start, exits with a code other than 0 or 2, or times out is a non-blocking error and the tool call
   goes ahead (see [Fail-Closed Analysis](#fail-closed-analysis)). With it, Claude Code
   [blocks the call](https://code.claude.com/docs/en/hooks#block-the-action-when-a-hook-fails).
@@ -209,8 +211,9 @@ checked 2026-08-23; the `onFailure` rows re-checked 2026-11-02):
 - **Any other exit code (including `0`) with invalid/absent JSON on stdout** (a crash, `SIGKILL`, a
   script that can't start, or a bug that writes non-JSON) → **a non-blocking error: "the action
   proceeds."** This is an unconditional fail-open — the tool call runs exactly as if the hook had
-  returned `allow`. With `"onFailure": "block"`, a crash or an exit code other than 0 or 2 counts as
-  a failure and blocks the call instead.
+  returned `allow`. With `"onFailure": "block"`, a crash, an exit code other than 0 or 2, or
+  unparseable / schema-invalid JSON blocks the call instead; plain-text or empty stdout on exit `0`
+  still proceeds (that is a success with no decision, not a failure).
 - **A `command` hook that exceeds its pinned `timeout`** → canceled; Claude Code discards its
   output and the hook "renders no decision." Distinctly from the bullet above, a _timed-out_
   `PreToolUse` hook "doesn't block the tool call. The call continues through **the normal
@@ -231,7 +234,8 @@ different, weaker gate than allw's — no second device, no cryptographic bindin
 `bypassPermissions` — but not a silent bypass). Both hosts share the same underlying residual this
 design cannot close from inside the hook process: if the process is killed, hangs before producing
 output, or is never started (a bad path in `settings.json`/`hooks.json`), the _governing_ host's
-gate is skipped and allw contributes nothing to that call. On Claude Code (v2.1.295 or later),
+gate is skipped and allw contributes nothing to that call. On Claude Code (v2.1.295 or later; older
+versions silently ignore the key),
 `"onFailure": "block"` closes this residual from the host side: a hook that can't start, crashes
 or times out blocks the call. Codex has no equivalent setting
 ([`docs/codex-integration.md`](./codex-integration.md#if-the-hook-cant-start)), so on Codex the

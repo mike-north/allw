@@ -19,7 +19,8 @@ governance layer that grows around it. See [`docs/`](./docs):
 
 ## Quickstart (zero → first approval)
 
-Get a real shell command **blocked until you approve it from a second device** — verified end to end.
+Get a real shell command **blocked until you approve it from a separate approver** — verified end to
+end. (The CLI approver below is a demo when it runs on the agent's machine.)
 Full walkthrough with troubleshooting: **[docs/quickstart.md](./docs/quickstart.md)**.
 
 > Requires Node ≥ 24 and Claude Code. **No Rust toolchain needed** — the audited core ships pre-built
@@ -33,11 +34,11 @@ Full walkthrough with troubleshooting: **[docs/quickstart.md](./docs/quickstart.
 # 1. Install the CLIs in your project (the @allw/sdk + bundled WASM come along automatically):
 npm install @allw/hook @allw/approver
 
-# 2. Pair a second device (a second terminal). Prints your account id + account-root public key
+# 2. Pair an approver (demo: a second terminal on this machine). Prints your account id + account-root public key
 #    (the account id is derived from the account-root key — you don't choose it):
 npx --no-install allw-approver pair --relay https://allw-relay.mnorth.workers.dev --label my-laptop
 
-# 3. Watch for requests on that device (leave running — this is your "phone" for now):
+# 3. Watch for requests in that terminal (leave running; it stands in for your phone):
 npx --no-install allw-approver watch
 ```
 

@@ -6,8 +6,8 @@
  * as the same OS user — including the agent — can read the keyfile and sign an "approved" verdict
  * for its own request. The cryptography still verifies; the human is simply no longer in the loop.
  * `docs/threat-model.md` R8 treats this as the walking-skeleton exception, and it must be presented
- * as one. So every `pair` and `watch` run prints this warning to stderr, before doing any work, so it
- * appears even when the command then fails.
+ * as one. So every `pair`, `watch` (`serve`) and `keygen` run prints this warning to stderr, before
+ * argument parsing or any other work, so it appears even when the command then fails.
  *
  * This module only defines the text and where it goes. Moving the root off the agent's machine
  * (#244) and self-certifying accounts (#242) are the real fixes; this warning is the stop-gap label.

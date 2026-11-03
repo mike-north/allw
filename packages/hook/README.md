@@ -61,13 +61,14 @@ for direct file edits, and `mcp__.*` for any MCP tool call:
 > (checked on npm 10.9.4 and 11.21.1). The `command` is run under `node`; there is no native binary
 > to sign or allow-list.
 
-> **Set `"onFailure": "block"`** (Claude Code v2.1.295 or later). Without it, if Claude Code can't
-> start the hook (a wrong path, `node` missing from `PATH`, the package not installed), the
-> [hooks reference](https://code.claude.com/docs/en/hooks#exit-code-output) treats that as a
-> non-blocking error and **the tool call goes ahead ungated**. With it, Claude Code
-> [blocks the call](https://code.claude.com/docs/en/hooks#block-the-action-when-a-hook-fails) when
-> the hook fails to start, exits with a code other than 0 or 2, or times out. This hook exits 0 on
-> every decision, deny included, so the setting only matters when the hook never gets to decide.
+> **Set `"onFailure": "block"`** (Claude Code v2.1.295 or later; older versions ignore the key
+> without warning, so check `claude --version`). Without it, if Claude Code can't start the hook (a
+> wrong path, `node` missing from `PATH`, the package not installed), the [hooks
+> reference](https://code.claude.com/docs/en/hooks#exit-code-output) treats that as a non-blocking
+> error and **the tool call goes ahead ungated**. With it, Claude Code [blocks the
+> call](https://code.claude.com/docs/en/hooks#block-the-action-when-a-hook-fails) when the hook
+> fails to start, exits with a code other than 0 or 2, or times out. This hook exits 0 on every
+> decision, deny included, so the setting only matters when the hook never gets to decide.
 
 > **Always pin `"timeout"`** (here `480`, in seconds). Without it the hook inherits Claude Code's
 > 600s default, and a too-large `ALLW_TIMEOUT_MS` could let that timeout fire before the hook decides
