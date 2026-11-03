@@ -75,6 +75,16 @@ priority order (`src/relay-config.ts`):
 
 That order applies **only before pairing**. Once a browser is paired, its relay is pinned (below).
 
+**[OPERATOR] The relay must allow the approver's origin (CORS).** Every relay call the approver
+makes is cross-origin, so the relay it talks to must list the origin the bundle is served from
+(e.g. `https://approvals.example.com`) in its `CORS_ALLOWED_ORIGINS` var (`docs/relay-deploy.md`
+§2). A relay that does not list it answers every preflight with a 403, the browser withholds every
+response, and the approver never gets past pairing. This is the relay-side mirror of the CSP
+`connect-src` list (§3.1), which must in turn name the relay. The hosted relay
+(`allw-relay.mnorth.workers.dev`) admits **only** the hosted approver origin
+(`https://allw-web-approver.pages.dev`), so a self-hosted approver needs a relay its operator
+controls.
+
 **HTTPS only.** A relay URL is accepted only if it is `https:`, or `http:` on a loopback host
 (`localhost` or `127.0.0.1`) for local development against `wrangler dev`, and it carries no
 username, password, query (`?`) or fragment (`#`) — userinfo lets a link look like one host while
@@ -108,18 +118,35 @@ WebSocket, account-state resolution — goes to that pinned relay.
 - **Browsers paired before pinning existed** are bound once, on their next visit, to the relay URL
   they had already persisted (`allw:relay-url:v1`) — never to a `?relay=` link on that visit. If
   none is persisted, the config prompt asks for it.
-- **A pin that a later build no longer accepts** makes the stored identity load as corrupt
-  (fail-closed). The browser boots as unpaired and must re-pair, which replaces the stored identity.
-  For example, browsers pinned to `http://[::1]:…` before `[::1]` was dropped must re-pair against
-  `http://127.0.0.1:…`. Builds that narrow the relay rule or change its canonical form must ship a
-  migration for stored pins.
+- **A pin that a later build no longer accepts** (a rejected or non-canonical relay URL in an
+  otherwise valid identity) puts the browser in a **re-pair-required** state. The identity is
+  unusable (fail-closed: nothing is sent to that relay), but it is not discarded silently. Before
+  any relay is resolved or asked for, a screen shows the pinned relay and says why it is rejected.
+  The pin is untrusted stored text, so the screen loads the approver core first (the same WASM the
+  inbox reuses) and shows the pin only as the core's `escape_for_display` renders it (an empty pin
+  as `(empty)`). If the core does not load, the pin is withheld as
+  `(hidden: the approver core did not load)`, and the screen still offers the choice below. The stored identity is cleared only when the human chooses **Forget this pairing and
+  pair again**, and only if it is still the identity the screen showed: a newer identity saved
+  since, for example by another tab, is kept, and the browser routes to it instead. Closing the
+  page leaves it in storage. After the confirmation the browser pairs again, but on that re-pair
+  visit it is treated as a previously paired browser, like the legacy binding above: a `?relay=`
+  link is ignored (the notice names it) and never persisted, and the relay is the one this browser already persisted, or one the human
+  enters. For example, browsers pinned to
+  `http://[::1]:…` before `[::1]` was dropped land here and re-pair against `http://127.0.0.1:…`.
+  Builds that narrow the relay rule or change its canonical form should ship a migration for stored
+  pins, or say in their release notes that affected devices must re-pair. An identity that is
+  corrupt in any other way (unparseable, a missing field, a non-string pin) is still discarded and
+  the browser routed to pairing.
 
 **[OPERATOR]** To hand a user a working link, share the deployed bundle's URL with `?relay=`
-appended, e.g.:
+appended, pointing at a relay that allows the bundle's origin (above), e.g. a self-hosted pair:
 
 ```
-https://approvals.example.com/?relay=https://allw-relay.mnorth.workers.dev
+https://approvals.example.com/?relay=https://relay.example.com
 ```
+
+The hosted approver and hosted relay pair up the same way:
+`https://allw-web-approver.pages.dev/?relay=https://allw-relay.mnorth.workers.dev`.
 
 ---
 
@@ -173,7 +200,9 @@ hardware-backed key custody (#244).
 site will talk to — a relay missing from it is blocked by the browser, even if it is pinned. The
 build reads the list from `ALLW_RELAY_ORIGINS` (origins separated by spaces or commas) and emits
 each origin in both its `https:` and `wss:` forms. Unset, it defaults to the hosted relay
-`https://allw-relay.mnorth.workers.dev`. Self-hosters set their own:
+`https://allw-relay.mnorth.workers.dev`. The relay side must match: each listed relay must allow the
+approver's origin in its `CORS_ALLOWED_ORIGINS` (§2, `docs/relay-deploy.md` §2). Self-hosters set
+their own:
 
 ```sh
 ALLW_RELAY_ORIGINS="https://relay.example.com" pnpm --filter @allw/web-approver build

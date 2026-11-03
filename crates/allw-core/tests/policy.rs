@@ -506,7 +506,8 @@ fn signed_policy_rule_rejects_cross_typ_jws_confusion() {
         &device_key(),
         &[0x01, 0x02, 0x03, 0x04],
         Some(device_cert()),
-    );
+    )
+    .expect("note within cap");
     let mut rule = sign_policy_rule(&unsigned, DEVICE_ID, &device_key(), Some(device_cert()));
     rule.sig = verdict.sig;
 

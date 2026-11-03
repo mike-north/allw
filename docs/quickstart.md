@@ -12,7 +12,8 @@ stand-ins, called out inline. Where a step is **not yet wired**, it says so rath
 > - One audited Rust core (crypto, contract, verdict verification), shipped as **WASM** — every
 >   surface below runs it under `node`, with **no Rust toolchain at install time**.
 > - A fail-closed Claude Code **PreToolUse hook** (`@allw/hook`) that turns a gated tool call into an
->   approval request and only emits `allow` for a verified human "yes".
+>   approval request and denies anything but a verified human "yes". It never grants: on a "yes"
+>   it steps aside and Claude Code's own permission rules decide.
 > - The same gate for **Codex** (`@allw/codex-hook`) — see [`docs/codex-integration.md`](./codex-integration.md)
 >   for the Codex-specific hook config; steps 0–3 below (relay, install, pairing, watch) are identical.
 > - An **approver** (`@allw/approver`, a CLI stand-in for a second device; demo-only when run on the
@@ -64,10 +65,9 @@ That's the `<RELAY_URL>` referenced in the steps below — no Cloudflare account
 > **Caveat — not yet zero-knowledge against the relay itself.** The SDK encrypts each request to the
 > device list the relay returns (`GET /{account}/devices`), and the shipped hooks do not yet check that
 > list against root-signed account state. A malicious or compromised relay operator could therefore
-> list a key it holds as a device and decrypt the action context. Until the fixes land
-> ([#243](https://github.com/mike-north/allw/issues/243): encrypt only to root-vouched devices;
-> [#242](https://github.com/mike-north/allw/issues/242): verified account state), only use a relay
-> whose operator you trust — or run your own. See `docs/threat-model.md` §Residual Risks.
+> list a key it holds as a device and decrypt the action context. Until the fix lands
+> ([#243](https://github.com/mike-north/allw/issues/243): encrypt only to root-vouched devices), only
+> use a relay whose operator you trust — or run your own. See `docs/threat-model.md` §Residual Risks.
 
 **Prefer to self-host?** Either option below gives you a `<RELAY_URL>` to use in place of the
 hosted one — everything else in this quickstart is unchanged.
@@ -234,14 +234,19 @@ You don't need any of these if the file is in place:
 | `ALLW_APPROVER_ROOT_KEY` | `approver_root_key`                                                                                                                                                                                       |
 
 Then register the hook in your project's (or user's) `.claude/settings.json` as a **PreToolUse**
-hook. The matcher `Bash|mcp__.*` gates shell commands and any MCP tool call:
+hook. The matcher `^(Bash|Edit|MultiEdit|Write)$|^mcp__` sends exactly the `Bash`, `Edit`,
+`MultiEdit` and `Write` tools, plus every MCP tool (`mcp__…`), to allw. The `deny` rules turn off
+`Monitor`, `PowerShell` and `NotebookEdit`: they run shell commands or edit files, and allw doesn't
+gate them yet ([#298](https://github.com/mike-north/allw/issues/298)). (Beyond a demo, install the hook outside the project and register it in
+`~/.claude/settings.json`, so the agent can't edit the gate:
+[Install the hook where the agent can't write it](./claude-code-integration.md#install-the-hook-where-the-agent-cant-write-it).)
 
 ```json
 {
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|mcp__.*",
+        "matcher": "^(Bash|Edit|MultiEdit|Write)$|^mcp__",
         "hooks": [
           {
             "type": "command",
@@ -252,12 +257,15 @@ hook. The matcher `Bash|mcp__.*` gates shell commands and any MCP tool call:
         ]
       }
     ]
+  },
+  "permissions": {
+    "deny": ["Monitor", "PowerShell", "NotebookEdit"]
   }
 }
 ```
 
 > **Always pin `"timeout": 480`** (seconds). Without it the hook inherits Claude Code's 600s default;
-> the pin guarantees the hook always emits an explicit `allow`/`deny` before Claude Code could time
+> the pin guarantees the hook always reaches its decision before Claude Code could time
 > it out (the fail-closed timeout-ordering invariant — see [`@allw/hook`](../packages/hook/README.md)).
 >
 > **Use `npx --no-install allw-hook`, never plain `npx allw-hook`.** With `--no-install`, `npx` runs
@@ -283,9 +291,8 @@ code other than 0 or 2, or times out, Claude Code
 [blocks the tool call](https://code.claude.com/docs/en/hooks#block-the-action-when-a-hook-fails)
 instead. It needs **Claude Code v2.1.295 or later**. On older versions Claude Code ignores the key
 without warning, so a hook that can't start still lets the call through. Check `claude --version`.
-`@allw/hook`
-exits 0 on every decision it makes, deny included, so the setting only changes what happens when
-the hook never gets to decide.
+`@allw/hook` exits 0 on every decision it makes, deny included, so the setting only changes what
+happens when the hook never gets to decide.
 
 Codex has no equivalent setting: a Codex hook that can't start is reported and the tool call goes
 ahead. See [`docs/codex-integration.md`](./codex-integration.md#if-the-hook-cant-start).
@@ -305,8 +312,11 @@ What happens:
    over the relay.
 3. Your **watch terminal (step 3) prints the exact command** (WYSIWYS) and prompts
    `Approve / Deny / Skip?`.
-4. Press **`a`** to approve. The hook receives the verified verdict and emits `allow`; Claude Code
-   runs the command.
+4. Press **`a`** to approve. The hook verifies the verdict and steps aside (no decision; it never
+   emits `allow`). Claude Code then applies its own permission rules, so in the default mode it may
+   still ask you at the desk; see
+   [After an approval](./claude-code-integration.md#after-an-approval-claude-codes-own-permissions-still-apply)
+   to make the phone the only prompt.
 5. Press **`d`** to deny (or just wait for the timeout): the hook emits `deny` and Claude Code is
    blocked. **Fail-closed both ways.**
 
@@ -326,7 +336,7 @@ agent, that decision is only as trustworthy as the machine: the agent can read t
 | No prompt appears in the watch terminal                                  | The account id / `--relay` printed by `pair` must match `account_id` / `relay_url` in `~/.allw/config.json` (or their `ALLW_*` overrides).                           |
 | Request times out immediately                                            | Check the relay is running (step 0) and reachable at the configured `relay_url`.                                                                                     |
 | Transcript shows `PreToolUse:… hook error`                               | The hook couldn't start (bad path, or not installed). See [If the hook can't start](#if-the-hook-cant-start).                                                        |
-| `git status` runs without prompting                                      | Only `Bash` and `mcp__*` are gated. Reads/edits/greps pass through by design (v0 conservative matcher).                                                              |
+| A read or search runs without your approver                              | By design: only `Bash`, `Edit`/`MultiEdit`/`Write` and `mcp__*` are gated. allw makes no decision for the rest.                                                      |
 
 ---
 

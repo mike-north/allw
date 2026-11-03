@@ -1,0 +1,57 @@
+{
+  "description": "Shared Rust/WASM vector for the small-order X25519 public-key denylist (#248). The hex values are libsodium's has_small_order list (crypto_scalarmult/curve25519/ref10/x25519_ref10.c), copied by hand; base64url is the unpadded encoding of the same bytes. Every entry must be in the core denylist AND rejected by encrypt_context; so must its bit-255-set variant (X25519 masks bit 255, RFC 7748 section 5). The not_small_order entries must be accepted by both.",
+  "small_order": [
+    {
+      "name": "0",
+      "hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "b64url": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    },
+    {
+      "name": "1",
+      "hex": "0100000000000000000000000000000000000000000000000000000000000000",
+      "b64url": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    },
+    {
+      "name": "order-8 point 325606250916557431795983626356110631294008115727848805560023387167927233504",
+      "hex": "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+      "b64url": "4Ot6fDtBuK4WVuP68Z_EatoJjeucMrH9hmIFFl9JuAA"
+    },
+    {
+      "name": "order-8 point 39382357235489614581723060781553021112529911719440698176882885853963445705823",
+      "hex": "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+      "b64url": "X5yVvKNQjCSx0LFVnIPvWwREXMRYHI6G2CJO3dCfEVc"
+    },
+    {
+      "name": "p - 1",
+      "hex": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "b64url": "7P_______________________________________38"
+    },
+    {
+      "name": "p (non-canonical 0)",
+      "hex": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "b64url": "7f_______________________________________38"
+    },
+    {
+      "name": "p + 1 (non-canonical 1)",
+      "hex": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "b64url": "7v_______________________________________38"
+    }
+  ],
+  "not_small_order": [
+    {
+      "name": "2",
+      "hex": "0200000000000000000000000000000000000000000000000000000000000000",
+      "b64url": "AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    },
+    {
+      "name": "9 (the X25519 base point)",
+      "hex": "0900000000000000000000000000000000000000000000000000000000000000",
+      "b64url": "CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    },
+    {
+      "name": "p + 2 (non-canonical 2)",
+      "hex": "efffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "b64url": "7________________________________________38"
+    }
+  ]
+}

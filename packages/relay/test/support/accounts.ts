@@ -101,3 +101,51 @@ export function pairingStartBody(
     ...(label === undefined ? {} : { label }),
   };
 }
+
+/** Options for a root-signed account-state document. */
+export interface AccountStateOptions {
+  /**
+   * The `sequence` claim. A `bigint` (or a decimal string) is written into the JSON verbatim, so a
+   * test can sign a sequence above 2^53-1 that a JS number cannot represent.
+   */
+  readonly sequence: number | bigint | string;
+  /** The `account_id` claim (default: the signing account's own id). */
+  readonly accountId?: string;
+  /** The `current_root` claim (default: the signing account's own root). */
+  readonly currentRoot?: string;
+  /** Device ids recorded as revoked in the document. */
+  readonly revokedDevices?: readonly string[];
+}
+
+/**
+ * Sign an `allw-account-state+jws` with `signer`'s root (the core's `sign_account_state`). The
+ * claims default to an honest document for `signer`'s own account; overrides build the forged or
+ * mismatched documents the relay must reject.
+ */
+export function signAccountState(signer: TestAccount, options: AccountStateOptions): string {
+  const claims = {
+    v: 1,
+    account_id: options.accountId ?? signer.id,
+    sequence: "__SEQUENCE__",
+    current_root: options.currentRoot ?? signer.rootPubkey,
+    previous_roots: [],
+    devices: [],
+    actors: [],
+    revocations: (options.revokedDevices ?? []).map((id) => ({
+      kind: "device",
+      id,
+      revoked_at: 1_700_000_000_000,
+    })),
+  };
+  const sequence =
+    typeof options.sequence === "string" ? options.sequence : String(options.sequence);
+  // Spliced into the JSON verbatim, so fail here — not inside the core's JSON parser — on anything
+  // that is not a plain non-negative decimal integer.
+  if (!/^(0|[1-9][0-9]*)$/.test(sequence)) {
+    throw new Error(
+      `signAccountState: sequence must be a non-negative decimal integer, got ${sequence}`,
+    );
+  }
+  const json = JSON.stringify(claims).replace('"__SEQUENCE__"', sequence);
+  return glue.sign_account_state(json, signer.rootSeed);
+}

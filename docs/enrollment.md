@@ -114,7 +114,8 @@ account_id = base64url-unpadded( SHA-256( "allw/account-id/v1" || 0x00 || accoun
   devices, pairing codes, actors and account state under any id — including one derived from a root they merely
   know (root public keys are not secret; integrators are configured with them). Binding a root over such rows would
   make them look root-authorized, so the relay **refuses** the first bind (409) when the account already holds any
-  device, pairing, actor or account-state row, and `pairing/complete` refuses (403) on an unbound account. Refusing
+  device, pairing or actor row, and `pairing/complete` refuses (403) on an unbound account. (The pre-verification
+  account-state cache is dropped outright: nothing in it was ever verified; §Account State.) Refusing
   is fail-closed and visible; purging would silently drop state. An honest derived-id account cannot hit this
   (no approver before this change could produce a derived id), so a populated unbound account was seeded by
   someone else; its owner starts again under a new root.
@@ -767,19 +768,23 @@ Authoring and distribution flow:
 
 1. A root-authorized account-state author builds the next document with a monotonic `sequence`.
 2. The account root signs it as a compact JWS (`typ = "allw-account-state+jws"`).
-3. An enrolled device publishes the signed document set to `POST /{account_id}/account-states` with its
-   `device_auth_token` and the highest sequence in the set as `max_sequence`. The relay treats the
-   compact JWS docs as opaque, but stores that asserted max sequence as monotonic metadata and rejects
-   lower-sequence republishes with `409`.
-4. Approver devices fetch `GET /{account_id}/account-states` with their `device_auth_token` before rendering a
-   request origin. The relay returns opaque compact JWS strings plus the stored `max_sequence` metadata and does
-   not inspect or author the docs.
+3. The root holder publishes the signed document set to `POST /{account_id}/account-states`. No device token is
+   involved: the relay verifies every document in the core (`verify_account_state`) against the root bound to the
+   account and the account id, rejects the whole publish if any document fails (403), and stores only the
+   documents at the highest **verified** `sequence`, which must be strictly above the stored one (`409`
+   otherwise). It never stores an unverified document or a caller-asserted sequence, so no device — honest,
+   compromised or attacker-enrolled — can poison distribution (before #242 a junk publish at
+   `max_sequence = 2^53-1` blocked every later honest publish). Sequences above 2^53-1 are rejected (400), since
+   the relay could not compare them exactly.
+4. Approver devices and integrators fetch `GET /{account_id}/account-states` with no token before rendering a
+   request origin or choosing recipients. The relay returns only the documents it verified plus their
+   `max_sequence`; it never authors them.
 5. The device verifies the account-root signature and highest valid sequence locally, persists the highest
    root-verified sequence it has accepted, and downgrades the origin to `⚠ UNVERIFIED` if the relay's
    `max_sequence` is not backed by a root-verified document at least that new or if fetched state is below the
    persisted floor. Missing, tampered, relay-substituted, or relay-rolled-back state renders `⚠ UNVERIFIED`;
-   relay-side monotonic publish metadata prevents enrolled devices from rolling the cache back to a lower
-   asserted sequence, while the device-side floor covers a compromised relay that lies about metadata.
+   relay-side verification and strictly increasing verified sequences prevent anyone without the root from
+   rolling the cache back or poisoning it, while the device-side floor covers a compromised relay that lies.
 
 Validation:
 
@@ -957,8 +962,8 @@ Current relay mechanics cover the registry subset and #89 adds relay-scoped endp
 | `POST /devices/{device_id}/revoke` | Remove an active device and close its live socket.                                                       |
 | `POST /actors`                     | Enroll an actor public key.                                                                              |
 | `GET /actors`                      | List enrolled actor public keys.                                                                         |
-| `POST /account-states`             | Publish the root-signed account-state document set with monotonic `max_sequence`.                        |
-| `GET /account-states`              | Fetch relay-distributed account-state docs plus `max_sequence` metadata.                                 |
+| `POST /account-states`             | Root-authorized: publish account-state docs the relay verifies against the bound root.                   |
+| `GET /account-states`              | Unauthenticated: fetch the relay-verified docs plus their `max_sequence`.                                |
 
 Endpoint authentication and authorization rules:
 
@@ -983,9 +988,11 @@ Endpoint authentication and authorization rules:
 - request polling and wait sockets require the `request_auth_token` returned by `POST /requests`;
 - legacy rows without a stored relay auth-token hash fail closed with `401`; devices must re-pair and pending
   requests must be re-submitted rather than becoming unauthenticated;
-- publishing and fetching account state require an enrolled device token. Account state contains public keys and
-  metadata, so confidentiality is not required, but authentication prevents open account enumeration and keeps the
-  relay cache scoped to paired devices.
+- publishing account state requires no token: each document must verify against the bound account root (a device
+  token is not authority to change account trust);
+- fetching account state is unauthenticated. The documents are root-signed public keys and metadata, so
+  confidentiality is not required, and integrators — which hold no device token — must be able to read them to
+  choose recipients (#243). The relay serves only documents it verified.
 
 ## Test Implications
 
@@ -1030,7 +1037,7 @@ Resolved (was deferred):
 
 - Whether actor keys are anchored via a root-signed `actor_cert` or via signed account-state: **#16 chose signed
   account-state** (`actors` entries), reusing the device-trust/revocation machinery.
-- Relay distribution of root-signed account state to devices: **#104 added authenticated
-  `POST /account-states` and `GET /account-states`**. The relay serves opaque signed documents and stores only an
-  asserted `max_sequence` guard for rollback resistance; verified-origin trust still comes only from local
-  account-root signature verification.
+- Relay distribution of root-signed account state to devices: **#104 added `POST /account-states` and
+  `GET /account-states`; #242 made the relay verify every published document against the bound root** (no device
+  token; only the highest verified sequence is stored) **and opened `GET` to integrators**. Verified-origin trust
+  still comes only from local account-root signature verification.
