@@ -1,0 +1,181 @@
+{
+  "$comment": "Shared accept/reject vectors for the relay-URL transport rule (issue #249). Loaded by the SDK (assertRelayUrlTransport), the web approver (checkRelayUrl) and the web-approver site build (relayConnectSources). `runtime` is the verdict of the SDK and web-approver runtime rule; `canonical` is the web approver's canonical form when runtime accepts; `build` is the verdict of the CSP connect-src relay list, which additionally requires a bare origin and no IPv6 literal. Expected values are written from the rule in docs/web-approver-deploy.md §2 and §3.1, not captured from the implementation.",
+  "vectors": [
+    {
+      "input": "https://relay.example.com",
+      "runtime": "accept",
+      "canonical": "https://relay.example.com",
+      "build": "accept",
+      "why": "https origin"
+    },
+    {
+      "input": "https://relay.example.com/",
+      "runtime": "accept",
+      "canonical": "https://relay.example.com",
+      "build": "accept",
+      "why": "trailing slash stripped"
+    },
+    {
+      "input": "  https://relay.example.com  ",
+      "runtime": "accept",
+      "canonical": "https://relay.example.com",
+      "build": "accept",
+      "why": "surrounding whitespace trimmed"
+    },
+    {
+      "input": "https://Relay.Example.COM",
+      "runtime": "accept",
+      "canonical": "https://relay.example.com",
+      "build": "accept",
+      "why": "host lowercased"
+    },
+    {
+      "input": "https://relay.example.com:443",
+      "runtime": "accept",
+      "canonical": "https://relay.example.com",
+      "build": "accept",
+      "why": "default port dropped"
+    },
+    {
+      "input": "https://relay.example.com:8443",
+      "runtime": "accept",
+      "canonical": "https://relay.example.com:8443",
+      "build": "accept",
+      "why": "explicit non-default port kept"
+    },
+    {
+      "input": "https://rélay.example",
+      "runtime": "accept",
+      "canonical": "https://xn--rlay-bpa.example",
+      "build": "accept",
+      "why": "IDN host canonicalized to punycode"
+    },
+    {
+      "input": "https://relay.example.com/base/",
+      "runtime": "accept",
+      "canonical": "https://relay.example.com/base",
+      "build": "reject",
+      "why": "a path is allowed at runtime; connect-src takes bare origins"
+    },
+    {
+      "input": "http://localhost:8787",
+      "runtime": "accept",
+      "canonical": "http://localhost:8787",
+      "build": "accept",
+      "why": "http on loopback (localhost)"
+    },
+    {
+      "input": "HTTP://LOCALHOST:8787",
+      "runtime": "accept",
+      "canonical": "http://localhost:8787",
+      "build": "accept",
+      "why": "scheme and host lowercased"
+    },
+    {
+      "input": "http://127.0.0.1:8787",
+      "runtime": "accept",
+      "canonical": "http://127.0.0.1:8787",
+      "build": "accept",
+      "why": "http on loopback (127.0.0.1)"
+    },
+    {
+      "input": "http://[::1]:8787",
+      "runtime": "accept",
+      "canonical": "http://[::1]:8787",
+      "build": "reject",
+      "why": "http on IPv6 loopback; a CSP host-source cannot express IPv6"
+    },
+    {
+      "input": "http://relay.example.com",
+      "runtime": "reject",
+      "build": "reject",
+      "why": "plaintext http to a remote host"
+    },
+    {
+      "input": "http://localhost.evil.example",
+      "runtime": "reject",
+      "build": "reject",
+      "why": "host merely starts with localhost"
+    },
+    {
+      "input": "http://127.0.0.2",
+      "runtime": "reject",
+      "build": "reject",
+      "why": "only 127.0.0.1 is loopback-allowed"
+    },
+    {
+      "input": "http://localhost@evil.example",
+      "runtime": "reject",
+      "build": "reject",
+      "why": "userinfo makes evil.example the real host"
+    },
+    {
+      "input": "https://relay.example.com@evil.example",
+      "runtime": "reject",
+      "build": "reject",
+      "why": "userinfo spoofs the visible host"
+    },
+    {
+      "input": "https://user:pw@relay.example.com",
+      "runtime": "reject",
+      "build": "reject",
+      "why": "credentials in the URL"
+    },
+    {
+      "input": "https://@relay.example.com",
+      "runtime": "reject",
+      "build": "reject",
+      "why": "empty userinfo"
+    },
+    {
+      "input": "https://relay.example.com?x=1",
+      "runtime": "reject",
+      "build": "reject",
+      "why": "query"
+    },
+    {
+      "input": "https://relay.example.com?",
+      "runtime": "reject",
+      "build": "reject",
+      "why": "empty query"
+    },
+    {
+      "input": "https://relay.example.com#frag",
+      "runtime": "reject",
+      "build": "reject",
+      "why": "fragment"
+    },
+    {
+      "input": "https://relay.example.com#",
+      "runtime": "reject",
+      "build": "reject",
+      "why": "empty fragment"
+    },
+    {
+      "input": "ftp://relay.example.com",
+      "runtime": "reject",
+      "build": "reject",
+      "why": "non-http(s) scheme"
+    },
+    {
+      "input": "ws://relay.example.com",
+      "runtime": "reject",
+      "build": "reject",
+      "why": "WebSocket scheme is derived, never configured"
+    },
+    {
+      "input": "wss://relay.example.com",
+      "runtime": "reject",
+      "build": "reject",
+      "why": "WebSocket scheme is derived, never configured"
+    },
+    { "input": "javascript:alert(1)", "runtime": "reject", "build": "reject", "why": "script URL" },
+    {
+      "input": "relay.example.com",
+      "runtime": "reject",
+      "build": "reject",
+      "why": "not an absolute URL"
+    },
+    { "input": "", "runtime": "reject", "build": "reject", "why": "empty" }
+  ]
+}

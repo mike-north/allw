@@ -99,6 +99,61 @@ export class RelayTimeoutError extends Error {
 }
 
 /**
+ * Hosts on which a plaintext `http:` relay is tolerated: a local-development relay
+ * (`wrangler dev`) never leaves the machine. `[::1]` is the bracketed form `URL.hostname` reports
+ * for the IPv6 loopback. Mirrors `packages/web-approver/src/relay-config.ts`.
+ */
+const LOOPBACK_HOSTNAMES: ReadonlySet<string> = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+/**
+ * Reject a relay URL that would carry bearer tokens and ciphertext without TLS, or that carries
+ * userinfo, a query, or a fragment (issue #249, `docs/threat-model.md` §Relay and Transport).
+ * Accepts `https:`, or `http:` on a loopback host; a path is allowed. Throws an actionable
+ * `Error` for anything else — including an unparseable URL — so a misconfigured client fails at
+ * construction, before any request is built.
+ *
+ * Userinfo makes a URL *look* like one host while pointing at another
+ * (`https://relay.example.com@evil.example` is `evil.example`); a query or fragment would corrupt
+ * the request paths {@link accountBase} appends. The empty forms (`https://host?`, `https://@host`)
+ * are rejected too, on the raw text, for the same reason. Mirrors
+ * `packages/web-approver/src/relay-config.ts` `checkRelayUrl`; both are pinned by the shared
+ * vectors in `test/fixtures/relay-url-vectors.json`.
+ */
+export function assertRelayUrlTransport(relayUrl: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(relayUrl);
+  } catch {
+    throw new Error(
+      `allw: relayUrl '${relayUrl}' is not an absolute URL; expected e.g. https://relay.example.com`,
+    );
+  }
+  const secure =
+    parsed.protocol === "https:" ||
+    (parsed.protocol === "http:" && LOOPBACK_HOSTNAMES.has(parsed.hostname));
+  if (!secure) {
+    throw new Error(
+      `allw: relayUrl '${relayUrl}' must use https:// — plain http:// is allowed only for a local ` +
+        "relay on localhost, 127.0.0.1, or [::1]",
+    );
+  }
+  const hasExtras =
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    parsed.search !== "" ||
+    parsed.hash !== "" ||
+    relayUrl.includes("?") ||
+    relayUrl.includes("#") ||
+    /^[a-z][a-z0-9+.-]*:\/\/[^/?#]*@/i.test(relayUrl.trim());
+  if (hasExtras) {
+    throw new Error(
+      `allw: relayUrl '${relayUrl}' must not include a username, password, query (?) or ` +
+        "fragment (#); expected e.g. https://relay.example.com",
+    );
+  }
+}
+
+/**
  * Build the per-account base URL: `<relayUrl>/<accountId>`. Trailing slashes on `relayUrl` are
  * normalized so a caller passing `https://relay.test/` or `https://relay.test` behaves identically.
  */
@@ -137,6 +192,7 @@ export class RelayClient {
     fetchImpl: FetchImpl,
     options: RelayClientOptions = {},
   ) {
+    assertRelayUrlTransport(relayUrl);
     this.base = accountBase(relayUrl, accountId);
     this.fetchImpl = fetchImpl;
     this.fetchTimeoutMs = options.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;

@@ -39,7 +39,28 @@
  * @see docs/contract.md §Invariants #6 (fail-closed)
  */
 
+import { checkRelayUrl, relayOrigin } from "./relay-config.js";
 import type { ApproverIdentity } from "./runtime.js";
+
+/**
+ * The identity the pairing store persists: the runtime's {@link ApproverIdentity} plus the relay
+ * it was paired against (#249).
+ *
+ * The relay is **pinned at pairing**: every relay call a paired browser makes goes to
+ * `relayUrl`, and a later `?relay=` link cannot move it (`./relay-config.ts`,
+ * `docs/web-approver-deploy.md` §Relay pinning). Without the pin a phishing link could re-point a
+ * paired device and collect its bearer `deviceAuthToken`.
+ */
+export interface PairedIdentity extends ApproverIdentity {
+  /**
+   * The canonical relay URL this identity was paired against (https, or http on loopback —
+   * `checkRelayUrl`). Absent only for an identity stored before pinning existed or paired through a
+   * relay-less harness (`mountWebApprover` without `relay`); the production boot (`./app.ts`)
+   * binds such an identity to the already-persisted relay — never to a `?relay=` link — before any
+   * relay call.
+   */
+  readonly relayUrl?: string;
+}
 
 // ── PairingStore ─────────────────────────────────────────────────────────────────────────────────
 
@@ -60,15 +81,25 @@ const REQUIRED_IDENTITY_FIELDS: readonly (keyof ApproverIdentity)[] = [
   "deviceAuthToken",
 ];
 
-/** Narrow a parsed JSON value to an `ApproverIdentity`. Returns `null` on any structural failure. */
-function parseIdentity(value: unknown): ApproverIdentity | null {
+/**
+ * Narrow a parsed JSON value to a {@link PairedIdentity}. Returns `null` on any structural failure,
+ * including a present-but-invalid pinned `relayUrl` (a tampered or insecure pin is treated as a
+ * corrupt identity — fail-closed — never silently dropped, which would un-pin the device).
+ */
+function parseIdentity(value: unknown): PairedIdentity | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
   for (const field of REQUIRED_IDENTITY_FIELDS) {
     const fieldValue = record[field];
     if (typeof fieldValue !== "string" || fieldValue.length === 0) return null;
   }
-  return record as unknown as ApproverIdentity;
+  const relayUrl = record.relayUrl;
+  if (relayUrl !== undefined) {
+    if (typeof relayUrl !== "string") return null;
+    const checked = checkRelayUrl(relayUrl);
+    if (!checked.ok || checked.relayUrl !== relayUrl) return null;
+  }
+  return record as unknown as PairedIdentity;
 }
 
 /**
@@ -86,9 +117,9 @@ function parseIdentity(value: unknown): ApproverIdentity | null {
  */
 export interface PairingStore {
   /** Load the persisted identity. Returns `null` when not yet paired or the stored value is corrupt. */
-  load(): ApproverIdentity | null;
+  load(): PairedIdentity | null;
   /** Persist a new identity (replaces any existing stored value). */
-  save(identity: ApproverIdentity): void;
+  save(identity: PairedIdentity): void;
   /** Remove the stored identity (used for "sign out" / reset flows). */
   clear(): void;
 }
@@ -109,7 +140,7 @@ export function createLocalPairingStore(storage?: Storage): PairingStore {
         return null;
       }
     },
-    save(identity: ApproverIdentity) {
+    save(identity: PairedIdentity) {
       store.setItem(STORAGE_KEY, JSON.stringify(identity));
     },
     clear() {
@@ -185,7 +216,7 @@ function labeledInput(
  */
 function renderReturningScreen(
   root: HTMLElement,
-  identity: ApproverIdentity,
+  identity: PairedIdentity,
   onUnlock: () => void,
   onReset: () => void,
 ): void {
@@ -269,6 +300,7 @@ function renderReturningScreen(
  */
 function renderPairingScreen(
   root: HTMLElement,
+  relayUrl: string | undefined,
   onPaired: (identity: ApproverIdentity) => void,
   errorMessage: string | null = null,
 ): void {
@@ -308,6 +340,24 @@ function renderPairingScreen(
     trustList.append(li);
   }
   screen.append(trustList);
+
+  // The relay this pairing will pin (#249) — shown before the human commits, because a `?relay=`
+  // link may have pre-filled it and, once paired, it cannot be changed by a link.
+  if (relayUrl !== undefined) {
+    const relayRow = el("div", "pairing-relay");
+    relayRow.append(text("span", "Relay", "pairing-relay-label"));
+    // The origin (punycode, from `URL.origin`), not the raw text: userinfo is already rejected by
+    // `checkRelayUrl`, and the punycode form keeps an IDN lookalike from passing as a familiar host.
+    relayRow.append(text("code", relayOrigin(relayUrl), "pairing-relay-url"));
+    relayRow.append(
+      text(
+        "p",
+        "This browser will only ever talk to this relay. Pair only if your operator gave you this address.",
+        "pairing-relay-note",
+      ),
+    );
+    screen.append(relayRow);
+  }
 
   // Error banner (fail-closed: shown when previous submission failed validation)
   if (errorMessage !== null) {
@@ -367,14 +417,14 @@ function renderPairingScreen(
     const validationError = validatePairingFields(fields);
     if (validationError !== null) {
       // Re-render the screen with the validation error visible (fail-closed: no inbox on error).
-      renderPairingScreen(root, onPaired, validationError);
+      renderPairingScreen(root, relayUrl, onPaired, validationError);
       return;
     }
 
     const identity = parseIdentity(fields);
     if (identity === null) {
       // Should be unreachable after validation but guarded for defensive fail-closed.
-      renderPairingScreen(root, onPaired, "Invalid credential format — please re-enter.");
+      renderPairingScreen(root, relayUrl, onPaired, "Invalid credential format — please re-enter.");
       return;
     }
 
@@ -400,13 +450,20 @@ export interface PairingGateOptions {
    */
   readonly pairingStore?: PairingStore;
   /**
-   * Called once when the user has a confirmed, valid `ApproverIdentity`. The caller should
-   * immediately mount the inbox (`mountWebApprover`) with the returned identity.
+   * The relay a **new** pairing pins into the stored identity (#249). It is shown on the pairing
+   * screen before the human commits. A returning device keeps the relay already pinned in its
+   * stored identity; this value never overrides it. Omit only in a relay-less harness.
+   */
+  readonly relayUrl?: string;
+  /**
+   * Called once when the user has a confirmed, valid `PairedIdentity`. The caller should
+   * immediately mount the inbox (`mountWebApprover`) with the returned identity, sending every
+   * relay call to its pinned `relayUrl`.
    *
    * This callback MUST be the only path to the inbox — the gate never calls it on a failed
    * or missing identity, enforcing the fail-closed invariant structurally.
    */
-  readonly onPaired: (identity: ApproverIdentity) => void;
+  readonly onPaired: (identity: PairedIdentity) => void;
 }
 
 /**
@@ -426,14 +483,15 @@ export interface PairingGateOptions {
  * @see docs/contract.md §Invariants #6 (fail-closed)
  */
 export function mountPairingGate(options: PairingGateOptions): void {
-  const { root, onPaired } = options;
+  const { root, onPaired, relayUrl } = options;
   const store: PairingStore = options.pairingStore ?? createLocalPairingStore();
 
   function goToPairing(): void {
     store.clear();
-    renderPairingScreen(root, (identity: ApproverIdentity) => {
-      store.save(identity);
-      onPaired(identity);
+    renderPairingScreen(root, relayUrl, (identity: ApproverIdentity) => {
+      const paired: PairedIdentity = relayUrl === undefined ? identity : { ...identity, relayUrl };
+      store.save(paired);
+      onPaired(paired);
     });
   }
 

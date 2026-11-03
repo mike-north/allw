@@ -1,32 +1,114 @@
 /**
- * Runtime relay-URL configuration for the bundled web approver (issue #180).
+ * Runtime relay-URL configuration for the bundled web approver (issues #180, #249).
  *
  * The static bundle produced by `scripts/build-site.mjs` is deployed once and then pointed at
  * whichever relay the operator runs (self-hosted, staging, the hosted `allw-relay` Worker) —
  * the relay origin must therefore be resolved **at runtime**, never embedded in the bundled JS as
- * a build-time literal. {@link resolveRelayUrl} resolves it, in priority order, from:
+ * a build-time literal. This module owns the two phases of that resolution:
  *
- *   1. a `?relay=` query-string parameter — present, it is validated and persisted to storage so
- *      a follow-up visit (or a home-screen bookmark without the query string) keeps working;
- *   2. a previously-persisted value in storage (`localStorage` in production; an injectable
- *      `Storage` in tests);
- *   3. neither present → `null`, signalling the caller to render {@link mountRelayConfigGate}
- *      (the "small config UI" the issue allows as a third option) before the pairing/inbox flow
- *      can proceed.
+ * - **Before pairing** ({@link resolveRelayUrl}) the relay is a *candidate*: a `?relay=` link may
+ *   pre-fill it (and is persisted, so a bookmark without the query keeps working), otherwise a
+ *   previously-persisted value is used, otherwise the caller renders {@link mountRelayConfigGate}.
+ *   The candidate is shown to the human on the pairing screen before they commit (#249).
+ * - **After pairing** the relay is *pinned* inside the stored identity (`./pairing.ts`
+ *   `PairedIdentity.relayUrl`) and is the only relay any request goes to. A `?relay=` that differs
+ *   is ignored — never persisted, never contacted — and {@link describeIgnoredRelayOverride} +
+ *   {@link mountIgnoredRelayNotice} tell the human which origin was ignored. Without the pin, a
+ *   phishing link (`…/?relay=https://evil.example`) would re-point a paired device and hand its
+ *   bearer `deviceAuthToken` to the attacker's relay (`docs/threat-model.md` §Trust Boundaries).
  *
- * Fail-closed on malformed input: a query value or stored value that is not an absolute `http(s)`
- * URL is treated as absent rather than passed through to `fetch` calls downstream (`relay-poll.ts`,
- * `account-state.ts`) — never construct a network request against untrusted, unparsed input.
+ * Fail-closed on malformed or insecure input ({@link checkRelayUrl}): only `https:` relay URLs are
+ * accepted, plus `http:` on a loopback host for local development. Anything else is rejected
+ * with an actionable reason rather than passed through to the `fetch`/WebSocket calls downstream
+ * (`relay-poll.ts`, `account-state.ts`, `retract-listener.ts`). The SDK's `createClient` applies
+ * the same rule (`packages/sdk/src/relay.ts` `assertRelayUrlTransport`).
  *
- * @see ./app.ts (the production bootstrap that calls this before mounting the pairing gate)
- * @see ../../../docs/web-approver-deploy.md §Runtime relay configuration
+ * @see ./app.ts (the production bootstrap that sequences these)
+ * @see ../../../docs/web-approver-deploy.md §Runtime relay configuration, §Relay pinning
  */
 
 /** The query-string parameter name used to seed the relay URL, e.g. `?relay=https%3A%2F%2F...`. */
 export const RELAY_URL_QUERY_PARAM = "relay";
 
-/** The `localStorage` key the resolved relay URL is persisted under. */
+/** The `localStorage` key the pre-pairing candidate relay URL is persisted under. */
 export const RELAY_URL_STORAGE_KEY = "allw:relay-url:v1";
+
+/**
+ * Hostnames on which a plaintext `http:` relay is tolerated: the local-development relay
+ * (`wrangler dev`) never leaves the machine, so there is no network path to protect. `[::1]` is
+ * the bracketed form `URL.hostname` reports for the IPv6 loopback.
+ */
+const LOOPBACK_HOSTNAMES: ReadonlySet<string> = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+/** The actionable reason shown when a relay URL fails the transport rule. */
+export const INSECURE_RELAY_URL_REASON =
+  "Relay URLs must use https://. Plain http:// is allowed only for a relay on this machine " +
+  "(localhost, 127.0.0.1, or [::1]).";
+
+/**
+ * The actionable reason shown when a relay URL carries userinfo (`user:pw@`), a query (`?`) or a
+ * fragment (`#`). Userinfo lets a link *look* like one host while pointing at another
+ * (`https://relay.example.com@evil.example` is `evil.example`); a query or fragment would corrupt
+ * the request paths appended to the relay URL.
+ */
+export const RELAY_URL_EXTRAS_REASON =
+  "Relay URLs must not include a username, password, query (?) or fragment (#), " +
+  "e.g. https://relay.example.com";
+
+/** Outcome of {@link checkRelayUrl}: the canonical URL, or why the candidate was rejected. */
+export type RelayUrlCheck =
+  | { readonly ok: true; readonly relayUrl: string }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * Whether the raw text carries userinfo, a query, or a fragment — including the *empty* forms
+ * (`https://@host`, `https://host?`, `https://host#`) that `URL` normalizes away. Checked on the
+ * raw text as well as the parsed URL so this rule agrees with the SDK's `assertRelayUrlTransport`,
+ * which appends request paths to the caller's raw string.
+ */
+function hasUrlExtras(raw: string, parsed: URL): boolean {
+  return (
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    parsed.search !== "" ||
+    parsed.hash !== "" ||
+    raw.includes("?") ||
+    raw.includes("#") ||
+    /^[a-z][a-z0-9+.-]*:\/\/[^/?#]*@/i.test(raw)
+  );
+}
+
+/**
+ * Validate and canonicalize a candidate relay URL. Accepts an absolute `https:` URL, or an
+ * `http:` URL whose host is loopback, with no userinfo, query, or fragment; rejects everything
+ * else with a human-readable reason. A path is allowed (a relay may be served under a subpath).
+ *
+ * The canonical form is `URL.origin` (lowercased, punycode host, default port dropped) plus the
+ * parsed pathname with trailing slashes stripped — never the caller's raw text — so the value
+ * stored in a pin, compared against a `?relay=` link, and shown to the human is one unambiguous
+ * string. `./pairing.ts` `parseIdentity` requires a stored pin to equal this form.
+ */
+export function checkRelayUrl(candidate: string): RelayUrlCheck {
+  const trimmed = candidate.trim();
+  if (trimmed.length === 0) {
+    return { ok: false, reason: "Enter a relay URL, e.g. https://relay.example.com" };
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return {
+      ok: false,
+      reason: "Enter a valid relay URL, e.g. https://relay.example.com",
+    };
+  }
+  const secure =
+    parsed.protocol === "https:" ||
+    (parsed.protocol === "http:" && LOOPBACK_HOSTNAMES.has(parsed.hostname));
+  if (!secure) return { ok: false, reason: INSECURE_RELAY_URL_REASON };
+  if (hasUrlExtras(trimmed, parsed)) return { ok: false, reason: RELAY_URL_EXTRAS_REASON };
+  return { ok: true, relayUrl: parsed.origin + parsed.pathname.replace(/\/+$/, "") };
+}
 
 /** Where {@link resolveRelayUrl} reads the query string and persisted value from. */
 export interface RelayUrlSource {
@@ -36,57 +118,90 @@ export interface RelayUrlSource {
   readonly storage: Storage;
 }
 
-/**
- * Validate and canonicalize a candidate relay URL. Returns `null` for anything that is not an
- * absolute `http:`/`https:` URL (fail-closed — malformed input is never treated as configured).
- * Trailing slashes are stripped so the stored value matches the canonical form `relay-poll.ts` /
- * `account-state.ts` already normalize internally.
- */
-function normalizeRelayUrl(candidate: string): string | null {
-  const trimmed = candidate.trim();
-  if (trimmed.length === 0) return null;
-  let parsed: URL;
-  try {
-    parsed = new URL(trimmed);
-  } catch {
-    return null;
-  }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
-  return trimmed.replace(/\/+$/, "");
+/** Outcome of {@link resolveRelayUrl}. */
+export interface RelayUrlResolution {
+  /** The candidate relay URL, or `null` when none is configured (render the config gate). */
+  readonly relayUrl: string | null;
+  /**
+   * Why a `?relay=` value was rejected, when one was present and failed {@link checkRelayUrl} —
+   * surfaced in {@link mountRelayConfigGate} so the human sees an actionable error rather than a
+   * silently-ignored link. `null` when no query value was present or it was accepted.
+   */
+  readonly rejectedQueryReason: string | null;
 }
 
 /**
- * Resolve the relay URL from the query string, falling back to storage. When the query string
- * carries a valid `?relay=` value it is persisted so the origin is remembered without the query
- * string on a future visit (e.g. a home-screen bookmark). Returns `null` when no valid relay URL
- * is available from either source — the caller should render {@link mountRelayConfigGate}.
+ * Resolve the **pre-pairing** candidate relay URL from the query string, falling back to storage.
+ * A valid `?relay=` value is persisted so the origin is remembered without the query string on a
+ * future visit (e.g. a home-screen bookmark). Never call this for a paired device — its relay is
+ * pinned in the stored identity; use {@link describeIgnoredRelayOverride} instead.
  */
-export function resolveRelayUrl(source: RelayUrlSource): string | null {
-  const params = new URLSearchParams(source.search);
-  const fromQuery = params.get(RELAY_URL_QUERY_PARAM);
+export function resolveRelayUrl(source: RelayUrlSource): RelayUrlResolution {
+  const fromQuery = readRelayQueryValue(source.search);
+  let rejectedQueryReason: string | null = null;
   if (fromQuery !== null) {
-    const normalized = normalizeRelayUrl(fromQuery);
-    if (normalized !== null) {
-      source.storage.setItem(RELAY_URL_STORAGE_KEY, normalized);
-      return normalized;
+    const checked = checkRelayUrl(fromQuery);
+    if (checked.ok) {
+      source.storage.setItem(RELAY_URL_STORAGE_KEY, checked.relayUrl);
+      return { relayUrl: checked.relayUrl, rejectedQueryReason: null };
     }
-    // A malformed query value falls through to any previously-stored value rather than wiping it.
+    // A rejected query value falls through to any previously-stored value rather than wiping it.
+    rejectedQueryReason = checked.reason;
   }
-  const stored = source.storage.getItem(RELAY_URL_STORAGE_KEY);
-  return stored !== null ? normalizeRelayUrl(stored) : null;
+  return { relayUrl: readStoredRelayUrl(source.storage), rejectedQueryReason };
 }
 
-// ── Small config UI (issue #180's third allowed option) ─────────────────────────────────────────
-
-/** Options for {@link mountRelayConfigGate}. */
-export interface RelayConfigGateOptions {
-  /** The DOM element to render the config prompt into. */
-  readonly root: HTMLElement;
-  /** Injectable storage seam. Production callers pass `window.localStorage`. */
-  readonly storage: Storage;
-  /** Called once with the validated, persisted relay URL. */
-  readonly onConfigured: (relayUrl: string) => void;
+/**
+ * The persisted pre-pairing relay URL, re-validated on read (a value written by an older build
+ * before the https-only rule is rejected here, fail-closed). `null` when absent or invalid.
+ */
+export function readStoredRelayUrl(storage: Storage): string | null {
+  const stored = storage.getItem(RELAY_URL_STORAGE_KEY);
+  if (stored === null) return null;
+  const checked = checkRelayUrl(stored);
+  return checked.ok ? checked.relayUrl : null;
 }
+
+/** The raw `?relay=` value, or `null` when the parameter is absent. */
+function readRelayQueryValue(search: string): string | null {
+  return new URLSearchParams(search).get(RELAY_URL_QUERY_PARAM);
+}
+
+/** Longest raw `?relay=` text echoed back in a notice when it is not a parseable URL. */
+const MAX_ECHOED_RELAY_TEXT = 120;
+
+/**
+ * For a **paired** device: if the page was opened with a `?relay=` that differs from the pinned
+ * relay, return the text naming what was ignored (the requested URL's origin, or the raw value
+ * truncated when it does not parse); otherwise `null`. Pure — it never persists or contacts
+ * anything, so the override has no effect beyond the notice.
+ */
+export function describeIgnoredRelayOverride(
+  search: string,
+  pinnedRelayUrl: string,
+): string | null {
+  const requested = readRelayQueryValue(search);
+  if (requested === null) return null;
+  const checked = checkRelayUrl(requested);
+  if (checked.ok && checked.relayUrl === pinnedRelayUrl) return null;
+  try {
+    return new URL(requested.trim()).origin;
+  } catch {
+    const raw = requested.trim();
+    return raw.length > MAX_ECHOED_RELAY_TEXT ? `${raw.slice(0, MAX_ECHOED_RELAY_TEXT)}…` : raw;
+  }
+}
+
+/** The display origin of a canonical relay URL (falls back to the URL itself if unparseable). */
+export function relayOrigin(relayUrl: string): string {
+  try {
+    return new URL(relayUrl).origin;
+  } catch {
+    return relayUrl;
+  }
+}
+
+// ── DOM helpers ──────────────────────────────────────────────────────────────────────────────────
 
 function el<Tag extends keyof HTMLElementTagNameMap>(
   tag: Tag,
@@ -107,16 +222,71 @@ function text<Tag extends keyof HTMLElementTagNameMap>(
   return element;
 }
 
+// ── Ignored-override notice (#249) ───────────────────────────────────────────────────────────────
+
+/** Options for {@link mountIgnoredRelayNotice}. */
+export interface IgnoredRelayNoticeOptions {
+  /** The element the notice renders into (`#notices` in `public/index.html`, outside `#app`). */
+  readonly host: HTMLElement;
+  /** What {@link describeIgnoredRelayOverride} returned for the ignored `?relay=` value. */
+  readonly ignored: string;
+  /** The relay URL pinned in the stored identity. */
+  readonly pinnedRelayUrl: string;
+}
+
+/**
+ * Render a persistent notice that a `?relay=` link was ignored because this browser is paired
+ * with a pinned relay. It renders into a host outside `#app` so it stays visible as the pairing
+ * gate hands off to the inbox. All attacker-influenced text goes through `textContent`.
+ */
+export function mountIgnoredRelayNotice(options: IgnoredRelayNoticeOptions): void {
+  const { host, ignored, pinnedRelayUrl } = options;
+  const notice = el("div", "relay-pin-notice");
+  notice.setAttribute("role", "status");
+  notice.append(text("strong", "Relay link ignored. ", "relay-pin-notice-title"));
+  notice.append(
+    document.createTextNode(
+      `This browser is paired with ${relayOrigin(pinnedRelayUrl)} and only talks to that relay. ` +
+        "The link asked to use ",
+    ),
+  );
+  notice.append(text("code", ignored, "relay-pin-notice-origin"));
+  notice.append(
+    document.createTextNode(
+      "; nothing was sent there. To use another relay, clear this site's data, then open the new link.",
+    ),
+  );
+  host.replaceChildren(notice);
+}
+
+// ── Small config UI (issue #180's third allowed option) ─────────────────────────────────────────
+
+/** Options for {@link mountRelayConfigGate}. */
+export interface RelayConfigGateOptions {
+  /** The DOM element to render the config prompt into. */
+  readonly root: HTMLElement;
+  /** Injectable storage seam. Production callers pass `window.localStorage`. */
+  readonly storage: Storage;
+  /** Called once with the validated, persisted relay URL. */
+  readonly onConfigured: (relayUrl: string) => void;
+  /**
+   * An error to show on first render — e.g. why a `?relay=` link was rejected
+   * ({@link RelayUrlResolution.rejectedQueryReason}).
+   */
+  readonly initialError?: string | null;
+}
+
 /**
  * Render a minimal one-field prompt for the relay URL when neither a `?relay=` query param nor a
  * previously-persisted value is available. On valid submission the URL is persisted (so a
  * subsequent visit resolves it via {@link resolveRelayUrl} without this prompt) and
- * `onConfigured` fires; on invalid input (empty, non-`http(s)`) an inline error is shown and
- * `onConfigured` never fires — structurally mirrors {@link mountPairingGate}'s fail-closed shape.
+ * `onConfigured` fires; on invalid input (empty, malformed, or insecure per
+ * {@link checkRelayUrl}) an inline error is shown and `onConfigured` never fires — structurally
+ * mirrors `mountPairingGate`'s fail-closed shape.
  */
 export function mountRelayConfigGate(options: RelayConfigGateOptions): void {
   const { root, storage, onConfigured } = options;
-  render(null);
+  render(options.initialError ?? null);
 
   function render(errorMessage: string | null): void {
     root.replaceChildren();
@@ -162,13 +332,13 @@ export function mountRelayConfigGate(options: RelayConfigGateOptions): void {
 
     form.addEventListener("submit", (event) => {
       event.preventDefault();
-      const normalized = normalizeRelayUrl(input.value);
-      if (normalized === null) {
-        render("Enter a valid relay URL, e.g. https://relay.example.com");
+      const checked = checkRelayUrl(input.value);
+      if (!checked.ok) {
+        render(checked.reason);
         return;
       }
-      storage.setItem(RELAY_URL_STORAGE_KEY, normalized);
-      onConfigured(normalized);
+      storage.setItem(RELAY_URL_STORAGE_KEY, checked.relayUrl);
+      onConfigured(checked.relayUrl);
     });
 
     shell.append(form);

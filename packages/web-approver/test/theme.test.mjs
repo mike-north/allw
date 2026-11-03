@@ -10,7 +10,8 @@
  *
  *   - the page defaults to the light theme (`theme-light` on `<html>`) so it is never unstyled
  *     before any script runs;
- *   - the inline theme script upgrades to `theme-dark` when the OS/browser reports a dark
+ *   - the theme script (`public/theme.js`, external since #249's CSP forbids inline script)
+ *     upgrades to `theme-dark` when the OS/browser reports a dark
  *     preference (`prefers-color-scheme: dark`), the actual mechanism a browser uses;
  *   - switching between `theme-light`/`theme-dark` changes the *resolved* value of the tokens
  *     `styles.css` depends on (`--bg`, `--ink`) — i.e. dark mode is not just present in
@@ -18,6 +19,7 @@
  *     fixes.
  *
  * @see ../public/index.html
+ * @see ../public/theme.js
  * @see ../public/styles.css
  * @see ../../../design/web-approver/inbox/tokens.css (the vendored source of truth, ENG rule 19)
  */
@@ -32,8 +34,9 @@ import { JSDOM } from "jsdom";
 const publicDir = new URL("../public/", import.meta.url).pathname;
 
 /**
- * Load `public/index.html` for real — real stylesheet fetch/parse (`resources: "usable"`), real
- * inline `<script>` execution (`runScripts: "dangerously"`) — with an injected `matchMedia` stub
+ * Load `public/index.html` for real — real stylesheet fetch/parse and `theme.js` load
+ * (`resources: "usable"`), real script execution (`runScripts: "dangerously"`) — with an injected
+ * `matchMedia` stub
  * so the dark-preference branch of the theme script is exercised deterministically (jsdom does not
  * implement `matchMedia` itself). `prefersDark` controls what `(prefers-color-scheme: dark)`
  * reports; a fresh listener list is captured so a test can simulate a live preference change.

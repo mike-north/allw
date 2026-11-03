@@ -600,6 +600,36 @@ input {
   border: 1px solid var(--border);
 }
 
+/* The relay a new pairing will pin (#249) — shown before the human commits */
+.pairing-relay {
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  padding: 14px 16px;
+}
+
+.pairing-relay-label {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-2);
+}
+
+.pairing-relay-url {
+  display: block;
+  margin-top: 4px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.pairing-relay-note {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
 /* Error banner — fail-closed: always visible on validation failure */
 .pairing-error-banner {
   border-radius: 8px; /* --r-sm */
@@ -796,4 +826,23 @@ input {
     width: 100%;
     text-align: center;
   }
+}
+
+/* Ignored ?relay= link on a paired browser (#249). Lives in #notices, outside #app, so it stays
+   visible across the pairing → inbox hand-off. Amber "caution" palette from tokens.css. */
+.relay-pin-notice {
+  margin: var(--step-3) auto 0;
+  max-width: 640px;
+  border-radius: var(--r-sm);
+  padding: 10px 14px;
+  color: var(--risk-med-fg);
+  background: var(--risk-med-bg);
+  border: 1px solid var(--risk-med-edge);
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.relay-pin-notice-origin {
+  font-family: var(--font-mono);
 }
