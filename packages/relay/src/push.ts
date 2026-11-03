@@ -81,7 +81,7 @@ export function warnPushServiceRejection(
   );
 }
 
-/** Outcome of one fan-out: which tokens' wakeups the push services accepted, and which to prune. */ /** Outcome of one fan-out: which tokens' wakeups the push services accepted, and which to prune. */
+/** Outcome of one fan-out: which tokens' wakeups the push services accepted, and which to prune. */
 export interface PushDispatchResult {
   /** Tokens whose wakeup the push service accepted (a 2xx). */
   readonly deliveredTokens: readonly StoredPushToken[];
