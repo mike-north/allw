@@ -44,9 +44,36 @@ relay account object
 ```
 
 The relay device registry and the signed account-state document are deliberately separate. The registry is the
-online routing/encryption view the relay enforces; signed account state is the verifier/device trust view that
-includes revocation, device signing keys, actor keys, and root rotation state. The relay may store the latest
-account state, but it cannot author it.
+online routing view the relay enforces (presence sockets, push fan-out); today it is also where `requestApproval`
+gets its encryption recipients, which the recipient selection rule below replaces. Signed account state is the
+verifier/device trust view that includes revocation, device signing keys, actor keys, and root rotation state. The
+relay may store the latest account state, but it cannot author it.
+
+**Recipient selection rule.** This is the core rule the SDK is adopting for who may read a request: the devices a
+request may be encrypted to are defined by root-signed account state, never by the registry. The core's
+`select_recipients(account_states, account_id, account_root_pub, now_ms, min_sequence)` implements it; the SDK
+adopts it in #243, and until then `requestApproval` still encrypts to every device in the registry. It returns
+`{ device_id, encryption_pubkey }` for each device that is `active`, not revoked, and whose signed
+`cert_expires_at` (when present) is after `now_ms`, in the highest-sequence documents that verify against the root.
+It is fail-closed throughout:
+
+- more than `MAX_ACCOUNT_STATES` (64) documents is an error, checked before any signature work;
+- every supplied document must verify, or the selection fails (a bad document is never skipped);
+- lower-sequence documents contribute nothing;
+- a caller that persists the highest sequence it has accepted passes it as `min_sequence`; a highest supplied
+  sequence below that floor is an error, never a fallback to the older state;
+- a device whose `cert_expires_at` is at or before `now_ms` is not a recipient;
+- when several verified documents share the highest sequence, a device counts only if all of them list it active,
+  unrevoked, unexpired, and with the same encryption key (a conflict can only remove readers); likewise, within
+  one document, a device id listed more than once counts only if every entry is active and unexpired with the
+  same key;
+- an empty `device_id` in a highest-sequence document, or an all-zero encryption key on a selected device, is an
+  error;
+- no document, no remaining device, or more than `MAX_RECIPIENTS` (16) is an error, never an empty list.
+
+Revocation is not permanent across sequences. Only the highest sequence counts, so a later root-signed document
+that lists a previously revoked device as active, with no revocation entry, makes it a recipient again. That is
+root-authorized: the root holder can always re-enroll a device, and the signed sequence is the authority.
 
 The approval primitive has two independent device keys:
 
@@ -102,7 +129,9 @@ account_id = base64url-unpadded( SHA-256( "allw/account-id/v1" || 0x00 || accoun
 ## Requirements
 
 1. Private keys and seeds must never cross the relay boundary.
-2. A device may receive encrypted requests only while it is enrolled in the relay device registry.
+2. A device may receive encrypted requests only while it is enrolled in the relay device registry. Under the
+   recipient selection rule (§Model; adopted by the SDK in #243) it must also be listed `active`, unrevoked and
+   unexpired in the highest root-signed account state.
 3. A device may resolve a request only while it is still enrolled.
 4. A verifier must accept a verdict only if its `device_cert` chains to an acceptable account root and the verdict
    itself verifies under the certified device signing key.
@@ -121,8 +150,9 @@ account_id = base64url-unpadded( SHA-256( "allw/account-id/v1" || 0x00 || accoun
 
 Device enrollment binds an approver device to an account in two places:
 
-1. **Relay device registry:** `device_id -> device_encryption_pubkey`, used by integrators to encrypt
-   `ApprovalContext` JWE recipients and by the relay to route presence sockets.
+1. **Relay device registry:** `device_id -> device_encryption_pubkey`, used by the relay to route presence sockets
+   and, until the SDK adopts the recipient selection rule (§Model, #243), by integrators to encrypt
+   `ApprovalContext` JWE recipients.
 2. **Device certificate:** `device_cert`, an EdDSA compact JWS signed by the account root, binding
    `device_id -> device_signing_pubkey` for verdict verification.
 
@@ -193,7 +223,7 @@ root-signed `device_cert` can make a verdict key trusted.
 
 ## Cross-Device `device_cert` Issuance Ceremony
 
-> **Status:** decided (#175). This section owns the path by which a device that is **not** the account-root
+> **Status:** decided (#175); relay courier not implemented (#199). This section owns the path by which a device that is **not** the account-root
 > holder — an iPhone, a Mac, a browser — obtains a root-signed `device_cert` without its signing key ever
 > leaving the hardware that generated it. Wire detail for the relay endpoints lives in
 > [relay-api.md](./relay-api.md) §Enrollment courier; the adversary analysis lives in
@@ -413,7 +443,8 @@ key) or the certificate (it is not a trust anchor). Its shape/ownership checks a
   generated on-device; the signing seed goes to Keychain/Secure Enclave and is never part of the CSR.
 - **Web approver**: no camera required — the human pastes the `https://<host>/#<b64url>` link, and the fragment
   never reaches the server. Everything else is identical.
-- **`allw-approver` CLI** plays **A** (`enroll` verb: start, render QR + link, poll, verify MAC, prompt with the
+- **`allw-approver` CLI** — **specified, not implemented (#199)**; the CLI has no `enroll` verb today (only
+  `pair`, `watch`, `keygen`, `help`). It is to play **A** (`enroll` verb: start, render QR + link, poll, verify MAC, prompt with the
   confirmation code, issue, publish, post). It can also play **B** for a second CLI install, which makes the
   ceremony testable end-to-end without a phone.
 
@@ -853,7 +884,9 @@ request's `ApprovalContext`, the SDK resolves the revoked device id set from the
 account-state documents (the highest-sequence root-signed state(s) — same semantics as offline verdict
 verification) and drops any relay-listed device that appears there, regardless of what `GET /devices` actually
 returns. If every enrolled device is revoked, `requestApproval` throws rather than submitting a request no
-trusted device can decrypt (fail-closed, never a silent send-to-nobody). This closes the gap where a revoked
+trusted device can decrypt (fail-closed, never a silent send-to-nobody). **This holds only when the caller passes
+verified `accountStates`; no shipped integrator (`@allw/hook`, `@allw/codex-hook`, `@allw/openclaw-bridge`) does
+yet (#243), and without them the filter is a no-op.** With them, it closes the gap where a revoked
 device would otherwise keep receiving every new request's plaintext context indefinitely, bounded only by how
 promptly the relay's registry converges — the relay is untrusted input, so sender-side filtering is the layer
 that actually holds. **A root-authorized relay-side eviction (the account root revoking another device's
@@ -865,7 +898,8 @@ Pending requests:
 
 - If a revoked device already holds a ciphertext, it may still be able to decrypt that old context.
 - It must not be able to resolve the request after revocation because the relay rejects its verdict and the
-  integrator checks account-state revocation before accepting a verdict.
+  integrator checks account-state revocation before accepting a verdict — again only when the integrator passes
+  verified `accountStates`, which no shipped integrator does yet (#243).
 
 ### Actor Revocation
 
@@ -910,24 +944,26 @@ If the account root is suspected compromised:
 
 ## Relay API Implications
 
-Current relay mechanics cover the registry subset and #89 adds relay-scoped endpoint tokens:
+Current relay mechanics cover the registry subset and #89 adds relay-scoped endpoint tokens. The
+`/enrollments/*` rows below (and the token notes that mention them) are **specified, not implemented (#199)**:
+`packages/relay/src/index.ts` has no enrollment routes today.
 
-| Endpoint                           | Enrollment meaning                                                                      |
-| ---------------------------------- | --------------------------------------------------------------------------------------- |
-| `POST /pairing/start`              | Root-authorized: create a short-lived single-use device enrollment code; bind the root. |
-| `POST /pairing/complete`           | Redeem the code with its pairing bearer token and store a device encryption public key. |
-| `POST /enrollments/start`          | Open a single-use cert-issuance mailbox pair for the ceremony (#175).                   |
-| `POST /enrollments/{id}/csr`       | Enrollee deposits its MAC-authenticated CSR (write-once).                               |
-| `GET /enrollments/{id}/csr`        | Root holder collects the CSR to verify and certify.                                     |
-| `POST /enrollments/{id}/cert`      | Root holder deposits the issued `device_cert` (write-once, opaque to the relay).        |
-| `GET /enrollments/{id}/cert`       | Enrollee collects its `device_cert` and verifies it against the pinned root.            |
-| `POST /enrollments/{id}/abort`     | Root holder terminates a ceremony fail-closed and visibly.                              |
-| `GET /devices`                     | Return active device encryption public keys for JWE recipients.                         |
-| `POST /devices/{device_id}/revoke` | Remove an active device and close its live socket.                                      |
-| `POST /actors`                     | Enroll an actor public key.                                                             |
-| `GET /actors`                      | List enrolled actor public keys.                                                        |
-| `POST /account-states`             | Root-authorized: publish account-state docs the relay verifies against the bound root.  |
-| `GET /account-states`              | Unauthenticated: fetch the relay-verified docs plus their `max_sequence`.               |
+| Endpoint                           | Enrollment meaning                                                                                       |
+| ---------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `POST /pairing/start`              | Root-authorized: create a short-lived single-use device enrollment code; bind the root.                  |
+| `POST /pairing/complete`           | Redeem the code with its pairing bearer token and store a device encryption public key.                  |
+| `POST /enrollments/start`          | Open a single-use cert-issuance mailbox pair for the ceremony (#175). Not implemented (#199).            |
+| `POST /enrollments/{id}/csr`       | Enrollee deposits its MAC-authenticated CSR (write-once). Not implemented (#199).                        |
+| `GET /enrollments/{id}/csr`        | Root holder collects the CSR to verify and certify. Not implemented (#199).                              |
+| `POST /enrollments/{id}/cert`      | Root holder deposits the issued `device_cert` (write-once, opaque to the relay). Not implemented (#199). |
+| `GET /enrollments/{id}/cert`       | Enrollee collects its `device_cert` and verifies it against the pinned root. Not implemented (#199).     |
+| `POST /enrollments/{id}/abort`     | Root holder terminates a ceremony fail-closed and visibly. Not implemented (#199).                       |
+| `GET /devices`                     | Return active device encryption public keys for JWE recipients.                                          |
+| `POST /devices/{device_id}/revoke` | Remove an active device and close its live socket.                                                       |
+| `POST /actors`                     | Enroll an actor public key.                                                                              |
+| `GET /actors`                      | List enrolled actor public keys.                                                                         |
+| `POST /account-states`             | Root-authorized: publish account-state docs the relay verifies against the bound root.                   |
+| `GET /account-states`              | Unauthenticated: fetch the relay-verified docs plus their `max_sequence`.                                |
 
 Endpoint authentication and authorization rules:
 

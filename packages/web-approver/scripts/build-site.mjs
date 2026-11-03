@@ -59,8 +59,9 @@ export const DEFAULT_RELAY_ORIGINS = ["https://allw-relay.mnorth.workers.dev"];
 const RELAY_CONNECT_SRC_PLACEHOLDER = "__ALLW_RELAY_CONNECT_SRC__";
 
 /**
- * Hosts on which a plaintext `http:` relay is tolerated (mirrors `src/relay-config.ts`, minus
- * `[::1]`: an IPv6 literal cannot be written as a CSP host-source — see {@link relayConnectSources}).
+ * Hosts on which a plaintext `http:` relay is tolerated — the same set as `src/relay-config.ts`.
+ * The IPv6 loopback `[::1]` is excluded everywhere because an IPv6 literal cannot be written as a
+ * CSP host-source (see {@link relayConnectSources}).
  */
 const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1"]);
 

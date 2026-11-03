@@ -596,7 +596,11 @@ test("origin fail-closed: relay max_sequence above verified docs renders ⚠ UNV
     /⚠ UNVERIFIED/,
     "a relay max_sequence not backed by root-verified docs must downgrade the origin",
   );
-  assert.match(prompter.renders[0], /max_sequence 2 exceeds highest root-verified sequence 1/);
+  // The reason is long, so the renderer hard-wraps it; match it with the wrap markers removed.
+  assert.match(
+    prompter.renders[0].replaceAll("\n  ↪ ", ""),
+    /max_sequence 2 exceeds highest root-verified sequence 1/,
+  );
 });
 
 test("origin fail-closed: persisted account-state floor rejects compromised relay rollback", async () => {

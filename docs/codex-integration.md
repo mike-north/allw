@@ -28,7 +28,7 @@ Recommended hook configuration:
         "hooks": [
           {
             "type": "command",
-            "command": "npx allw-codex-hook",
+            "command": "npx --no-install allw-codex-hook",
             "timeout": 480,
             "statusMessage": "Requesting allw approval"
           }
@@ -39,10 +39,25 @@ Recommended hook configuration:
 }
 ```
 
-> `npx allw-codex-hook` resolves the installed bin. If your Codex launch environment does not see
-> the project's `node_modules/.bin` on `PATH`, use the absolute path to the resolved bin instead
-> (find it with `node -e "console.log(require.resolve('@allw/codex-hook/package.json'))"` → the
-> `dist/cli.js` beside it), e.g. `"command": "node /abs/path/to/@allw/codex-hook/dist/cli.js"`.
+> **Use `npx --no-install allw-codex-hook`, never plain `npx allw-codex-hook`.** `--no-install` runs
+> the installed bin (project or global) and exits 1 if there is none; plain `npx` would download and
+> run whatever registry package has that name, so a squatted package would run as the gate (checked
+> on npm 10.9.4 and 11.21.1). If your Codex launch environment doesn't run from the project
+> directory, use the absolute path to the installed bin instead (find it with
+> `node -e "console.log(require.resolve('@allw/codex-hook/package.json'))"` → the `dist/cli.js`
+> beside it), e.g. `"command": "node /abs/path/to/@allw/codex-hook/dist/cli.js"`.
+
+### If the hook can't start
+
+If Codex can't start the hook (a wrong path, `node` missing from `PATH`, `npx --no-install` finding
+no installed bin), **the tool call goes ahead ungated.** Codex reports the hook run as failed and
+continues; it has no setting to block on hook failure (Claude Code's `onFailure: "block"` has no
+Codex equivalent). The [Codex hooks docs](https://learn.chatgpt.com/docs/hooks) don't spell out the
+spawn-failure case, so this was checked in the source: in
+[`pre_tool_use.rs`](https://github.com/openai/codex/blob/29eed280828d498fead76c3c5dedd9642836b571/codex-rs/hooks/src/events/pre_tool_use.rs#L211-L216)
+a run error marks the hook `Failed` and leaves `should_block` false (checked 2026-11-02). After any
+change to the hook command, run one gated call and confirm it reaches your approver; a hook error
+in the Codex transcript means nothing was gated. See [Fail-Open Residual](#fail-open-residual).
 
 ## Quickstart
 
@@ -59,18 +74,27 @@ This is the Codex-parallel install path for developers who already have a paired
    Confirm it's installed and which version you have (useful for bug reports):
 
    ```sh
-   npx allw-codex-hook --version
+   npx --no-install allw-codex-hook --version
    ```
 
-2. Export the relay and account trust anchor (the hosted relay,
+2. Write the integrator config file `~/.allw/config.json` (`0600`, in a `0700` `~/.allw`) with the
+   relay and account trust anchor printed by `allw-approver pair` — the same file the Claude Code
+   hook and `@allw/sdk` read ([`docs/quickstart.md`](./quickstart.md) §4). The hosted relay,
    `https://allw-relay.mnorth.workers.dev`, needs no Cloudflare account; substitute your own URL if
-   you self-hosted per [`docs/relay-deploy.md`](./relay-deploy.md)):
+   you self-hosted per [`docs/relay-deploy.md`](./relay-deploy.md):
 
-   ```sh
-   export ALLW_RELAY_URL="https://allw-relay.mnorth.workers.dev"
-   export ALLW_ACCOUNT_ID="acct_..."
-   export ALLW_APPROVER_ROOT_KEY="..."
+   ```json
+   {
+     "version": 1,
+     "relay_url": "https://allw-relay.mnorth.workers.dev",
+     "account_id": "<account id from pair>",
+     "approver_root_key": "<account-root public key from pair>"
+   }
    ```
+
+   The `ALLW_RELAY_URL` / `ALLW_ACCOUNT_ID` / `ALLW_APPROVER_ROOT_KEY` env vars still work as
+   per-field overrides (env wins), and `ALLW_CONFIG` moves the file (it must be an absolute path;
+   a leading `~/` is expanded).
 
 3. Add the `PreToolUse` block above to `~/.codex/hooks.json` or a trusted project
    `.codex/hooks.json`.
@@ -164,15 +188,20 @@ The matcher intentionally matches the hook's v1 surfaces:
 
 ## Decision Mapping
 
-The hook reads the same allw environment as the Claude Code hook:
+The hook reads the same allw config as the Claude Code hook — `~/.allw/config.json` through
+`@allw/sdk`'s `loadClientConfig` — with these env vars as overrides:
 
-| Variable                 | Required | Meaning                                                       |
-| ------------------------ | -------- | ------------------------------------------------------------- |
-| `ALLW_RELAY_URL`         | yes      | Base URL of the zero-knowledge relay.                         |
-| `ALLW_ACCOUNT_ID`        | yes      | The approver's relay account id.                              |
-| `ALLW_APPROVER_ROOT_KEY` | yes      | The approver account-root Ed25519 public key.                 |
-| `ALLW_TIMEOUT_MS`        | no       | Fail-closed approval deadline in ms, capped below hook time.  |
-| `ALLW_FETCH_TIMEOUT_MS`  | no       | Per-relay-fetch timeout in ms, only allowed to lower the cap. |
+| Variable                 | Required | Meaning                                                                                                                                                                                                 |
+| ------------------------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ALLW_CONFIG`            | no       | Config-file path (default `~/.allw/config.json`); must be an **absolute** path (a leading `~/` is expanded; a relative path is rejected, since it would resolve against the agent's working directory). |
+| `ALLW_RELAY_URL`         | no       | Overrides `relay_url`: base URL of the zero-knowledge relay.                                                                                                                                            |
+| `ALLW_ACCOUNT_ID`        | no       | Overrides `account_id`: the approver's self-certifying relay account id.                                                                                                                                |
+| `ALLW_APPROVER_ROOT_KEY` | no       | Overrides `approver_root_key`: the approver account-root Ed25519 key.                                                                                                                                   |
+| `ALLW_TIMEOUT_MS`        | no       | Fail-closed approval deadline in ms, capped below hook time.                                                                                                                                            |
+| `ALLW_FETCH_TIMEOUT_MS`  | no       | Per-relay-fetch timeout in ms, only allowed to lower the cap.                                                                                                                                           |
+
+With neither the file nor the overrides, or with an invalid file, every gated call is denied with a
+reason naming both ways to configure.
 
 For gated calls, the hook builds the syntactic `ActionRecord`, requests approval through
 `@allw/sdk`, and maps the verdict to what it writes to stdout. Only `deny` is ever an explicit wire

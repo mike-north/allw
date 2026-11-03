@@ -23,7 +23,7 @@ import {
 } from "../lib/approver-core.js";
 import { readKeyfile, writeKeyfile, type Keyfile } from "../lib/keyfile.js";
 import { deviceConnectWsUrl, fetchAccountStatesWithMetadata } from "../lib/relay-client.js";
-import { renderRequest } from "../lib/render.js";
+import { DEFAULT_COLUMNS, renderRequest } from "../lib/render.js";
 import type { AllwWasm } from "../lib/wasm.js";
 import type { Decision, DeviceInboundMessage } from "../lib/types.js";
 
@@ -75,6 +75,24 @@ const defaultLogger: WatchLogger = {
     console.error(line);
   },
 };
+
+/**
+ * Wrap a logger so every line passes through the core's `escape_for_display` before it reaches the
+ * terminal (#246). Log lines interpolate relay-supplied text (request ids, relay error strings,
+ * ack statuses) and core error messages; a malicious relay could otherwise send an `ESC`/`CR`
+ * sequence that repaints the request block while the human is reading the prompt. Escaping is
+ * idempotent, so wrapping an already-wrapped logger is harmless.
+ */
+export function displaySafeLogger(log: WatchLogger, wasm: AllwWasm): WatchLogger {
+  return {
+    info: (line) => {
+      log.info(wasm.escape_for_display(line));
+    },
+    warn: (line) => {
+      log.warn(wasm.escape_for_display(line));
+    },
+  };
+}
 
 /** Remove relay bearer capabilities from URLs before printing them to terminals or captured logs. */
 function redactAuthQuery(url: string): string {
@@ -175,11 +193,12 @@ export async function handleRequest(
   ws: WebSocketLike,
   prompter: Prompter,
   rawEnvelope: unknown,
-  log: WatchLogger,
+  rawLog: WatchLogger,
   now: () => number = Date.now,
   resolveAccountStates: AccountStateResolver = () => Promise.resolve([]),
   recordAccountStateSequence?: (sequence: number) => void,
 ): Promise<Decision | null> {
+  const log = displaySafeLogger(rawLog, wasm);
   let prepared: RenderableRequest;
   try {
     // Pass the current clock so prepareRequest can fail-closed on an already-expired request
@@ -206,7 +225,7 @@ export async function handleRequest(
     relayMaxSequence = resolved.maxSequence;
   } catch (err) {
     log.warn(
-      `Could not resolve account state for '${prepared.context.actor.id}' — rendering origin as unverified: ${(err as Error).message}`,
+      `Could not resolve account state for '${prepared.display.actor_id}' — rendering origin as unverified: ${(err as Error).message}`,
     );
     accountStates = [];
   }
@@ -265,15 +284,17 @@ export async function handleRequest(
   } catch (err) {
     origin = {
       verified: false as const,
-      reason: `account-state sequence check failed: ${(err as Error).message}`,
+      reason: wasm.escape_for_display(
+        `account-state sequence check failed: ${(err as Error).message}`,
+      ),
     };
   }
   const preparedWithOrigin: RenderableRequest = { ...prepared, origin };
 
-  const rendered = renderRequest(preparedWithOrigin);
+  const rendered = renderRequest(preparedWithOrigin, terminalColumns());
   const promptDecision = normalizePromptResult(await prompter.decide(rendered, preparedWithOrigin));
   if (promptDecision === null) {
-    log.info(`No decision recorded for ${prepared.requestId} — leaving it pending.`);
+    log.info(`No decision recorded for ${prepared.displayRequestId} — leaving it pending.`);
     return null;
   }
 
@@ -282,7 +303,7 @@ export async function handleRequest(
   // expired during the prompt must emit nothing, never a stale-but-signed approval.
   if (prepared.expiresAt <= now()) {
     log.warn(
-      `Request ${prepared.requestId} expired while awaiting a decision — discarding (fail-closed).`,
+      `Request ${prepared.displayRequestId} expired while awaiting a decision — discarding (fail-closed).`,
     );
     return null;
   }
@@ -301,13 +322,22 @@ export async function handleRequest(
     );
   } catch (err) {
     // A signing failure must NOT emit a partial/forged verdict — abort this request.
-    log.warn(`Failed to sign verdict for ${prepared.requestId}: ${(err as Error).message}`);
+    log.warn(`Failed to sign verdict for ${prepared.displayRequestId}: ${(err as Error).message}`);
     return null;
   }
 
   ws.send(JSON.stringify({ type: "verdict", request_id: prepared.requestId, verdict }));
-  log.info(`Sent ${promptDecision.decision} verdict for ${prepared.requestId}.`);
+  log.info(`Sent ${promptDecision.decision} verdict for ${prepared.displayRequestId}.`);
   return promptDecision.decision;
+}
+
+/**
+ * The width the request block is wrapped to: the terminal's when stdout is a TTY, else
+ * {@link DEFAULT_COLUMNS}.
+ */
+function terminalColumns(): number {
+  const { isTTY, columns } = process.stdout;
+  return isTTY && columns > 0 ? columns : DEFAULT_COLUMNS;
 }
 
 /** A readline-backed prompter for the interactive CLI. */
@@ -353,7 +383,7 @@ export async function runWatch(
     now?: () => number;
   },
 ): Promise<void> {
-  const log = deps.log ?? defaultLogger;
+  const log = displaySafeLogger(deps.log ?? defaultLogger, wasm);
   // readKeyfile returns a VALIDATED Keyfile (validateKeyfile): the required seeds/pubkeys are
   // well-formed base64url-32-byte keys and every optional pairing field is a string-or-absent. So a
   // present relay_url/account_id/device_id is guaranteed a string here — a corrupt non-string field

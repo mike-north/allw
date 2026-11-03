@@ -18,15 +18,37 @@ hook reimplements none of it. See [`docs/architecture.md`](../../docs/architectu
 
 ## Install & configure
 
-The hook reads its configuration from the environment, so there is no config file of its own:
+The hook reads the relay coordinates and the approver trust anchor through the shared
+[`@allw/sdk`](../sdk) `loadClientConfig` loader: **one non-secret config file**,
+`~/.allw/config.json` (moved with `ALLW_CONFIG`), with per-field env-var overrides (env wins):
 
-| Variable                 | Required | Meaning                                                                                                                                                                 |
-| ------------------------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ALLW_RELAY_URL`         | yes      | Base URL of the zero-knowledge relay.                                                                                                                                   |
-| `ALLW_ACCOUNT_ID`        | yes      | The approver's relay account id (routes to their devices).                                                                                                              |
-| `ALLW_APPROVER_ROOT_KEY` | yes      | The approver account-root Ed25519 public key (base64url).                                                                                                               |
-| `ALLW_TIMEOUT_MS`        | no       | Fail-closed deadline in ms (default `300000` = 5 minutes; must be **below `420000`** — see [the timeout-ordering invariant](#the-timeout-ordering-invariant-issue-52)). |
-| `ALLW_FETCH_TIMEOUT_MS`  | no       | Per-relay-fetch timeout in ms (default/max `30000`); may lower the SDK default for faster fail-closed decisions, but may not raise it.                                  |
+```json
+{
+  "version": 1,
+  "relay_url": "https://relay.example.com",
+  "account_id": "<account id printed by allw-approver pair>",
+  "approver_root_key": "<account-root public key printed by allw-approver pair>"
+}
+```
+
+Keep it `0600` in a `0700` `~/.allw`: it holds no secrets, but `approver_root_key` is your trust
+anchor — whoever can rewrite it can redirect approvals. On POSIX the loader enforces this on read:
+a file not owned by you, or group- or world-writable, is rejected (fix with `chmod 600`), as is
+anything that is not a regular file (a FIFO, device, directory) or is over 64 KiB.
+
+| Variable                 | Required | Meaning                                                                                                                                                                                                                                            |
+| ------------------------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ALLW_CONFIG`            | no       | Config-file path (default `~/.allw/config.json`). When set, the file must exist and the path must be an **absolute** path (a leading `~/` is expanded; a relative path is rejected, since it would resolve against the agent's working directory). |
+| `ALLW_RELAY_URL`         | no       | Overrides `relay_url`: base URL of the zero-knowledge relay.                                                                                                                                                                                       |
+| `ALLW_ACCOUNT_ID`        | no       | Overrides `account_id`: the approver's self-certifying relay account id (must derive from the root key).                                                                                                                                           |
+| `ALLW_APPROVER_ROOT_KEY` | no       | Overrides `approver_root_key`: the approver account-root Ed25519 public key (base64url-unpadded, 32 bytes).                                                                                                                                        |
+| `ALLW_TIMEOUT_MS`        | no       | Fail-closed deadline in ms (default `300000` = 5 minutes; must be **below `420000`** — see [the timeout-ordering invariant](#the-timeout-ordering-invariant-issue-52)).                                                                            |
+| `ALLW_FETCH_TIMEOUT_MS`  | no       | Per-relay-fetch timeout in ms (default/max `30000`); may lower the SDK default for faster fail-closed decisions, but may not raise it.                                                                                                             |
+
+Each of `relay_url`, `account_id`, `approver_root_key` must come from the file or its env override.
+With neither, or with a malformed/unknown-version/incomplete file, a malformed root key, or an
+account id that does not derive from the root key, every gated call is **denied** with a reason
+naming the file path and the env vars.
 
 Pair an approver device first (e.g. with [`@allw/approver`](../approver)) to obtain the account id and
 the account-root public key.
@@ -45,7 +67,8 @@ for direct file edits, and `mcp__.*` for any MCP tool call:
           {
             "type": "command",
             "command": "node /absolute/path/to/packages/hook/dist/cli.js",
-            "timeout": 480
+            "timeout": 480,
+            "onFailure": "block"
           }
         ]
       }
@@ -54,8 +77,20 @@ for direct file edits, and `mcp__.*` for any MCP tool call:
 }
 ```
 
-> Use an absolute path to `dist/cli.js` (or the resolved `allw-hook` bin). The `command` is run under
-> `node`; there is no native binary to sign or allow-list.
+> Use an absolute path to `dist/cli.js`, or `npx --no-install allw-hook`. **Never plain
+> `npx allw-hook`:** when no installed bin resolves, plain `npx` downloads and runs the registry
+> package of that name, so a squatted package would run as the gate; `--no-install` exits 1 instead
+> (checked on npm 10.9.4 and 11.21.1). The `command` is run under `node`; there is no native binary
+> to sign or allow-list.
+
+> **Set `"onFailure": "block"`** (Claude Code v2.1.295 or later; older versions ignore the key
+> without warning, so check `claude --version`). Without it, if Claude Code can't start the hook (a
+> wrong path, `node` missing from `PATH`, the package not installed), the [hooks
+> reference](https://code.claude.com/docs/en/hooks#exit-code-output) treats that as a non-blocking
+> error and **the tool call goes ahead ungated**. With it, Claude Code [blocks the
+> call](https://code.claude.com/docs/en/hooks#block-the-action-when-a-hook-fails) when the hook
+> fails to start, exits with a code other than 0 or 2, or times out. This hook exits 0 on every
+> decision, deny included, so the setting only matters when the hook never gets to decide.
 
 > **Always pin `"timeout"`** (here `480`, in seconds). Without it the hook inherits Claude Code's
 > 600s default, and a too-large `ALLW_TIMEOUT_MS` could let that timeout fire before the hook decides
@@ -68,8 +103,8 @@ before any external timeout fires.** This must never depend on what Claude Code 
 fails to emit a decision, because that behavior is fail-**open** and partly undocumented:
 
 - Claude Code's command-hook `timeout` defaults to **600 seconds**.
-- A hook **timeout** is treated as a _non-blocking error_ → **the tool proceeds** (fail-open). Claude
-  Code's exact behavior on hook timeout is otherwise undocumented and version-dependent.
+- A hook **timeout** does not block the call → **the tool proceeds** through Claude Code's normal
+  permission flow (fail-open), unless the hook sets `"onFailure": "block"`.
 - (Likewise, a non-zero, non-2 hook _exit code_ is a non-blocking error → the tool proceeds.)
 
 So we never rely on it. The invariant we control:
@@ -160,7 +195,7 @@ The primitive never returns a bare "allow"; the hook composes it. Every uncertai
 | Gated, the `ActionRecord` could not be built                 | `deny`                 |
 | Gated, the approval request threw (network/relay/no devices) | `deny`                 |
 | Malformed hook stdin (not JSON, wrong event, …)              | `deny`                 |
-| Missing/invalid configuration                                | `deny`                 |
+| Missing/invalid configuration (file and env)                 | `deny`                 |
 | Any unexpected internal error                                | `deny`                 |
 
 A verdict is `allow` **only** when it is delivered, cryptographically verified against the approver's

@@ -15,7 +15,12 @@ import type { ApproverIdentity } from "./approver-harness.js";
 
 /** Pairing parameters for {@link buildPairedApprover}. */
 export interface PairingParams {
-  readonly accountId: string;
+  /**
+   * The account id to certify. Omit it to use the self-certifying id the core derives from the
+   * generated account root (`account_id_for_root`, `docs/enrollment.md` §Model) — required by any
+   * surface that reads config through `loadClientConfig`, such as the hook.
+   */
+  readonly accountId?: string;
   readonly deviceId: string;
   readonly relayUrl: string;
   /** Cert issuance time (ms). Optional cert expiry is omitted (not the thing under test). */
@@ -30,9 +35,10 @@ export interface PairingParams {
  */
 export function buildPairedApprover(wasm: AllwWasm, params: PairingParams): ApproverIdentity {
   const fresh = generateKeyfile(wasm);
+  const accountId = params.accountId ?? wasm.account_id_for_root(fresh.account_root_pubkey);
   const cert = wasm.issue_device_cert(
     fresh.account_root_seed,
-    params.accountId,
+    accountId,
     params.deviceId,
     fresh.device_signing_pubkey,
     params.issuedAt,
@@ -40,7 +46,7 @@ export function buildPairedApprover(wasm: AllwWasm, params: PairingParams): Appr
   const keyfile: Keyfile = {
     ...fresh,
     relay_url: params.relayUrl,
-    account_id: params.accountId,
+    account_id: accountId,
     device_id: params.deviceId,
     device_cert: cert,
     ...(params.label !== undefined ? { label: params.label } : {}),

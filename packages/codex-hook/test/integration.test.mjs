@@ -19,7 +19,14 @@ import { assertConformsToPreToolUseOutputContract } from "./support/codex-schema
 
 const NOW_MS = 1_700_000_000_000;
 const TIMEOUT_MS = 300_000;
-const ACCOUNT_ID = "acct-codex-integration";
+// Accounts are self-certifying (docs/enrollment.md §Model): the id is the core's derivation from
+// the account-root key (seed 41, below), so the shared config loader's derivation check passes.
+const ACCOUNT_ID = await (async () => {
+  const wasm = await loadWasm();
+  return wasm.account_id_for_root(
+    wasm.ed25519_public_key(Buffer.alloc(32, 41).toString("base64url")),
+  );
+})();
 const DEVICE_ID = "dev-codex-integration";
 const DEVICE_LABEL = "codex test device";
 
