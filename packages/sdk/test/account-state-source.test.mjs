@@ -24,11 +24,13 @@ import { execFile } from "node:child_process";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
   statSync,
+  symlinkSync,
   unlinkSync,
   utimesSync,
   writeFileSync,
@@ -45,7 +47,7 @@ import {
   relayAccountStateSource,
   SequenceFloorError,
 } from "../dist/index.js";
-import { fileSequenceFloorStoreWith } from "../dist/account-state-source.js";
+import { breakLockIfStale, fileSequenceFloorStoreWith } from "../dist/account-state-source.js";
 import { RelayClient, RelayError } from "../dist/relay.js";
 import { signedAccountState } from "./fixtures/account-state.mjs";
 
@@ -222,7 +224,13 @@ test(
       { accountId: ACCOUNT_ID, dir },
       { geteuid: () => (process.geteuid?.() ?? 0) + 1 },
     );
-    await assert.rejects(() => store.read(), /cannot be trusted \(wrong_owner\)/);
+    // The faked uid also makes the state directory "another user's", and read() checks the
+    // directory first; either refusal denies. The file-level wrong_owner check is shared with the
+    // config loader and covered by its tests.
+    await assert.rejects(
+      () => store.read(),
+      /state directory is owned by another user|cannot be trusted \(wrong_owner\)/,
+    );
   },
 );
 
@@ -245,22 +253,101 @@ test("floor: concurrent raises in one process converge on the maximum", async ()
   assert.equal(await store.read(), 59);
 });
 
+// Review F3: only this user can plant a link inside the 0700 state dir, but a floor that a link
+// redirects is not one this package wrote, so it is refused on both read and raise, and the link's
+// target is never written through.
+test(
+  "floor: a symlinked floor file is refused on read and raise; its target is untouched",
+  { skip: process.platform === "win32" },
+  async () => {
+    const dir = tempDir();
+    const target = join(tempDir(), "real.json");
+    const body = JSON.stringify({ v: 1, account_id: ACCOUNT_ID, sequence: 9 });
+    writeFileSync(target, body, { mode: 0o600 });
+    chmodSync(target, 0o600);
+    symlinkSync(target, floorPath(dir));
+    const store = fileSequenceFloorStore({ accountId: ACCOUNT_ID, dir });
+    await assert.rejects(() => store.read(), /cannot be trusted \(open_failed\)/);
+    await assert.rejects(() => store.raise(12), /cannot be trusted \(open_failed\)/);
+    assert.equal(readFileSync(target, "utf8"), body, "the link's target is never written");
+    assert.ok(lstatSync(floorPath(dir)).isSymbolicLink(), "the link is not replaced either");
+  },
+);
+
+test(
+  "floor: a symlinked state directory is refused on read and raise",
+  { skip: process.platform === "win32" },
+  async () => {
+    const realDir = tempDir();
+    writeFloorFile(realDir, { v: 1, account_id: ACCOUNT_ID, sequence: 4 });
+    const linkDir = join(tempDir(), "state");
+    symlinkSync(realDir, linkDir);
+    const store = fileSequenceFloorStore({ accountId: ACCOUNT_ID, dir: linkDir });
+    await assert.rejects(() => store.read(), /state directory is not a directory/);
+    await assert.rejects(() => store.raise(5), /state directory is not a directory/);
+  },
+);
+
+test(
+  "floor: read() refuses a state dir that is group/world-writable or another user's (review F3)",
+  { skip: process.platform === "win32" || isRoot },
+  async () => {
+    const writable = tempDir();
+    writeFloorFile(writable, { v: 1, account_id: ACCOUNT_ID, sequence: 2 });
+    chmodSync(writable, 0o777);
+    try {
+      await assert.rejects(
+        () => fileSequenceFloorStore({ accountId: ACCOUNT_ID, dir: writable }).read(),
+        /state directory is group- or world-writable/,
+      );
+    } finally {
+      chmodSync(writable, 0o700);
+    }
+    const foreign = tempDir(); // exists, holds no floor: the directory check still runs
+    await assert.rejects(
+      () =>
+        fileSequenceFloorStoreWith(
+          { accountId: ACCOUNT_ID, dir: foreign },
+          { geteuid: () => (process.geteuid?.() ?? 0) + 1 },
+        ).read(),
+      /state directory is owned by another user/,
+    );
+  },
+);
+
+test("floor: read() with no state directory yet is first use, not an error", async () => {
+  const store = fileSequenceFloorStore({ accountId: ACCOUNT_ID, dir: join(tempDir(), "absent") });
+  assert.equal(await store.read(), undefined);
+});
+
 test("floor: racing writer processes never lose the highest value", async () => {
-  const dir = tempDir();
+  // One writer records TOP once while six others spam lower values (review F4). Without the lock,
+  // a spammer that read the floor before TOP landed renames its lower value over it; spreading the
+  // spam across the TOP write makes that clobber window wide, so a missing lock is caught every
+  // round rather than now and then.
   const writer = join(here, "fixtures", "floor-writer.mjs");
-  const WRITERS = 6;
-  const TOP = 300;
-  // Writer w raises w, w+6, w+12, … — every writer is mid-stream while the others write, and the
-  // last value of the writer holding TOP-1 is the one a lost update would drop.
-  const runs = Array.from({ length: WRITERS }, (_, w) => {
-    const sequences = [];
-    for (let s = w; s < TOP; s += WRITERS) sequences.push(String(s));
-    return run(process.execPath, [writer, dir, ACCOUNT_ID, ...sequences]);
-  });
-  await Promise.all(runs);
-  const store = fileSequenceFloorStore({ accountId: ACCOUNT_ID, dir });
-  assert.equal(await store.read(), TOP - 1, "the floor is the maximum any writer recorded");
-  assert.deepEqual(readdirSync(dir), [`${ACCOUNT_ID}.floor.json`], "no temp or lock file left");
+  const SPAMMERS = 6;
+  const PER_SPAMMER = 150;
+  const TOP = 100_000;
+  for (let round = 0; round < 3; round++) {
+    const dir = tempDir();
+    const spam = Array.from({ length: SPAMMERS }, (_, w) =>
+      run(process.execPath, [
+        writer,
+        dir,
+        ACCOUNT_ID,
+        ...Array.from({ length: PER_SPAMMER }, (_, i) => String(w * PER_SPAMMER + i + 1)),
+      ]),
+    );
+    const top = (async () => {
+      await new Promise((resolve) => setTimeout(resolve, 150)); // land TOP mid-spam
+      await run(process.execPath, [writer, dir, ACCOUNT_ID, String(TOP)]);
+    })();
+    await Promise.all([...spam, top]);
+    const store = fileSequenceFloorStore({ accountId: ACCOUNT_ID, dir });
+    assert.equal(await store.read(), TOP, `round ${String(round)}: TOP survives every lower write`);
+    assert.deepEqual(readdirSync(dir), [`${ACCOUNT_ID}.floor.json`], "no temp or lock file left");
+  }
 });
 
 test("floor: a raise waiting on the lock re-reads under it and never lowers a newer floor", async () => {
@@ -276,6 +363,78 @@ test("floor: a raise waiting on the lock re-reads under it and never lowers a ne
   unlinkSync(lock);
   await pending;
   assert.equal(await store.read(), 7, "the newer floor survives");
+});
+
+// Review F2, replayed step by step: breaker B judges a crashed writer's lock L0 stale; meanwhile A
+// breaks L0 and C takes a fresh lock L1; B moves L1 aside, and D takes L2 at the now-free path. B
+// must give L1 back without replacing L2 (an older rename-back put L1 over L2, so C and D both held
+// "the" lock and the floor could lose an update C had already accepted).
+test("floor: a breaker that moved a fresh lock never replaces a newer one (review F2)", () => {
+  const dir = tempDir();
+  const lock = `${floorPath(dir)}.lock`;
+  writeFileSync(lock, "L0 crashed\n", { mode: 0o600 });
+  const old = new Date(NOW_MS - 120_000);
+  utimesSync(lock, old, old);
+  breakLockIfStale(lock, () => NOW_MS, {
+    afterJudgedStale: () => {
+      unlinkSync(lock); // A breaks L0
+      writeFileSync(lock, "L1 C\n", { flag: "wx", mode: 0o600 }); // C takes L1
+    },
+    afterMovedAside: () => {
+      writeFileSync(lock, "L2 D\n", { flag: "wx", mode: 0o600 }); // D takes the free path
+    },
+  });
+  assert.equal(readFileSync(lock, "utf8"), "L2 D\n", "D's newer lock is untouched");
+  assert.deepEqual(readdirSync(dir), [`${ACCOUNT_ID}.floor.json.lock`], "no .stale file left");
+});
+
+test("floor: a fresh lock moved aside by a breaker is linked back intact for its owner", () => {
+  const dir = tempDir();
+  const lock = `${floorPath(dir)}.lock`;
+  writeFileSync(lock, "L0 crashed\n", { mode: 0o600 });
+  const old = new Date(NOW_MS - 120_000);
+  utimesSync(lock, old, old);
+  let freshIno;
+  breakLockIfStale(lock, () => NOW_MS, {
+    afterJudgedStale: () => {
+      unlinkSync(lock);
+      writeFileSync(lock, "L1 C\n", { flag: "wx", mode: 0o600 });
+      freshIno = statSync(lock).ino;
+    },
+  });
+  assert.equal(readFileSync(lock, "utf8"), "L1 C\n");
+  assert.equal(statSync(lock).ino, freshIno, "the same file, so its owner still holds it");
+  assert.deepEqual(readdirSync(dir), [`${ACCOUNT_ID}.floor.json.lock`], "no .stale file left");
+});
+
+test("floor: a writer whose lock was taken over fails closed and leaves the newer lock (review F2)", async () => {
+  const dir = tempDir();
+  writeFloorFile(dir, { v: 1, account_id: ACCOUNT_ID, sequence: 3 });
+  const lock = `${floorPath(dir)}.lock`;
+  const store = fileSequenceFloorStoreWith(
+    { accountId: ACCOUNT_ID, dir },
+    {
+      // While this writer holds the lock, a breaker removes it and another writer takes a new one.
+      afterLockAcquired: () => {
+        unlinkSync(lock);
+        writeFileSync(lock, "other writer\n", { flag: "wx", mode: 0o600 });
+      },
+    },
+  );
+  await assert.rejects(
+    () => store.raise(9),
+    (err) => err instanceof SequenceFloorError && /taken over by another writer/.test(err.message),
+  );
+  assert.equal(
+    await fileSequenceFloorStore({ accountId: ACCOUNT_ID, dir }).read(),
+    3,
+    "not written",
+  );
+  assert.equal(
+    readFileSync(lock, "utf8"),
+    "other writer\n",
+    "the other writer's lock survives release",
+  );
 });
 
 test("floor: a stale lock from a crashed writer is broken", async () => {
@@ -304,6 +463,36 @@ test("floor: a live lock that is never released fails closed after the timeout",
   assert.equal(existsSync(floorPath(dir)), false, "no floor written without the lock");
   assert.equal(existsSync(lock), true, "another writer's live lock is left alone");
 });
+
+// Review N7: the lock path is built from the same env-derived directory as the floor path, so the
+// timeout message shows it escaped too.
+test(
+  "floor: the lock-timeout message shows the lock path escaped",
+  { skip: process.platform === "win32" },
+  async () => {
+    const dir = join(tempDir(), "line\nbreak\u001b[31m");
+    mkdirSync(dir, { mode: 0o700 });
+    writeFileSync(`${floorPath(dir)}.lock`, "12345\n", { mode: 0o600 });
+    let clock = NOW_MS;
+    const store = fileSequenceFloorStoreWith(
+      { accountId: ACCOUNT_ID, dir },
+      { now: () => (clock += 1000) },
+    );
+    await assert.rejects(
+      () => store.raise(4),
+      (err) => {
+        assert.match(err.message, /lock is held by another writer \(.*\.floor\.json\.lock\)/);
+        assert.doesNotMatch(err.message, /[\u0000-\u001f\u007f]/, "no raw control characters");
+        assert.match(
+          err.message,
+          /line\\u000abreak\\u001b\[31m.*line\\u000abreak/,
+          "both paths escaped",
+        );
+        return true;
+      },
+    );
+  },
+);
 
 // ── relay GET /{account}/account-states body validation ──────────────────────────────
 

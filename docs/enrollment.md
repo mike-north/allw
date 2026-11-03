@@ -86,8 +86,9 @@ rather than trusted. If recording the floor fails, the request is not sent.
 The SDK's `relayAccountStateSource` fetches `GET /{account}/account-states` (unauthenticated: every document is
 verified in the core against the configured root) once per request and uses that one set for both sealing and
 verdict revocation checks. Its `fileSequenceFloorStore` keeps the floor at
-`~/.allw/state/<account_id>.floor.json` and fails closed on any file it cannot trust; only a missing file means
-"no floor yet". The Claude Code hook, the Codex hook and the OpenClaw bridge all use these two.
+`~/.allw/state/<account_id>.floor.json` and fails closed on any file or state directory it cannot trust (a symlink
+included); only a missing file means "no floor yet". The Claude Code hook, the Codex hook and the OpenClaw bridge all
+use these two; the bridge keeps its floor under `ALLW_OPENCLAW_STATE_DIR/state` when that is set.
 
 Account state exists only once the root holder publishes it. `allw-approver pair` publishes the next state (the
 previous verified state's devices plus this one, at `sequence + 1`) before it writes the paired keyfile; until an

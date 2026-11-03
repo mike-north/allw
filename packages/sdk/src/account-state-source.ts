@@ -13,13 +13,20 @@
  *
  * - **Fail-closed reads.** A missing file means "first use" (no floor). Anything else that is not a
  *   well-formed floor for this account — unreadable, corrupt, wrong owner or mode, not a regular
- *   file, oversized — throws, which denies the request. It is never read as `0`.
+ *   file, a symlink, oversized, or in a state directory that is not a directory this user owns and
+ *   only this user can write — throws, which denies the request. It is never read as `0`.
  * - **Monotonic, race-free writes.** Several hook processes can record a floor at once. A writer
  *   takes an exclusive lockfile, re-reads the floor, writes `max(stored, sequence)` to a temp file
  *   and renames it into place, then releases the lock. A plain read-max-write without the lock can
  *   lose a higher value to a slower writer holding a lower one.
+ * - **Stale locks.** A lock older than 30 s is a crashed writer's and is broken: renamed aside, and
+ *   deleted only if it is still the file judged stale. A fresh lock moved by mistake is linked back,
+ *   never renamed over a newer one. A holder confirms the lock file is still its own just before it
+ *   commits the floor and before it releases, so a lock lost to a breaker fails that write closed
+ *   rather than letting two writers commit.
  * - **No path tricks.** The account id must have the self-certifying id's syntax (43 base64url
- *   characters) before it becomes part of a path.
+ *   characters) before it becomes part of a path, and the floor file is opened without following a
+ *   symlink.
  *
  * @see ../../../docs/enrollment.md §Model (recipient selection rule; sequence floor)
  * @see ./user-file.ts (the shared ownership/mode checks)
@@ -28,7 +35,9 @@
 import { randomUUID } from "node:crypto";
 import {
   closeSync,
+  fstatSync,
   fsyncSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -115,6 +124,22 @@ export interface FileSequenceFloorStoreOptions {
 export interface FileSequenceFloorStoreDeps extends UserFileCheckDeps {
   /** Override the clock used for lock staleness. Defaults to `Date.now`. */
   readonly now?: () => number;
+  /** Runs after a writer takes the lock, before it re-reads and commits (race tests). */
+  readonly afterLockAcquired?: () => void;
+  /** Interleaving points inside {@link breakLockIfStale} (race tests). */
+  readonly lockBreak?: LockBreakHooks;
+}
+
+/**
+ * Interleaving points inside {@link breakLockIfStale}, for tests that replay a race step by step.
+ *
+ * @internal
+ */
+export interface LockBreakHooks {
+  /** After the lock was judged stale, before it is moved aside. */
+  readonly afterJudgedStale?: () => void;
+  /** After the lock was moved aside, before the moved file is checked. */
+  readonly afterMovedAside?: () => void;
 }
 
 /** The default state directory, `~/.allw/state`. */
@@ -147,7 +172,10 @@ export function fileSequenceFloorStoreWith(
   const lockPath = `${path}.lock`;
   const now = deps.now ?? Date.now;
 
-  const read = (): number | undefined => readFloor(path, options.accountId, deps);
+  const read = (): number | undefined => {
+    checkStateDir(dir, path, deps);
+    return readFloor(path, options.accountId, deps);
+  };
 
   return {
     read: () => Promise.resolve().then(read),
@@ -159,13 +187,21 @@ export function fileSequenceFloorStoreWith(
       const before = read();
       if (before !== undefined && before >= sequence) return;
       ensureStateDir(dir, path, deps);
-      const release = await acquireLock(lockPath, path, now);
+      const lock = await acquireLock(lockPath, path, now, deps.lockBreak);
       try {
+        deps.afterLockAcquired?.();
         const stored = read();
         if (stored !== undefined && stored >= sequence) return;
-        writeFloorAtomically(path, options.accountId, sequence);
+        writeFloorAtomically(path, options.accountId, sequence, () => {
+          if (!lock.stillHeld()) {
+            throw new SequenceFloorError(
+              path,
+              "lock was taken over by another writer before this write committed",
+            );
+          }
+        });
       } finally {
-        release();
+        lock.release();
       }
     },
   };
@@ -175,7 +211,7 @@ export function fileSequenceFloorStoreWith(
 function readFloor(path: string, accountId: string, deps: UserFileCheckDeps): number | undefined {
   let text: string | null;
   try {
-    text = readUserOwnedFile(path, MAX_FLOOR_FILE_BYTES, deps);
+    text = readUserOwnedFile(path, MAX_FLOOR_FILE_BYTES, deps, { noFollow: true });
   } catch (cause) {
     const problem = cause instanceof UserFileError ? cause.problem.kind : "unreadable";
     throw new SequenceFloorError(path, `cannot be trusted (${problem})`, { cause });
@@ -206,8 +242,7 @@ function readFloor(path: string, accountId: string, deps: UserFileCheckDeps): nu
 }
 
 /**
- * Create the state directory `0700` if missing, and refuse one this user does not own or that
- * others can write (they could replace the floor file between our reads).
+ * Create the state directory `0700` if missing, then apply {@link checkStateDir}.
  */
 function ensureStateDir(dir: string, path: string, deps: UserFileCheckDeps): void {
   try {
@@ -215,7 +250,22 @@ function ensureStateDir(dir: string, path: string, deps: UserFileCheckDeps): voi
   } catch (cause) {
     throw new SequenceFloorError(path, "state directory could not be created", { cause });
   }
-  const stat = lstatSync(dir);
+  checkStateDir(dir, path, deps);
+}
+
+/**
+ * Refuse a state directory that is not a real directory (a symlink included), that this user does
+ * not own, or that others can write: they could replace the floor file between our reads. A
+ * missing directory passes, since it holds no floor yet (first use).
+ */
+function checkStateDir(dir: string, path: string, deps: UserFileCheckDeps): void {
+  let stat;
+  try {
+    stat = lstatSync(dir);
+  } catch (cause) {
+    if (errorCode(cause) === "ENOENT") return;
+    throw new SequenceFloorError(path, "state directory cannot be inspected", { cause });
+  }
   if (!stat.isDirectory()) {
     throw new SequenceFloorError(path, "state directory is not a directory");
   }
@@ -230,8 +280,16 @@ function ensureStateDir(dir: string, path: string, deps: UserFileCheckDeps): voi
   }
 }
 
-/** Write the floor to a fresh temp file in the same directory and rename it over the floor file. */
-function writeFloorAtomically(path: string, accountId: string, sequence: number): void {
+/**
+ * Write the floor to a fresh temp file in the same directory and rename it over the floor file.
+ * `beforeCommit` runs just before the rename and may throw to abandon the write.
+ */
+function writeFloorAtomically(
+  path: string,
+  accountId: string,
+  sequence: number,
+  beforeCommit: () => void,
+): void {
   const tmp = `${path}.${String(process.pid)}.${randomUUID()}.tmp`;
   const body = `${JSON.stringify({ v: FLOOR_FILE_VERSION, account_id: accountId, sequence })}\n`;
   try {
@@ -242,6 +300,7 @@ function writeFloorAtomically(path: string, accountId: string, sequence: number)
     } finally {
       closeSync(fd);
     }
+    beforeCommit();
     renameSync(tmp, path);
   } catch (cause) {
     try {
@@ -249,8 +308,17 @@ function writeFloorAtomically(path: string, accountId: string, sequence: number)
     } catch {
       // The temp file may never have been created; nothing to clean up.
     }
+    if (cause instanceof SequenceFloorError) throw cause;
     throw new SequenceFloorError(path, "could not be written", { cause });
   }
+}
+
+/** A floor lock this writer holds, identified by the lock file's device and inode. */
+interface HeldLock {
+  /** Whether the file at the lock path is still this writer's lock (not broken and replaced). */
+  stillHeld(): boolean;
+  /** Remove the lock, but only while it is still this writer's: never delete a newer lock. */
+  release(): void;
 }
 
 /**
@@ -259,35 +327,76 @@ function writeFloorAtomically(path: string, accountId: string, sequence: number)
  * it aside and checking it is still the same file, so a writer never breaks a fresh lock that
  * replaced the stale one. Returns the release function.
  */
-async function acquireLock(lockPath: string, path: string, now: () => number): Promise<() => void> {
+async function acquireLock(
+  lockPath: string,
+  path: string,
+  now: () => number,
+  hooks: LockBreakHooks = {},
+): Promise<HeldLock> {
   const deadline = now() + FLOOR_LOCK_TIMEOUT_MS;
   for (;;) {
     try {
       const fd = openSync(lockPath, "wx", 0o600);
-      writeSync(fd, `${String(process.pid)}\n`);
-      closeSync(fd);
-      return () => {
+      let ino: number;
+      let dev: number;
+      try {
+        writeSync(fd, `${String(process.pid)}\n`);
+        ({ ino, dev } = fstatSync(fd));
+      } finally {
+        closeSync(fd);
+      }
+      const stillHeld = (): boolean => {
         try {
-          unlinkSync(lockPath);
+          const current = lstatSync(lockPath);
+          return current.ino === ino && current.dev === dev;
         } catch {
-          // Already broken as stale by another writer; nothing to release.
+          return false;
         }
+      };
+      return {
+        stillHeld,
+        release() {
+          if (!stillHeld()) return; // Broken as stale meanwhile; a newer lock is not ours to remove.
+          try {
+            unlinkSync(lockPath);
+          } catch {
+            // Already gone; nothing to release.
+          }
+        },
       };
     } catch (cause) {
       if (errorCode(cause) !== "EEXIST") {
         throw new SequenceFloorError(path, "lock could not be taken", { cause });
       }
     }
-    breakLockIfStale(lockPath, now);
+    breakLockIfStale(lockPath, now, hooks);
     if (now() >= deadline) {
-      throw new SequenceFloorError(path, `lock is held by another writer (${lockPath})`);
+      throw new SequenceFloorError(
+        path,
+        `lock is held by another writer (${escapeToPrintableAscii(lockPath, MAX_ESCAPED_DIAGNOSTIC_CHARS)})`,
+      );
     }
     await new Promise((resolve) => setTimeout(resolve, FLOOR_LOCK_RETRY_MS));
   }
 }
 
-/** Remove `lockPath` only if it is stale and is still the same file we judged stale. */
-function breakLockIfStale(lockPath: string, now: () => number): void {
+/**
+ * Remove `lockPath` only if it is stale and is still the same file we judged stale.
+ *
+ * Breaking is rename-aside-then-check, because nothing removes a path only if it is a given file.
+ * When the moved file turns out to be a fresh lock that replaced the stale one, it goes back with
+ * `link`, which fails with `EEXIST` rather than overwrite a lock taken meanwhile (a rename back
+ * would replace it, and two writers would both hold "the" lock). If the link fails, the moved
+ * lock's owner no longer holds the lock; its {@link HeldLock.stillHeld} check sees that and it
+ * fails its write closed.
+ *
+ * @internal
+ */
+export function breakLockIfStale(
+  lockPath: string,
+  now: () => number,
+  hooks: LockBreakHooks = {},
+): void {
   let stale;
   try {
     stale = statSync(lockPath);
@@ -295,18 +404,24 @@ function breakLockIfStale(lockPath: string, now: () => number): void {
     return; // Released meanwhile.
   }
   if (now() - stale.mtimeMs < FLOOR_LOCK_STALE_MS) return;
+  hooks.afterJudgedStale?.();
   const aside = `${lockPath}.${randomUUID()}.stale`;
   try {
     renameSync(lockPath, aside);
   } catch {
     return; // Someone else broke or released it.
   }
+  hooks.afterMovedAside?.();
   try {
     const moved = statSync(aside);
-    if (moved.ino !== stale.ino || moved.mtimeMs !== stale.mtimeMs) {
-      // We moved a fresh lock that replaced the stale one: put it back for its owner.
-      renameSync(aside, lockPath);
-      return;
+    if (moved.ino !== stale.ino || moved.dev !== stale.dev || moved.mtimeMs !== stale.mtimeMs) {
+      // We moved a fresh lock that replaced the stale one: give it back to its owner, but never
+      // over a newer lock (EEXIST leaves the newer one in place).
+      try {
+        linkSync(aside, lockPath);
+      } catch {
+        // A newer lock exists; the moved lock's owner will find it lost and fail closed.
+      }
     }
     unlinkSync(aside);
   } catch {

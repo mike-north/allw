@@ -86,8 +86,10 @@ rejected.
 - **`fileSequenceFloorStore({ accountId })`** keeps the highest sequence used so far in
   `~/.allw/state/<account_id>.floor.json`. A later state below it is refused, which stops a relay
   from rolling back to a state that still lists a revoked device. Only a missing file means "no
-  floor yet". A file that is corrupt, unreadable, not a regular file, owned by another user, or
-  writable by others makes the request fail closed.
+  floor yet". A file that is corrupt, unreadable, not a regular file (a symlink included), owned by
+  another user, or writable by others makes the request fail closed, as does a state directory that
+  is not a real directory, is owned by another user, or is group- or world-writable. Pass `dir` to
+  keep the floor somewhere else.
 - A fixed array of compact account-state documents also works. The caller then owns rollback
   protection.
 - You can write your own `AccountStateSource`. `load()` is called once per request, and that set is

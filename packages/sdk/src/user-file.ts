@@ -74,6 +74,17 @@ export interface UserFileCheckDeps {
   readonly platform?: NodeJS.Platform;
 }
 
+/** How {@link readUserOwnedFile} opens the path. */
+export interface ReadUserOwnedFileOptions {
+  /**
+   * Refuse a symlink at `path` itself (POSIX `O_NOFOLLOW`; the open fails with `ELOOP`, reported
+   * as `open_failed`). For files only this package writes, such as the sequence floor, where a link
+   * can only be a substitution. The config loader leaves it off: a symlinked config file is a
+   * normal dotfile-manager setup, and the target still passes the owner and mode checks.
+   */
+  readonly noFollow?: boolean;
+}
+
 /** The `code` of a Node system error, if any. */
 export function errorCode(err: unknown): string | undefined {
   if (typeof err === "object" && err !== null && "code" in err) {
@@ -93,11 +104,16 @@ export function readUserOwnedFile(
   path: string,
   maxBytes: number,
   deps: UserFileCheckDeps = {},
+  options: ReadUserOwnedFileOptions = {},
 ): string | null {
   const platform = deps.platform ?? process.platform;
-  // O_NONBLOCK is POSIX-only (undefined on Windows, where FIFOs at a path do not exist).
+  // O_NONBLOCK and O_NOFOLLOW are POSIX-only (undefined on Windows, where FIFOs at a path do not
+  // exist).
   const optional: Partial<typeof fsConstants> = fsConstants;
-  const flags = fsConstants.O_RDONLY | (optional.O_NONBLOCK ?? 0);
+  const flags =
+    fsConstants.O_RDONLY |
+    (optional.O_NONBLOCK ?? 0) |
+    (options.noFollow === true ? (optional.O_NOFOLLOW ?? 0) : 0);
   let fd: number;
   try {
     fd = openSync(path, flags);
