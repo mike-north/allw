@@ -32,9 +32,10 @@ import {
 } from "../src/push.js";
 import { WebPushTransport, type VapidConfig } from "../src/web-push.js";
 import { pairingStartBody, testAccount } from "./support/accounts.js";
+import { DEVICE_X25519_PUBKEY } from "./support/keys.js";
 
-/** A 32-byte base64url-unpadded device key (32 × 0x00). */
-const DEVICE_PUBKEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+/** A full-order X25519 device key (pairing rejects small-order keys, #248). */
+const DEVICE_PUBKEY = DEVICE_X25519_PUBKEY;
 /** Far-future expiry (2100-01-01Z, ms) — deterministic and always after the relay's clock. */
 const FUTURE_EXPIRES_AT = 4102444800000;
 /** A fixed creation timestamp (2023-11-14Z, ms). */
