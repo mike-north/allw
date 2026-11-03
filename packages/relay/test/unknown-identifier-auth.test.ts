@@ -141,6 +141,31 @@ describe("request ids: an unknown id answers like a wrong token (#357)", () => {
     });
     expect(owner.status).toBe(200);
   });
+
+  // The state checks (409 for a request already expired) come after the token check, so a
+  // request's state is no more visible than its existence.
+  it("POST /requests/{id}/retract on an expired request: 403 to a stranger, never 409", async () => {
+    const acct = testAccount("acct-oracle-retract-expired");
+    const token = await submit(acct, "req-oracle-retract-expired");
+    await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(acct)), (instance) => {
+      const relay = instance as unknown as { sql: SqlStorage };
+      relay.sql.exec(
+        `UPDATE request SET expires_at = 1 WHERE request_id = ?`,
+        "req-oracle-retract-expired",
+      );
+    });
+    await expectIndistinguishable(
+      (id, t) => call(acct, "POST", `/requests/${id}/retract`, { token: t, body: {} }),
+      "req-oracle-retract-expired",
+      "req-oracle-retract-expired-unknown",
+    );
+    // Only the owner learns the state.
+    const owner = await call(acct, "POST", "/requests/req-oracle-retract-expired/retract", {
+      token,
+      body: {},
+    });
+    expect(owner.status).toBe(409);
+  });
 });
 
 describe("pairing codes: an unknown code answers like a wrong token (#357)", () => {
@@ -177,6 +202,32 @@ describe("pairing codes: an unknown code answers like a wrong token (#357)", () 
     // The probes did not consume the code: its own token still completes the pairing.
     const owner = await complete(acct)(start.code, start.pairing_auth_token);
     expect(owner.status).toBe(201);
+  });
+
+  // The code's state (used → 409, expired → 410) is checked only after its token, so a stranger
+  // cannot tell a used or expired code from an unknown one either.
+  it("a used code answers a stranger like an unknown code, not 409", async () => {
+    const acct = testAccount("acct-oracle-pairing-used");
+    const start = await startPairing(acct);
+    expect((await complete(acct)(start.code, start.pairing_auth_token)).status).toBe(201);
+    const unknown = (await startPairing(testAccount("acct-oracle-pairing-used-elsewhere"))).code;
+
+    await expectIndistinguishable(complete(acct), start.code, unknown);
+    // Only the code's own token learns that it was used.
+    expect((await complete(acct)(start.code, start.pairing_auth_token)).status).toBe(409);
+  });
+
+  it("an expired code answers a stranger like an unknown code, not 410", async () => {
+    const acct = testAccount("acct-oracle-pairing-expired");
+    const start = await startPairing(acct);
+    await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(acct)), (instance) => {
+      const relay = instance as unknown as { sql: SqlStorage };
+      relay.sql.exec(`UPDATE pairing SET expires_at = 1 WHERE code = ?`, start.code);
+    });
+    const unknown = (await startPairing(testAccount("acct-oracle-pairing-expired-elsewhere"))).code;
+
+    await expectIndistinguishable(complete(acct), start.code, unknown);
+    expect((await complete(acct)(start.code, start.pairing_auth_token)).status).toBe(410);
   });
 
   it("a legacy code with no stored token hash answers like an unknown code", async () => {
