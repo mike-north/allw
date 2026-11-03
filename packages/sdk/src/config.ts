@@ -20,11 +20,15 @@
  *
  * # Fail-closed (`docs/contract.md` §Invariants #6)
  * The loader never returns a partial config. It throws a {@link ClientConfigError} — whose message
- * names the file path and the env var(s) to fix, and never echoes the file's contents — when:
+ * names the file path and the env var(s) to fix, and never echoes the file's contents, including
+ * its key names (#301): the hooks put the message in the deny reason the agent reads, and a file
+ * the agent could write must not become text in that channel — when:
  *
  * - there is no file and the env does not supply every field;
  * - `ALLW_CONFIG` / `path` is not absolute (after expanding a leading `~/`) — a relative path would
  *   resolve against the agent's working directory, letting a cloned repo supply the trust anchor;
+ * - neither is set and the default path is not absolute, because `HOME` is relative (#301): the
+ *   same cwd-relative resolution, reached through the home directory;
  * - an explicitly named file (`ALLW_CONFIG` / `path`) does not exist;
  * - the path is not a readable regular file (a FIFO, device, socket or directory is rejected via
  *   `fstat` on the opened descriptor, so it can never block the read), or exceeds
@@ -33,7 +37,8 @@
  * - the file exists but is malformed JSON, is not an object, has an unknown `version`, is missing a
  *   key, has an unknown key, or has a non-string / empty value — even when the env would override
  *   every field (a corrupted trust-anchor file is never silently skipped);
- * - the resolved `relay_url` fails the SDK's transport check (`https:`, or `http:` on loopback);
+ * - the resolved `relay_url` fails the SDK's transport check (`https:`, or `http:` on loopback); a
+ *   rejected value from the file is described by the rule, not echoed;
  * - the resolved `approver_root_key` is not a base64url-unpadded 32-byte Ed25519 public key;
  * - the resolved `account_id` does not derive from `approver_root_key` (accounts are
  *   self-certifying, `docs/enrollment.md` §Model).
@@ -128,9 +133,31 @@ const FIELDS: readonly FieldSpec[] = [RELAY_FIELD, ACCOUNT_FIELD, ROOT_FIELD];
 
 const FILE_KEYS = new Set<string>(["version", ...FIELDS.map((f) => f.key)]);
 
-/** The default config-file location, `~/.allw/config.json`. */
+/**
+ * The default config-file location, `~/.allw/config.json`, built from the home directory (`HOME`
+ * on POSIX). It is relative when `HOME` is; {@link loadClientConfig} refuses to read it then.
+ */
 export function defaultClientConfigPath(): string {
   return join(homedir(), ".allw", "config.json");
+}
+
+/**
+ * The default config path, required to be absolute (#301). A relative `HOME` would otherwise make
+ * the loader read `.allw/config.json` from the agent's working directory, where a cloned repo can
+ * supply the trust anchor. The message does not echo `HOME`.
+ */
+function absoluteDefaultConfigPath(): string {
+  const path = defaultClientConfigPath();
+  if (!isAbsolute(path)) {
+    throw new ClientConfigError(
+      `allw: the default config path is not absolute because the home directory (HOME) is not an ` +
+        `absolute path; a relative path would resolve against the agent's working directory. Set ` +
+        `HOME to an absolute path, or set ${CLIENT_CONFIG_PATH_ENV} to the config file's absolute ` +
+        `path (fail-closed)`,
+      path,
+    );
+  }
+  return path;
 }
 
 /** A non-blank env value, or `null`. */
@@ -342,14 +369,16 @@ function readConfigFile(
       path,
     );
   }
-  for (const key of Object.keys(obj)) {
-    if (!FILE_KEYS.has(key)) {
-      throw new ClientConfigError(
-        `allw: config file ${path} has unknown key '${key}'; version 1 allows only version, ` +
-          `relay_url, account_id and approver_root_key — and never secrets (fail-closed)`,
-        path,
-      );
-    }
+  // Unknown keys are counted, never named (#301): the name is file content, and the message
+  // reaches the agent through the hook's deny reason.
+  const unknownKeys = Object.keys(obj).filter((key) => !FILE_KEYS.has(key)).length;
+  if (unknownKeys > 0) {
+    throw new ClientConfigError(
+      `allw: config file ${path} has ${String(unknownKeys)} unknown ` +
+        `${unknownKeys === 1 ? "key" : "keys"}; version 1 allows only version, relay_url, ` +
+        `account_id and approver_root_key — and never secrets. Remove the other keys (fail-closed)`,
+      path,
+    );
   }
   const out: Record<string, string> = {};
   for (const field of FIELDS) {
@@ -402,7 +431,7 @@ export function loadClientConfigWith(
       ? resolveConfigPath(options.path, "the path option")
       : envPath !== null
         ? resolveConfigPath(envPath, CLIENT_CONFIG_PATH_ENV)
-        : defaultClientConfigPath();
+        : absoluteDefaultConfigPath();
 
   const file = readConfigFile(path, explicit, deps);
 
@@ -437,12 +466,17 @@ export function loadClientConfigWith(
   try {
     assertRelayUrlTransport(relay.value);
   } catch (cause) {
+    // The transport check's message quotes the URL. That is fine for an env value, but a value from
+    // the file is file content (#301), so the rule is stated instead of the rejected value.
+    const reason = relay.fromEnv
+      ? cause instanceof Error
+        ? cause.message
+        : String(cause)
+      : `allw: relay_url must use https:// (plain http:// is allowed only for a local relay on ` +
+        `localhost or 127.0.0.1) and must not include a username, password, query (?) or ` +
+        `fragment (#); expected e.g. https://relay.example.com`;
     throw new ClientConfigError(
-      `${cause instanceof Error ? cause.message : String(cause)} (from ${describeSource(
-        RELAY_FIELD,
-        relay.fromEnv,
-        path,
-      )}; fail-closed)`,
+      `${reason} (from ${describeSource(RELAY_FIELD, relay.fromEnv, path)}; fail-closed)`,
       path,
       { cause },
     );
@@ -465,15 +499,20 @@ export function loadClientConfigWith(
   try {
     wasm.account_id_for_root(root.value);
   } catch (cause) {
+    // The core's message can quote part of the value (the base64 decoder names the offending byte
+    // and its offset). That is fine for an env value, but a value from the file is file content
+    // (#301), so only the rule is stated; the core's error stays on `cause`.
+    const detail = root.fromEnv
+      ? ` (${cause instanceof Error ? cause.message : String(cause)})`
+      : "";
     throw new ClientConfigError(
       `allw: approver_root_key from ${describeSource(
         ROOT_FIELD,
         root.fromEnv,
         path,
-      )} is not a base64url-unpadded 32-byte Ed25519 public key (${
-        cause instanceof Error ? cause.message : String(cause)
-      }). Copy the account-root public key printed by \`allw-approver pair\` into ${path} ` +
-        `or ALLW_APPROVER_ROOT_KEY (fail-closed)`,
+      )} is not a base64url-unpadded 32-byte Ed25519 public key${detail}. Copy the ` +
+        `account-root public key printed by \`allw-approver pair\` into ${path} or ` +
+        `ALLW_APPROVER_ROOT_KEY (fail-closed)`,
       path,
       { cause },
     );

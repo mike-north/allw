@@ -269,6 +269,36 @@ describe("POST /requests body size", () => {
     expect(pull).not.toHaveBeenCalled();
   });
 
+  it("readBodyCapped: a digit-only Content-Length past the safe-integer range is too_large", async () => {
+    for (const declared of [
+      String(Number.MAX_SAFE_INTEGER), // the largest safe integer: a real size, over the cap
+      String(Number.MAX_SAFE_INTEGER + 1), // one past it
+      "99999999999999999999",
+    ]) {
+      const pull = vi.fn();
+      const request = new Request("https://relay.allw.test/a/requests", {
+        method: "POST",
+        headers: { "Content-Length": declared },
+        body: new ReadableStream({ pull }, { highWaterMark: 0 }),
+      });
+      expect(await readBodyCapped(request, MAX_REQUEST_BODY_BYTES), declared).toEqual({
+        kind: "too_large",
+      });
+      expect(pull).not.toHaveBeenCalled();
+    }
+  });
+
+  it("413 through the Worker for a Content-Length past the safe-integer range", async () => {
+    const acct = await freshAccount("body-length-overflow");
+    const resp = await SELF.fetch(relayUrl(acct, "/requests"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Content-Length": "99999999999999999999" },
+      body: "{}",
+    });
+    expect(resp.status).toBe(413);
+    expect(await requestStatuses(acct)).toEqual({});
+  });
+
   it("readBodyCapped: exactly the cap is ok, one byte more is too_large", async () => {
     const at = new Request("https://relay.allw.test/a/requests", { method: "POST", body: "abcd" });
     expect(await readBodyCapped(at, 4)).toEqual({ kind: "ok", text: "abcd" });
@@ -280,12 +310,15 @@ describe("POST /requests body size", () => {
   });
 
   it("readBodyCapped: malformed Content-Length and invalid UTF-8 are unreadable", async () => {
+    const cancel = vi.fn();
     const malformed = new Request("https://relay.allw.test/a/requests", {
       method: "POST",
       headers: { "Content-Length": "12abc" },
-      body: new ReadableStream(),
+      body: new ReadableStream({ cancel }),
     });
     expect(await readBodyCapped(malformed, 1024)).toEqual({ kind: "unreadable" });
+    // The unread body is released, as for an over-cap length.
+    expect(cancel).toHaveBeenCalled();
     const badUtf8 = new Request("https://relay.allw.test/a/requests", {
       method: "POST",
       body: new Uint8Array([0x7b, 0xff, 0x7d]),
@@ -378,6 +411,20 @@ describe("POST /requests expires_at horizon", () => {
       envelope(rid("req-ttl-hook"), { expires_at: NOW + HOOK_MAX_TIMEOUT_MS }),
     );
     expect(result.status).toBe(202);
+  });
+
+  it("accepts an integer expires_at; 400 for a fractional one, and stores nothing", async () => {
+    const acct = await freshAccount("ttl-int");
+    expect(
+      (await submit(acct, envelope(rid("req-ttl-int"), { expires_at: NOW + 60_000 }))).status,
+    ).toBe(202);
+    const fractional = await submit(
+      acct,
+      envelope(rid("req-ttl-frac"), { expires_at: NOW + 60_000.5 }),
+    );
+    expect(fractional.status).toBe(400);
+    expect(fractional.error).toBe("'expires_at' must be an integer (i64 ms)");
+    expect((await requestStatuses(acct))[rid("req-ttl-frac")]).toBeUndefined();
   });
 
   it("still refuses expires_at equal to now (already expired) and accepts now + 1", async () => {
@@ -1096,10 +1143,23 @@ describe("pairing body size caps", () => {
 // ---------------------------------------------------------------------------
 
 describe("POST /requests id must be a canonical UUID", () => {
-  it("accepts a canonical UUID in lower or upper case", async () => {
+  it("accepts a lowercase canonical UUID", async () => {
     const acct = await freshAccount("id-valid");
     expect((await submit(acct, envelope("3f2b8c1e-9a4d-4e7b-8c2f-1a2b3c4d5e6f"))).status).toBe(202);
-    expect((await submit(acct, envelope("3F2B8C1E-9A4D-4E7B-8C2F-1A2B3C4D5E70"))).status).toBe(202);
+  });
+
+  it("400 for an uppercase or mixed-case UUID, never normalized, and stores nothing", async () => {
+    // One UUID gets one identity: the device binds to the id exactly as sent.
+    const acct = await freshAccount("id-upper");
+    for (const bad of [
+      "3F2B8C1E-9A4D-4E7B-8C2F-1A2B3C4D5E70",
+      "3f2b8c1e-9a4d-4e7b-8c2f-1a2b3c4d5e7F",
+    ]) {
+      const result = await submit(acct, envelope(bad));
+      expect(result.status, bad).toBe(400);
+      expect(result.error).toBe("'id' must be a lowercase canonical UUID (8-4-4-4-12 hex)");
+    }
+    expect(await requestStatuses(acct)).toEqual({});
   });
 
   it("400 for an over-long id, and stores nothing", async () => {

@@ -397,9 +397,13 @@ enrolled devices before root binding existed (#264's pre-binding state): they no
 submit and must move to a new account root, as #264 already requires (their first bind is refused
 with 409, see §3 Pairing).
 
-**Request id.** The envelope `id` must be a canonical UUID — 8-4-4-4-12 hex digits, either case
-(contract §Transport requires UUIDv4 or later) — otherwise **400**. This bounds the id, which is
-part of every retained row.
+**Request id.** The envelope `id` must be a UUID in lowercase canonical form — 8-4-4-4-12
+lowercase hex digits (contract §Transport requires UUIDv4 or later) — otherwise **400**. The relay
+never normalizes an id: an upper- or mixed-case id is refused, not lowered. This bounds the id,
+which is part of every retained row.
+
+**`expires_at`.** Must be an integer (i64 ms) — a fractional value ⇒ **400** — and is then held to
+the horizon below.
 
 **`created_at` sanity bound.** The envelope's `created_at` must be an integer (i64 ms), no later
 than `expires_at`, no further back than the request horizon (`now − MAX_REQUEST_TTL_MS`), and no
@@ -419,7 +423,11 @@ Limits on `POST /{acct}/requests` (#248; constants in `packages/relay/src/consta
 | Submits per account + IP      | `RATE_LIMIT_REQUESTS` binding (default 60 / 60 s)                   | **429**        |
 | Unauthenticated calls per IP  | `RATE_LIMIT_CLIENT` binding (default 120 / 60 s, all three routes)  | **429**        |
 
-Each value is inclusive (exactly the limit is accepted). The 15-minute horizon covers the hooks'
+Each value is inclusive (exactly the limit is accepted). The `context_ciphertext` ceiling is the
+one integrators can hit with honest input: it caps the encrypted context, which is larger than the
+plaintext context the SDK encrypts. Over-size fails closed — the relay stores nothing, and the SDK's
+`requestApproval` rejects with a `RelayError` (`name` `"RelayError"`, `status` 413), which a caller
+must treat as deny. The SDK does no pre-check of its own. The 15-minute horizon covers the hooks'
 420 s maximum timeout; an operator who lowers it below that makes hook requests fail closed. Only
 **live** pending requests count toward the pending cap: resolved, expired and retracted requests,
 and pending ones already past `expires_at`, do not. A pending request older than the horizon (only
@@ -430,6 +438,7 @@ but the ciphertext is gone. The pending cap therefore bounds **live** requests; 
 bounded by submit rate × retention × that small per-row residue. Anyone who knows an account id can
 fill its pending slots, which denies (fail-closed) its owner's agents until those requests end — see
 `docs/threat-model.md` "Relay denial of service".
+
 **`GET /{acct}/requests/{id}`** and **`GET /{acct}/requests/{id}/wait`** (WS) — Bearer
 `request_auth_token`; poll/await `{ status, verdict? }`. `status` is `pending`, terminal `expired`,
 terminal `retracted` (see below), or `resolved` (+ `verdict`).
@@ -457,6 +466,10 @@ offline queue (still-pending, non-expired) as `request` messages. Hibernatable.
 - `{ "type": "retract", "request_id": string }` — resolved elsewhere, expired, or the submitting
   integrator cancelled it (`POST …/requests/{id}/retract`, #195); clear the notification either way.
 - `{ "type": "error", "error": string }` — your last message was malformed.
+- `{ "type": "error", "request_id": string, "error": string }` — your verdict for `request_id` was
+  refused and **not recorded** (#245): `"verdict failed provenance verification"` or
+  `"verdict is signed by another device"`. Nothing changed: the request is still pending, no
+  `retract` went out, and another device (or a corrected verdict from you) can still answer it.
 
 **device → relay**
 
@@ -468,8 +481,40 @@ offline queue (still-pending, non-expired) as `request` messages. Hibernatable.
   is `expired` (rejected, fail-closed); a verdict for a request the integrator already cancelled is
   `retracted` (rejected — a retract is never overridable, #195).
 
-Only device sockets may submit verdicts. On the first valid verdict the relay marks the request
-`resolved`, retracts it from other device sockets, and pushes it to any waiting integrator.
+Only device sockets may submit verdicts, and only a verdict with valid **provenance** is recorded
+(#245). The relay checks it in the core (`verify_verdict_provenance`), without the plaintext,
+against the account root bound at pairing (#242), the account-state documents it has verified,
+and the request it holds:
+
+- the signing device, named by the outer `approver.device_id`, is the device this socket
+  authenticated as (checked first, before any signature work);
+- the verdict's `decided_at` lies in the request envelope's `[created_at, expires_at]`, the same
+  window the integrator's `verify_verdict` checks (`docs/contract.md` §Verification checklist,
+  step 5). This runs before the certificate is judged, because `decided_at` is the time chosen by
+  the device;
+- the device certificate chains to that root, names this account and the signing device, and was
+  unexpired at that `decided_at`;
+- the device is not revoked in the highest-sequence verified account state (when any is stored);
+- the JWS verifies under the certified device key, its `kid` is that device, and every outer field
+  equals its signed claim;
+- the signed `request_id` is the frame's `request_id`, and the certified signer is the socket's
+  device.
+
+A verdict that fails any of these gets the `error` frame above. The request stays `pending`,
+nothing is stored, and no device is retracted, so one bad or compromised device can no longer
+answer every request first. A genuine verdict, approving or not, is recorded as before: on the
+first one the relay marks the request `resolved`, retracts it from other device sockets, and pushes
+it to any waiting integrator. Provenance is not a decision. The relay cannot check the WYSIWYS
+`request_hash` (it never sees the plaintext) or nonce replay, so the integrator still verifies
+every verdict in full (`docs/contract.md` §Verification checklist).
+
+A device can still backdate `decided_at` inside the request's window, so a device whose certificate
+expired partway through a request can answer it with a time when the certificate was valid. That
+holds only for a request whose envelope `created_at` precedes the certificate's expiry. That
+`created_at` is the submitter's clock, which the relay does not check at submit (see #248). The
+integrator's own
+`verify_verdict` accepts the same verdict. Revocation, not certificate expiry, is how a device is
+cut off at once.
 
 ### `ApprovalEnvelope` (relay-visible; wire field names)
 
@@ -621,7 +666,8 @@ Answers to load-bearing client questions, confirmed against the relay source + t
    canonical Verdict **object** JSON (`{ v, request_id, request_hash, decision, decided_at,
 approver:{account_id,device_id}, sig:<compact JWS>, note?, challenge_response?, device_cert? }`) —
    `JSON.parse` it and inline the object. The relay stores it opaquely and forwards the object to the
-   integrator; only `sig`/`device_cert` carry the cryptography (verified downstream, never by the relay).
+   integrator; only `sig`/`device_cert` carry the cryptography. The relay checks their provenance
+   before recording the verdict (§4, #245); the integrator verifies the verdict in full.
 
 2. **`ack` reconciliation.** The relay replies `{type:"ack", status}`:
    - `resolved` — your verdict won; row is terminal.
