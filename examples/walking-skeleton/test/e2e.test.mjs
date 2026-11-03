@@ -27,6 +27,8 @@
  * 4. The integrator independently re-verifies the signed verdict — request_id AND request_hash,
  *    no-swap — and the relay stored ONLY ciphertext + routing (zero-knowledge), never plaintext or
  *    a signing key.
+ * 5. Recipients are root-vouched (#243): a key the relay lists in its device registry but the
+ *    root-signed account state does not name receives no way to decrypt the request.
  *
  * Deterministic: fixed clock (no `Date.now()` in fixtures), no real network, no WebSocket.
  *
@@ -37,14 +39,22 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { createClient } from "@allw/sdk";
+import { createClient, fileSequenceFloorStore, relayAccountStateSource } from "@allw/sdk";
 import { loadWasm } from "@allw/approver";
 import { runHook } from "@allw/hook";
 
 import { InProcessRelay } from "../dist/lib/in-process-relay.js";
 import { attachAutoApprover } from "../dist/lib/approver-harness.js";
-import { buildPairedApprover } from "../dist/lib/identity.js";
+import { buildPairedApprover, signDeviceAccountState } from "../dist/lib/identity.js";
+
+// The hook keeps a per-account sequence floor under ~/.allw/state: point HOME at a throwaway dir
+// for this whole file so a real ~/.allw is never read or written.
+process.env.HOME = mkdtempSync(join(tmpdir(), "allw-walking-skeleton-home-"));
+process.env.USERPROFILE = process.env.HOME;
 
 // ── Fixed, deterministic timeline (fixed-dates rule: never Date.now() in fixtures) ──────────────
 const NOW_MS = 1_700_000_000_000;
@@ -75,11 +85,27 @@ async function harness(mode) {
     label: identity.keyfile.label ?? null,
     created_at: NOW_MS - 10_000,
   });
+  // What `allw-approver pair` publishes: the root-signed state naming this device (#243).
+  relay.publishAccountStates([signDeviceAccountState(identity)], 1);
 
   const connection = relay.connectDevice();
   const { log } = attachAutoApprover(identity, connection, mode, now);
 
   return { wasm, identity, relay, log };
+}
+
+/** The relay-backed account-state source an integrator passes to `createClient` (#243). */
+function accountStatesFrom(relay, identity) {
+  const accountId = identity.keyfile.account_id;
+  return relayAccountStateSource({
+    relayUrl: RELAY_URL,
+    accountId,
+    floorStore: fileSequenceFloorStore({
+      accountId,
+      dir: mkdtempSync(join(tmpdir(), "allw-walking-skeleton-floor-")),
+    }),
+    fetchImpl: relay.fetchImpl,
+  });
 }
 
 /** SDK transport overrides: the in-process relay's fetch, poll-only, fixed clock, immediate timers. */
@@ -212,6 +238,7 @@ test("integrator independently re-verifies the verdict: request_id AND request_h
     relayUrl: RELAY_URL,
     accountId: identity.keyfile.account_id,
     approverRootKey: identity.keyfile.account_root_pubkey,
+    accountStates: accountStatesFrom(relay, identity),
     ...sdkOverrides(relay),
   });
 
@@ -260,6 +287,7 @@ test("zero-knowledge: the relay stores only the opaque ciphertext envelope + sig
     relayUrl: RELAY_URL,
     accountId: identity.keyfile.account_id,
     approverRootKey: identity.keyfile.account_root_pubkey,
+    accountStates: accountStatesFrom(relay, identity),
     ...sdkOverrides(relay),
   });
 
@@ -321,4 +349,56 @@ test("zero-knowledge: the relay stores only the opaque ciphertext envelope + sig
     typeof storedVerdict === "object" && storedVerdict !== null && "sig" in storedVerdict,
     "the stored verdict is a JWS-signed decision, not a relay-forgeable value",
   );
+});
+
+// ── Acceptance item 5: recipients are root-vouched, never the relay's device list (#243) ─────────
+
+test("root-vouched recipients: a key injected into the relay's device list cannot read the request", async () => {
+  const { wasm, identity, relay } = await harness("approved");
+
+  // A hostile relay (or anyone who can write its registry) lists an extra device whose X25519 key
+  // it holds, and connects it, so the request is pushed to it.
+  const injectedSeed = Buffer.alloc(32, 0x66).toString("base64url");
+  relay.enrollDevice({
+    device_id: "dev-injected",
+    pubkey: wasm.x25519_public_key(injectedSeed),
+    label: null,
+    created_at: NOW_MS - 5_000,
+  });
+  const pushedToInjected = [];
+  relay.connectDevice().onRequest((_requestId, envelope) => pushedToInjected.push(envelope));
+
+  const client = createClient({
+    relayUrl: RELAY_URL,
+    accountId: identity.keyfile.account_id,
+    approverRootKey: identity.keyfile.account_root_pubkey,
+    accountStates: accountStatesFrom(relay, identity),
+    ...sdkOverrides(relay),
+  });
+  const verdict = await client.requestApproval({
+    action: {
+      recordSchemaVersion: 1,
+      surface: "command",
+      syntactic: { argv: ["git", "push", "--force", "origin", "main"] },
+      risk: "high",
+    },
+    summary: "force push to main",
+    actor: { id: "machine:laptop", kind: "claude-code" },
+    risk: "high",
+    reversible: false,
+    timeoutMs: TIMEOUT_MS,
+  });
+  assert.equal(verdict.decision, "approved", "the vouched device still approves");
+
+  assert.equal(pushedToInjected.length, 1, "the relay pushed the request to the injected device");
+  const jwe = String(pushedToInjected[0].context_ciphertext);
+  assert.throws(
+    () => wasm.decrypt_context(jwe, "dev-injected", injectedSeed),
+    /no recipient header kid matches the requested device id/,
+    "the injected key has no recipient entry: the request is unreadable to it",
+  );
+  const plaintext = JSON.parse(
+    wasm.decrypt_context(jwe, DEVICE_ID, identity.keyfile.device_encryption_seed),
+  );
+  assert.equal(plaintext.summary, "force push to main", "the vouched device reads it");
 });

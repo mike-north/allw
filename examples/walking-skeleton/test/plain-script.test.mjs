@@ -33,9 +33,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { readFileSync, realpathSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync } from "node:fs";
 import { createServer } from "node:http";
-import { hostname } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -43,18 +43,20 @@ import { loadWasm } from "@allw/approver";
 
 import { InProcessRelay } from "../dist/lib/in-process-relay.js";
 import { attachAutoApprover } from "../dist/lib/approver-harness.js";
-import { buildPairedApprover } from "../dist/lib/identity.js";
+import { buildPairedApprover, signDeviceAccountState } from "../dist/lib/identity.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const packageRoot = join(here, "..");
 const SCRIPT = join(packageRoot, "scripts", "gate-refund.mjs");
 const SDK_README = join(packageRoot, "..", "..", "packages", "sdk", "README.md");
 
-const ACCOUNT_ID = "acct-plain-script";
 const DEVICE_ID = "dev-plain-script";
 const CHARGE_ID = "ch_3PqR9sT";
 /** The argv the script builds for {@link CHARGE_ID} (see `scripts/gate-refund.mjs`). */
 const SCRIPT_ARGV = ["stripe", "refunds", "create", "--charge", CHARGE_ID];
+
+/** A throwaway HOME for the script subprocess. */
+const SCRIPT_HOME = mkdtempSync(join(tmpdir(), "allw-plain-script-home-"));
 
 /** The real clock — see the module comment for why this suite cannot use a fixed one. */
 const now = () => Date.now();
@@ -85,8 +87,9 @@ async function serveRelay(relay) {
 async function harness(t, mode) {
   const wasm = await loadWasm();
   const pairedAt = now();
+  // No accountId: the self-certifying id the core derives from the root (the floor file is named
+  // by it, so it must have that syntax).
   const identity = buildPairedApprover(wasm, {
-    accountId: ACCOUNT_ID,
     deviceId: DEVICE_ID,
     relayUrl: "http://127.0.0.1",
     issuedAt: pairedAt - 1000,
@@ -99,6 +102,7 @@ async function harness(t, mode) {
     label: identity.keyfile.label ?? null,
     created_at: pairedAt - 10_000,
   });
+  relay.publishAccountStates([signDeviceAccountState(identity)], 1);
   const { log } = attachAutoApprover(identity, relay.connectDevice(), mode, now);
   const served = await serveRelay(relay);
   t.after(served.close);
@@ -122,8 +126,10 @@ function runScript(args, env) {
 /** The script's environment: where the relay is, which account, and the approver's root key. */
 function scriptEnv(h, extra = {}) {
   return {
+    // The script keeps its sequence floor under ~/.allw/state: never the developer's real one.
+    HOME: SCRIPT_HOME,
     ALLW_RELAY_URL: h.relayUrl,
-    ALLW_ACCOUNT_ID: ACCOUNT_ID,
+    ALLW_ACCOUNT_ID: h.identity.keyfile.account_id,
     ALLW_APPROVER_ROOT_KEY: h.identity.keyfile.account_root_pubkey,
     ...extra,
   };

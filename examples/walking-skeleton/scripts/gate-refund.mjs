@@ -1,5 +1,10 @@
 // Gate a command on a human approval from a plain script (issue #231). Usage: node gate-refund.mjs <charge-id>
-import { createClient, commandRequest } from "@allw/sdk";
+import {
+  createClient,
+  commandRequest,
+  fileSequenceFloorStore,
+  relayAccountStateSource,
+} from "@allw/sdk";
 
 const {
   ALLW_RELAY_URL: relayUrl,
@@ -8,7 +13,10 @@ const {
 } = process.env;
 const timeoutMs = Number(process.env.ALLW_TIMEOUT_MS ?? 300_000);
 const argv = ["stripe", "refunds", "create", "--charge", process.argv[2]];
-const client = createClient({ relayUrl, accountId, approverRootKey });
+// Encrypt only to the devices the root-signed account state vouches for; refuse a rollback.
+const floorStore = fileSequenceFloorStore({ accountId });
+const accountStates = relayAccountStateSource({ relayUrl, accountId, floorStore });
+const client = createClient({ relayUrl, accountId, approverRootKey, accountStates });
 const verdict = await client.requestApproval(
   await commandRequest({ argv, summary: `Refund charge ${process.argv[2]}`, timeoutMs }),
 );

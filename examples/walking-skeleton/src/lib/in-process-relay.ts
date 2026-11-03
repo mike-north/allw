@@ -11,7 +11,10 @@
  * and the **real** `@allw/approver` core against this in-process relay, which mirrors the relay's
  * **observable contract** exactly (`docs/contract.md` §Transport → Relay routing API):
  *
- * - `GET  /:acct/devices`            → the enrolled device pubkey list (JWE recipients).
+ * - `GET  /:acct/devices`            → the relay's device registry (routing metadata; the SDK never
+ *   reads it for recipients, #243).
+ * - `GET  /:acct/account-states`     → the root-signed account-state documents published with
+ *   {@link InProcessRelay.publishAccountStates}; the SDK encrypts only to the devices they vouch for.
  * - `POST /:acct/requests`           → store the opaque envelope; reject any non-contract key
  *   (the zero-knowledge guard) and an already-expired `expires_at`; fan out to online devices;
  *   return the request-scoped bearer token used by the poll path.
@@ -114,6 +117,8 @@ function authHeader(headers: HeadersInit | undefined): string | null {
 export class InProcessRelay {
   private readonly now: () => number;
   private readonly devices: RelayDevice[] = [];
+  private accountStates: readonly string[] = [];
+  private maxSequence = 0;
   private readonly requests = new Map<string, StoredRequest>();
   private readonly verdicts = new Map<string, unknown>();
   private readonly connections = new Set<InternalDeviceConnection>();
@@ -125,6 +130,17 @@ export class InProcessRelay {
   /** Enroll a device's X25519 pubkey (mirrors `POST /pairing/complete` registering one key). */
   enrollDevice(device: RelayDevice): void {
     this.devices.push(device);
+  }
+
+  /**
+   * Publish root-signed account-state documents (stands in for `POST /:acct/account-states`). The
+   * real relay verifies them against the bound root; this double trusts the test, because every
+   * consumer verifies them again in the core anyway. `maxSequence` is the highest sequence they
+   * carry.
+   */
+  publishAccountStates(accountStates: readonly string[], maxSequence: number): void {
+    this.accountStates = [...accountStates];
+    this.maxSequence = maxSequence;
   }
 
   /**
@@ -159,6 +175,11 @@ export class InProcessRelay {
 
     if (url.endsWith("/devices") && method === "GET") {
       return Promise.resolve(this.json({ devices: this.devices }));
+    }
+    if (url.endsWith("/account-states") && method === "GET") {
+      return Promise.resolve(
+        this.json({ account_states: this.accountStates, max_sequence: this.maxSequence }),
+      );
     }
     if (url.endsWith("/requests") && method === "POST") {
       return Promise.resolve(this.handleSubmit(init?.body));

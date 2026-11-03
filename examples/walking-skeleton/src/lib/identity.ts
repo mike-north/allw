@@ -53,3 +53,35 @@ export function buildPairedApprover(wasm: AllwWasm, params: PairingParams): Appr
   };
   return { wasm, keyfile };
 }
+
+/**
+ * Root-sign the account state that vouches for this identity's device — what `allw-approver pair`
+ * publishes (#243). Integrators encrypt only to devices a verified account state names, so a relay
+ * double must serve this for the round-trip to reach the approver.
+ */
+export function signDeviceAccountState(identity: ApproverIdentity, sequence = 1): string {
+  const { wasm, keyfile } = identity;
+  if (keyfile.account_id === undefined || keyfile.device_id === undefined) {
+    throw new Error("signDeviceAccountState needs a paired identity (account_id and device_id)");
+  }
+  return wasm.sign_account_state(
+    JSON.stringify({
+      v: 1,
+      account_id: keyfile.account_id,
+      sequence,
+      current_root: keyfile.account_root_pubkey,
+      previous_roots: [],
+      devices: [
+        {
+          device_id: keyfile.device_id,
+          encryption_pubkey: keyfile.device_encryption_pubkey,
+          signing_pubkey: keyfile.device_signing_pubkey,
+          status: "active",
+        },
+      ],
+      actors: [],
+      revocations: [],
+    }),
+    keyfile.account_root_seed,
+  );
+}
