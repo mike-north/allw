@@ -1,0 +1,185 @@
+{
+  "description": "Shared Rust <-> WASM vectors for command risk classification on the program that actually runs (issue #268). Expected values are derived by hand from the rule in crates/allw-core/src/command.rs (classify_effective_risk) and docs/policy-seam.md; bin is always argv[0] (unchanged by #268). Append-only.",
+  "cases": [
+    {
+      "command": "FOO=1 git push --force origin main",
+      "risk": "high",
+      "bin": "FOO=1",
+      "why": "assignment skipped; git push with a force flag is High"
+    },
+    {
+      "command": "X=1 rm -rf ~",
+      "risk": "high",
+      "bin": "X=1",
+      "why": "assignment skipped; rm recursive+force is High"
+    },
+    {
+      "command": "A=1 B=2 dd if=/dev/zero of=/dev/sda",
+      "risk": "critical",
+      "bin": "A=1",
+      "why": "both assignments skipped; dd is Critical"
+    },
+    {
+      "command": "env FOO=1 rm -rf ~",
+      "risk": "high",
+      "bin": "env",
+      "why": "env wraps an assignment + rm -rf: High"
+    },
+    {
+      "command": "env rm -rf ~",
+      "risk": "high",
+      "bin": "env",
+      "why": "env is Low alone but wraps rm -rf: High"
+    },
+    {
+      "command": "/usr/bin/env rm -rf ~",
+      "risk": "high",
+      "bin": "/usr/bin/env",
+      "why": "wrapper matched by basename"
+    },
+    {
+      "command": "command rm -rf ~",
+      "risk": "high",
+      "bin": "command",
+      "why": "command wraps rm -rf"
+    },
+    {
+      "command": "nice rm -rf ~",
+      "risk": "high",
+      "bin": "nice",
+      "why": "nice wraps rm -rf"
+    },
+    {
+      "command": "nice -n 10 rm -rf ~",
+      "risk": "high",
+      "bin": "nice",
+      "why": "option value 10 is a candidate too; rm -rf still found"
+    },
+    {
+      "command": "exec rm -rf ~",
+      "risk": "high",
+      "bin": "exec",
+      "why": "exec wraps rm -rf"
+    },
+    {
+      "command": "time rm -rf ~",
+      "risk": "high",
+      "bin": "time",
+      "why": "time wraps rm -rf"
+    },
+    {
+      "command": "nohup rm -rf ~",
+      "risk": "high",
+      "bin": "nohup",
+      "why": "nohup wraps rm -rf"
+    },
+    {
+      "command": "timeout 5 git push -f origin main",
+      "risk": "high",
+      "bin": "timeout",
+      "why": "timeout wraps a force push"
+    },
+    {
+      "command": "xargs rm -rf",
+      "risk": "high",
+      "bin": "xargs",
+      "why": "xargs wraps rm -rf"
+    },
+    {
+      "command": "sudo dd if=/dev/zero of=/dev/sda",
+      "risk": "critical",
+      "bin": "sudo",
+      "why": "sudo is High but wraps dd: Critical"
+    },
+    {
+      "command": "sudo -u root env X=1 rm -rf /",
+      "risk": "high",
+      "bin": "sudo",
+      "why": "nested wrappers and an assignment"
+    },
+    {
+      "command": "sh -c 'rm -rf ~'",
+      "risk": "high",
+      "bin": "sh",
+      "why": "sh -c command string is classified"
+    },
+    {
+      "command": "bash -c 'git push --force'",
+      "risk": "high",
+      "bin": "bash",
+      "why": "bash -c command string is classified"
+    },
+    {
+      "command": "bash -lc 'dd if=/dev/zero of=/dev/sda'",
+      "risk": "critical",
+      "bin": "bash",
+      "why": "combined -lc carries -c"
+    },
+    {
+      "command": "env",
+      "risk": "low",
+      "bin": "env",
+      "why": "negative: env alone (prints the environment) stays Low"
+    },
+    {
+      "command": "env -i",
+      "risk": "low",
+      "bin": "env",
+      "why": "negative: flags after a wrapper are not wrapped programs"
+    },
+    {
+      "command": "FOO=bar",
+      "risk": "medium",
+      "bin": "FOO=bar",
+      "why": "negative: a bare assignment is Medium, as before"
+    },
+    {
+      "command": "X=1 ls",
+      "risk": "medium",
+      "bin": "X=1",
+      "why": "negative: an assignment never classifies below Medium (LD_PRELOAD, PATH, ...)"
+    },
+    {
+      "command": "1FOO=1 rm -rf ~",
+      "risk": "medium",
+      "bin": "1FOO=1",
+      "why": "negative: not a valid NAME, so it is the program itself, not an assignment"
+    },
+    {
+      "command": "nice ls",
+      "risk": "medium",
+      "bin": "nice",
+      "why": "negative: a wrapper never lowers its own tier"
+    },
+    {
+      "command": "bash script.sh",
+      "risk": "medium",
+      "bin": "bash",
+      "why": "negative: without -c the argument is a script path, not a command string"
+    },
+    {
+      "command": "sh -c 'echo \"unterminated'",
+      "risk": "medium",
+      "bin": "sh",
+      "why": "negative: an unparseable -c string contributes nothing; the shell's own tier stands"
+    },
+    {
+      "command": "git push origin main",
+      "risk": "medium",
+      "bin": "git",
+      "why": "negative: unprefixed baseline unchanged"
+    },
+    {
+      "command": "rm -rf ~",
+      "risk": "high",
+      "bin": "rm",
+      "why": "negative: unprefixed baseline unchanged"
+    },
+    {
+      "command": "X=/bin/dd ls",
+      "risk": "critical",
+      "bin": "X=/bin/dd",
+      "why": "negative: never lower than the argv[0]-only classification (basename of X=/bin/dd is dd)"
+    }
+  ]
+}
