@@ -109,9 +109,17 @@ WebSocket, account-state resolution — goes to that pinned relay.
   pre-filled by a `?relay=` link is visible before the human commits. Nothing is sent to it until
   pairing completes.
 - **After pairing**, a `?relay=` link that differs from the pinned relay is **ignored**: it is not
-  persisted and nothing is sent to it, and a notice at the top of the page names the ignored origin.
+  persisted and nothing is sent to it, and a notice at the top of the page names the ignored link.
   This closes the phishing path where `…/?relay=https://evil.example` would re-point a paired device
   and hand its `deviceAuthToken` to the attacker's relay.
+  - Anyone can send the link, so the notice names it only through the core's `escape_for_display`
+    (#307). It shows the link's origin, or for a value that isn't a URL, its first 120 characters.
+    Bidi overrides, zero-width and control characters appear as visible escapes such as `⟨U+202E⟩`.
+  - The notice appears at once. The name reads "(checking…)" until the core has loaded. If the core
+    can't load, the name is withheld ("(hidden: the approver core did not load)"), and the notice
+    still says a link was ignored.
+  - The pinned relay in the notice is printed as is: `checkRelayUrl` accepts it only in canonical
+    form, and its origin is ASCII (punycode for an internationalized host).
 - **To change relays**, pair the browser again. "Use another device" on the returning-device screen
   re-pairs against the currently pinned relay; to pin a different relay, clear the site's data for
   the approver origin and open it with the new `?relay=` link.
@@ -405,6 +413,7 @@ app when tapped.
 | No literal relay URL embedded in the bundled `app.js`                         | Verified (`test/site-build.test.mjs`)                                |
 | `_headers` ships with the CSP directives; `index.html` has no inline script   | Verified (`test/site-build.test.mjs`)                                |
 | Relay pinned at pairing; a differing `?relay=` is ignored with a notice       | Verified (`test/app-boot.test.mjs`)                                  |
+| The ignored `?relay=` link is shown only core-escaped, or withheld (#307)     | Verified (`test/relay-config.test.mjs`, `test/app-boot.test.mjs`)    |
 | HTTPS-only relay URLs (http only on loopback)                                 | Verified (`test/relay-config.test.mjs`, SDK `relay-url-transport`)   |
 | CSP does not break WASM load or relay fetch/WebSocket in a real browser       | Verified locally in Chrome against `wrangler dev` (issue #249 PR)    |
 | CSP header present on the live Pages deployment (`curl -sI`)                  | **Not run** — post-deploy operator step (§3.1)                       |

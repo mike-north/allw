@@ -13,6 +13,7 @@ export type {
   StoredPairing,
   StoredSnapshot,
 } from "./pairing.js";
+export { WITHHELD_UNTRUSTED_TEXT, displayUntrusted } from "./display-escape.js";
 export {
   WITHHELD_PIN_TEXT,
   createLocalPairingStore,
@@ -88,6 +89,7 @@ export type {
 } from "./relay-config.js";
 export {
   INSECURE_RELAY_URL_REASON,
+  PENDING_IGNORED_RELAY_TEXT,
   RELAY_URL_EXTRAS_REASON,
   RELAY_URL_QUERY_PARAM,
   RELAY_URL_STORAGE_KEY,

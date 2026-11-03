@@ -371,11 +371,15 @@ export async function boot(env: BootEnvironment): Promise<void> {
         : await resolveRepairRelayUrl(env);
     const ignored = describeIgnoredRelayOverride(env.search, relayUrl);
     if (ignored !== null) {
-      mountIgnoredRelayNotice({
+      // Rendered now, never awaited: the ignored link's name is filled in once the core escape is
+      // available (#307). A re-pair visit already tried to load it; otherwise start the load here
+      // (`initWasm` shares it with the inbox's).
+      void mountIgnoredRelayNotice({
         host: env.noticeHost,
         ignored,
         pinnedRelayUrl: relayUrl,
         repairing: stored === null,
+        escapeForDisplay: repairing ? Promise.resolve(escapeForDisplay) : loadDisplayEscape(env),
       });
     }
   } else {

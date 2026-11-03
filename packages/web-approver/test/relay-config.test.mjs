@@ -11,6 +11,8 @@
  * @see ../../sdk/test/fixtures/relay-url-vectors.json (shared with the SDK and the site build)
  * @see ../../../docs/web-approver-deploy.md (§Runtime relay configuration, §Relay pinning)
  * @see ../src/relay-config.ts
+ * @see ../../../crates/allw-core/src/display.rs (`escape_for_display`: the escapes the notice shows)
+ * @see https://github.com/mike-north/allw/issues/307
  * @see ../src/app.ts (the production bootstrap that calls these before mounting the pairing gate)
  */
 
@@ -22,6 +24,7 @@ import { JSDOM } from "jsdom";
 
 import {
   INSECURE_RELAY_URL_REASON,
+  PENDING_IGNORED_RELAY_TEXT,
   RELAY_URL_EXTRAS_REASON,
   RELAY_URL_QUERY_PARAM,
   RELAY_URL_STORAGE_KEY,
@@ -30,7 +33,9 @@ import {
   mountIgnoredRelayNotice,
   mountRelayConfigGate,
   resolveRelayUrl,
+  WITHHELD_UNTRUSTED_TEXT,
 } from "../dist/index.js";
+import { loadTestWasm } from "./wasm-helper.mjs";
 
 /** A `location.search` string carrying `?relay=<value>`. */
 function relayQuery(value) {
@@ -259,6 +264,13 @@ describe("describeIgnoredRelayOverride", () => {
     const ignored = describeIgnoredRelayOverride(relayQuery("x".repeat(500)), PINNED);
     assert.equal(ignored, `${"x".repeat(120)}…`);
   });
+
+  test("truncation counts code points, so it never splits a surrogate pair", () => {
+    // U+1F600 is two UTF-16 code units; a cut at 120 code units would leave a lone surrogate.
+    const value = `${"x".repeat(119)}\u{1F600}${"y".repeat(10)}`;
+    const ignored = describeIgnoredRelayOverride(relayQuery(value), PINNED);
+    assert.equal(ignored, `${"x".repeat(119)}\u{1F600}…`);
+  });
 });
 
 // ── mountRelayConfigGate ─────────────────────────────────────────────────────────────────────────
@@ -383,22 +395,166 @@ describe("mountRelayConfigGate", () => {
 // ── mountIgnoredRelayNotice ──────────────────────────────────────────────────────────────────────
 
 describe("mountIgnoredRelayNotice", () => {
-  test("names the ignored origin and the pinned relay, as text (never parsed as markup)", () => {
+  /** The real core's display escape, as production uses it. */
+  async function coreEscape() {
+    const wasm = await loadTestWasm();
+    return (text) => wasm.escape_for_display(text);
+  }
+
+  /** A `?relay=` value built to spoof the screen: RLO, ESC with an SGR sequence, ZWSP. */
+  const SPOOFING_VALUE = "evil\u202Etxt.exe\u001B[31m\u200Bok";
+  /**
+   * The core's escape of it (`crates/allw-core/src/display.rs`): RLO and ZWSP as `⟨U+XXXX⟩`, a C0
+   * control as `\xNN`. Written from the core's rules, not captured from its output.
+   */
+  const SPOOFING_ESCAPED = "evil⟨U+202E⟩txt.exe\\x1b[31m⟨U+200B⟩ok";
+
+  test("names the ignored link only through the core escape; no raw spoofing character reaches the DOM (#307)", async () => {
     const { root, restore } = installDom();
     try {
-      mountIgnoredRelayNotice({
+      const ignored = describeIgnoredRelayOverride(
+        relayQuery(SPOOFING_VALUE),
+        "https://relay.example.com",
+      );
+      assert.equal(
+        ignored,
+        SPOOFING_VALUE,
+        "an unparseable value is echoed, so it must be escaped",
+      );
+      await mountIgnoredRelayNotice({
         host: root,
-        ignored: "<img src=x onerror=alert(1)>",
-        pinnedRelayUrl: "https://relay.example.com/base",
+        ignored,
+        pinnedRelayUrl: "https://relay.example.com",
+        escapeForDisplay: coreEscape(),
       });
       const notice = root.querySelector(".relay-pin-notice");
-      assert.ok(notice, "notice must render");
-      assert.equal(notice.getAttribute("role"), "status");
-      assert.match(notice.textContent, /paired with https:\/\/relay\.example\.com /);
-      assert.match(notice.textContent, /clear this site's data, then open the new link\./);
+      assert.equal(notice.querySelector(".relay-pin-notice-origin").textContent, SPOOFING_ESCAPED);
+      for (const raw of ["\u202E", "\u001B", "\u200B"]) {
+        assert.ok(
+          !root.innerHTML.includes(raw),
+          `U+${raw.codePointAt(0).toString(16)} is not in the DOM`,
+        );
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test("renders before the core loads, with the name pending, then fills it in", async () => {
+    const { root, restore } = installDom();
+    try {
+      let release;
+      const escape = new Promise((resolve) => {
+        release = resolve;
+      });
+      const mounted = mountIgnoredRelayNotice({
+        host: root,
+        ignored: SPOOFING_VALUE,
+        pinnedRelayUrl: "https://relay.example.com",
+        escapeForDisplay: escape,
+      });
+      const notice = root.querySelector(".relay-pin-notice");
+      assert.ok(notice, "the notice is shown at once");
+      assert.match(notice.textContent, /^Relay link ignored\./);
       assert.equal(
         notice.querySelector(".relay-pin-notice-origin").textContent,
+        PENDING_IGNORED_RELAY_TEXT,
+      );
+      assert.ok(!root.innerHTML.includes("\u202E"));
+      release(await coreEscape());
+      await mounted;
+      assert.equal(notice.querySelector(".relay-pin-notice-origin").textContent, SPOOFING_ESCAPED);
+    } finally {
+      restore();
+    }
+  });
+
+  for (const [label, escapeForDisplay] of [
+    ["no core", () => Promise.resolve(null)],
+    ["a core load that rejects", () => Promise.reject(new Error("wasm fetch failed"))],
+    [
+      "a core escape that throws",
+      () =>
+        Promise.resolve(() => {
+          throw new Error("escape failed");
+        }),
+    ],
+  ]) {
+    test(`with ${label}, the link is withheld and the notice still says a link was ignored`, async () => {
+      const { root, restore } = installDom();
+      try {
+        await mountIgnoredRelayNotice({
+          host: root,
+          ignored: SPOOFING_VALUE,
+          pinnedRelayUrl: "https://relay.example.com",
+          escapeForDisplay: escapeForDisplay(),
+        });
+        const notice = root.querySelector(".relay-pin-notice");
+        assert.match(notice.textContent, /^Relay link ignored\./);
+        assert.equal(
+          notice.querySelector(".relay-pin-notice-origin").textContent,
+          WITHHELD_UNTRUSTED_TEXT,
+        );
+        assert.ok(!root.innerHTML.includes("evil"), "no part of the raw value is shown");
+      } finally {
+        restore();
+      }
+    });
+  }
+
+  test("names a canonical pinned relay by origin at once, without the core", async () => {
+    const { root, restore } = installDom();
+    try {
+      await mountIgnoredRelayNotice({
+        host: root,
+        ignored: "https://evil.example",
+        pinnedRelayUrl: "https://relay.example.com/base",
+        escapeForDisplay: Promise.resolve(null),
+      });
+      const notice = root.querySelector(".relay-pin-notice");
+      assert.equal(role(notice), "status");
+      assert.match(notice.textContent, /paired with https:\/\/relay\.example\.com and only/);
+      assert.match(notice.textContent, /clear this site's data, then open the new link\./);
+    } finally {
+      restore();
+    }
+  });
+
+  test("a pinned relay that is not canonical is escaped like the link, or withheld", async () => {
+    const pinned = "https://relay.example.com/\u202Eevil";
+    for (const [escape, expected] of [
+      [coreEscape(), "https://relay.example.com/⟨U+202E⟩evil"],
+      [Promise.resolve(null), WITHHELD_UNTRUSTED_TEXT],
+    ]) {
+      const { root, restore } = installDom();
+      try {
+        await mountIgnoredRelayNotice({
+          host: root,
+          ignored: "https://evil.example",
+          pinnedRelayUrl: pinned,
+          escapeForDisplay: escape,
+        });
+        assert.equal(root.querySelector(".relay-pin-notice-pinned").textContent, expected);
+        assert.ok(!root.innerHTML.includes("\u202E"));
+      } finally {
+        restore();
+      }
+    }
+  });
+
+  test("ignored text is never parsed as markup", async () => {
+    const { root, restore } = installDom();
+    try {
+      await mountIgnoredRelayNotice({
+        host: root,
+        ignored: "<img src=x onerror=alert(1)>",
+        pinnedRelayUrl: "https://relay.example.com",
+        escapeForDisplay: coreEscape(),
+      });
+      assert.equal(
+        root.querySelector(".relay-pin-notice-origin").textContent,
         "<img src=x onerror=alert(1)>",
+        "the core escape leaves visible characters alone",
       );
       assert.equal(root.querySelector("img"), null, "ignored text must not become markup");
     } finally {
@@ -406,3 +562,8 @@ describe("mountIgnoredRelayNotice", () => {
     }
   });
 });
+
+/** An element's ARIA role. */
+function role(element) {
+  return element.getAttribute("role");
+}
