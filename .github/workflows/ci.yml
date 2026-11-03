@@ -55,9 +55,11 @@ jobs:
       # never a floating `stable`, so a new Rust release cannot turn CI red on its own.
       - run: rustup toolchain install && rustc --version
       - uses: Swatinem/rust-cache@v2
+      # Pinned for the same reason as the Rust toolchain: a floating `latest` can change the build
+      # under an unchanged commit. Bump deliberately, alongside rust-toolchain.toml if needed.
       - uses: jetli/wasm-pack-action@v0.4.0
         with:
-          version: latest
+          version: v0.15.1
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -163,9 +165,11 @@ jobs:
       # never a floating `stable`, so a new Rust release cannot turn CI red on its own.
       - run: rustup toolchain install && rustc --version
       - uses: Swatinem/rust-cache@v2
+      # Pinned for the same reason as the Rust toolchain: a floating `latest` can change the build
+      # under an unchanged commit. Bump deliberately, alongside rust-toolchain.toml if needed.
       - uses: jetli/wasm-pack-action@v0.4.0
         with:
-          version: latest
+          version: v0.15.1
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
