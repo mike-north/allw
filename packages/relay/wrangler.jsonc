@@ -10,18 +10,19 @@
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccountRelay"] }],
   // Rate limits for the unauthenticated routes (#248; src/limits.ts): per account id + client IP
   // (IPv6 reduced to its /64) for pairing and for requests, plus one per client IP alone across all
-  // three routes. Workers rate limiting is per Cloudflare location and eventually consistent.
+  // four routes. Workers rate limiting is per Cloudflare location and eventually consistent.
   // The per-account pending cap bounds LIVE requests only; stored bytes are bounded by submit rate ×
   // the 7-day retention × a small per-row residue (envelopes are blanked once a request ends).
-  // `period` is 10 or 60 seconds. Missing bindings make these routes fail closed (503).
+  // Keep `period` at 60: a 429's Retry-After is RATE_LIMIT_PERIOD_SECONDS (src/constants.ts), not
+  // read from the binding. Missing bindings make these routes fail closed (503).
   "ratelimits": [
-    // POST /{acct}/pairing/start and /{acct}/pairing/complete.
+    // POST /{acct}/pairing/start, /{acct}/pairing/complete and /{acct}/account-states.
     {
       "name": "RATE_LIMIT_PAIRING",
       "namespace_id": "2481",
       "simple": { "limit": 10, "period": 60 },
     },
-    // POST /{acct}/requests. (RATE_LIMIT_CLIENT, next, covers all three routes per client IP.)
+    // POST /{acct}/requests. (RATE_LIMIT_CLIENT, next, covers all four routes per client IP.)
     {
       "name": "RATE_LIMIT_REQUESTS",
       "namespace_id": "2482",

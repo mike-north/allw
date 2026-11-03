@@ -10,7 +10,7 @@
  * @see ../../../docs/relay-deploy.md (rate-limit bindings and the TTL var)
  */
 
-import { DEFAULT_MAX_REQUEST_TTL_MS } from "./constants.js";
+import { DEFAULT_MAX_REQUEST_TTL_MS, RATE_LIMIT_PERIOD_SECONDS } from "./constants.js";
 import { accountSubPathSegments, resolveAccountRoute, type AccountRouteName } from "./routes.js";
 
 /** Outcome of reading a body under a byte cap. */
@@ -135,30 +135,41 @@ export function parseMaxRequestTtlMs(raw: string | undefined): number {
   return value;
 }
 
-/** The relay's unauthenticated routes, each with its own per-account rate-limit binding. */
-export type RateLimitedRoute = "pairing" | "requests";
+/**
+ * A per-account rate-limit budget, each backed by its own binding:
+ * - `pairing` (`RATE_LIMIT_PAIRING`): the account-root holder's control-plane writes —
+ *   `pairing/start`, `pairing/complete` and the `account-states` publish, which share an actor and
+ *   a low cadence;
+ * - `requests` (`RATE_LIMIT_REQUESTS`): integrator submits.
+ */
+export type RateLimitBudget = "pairing" | "requests";
 
 /** The subset of the Cloudflare rate-limiting binding the relay calls (injectable in tests). */
 export interface RateLimiter {
   limit(options: { key: string }): Promise<{ success: boolean }>;
 }
 
-/** The account routes the limiter covers, by dispatch key, and the budget each one draws on. */
-const RATE_LIMITED_ROUTES: Partial<Record<AccountRouteName, RateLimitedRoute>> = {
+/**
+ * The account routes the limiter covers, by dispatch key, and the budget each one draws on: every
+ * route that needs no credential and costs the relay a write or a signature check.
+ */
+const RATE_LIMITED_ROUTES: Partial<Record<AccountRouteName, RateLimitBudget>> = {
   pairingStart: "pairing",
   pairingComplete: "pairing",
+  accountStatePublish: "pairing",
   requestSubmit: "requests",
 };
 
 /**
- * Which rate-limited route a request targets, or `null` for routes the limiter does not cover.
- * Covered: `POST /{acct}/pairing/start`, `POST /{acct}/pairing/complete`, `POST /{acct}/requests`.
+ * Which budget a request draws on, or `null` for routes the limiter does not cover. Covered:
+ * `POST /{acct}/pairing/start`, `POST /{acct}/pairing/complete`, `POST /{acct}/account-states`
+ * (all `pairing`) and `POST /{acct}/requests` (`requests`).
  *
  * Resolved through the Durable Object's own route table (`resolveAccountRoute`), so the limiter
  * covers exactly the requests that dispatch to those handlers: a path the router answers with 404
  * or 405 (an extra segment, a trailing slash) is neither limited nor handled.
  */
-export function rateLimitedRoute(method: string, pathname: string): RateLimitedRoute | null {
+export function rateLimitBudget(method: string, pathname: string): RateLimitBudget | null {
   const resolved = resolveAccountRoute(method.toUpperCase(), accountSubPathSegments(pathname));
   return resolved.kind === "route" ? (RATE_LIMITED_ROUTES[resolved.name] ?? null) : null;
 }
@@ -276,6 +287,6 @@ export async function enforceRateLimit(
 
 function limitResponse(data: unknown, status: number): Response {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (status === 429) headers["Retry-After"] = "60";
+  if (status === 429) headers["Retry-After"] = String(RATE_LIMIT_PERIOD_SECONDS);
   return new Response(JSON.stringify(data), { status, headers });
 }

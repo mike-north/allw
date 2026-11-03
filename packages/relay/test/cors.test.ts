@@ -17,6 +17,7 @@ import {
   withCors,
 } from "../src/cors.js";
 import wranglerConfigText from "../wrangler.jsonc?raw";
+import { parseJsonc } from "./support/jsonc.js";
 import { pairingStartBody, testAccount } from "./support/accounts.js";
 import { DEVICE_X25519_PUBKEY } from "./support/keys.js";
 
@@ -459,34 +460,6 @@ describe("withCors — a throwing handler still answers with CORS headers", () =
     }
   });
 });
-
-/**
- * Strip `//` and `/* *\/` comments and trailing commas from JSONC, leaving string contents (which
- * hold `http://…` origins) untouched. Enough for the committed `wrangler.jsonc`.
- */
-function parseJsonc(text: string): unknown {
-  let out = "";
-  let inString = false;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i] ?? "";
-    if (inString) {
-      out += c;
-      if (c === "\\") out += text[++i] ?? "";
-      else if (c === '"') inString = false;
-    } else if (c === '"') {
-      inString = true;
-      out += c;
-    } else if (c === "/" && text[i + 1] === "/") {
-      while (i < text.length && text[i] !== "\n") i++;
-      out += "\n";
-    } else if (c === "/" && text[i + 1] === "*") {
-      i = text.indexOf("*/", i + 2) + 1;
-    } else {
-      out += c;
-    }
-  }
-  return JSON.parse(out.replace(/,(\s*[}\]])/g, "$1"));
-}
 
 describe("committed wrangler.jsonc CORS configuration", () => {
   const config = parseJsonc(wranglerConfigText) as {

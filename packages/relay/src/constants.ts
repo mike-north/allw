@@ -63,3 +63,26 @@ export const MAX_PENDING_REQUESTS_PER_ACCOUNT = 64;
  * (checked before parsing; larger gets 413). Both bodies are a few keys plus short tokens.
  */
 export const MAX_PAIRING_BODY_BYTES = 16 * 1024;
+
+/** Most root-signed documents one `POST /{acct}/account-states` may carry (more gets 400). */
+export const MAX_ACCOUNT_STATE_DOCS = 16;
+
+/** Longest accepted account-state document (a compact JWS, so its length is its byte count). */
+export const MAX_ACCOUNT_STATE_JWS_BYTES = 32 * 1024;
+
+/**
+ * Largest accepted `POST /{acct}/account-states` body, in bytes (checked before parsing; larger
+ * gets 413). It is the most a valid publish can need — {@link MAX_ACCOUNT_STATE_DOCS} documents at
+ * {@link MAX_ACCOUNT_STATE_JWS_BYTES} each — plus 4 KiB for the JSON framing and `max_sequence`,
+ * so the cap never refuses a publish the document checks would accept.
+ */
+export const MAX_ACCOUNT_STATE_BODY_BYTES =
+  MAX_ACCOUNT_STATE_DOCS * MAX_ACCOUNT_STATE_JWS_BYTES + 4 * 1024;
+
+/**
+ * The window, in seconds, of every rate-limiting binding in `wrangler.jsonc` (`simple.period`),
+ * and so the `Retry-After` a rate-limit 429 sends. The binding's period isn't readable at runtime,
+ * so the two are kept equal by hand: a deployment must keep `period` at 60 (a test pins
+ * `wrangler.jsonc`).
+ */
+export const RATE_LIMIT_PERIOD_SECONDS = 60;

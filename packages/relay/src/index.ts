@@ -30,6 +30,9 @@
 
 import { AlarmMultiplexer } from "./alarms.js";
 import {
+  MAX_ACCOUNT_STATE_BODY_BYTES,
+  MAX_ACCOUNT_STATE_DOCS,
+  MAX_ACCOUNT_STATE_JWS_BYTES,
   MAX_CONTEXT_CIPHERTEXT_BYTES,
   MAX_CREATED_AT_SKEW_MS,
   MAX_PAIRING_BODY_BYTES,
@@ -53,8 +56,8 @@ import {
   clientRateLimitKey,
   enforceRateLimit,
   parseMaxRequestTtlMs,
+  rateLimitBudget,
   rateLimitKey,
-  rateLimitedRoute,
   readJsonObjectCapped,
   utf8ByteLength,
   type RateLimiter,
@@ -97,8 +100,8 @@ export interface Env extends VapidEnv, CorsEnv {
   readonly FCM_BEARER_TOKEN?: string;
   /**
    * Cloudflare rate-limiting bindings for the unauthenticated routes (`wrangler.jsonc`
-   * `ratelimits`): per account + client, `pairing/start` + `pairing/complete` and `requests`; and
-   * per client alone across all three. Missing ⇒ those routes fail closed with 503. See
+   * `ratelimits`): per account + client, the pairing budget (`pairing/start`, `pairing/complete`,
+   * `account-states` publish) and the `requests` budget; and per client alone across all four. Missing ⇒ those routes fail closed with 503. See
    * `./limits.ts`.
    */
   readonly RATE_LIMIT_PAIRING?: RateLimiter;
@@ -120,15 +123,15 @@ export default {
       const accountId = url.pathname.split("/")[1] ?? "";
       if (!accountId) return new Response("missing account", { status: 400 });
       // Rate-limit the unauthenticated routes at the edge, before the account's Durable Object.
-      const route = rateLimitedRoute(req.method, url.pathname);
-      if (route !== null) {
+      const budget = rateLimitBudget(req.method, url.pathname);
+      if (budget !== null) {
         // Per client across every account first, so minting fresh account ids buys no new budget.
         const clientRefused = await enforceRateLimit(
           env.RATE_LIMIT_CLIENT,
           clientRateLimitKey(req),
         );
         if (clientRefused) return clientRefused;
-        const limiter = route === "pairing" ? env.RATE_LIMIT_PAIRING : env.RATE_LIMIT_REQUESTS;
+        const limiter = budget === "pairing" ? env.RATE_LIMIT_PAIRING : env.RATE_LIMIT_REQUESTS;
         const refused = await enforceRateLimit(limiter, rateLimitKey(accountId, req));
         if (refused) return refused;
       }
@@ -259,8 +262,6 @@ if (PAIRING_ALPHABET.length !== 32) {
 
 const PAIRING_CODE_LENGTH = 8;
 const AUTH_TOKEN_BYTES = 32;
-const MAX_ACCOUNT_STATE_DOCS = 16;
-const MAX_ACCOUNT_STATE_JWS_BYTES = 32 * 1024;
 
 /**
  * How long a used pairing-start `jti` is kept past its authorization's `expires_at`. Equal to the
@@ -1378,8 +1379,17 @@ export class AccountRelay implements DurableObject {
       return coreUnavailable(err);
     }
 
-    const body = await parseJsonBody(request);
-    if (!body) return json({ error: "invalid JSON body" }, 400);
+    // Capped before parsing: an unauthenticated caller must not make the relay buffer an unbounded
+    // body ahead of the (bounded) document checks.
+    const read = await readJsonObjectCapped(request, MAX_ACCOUNT_STATE_BODY_BYTES);
+    if (read.kind === "too_large") {
+      return json(
+        { error: `request body exceeds ${String(MAX_ACCOUNT_STATE_BODY_BYTES)} bytes` },
+        413,
+      );
+    }
+    if (read.kind === "invalid") return json({ error: "invalid JSON body" }, 400);
+    const body = read.body;
 
     const accountStates = requiredAccountStates(body);
     if (accountStates === null || accountStates.length === 0) {
