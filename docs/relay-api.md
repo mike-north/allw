@@ -8,6 +8,11 @@ relay source + tests; this doc is the source of truth for client implementations
 > verdicts (JWS). It never parses them and never sees plaintext, private keys, or push payloads with
 > content. Honor `docs/contract.md` / `docs/threat-model.md` — clients decrypt/verify/sign **on
 > device** via the core; the relay is a dumb router.
+>
+> **Not yet zero-knowledge against the relay itself:** integrators encrypt to the device list the relay
+> serves (`GET /{acct}/devices`, unauthenticated, not root-vouched), so a malicious relay can add a
+> recipient key it holds. Fix: encrypt only to root-vouched devices (#243) from verified account state
+> (#242). See `docs/threat-model.md` §Residual Risks.
 
 ---
 
@@ -42,14 +47,14 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   **WebSocket** upgrades (which can't easily set headers), pass `?auth=<token>` as a query param.
   The relay stores only `SHA-256(token)`; the plaintext is returned **once** at issuance — cache it.
   Missing token ⇒ **401**; wrong/expired/cross-scope token ⇒ **403**.
-- **Four token scopes:**
+- **Token scopes** (three implemented; `enrollment_auth_token` is specified only):
 
-  | Token                   | Issued by                     | Used for                                                                      | Lifetime                     |
-  | ----------------------- | ----------------------------- | ----------------------------------------------------------------------------- | ---------------------------- |
-  | `pairing_auth_token`    | `POST /pairing/start`         | `POST /pairing/complete`                                                      | 10 min (`PAIRING_TTL_MS`)    |
-  | `enrollment_auth_token` | `POST /enrollments/start`     | `GET …/enrollments/{id}/csr`, `POST …/cert`, `POST …/abort` (the root holder) | 10 min (`ENROLLMENT_TTL_MS`) |
-  | `device_auth_token`     | `POST /pairing/complete`      | all `devices/{id}/…`, `actors`, `account-states`, the enrollee's courier legs | until revoked                |
-  | `request_auth_token`    | `POST /requests` (integrator) | `requests/{id}` polling/wait, `requests/{id}/retract`                         | 7 days post-terminal         |
+  | Token                   | Issued by                     | Used for                                                            | Lifetime                  |
+  | ----------------------- | ----------------------------- | ------------------------------------------------------------------- | ------------------------- |
+  | `pairing_auth_token`    | `POST /pairing/start`         | `POST /pairing/complete`                                            | 10 min (`PAIRING_TTL_MS`) |
+  | `enrollment_auth_token` | `POST /enrollments/start`     | **specified, not implemented (#199)** — the enrollment courier (§3) | 10 min (specified)        |
+  | `device_auth_token`     | `POST /pairing/complete`      | all `devices/{id}/…`, `actors`, `account-states`                    | until revoked             |
+  | `request_auth_token`    | `POST /requests` (integrator) | `requests/{id}` polling/wait, `requests/{id}/retract`               | 7 days post-terminal      |
 
 - **CORS (browser clients).** A browser page may call the relay only from an allowlisted origin
   (`CORS_ALLOWED_ORIGINS`, `docs/relay-deploy.md` §2; the hosted relay allows
@@ -81,6 +86,9 @@ PAIR (once)
                                         → { device_id, device_auth_token }   (cache both)
 
 GET A device_cert (once, right after pairing — you cannot approve without one)
+  ⚠ SPECIFIED, NOT IMPLEMENTED (#199): the relay has no /enrollments/* routes today (they 404).
+  Today the account-root holder mints the cert off-relay (issue_device_cert) and provisions it.
+  Specified flow:
   POST /{acct}/enrollments/{id}/csr     (Bearer device_auth_token)
      body: { csr: {…signing_pubkey…}, mac }        ← mac keyed by the out-of-band enrollment secret
   GET  /{acct}/enrollments/{id}/cert    (Bearer device_auth_token; poll)
@@ -110,7 +118,7 @@ REFRESH TRUST  (periodically, to verify actor attestation / feed AccountStateRes
 | Need                                     | Endpoint                             | Package seam                                                                                                                                                                                                                                                        |
 | ---------------------------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Pair + store creds                       | `pairing/start` + `pairing/complete` | persist via `NativeCredentialStore` (`device_id`, `device_auth_token`, account-root pubkey)                                                                                                                                                                         |
-| Obtain the `device_cert`                 | `enrollments/{id}/csr` + `…/cert`    | scan the enrollment QR, generate keys on-device, deposit the MAC'd CSR, poll for the cert, verify against the pinned root, persist via `NativeCredentialStore` — no cert ⇒ no inbox                                                                                 |
+| Obtain the `device_cert`                 | `enrollments/{id}/csr` + `…/cert`    | **specified, not implemented (#199).** Scan the enrollment QR, generate keys on-device, deposit the MAC'd CSR, poll for the cert, verify against the pinned root, persist via `NativeCredentialStore` — no cert ⇒ no inbox                                          |
 | Register APNs token                      | `push_tokens` in `pairing/complete`  | `PushTokenRegistering` / `HexApnsTokenRegistrar` `send` closure posts it here                                                                                                                                                                                       |
 | Poll inbox                               | `GET …/inbox`                        | `RelayInboxFetching` / `UrlSessionRelayInboxClient.fetchPendingEnvelopes()`                                                                                                                                                                                         |
 | Live push + **verdict submit + retract** | `…/connect` WebSocket                | **NOT in the package yet — the app builds this WS client.** Feed `{type:"request"}` into `ApprovalInboxStore.sync`; on resolve, send the `SignedVerdict.signedVerdictJson` as `{type:"verdict"}`; on `{type:"retract"}` clear via `PushInboxCoordinator.didResolve` |
@@ -193,7 +201,11 @@ VAPID public key (an uncompressed P-256 point, 65 bytes), which a browser passes
 configured, or the configured pair fails validation (Web Push disabled); **405** for any other
 method. Any other `/.well-known/…` path is **404**.
 
-### Enrollment courier (cross-device `device_cert` issuance, #175)
+### Enrollment courier (cross-device `device_cert` issuance, #175) — specified, not implemented (#199)
+
+> ⚠ **Not implemented.** None of the `/enrollments/*` routes below exist in `packages/relay/src/index.ts`; the
+> relay answers them `404`. This section is the specification the relay will implement under #199. Until then a
+> device's `device_cert` is minted by the account-root holder outside the relay and provisioned directly.
 
 Two write-once mailboxes that carry a **certificate signing request** from a new device to the account-root
 holder, and the issued **`device_cert`** back. Full ceremony, derivations, and failure semantics:
@@ -289,8 +301,8 @@ account-root signature on device**; reject rollbacks below your highest-verified
 ### Integrator endpoints (the app does NOT call these — listed for completeness)
 
 **`POST /{acct}/requests`** — no auth; submits the `ApprovalRequest` envelope (only keys `v`, `id`,
-`created_at`, `expires_at`, `approver`, `context_ciphertext`, `action_structure?`,
-`privacy_preference?`-reserved; any other key ⇒ 400; `expires_at ≤ now` ⇒ 400). → **202**
+`created_at`, `expires_at`, `approver`, `context_ciphertext`; any other key ⇒ 400, including the
+specified-but-unimplemented `action_structure` / `privacy_preference` (#216); `expires_at ≤ now` ⇒ 400). → **202**
 `{ request_id, status:"pending", delivered_to, push_wakeups, request_auth_token }`. 409 on dup `id`.
 **`GET /{acct}/requests/{id}`** and **`GET /{acct}/requests/{id}/wait`** (WS) — Bearer
 `request_auth_token`; poll/await `{ status, verdict? }`. `status` is `pending`, terminal `expired`,
@@ -342,13 +354,13 @@ Only device sockets may submit verdicts. On the first valid verdict the relay ma
   "created_at": 0,
   "expires_at": 0,
   "approver": "string (routing id)",
-  "context_ciphertext": "string (JWE — decrypt on device)",
-  "action_structure": null
+  "context_ciphertext": "string (JWE — decrypt on device)"
 }
 ```
 
 (The Swift `ApprovalEnvelope` mirrors this in camelCase: `createdAt`, `expiresAt`,
-`contextCiphertext`. `action_structure` is the structure-not-data view, #131 — never carries args/values.)
+`contextCiphertext`.) The structure-not-data `action_structure` view (#131 — never carries args/values) is
+**specified, not implemented (#216)**: the relay's envelope key allow-list rejects it with `400` today.
 
 ---
 
@@ -405,8 +417,8 @@ number delivered.
 1. **Pairing-code delivery** (QR / deep-link / manual entry) is a UX layer — not defined by the relay.
 2. **`device_cert`** (binds the device signing key to the account root) is signed by the **account-root
    holder** and persisted **on device**; the relay never issues or validates it. A device that is not the root
-   holder obtains one through the enrollment courier (§3) — the relay stores the CSR and the cert as opaque
-   bytes and can neither forge nor authenticate either. Include the cert in verdicts per the Verdict schema.
+   holder will obtain one through the enrollment courier (§3, specified, not implemented — #199) — the relay
+   will store the CSR and the cert as opaque bytes and can neither forge nor authenticate either. Include the cert in verdicts per the Verdict schema.
 3. **Verdict submission is WS-only** (§2 build note) — there is no HTTP fallback today. If the app
    needs an HTTP verdict path (e.g. background-task constraints), that's a relay change — file an issue.
 4. **Account-state signing/publishing** (who holds the root, how docs are produced) is out of relay
@@ -475,7 +487,7 @@ approver:{account_id,device_id}, sig:<compact JWS>, note?, challenge_response?, 
      root-signed authorization (§3 Pairing). The reference `allw-approver pair` CLI holds the root and drives
      `start` itself when `--code` is omitted. The new device calls only
      `/pairing/complete` with the `pairing_auth_token` shown out-of-band.
-   - **Cross-device issuance (resolved, #175):** the walking-skeleton CLI holds the account-root seed and
+   - **Cross-device issuance (specified #175; relay courier not implemented, #199):** the walking-skeleton CLI holds the account-root seed and
      self-mints its own cert; the phone and the web approver are **not** root holders. They generate their
      keys on-device (signing key never exported), complete relay pairing with the encryption pubkey, then
      deposit a **MAC-authenticated CSR** in the enrollment courier (§3). The root holder verifies the MAC

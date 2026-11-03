@@ -5,7 +5,7 @@
   "compatibility_date": "2026-01-01",
   "compatibility_flags": ["nodejs_compat"],
   "durable_objects": {
-    "bindings": [{ "name": "ACCOUNT", "class_name": "AccountRelay" }]
+    "bindings": [{ "name": "ACCOUNT", "class_name": "AccountRelay" }],
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccountRelay"] }],
 
@@ -43,7 +43,7 @@
 
       // Durable Object binding — must reference the same class as the dev environment.
       "durable_objects": {
-        "bindings": [{ "name": "ACCOUNT", "class_name": "AccountRelay" }]
+        "bindings": [{ "name": "ACCOUNT", "class_name": "AccountRelay" }],
       },
 
       // Pin the migration tag so Cloudflare applies the DO schema exactly once on first deploy.
@@ -81,6 +81,6 @@
       //   VAPID_PRIVATE_KEY  — Web Push VAPID private key (base64url 32-byte P-256 scalar).
       //
       // See docs/relay-deploy.md §Secrets for the full inventory and setup commands.
-    }
-  }
+    },
+  },
 }
