@@ -639,9 +639,8 @@ describe("rate limiting on unauthenticated routes", () => {
   it("503 (fail-closed) when the per-client binding is missing", async () => {
     const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const acct = testAccount("limits-rl-client-missing");
-    const resp = await workerFetch(acct, "/requests", {
-      RATE_LIMIT_CLIENT: undefined,
-    } as Partial<Env>);
+    const missing: Record<string, undefined> = { RATE_LIMIT_CLIENT: undefined };
+    const resp = await workerFetch(acct, "/requests", missing as Partial<Env>);
     expect(resp.status).toBe(503);
     errors.mockRestore();
   });

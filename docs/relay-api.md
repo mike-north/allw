@@ -54,10 +54,13 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   the rate limiter is unavailable or unconfigured (fail-closed). Treat all of them as "not
   submitted" — an integrator fails closed (deny), never retries into an approval.
 - **Rate limiting.** The unauthenticated routes — `POST /pairing/start`, `POST /pairing/complete`,
-  `POST /requests` — pass through a Cloudflare rate-limiting binding keyed by **account id + client
-  IP** before reaching the account's Durable Object. Pairing and requests have separate budgets
-  (defaults: 10 and 60 per 60 s; set in `packages/relay/wrangler.jsonc`, see `docs/relay-deploy.md`).
-  Over the limit ⇒ **429**; binding missing or failing ⇒ **503**.
+  `POST /requests` — pass through Cloudflare rate-limiting bindings before reaching the account's
+  Durable Object: one keyed by **client IP alone** across all three (default 120 per 60 s), then one
+  keyed by **account id + client IP** with separate pairing and requests budgets (defaults 10 and
+  60 per 60 s). An IPv6 client is keyed by its /64. Limits live in `packages/relay/wrangler.jsonc`
+  (see `docs/relay-deploy.md` §3d). Over a limit ⇒ **429**; binding missing or failing ⇒ **503**.
+- **Pairing body cap.** `POST /pairing/start` and `POST /pairing/complete` bodies above
+  `MAX_PAIRING_BODY_BYTES` (16 KiB) are refused with **413** before parsing.
 
 ---
 
@@ -270,6 +273,10 @@ account-root signature on device**; reject rollbacks below your highest-verified
 `privacy_preference?`-reserved; any other key ⇒ 400; `expires_at ≤ now` ⇒ 400). → **202**
 `{ request_id, status:"pending", delivered_to, push_wakeups, request_auth_token }`. 409 on dup `id`.
 
+**Unknown account.** `POST /{acct}/requests` on an account with no bound root (no root-signed
+`pairing/start` has ever succeeded, so no device can have paired) ⇒ **404**
+`{ "error": "unknown account" }`, checked before the body is read.
+
 Limits on `POST /{acct}/requests` (#248; constants in `packages/relay/src/constants.ts`):
 
 | Limit                         | Value                                                               | Over the limit |
@@ -279,13 +286,19 @@ Limits on `POST /{acct}/requests` (#248; constants in `packages/relay/src/consta
 | Horizon (`expires_at − now`)  | `MAX_REQUEST_TTL_MS`, default **15 min** (Worker var override)      | **400**        |
 | Live pending requests/account | `MAX_PENDING_REQUESTS_PER_ACCOUNT` = 64                             | **429**        |
 | Submits per account + IP      | `RATE_LIMIT_REQUESTS` binding (default 60 / 60 s)                   | **429**        |
+| Unauthenticated calls per IP  | `RATE_LIMIT_CLIENT` binding (default 120 / 60 s, all three routes)  | **429**        |
 
 Each value is inclusive (exactly the limit is accepted). The 15-minute horizon covers the hooks'
 420 s maximum timeout; an operator who lowers it below that makes hook requests fail closed. Only
 **live** pending requests count toward the pending cap: resolved, expired and retracted requests,
 and pending ones already past `expires_at`, do not. A pending request older than the horizon (only
 possible for one stored before the horizon existed) also stops counting and is expired by the alarm;
-like every terminal request it is deleted 7 days after it ends.
+like every terminal request it is deleted 7 days after it ends. When a request ends (expired,
+retracted or resolved) the relay blanks its stored envelope: status and verdict reads keep working,
+but the ciphertext is gone. The pending cap therefore bounds **live** requests; stored bytes are
+bounded by submit rate × retention × that small per-row residue. Anyone who knows an account id can
+fill its pending slots, which denies (fail-closed) its owner's agents until those requests end — see
+`docs/threat-model.md` "Relay denial of service".
 **`GET /{acct}/requests/{id}`** and **`GET /{acct}/requests/{id}/wait`** (WS) — Bearer
 `request_auth_token`; poll/await `{ status, verdict? }`. `status` is `pending`, terminal `expired`,
 terminal `retracted` (see below), or `resolved` (+ `verdict`).
