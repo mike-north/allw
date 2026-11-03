@@ -68,7 +68,10 @@ test("hook bin waits across poll intervals and prints a decision (never exits si
     }),
     {
       ALLW_RELAY_URL: relay.url,
-      ALLW_ACCOUNT_ID: "acct_poll_keepalive",
+      // Self-certifying account id: derived from the root key by the core (docs/enrollment.md).
+      ALLW_ACCOUNT_ID: wasm.account_id_for_root(
+        wasm.ed25519_public_key(Buffer.alloc(32, 7).toString("base64url")),
+      ),
       ALLW_APPROVER_ROOT_KEY: wasm.ed25519_public_key(Buffer.alloc(32, 7).toString("base64url")),
     },
   );
