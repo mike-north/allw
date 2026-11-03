@@ -18,6 +18,8 @@
 export { runHook } from "./cli.js";
 
 export {
+  MAX_ERROR_TEXT_CHARS,
+  agentSafeErrorText,
   decide,
   type ApprovalVerdict,
   type DecideDeps,

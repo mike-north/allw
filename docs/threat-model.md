@@ -205,12 +205,20 @@ Validation:
   masked) through WASM, so device-key registration can reject the same keys up front. A shared vector
   (`crates/allw-core/tests/fixtures/x25519_small_order.json`) asserts the denylist and encryption agree in
   Rust and through WASM (#248).
-- Device ids in that registry are relay-chosen text, and SDK error messages reach the agent through the
-  hooks' deny reason. A hostile id could therefore pose as an allw diagnostic (prompt injection). Two layers
-  stop this. The SDK fails closed on any relay device entry whose `device_id` doesn't match
-  `^[A-Za-z0-9_-]{1,64}$` (the relay mints UUIDs) or whose `pubkey` isn't a string, and its error names only
-  the entry's index. The core's `EncryptError` message renders a device id escaped (`{:?}`) and capped at 64
-  characters, while the variant keeps the full id.
+- Relay-chosen text (device ids, error bodies, any response body) can reach SDK error messages, and the hooks
+  put those messages in the deny reason the agent reads. A hostile relay could therefore pose as an allw
+  diagnostic (prompt injection). The defence is layered:
+  - **The hooks are the choke point.** Both `decide()`s pass the error text through the core's
+    `escape_for_display` and cap it at 256 characters (`agentSafeErrorText` in `@allw/hook`), so no SDK path,
+    present or future, can put raw relay text into the agent's context. If the escape fails, the text is
+    withheld.
+  - **The SDK keeps relay text out of its messages.** A rejected `submit` reports only the HTTP status, not
+    the relay's `error` field. A body that isn't JSON reports only the call and status, not the parser's
+    message (which quotes the body). A relay device entry whose `device_id` doesn't match
+    `^[A-Za-z0-9_-]{1,64}$`, or whose `pubkey` isn't a string, fails the whole call closed, and the error
+    names only the entry's index.
+  - **The core renders device ids escaped and capped.** `EncryptError` shows a device id with `{:?}`, capped
+    at 64 characters, while the variant keeps the full id.
 
 ### R2. Verdict authenticity and binding
 

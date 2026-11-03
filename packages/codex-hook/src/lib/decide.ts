@@ -7,7 +7,7 @@
  * core through `@allw/hook` helpers.
  */
 
-import { gateToolCall, type HookConfig, type HookWasm } from "@allw/hook";
+import { agentSafeErrorText, gateToolCall, type HookConfig, type HookWasm } from "@allw/hook";
 
 import {
   denyOutput,
@@ -142,10 +142,9 @@ export async function decide(
   try {
     verdict = await deps.requestApproval(req);
   } catch (err) {
+    // The error text may carry relay-supplied text: escape and cap it before the agent reads it.
     return denyOutput(
-      `allw: approval request failed (fail-closed deny): ${
-        err instanceof Error ? err.message : String(err)
-      }`,
+      `allw: approval request failed (fail-closed deny): ${agentSafeErrorText(deps.wasm, err)}`,
       "transport-error",
     );
   }

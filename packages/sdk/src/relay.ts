@@ -49,6 +49,23 @@ function hasRoutableRecipientFields(
   );
 }
 
+/**
+ * Read a relay response body as JSON. A body that isn't JSON becomes a {@link RelayError} naming only
+ * the call and the status: the parser's own message quotes the start of the body, and relay text
+ * must not reach the agent through the hooks' deny reason. Other failures (a network error while
+ * reading the body) are rethrown unchanged, so they stay transport failures.
+ */
+async function readJsonBody(resp: Response, call: string): Promise<unknown> {
+  try {
+    return (await resp.json()) as unknown;
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      throw new RelayError(`relay ${call} returned a non-JSON body`, resp.status);
+    }
+    throw err;
+  }
+}
+
 /** The relay-visible `ApprovalRequest` envelope — exactly the contract's key set, nothing more. */
 export interface ApprovalRequestEnvelope {
   readonly v: number;
@@ -290,7 +307,7 @@ export class RelayClient {
     if (!resp.ok) {
       throw new RelayError(`relay device list failed (HTTP ${String(resp.status)})`, resp.status);
     }
-    const body: unknown = await resp.json();
+    const body = await readJsonBody(resp, "device list");
     if (typeof body !== "object" || body === null || !("devices" in body)) {
       throw new RelayError("relay device list returned a malformed body", resp.status);
     }
@@ -313,7 +330,11 @@ export class RelayClient {
    * Submit an `ApprovalRequest` envelope (`POST /:acct/requests`). The relay stores it opaquely and
    * fans the ciphertext out to online devices.
    *
-   * @throws {RelayError} on a non-2xx response (e.g. 400 malformed envelope, 409 duplicate id).
+   * The relay's error body is not included in the message, only the status: the relay is untrusted,
+   * and the message can reach the agent through the hooks' deny reason.
+   *
+   * @throws {RelayError} on a non-2xx response (e.g. 400 malformed envelope, 409 duplicate id), or a
+   *   success body that is not JSON or carries no auth token.
    */
   async submit(envelope: ApprovalRequestEnvelope): Promise<void> {
     const resp = await this.timedFetch(`${this.base}/requests`, {
@@ -322,21 +343,9 @@ export class RelayClient {
       body: JSON.stringify(envelope),
     });
     if (!resp.ok) {
-      let detail = "";
-      try {
-        const body: unknown = await resp.json();
-        if (typeof body === "object" && body !== null && "error" in body) {
-          detail = `: ${String(body.error)}`;
-        }
-      } catch {
-        // Non-JSON error body — the status alone is the signal.
-      }
-      throw new RelayError(
-        `relay submit failed (HTTP ${String(resp.status)})${detail}`,
-        resp.status,
-      );
+      throw new RelayError(`relay submit failed (HTTP ${String(resp.status)})`, resp.status);
     }
-    const body: unknown = await resp.json();
+    const body = await readJsonBody(resp, "submit");
     if (
       typeof body !== "object" ||
       body === null ||
@@ -365,7 +374,7 @@ export class RelayClient {
     if (!resp.ok) {
       throw new RelayError(`relay poll failed (HTTP ${String(resp.status)})`, resp.status);
     }
-    const body: unknown = await resp.json();
+    const body = await readJsonBody(resp, "poll");
     if (typeof body !== "object" || body === null || !("status" in body)) {
       throw new RelayError("relay poll returned a malformed body", resp.status);
     }
