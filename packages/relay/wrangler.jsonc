@@ -8,6 +8,32 @@
     "bindings": [{ "name": "ACCOUNT", "class_name": "AccountRelay" }],
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccountRelay"] }],
+  // Rate limits for the unauthenticated routes (#248; src/limits.ts): per account id + client IP
+  // (IPv6 reduced to its /64) for pairing and for requests, plus one per client IP alone across all
+  // four routes. Workers rate limiting is per Cloudflare location and eventually consistent.
+  // The per-account pending cap bounds LIVE requests only; stored bytes are bounded by submit rate ×
+  // the 7-day retention × a small per-row residue (envelopes are blanked once a request ends).
+  // Keep `period` at 60: a 429's Retry-After is RATE_LIMIT_PERIOD_SECONDS (src/constants.ts), not
+  // read from the binding. Missing bindings make these routes fail closed (503).
+  "ratelimits": [
+    // POST /{acct}/pairing/start, /{acct}/pairing/complete and /{acct}/account-states.
+    {
+      "name": "RATE_LIMIT_PAIRING",
+      "namespace_id": "2481",
+      "simple": { "limit": 10, "period": 60 },
+    },
+    // POST /{acct}/requests. (RATE_LIMIT_CLIENT, next, covers all four routes per client IP.)
+    {
+      "name": "RATE_LIMIT_REQUESTS",
+      "namespace_id": "2482",
+      "simple": { "limit": 60, "period": 60 },
+    },
+    {
+      "name": "RATE_LIMIT_CLIENT",
+      "namespace_id": "2483",
+      "simple": { "limit": 120, "period": 60 },
+    },
+  ],
 
   // Browser origins allowed to read relay responses (CORS). Local dev also admits loopback web
   // approvers on any port. See docs/relay-deploy.md §2 and packages/relay/src/cors.ts.
@@ -57,6 +83,26 @@
       "vars": {
         "CORS_ALLOWED_ORIGINS": "https://allw-web-approver.pages.dev",
       },
+
+      // Rate limits are NOT inherited from the top level: repeat them per environment. Keep the
+      // binding names; tune `limit` here for production traffic.
+      "ratelimits": [
+        {
+          "name": "RATE_LIMIT_PAIRING",
+          "namespace_id": "2481",
+          "simple": { "limit": 10, "period": 60 },
+        },
+        {
+          "name": "RATE_LIMIT_REQUESTS",
+          "namespace_id": "2482",
+          "simple": { "limit": 60, "period": 60 },
+        },
+        {
+          "name": "RATE_LIMIT_CLIENT",
+          "namespace_id": "2483",
+          "simple": { "limit": 120, "period": 60 },
+        },
+      ],
 
       // Production resource limits: a per-request CPU cap ("limits": { "cpu_ms": 30 })
       // requires the Workers Paid plan — Cloudflare rejects it on Free (error 100328).

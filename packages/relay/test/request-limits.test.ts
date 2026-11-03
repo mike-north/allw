@@ -9,13 +9,17 @@
  * - Horizon: `expires_at - now > MAX_REQUEST_TTL_MS` → 400 (Worker-var configurable).
  * - `created_at` sanity: an integer, `<= expires_at`, `>= now - MAX_REQUEST_TTL_MS` and
  *   `<= now + MAX_CREATED_AT_SKEW_MS`, else 400.
+ * - Pending cap per account → 429; expired / resolved / retracted / over-horizon rows don't count.
  * - Over-horizon pending rows are expired by the alarm and then swept after retention.
  * - Every terminal transition blanks the stored envelope, so retained rows hold no ciphertext.
  * - Submits to an account with no bound root → 404 "unknown account".
  * - `pairing/start` and `pairing/complete` bodies are size-capped before parsing → 413.
+ * - Rate limiting on `pairing/start`, `pairing/complete`, `requests` → 429 (503 fail-closed when
+ *   the limiter binding is missing or throws), keyed by account id + client IP, plus a per-client
+ *   limit keyed by IP alone; IPv6 clients are keyed by their /64.
  *
  * @see ../../../docs/relay-api.md §3 Integrator endpoints (limits) and §1 Conventions
- * @see ../../../docs/relay-deploy.md (MAX_REQUEST_TTL_MS)
+ * @see ../../../docs/relay-deploy.md (rate-limit bindings, MAX_REQUEST_TTL_MS)
  * @see ../../../docs/threat-model.md Residual risks — "Relay denial of service"
  * @see ../../../docs/contract.md §Invariants (fail-closed)
  */
@@ -23,17 +27,37 @@
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, it, expect, vi } from "vitest";
 import type { SqlStorage } from "@cloudflare/workers-types";
-import { AccountRelay, type Env } from "../src/index.js";
+import worker, { AccountRelay, type Env } from "../src/index.js";
+import wranglerConfigText from "../wrangler.jsonc?raw";
 import {
   DEFAULT_MAX_REQUEST_TTL_MS,
+  MAX_ACCOUNT_STATE_BODY_BYTES,
   MAX_CONTEXT_CIPHERTEXT_BYTES,
   MAX_CREATED_AT_SKEW_MS,
   MAX_PAIRING_BODY_BYTES,
+  MAX_PENDING_REQUESTS_PER_ACCOUNT,
   MAX_REQUEST_BODY_BYTES,
+  RATE_LIMIT_PERIOD_SECONDS,
   REQUEST_RETENTION_MS,
 } from "../src/constants.js";
-import { parseMaxRequestTtlMs, readBodyCapped } from "../src/limits.js";
-import { pairingStartBody, testAccount, testRequestId as rid } from "./support/accounts.js";
+import {
+  clientIpKey,
+  clientRateLimitKey,
+  enforceRateLimit,
+  parseMaxRequestTtlMs,
+  rateLimitBudget,
+  rateLimitKey,
+  readBodyCapped,
+  type RateLimiter,
+} from "../src/limits.js";
+import {
+  pairingStartBody,
+  rootFor,
+  signAccountState,
+  testAccount,
+  testRequestId as rid,
+} from "./support/accounts.js";
+import { parseJsonc } from "./support/jsonc.js";
 import { bindAccountRoot, pinRelayClock } from "./support/relay-state.js";
 
 // ---------------------------------------------------------------------------
@@ -124,6 +148,16 @@ async function seedRequests(accountId: string, rows: readonly SeedRow[]): Promis
       );
     }
   });
+}
+
+function livePending(prefix: string, count: number): SeedRow[] {
+  return Array.from({ length: count }, (_, i) => ({
+    id: `${prefix}-${String(i)}`,
+    status: "pending" as const,
+    created_at: NOW - 1000,
+    expires_at: NOW + 60_000,
+    terminal_at: null,
+  }));
 }
 
 async function requestStatuses(accountId: string): Promise<Record<string, string>> {
@@ -542,6 +576,97 @@ describe("POST /requests created_at bound", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Pending cap
+// ---------------------------------------------------------------------------
+
+describe("POST /requests per-account pending cap", () => {
+  it("accepts the submit that reaches the cap, and 429s the one after it", async () => {
+    const acct = await freshAccount("cap");
+    await seedRequests(acct, livePending("seed", MAX_PENDING_REQUESTS_PER_ACCOUNT - 1));
+
+    expect((await submit(acct, envelope(rid("req-cap-last")))).status).toBe(202);
+    const over = await submit(acct, envelope(rid("req-cap-over")));
+    expect(over.status).toBe(429);
+    expect(over.error).toMatch(/pending/);
+    expect((await requestStatuses(acct))[rid("req-cap-over")]).toBeUndefined();
+  });
+
+  it("does not count expired, resolved, retracted, past-deadline or over-horizon rows", async () => {
+    const acct = await freshAccount("cap-excluded");
+    const cap = MAX_PENDING_REQUESTS_PER_ACCOUNT;
+    const terminal = (status: SeedRow["status"]) =>
+      Array.from({ length: cap }, (_, i) => ({
+        id: `${status}-${String(i)}`,
+        status,
+        created_at: NOW - 10_000,
+        expires_at: NOW - 5_000,
+        terminal_at: NOW - 5_000,
+      }));
+    await seedRequests(acct, [
+      ...terminal("expired"),
+      ...terminal("resolved"),
+      ...terminal("retracted"),
+      // Still 'pending' in storage but at/past expires_at (the alarm has not run yet).
+      ...Array.from({ length: cap }, (_, i) => ({
+        id: `overdue-${String(i)}`,
+        status: "pending" as const,
+        created_at: NOW - 10_000,
+        expires_at: NOW,
+        terminal_at: null,
+      })),
+      // Pre-horizon rows with a far-future expiry, received exactly MAX_REQUEST_TTL_MS ago.
+      ...Array.from({ length: cap }, (_, i) => ({
+        id: `legacy-${String(i)}`,
+        status: "pending" as const,
+        created_at: NOW - DEFAULT_MAX_REQUEST_TTL_MS,
+        expires_at: NOW + 365 * 24 * 60 * 60 * 1000,
+        terminal_at: null,
+      })),
+      ...livePending("live", cap - 1),
+    ]);
+
+    expect((await submit(acct, envelope(rid("req-cap-excluded-ok")))).status).toBe(202);
+    expect((await submit(acct, envelope(rid("req-cap-excluded-over")))).status).toBe(429);
+  });
+
+  it("a row stops counting at its horizon deadline, while its expires_at is still ahead (#292)", async () => {
+    // A full account of live rows received at NOW - 1000, expiring at NOW + 60_000 (livePending).
+    // Lowering the horizon to 30 s, as a redeploy with a smaller MAX_REQUEST_TTL_MS would, puts
+    // their deadline at NOW + 29_000: 31 s before their expires_at.
+    const acct = await freshAccount("cap-horizon-deadline");
+    await seedRequests(acct, livePending("held", MAX_PENDING_REQUESTS_PER_ACCOUNT));
+    const lowered = 30_000;
+    await runInDurableObject(stubFor(acct), (instance: AccountRelay) => {
+      (instance as unknown as { maxRequestTtlMs: number }).maxRequestTtlMs = lowered;
+    });
+    const deadline = NOW - 1000 + lowered;
+    // Each submit's created_at is its own receipt time, inside the lowered past bound.
+    const at = (t: number, id: string) =>
+      envelope(rid(id), { created_at: t, expires_at: t + 10_000 });
+
+    await pinRelayClock(acct, deadline - 1);
+    expect((await submit(acct, at(deadline - 1, "req-cap-horizon-before"))).status).toBe(429);
+    await pinRelayClock(acct, deadline);
+    expect((await submit(acct, at(deadline, "req-cap-horizon-at"))).status).toBe(202);
+  });
+
+  it("a pre-horizon row one millisecond younger than the horizon still counts", async () => {
+    const acct = await freshAccount("cap-legacy-young");
+    await seedRequests(acct, [
+      ...livePending("live", MAX_PENDING_REQUESTS_PER_ACCOUNT - 1),
+      {
+        id: "legacy-young",
+        status: "pending",
+        created_at: NOW - DEFAULT_MAX_REQUEST_TTL_MS + 1,
+        expires_at: NOW + 365 * 24 * 60 * 60 * 1000,
+        terminal_at: null,
+      },
+    ]);
+    expect((await submit(acct, envelope(rid("req-cap-legacy-young")))).status).toBe(429);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Expiry + sweep of over-horizon pending rows
 // ---------------------------------------------------------------------------
 
@@ -606,6 +731,322 @@ describe("alarm expires over-horizon pending rows so the sweep removes them", ()
       (instance as unknown as { ctx: DurableObjectState }).ctx.storage.getAlarm(),
     );
     expect(alarm).toBe(NOW + 60_000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rate limiting (Worker entrypoint)
+// ---------------------------------------------------------------------------
+
+/** A fake limiter allowing `limit` calls per key, recording the keys it saw. */
+function countingLimiter(limit: number): RateLimiter & { keys: string[] } {
+  const counts = new Map<string, number>();
+  const keys: string[] = [];
+  return {
+    keys,
+    limit({ key }) {
+      keys.push(key);
+      const n = (counts.get(key) ?? 0) + 1;
+      counts.set(key, n);
+      return Promise.resolve({ success: n <= limit });
+    },
+  };
+}
+
+function workerFetch(
+  accountId: string,
+  subPath: string,
+  overrides: Partial<Env>,
+  init: RequestInit = { method: "POST", body: "{}" },
+  ip = "198.51.100.7",
+): Promise<Response> {
+  const request = new Request(relayUrl(accountId, subPath), {
+    ...init,
+    headers: { "Content-Type": "application/json", "CF-Connecting-IP": ip },
+  });
+  return worker.fetch(request, { ...env, ...overrides } as Env);
+}
+
+describe("rate limiting on unauthenticated routes", () => {
+  const routes = [
+    { subPath: "/pairing/start", binding: "RATE_LIMIT_PAIRING" as const },
+    { subPath: "/pairing/complete", binding: "RATE_LIMIT_PAIRING" as const },
+    // Unauthenticated and costs up to 16 signature checks, so it draws on the pairing budget.
+    { subPath: "/account-states", binding: "RATE_LIMIT_PAIRING" as const },
+    { subPath: "/requests", binding: "RATE_LIMIT_REQUESTS" as const },
+  ];
+
+  it("wrangler.jsonc configures all three bindings", () => {
+    expect(typeof env.RATE_LIMIT_PAIRING?.limit).toBe("function");
+    expect(typeof env.RATE_LIMIT_REQUESTS?.limit).toBe("function");
+    expect(typeof env.RATE_LIMIT_CLIENT?.limit).toBe("function");
+  });
+
+  it("per-client limit: fresh account ids from one IP share one bucket (limit-th passes, next 429)", async () => {
+    const client = countingLimiter(3);
+    const perAccount = countingLimiter(1_000);
+    const overrides = { RATE_LIMIT_CLIENT: client, RATE_LIMIT_REQUESTS: perAccount };
+    for (const name of ["a", "b", "c"]) {
+      const acct = testAccount(`limits-rl-client-${name}`);
+      expect((await workerFetch(acct, "/requests", overrides)).status).not.toBe(429);
+    }
+    const minted = testAccount("limits-rl-client-d");
+    const resp = await workerFetch(minted, "/requests", overrides);
+    expect(resp.status).toBe(429);
+    expect(client.keys).toEqual(Array<string>(4).fill("ip|198.51.100.7"));
+    // The refused request never reached the per-account limiter.
+    expect(perAccount.keys).toHaveLength(3);
+    // Another client IP has its own bucket.
+    expect(
+      (await workerFetch(minted, "/requests", overrides, undefined, "198.51.100.8")).status,
+    ).not.toBe(429);
+  });
+
+  it("per-client limit covers the pairing and account-state publish routes too", async () => {
+    const client = countingLimiter(0);
+    const acct = testAccount("limits-rl-client-pairing");
+    for (const subPath of ["/pairing/start", "/pairing/complete", "/account-states"]) {
+      expect((await workerFetch(acct, subPath, { RATE_LIMIT_CLIENT: client })).status).toBe(429);
+    }
+  });
+
+  it("503 (fail-closed) when the per-client binding is missing", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const acct = testAccount("limits-rl-client-missing");
+    const missing: Record<string, undefined> = { RATE_LIMIT_CLIENT: undefined };
+    const resp = await workerFetch(acct, "/requests", missing as Partial<Env>);
+    expect(resp.status).toBe(503);
+    errors.mockRestore();
+  });
+
+  for (const { subPath, binding } of routes) {
+    it(`POST ${subPath}: the limit-th call passes through, the next is 429`, async () => {
+      const acct = testAccount(`limits-rl-${subPath}`);
+      const limiter = countingLimiter(2);
+      const overrides = { [binding]: limiter } as Partial<Env>;
+      // Within the limit the request reaches the Durable Object (which rejects the empty body).
+      expect((await workerFetch(acct, subPath, overrides)).status).not.toBe(429);
+      expect((await workerFetch(acct, subPath, overrides)).status).not.toBe(429);
+      const limited = await workerFetch(acct, subPath, overrides);
+      expect(limited.status).toBe(429);
+      expect(limited.headers.get("Retry-After")).toBe(String(RATE_LIMIT_PERIOD_SECONDS));
+      expect(((await limited.json()) as { error: string }).error).toMatch(/rate limit/);
+      expect(limiter.keys).toEqual([
+        `${acct}|198.51.100.7`,
+        `${acct}|198.51.100.7`,
+        `${acct}|198.51.100.7`,
+      ]);
+    });
+
+    it(`POST ${subPath}: 503 (fail-closed) when the binding is missing`, async () => {
+      const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const acct = testAccount(`limits-rl-missing-${subPath}`);
+      const resp = await workerFetch(acct, subPath, { [binding]: undefined } as Partial<Env>);
+      expect(resp.status).toBe(503);
+      errors.mockRestore();
+    });
+
+    it(`POST ${subPath}: 503 (fail-closed) when the limiter throws`, async () => {
+      const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const acct = testAccount(`limits-rl-throws-${subPath}`);
+      const throwing: RateLimiter = { limit: () => Promise.reject(new Error("limiter down")) };
+      const resp = await workerFetch(acct, subPath, { [binding]: throwing } as Partial<Env>);
+      expect(resp.status).toBe(503);
+      errors.mockRestore();
+    });
+  }
+
+  it("a rate-limited submit never reaches the Durable Object", async () => {
+    const acct = await freshAccount("rl-no-store");
+    const deny: RateLimiter = { limit: () => Promise.resolve({ success: false }) };
+    const resp = await workerFetch(
+      acct,
+      "/requests",
+      { RATE_LIMIT_REQUESTS: deny },
+      { method: "POST", body: JSON.stringify(envelope(rid("req-rl"))) },
+    );
+    expect(resp.status).toBe(429);
+    expect(await requestStatuses(acct)).toEqual({});
+  });
+
+  it("keys separate clients and separate accounts independently", async () => {
+    const limiter = countingLimiter(1);
+    const a = testAccount("limits-rl-key-a");
+    const b = testAccount("limits-rl-key-b");
+    const overrides = { RATE_LIMIT_REQUESTS: limiter };
+    expect((await workerFetch(a, "/requests", overrides, undefined, "192.0.2.1")).status).not.toBe(
+      429,
+    );
+    expect((await workerFetch(a, "/requests", overrides, undefined, "192.0.2.1")).status).toBe(429);
+    // A different client IP on the same account, and the same IP on another account, are unaffected.
+    expect((await workerFetch(a, "/requests", overrides, undefined, "192.0.2.2")).status).not.toBe(
+      429,
+    );
+    expect((await workerFetch(b, "/requests", overrides, undefined, "192.0.2.1")).status).not.toBe(
+      429,
+    );
+  });
+
+  it("does not consult the limiter for authenticated or read routes", async () => {
+    const limiter = countingLimiter(0);
+    const acct = testAccount("limits-rl-uncovered");
+    const overrides = { RATE_LIMIT_PAIRING: limiter, RATE_LIMIT_REQUESTS: limiter };
+    expect((await workerFetch(acct, "/devices", overrides, { method: "GET" })).status).toBe(200);
+    // No bearer: an unknown request id answers like a missing token (401), never 404 (#357).
+    expect((await workerFetch(acct, "/requests/x", overrides, { method: "GET" })).status).toBe(401);
+    expect((await workerFetch(acct, "/account-states", overrides, { method: "GET" })).status).toBe(
+      200,
+    );
+    expect(limiter.keys).toEqual([]);
+  });
+
+  it("does not charge a path the router answers 404, such as a trailing slash (#302)", async () => {
+    const limiter = countingLimiter(0);
+    const acct = testAccount("limits-rl-not-a-route");
+    const overrides = {
+      RATE_LIMIT_CLIENT: limiter,
+      RATE_LIMIT_PAIRING: limiter,
+      RATE_LIMIT_REQUESTS: limiter,
+    };
+    for (const subPath of ["/requests/", "/pairing/start/", "/pairing/complete/extra"]) {
+      const resp = await workerFetch(acct, subPath, overrides);
+      expect(resp.status).toBe(404);
+      expect(await resp.json()).toEqual({ error: "not found" });
+    }
+    expect(limiter.keys).toEqual([]);
+  });
+
+  it("rateLimitBudget matches only the exact unauthenticated POST routes", () => {
+    expect(rateLimitBudget("POST", "/acct/pairing/start")).toBe("pairing");
+    expect(rateLimitBudget("post", "/acct/pairing/complete")).toBe("pairing");
+    expect(rateLimitBudget("POST", "/acct/account-states")).toBe("pairing");
+    expect(rateLimitBudget("POST", "/acct/requests")).toBe("requests");
+    expect(rateLimitBudget("GET", "/acct/account-states")).toBeNull();
+    expect(rateLimitBudget("POST", "/acct/account-states/")).toBeNull();
+    // The router's exact paths (#302): a trailing slash or an extra segment is a 404 there, so the
+    // limiter doesn't cover it either.
+    expect(rateLimitBudget("POST", "/acct/requests/")).toBeNull();
+    expect(rateLimitBudget("POST", "/acct/pairing/start/extra")).toBeNull();
+    expect(rateLimitBudget("POST", "/acct//requests")).toBeNull();
+    expect(rateLimitBudget("GET", "/acct/requests")).toBeNull();
+    expect(rateLimitBudget("POST", "/acct/requests/r1/retract")).toBeNull();
+    expect(rateLimitBudget("POST", "/acct/pairing/other")).toBeNull();
+    expect(rateLimitBudget("POST", "/acct/actors")).toBeNull();
+  });
+
+  function withIp(ip: string): Request {
+    return new Request("https://relay.allw.test/a/requests", {
+      headers: { "CF-Connecting-IP": ip },
+    });
+  }
+
+  it("clientIpKey keeps IPv4 as-is", () => {
+    expect(clientIpKey(withIp("203.0.113.9"))).toBe("203.0.113.9");
+    expect(clientRateLimitKey(withIp("203.0.113.9"))).toBe("ip|203.0.113.9");
+  });
+
+  it("clientIpKey reduces IPv6 to its /64", () => {
+    expect(clientIpKey(withIp("2001:db8:1:2:3:4:5:6"))).toBe("2001:db8:1:2::/64");
+    expect(clientIpKey(withIp("2001:0DB8:0001:0002:aaaa:bbbb:cccc:dddd"))).toBe(
+      "2001:db8:1:2::/64",
+    );
+    expect(clientIpKey(withIp("2001:db8::1"))).toBe("2001:db8:0:0::/64");
+    expect(clientIpKey(withIp("::1"))).toBe("0:0:0:0::/64");
+    expect(clientIpKey(withIp("fe80::1%eth0"))).toBe("fe80:0:0:0::/64");
+    expect(clientIpKey(withIp("64:ff9b::192.0.2.1"))).toBe("64:ff9b:0:0::/64");
+  });
+
+  it("two IPv6 addresses in the same /64 share a bucket; a different /64 does not", async () => {
+    const a = clientIpKey(withIp("2001:db8:aa:bb::1"));
+    const b = clientIpKey(withIp("2001:db8:aa:bb:ffff:ffff:ffff:ffff"));
+    const other = clientIpKey(withIp("2001:db8:aa:bc::1"));
+    expect(a).toBe(b);
+    expect(other).not.toBe(a);
+
+    const limiter = countingLimiter(1);
+    const acct = testAccount("limits-rl-v6");
+    const overrides = { RATE_LIMIT_REQUESTS: limiter };
+    expect(
+      (await workerFetch(acct, "/requests", overrides, undefined, "2001:db8:aa:bb::1")).status,
+    ).not.toBe(429);
+    expect(
+      (await workerFetch(acct, "/requests", overrides, undefined, "2001:db8:aa:bb::2")).status,
+    ).toBe(429);
+    expect(
+      (await workerFetch(acct, "/requests", overrides, undefined, "2001:db8:aa:bc::1")).status,
+    ).not.toBe(429);
+  });
+
+  it("clientIpKey maps IPv4-mapped IPv6 to the IPv4, and garbage to 'unknown'", () => {
+    expect(clientIpKey(withIp("::ffff:203.0.113.9"))).toBe("203.0.113.9");
+    expect(clientIpKey(withIp("::FFFF:cb00:7109"))).toBe("203.0.113.9");
+    for (const bad of [
+      "not-an-ip",
+      "1.2.3",
+      "1.2.3.256",
+      "01.2.3.4",
+      "1::2::3",
+      "1:2:3:4:5:6:7:8:9",
+      "12345::1",
+      "",
+    ]) {
+      expect(clientIpKey(withIp(bad))).toBe("unknown");
+    }
+  });
+
+  it("rateLimitKey uses CF-Connecting-IP, or a shared 'unknown' bucket without it", () => {
+    const withIp = new Request("https://relay.allw.test/a/requests", {
+      headers: { "CF-Connecting-IP": "203.0.113.9" },
+    });
+    expect(rateLimitKey("acct-1", withIp)).toBe("acct-1|203.0.113.9");
+    expect(rateLimitKey("acct-1", new Request("https://relay.allw.test/a/requests"))).toBe(
+      "acct-1|unknown",
+    );
+  });
+
+  it("a request with no CF-Connecting-IP is charged to the shared 'unknown' buckets", async () => {
+    const client = countingLimiter(1_000);
+    const perAccount = countingLimiter(1_000);
+    const acct = testAccount("limits-rl-no-ip");
+    const request = new Request(relayUrl(acct, "/requests"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    const resp = await worker.fetch(request, {
+      ...env,
+      RATE_LIMIT_CLIENT: client,
+      RATE_LIMIT_REQUESTS: perAccount,
+    } as Env);
+    expect(resp.status).not.toBe(429);
+    expect(client.keys).toEqual(["ip|unknown"]);
+    expect(perAccount.keys).toEqual([`${acct}|unknown`]);
+  });
+
+  it("every committed binding's period is RATE_LIMIT_PERIOD_SECONDS, which Retry-After states", () => {
+    interface Binding {
+      name: string;
+      simple: { limit: number; period: number };
+    }
+    const config = parseJsonc(wranglerConfigText) as {
+      ratelimits: Binding[];
+      env: { production: { ratelimits: Binding[] } };
+    };
+    for (const bindings of [config.ratelimits, config.env.production.ratelimits]) {
+      expect(bindings.map((b) => b.name).sort()).toEqual([
+        "RATE_LIMIT_CLIENT",
+        "RATE_LIMIT_PAIRING",
+        "RATE_LIMIT_REQUESTS",
+      ]);
+      for (const binding of bindings) {
+        expect(binding.simple.period, binding.name).toBe(RATE_LIMIT_PERIOD_SECONDS);
+      }
+    }
+  });
+
+  it("enforceRateLimit returns null on success", async () => {
+    const allow: RateLimiter = { limit: () => Promise.resolve({ success: true }) };
+    expect(await enforceRateLimit(allow, "k")).toBeNull();
   });
 });
 
@@ -776,6 +1217,55 @@ describe("pairing body size caps", () => {
       auth,
     );
     expect(ok.status).toBe(201);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Account-state publish body cap
+// ---------------------------------------------------------------------------
+
+describe("account-state publish body cap", () => {
+  function storedStates(acct: string): Promise<string[]> {
+    return runInDurableObject(stubFor(acct), (instance: AccountRelay) =>
+      [
+        ...(instance as unknown as { sql: SqlStorage }).sql.exec<{ state_jws: string }>(
+          `SELECT state_jws FROM verified_account_state`,
+        ),
+      ].map((row) => row.state_jws),
+    );
+  }
+
+  /** A valid one-document publish for `acct`, padded with trailing whitespace to `bytes`. */
+  function paddedPublish(acct: string, bytes: number): { body: string; doc: string } {
+    const doc = signAccountState(rootFor(acct), { sequence: 1 });
+    const json = JSON.stringify({ account_states: [doc] });
+    return { body: json + " ".repeat(bytes - new TextEncoder().encode(json).byteLength), doc };
+  }
+
+  function publishRaw(acct: string, body: string): Promise<Response> {
+    return SELF.fetch(relayUrl(acct, "/account-states"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    });
+  }
+
+  it("exactly MAX_ACCOUNT_STATE_BODY_BYTES is processed and stored (200)", async () => {
+    const acct = testAccount("limits-acct-state-at");
+    await bindAccountRoot(acct);
+    const { body, doc } = paddedPublish(acct, MAX_ACCOUNT_STATE_BODY_BYTES);
+    expect((await publishRaw(acct, body)).status).toBe(200);
+    expect(await storedStates(acct)).toEqual([doc]);
+  });
+
+  it("one byte over is 413 before parsing, and stores nothing", async () => {
+    const acct = testAccount("limits-acct-state-over");
+    await bindAccountRoot(acct);
+    const { body } = paddedPublish(acct, MAX_ACCOUNT_STATE_BODY_BYTES + 1);
+    const resp = await publishRaw(acct, body);
+    expect(resp.status).toBe(413);
+    expect(((await resp.json()) as { error: string }).error).toMatch(/exceeds/);
+    expect(await storedStates(acct)).toEqual([]);
   });
 });
 

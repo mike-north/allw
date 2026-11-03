@@ -1,7 +1,7 @@
 /**
  * Direct `AccountRelay` state setup for tests: an injected clock and a bound account root.
  *
- * The relay's submit limits (expiry, horizon) and its expiry alarm/sweep read
+ * The relay's submit limits (expiry, horizon, pending cap) and its expiry alarm/sweep read
  * `AccountRelay#now`, which defaults to the real time. Tests replace it on the live instance so
  * boundaries are exact and fixtures stay fixed dates (never `Date.now()` in test data). The override
  * lives on the in-memory instance; it holds for a test because the workers pool keeps each Durable

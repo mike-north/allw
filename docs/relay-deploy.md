@@ -235,6 +235,47 @@ anything in the approval contract.
 
 ---
 
+### 3e. Rate limiting (unauthenticated routes)
+
+The relay's unauthenticated routes are rate-limited with the
+[Workers rate-limiting binding](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/).
+Three bindings are declared under `"ratelimits"` in `packages/relay/wrangler.jsonc`, at the top level
+**and** under `env.production` (named environments do not inherit them). The client identity is
+`CF-Connecting-IP`, with an IPv6 address reduced to its /64:
+
+| Binding               | Routes                                                                               | Key                 | Default      |
+| --------------------- | ------------------------------------------------------------------------------------ | ------------------- | ------------ |
+| `RATE_LIMIT_CLIENT`   | `POST /{acct}/pairing/start`, `…/pairing/complete`, `…/account-states`, `…/requests` | client IP           | 120 per 60 s |
+| `RATE_LIMIT_PAIRING`  | `POST /{acct}/pairing/start`, `…/pairing/complete`, `…/account-states`               | account + client IP | 10 per 60 s  |
+| `RATE_LIMIT_REQUESTS` | `POST /{acct}/requests`                                                              | account + client IP | 60 per 60 s  |
+
+The per-client binding is checked first, so minting fresh account ids does not buy a client new
+budget. That per-IP budget is shared by every client behind one address (a corporate NAT, a CGNAT
+pool, an IPv6 /64), so a busy office can exhaust it; raise `RATE_LIMIT_CLIENT`'s `limit` for such
+deployments. Tune `simple.limit` per environment and keep the binding names. Keep `period` at `60`:
+a 429's `Retry-After` is the relay's `RATE_LIMIT_PERIOD_SECONDS` (60), not read from the binding,
+and a test pins every committed binding to it. **If a binding is missing the routes it covers fail
+closed with 503**, so a deploy that drops the block takes pairing, account-state publish and
+submission offline rather than running unlimited.
+
+A `namespace_id` identifies one rate-limiting namespace within your Cloudflare account, and every
+binding that names it shares its counters. The top-level and `env.production` blocks reuse the same
+three ids on purpose: both describe the same Worker (`allw-relay`), and the counters are keyed by
+account id and client IP, so sharing them is correct. An environment that deploys a Worker under a
+different `name` (a staging Worker, say) needs its own ids, or it shares production's budgets.
+
+Workers rate limiting is per Cloudflare location and eventually consistent, so treat it as flood
+damping. What the other limits bound (`docs/relay-api.md` §3 Integrator endpoints):
+
+- The per-account pending cap (64) bounds **live** requests only — what devices are shown and what
+  a submit flood can hold open at once.
+- **Stored bytes** are bounded by submit rate × the 7-day retention × a small per-row residue: the
+  request horizon (`MAX_REQUEST_TTL_MS`, above) ends every request within 15 minutes, and every
+  terminal transition (expired, retracted, resolved) blanks the stored envelope, so a retained row
+  keeps only its id (a UUID), timestamps, status, token hash and (if resolved) the signed verdict.
+
+---
+
 ## 4. Migrations
 
 The `AccountRelay` Durable Object uses a single migration tag: `"v1"` (declared in `wrangler.jsonc`

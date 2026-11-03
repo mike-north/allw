@@ -31,9 +31,13 @@
 import { AlarmMultiplexer } from "./alarms.js";
 import { matchesStoredHash, timingSafeEqual } from "./auth-token.js";
 import {
+  MAX_ACCOUNT_STATE_BODY_BYTES,
+  MAX_ACCOUNT_STATE_DOCS,
+  MAX_ACCOUNT_STATE_JWS_BYTES,
   MAX_CONTEXT_CIPHERTEXT_BYTES,
   MAX_CREATED_AT_SKEW_MS,
   MAX_PAIRING_BODY_BYTES,
+  MAX_PENDING_REQUESTS_PER_ACCOUNT,
   MAX_REQUEST_BODY_BYTES,
   PAIRING_TTL_MS,
   REQUEST_RETENTION_MS,
@@ -49,7 +53,16 @@ import {
   verifyPairingStartAuthorization,
   verifyVerdictProvenance,
 } from "./core.js";
-import { parseMaxRequestTtlMs, readJsonObjectCapped, utf8ByteLength } from "./limits.js";
+import {
+  clientRateLimitKey,
+  enforceRateLimit,
+  parseMaxRequestTtlMs,
+  rateLimitBudget,
+  rateLimitKey,
+  readJsonObjectCapped,
+  utf8ByteLength,
+  type RateLimiter,
+} from "./limits.js";
 import {
   ApnsPushTransport,
   FcmPushTransport,
@@ -87,6 +100,15 @@ export interface Env extends VapidEnv, CorsEnv {
   readonly APNS_BEARER_TOKEN?: string;
   readonly FCM_ENDPOINT?: string;
   readonly FCM_BEARER_TOKEN?: string;
+  /**
+   * Cloudflare rate-limiting bindings for the unauthenticated routes (`wrangler.jsonc`
+   * `ratelimits`): per account + client, the pairing budget (`pairing/start`, `pairing/complete`,
+   * `account-states` publish) and the `requests` budget; and per client alone across all four. Missing ⇒ those routes fail closed with 503. See
+   * `./limits.ts`.
+   */
+  readonly RATE_LIMIT_PAIRING?: RateLimiter;
+  readonly RATE_LIMIT_REQUESTS?: RateLimiter;
+  readonly RATE_LIMIT_CLIENT?: RateLimiter;
   /** Optional request-horizon override in ms (default 15 min). See `parseMaxRequestTtlMs`. */
   readonly MAX_REQUEST_TTL_MS?: string;
 }
@@ -102,6 +124,19 @@ export default {
       // Route by account id → its Durable Object.
       const accountId = url.pathname.split("/")[1] ?? "";
       if (!accountId) return new Response("missing account", { status: 400 });
+      // Rate-limit the unauthenticated routes at the edge, before the account's Durable Object.
+      const budget = rateLimitBudget(req.method, url.pathname);
+      if (budget !== null) {
+        // Per client across every account first, so minting fresh account ids buys no new budget.
+        const clientRefused = await enforceRateLimit(
+          env.RATE_LIMIT_CLIENT,
+          clientRateLimitKey(req),
+        );
+        if (clientRefused) return clientRefused;
+        const limiter = budget === "pairing" ? env.RATE_LIMIT_PAIRING : env.RATE_LIMIT_REQUESTS;
+        const refused = await enforceRateLimit(limiter, rateLimitKey(accountId, req));
+        if (refused) return refused;
+      }
       const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
       return stub.fetch(req);
     });
@@ -232,8 +267,6 @@ if (PAIRING_ALPHABET.length !== 32) {
 
 const PAIRING_CODE_LENGTH = 8;
 const AUTH_TOKEN_BYTES = 32;
-const MAX_ACCOUNT_STATE_DOCS = 16;
-const MAX_ACCOUNT_STATE_JWS_BYTES = 32 * 1024;
 
 /**
  * How long a used pairing-start `jti` is kept past its authorization's `expires_at`. Equal to the
@@ -1429,8 +1462,17 @@ export class AccountRelay implements DurableObject {
       return coreUnavailable(err);
     }
 
-    const body = await parseJsonBody(request);
-    if (!body) return json({ error: "invalid JSON body" }, 400);
+    // Capped before parsing: an unauthenticated caller must not make the relay buffer an unbounded
+    // body ahead of the (bounded) document checks.
+    const read = await readJsonObjectCapped(request, MAX_ACCOUNT_STATE_BODY_BYTES);
+    if (read.kind === "too_large") {
+      return json(
+        { error: `request body exceeds ${String(MAX_ACCOUNT_STATE_BODY_BYTES)} bytes` },
+        413,
+      );
+    }
+    if (read.kind === "invalid") return json({ error: "invalid JSON body" }, 400);
+    const body = read.body;
 
     const accountStates = requiredAccountStates(body);
     if (accountStates === null || accountStates.length === 0) {
@@ -1757,6 +1799,8 @@ export class AccountRelay implements DurableObject {
    * - 409: a request with this `id` was already submitted.
    * - 413: the body exceeds `MAX_REQUEST_BODY_BYTES` (checked before parsing) or
    *        `context_ciphertext` exceeds `MAX_CONTEXT_CIPHERTEXT_BYTES`.
+   * - 429: the account already holds `MAX_PENDING_REQUESTS_PER_ACCOUNT` live pending requests.
+   * (The Worker's rate limiter may also answer 429/503 before this handler runs.)
    */
   private async handleSubmit(request: Request, accountId: string): Promise<Response> {
     // No bound root ⇒ no device can have paired (#242), so nothing could ever decide this request.
@@ -1841,6 +1885,13 @@ export class AccountRelay implements DurableObject {
     ];
     if (existing.length > 0) return json({ error: "request already submitted" }, 409);
 
+    // Pending cap. Counted in the same synchronous section as the INSERT below (nothing awaits in
+    // between), so concurrent submits cannot overshoot it. Only live requests count: resolved,
+    // expired and retracted rows, and pending rows already past their deadline, do not.
+    if (this.livePendingCount(now) >= MAX_PENDING_REQUESTS_PER_ACCOUNT) {
+      return json({ error: "too many pending requests for this account" }, 429);
+    }
+
     // SECURITY: the whole envelope is routing/lifecycle + the opaque ciphertext — no plaintext.
     try {
       this.sql.exec(
@@ -1889,6 +1940,22 @@ export class AccountRelay implements DurableObject {
       return `'created_at' is more than ${String(MAX_CREATED_AT_SKEW_MS)} ms in the future`;
     }
     return null;
+  }
+
+  /**
+   * How many live pending requests the account holds at `now`: status `pending` and strictly before
+   * the deadline ({@link deadlineOf}), the same rule as {@link livePendingRequests}. A row past its
+   * horizon deadline stops counting even while its `expires_at` is still ahead.
+   */
+  private livePendingCount(now: number): number {
+    const row = [
+      ...this.sql.exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM request WHERE status = 'pending' AND ${DEADLINE_SQL} > ?`,
+        this.maxRequestTtlMs,
+        now,
+      ),
+    ][0];
+    return row?.n ?? 0;
   }
 
   private async authorizeRequestRead(

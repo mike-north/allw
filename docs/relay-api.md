@@ -93,8 +93,19 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   send no `Origin` and are unaffected.
 - **Errors** are plain bodies with the status code; `400` covers malformed JSON / bad fields /
   unexpected envelope keys (zero-knowledge guard).
-- **Abuse limits (#248).** `413` = body or `context_ciphertext` too large. Treat it as "not
-  submitted": an integrator fails closed (deny), never retries into an approval.
+- **Abuse limits (#248).** `413` = body or `context_ciphertext` too large; `429` = rate-limited or
+  the account's pending-request cap is reached (`Retry-After: 60` on the rate-limit 429); `503` =
+  the rate limiter is unavailable or unconfigured (fail-closed). Treat all of them as "not
+  submitted" — an integrator fails closed (deny), never retries into an approval.
+- **Rate limiting.** The unauthenticated routes — `POST /pairing/start`, `POST /pairing/complete`,
+  `POST /account-states`, `POST /requests`, matched by the same exact route table as dispatch (see
+  "Exact paths" below) — pass through Cloudflare rate-limiting bindings before reaching the
+  account's Durable Object: one keyed by **client IP alone** across all four (default 120 per 60 s),
+  then one keyed by **account id + client IP**. That per-account check has two budgets: pairing
+  (`pairing/start`, `pairing/complete` and the `account-states` publish, default 10 per 60 s) and
+  requests (default 60 per 60 s). An IPv6 client is keyed by its /64. A 429's `Retry-After` is
+  fixed at 60, the period every binding must keep. Limits live in `packages/relay/wrangler.jsonc`
+  (see `docs/relay-deploy.md` §3e). Over a limit ⇒ **429**; binding missing or failing ⇒ **503**.
 - **Pairing body cap.** `POST /pairing/start` and `POST /pairing/complete` bodies above
   `MAX_PAIRING_BODY_BYTES` (16 KiB) are refused with **413** before parsing.
 - **Exact paths.** An account route answers only on its exact path, compared segment by segment as the URL
@@ -373,7 +384,10 @@ deletes its push tokens.
 ### Account state (trust distribution) — authorized by the account root, not a token
 
 **`POST /{acct}/account-states`** (no auth header) body
-`{ account_states: string[] (1–16 compact JWS, ≤32 KiB each), max_sequence?: number }`.
+`{ account_states: string[] (1–16 compact JWS, ≤32 KiB each), max_sequence?: number }`. The body
+is capped at `MAX_ACCOUNT_STATE_BODY_BYTES` (516 KiB: 16 documents at 32 KiB plus 4 KiB of framing)
+before parsing — larger ⇒ **413** — and the route draws on the per-account pairing rate-limit
+budget (§1 Rate limiting), since each call can cost up to 16 signature checks.
 Authority is the root's signature: the relay verifies **every** document with the core's
 `verify_account_state` against the root bound to `{acct}` (by a root-signed `pairing/start`) and the
 path's account id. All-or-nothing — any rejection leaves the stored state unchanged. On success the
@@ -383,12 +397,14 @@ relay replaces its stored set with the submitted documents at the **highest veri
 sequence). `max_sequence` in the body is optional and never trusted; when present it must equal the
 highest verified sequence.
 
-| Status | When                                                                                                                                                                                                        |
-| ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 400    | body is not JSON; `account_states` missing, empty, over 16, or not all compact JWS; `max_sequence` not a non-negative safe integer or not equal to the highest verified; a verified `sequence` above 2^53-1 |
-| 403    | any document fails verification: another signer, wrong `account_id`/`kid`, a `current_root` other than the bound root, wrong `typ`, unsupported `v`, or junk                                                |
-| 409    | no root is bound yet; or the highest verified sequence is not strictly above the stored one (an idempotent republish of the current document is a 409 too)                                                  |
-| 500    | the relay's verification core failed to initialize (logged; no document is judged)                                                                                                                          |
+| Status    | When                                                                                                                                                                                                        |
+| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 400       | body is not JSON; `account_states` missing, empty, over 16, or not all compact JWS; `max_sequence` not a non-negative safe integer or not equal to the highest verified; a verified `sequence` above 2^53-1 |
+| 403       | any document fails verification: another signer, wrong `account_id`/`kid`, a `current_root` other than the bound root, wrong `typ`, unsupported `v`, or junk                                                |
+| 409       | no root is bound yet; or the highest verified sequence is not strictly above the stored one (an idempotent republish of the current document is a 409 too)                                                  |
+| 413       | body over `MAX_ACCOUNT_STATE_BODY_BYTES`, refused before parsing                                                                                                                                            |
+| 429 / 503 | rate-limited, or the limiter is unavailable (§1 Rate limiting)                                                                                                                                              |
+| 500       | the relay's verification core failed to initialize (logged; no document is judged)                                                                                                                          |
 
 **`GET /{acct}/account-states`** (no auth — the documents are public and root-signed; integrators hold
 no device token) → **200** `{ account_states: [ "<compact JWS>" … ], max_sequence: number }`: only
@@ -427,11 +443,14 @@ device after the human taps.
 
 Limits on `POST /{acct}/requests` (#248; constants in `packages/relay/src/constants.ts`):
 
-| Limit                        | Value                                                               | Over the limit |
-| ---------------------------- | ------------------------------------------------------------------- | -------------- |
-| Request body                 | `MAX_REQUEST_BODY_BYTES` = 128 KiB, checked **before** JSON parsing | **413**        |
-| `context_ciphertext`         | `MAX_CONTEXT_CIPHERTEXT_BYTES` = 64 KiB (UTF-8 bytes of the string) | **413**        |
-| Horizon (`expires_at − now`) | `MAX_REQUEST_TTL_MS`, default **15 min** (Worker var override)      | **400**        |
+| Limit                         | Value                                                               | Over the limit |
+| ----------------------------- | ------------------------------------------------------------------- | -------------- |
+| Request body                  | `MAX_REQUEST_BODY_BYTES` = 128 KiB, checked **before** JSON parsing | **413**        |
+| `context_ciphertext`          | `MAX_CONTEXT_CIPHERTEXT_BYTES` = 64 KiB (UTF-8 bytes of the string) | **413**        |
+| Horizon (`expires_at − now`)  | `MAX_REQUEST_TTL_MS`, default **15 min** (Worker var override)      | **400**        |
+| Live pending requests/account | `MAX_PENDING_REQUESTS_PER_ACCOUNT` = 64                             | **429**        |
+| Submits per account + IP      | `RATE_LIMIT_REQUESTS` binding (default 60 / 60 s)                   | **429**        |
+| Unauthenticated calls per IP  | `RATE_LIMIT_CLIENT` binding (default 120 / 60 s, all four routes)   | **429**        |
 
 Each value is inclusive (exactly the limit is accepted). The `context_ciphertext` ceiling is the one
 integrators can hit with honest input: it caps the encrypted context, which is larger than the plaintext
@@ -447,16 +466,27 @@ timeout; an operator who lowers it below that makes hook requests fail closed.
 **Request deadline.** A stored request's deadline is `min(expires_at, created_at + MAX_REQUEST_TTL_MS)`,
 where `created_at` is the relay's own receipt time, not the envelope's. A request is live strictly
 before its deadline and expired at it. Every lifecycle path reads this one deadline, on one relay
-clock: submit, the inbox and the reconnect flush, poll, wait, retract, verdict acceptance, the
-expiry alarm, and the deadline a push wakeup carries. The horizon term only bites for a request
-stored before the horizon existed or before an operator lowered `MAX_REQUEST_TTL_MS`. From its
-deadline on such a request is treated exactly like one past `expires_at`: it is not delivered, poll
-and wait report `expired`, retract is 409, a verdict is acked `expired`, and the alarm expires it.
+clock: submit and its pending cap, the inbox and the reconnect flush, poll, wait, retract, verdict
+acceptance, the expiry alarm, and the deadline a push wakeup carries. Only **live** pending requests
+count toward the pending cap: resolved, expired and retracted requests, and pending ones already at
+or past their deadline, do not. The horizon term only bites for a request stored before the horizon
+existed or before an operator lowered `MAX_REQUEST_TTL_MS`. From its deadline on such a request is
+treated exactly like one past `expires_at`: it is not delivered, poll and wait report `expired`,
+retract is 409, a verdict is acked `expired`, it frees its pending slot, and the alarm expires it.
 Like every terminal request it is deleted 7 days after it ends. When a request ends (expired,
 retracted or resolved) the relay blanks its stored envelope: status and verdict reads keep working,
-but the ciphertext is gone. Stored bytes are therefore bounded by submit rate × retention × that small
-per-row residue. Submission is not yet rate-limited, nor is the number of pending requests per account
-bounded — see `docs/threat-model.md` "Relay denial of service".
+but the ciphertext is gone. The pending cap therefore bounds **live** requests; stored bytes are
+bounded by submit rate × retention × that small per-row residue.
+
+Anyone who knows an account id can fill its pending slots, which denies (fail-closed) its owner's
+agents **for as long as the submitter keeps the slots filled**: refilling 64 slots every 15 minutes
+is about 4.3 submits a minute from one IP, under every rate limit above, so the lockout can be held
+indefinitely. The cap is also an activity oracle: a stranger holding 63 slots learns from whether
+the next submit gets the cap's 429 whether the owner has a live pending approval. And retained rows
+are bounded per IP, not per account: a submitter retracts its own requests to free slots at once,
+so it can create rows at the full per-account rate (60 a minute per IP), and an IPv6 /48 holds
+65,536 /64 keys. See `docs/threat-model.md` "Relay denial of service"; mitigations are an open
+product decision.
 
 **`GET /{acct}/requests/{id}`** and **`GET /{acct}/requests/{id}/wait`** (WS) — Bearer
 `request_auth_token`; poll/await `{ status, verdict? }`. `status` is `pending`, terminal `expired`,
