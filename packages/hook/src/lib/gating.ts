@@ -36,11 +36,24 @@ const MCP_TOOL_PREFIX = "mcp__";
 /** The Bash tool name (the v0 command surface). */
 const BASH_TOOL_NAME = "Bash";
 
+/**
+ * Claude Code's PowerShell tool: a shell command in `tool_input.command`, like Bash, but in
+ * PowerShell syntax, so the core's PowerShell builder records it (#298).
+ */
+const POWERSHELL_TOOL_NAME = "PowerShell";
+
+/**
+ * Claude Code's Monitor tool. With `tool_input.command` it runs a shell command in the background,
+ * exactly as Bash would (and under Bash's permission rules), so it is gated like Bash. With
+ * `tool_input.ws` it opens a WebSocket watch instead and runs nothing (#298).
+ */
+const MONITOR_TOOL_NAME = "Monitor";
+
 /** Codex's patch application tool name. */
 const APPLY_PATCH_TOOL_NAME = "apply_patch";
 
 /** Claude Code file-editing tool names that can mutate files without going through Bash. */
-const CLAUDE_FILE_EDIT_TOOLS = new Set(["Edit", "MultiEdit", "Write"]);
+const CLAUDE_FILE_EDIT_TOOLS = new Set(["Edit", "MultiEdit", "Write", "NotebookEdit"]);
 
 /**
  * The outcome of classifying + reducing a tool call:
@@ -57,7 +70,7 @@ export type GateOutcome =
   | { readonly kind: "pass-through"; readonly reason: string }
   | { readonly kind: "build-error"; readonly reason: string };
 
-/** Narrow `tool_input` to a `Bash` shape: a `{ command: string }`. */
+/** Narrow `tool_input` to a `Bash`-shaped `{ command: string }` (also PowerShell and Monitor). */
 function readBashCommand(toolInput: unknown): string | null {
   if (typeof toolInput !== "object" || toolInput === null) return null;
   const command = (toolInput as { command?: unknown }).command;
@@ -100,8 +113,10 @@ function isFileEditTool(toolName: string): boolean {
 }
 
 /**
- * True if a tool name is one this hook gates: `Bash`, file edit tools, or **any**
- * `mcp__`-prefixed name.
+ * True if a tool name is one this hook gates: the shell tools (`Bash`, `PowerShell`, `Monitor`),
+ * the file edit tools (including `NotebookEdit`), or **any** `mcp__`-prefixed name. A `Monitor`
+ * call is routed here even when it turns out to be a WebSocket watch; `gateToolCall` then makes no
+ * decision for it.
  *
  * Crucially, gating an MCP name does NOT require it to fully parse as `mcp__<server>__<tool>`. The
  * recommended `.claude/settings.json` matcher is `mcp__.*`, so Claude Code routes every
@@ -111,7 +126,41 @@ function isFileEditTool(toolName: string): boolean {
  * cannot be reduced to an `ActionRecord`.
  */
 export function isGatedTool(toolName: string): boolean {
-  return toolName === BASH_TOOL_NAME || isFileEditTool(toolName) || hasMcpPrefix(toolName);
+  return (
+    toolName === BASH_TOOL_NAME ||
+    toolName === POWERSHELL_TOOL_NAME ||
+    toolName === MONITOR_TOOL_NAME ||
+    isFileEditTool(toolName) ||
+    hasMcpPrefix(toolName)
+  );
+}
+
+/**
+ * What a `Monitor` call asks for: a shell `command`, a WebSocket `ws` watch, or neither (malformed).
+ * Claude Code accepts exactly one of the two, so a call carrying both is malformed too.
+ */
+type MonitorRequest =
+  | { readonly kind: "command"; readonly command: string }
+  | { readonly kind: "ws" }
+  | { readonly kind: "malformed" };
+
+/** Classify a `Monitor` `tool_input`. A `ws` watch needs an object with a string `url`. */
+function readMonitorRequest(toolInput: unknown): MonitorRequest {
+  if (typeof toolInput !== "object" || toolInput === null || Array.isArray(toolInput)) {
+    return { kind: "malformed" };
+  }
+  const record = toolInput as Record<string, unknown>;
+  const hasCommand = "command" in record;
+  const hasWs = "ws" in record;
+  if (hasCommand && !hasWs) {
+    return typeof record.command === "string"
+      ? { kind: "command", command: record.command }
+      : { kind: "malformed" };
+  }
+  if (hasWs && !hasCommand) {
+    return readStringField(record.ws, "url") !== null ? { kind: "ws" } : { kind: "malformed" };
+  }
+  return { kind: "malformed" };
 }
 
 /** Truncate a summary so a long command/params blob stays a one-liner in the notification. */
@@ -181,6 +230,56 @@ type FileEditReduction =
     }
   | { readonly error: string };
 
+/** The edit modes Claude Code's `NotebookEdit` accepts; `replace` is its default. */
+const NOTEBOOK_EDIT_MODES = new Set(["replace", "insert", "delete"]);
+
+/**
+ * Reduce a `NotebookEdit` call (one cell of a Jupyter notebook) into the core's file_edit builder
+ * inputs. The hash-bound bytes are the cell-level change itself: which cell, how, and the new source.
+ */
+function reduceNotebookEdit(toolInput: unknown): FileEditReduction {
+  const notebookPath = readStringField(toolInput, "notebook_path");
+  if (notebookPath === null || notebookPath.trim().length === 0) {
+    return { error: "NotebookEdit tool_input missing a string 'notebook_path'" };
+  }
+  const record = toolInput as Record<string, unknown>;
+  const optionalString = (key: string): string | null | undefined => {
+    const value = record[key];
+    if (value === undefined || value === null) return null;
+    return typeof value === "string" ? value : undefined;
+  };
+  const cellId = optionalString("cell_id");
+  const cellType = optionalString("cell_type");
+  const editMode = optionalString("edit_mode");
+  const newSource = optionalString("new_source");
+  if (cellId === undefined || cellType === undefined || editMode === undefined) {
+    return {
+      error: "NotebookEdit tool_input has a non-string 'cell_id', 'cell_type' or 'edit_mode'",
+    };
+  }
+  const mode = editMode ?? "replace";
+  if (!NOTEBOOK_EDIT_MODES.has(mode)) {
+    return { error: `NotebookEdit tool_input has an unknown 'edit_mode' '${mode}'` };
+  }
+  if (newSource === undefined || (newSource === null && mode !== "delete")) {
+    return { error: "NotebookEdit tool_input missing a string 'new_source'" };
+  }
+  const paths = [notebookPath];
+  const target = cellId === null ? mode : `cell ${cellId}, ${mode}`;
+  return {
+    operation: "notebook_edit",
+    paths,
+    diffSummary: summarizeFileEdit("notebook_edit", paths, `(${target})`),
+    diffBytes: JSON.stringify({
+      notebook_path: notebookPath,
+      cell_id: cellId,
+      cell_type: cellType,
+      edit_mode: mode,
+      new_source: newSource,
+    }),
+  };
+}
+
 /** Reduce a direct file-edit tool call into the core's file_edit builder inputs. */
 function reduceFileEdit(toolName: string, toolInput: unknown): FileEditReduction {
   if (toolName === APPLY_PATCH_TOOL_NAME) {
@@ -195,6 +294,8 @@ function reduceFileEdit(toolName: string, toolInput: unknown): FileEditReduction
       diffBytes: patch.patch,
     };
   }
+
+  if (toolName === "NotebookEdit") return reduceNotebookEdit(toolInput);
 
   const filePath = readStringField(toolInput, "file_path");
   if (filePath === null || filePath.trim().length === 0) {
@@ -250,6 +351,33 @@ function reduceFileEdit(toolName: string, toolInput: unknown): FileEditReduction
 }
 
 /**
+ * Build a `command` record for a POSIX shell command (Bash, or Monitor's `command`) through the core.
+ * A core error (invalid shell syntax) is a `build-error`, so the caller denies.
+ */
+function gatePosixCommand(
+  wasm: HookWasm,
+  command: string,
+  cwd: string | undefined,
+  summary: string,
+): GateOutcome {
+  try {
+    // Pass cwd through to the core only when present; the FFI maps `undefined` → `None`.
+    const actionRecord =
+      cwd === undefined
+        ? wasm.action_from_command(command)
+        : wasm.action_from_command(command, cwd);
+    return { kind: "gated", actionRecord, summary: oneLine(summary) };
+  } catch (err) {
+    return {
+      kind: "build-error",
+      reason: `allw: could not build an ActionRecord for the command (fail-closed deny): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    };
+  }
+}
+
+/**
  * Classify a tool call and, when gated, build its `ActionRecord` through the WASM core.
  *
  * All `ActionRecord` construction is delegated to the core — the hook never reimplements the
@@ -270,17 +398,50 @@ export function gateToolCall(
         reason: "allw: Bash tool_input missing a string 'command' (fail-closed deny)",
       };
     }
+    return gatePosixCommand(wasm, command, cwd, `Run command: ${command}`);
+  }
+
+  if (toolName === MONITOR_TOOL_NAME) {
+    const request = readMonitorRequest(toolInput);
+    if (request.kind === "ws") {
+      // A WebSocket watch runs no command: it is a read-only network subscription, and allw does
+      // not gate raw egress (docs/policy-seam.md). Claude Code's own WebSocket prompt still applies.
+      return { kind: "pass-through", reason: "allw: Monitor WebSocket watch runs no command" };
+    }
+    if (request.kind === "malformed") {
+      return {
+        kind: "build-error",
+        reason:
+          "allw: Monitor tool_input must have either a string 'command' or a 'ws' object with a " +
+          "string 'url' (fail-closed deny)",
+      };
+    }
+    return gatePosixCommand(
+      wasm,
+      request.command,
+      cwd,
+      `Run command (Monitor): ${request.command}`,
+    );
+  }
+
+  if (toolName === POWERSHELL_TOOL_NAME) {
+    const command = readBashCommand(toolInput);
+    if (command === null) {
+      return {
+        kind: "build-error",
+        reason: "allw: PowerShell tool_input missing a string 'command' (fail-closed deny)",
+      };
+    }
     try {
-      // Pass cwd through to the core only when present; the FFI maps `undefined` → `None`.
       const actionRecord =
         cwd === undefined
-          ? wasm.action_from_command(command)
-          : wasm.action_from_command(command, cwd);
-      return { kind: "gated", actionRecord, summary: oneLine(`Run command: ${command}`) };
+          ? wasm.action_from_powershell_command(command)
+          : wasm.action_from_powershell_command(command, cwd);
+      return { kind: "gated", actionRecord, summary: oneLine(`PowerShell: ${command}`) };
     } catch (err) {
       return {
         kind: "build-error",
-        reason: `allw: could not build an ActionRecord for the command (fail-closed deny): ${
+        reason: `allw: could not build an ActionRecord for the PowerShell command (fail-closed deny): ${
           err instanceof Error ? err.message : String(err)
         }`,
       };
