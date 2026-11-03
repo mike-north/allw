@@ -254,8 +254,9 @@ fn build_vector() -> WasmVector {
         note: Some(NOTE.to_string()),
         ..clone_unsigned(&unsigned)
     };
-    let noted_verdict = sign_verdict(&noted_unsigned, &device, NOTED_NONCE, Some(cert.clone()));
-    let verdict = sign_verdict(&unsigned, &device, NONCE, Some(cert));
+    let noted_verdict = sign_verdict(&noted_unsigned, &device, NOTED_NONCE, Some(cert.clone()))
+        .expect("note within cap");
+    let verdict = sign_verdict(&unsigned, &device, NONCE, Some(cert)).expect("note within cap");
 
     let agent_tool_call_context = make_agent_tool_call_context();
     let agent_tool_call_request_hash = compute_request_hash(&agent_tool_call_context, TS_EXPIRES);

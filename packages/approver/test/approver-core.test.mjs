@@ -174,7 +174,7 @@ test("approver note is signed: a noted verdict verifies and a rewritten note is 
   assert.equal(JSON.parse(verify(verdict)).approved, true, "an untampered noted verdict verifies");
   assert.throws(
     () => verify({ ...verdict, note: "anything goes" }),
-    /note/,
+    /field 'note' disagrees with the signed claim/,
     "a relay-rewritten note must fail verification",
   );
 });

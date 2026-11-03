@@ -173,7 +173,13 @@ function makeSecondDevice(wasm, primary, { seedByte, deviceId }) {
  * Mint a signed verdict for a captured envelope, bound to the SDK's context. `decision` controls
  * approved/denied/etc. Uses the device key the cert certifies (a genuine, verifiable verdict).
  */
-function signVerdict(wasm, approver, req, capturedEnvelope, { decision = "approved" } = {}) {
+function signVerdict(
+  wasm,
+  approver,
+  req,
+  capturedEnvelope,
+  { decision = "approved", note = undefined } = {},
+) {
   const requestHash = wasm.compute_request_hash(
     JSON.stringify(wireContext(req)),
     capturedEnvelope.expires_at,
@@ -185,6 +191,7 @@ function signVerdict(wasm, approver, req, capturedEnvelope, { decision = "approv
     decision,
     decided_at: NOW_MS, // inside [created_at, expires_at]
     approver: { account_id: ACCOUNT_ID, device_id: approver.deviceId },
+    ...(note === undefined ? {} : { note }),
   };
   const nonce = Buffer.alloc(16, 3).toString("base64url");
   const verdictJson = wasm.sign_verdict(
@@ -746,6 +753,49 @@ test("(c) tampered verdict (outer decision flipped) → never approved, synthesi
     false,
     "verify() rejects the forgery",
   );
+});
+
+/**
+ * The note check runs before the decision gate (#251 S15): a signed non-approval whose note the
+ * relay rewrote is unverifiable, so `verifyToDecision` returns null and the SDK synthesizes
+ * `denied` — it is never reported as the verified decision. The verdict is signed `aborted` so a
+ * verified decision (`aborted`) and the synthesized one (`denied`) are distinguishable.
+ *
+ * @see docs/contract.md §Wire encoding → verdict signature
+ */
+test("(c-note) rewritten note on a signed non-approval → synthesized denied, never the verified decision", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+
+  const run = async (tamper) => {
+    const req = sampleRequest();
+    const relay = makeRelayDouble({
+      devices: [deviceRecord(approver)],
+      behavior: {
+        poll: (env) => {
+          if (!env) return null;
+          const verdict = signVerdict(wasm, approver, req, env, {
+            decision: "aborted",
+            note: "never on prod",
+          });
+          if (tamper) verdict.note = "fine on prod";
+          return verdict;
+        },
+      },
+    });
+    return pollClient(approver, relay).requestApproval(req);
+  };
+
+  const control = await run(false);
+  assert.equal(control.decision, "aborted", "an untampered signed non-approval is verified");
+
+  const tampered = await run(true);
+  assert.equal(
+    tampered.decision,
+    "denied",
+    "a rewritten note makes the verdict unverifiable → synthesized denied, not 'aborted'",
+  );
+  assert.equal(await tampered.verify(approver.accountRootPub), false);
 });
 
 test("(c-sig) verdict signed by an uncertified key → never approved", async () => {

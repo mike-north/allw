@@ -189,16 +189,59 @@ test("verify_verdict accepts the noted vector and rejects a tampered, removed, o
     );
 
   const noted = JSON.parse(v.noted_verdict_json);
-  assert.equal(JSON.parse(verify(noted)).approved, true, "the untampered noted verdict verifies");
+  const verified = JSON.parse(verify(noted));
+  assert.equal(verified.approved, true, "the untampered noted verdict verifies");
+  assert.equal(
+    verified.note,
+    v.noted_verdict_note,
+    "verify returns the note from the signed claims",
+  );
+  assert.equal(
+    "note" in JSON.parse(verify(JSON.parse(v.verdict_json))),
+    false,
+    "a note-less verdict's verify result has no note",
+  );
 
   const tampered = { ...noted, note: "ok for prod" };
-  assert.throws(() => verify(tampered), /note/, "a rewritten note must fail verification");
+  assert.throws(
+    () => verify(tampered),
+    /field 'note' disagrees with the signed claim/,
+    "a rewritten note must fail verification",
+  );
 
   const { note: _note, ...removed } = noted;
-  assert.throws(() => verify(removed), /note/, "a stripped note must fail verification");
+  assert.throws(
+    () => verify(removed),
+    /field 'note' disagrees with the signed claim/,
+    "a stripped note must fail verification",
+  );
 
   const added = { ...JSON.parse(v.verdict_json), note: "injected" };
-  assert.throws(() => verify(added), /note/, "an injected note must fail verification");
+  assert.throws(
+    () => verify(added),
+    /field 'note' disagrees with the signed claim/,
+    "an injected note must fail verification",
+  );
+});
+
+test("sign_verdict signs a note at the 2048-byte cap and refuses one byte over", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  const { sig: _sig, device_cert: deviceCert, ...unsigned } = JSON.parse(v.noted_verdict_json);
+  const deviceSeed = Buffer.alloc(32, 0x22).toString("base64url");
+  const sign = (note) =>
+    wasm.sign_verdict(
+      JSON.stringify({ ...unsigned, note }),
+      deviceSeed,
+      v.noted_verdict_nonce_b64,
+      deviceCert,
+    );
+  assert.equal(JSON.parse(sign("a".repeat(2048))).note.length, 2048, "at the cap signs");
+  assert.throws(
+    () => sign("a".repeat(2049)),
+    /sign_verdict failed: verdict note is 2049 bytes of UTF-8; the maximum is 2048/,
+    "one byte over the cap must not sign",
+  );
 });
 
 test("compute_request_hash throws on invalid context JSON", async () => {

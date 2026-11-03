@@ -314,13 +314,18 @@ struct VerifyResult {
     decided_at: i64,
     /// The signed anti-replay nonce, base64url-unpadded, for SDK/client-level replay stores.
     nonce_b64: String,
+    /// The approver's note from the **signed claims** (omitted when absent). Audit records take
+    /// the note from here, never from the unverified outer verdict (`docs/contract.md`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
 }
 
 /// Verifies a [`Verdict`](allw_core::Verdict) against the request it answers, the human-shown
 /// context, and the approver's account-root Ed25519 public key.
 ///
 /// On success returns a JSON
-/// `{ "approved": true, "device_id": string, "decided_at": number, "nonce_b64": string }`.
+/// `{ "approved": true, "device_id": string, "decided_at": number, "nonce_b64": string, "note"?: string }`
+/// (`note` is the signed note, present only when the verdict carries one).
 /// Uses a fresh single-shot [`InMemoryNonceStore`](allw_core::InMemoryNonceStore), then returns the
 /// verified nonce so SDK/client code can enforce cross-call replay protection in a long-lived
 /// store.
@@ -381,6 +386,7 @@ pub fn verify_verdict(
             device_id: verified.device_id,
             decided_at: verified.decided_at,
             nonce_b64: URL_SAFE_NO_PAD.encode(verified.nonce),
+            note: verified.note,
         },
         "VerifyResult",
     )
@@ -452,6 +458,7 @@ pub fn verify_verdict_with_account_states(
             device_id: verified.device_id,
             decided_at: verified.decided_at,
             nonce_b64: URL_SAFE_NO_PAD.encode(verified.nonce),
+            note: verified.note,
         },
         "VerifyResult",
     )
@@ -523,7 +530,8 @@ pub fn sign_verdict(
 
     let cert = required_device_cert(device_cert)?;
 
-    let verdict: Verdict = core_sign_verdict(&unsigned, &device_key, &nonce, Some(cert));
+    let verdict: Verdict = core_sign_verdict(&unsigned, &device_key, &nonce, Some(cert))
+        .map_err(|e| JsError::new(&format!("sign_verdict failed: {e}")))?;
     to_json(&verdict, "Verdict")
 }
 
