@@ -39,6 +39,7 @@ export function runKeygen(
   writeKeyfile(options.keyfilePath, keyfile);
 
   log(`Generated a fresh keyfile at ${options.keyfilePath}`);
+  log(`  account id:              ${wasm.account_id_for_root(keyfile.account_root_pubkey)}`);
   log(`  account-root pubkey:     ${keyfile.account_root_pubkey}`);
   log(`  device signing pubkey:   ${keyfile.device_signing_pubkey}`);
   log(`  device encryption pubkey:${keyfile.device_encryption_pubkey}`);

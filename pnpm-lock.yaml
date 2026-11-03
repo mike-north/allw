@@ -100,6 +100,9 @@ importers:
 
   packages/relay:
     devDependencies:
+      '@allw/sdk':
+        specifier: workspace:*
+        version: link:../sdk
       '@cloudflare/vitest-pool-workers':
         specifier: ^0.16.14
         version: 0.16.14(@cloudflare/workers-types@4.20260609.1)(@vitest/runner@4.1.8)(@vitest/snapshot@4.1.8)(vitest@4.1.8(@types/node@22.19.20)(jsdom@29.1.1)(vite@8.0.16(@types/node@22.19.20)(esbuild@0.27.3)))

@@ -118,6 +118,8 @@ export async function mountWebApprover(config: BrowserConfig): Promise<WebApprov
       mountPairingGate({
         root: config.root,
         pairingStore,
+        // A new pairing pins the relay this mount polls (#249); a relay-less harness pins none.
+        ...(config.relay ? { relayUrl: config.relay.relayUrl } : {}),
         onPaired: (_identity) => {
           // Identity confirmed — now mount the inbox (without the gate).
           void mountWebApproverInbox(config).then(resolve);

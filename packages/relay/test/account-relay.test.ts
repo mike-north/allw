@@ -15,6 +15,7 @@
 
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
+import { pairingStartBody, testAccount } from "./support/accounts.js";
 import { AccountRelay } from "../src/index.js";
 
 // ---------------------------------------------------------------------------
@@ -99,8 +100,11 @@ interface PairingCompleteResult {
 }
 
 async function startPairing(accountId: string, label?: string): Promise<PairingStartResult> {
-  const body = label === undefined ? {} : { label };
-  const { status, data } = await post<PairingStartResult>(accountId, "/pairing/start", body);
+  const { status, data } = await post<PairingStartResult>(
+    accountId,
+    "/pairing/start",
+    pairingStartBody(accountId, label),
+  );
   expect(status).toBe(201);
   expect(typeof data.pairing_auth_token).toBe("string");
   return data;
@@ -159,10 +163,11 @@ async function readPushTokens(
 
 describe("AccountRelay — pairing", () => {
   it("starts a pairing and returns a code + expires_at", async () => {
+    const acct = testAccount("acct-pairing-start");
     const { status, data } = await post<PairingStartResult>(
-      "acct-pairing-start",
+      acct,
       "/pairing/start",
-      { label: "My MacBook" },
+      pairingStartBody(acct, "My MacBook"),
     );
     expect(status).toBe(201);
     expect(typeof data.code).toBe("string");
@@ -174,7 +179,7 @@ describe("AccountRelay — pairing", () => {
   });
 
   it("completes pairing: returns device_id and the device appears in /devices", async () => {
-    const acct = "acct-pairing-complete";
+    const acct = testAccount("acct-pairing-complete");
 
     const start = await startPairing(acct, "My Phone");
 
@@ -218,7 +223,7 @@ describe("AccountRelay — pairing", () => {
   });
 
   it("requires the pairing auth token to complete pairing and does not consume the code on auth failure", async () => {
-    const acct = "acct-pairing-complete-auth";
+    const acct = testAccount("acct-pairing-complete-auth");
     const start = await startPairing(acct);
 
     const noAuth = await post<{ error: string }>(acct, "/pairing/complete", {
@@ -240,7 +245,7 @@ describe("AccountRelay — pairing", () => {
   });
 
   it("fails closed when a legacy pairing row has no stored auth-token hash", async () => {
-    const acct = "acct-pairing-null-auth-hash";
+    const acct = testAccount("acct-pairing-null-auth-hash");
     const start = await startPairing(acct);
 
     await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(acct)), (instance) => {
@@ -256,7 +261,7 @@ describe("AccountRelay — pairing", () => {
   });
 
   it("stores push tokens supplied while completing pairing without exposing them in /devices", async () => {
-    const acct = "acct-pairing-push-token";
+    const acct = testAccount("acct-pairing-push-token");
     const startResp = await startPairing(acct, "Phone");
 
     const completeResp = await completePairing(acct, startResp, {
@@ -278,7 +283,7 @@ describe("AccountRelay — pairing", () => {
   });
 
   it("deduplicates repeated push tokens before consuming the pairing code", async () => {
-    const acct = "acct-pairing-duplicate-push-token";
+    const acct = testAccount("acct-pairing-duplicate-push-token");
     const startResp = await startPairing(acct, "Phone");
 
     const completeResp = await completePairing(acct, startResp, {
@@ -294,7 +299,7 @@ describe("AccountRelay — pairing", () => {
   });
 
   it("rejects malformed push tokens before consuming the pairing code", async () => {
-    const acct = "acct-pairing-bad-push-token";
+    const acct = testAccount("acct-pairing-bad-push-token");
     const startResp = await startPairing(acct);
 
     const badComplete = await post<{ error: string }>(
@@ -315,7 +320,7 @@ describe("AccountRelay — pairing", () => {
   });
 
   it("rejects malformed APNs and FCM token formats before consuming the pairing code", async () => {
-    const acct = "acct-pairing-transport-token-format";
+    const acct = testAccount("acct-pairing-transport-token-format");
     const badApns = await startPairing(acct);
     const apnsResp = await post<{ error: string }>(
       acct,
@@ -347,8 +352,10 @@ describe("AccountRelay — pairing", () => {
   });
 
   it("rejects completing a pairing with an unknown code (404)", async () => {
+    // Bind the root first: an unbound account refuses every completion (403) before code lookup.
+    await startPairing(testAccount("acct-unknown-code"));
     const { status, data } = await post<{ error: string }>(
-      "acct-unknown-code",
+      testAccount("acct-unknown-code"),
       "/pairing/complete",
       { code: "XXXXXXXX", pubkey: VALID_PUBKEY_1 },
     );
@@ -356,12 +363,15 @@ describe("AccountRelay — pairing", () => {
     expect(typeof data.error).toBe("string");
 
     // No device should have been added
-    const listResp = await get<{ devices: unknown[] }>("acct-unknown-code", "/devices");
+    const listResp = await get<{ devices: unknown[] }>(
+      testAccount("acct-unknown-code"),
+      "/devices",
+    );
     expect(listResp.data.devices).toHaveLength(0);
   });
 
   it("rejects completing a pairing that was already used (409)", async () => {
-    const acct = "acct-already-used";
+    const acct = testAccount("acct-already-used");
 
     const startData = await startPairing(acct);
 
@@ -387,7 +397,7 @@ describe("AccountRelay — pairing", () => {
   });
 
   it("rejects completing an expired pairing code (410)", async () => {
-    const acct = "acct-expired-code";
+    const acct = testAccount("acct-expired-code");
     const start = await startPairing(acct);
     await expirePairing(acct, start.code);
 
@@ -409,7 +419,7 @@ describe("AccountRelay — pairing", () => {
   });
 
   it("rejects a pubkey that is not 32 bytes (400)", async () => {
-    const acct = "acct-bad-pubkey";
+    const acct = testAccount("acct-bad-pubkey");
     const startData = await startPairing(acct);
 
     // 19 base64url chars (decodes to ~14 bytes) — not the 43 chars / 32 bytes a valid key needs.
@@ -433,7 +443,7 @@ describe("AccountRelay — pairing", () => {
   });
 
   it("rejects a pubkey that contains non-base64url characters (400)", async () => {
-    const acct = "acct-bad-b64";
+    const acct = testAccount("acct-bad-b64");
     const startData = await startPairing(acct);
 
     // Contains '+' which is standard base64 but not base64url
@@ -454,7 +464,7 @@ describe("AccountRelay — pairing", () => {
 
 describe("AccountRelay — actor enrollment", () => {
   it("enrolls an actor and it appears in /actors", async () => {
-    const acct = "acct-actor-enroll";
+    const acct = testAccount("acct-actor-enroll");
     const device = await enrollDevice(acct);
 
     const { status, data } = await post<{ actor_id: string }>(
@@ -496,7 +506,7 @@ describe("AccountRelay — actor enrollment", () => {
   });
 
   it("rejects duplicate actor_id (409)", async () => {
-    const acct = "acct-actor-dup";
+    const acct = testAccount("acct-actor-dup");
     const device = await enrollDevice(acct);
 
     await post(
@@ -526,7 +536,7 @@ describe("AccountRelay — actor enrollment", () => {
   });
 
   it("rejects an actor pubkey that is not 32 bytes (400)", async () => {
-    const acct = "acct-actor-bad-pk";
+    const acct = testAccount("acct-actor-bad-pk");
     const device = await enrollDevice(acct);
     const { status } = await post(
       acct,
@@ -541,7 +551,7 @@ describe("AccountRelay — actor enrollment", () => {
   });
 
   it("requires an enrolled device auth token to enroll actors", async () => {
-    const acct = "acct-actor-auth-required";
+    const acct = testAccount("acct-actor-auth-required");
     const noAuth = await post<{ error: string }>(acct, "/actors", {
       actor_id: "bad-agent",
       pubkey: VALID_PUBKEY_1,
@@ -566,7 +576,7 @@ describe("AccountRelay — account-state distribution", () => {
   const ACCOUNT_STATE_2 = "eyJhbGciOiJFZERTQSJ9.eyJzZXF1ZW5jZSI6Mn0.sig";
 
   it("lets an enrolled device publish and fetch root-signed account-state documents", async () => {
-    const acct = "acct-account-state";
+    const acct = testAccount("acct-account-state");
     const device = await enrollDevice(acct);
 
     const publish = await post<{ account_states: string[] }>(
@@ -588,7 +598,7 @@ describe("AccountRelay — account-state distribution", () => {
   });
 
   it("replaces the current account-state document set atomically for the account", async () => {
-    const acct = "acct-account-state-replace";
+    const acct = testAccount("acct-account-state-replace");
     const device = await enrollDevice(acct);
 
     await post(
@@ -614,7 +624,7 @@ describe("AccountRelay — account-state distribution", () => {
   });
 
   it("requires an enrolled device token to publish or fetch account state", async () => {
-    const acct = "acct-account-state-auth";
+    const acct = testAccount("acct-account-state-auth");
     const device = await enrollDevice(acct);
 
     const noPublishAuth = await post<{ error: string }>(acct, "/account-states", {
@@ -640,7 +650,7 @@ describe("AccountRelay — account-state distribution", () => {
   });
 
   it("rejects malformed account-state payloads before replacing stored state", async () => {
-    const acct = "acct-account-state-bad-shape";
+    const acct = testAccount("acct-account-state-bad-shape");
     const device = await enrollDevice(acct);
     await post(
       acct,
@@ -666,7 +676,7 @@ describe("AccountRelay — account-state distribution", () => {
   });
 
   it("rejects malformed account-state max_sequence before replacing stored state", async () => {
-    const acct = "acct-account-state-bad-sequence";
+    const acct = testAccount("acct-account-state-bad-sequence");
     const device = await enrollDevice(acct);
     await post(
       acct,
@@ -693,7 +703,7 @@ describe("AccountRelay — account-state distribution", () => {
   });
 
   it("rejects regressive account-state publishes and preserves the newer cached set", async () => {
-    const acct = "acct-account-state-regression";
+    const acct = testAccount("acct-account-state-regression");
     const firstDevice = await enrollDevice(acct);
     const secondDevice = await enrollDevice(acct);
 
@@ -723,7 +733,7 @@ describe("AccountRelay — account-state distribution", () => {
   });
 
   it("allows equal-sequence account-state republishes without parsing opaque JWS docs", async () => {
-    const acct = "acct-account-state-equal-sequence";
+    const acct = testAccount("acct-account-state-equal-sequence");
     const device = await enrollDevice(acct);
 
     await post(
@@ -745,7 +755,7 @@ describe("AccountRelay — account-state distribution", () => {
 
 describe("AccountRelay — device revocation", () => {
   it("revokes a device and it no longer appears in /devices", async () => {
-    const acct = "acct-revoke";
+    const acct = testAccount("acct-revoke");
 
     const { device_id, device_auth_token } = await enrollDevice(acct);
 
@@ -769,9 +779,9 @@ describe("AccountRelay — device revocation", () => {
   });
 
   it("returns 404 when revoking an unknown device", async () => {
-    const device = await enrollDevice("acct-revoke-unknown");
+    const device = await enrollDevice(testAccount("acct-revoke-unknown"));
     const { status } = await post(
-      "acct-revoke-unknown",
+      testAccount("acct-revoke-unknown"),
       "/devices/nonexistent-device-id/revoke",
       {},
       bearer(device.device_auth_token),
@@ -780,7 +790,7 @@ describe("AccountRelay — device revocation", () => {
   });
 
   it("requires the target device auth token to revoke a device", async () => {
-    const acct = "acct-revoke-auth-required";
+    const acct = testAccount("acct-revoke-auth-required");
     const device = await enrollDevice(acct);
 
     const noAuth = await post<{ error: string }>(acct, `/devices/${device.device_id}/revoke`, {});
@@ -796,7 +806,7 @@ describe("AccountRelay — device revocation", () => {
   });
 
   it("rejects another enrolled device's real token when revoking the target device", async () => {
-    const acct = "acct-revoke-token-scoped-to-device";
+    const acct = testAccount("acct-revoke-token-scoped-to-device");
     const deviceA = await enrollDevice(acct);
     const startB = await startPairing(acct);
     const completeB = await completePairing(acct, startB, { pubkey: VALID_PUBKEY_2 });
@@ -812,7 +822,7 @@ describe("AccountRelay — device revocation", () => {
   });
 
   it("deletes registered push tokens when revoking a device", async () => {
-    const acct = "acct-revoke-clears-push-tokens";
+    const acct = testAccount("acct-revoke-clears-push-tokens");
     const startData = await startPairing(acct);
     const { data: completeData } = await completePairing(acct, startData, {
       push_tokens: [{ transport: "apns", token: VALID_APNS_TOKEN }],
@@ -836,17 +846,17 @@ describe("AccountRelay — device revocation", () => {
 describe("AccountRelay — per-account isolation", () => {
   it("devices enrolled under acct1 are NOT visible under acct2", async () => {
     // Enroll a device under acct1
-    await enrollDevice("acct-iso-1");
+    await enrollDevice(testAccount("acct-iso-1"));
 
     // acct2 should have an empty device list
-    const { data } = await get<{ devices: unknown[] }>("acct-iso-2", "/devices");
+    const { data } = await get<{ devices: unknown[] }>(testAccount("acct-iso-2"), "/devices");
     expect(data.devices).toHaveLength(0);
   });
 
   it("actors enrolled under acct1 are NOT visible under acct2", async () => {
-    const device = await enrollDevice("acct-iso-actors-1");
+    const device = await enrollDevice(testAccount("acct-iso-actors-1"));
     await post(
-      "acct-iso-actors-1",
+      testAccount("acct-iso-actors-1"),
       "/actors",
       {
         actor_id: "agent-a",
@@ -855,14 +865,14 @@ describe("AccountRelay — per-account isolation", () => {
       bearer(device.device_auth_token),
     );
 
-    const { data } = await get<{ actors: unknown[] }>("acct-iso-actors-2", "/actors");
+    const { data } = await get<{ actors: unknown[] }>(testAccount("acct-iso-actors-2"), "/actors");
     expect(data.actors).toHaveLength(0);
   });
 });
 
 describe("AccountRelay — zero-knowledge invariant", () => {
   it("GET /devices returns ONLY device_id, pubkey, label, created_at (no secret fields)", async () => {
-    const acct = "acct-zk-devices";
+    const acct = testAccount("acct-zk-devices");
 
     const startData = await startPairing(acct);
     await completePairing(acct, startData, { label: "Test device" });
@@ -880,7 +890,7 @@ describe("AccountRelay — zero-knowledge invariant", () => {
   });
 
   it("GET /actors returns ONLY actor_id, pubkey, label, created_at (no secret fields)", async () => {
-    const acct = "acct-zk-actors";
+    const acct = testAccount("acct-zk-actors");
     const device = await enrollDevice(acct);
 
     await post(
@@ -909,12 +919,14 @@ describe("AccountRelay — zero-knowledge invariant", () => {
 
 describe("AccountRelay — routing edge cases", () => {
   it("returns 404 for an unknown path", async () => {
-    const resp = await SELF.fetch(relayUrl("acct-routing", "/unknown/path"), { method: "GET" });
+    const resp = await SELF.fetch(relayUrl(testAccount("acct-routing"), "/unknown/path"), {
+      method: "GET",
+    });
     expect(resp.status).toBe(404);
   });
 
   it("returns 405 for an unsupported method on a known path", async () => {
-    const resp = await SELF.fetch(relayUrl("acct-routing-405", "/devices"), {
+    const resp = await SELF.fetch(relayUrl(testAccount("acct-routing-405"), "/devices"), {
       method: "DELETE",
     });
     expect(resp.status).toBe(405);

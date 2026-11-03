@@ -30,10 +30,14 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
 ## 1. Conventions
 
 - **Account prefix.** Every path is `/{account_id}/<subpath>`. `account_id` selects the per-account
-  Durable Object. The one exception is the **relay-level namespace** `/.well-known/allw/…` (RFC 8615,
-  §3): the router claims the whole `/.well-known` segment before account routing, so it never
-  reaches an account (a leading `.` is outside the account-id alphabet). Every relay-level route,
-  present or future, lives there.
+  Durable Object. Account ids are **self-certifying**:
+  `base64url-unpadded(SHA-256("allw/account-id/v1" || 0x00 || account_root_pub))` — 43 characters, derived from
+  the account-root public key (`docs/enrollment.md` §Self-Certifying Account Id). Root-signed calls present the
+  root key and the relay rejects an id it cannot re-derive from it.
+- **Relay-level namespace.** The one exception to the account prefix is `/.well-known/allw/…` (RFC 8615,
+  §3). The router claims the whole `/.well-known` segment before account routing, so it never reaches an
+  account; a leading `.` is outside the base64url alphabet account ids use, so it cannot collide with one.
+  Every relay-level route, present or future, lives there.
 - **Auth.** `Authorization: Bearer <token>` (token = base64url, `^[A-Za-z0-9_-]+$`, ~43 chars). For
   **WebSocket** upgrades (which can't easily set headers), pass `?auth=<token>` as a query param.
   The relay stores only `SHA-256(token)`; the plaintext is returned **once** at issuance — cache it.
@@ -56,7 +60,9 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
 
 ```
 PAIR (once)
-  POST /{acct}/pairing/start            → { code, expires_at, pairing_auth_token }
+  POST /{acct}/pairing/start            (account-root holder only; root-signed)
+     body: { root_pubkey, authorization, label? }
+                                        → { code, expires_at, pairing_auth_token }
      (code reaches the device out-of-band — QR/deep-link/manual; UX layer, not relay)
   POST /{acct}/pairing/complete         (Bearer pairing_auth_token)
      body: { code, pubkey, label?, push_tokens? }   ← APNs token goes HERE
@@ -111,9 +117,37 @@ REFRESH TRUST  (periodically, to verify actor attestation / feed AccountStateRes
 
 ### Pairing
 
-**`POST /{acct}/pairing/start`** — no auth. Body `{ label?: string }`. → **201**
-`{ code: string (8-char Crockford base32), expires_at: number(ms), pairing_auth_token: string }`.
-Code is single-use, 10-min TTL.
+**`POST /{acct}/pairing/start`** — account-root authorization. Body:
+
+```json
+{
+  "root_pubkey": "base64url 32-byte Ed25519 account-root public key, 43 chars",
+  "authorization": "compact JWS, typ allw-pairing-start+jws, signed by the account root",
+  "label": "string (optional)"
+}
+```
+
+`authorization` is an EdDSA compact JWS with protected header
+`{ "alg": "EdDSA", "typ": "allw-pairing-start+jws", "kid": "<account_id>" }` and payload
+`{ "v": 1, "account_id": "<account_id>", "issued_at": <ms>, "expires_at": <ms>, "jti": "<16–128 base64url chars>" }`.
+`expires_at - issued_at` must be in `(0, 5 min]`; `issued_at` may be at most 60 s in the relay's future; the
+authorization is rejected at or after `expires_at`. Sign it with the core
+(`sign_pairing_start_authorization`), which always binds the id derived from the signing root.
+
+→ **201** `{ code: string (8-char Crockford base32), expires_at: number(ms), pairing_auth_token: string }`.
+Code is single-use, 10-min TTL. The first success binds `root_pubkey` to the account — but only into an account
+with no device, pairing, actor or account-state rows; otherwise the bind is refused (409), never purged
+(`docs/enrollment.md` §Self-Certifying Account Id). A used `jti` is remembered until 60 s past its `expires_at`.
+
+| Status | When                                                                                                                                                                                                                                                        |
+| ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 400    | body is not a JSON object; `root_pubkey` missing, malformed, or not an Ed25519 key; `{acct}` does not derive from `root_pubkey`                                                                                                                             |
+| 401    | `authorization` missing (or not a string)                                                                                                                                                                                                                   |
+| 403    | bad signature, wrong `typ`, wrong `kid`/`account_id`, unsupported `v`, malformed `jti`, invalid/overlong window, not yet valid, expired, a `jti` already accepted for this account, or a `root_pubkey` different from the root already bound to the account |
+| 409    | no root is bound yet but the account already holds devices, pairing codes, actors or account state from before root binding                                                                                                                                 |
+| 500    | the relay's verification core failed to initialize (logged; the request is not judged)                                                                                                                                                                      |
+
+Every rejection leaves the account unchanged (no root bound, no code issued, nothing purged).
 
 **`POST /{acct}/pairing/complete`** — Bearer `pairing_auth_token`. Body:
 
@@ -132,9 +166,11 @@ allowlist (§5); it is stored in normalized form (`URL.href`), so two spellings 
 one token. **Budgets:** at most **4** `push_tokens` entries per registration and **2** distinct tokens
 per transport (duplicates collapse first); over budget is a **400**, never a silent truncation. An
 account holds at most **32** push tokens across all devices; a registration that would exceed that is
-a **409** and the pairing code is not consumed (retry without tokens, or free some). Errors: 400 (bad
-body/pubkey/push_token/unexpected key/over budget), 401/403 (token), 404 (code unknown), 409 (code
-already used, or account push-token budget full), 410 (code expired). Atomic — no half-enrollment.
+a **409** and the pairing code is not consumed (retry without tokens, or free some). Errors: 403 when
+no root is bound to the account (a code on an unbound account predates root binding and is never
+honored), 400 (bad body/pubkey/push_token/unexpected key/over budget), 401/403 (token), 404 (code
+unknown), 409 (code already used, or account push-token budget full), 410 (code expired). Atomic — no
+half-enrollment.
 
 ### Relay-level (`/.well-known/allw/`, not per-account)
 
@@ -157,8 +193,8 @@ holder, and the issued **`device_cert`** back. Full ceremony, derivations, and f
 > keys the CSR MAC travels **only** out of band (QR / pasted link) and must never appear in any request to the
 > relay.
 
-**`POST /{acct}/enrollments/start`** — no auth (account-owner ceremony boundary, same rationale as
-`pairing/start`). Body `{ label?: string }`. → **201**
+**`POST /{acct}/enrollments/start`** — no auth (it only opens a mailbox pair; nothing is certified until the root
+holder authenticates the CSR with the out-of-band MAC). Body `{ label?: string }`. → **201**
 `{ enrollment_id: string (base64url 16 bytes), expires_at: number(ms), enrollment_auth_token: string }`.
 Single-use, 10-min TTL.
 
@@ -414,8 +450,9 @@ approver:{account_id,device_id}, sig:<compact JWS>, note?, challenge_response?, 
    - The device also needs a **`device_cert`** — an account-root-signed JWS binding its Ed25519 signing
      pubkey (`issue_device_cert`). **The relay does NOT issue or validate it.** Verdicts without a valid
      `device_cert` are denied by integrators (`enrollment.md` §Device Certificate Validation).
-   - Who calls `/pairing/start`: the **account owner** (the root-seed holder), or the reference
-     `allw-approver pair` CLI drives `start` itself when `--code` is omitted. The new device calls only
+   - Who calls `/pairing/start`: only the **account owner** (the root-seed holder) — the call carries a
+     root-signed authorization (§3 Pairing). The reference `allw-approver pair` CLI holds the root and drives
+     `start` itself when `--code` is omitted. The new device calls only
      `/pairing/complete` with the `pairing_auth_token` shown out-of-band.
    - **Cross-device issuance (resolved, #175):** the walking-skeleton CLI holds the account-root seed and
      self-mints its own cert; the phone and the web approver are **not** root holders. They generate their

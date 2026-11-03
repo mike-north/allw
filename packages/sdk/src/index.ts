@@ -26,6 +26,19 @@ import {
 import { awaitVerdict, type WebSocketFactory } from "./wait.js";
 import { loadWasm, type AllwWasm } from "./wasm.js";
 
+export {
+  CommandActionError,
+  commandAction,
+  commandActionFromLine,
+  commandRequest,
+} from "./command-request.js";
+export type {
+  CommandActionErrorReason,
+  CommandActionFromLineOptions,
+  CommandActionOptions,
+  CommandRequestInput,
+} from "./command-request.js";
+
 /**
  * A verdict decision. `requestApproval` *resolves* to `approved` (verified), `denied` (a verified
  * human "no" or a fail-closed synthesis), or `expired` (timeout / past deadline). `aborted` is part
@@ -261,7 +274,10 @@ export interface EvaluatePolicyWithAccountStatesInput extends AccountStateOption
 
 /** Configuration for {@link createClient}. */
 export interface ClientConfig {
-  /** Base URL of the relay (e.g. `https://relay.allw.example`). */
+  /**
+   * Base URL of the relay (e.g. `https://relay.allw.example`). Must be `https:`, or `http:` on a
+   * loopback host for local development; {@link createClient} throws on anything else.
+   */
   readonly relayUrl: string;
   /** The approver's relay account id (routes to the per-account Durable Object). */
   readonly accountId: string;
@@ -304,9 +320,15 @@ export interface ClientConfig {
    */
   readonly expectedAccountId?: string;
   /**
-   * Override the timer used to schedule the poll cadence and the fail-closed deadline (tests).
-   * Defaults to `setTimeout`. Exposed so the fail-closed timing can be driven deterministically by
-   * a fake clock instead of waiting in real time.
+   * Override the timer used for the poll sleep, the fail-closed deadline, and the per-fetch timeout.
+   * Meant for tests, so the fail-closed timing can be driven by a fake clock instead of real time.
+   *
+   * The defaults are two different `setTimeout` timers: the deadline backstop and per-fetch timeout
+   * are `unref`'d (they never hold a process open after the wait resolves), while the poll sleep is
+   * ref'd (it keeps the process alive between polls when no WebSocket is available). An override
+   * replaces **all** of them, so it must keep the event loop alive for the poll sleep. An override
+   * that `unref`s it lets node exit mid-wait with no verdict (#254); one that refs everything keeps
+   * the process alive until the deadline even after a verdict arrives.
    */
   readonly scheduleImpl?: (fn: () => void, ms: number) => void;
 }

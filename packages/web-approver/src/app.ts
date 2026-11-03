@@ -17,6 +17,18 @@
  * (pre-enrollment only, #151) → run the pairing gate → load WASM → build the runtime from the
  * paired identity → mount the live inbox.
  *
+ * # Relay pinning (#249)
+ * The relay URL is resolved differently depending on whether this browser is already paired:
+ *
+ * - **Paired** — the relay pinned inside the stored identity is the only relay used. A `?relay=`
+ *   link that differs is ignored (never persisted, never contacted) and a notice names the
+ *   ignored origin. An identity stored before pinning existed is bound to the relay this browser
+ *   had already persisted — never to the link — or, if none, to one the human types.
+ * - **Unpaired** — a `?relay=` link may pre-fill the candidate relay; the pairing screen shows it
+ *   before the human commits, and pairing pins it.
+ *
+ * Every relay call after pairing ({@link bootInbox}) reads the identity's pinned `relayUrl`.
+ *
  * # WASM asset loading (never a bare package specifier at runtime)
  * The vendored `--target web` glue and `.wasm` binary are copied by `scripts/build-site.mjs` to
  * `./vendor/allw-wasm/` next to this bundled module. Both URLs below are computed relative to
@@ -36,13 +48,20 @@
  */
 
 import { createRelayAccountStateResolver } from "./account-state.js";
-import { mountWebApprover } from "./browser.js";
+import { mountWebApprover, type WebApproverMount } from "./browser.js";
 import { mountOnboardingGate } from "./onboarding.js";
-import { createLocalPairingStore, mountPairingGate } from "./pairing.js";
-import { mountRelayConfigGate, resolveRelayUrl } from "./relay-config.js";
-import { createBrowserRuntime, type ApproverIdentity } from "./runtime.js";
+import { createLocalPairingStore, mountPairingGate, type PairedIdentity } from "./pairing.js";
+import {
+  describeIgnoredRelayOverride,
+  mountIgnoredRelayNotice,
+  mountRelayConfigGate,
+  readStoredRelayUrl,
+  resolveRelayUrl,
+} from "./relay-config.js";
+import { createBrowserRuntime } from "./runtime.js";
 import { createLocalAccountStateFloorStore } from "./sequence-floor.js";
 import { createLocalSurfaceIdStore, resolveSurfaceId } from "./surface-id.js";
+import type { WasmModuleSource } from "./wasm.js";
 
 /** The default poll interval for the live inbox once mounted (matches `relay-poll.ts`'s default). */
 const POLL_INTERVAL_MS = 2_000;
@@ -55,50 +74,112 @@ const WASM_GLUE_URL = new URL("./vendor/allw-wasm/allw_wasm.js", import.meta.url
 const WASM_BINARY_URL = new URL("./vendor/allw-wasm/allw_wasm_bg.wasm", import.meta.url);
 
 /**
- * Resolve the static HTML shell's `#app` mount element, or throw. Returning a non-nullable
- * `HTMLElement` (rather than narrowing `HTMLElement | null` inline in `boot()`) keeps the type
- * non-null when `root` is later captured by `boot()`'s nested closures (`startPairing`,
- * `onPaired`) — TypeScript's control-flow narrowing of an `if (!root) throw` guard does not
- * survive into a function declared later in the same scope.
+ * Where {@link bootInbox} gets the WASM core: the glue module and the binary it instantiates.
+ * Production uses {@link VENDORED_WASM}; tests inject the same vendored artifact from disk.
  */
-function requireRootElement(): HTMLElement {
-  const root = document.getElementById("app");
-  if (!root) {
-    throw new Error("allw web approver: missing '#app' mount element in the static HTML shell");
-  }
-  return root;
+export interface InboxWasmSource {
+  readonly loadGlue: () => Promise<unknown>;
+  readonly moduleSource: WasmModuleSource;
 }
 
-/** Resolve the relay URL, prompting with {@link mountRelayConfigGate} if none is configured yet. */
-function ensureRelayUrl(root: HTMLElement): Promise<string> {
-  const resolved = resolveRelayUrl({
-    search: window.location.search,
-    storage: window.localStorage,
-  });
-  if (resolved !== null) {
-    return Promise.resolve(resolved);
+/** The vendored WASM copied next to the bundled module by `scripts/build-site.mjs`. */
+const VENDORED_WASM: InboxWasmSource = {
+  loadGlue: () => import(WASM_GLUE_URL.href),
+  moduleSource: WASM_BINARY_URL,
+};
+
+/** A paired identity whose relay is pinned — the only shape {@link bootInbox} accepts. */
+export type PinnedIdentity = PairedIdentity & { readonly relayUrl: string };
+
+/**
+ * Everything {@link boot} reads from the page, injectable so the boot decisions (which relay,
+ * which notice, which gate) are testable without a real browser or WASM.
+ */
+export interface BootEnvironment {
+  /** The `#app` element every gate and the inbox render into. */
+  readonly root: HTMLElement;
+  /** The `#notices` element, outside `#app`, that keeps the ignored-relay notice visible. */
+  readonly noticeHost: HTMLElement;
+  /** Injectable storage seam. Production passes `window.localStorage`. */
+  readonly storage: Storage;
+  /** A `location.search`-shaped string. */
+  readonly search: string;
+  /** Load WASM and mount the live inbox for a paired identity, against its pinned relay. */
+  readonly startInbox: (root: HTMLElement, identity: PinnedIdentity) => Promise<unknown>;
+}
+
+/**
+ * Resolve an element the static HTML shell must provide, or throw. Returning a non-nullable
+ * `HTMLElement` (rather than narrowing `HTMLElement | null` inline) keeps the type non-null when
+ * the element is later captured by {@link boot}'s nested closures.
+ */
+function requireElement(id: string): HTMLElement {
+  const element = document.getElementById(id);
+  if (!element) {
+    throw new Error(`allw web approver: missing '#${id}' element in the static HTML shell`);
   }
+  return element;
+}
+
+/** Prompt for a relay URL with {@link mountRelayConfigGate}; resolves once a valid one is entered. */
+function promptForRelayUrl(
+  root: HTMLElement,
+  storage: Storage,
+  initialError: string | null,
+): Promise<string> {
   return new Promise((resolve) => {
-    mountRelayConfigGate({ root, storage: window.localStorage, onConfigured: resolve });
+    mountRelayConfigGate({ root, storage, initialError, onConfigured: resolve });
   });
 }
 
 /**
- * Load the vendored WASM core and mount the live inbox for a confirmed `identity`. Any failure
- * here (a stale/missing vendored artifact, a WASM instantiation error) is allowed to reject —
- * there is no safe UI to fall back to once pairing has already confirmed a human is present, so
- * a startup failure surfaces as an unhandled rejection an operator can see in devtools rather than
- * a silently blank inbox.
+ * The relay for a browser with **no** stored identity: a `?relay=` candidate (persisted), the
+ * persisted candidate, or one the human enters. A rejected `?relay=` (e.g. plain `http:` to a
+ * remote host) is surfaced in the config prompt as an actionable error.
  */
-async function bootInbox(
+function resolveCandidateRelayUrl(env: BootEnvironment): Promise<string> {
+  const resolution = resolveRelayUrl({ search: env.search, storage: env.storage });
+  if (resolution.relayUrl !== null && resolution.rejectedQueryReason === null) {
+    return Promise.resolve(resolution.relayUrl);
+  }
+  return promptForRelayUrl(env.root, env.storage, resolution.rejectedQueryReason);
+}
+
+/**
+ * The pinned relay for a browser **with** a stored identity. An identity stored before pinning
+ * existed is bound once — to the relay this browser had already persisted, or to one the human
+ * types — and re-saved. The `?relay=` query is never consulted here.
+ */
+async function resolvePinnedRelayUrl(
+  env: BootEnvironment,
+  stored: PairedIdentity,
+  save: (identity: PairedIdentity) => void,
+): Promise<string> {
+  if (stored.relayUrl !== undefined) return stored.relayUrl;
+  const legacyRelayUrl =
+    readStoredRelayUrl(env.storage) ?? (await promptForRelayUrl(env.root, env.storage, null));
+  save({ ...stored, relayUrl: legacyRelayUrl });
+  return legacyRelayUrl;
+}
+
+/**
+ * Load the vendored WASM core and mount the live inbox for a confirmed `identity`, sending every
+ * relay call — inbox poll, `connect` WebSocket, account-state resolution — to its pinned
+ * `relayUrl` and to nothing else. Resolves to the mount, whose `stop()` ends the poll loop. Any failure here (a stale/missing vendored artifact, a WASM
+ * instantiation error) is allowed to reject — there is no safe UI to fall back to once pairing has
+ * already confirmed a human is present, so a startup failure surfaces as an unhandled rejection
+ * an operator can see in devtools rather than a silently blank inbox.
+ */
+export async function bootInbox(
   root: HTMLElement,
-  identity: ApproverIdentity,
-  relayUrl: string,
-): Promise<void> {
-  const glueModule: unknown = await import(WASM_GLUE_URL.href);
+  identity: PinnedIdentity,
+  wasm: InboxWasmSource = VENDORED_WASM,
+): Promise<WebApproverMount> {
+  const { relayUrl } = identity;
+  const glueModule: unknown = await wasm.loadGlue();
   const runtime = await createBrowserRuntime({
     glueModule,
-    moduleSource: WASM_BINARY_URL,
+    moduleSource: wasm.moduleSource,
     identity,
     resolveAccountStates: createRelayAccountStateResolver({
       relayUrl,
@@ -110,7 +191,7 @@ async function bootInbox(
     sequenceFloorStore: createLocalAccountStateFloorStore(),
   });
 
-  await mountWebApprover({
+  return mountWebApprover({
     root,
     runtime,
     relay: {
@@ -127,20 +208,43 @@ async function bootInbox(
 }
 
 /**
- * The full boot sequence: relay URL → first-run onboarding walkthrough (pre-enrollment only,
- * #151) → pairing gate → (on success) WASM + live inbox.
+ * The full boot sequence: relay URL (pinned if paired, candidate otherwise) → first-run
+ * onboarding walkthrough (pre-enrollment only, #151) → pairing gate → (on success) WASM + live
+ * inbox against the pinned relay.
  */
-async function boot(): Promise<void> {
-  const root = requireRootElement();
-  const relayUrl = await ensureRelayUrl(root);
-  const pairingStore = createLocalPairingStore();
+export async function boot(env: BootEnvironment): Promise<void> {
+  const { root, storage } = env;
+  const pairingStore = createLocalPairingStore(storage);
+  const stored = pairingStore.load();
+
+  let relayUrl: string;
+  if (stored !== null) {
+    relayUrl = await resolvePinnedRelayUrl(env, stored, (identity) => {
+      pairingStore.save(identity);
+    });
+    const ignored = describeIgnoredRelayOverride(env.search, relayUrl);
+    if (ignored !== null) {
+      mountIgnoredRelayNotice({ host: env.noticeHost, ignored, pinnedRelayUrl: relayUrl });
+    }
+  } else {
+    relayUrl = await resolveCandidateRelayUrl(env);
+  }
 
   function startPairing(): void {
     mountPairingGate({
       root,
       pairingStore,
+      // A new pairing (including "Use another device") pins this relay; a returning device keeps
+      // the relay already pinned in its stored identity.
+      relayUrl,
       onPaired: (identity) => {
-        void bootInbox(root, identity, relayUrl);
+        // Fail-closed: the gate always pins `relayUrl` above and a stored identity was bound
+        // before the gate mounted, so an unpinned identity here is a programming error — never
+        // fall back to an unpinned relay.
+        if (identity.relayUrl === undefined) {
+          throw new Error("allw web approver: paired identity has no pinned relay");
+        }
+        void env.startInbox(root, { ...identity, relayUrl: identity.relayUrl });
       },
     });
   }
@@ -150,14 +254,20 @@ async function boot(): Promise<void> {
   // that has already completed/skipped the walkthrough is never shown it again.
   mountOnboardingGate({
     root,
-    storage: window.localStorage,
-    hasStoredIdentity: pairingStore.load() !== null,
+    storage,
+    hasStoredIdentity: stored !== null,
     onComplete: startPairing,
   });
 }
 
 if (typeof window !== "undefined" && typeof document !== "undefined") {
-  void boot();
+  void boot({
+    root: requireElement("app"),
+    noticeHost: requireElement("notices"),
+    storage: window.localStorage,
+    search: window.location.search,
+    startInbox: bootInbox,
+  });
 }
 
 // Exported for the site-build integration test (`test/site-build.test.mjs`) to assert the bundle

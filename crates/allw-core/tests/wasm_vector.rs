@@ -27,15 +27,21 @@
 //! frozen `request-hash/v2` vector, not a captured snapshot — if a code change alters it, that is a
 //! deliberate `DOMAIN_TAG` bump, mirrored here and in `hash.rs`.
 //!
+//! It also carries the self-certifying account-id vector (`account_id_for_root` of the approver
+//! root) and a root-signed pairing-start authorization, so the WASM surface proves it derives the
+//! same id and signs/verifies the same `allw-pairing-start+jws` bytes as the core.
+//!
 //! @see docs/contract.md §Wire encoding, §Verification checklist
+//! @see docs/enrollment.md §Model (account id derivation, pairing-start authorization)
 //! @see crates/allw-core/src/hash.rs (FROZEN_HASH_HEX — the same value)
 
 use std::path::PathBuf;
 
 use allw_core::{
-    action_from_agent_tool_call, compute_request_hash, issue_device_cert, sign_verdict,
-    ActionRecord, Actor, ApprovalContext, ApprovalRequest, Approver, Constraints, Decision, Risk,
-    SigningKeyPair, Surface, SyntacticSubstrate, UnsignedVerdict,
+    account_id_for_root, action_from_agent_tool_call, compute_request_hash, issue_device_cert,
+    sign_pairing_start_authorization, sign_verdict, ActionRecord, Actor, ApprovalContext,
+    ApprovalRequest, Approver, Constraints, Decision, Risk, SigningKeyPair, Surface,
+    SyntacticSubstrate, UnsignedVerdict,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
@@ -55,6 +61,17 @@ const TS_EXPIRES: i64 = 1_700_003_600_000;
 const TS_CREATED: i64 = 1_700_000_000_000;
 const TS_DECIDED: i64 = 1_700_001_000_000;
 const NOW_MS: i64 = 1_700_001_500_000;
+
+// Pairing-start authorization window (2-minute lifetime) and a verifier time inside it.
+const TS_PAIRING_ISSUED: i64 = 1_700_000_000_000;
+const TS_PAIRING_EXPIRES: i64 = 1_700_000_120_000;
+const PAIRING_NOW_MS: i64 = 1_700_000_001_000;
+const PAIRING_JTI: &str = "jti_wasm_vector_01";
+
+/// Account id derived from the approver root (seed `[0x11; 32]`), computed independently of the
+/// core: `SHA-256("allw/account-id/v1" || 0x00 || root_pubkey)` via `shasum -a 256`, then
+/// base64url-unpadded. Matches `account::tests::FROZEN_ACCOUNT_ID_0X11`.
+const FROZEN_ACCOUNT_ID: &str = "hUes5Gso3s5hHMmZjDI-P0tyaD905KSl1B97nsp2VIo";
 
 // Fixed anti-replay nonce (deterministic fixture).
 const NONCE: &[u8] = &[0xA1, 0xB2, 0xC3, 0xD4];
@@ -91,6 +108,17 @@ struct WasmVector {
     /// Expected `request_hash` for `agent_tool_call_context_json` (bound to the same
     /// `expires_at` above), as base64url-unpadded — the WASM `compute_request_hash` return shape.
     agent_tool_call_expected_request_hash_b64: String,
+
+    /// Self-certifying account id derived from `approver_root_pubkey_b64` (`account_id_for_root`).
+    expected_account_id_for_root: String,
+    /// `allw-pairing-start+jws` signed by the approver root for the derived account id.
+    pairing_start_authorization: String,
+    /// The authorization's signed `issued_at` / `expires_at` (Unix ms) and `jti`.
+    pairing_start_issued_at: i64,
+    pairing_start_expires_at: i64,
+    pairing_start_jti: String,
+    /// A verifier time inside the authorization's validity window.
+    pairing_start_now_ms: i64,
 }
 
 // ── Builders (mirror hash::tests::make_minimal_context exactly) ───────────────────
@@ -226,6 +254,18 @@ fn build_vector() -> WasmVector {
             .expect("agent_tool_call context serializes"),
         agent_tool_call_expected_request_hash_b64: URL_SAFE_NO_PAD
             .encode(agent_tool_call_request_hash),
+        expected_account_id_for_root: account_id_for_root(&root.public_key()),
+        pairing_start_authorization: sign_pairing_start_authorization(
+            &root,
+            TS_PAIRING_ISSUED,
+            TS_PAIRING_EXPIRES,
+            PAIRING_JTI,
+        )
+        .expect("fixture pairing-start inputs are valid"),
+        pairing_start_issued_at: TS_PAIRING_ISSUED,
+        pairing_start_expires_at: TS_PAIRING_EXPIRES,
+        pairing_start_jti: PAIRING_JTI.to_string(),
+        pairing_start_now_ms: PAIRING_NOW_MS,
     }
 }
 
@@ -323,4 +363,15 @@ fn agent_tool_call_and_command_fixtures_hash_differently() {
         command_hash, agent_tool_call_hash,
         "changing action.surface (and its syntactic substrate) must change request_hash"
     );
+}
+
+/// The fixture's account id equals the independently computed frozen derivation — spec-first,
+/// so the WASM surface replaying `expected_account_id_for_root` is checked against the spec value,
+/// not a captured output.
+#[test]
+fn fixture_account_id_equals_frozen_vector() {
+    let raw = std::fs::read_to_string(fixture_path()).expect("fixture must exist for this test");
+    let committed: WasmVector =
+        serde_json::from_str(&raw).expect("committed fixture is valid WasmVector JSON");
+    assert_eq!(committed.expected_account_id_for_root, FROZEN_ACCOUNT_ID);
 }

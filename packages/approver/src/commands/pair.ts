@@ -1,17 +1,23 @@
 /**
  * `allw-approver pair` — enroll this software approver as a device on an account.
  *
- * Flow (`docs/contract.md` §Lifecycle / §Transport → pairing; relay #89 auth):
+ * Flow (`docs/contract.md` §Lifecycle / §Transport → pairing; relay #89 auth; #242):
  * 1. Load (or generate) the local keyfile — three software-held seeds + derived pubkeys.
+ * 1a. Derive the **self-certifying account id** from the keyfile's account-root pubkey
+ *    (`docs/enrollment.md` §Self-Certifying Account Id). An explicit `accountId` is accepted only
+ *    when it equals the derived id — the relay would reject any other id anyway.
  * 2. Obtain a pairing code: use `--code <code>` if supplied, else drive `POST /pairing/start`
- *    ourselves. The matching pairing auth token authorizes `/pairing/complete`.
+ *    ourselves with a fresh root-signed authorization. The matching pairing auth token authorizes
+ *    `/pairing/complete`.
  * 3. `POST /pairing/complete` registering the device **X25519** public key → relay-assigned
  *    `device_id` and relay `device_auth_token`.
  * 4. Mint a **device_cert** (`issue_device_cert`): the account-root key signs the device Ed25519
  *    verifying key → cert, so verifiers need only the account-root key.
- * 5. Persist relay/account/device + cert into the keyfile, and print the **account-root pubkey**
- *    (the integrator's trust anchor, #12).
+ * 5. Persist relay/account/device + cert into the keyfile, and print the **account id** and the
+ *    **account-root pubkey** (the integrator's routing id and trust anchor, #12).
  */
+
+import { randomBytes } from "node:crypto";
 
 import { generateKeyfile, loadKeyfile, writeKeyfile, type Keyfile } from "../lib/keyfile.js";
 import { pairingComplete, pairingStart } from "../lib/relay-client.js";
@@ -20,7 +26,11 @@ import type { AllwWasm } from "../lib/wasm.js";
 /** Options for `pair`, parsed from argv by the CLI. */
 export interface PairOptions {
   readonly relayUrl: string;
-  readonly accountId: string;
+  /**
+   * Optional explicit account id. The id is derived from the keyfile's account root; when this is
+   * supplied it must equal the derived id, or pairing fails before contacting the relay.
+   */
+  readonly accountId?: string;
   readonly keyfilePath: string;
   readonly label?: string;
   /** An existing pairing code (account owner ran `/pairing/start`); omit to self-drive start. */
@@ -30,6 +40,9 @@ export interface PairOptions {
   /** Current time (ms) — injectable for deterministic tests; defaults to `Date.now()`. */
   readonly now?: number;
 }
+
+/** Lifetime of the root-signed pairing-start authorization `pair` sends (the core allows ≤ 5 min). */
+export const PAIRING_START_AUTH_LIFETIME_MS = 2 * 60 * 1000;
 
 /** A sink for human-facing output (stdout by default; captured in tests). */
 export type Logger = (line: string) => void;
@@ -70,11 +83,32 @@ export async function runPair(
     writeKeyfile(options.keyfilePath, existing);
   }
 
+  // 0a. The account id is a function of the account root, never chosen.
+  const accountId = wasm.account_id_for_root(existing.account_root_pubkey);
+  if (options.accountId !== undefined && options.accountId !== accountId) {
+    throw new Error(
+      `--account ${options.accountId} does not match the account id derived from this keyfile's ` +
+        `account root (${accountId}); omit --account to use the derived id`,
+    );
+  }
+
   // 1. Obtain a pairing code (supplied or self-driven).
   let code = options.code;
   let pairingAuthToken = options.pairingAuthToken;
   if (code === undefined) {
-    const started = await pairingStart(options.relayUrl, options.accountId, options.label);
+    // A fresh one-time jti (128 random bits) and a short window: the relay rejects reuse.
+    const authorization = wasm.sign_pairing_start_authorization(
+      existing.account_root_seed,
+      now,
+      now + PAIRING_START_AUTH_LIFETIME_MS,
+      randomBytes(16).toString("base64url"),
+    );
+    const started = await pairingStart(
+      options.relayUrl,
+      accountId,
+      { rootPubkey: existing.account_root_pubkey, authorization },
+      options.label,
+    );
     code = started.code;
     pairingAuthToken = started.pairing_auth_token;
     log(`Started pairing — code ${code} (expires ${new Date(started.expires_at).toISOString()})`);
@@ -85,7 +119,7 @@ export async function runPair(
   // 2. Complete pairing: register the device X25519 (encryption) key → device_id.
   const paired = await pairingComplete(
     options.relayUrl,
-    options.accountId,
+    accountId,
     code,
     pairingAuthToken,
     existing.device_encryption_pubkey,
@@ -97,7 +131,7 @@ export async function runPair(
   // 3. Mint the device certificate: account-root signs the device Ed25519 verifying key.
   const deviceCert = wasm.issue_device_cert(
     existing.account_root_seed,
-    options.accountId,
+    accountId,
     deviceId,
     existing.device_signing_pubkey,
     now,
@@ -107,7 +141,7 @@ export async function runPair(
   const updated: Keyfile = {
     ...existing,
     relay_url: options.relayUrl,
-    account_id: options.accountId,
+    account_id: accountId,
     device_id: deviceId,
     device_auth_token: paired.device_auth_token,
     device_cert: deviceCert,
@@ -116,7 +150,8 @@ export async function runPair(
   writeKeyfile(options.keyfilePath, updated);
 
   log("");
-  log("Paired successfully. Trust anchor for integrators (#12):");
+  log("Paired successfully. Configure integrators with (#12):");
+  log(`  account id:          ${accountId}`);
   log(`  account-root pubkey: ${updated.account_root_pubkey}`);
   log(`  device id:           ${deviceId}`);
   log(`  keyfile:             ${options.keyfilePath}`);

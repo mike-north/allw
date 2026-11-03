@@ -88,8 +88,17 @@ export interface PairingCompleteResult {
   readonly device_auth_token: string;
 }
 
+/** The account-root credentials that authorize `POST /:acct/pairing/start`. */
+export interface PairingStartAuthorization {
+  /** The account-root Ed25519 public key (base64url); `accountId` must derive from it. */
+  readonly rootPubkey: string;
+  /** A fresh root-signed `allw-pairing-start+jws` for `accountId`. */
+  readonly authorization: string;
+}
+
 /**
- * Start a pairing: ask the relay for a short code (the account owner runs this in production).
+ * Start a pairing: ask the relay for a short code. Only the account-root holder can: the request
+ * carries the root public key and a root-signed authorization (`docs/relay-api.md` §3 Pairing).
  *
  * `timeoutMs` (default {@link PAIRING_TIMEOUT_MS}) bounds a hung relay; it is parameterized so the
  * fail-closed abort is testable without a multi-second wait.
@@ -97,11 +106,16 @@ export interface PairingCompleteResult {
 export async function pairingStart(
   relayUrl: string,
   accountId: string,
+  auth: PairingStartAuthorization,
   label?: string,
   timeoutMs: number = PAIRING_TIMEOUT_MS,
 ): Promise<PairingStartResult> {
   const url = `${normalizeBase(relayUrl)}/${encodeURIComponent(accountId)}/pairing/start`;
-  const body = label === undefined ? {} : { label };
+  const body: Record<string, string> = {
+    root_pubkey: auth.rootPubkey,
+    authorization: auth.authorization,
+  };
+  if (label !== undefined) body.label = label;
   const result = await postJson(url, body, timeoutMs);
   if (
     typeof result !== "object" ||
