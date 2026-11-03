@@ -13,8 +13,11 @@ import {
   gateToolCall,
   isGatedTool,
   parseMcpToolName,
+  commandBuildFailureReason,
   posixCommandCall,
 } from "../dist/lib/gating.js";
+import { decide } from "../dist/lib/decide.js";
+import { commandRequest } from "@allw/sdk";
 import { loadWasm } from "../dist/lib/wasm.js";
 
 // ── MCP tool-name parsing ───────────────────────────────────────────────────────────────────────
@@ -509,4 +512,67 @@ test("(#269) posixCommandCall reads Bash and Monitor commands, and only those", 
   for (const toolName of ["PowerShell", "Edit", "mcp__srv__tool", "Read"]) {
     assert.equal(posixCommandCall(toolName, { command: "ls" }), null, toolName);
   }
+});
+
+test("(#374) gateToolCall refuses a command with no program, with the hooks' exact reason", async () => {
+  const wasm = await loadWasm();
+  const config = {
+    relayUrl: "https://relay.allw.test",
+    accountId: "acct-test",
+    approverRootKey: "x".repeat(43),
+  };
+  for (const toolName of ["Bash", "Monitor"]) {
+    for (const command of ["", "   ", "\t\n\t", "'' rm -rf x"]) {
+      const gate = gateToolCall(wasm, toolName, { command }, "/repo");
+      const label = `${toolName} ${JSON.stringify(command)}`;
+      assert.equal(gate.kind, "build-error", label);
+      // The hooks' path (the SDK's commandRequest) denies the same input; the reasons must match,
+      // so the exported gate can never drift from what the hooks do.
+      const hook = await decide(
+        { hookEventName: "PreToolUse", toolName, toolInput: { command }, cwd: "/repo" },
+        {
+          wasm,
+          config,
+          commandRequest,
+          requestApproval: () => Promise.reject(new Error("never asked")),
+        },
+        "host",
+      );
+      assert.equal(gate.reason, hook.hookSpecificOutput.permissionDecisionReason, label);
+    }
+  }
+  // A command with a program still gates.
+  assert.equal(gateToolCall(wasm, "Bash", { command: "rm -rf x" }, "/repo").kind, "gated");
+});
+
+test("(#374) commandBuildFailureReason recognises the SDK's error by name and reason, not instanceof", async () => {
+  const wasm = await loadWasm();
+  const prefix = "allw: could not build an ActionRecord for the command (fail-closed deny): ";
+  // An error from a second copy of @allw/sdk: the same shape, but not an instance of this copy's
+  // class (a published install may hold two copies).
+  const foreign = (message, options) =>
+    Object.assign(new Error(message, options), {
+      name: "CommandActionError",
+      reason: "command_line_empty",
+    });
+  assert.equal(
+    commandBuildFailureReason(wasm, foreign("allw: commandLine contains no command")),
+    `${prefix}commandLine contains no command`,
+    "the SDK's allw: prefix is dropped",
+  );
+  assert.equal(
+    commandBuildFailureReason(
+      wasm,
+      foreign("allw: commandLine could not be parsed", {
+        cause: new Error("action_from_command failed: unmatched quotes"),
+      }),
+    ),
+    `${prefix}action_from_command failed: unmatched quotes`,
+    "the core's own error is quoted when the SDK wraps one",
+  );
+  // Not the SDK's error (no reason field): quoted whole.
+  const lookalike = Object.assign(new Error("allw: something else"), {
+    name: "CommandActionError",
+  });
+  assert.equal(commandBuildFailureReason(wasm, lookalike), `${prefix}allw: something else`);
 });

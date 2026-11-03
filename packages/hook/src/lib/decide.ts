@@ -36,11 +36,11 @@
  * @see ../../../sdk/src/index.ts (requestApproval is itself fail-closed: approved ⇒ verified)
  */
 
-import { CommandActionError, type commandRequest } from "@allw/sdk";
+import type { commandRequest } from "@allw/sdk";
 
 import type { HookWasm } from "./wasm.js";
 import { agentSafeErrorText, agentSafeText } from "./agent-text.js";
-import { gateToolCall, posixCommandCall } from "./gating.js";
+import { commandBuildFailureReason, gateToolCall, posixCommandCall } from "./gating.js";
 import {
   denyOutput,
   noDecisionOutput,
@@ -140,7 +140,7 @@ function hookActor(hostname: string): HookApprovalRequest["actor"] {
  * record is built, so it replaces `commandRequest`'s conservative `false` afterwards; the key order
  * is unchanged, so the request is the one the hook built by hand before #269.
  *
- * @throws {@link CommandActionError} (as a rejection) when the SDK refuses the command: invalid
+ * @throws `CommandActionError` (as a rejection) when the SDK refuses the command: invalid
  * shell syntax, or a blank command or program. (It also refuses a blank `cwd`, which the stdin
  * parser has already turned into an absent one.) The caller denies.
  */
@@ -160,18 +160,6 @@ async function commandApprovalRequest(
     ...(config.timeoutMs !== undefined ? { timeoutMs: config.timeoutMs } : {}),
   });
   return { ...req, reversible: reversibleForRisk(req.risk) };
-}
-
-/**
- * The error to quote when a command request could not be built. For invalid shell syntax the SDK
- * wraps the core's own error, which names the problem; quoting that keeps the reason the agent sees
- * the same as before #269. Otherwise the SDK's message is used, without its `allw: ` prefix (the
- * deny reason already carries one).
- */
-function commandBuildError(err: unknown): unknown {
-  if (!(err instanceof CommandActionError)) return err;
-  if (err.cause instanceof Error) return err.cause;
-  return err.message.replace(/^allw: /u, "");
 }
 
 /**
@@ -246,13 +234,7 @@ async function prepareCall(
     } catch (err) {
       // A command the SDK refuses, or any other failure to build the request (the SDK's WASM
       // loader, say), is never submitted; the human is not asked (fail-closed).
-      return {
-        kind: "build-error",
-        reason: `allw: could not build an ActionRecord for the command (fail-closed deny): ${agentSafeErrorText(
-          wasm,
-          commandBuildError(err),
-        )}`,
-      };
+      return { kind: "build-error", reason: commandBuildFailureReason(wasm, err) };
     }
   }
 
