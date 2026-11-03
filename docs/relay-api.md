@@ -79,11 +79,11 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   the rate limiter is unavailable or unconfigured (fail-closed). Treat all of them as "not
   submitted" — an integrator fails closed (deny), never retries into an approval.
 - **Rate limiting.** The unauthenticated routes — `POST /pairing/start`, `POST /pairing/complete`,
-  `POST /requests` — pass through Cloudflare rate-limiting bindings before reaching the account's
-  Durable Object: one keyed by **client IP alone** across all three (default 120 per 60 s), then one
+  `POST /requests`, matched by the same exact route table as dispatch (see "Exact paths" below) —
+  pass through Cloudflare rate-limiting bindings before reaching the account's Durable Object: one keyed by **client IP alone** across all three (default 120 per 60 s), then one
   keyed by **account id + client IP** with separate pairing and requests budgets (defaults 10 and
   60 per 60 s). An IPv6 client is keyed by its /64. Limits live in `packages/relay/wrangler.jsonc`
-  (see `docs/relay-deploy.md` §3d). Over a limit ⇒ **429**; binding missing or failing ⇒ **503**.
+  (see `docs/relay-deploy.md` §3e). Over a limit ⇒ **429**; binding missing or failing ⇒ **503**.
 - **Pairing body cap.** `POST /pairing/start` and `POST /pairing/complete` bodies above
   `MAX_PAIRING_BODY_BYTES` (16 KiB) are refused with **413** before parsing.
 - **Exact paths.** An account route answers only on its exact path, compared segment by segment as the URL

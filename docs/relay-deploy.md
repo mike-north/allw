@@ -235,7 +235,7 @@ anything in the approval contract.
 
 ---
 
-### 3d. Rate limiting (unauthenticated routes)
+### 3e. Rate limiting (unauthenticated routes)
 
 The relay's unauthenticated routes are rate-limited with the
 [Workers rate-limiting binding](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/).

@@ -11,6 +11,7 @@
  */
 
 import { DEFAULT_MAX_REQUEST_TTL_MS } from "./constants.js";
+import { accountSubPathSegments, resolveAccountRoute, type AccountRouteName } from "./routes.js";
 
 /** Outcome of reading a body under a byte cap. */
 export type CappedBody =
@@ -139,18 +140,24 @@ export interface RateLimiter {
   limit(options: { key: string }): Promise<{ success: boolean }>;
 }
 
+/** The account routes the limiter covers, by dispatch key, and the budget each one draws on. */
+const RATE_LIMITED_ROUTES: Partial<Record<AccountRouteName, RateLimitedRoute>> = {
+  pairingStart: "pairing",
+  pairingComplete: "pairing",
+  requestSubmit: "requests",
+};
+
 /**
  * Which rate-limited route a request targets, or `null` for routes the limiter does not cover.
  * Covered: `POST /{acct}/pairing/start`, `POST /{acct}/pairing/complete`, `POST /{acct}/requests`.
+ *
+ * Resolved through the Durable Object's own route table (`resolveAccountRoute`), so the limiter
+ * covers exactly the requests that dispatch to those handlers: a path the router answers with 404
+ * or 405 (an extra segment, a trailing slash) is neither limited nor handled.
  */
 export function rateLimitedRoute(method: string, pathname: string): RateLimitedRoute | null {
-  if (method.toUpperCase() !== "POST") return null;
-  const segments = pathname.split("/").filter(Boolean);
-  if (segments.length === 3 && segments[1] === "pairing") {
-    return segments[2] === "start" || segments[2] === "complete" ? "pairing" : null;
-  }
-  if (segments.length === 2 && segments[1] === "requests") return "requests";
-  return null;
+  const resolved = resolveAccountRoute(method.toUpperCase(), accountSubPathSegments(pathname));
+  return resolved.kind === "route" ? (RATE_LIMITED_ROUTES[resolved.name] ?? null) : null;
 }
 
 /**

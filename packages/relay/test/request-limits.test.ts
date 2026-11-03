@@ -814,11 +814,31 @@ describe("rate limiting on unauthenticated routes", () => {
     expect(limiter.keys).toEqual([]);
   });
 
+  it("does not charge a path the router answers 404, such as a trailing slash (#302)", async () => {
+    const limiter = countingLimiter(0);
+    const acct = testAccount("limits-rl-not-a-route");
+    const overrides = {
+      RATE_LIMIT_CLIENT: limiter,
+      RATE_LIMIT_PAIRING: limiter,
+      RATE_LIMIT_REQUESTS: limiter,
+    };
+    for (const subPath of ["/requests/", "/pairing/start/", "/pairing/complete/extra"]) {
+      const resp = await workerFetch(acct, subPath, overrides);
+      expect(resp.status).toBe(404);
+      expect(await resp.json()).toEqual({ error: "not found" });
+    }
+    expect(limiter.keys).toEqual([]);
+  });
+
   it("rateLimitedRoute matches only the exact unauthenticated POST routes", () => {
     expect(rateLimitedRoute("POST", "/acct/pairing/start")).toBe("pairing");
     expect(rateLimitedRoute("post", "/acct/pairing/complete")).toBe("pairing");
     expect(rateLimitedRoute("POST", "/acct/requests")).toBe("requests");
-    expect(rateLimitedRoute("POST", "/acct/requests/")).toBe("requests");
+    // The router's exact paths (#302): a trailing slash or an extra segment is a 404 there, so the
+    // limiter doesn't cover it either.
+    expect(rateLimitedRoute("POST", "/acct/requests/")).toBeNull();
+    expect(rateLimitedRoute("POST", "/acct/pairing/start/extra")).toBeNull();
+    expect(rateLimitedRoute("POST", "/acct//requests")).toBeNull();
     expect(rateLimitedRoute("GET", "/acct/requests")).toBeNull();
     expect(rateLimitedRoute("POST", "/acct/requests/r1/retract")).toBeNull();
     expect(rateLimitedRoute("POST", "/acct/pairing/other")).toBeNull();
