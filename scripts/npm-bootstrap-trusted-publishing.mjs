@@ -9,6 +9,9 @@
  *   node scripts/npm-bootstrap-trusted-publishing.mjs --refresh-trust
  *       # right before the first real release: revoke and recreate every trust config, because one
  *       # that saw no publish within 48 hours has expired
+ *   node scripts/npm-bootstrap-trusted-publishing.mjs --audit-trust [--dry-run]
+ *       # only audit: list every trust config with its permissions and revoke any that is not
+ *       # exactly the stage-only release config (creates nothing, publishes nothing)
  *
  * Why it exists: npm can only attach a trusted publisher (GitHub Actions OIDC) to a package that
  * already exists on the registry, and none of ours do yet. So, for each package in the release set
@@ -21,10 +24,13 @@
  *   2. Configures a **stage-only** trusted publisher with `npm trust github` (npm >= 11.15.0): repo
  *      mike-north/allw, workflow `release.yml`, environment `npm-publish`, permission
  *      `--allow-stage-publish` and nothing else. CI can then only *stage* a release, and each staged
- *      version goes public only when a maintainer approves it with npm 2FA. Any other config,
- *      including a direct-publish (`--allow-publish`) one, counts as wrong: the script offers to
- *      revoke and replace it. If the CLI path fails, it prints the exact npmjs.com page and field
- *      values to enter by hand.
+ *      version goes public only when a maintainer approves it with npm 2FA. Every other config,
+ *      including a direct-publish (`--allow-publish`) one, counts as wrong, and the script offers
+ *      to revoke it. A package can hold several configs, so adding a stage-only one is not enough.
+ *      Reading the configs needs 2FA on accounts with auth-and-writes 2FA. In that case the
+ *      script asks for a one-time password and retries with `--otp`, and it fails closed when it
+ *      gets none. It never takes the operator's word for what is attached. If the CLI path fails,
+ *      it prints the exact npmjs.com page and field values to enter by hand.
  *   3. Claims the unscoped names in CLAIM_ONLY_NAMES (every bin name `npx` could resolve to a
  *      registry package) with the same kind of inert placeholder. Each is gated on its
  *      own confirmation. They are name claims only and get no trusted publisher.
@@ -127,6 +133,71 @@ export function isExpectedTrust(config) {
   );
 }
 
+/** Why `config` is not the release workflow's stage-only config, or `null` when it is. */
+export function trustProblem(config) {
+  if (isExpectedTrust(config)) return null;
+  const reasons = [];
+  if (config?.type !== "github") reasons.push(`type ${String(config?.type)}`);
+  if (config?.repository !== TRUSTED_REPOSITORY) reasons.push(`repo ${String(config?.repository)}`);
+  if (config?.file !== RELEASE_WORKFLOW_FILE) reasons.push(`file ${String(config?.file)}`);
+  if (config?.environment !== RELEASE_ENVIRONMENT)
+    reasons.push(`environment ${String(config?.environment)}`);
+  const perms = Array.isArray(config?.permissions) ? config.permissions : [];
+  if (perms.includes("createPackage")) reasons.push("can publish directly (createPackage)");
+  if (reasons.length === 0) reasons.push(`permissions [${perms.join(", ")}] are not stage-only`);
+  return reasons.join("; ");
+}
+
+/**
+ * What to change on one package, given every trust config it holds. Every config that is not the
+ * stage-only release config is revoked, because npm allows several configs per package and any
+ * one of them is enough to publish. One matching config is kept, unless `refreshTrust` asks to
+ * recreate it (to restart npm's 48-hour window for a config that has never been used).
+ */
+export function planTrust(configs, { refreshTrust = false } = {}) {
+  const keep = refreshTrust ? null : (configs.find(isExpectedTrust) ?? null);
+  return { revoke: configs.filter((c) => c !== keep), create: keep === null };
+}
+
+/** A one-time password as authenticator apps show it. */
+const OTP_PATTERN = /^\d{6,8}$/;
+
+/**
+ * Read every trust config on `name`. On accounts with auth-and-writes 2FA, npm wants a one-time
+ * password even for this read. A captured read can't prompt, so on EOTP this asks the operator
+ * for a code (`askOtp`) and retries with `--otp`. The last code is tried again for the next
+ * package before asking anew. Throws PreconditionError (fail closed) when the configs can't be
+ * read, including when no code is given.
+ */
+export async function readTrustConfigs(name, { npm, askOtp, otpCache = {} }) {
+  const args = ["trust", "list", name, "--json"];
+  let res = npm(args);
+  if (res.status !== 0 && needsOtp(res) && otpCache.value) {
+    res = npm([...args, `--otp=${otpCache.value}`]);
+  }
+  for (let attempt = 0; res.status !== 0 && needsOtp(res) && attempt < 2; attempt++) {
+    const otp = String((await askOtp(name)) ?? "").trim();
+    if (!OTP_PATTERN.test(otp)) {
+      throw new PreconditionError(
+        `Reading ${name}'s trust configs needs an npm one-time password, and none was given.\n` +
+          `Nothing was changed for ${name}. Fix: re-run in a terminal and enter the current code from your authenticator.`,
+      );
+    }
+    otpCache.value = otp;
+    res = npm([...args, `--otp=${otp}`]);
+  }
+  if (res.status !== 0) {
+    throw new PreconditionError(`could not list trust configs for ${name}:\n${res.stderr.trim()}`);
+  }
+  return parseTrustList(res.stdout);
+}
+
+/** One config as a log line: id, identity and permissions. */
+function describeTrust(config) {
+  const perms = Array.isArray(config?.permissions) ? config.permissions.join(", ") : "none";
+  return `id ${String(config?.id)}: ${String(config?.type)} ${String(config?.repository)} ${String(config?.file)} env ${String(config?.environment)} [${perms}]`;
+}
+
 /** The `npm trust github` arguments that attach our release workflow to `name`. */
 export function trustGithubArgs(name, { dryRun = false } = {}) {
   return [
@@ -153,6 +224,7 @@ export function manualTrustInstructions(name) {
     `      Workflow filename:    ${RELEASE_WORKFLOW_FILE}`,
     `      Environment name:     ${RELEASE_ENVIRONMENT}`,
     `      Allowed actions:      npm stage publish ONLY (leave "npm publish" and "npm dist-tag" unticked)`,
+    `      Then delete every other trusted publisher listed on that page.`,
   ].join("\n");
 }
 
@@ -229,6 +301,19 @@ async function defaultConfirm(question) {
   try {
     const answer = await rl.question(`${question} [y/N] `);
     return /^y(es)?$/i.test(answer.trim());
+  } finally {
+    rl.close();
+  }
+}
+
+/** Ask for an npm one-time password on the terminal; `null` when there is no terminal. */
+async function defaultAskOtp(name) {
+  if (!process.stdin.isTTY) return null;
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return (
+      await rl.question(`npm one-time password (2FA code) to read ${name}'s trust configs: `)
+    ).trim();
   } finally {
     rl.close();
   }
@@ -399,6 +484,7 @@ export async function bootstrap({
   refreshTrust = false,
   npm = defaultNpm,
   confirm = defaultConfirm,
+  askOtp = defaultAskOtp,
   log = (line) => console.log(line),
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   root = REPO_ROOT,
@@ -460,6 +546,7 @@ export async function bootstrap({
 
   log("\n[3/4] trusted publishers (release packages only)");
   const toCreate = [];
+  const otpCache = {};
   for (const row of rows) {
     if (row.versions === null) {
       if (dryRun) {
@@ -472,66 +559,50 @@ export async function bootstrap({
       }
       continue;
     }
-    const list = npm(["trust", "list", row.name, "--json"]);
-    if (list.status !== 0 && needsOtp(list)) {
-      // npm only prompts for 2FA when attached to a terminal, which a captured read is not. Show the
-      // configs interactively (the operator authenticates there) and let the operator judge them.
-      log(`  ${row.name}: reading trust configs needs 2FA — showing them interactively:`);
-      const shown = npm(["trust", "list", row.name], { interactive: true });
-      const expected = `repository ${TRUSTED_REPOSITORY}, file ${RELEASE_WORKFLOW_FILE}, environment ${RELEASE_ENVIRONMENT}`;
-      if (
-        !refreshTrust &&
-        shown.status === 0 &&
-        (await confirm(`Does the output above show ${expected}?`))
-      ) {
-        row.trust = "configured";
-        continue;
-      }
-      toCreate.push({ row, replace: [] });
-      continue;
-    }
-    if (list.status !== 0) {
+    let configs;
+    try {
+      configs = await readTrustConfigs(row.name, { npm, askOtp, otpCache });
+    } catch (err) {
+      if (!(err instanceof PreconditionError)) throw err;
       failed = true;
       row.trust = "could not read";
-      log(`✗ could not list trust configs for ${row.name}:\n${list.stderr.trim()}`);
+      log(`✗ ${err.message}`);
       continue;
     }
-    const configs = parseTrustList(list.stdout);
-    if (refreshTrust && configs.length > 0) {
-      // A config that saw no publish within 48 hours of creation has expired, but may still be
-      // listed. Recreate them all so the release about to run gets a fresh window.
-      toCreate.push({ row, replace: configs });
-      continue;
-    }
-    if (configs.some(isExpectedTrust)) {
+    const plan = planTrust(configs, { refreshTrust });
+    if (plan.revoke.length === 0 && !plan.create) {
       row.trust = "configured";
-      log(`✓ ${row.name}: trusted publisher already configured`);
+      log(`✓ ${row.name}: stage-only trusted publisher configured, and nothing else`);
       continue;
     }
-    toCreate.push({ row, replace: configs });
+    toCreate.push({ row, ...plan });
   }
 
   if (toCreate.length > 0) {
     log(
-      `Will attach the trusted publisher (repo ${TRUSTED_REPOSITORY}, workflow ${RELEASE_WORKFLOW_FILE}, ` +
-        `environment ${RELEASE_ENVIRONMENT}, allow: npm stage publish only) to:\n` +
+      `The stage-only trusted publisher is repo ${TRUSTED_REPOSITORY}, workflow ${RELEASE_WORKFLOW_FILE}, ` +
+        `environment ${RELEASE_ENVIRONMENT}, allow: npm stage publish only. Changes:\n` +
         toCreate
-          .map(({ row, replace }) =>
-            replace.length > 0
-              ? `  - ${row.name} (REPLACING existing: ${replace.map((c) => JSON.stringify(c)).join(", ")})`
-              : `  - ${row.name}`,
+          .map(({ row, revoke, create }) =>
+            [
+              `  - ${row.name}:`,
+              ...revoke.map(
+                (c) => `      REVOKE ${describeTrust(c)} (${trustProblem(c) ?? "recreating"})`,
+              ),
+              ...(create ? ["      CREATE the stage-only config"] : []),
+            ].join("\n"),
           )
           .join("\n") +
-        `\nnpm will ask for 2FA on the first change.`,
+        `\nStale configs are revoked before anything is created. npm will ask for 2FA on each change.`,
     );
     const proceed =
       dryRun || (await confirm(`Configure ${toCreate.length} trusted publisher(s) now?`));
-    for (const [i, { row, replace }] of toCreate.entries()) {
+    for (const [i, { row, revoke, create }] of toCreate.entries()) {
       if (dryRun) {
-        for (const c of replace)
+        for (const c of revoke)
           log(`  [dry-run] npm trust revoke ${row.name} --id=${String(c.id)}`);
-        log(`  [dry-run] npm ${trustGithubArgs(row.name).join(" ")}`);
-        row.trust = replace.length > 0 ? "would replace" : "would configure";
+        if (create) log(`  [dry-run] npm ${trustGithubArgs(row.name).join(" ")}`);
+        row.trust = revoke.length > 0 ? "would replace" : "would configure";
         continue;
       }
       if (!proceed) {
@@ -540,16 +611,16 @@ export async function bootstrap({
       }
       if (i > 0) await sleep(2000); // npm docs: pace bulk trust calls to avoid rate limiting
       let ok = true;
-      for (const c of replace) {
+      for (const c of revoke) {
         ok =
           npm(["trust", "revoke", row.name, `--id=${String(c.id)}`], { interactive: true })
             .status === 0;
         if (!ok) break;
       }
-      ok = ok && npm(trustGithubArgs(row.name), { interactive: true }).status === 0;
+      if (ok && create) ok = npm(trustGithubArgs(row.name), { interactive: true }).status === 0;
       if (ok) {
-        row.trust = "configured (this run)";
-        log(`✓ ${row.name}: trusted publisher configured`);
+        row.trust = create ? "configured (this run)" : "configured (stale configs revoked)";
+        log(`✓ ${row.name}: stage-only trusted publisher configured, and nothing else`);
       } else {
         failed = true;
         row.trust = "FAILED — configure by hand";
@@ -608,6 +679,97 @@ export async function bootstrap({
 
   printChecklist({ rows, claimRows, log, dryRun, refreshTrust });
   return { exitCode: failed ? 1 : 0, rows, claimRows };
+}
+
+/**
+ * Audit only: list every trust config on every release package with its permissions, and revoke
+ * (after one confirmation) each one that isn't exactly the stage-only release config. It creates
+ * nothing and publishes nothing. Use it to make sure nothing can publish directly. Then run the
+ * bootstrap normally to (re)create the stage-only configs. Exits non-zero while a wrong config
+ * remains, or when a package's configs can't be read.
+ */
+export async function auditTrust({
+  dryRun = false,
+  npm = defaultNpm,
+  confirm = defaultConfirm,
+  askOtp = defaultAskOtp,
+  log = (line) => console.log(line),
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  root = REPO_ROOT,
+  packages = PUBLISHED_PACKAGES,
+} = {}) {
+  log(
+    `npm trust audit for ${TRUSTED_REPOSITORY}${dryRun ? " (dry run — no changes will be made)" : ""}\n`,
+  );
+  try {
+    checkPreconditions({ npm, log, root, packages });
+  } catch (err) {
+    if (err instanceof PreconditionError) {
+      log(`\n✗ ${err.message}`);
+      return { exitCode: 1, audit: [] };
+    }
+    throw err;
+  }
+  const otpCache = {};
+  const audit = [];
+  let failed = false;
+  log("");
+  for (const pkg of packages) {
+    let configs;
+    try {
+      if (registryVersions(npm, pkg.name) === null) {
+        log(`${pkg.name}: not on npm, so no trust configs`);
+        continue;
+      }
+      configs = await readTrustConfigs(pkg.name, { npm, askOtp, otpCache });
+    } catch (err) {
+      if (!(err instanceof PreconditionError)) throw err;
+      failed = true;
+      log(`✗ ${err.message}`);
+      continue;
+    }
+    log(`${pkg.name}: ${configs.length} trust config(s)`);
+    for (const config of configs) {
+      const problem = trustProblem(config);
+      audit.push({ name: pkg.name, config, problem, revoked: false });
+      log(
+        `  ${problem ? "✗ WRONG" : "✓ ok   "} ${describeTrust(config)}${problem ? ` — ${problem}` : ""}`,
+      );
+    }
+    if (!configs.some(isExpectedTrust)) {
+      log(`  ! no stage-only config: run the bootstrap (without --audit-trust) to create one`);
+    }
+  }
+
+  const wrong = audit.filter((a) => a.problem);
+  if (wrong.length > 0) {
+    log(`\n${wrong.length} trust config(s) are not exactly stage-only and will be revoked.`);
+    if (dryRun) {
+      for (const a of wrong) {
+        log(`  [dry-run] npm trust revoke ${a.name} --id=${String(a.config.id)}`);
+      }
+    } else if (await confirm(`Revoke ${wrong.length} trust config(s) now?`)) {
+      for (const [i, a] of wrong.entries()) {
+        if (i > 0) await sleep(2000); // npm docs: pace bulk trust calls to avoid rate limiting
+        const res = npm(["trust", "revoke", a.name, `--id=${String(a.config.id)}`], {
+          interactive: true,
+        });
+        a.revoked = res.status === 0;
+        log(
+          a.revoked
+            ? `✓ revoked ${a.name} ${String(a.config.id)}`
+            : `✗ could not revoke ${a.name} ${String(a.config.id)}`,
+        );
+      }
+    } else {
+      log("Skipped: nothing revoked.");
+    }
+  } else if (!failed) {
+    log("\n✓ No trust config can publish directly or names another identity.");
+  }
+  const remaining = wrong.filter((a) => !a.revoked);
+  if (remaining.length > 0) failed = true;
+  return { exitCode: failed ? 1 : 0, audit };
 }
 
 /** Inline-code helper for log text. */
@@ -694,7 +856,7 @@ function printChecklist({ rows, claimRows, log, dryRun, refreshTrust }) {
 
 function usage() {
   return [
-    "usage: node scripts/npm-bootstrap-trusted-publishing.mjs [--dry-run] [--refresh-trust]",
+    "usage: node scripts/npm-bootstrap-trusted-publishing.mjs [--dry-run] [--refresh-trust | --audit-trust]",
     "",
     "Reserves the @allw/* package names on npm (placeholder), attaches the GitHub Actions trusted",
     "publisher for .github/workflows/release.yml, and claims the unscoped bin names (allw-hook, …)",
@@ -703,6 +865,10 @@ function usage() {
     "  --dry-run        report what would happen; change nothing",
     "  --refresh-trust  revoke and recreate every trust config (run right before the first release,",
     "                   since configs that saw no publish within 48 hours expire)",
+    "  --audit-trust    only list every trust config with its permissions and revoke each one that",
+    "                   is not exactly stage-only; creates and publishes nothing",
+    "",
+    "If npm needs 2FA to read trust configs, you are asked for a one-time password (2FA code).",
     "",
     "See docs/releasing.md.",
   ].join("\n");
@@ -714,14 +880,17 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     console.log(usage());
     process.exit(0);
   }
-  const unknown = args.filter((a) => a !== "--dry-run" && a !== "--refresh-trust");
-  if (unknown.length > 0) {
-    console.error(`unknown argument(s): ${unknown.join(" ")}\n\n${usage()}`);
+  const known = new Set(["--dry-run", "--refresh-trust", "--audit-trust"]);
+  const unknown = args.filter((a) => !known.has(a));
+  if (unknown.length > 0 || (args.includes("--refresh-trust") && args.includes("--audit-trust"))) {
+    console.error(
+      `${unknown.length > 0 ? `unknown argument(s): ${unknown.join(" ")}` : "--refresh-trust and --audit-trust are exclusive"}\n\n${usage()}`,
+    );
     process.exit(2);
   }
-  const { exitCode } = await bootstrap({
-    dryRun: args.includes("--dry-run"),
-    refreshTrust: args.includes("--refresh-trust"),
-  });
+  const dryRun = args.includes("--dry-run");
+  const { exitCode } = args.includes("--audit-trust")
+    ? await auditTrust({ dryRun })
+    : await bootstrap({ dryRun, refreshTrust: args.includes("--refresh-trust") });
   process.exit(exitCode);
 }

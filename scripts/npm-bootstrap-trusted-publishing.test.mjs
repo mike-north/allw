@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import {
+  auditTrust,
   PLACEHOLDER_TAG,
   PLACEHOLDER_VERSION,
   bootstrap,
@@ -62,6 +63,7 @@ function fakeNpm({
   failTrustCreate = false,
   viewError = null,
   maintainersError = false,
+  trustListOtp = null,
 } = {}) {
   const calls = [];
   const placeholders = [];
@@ -98,6 +100,10 @@ function fakeNpm({
       return ok();
     }
     if (cmd === "trust" && sub === "list") {
+      // Accounts with auth-and-writes 2FA: npm refuses the read without a one-time password.
+      if (trustListOtp && !args.includes(`--otp=${trustListOtp}`)) {
+        return err("npm error code EOTP\nnpm error This operation requires a one-time password.");
+      }
       return ok((registry[name]?.trust ?? []).map((c) => JSON.stringify(c, null, 2)).join("\n"));
     }
     if (cmd === "trust" && sub === "github") {
@@ -124,15 +130,26 @@ function fakeNpm({
   return { npm, calls, writes, placeholders, registry };
 }
 
-/** Run the bootstrap with captured log, a scripted confirm, and no real sleeping. */
-async function run(fake, { dryRun = false, refreshTrust = false, answer = true } = {}) {
+/**
+ * Run the bootstrap (or, with `audit`, the trust audit) with captured log, a scripted confirm, a
+ * scripted one-time password (`otp`; recorded in `otpAsks`), and no real sleeping.
+ */
+async function run(
+  fake,
+  { dryRun = false, refreshTrust = false, answer = true, otp = null, audit = false } = {},
+) {
   const lines = [];
   const questions = [];
   const sleeps = [];
-  const result = await bootstrap({
+  const otpAsks = [];
+  const result = await (audit ? auditTrust : bootstrap)({
     dryRun,
     refreshTrust,
     npm: fake.npm,
+    askOtp: async (name) => {
+      otpAsks.push(name);
+      return otp;
+    },
     log: (line) => lines.push(line),
     confirm: async (q) => {
       questions.push(q);
@@ -142,7 +159,7 @@ async function run(fake, { dryRun = false, refreshTrust = false, answer = true }
       sleeps.push(ms);
     },
   });
-  return { ...result, out: lines.join("\n"), questions, sleeps };
+  return { ...result, out: lines.join("\n"), questions, sleeps, otpAsks };
 }
 
 /** A registry where every release package is trusted and every claim-only name is ours. */
@@ -314,6 +331,124 @@ test("a direct-publish trust config is revoked and replaced with a stage-only on
     assert.ok(create?.includes("--allow-stage-publish"), `recreates ${name} stage-only`);
     assert.ok(!create.includes("--allow-publish"));
   }
+});
+
+// Regression: with auth-and-writes 2FA, `npm trust list --json` fails with EOTP. The old fallback
+// asked "does the output above look right?" without mentioning permissions, so a direct-publish
+// config was kept on `y`, and on `n` a stage-only config was added *beside* it (npm allows several
+// per package), which left direct publishing working either way.
+test("EOTP on trust list: retries with --otp, then revokes the direct-publish config", async () => {
+  const registry = configuredRegistry();
+  for (const name of NAMES) {
+    registry[name].trust = [
+      { ...EXPECTED_TRUST, id: `direct-${name}`, permissions: ["createPackage"] },
+    ];
+  }
+  const fake = fakeNpm({ registry, trustListOtp: "123456" });
+  const { exitCode, otpAsks, questions } = await run(fake, { otp: "123456" });
+  assert.equal(exitCode, 0);
+  assert.deepEqual(otpAsks, [NAMES[0]], "asks once; the code is reused for the other packages");
+  assert.ok(!questions.some((q) => /Does the output/.test(q)), "never asks the operator to judge");
+  for (const name of NAMES) {
+    assert.deepEqual(
+      registry[name].trust.map((c) => c.permissions),
+      [["createStagedPackage"]],
+      `${name} ends with exactly one stage-only config`,
+    );
+  }
+  const writes = fake.writes().map(({ args }) => args.slice(0, 3).join(" "));
+  assert.ok(
+    writes.indexOf(`trust revoke ${NAMES[0]}`) < writes.indexOf(`trust github ${NAMES[0]}`),
+    "revokes before it creates",
+  );
+});
+
+test("EOTP on trust list with no one-time password fails closed and changes nothing", async () => {
+  const registry = configuredRegistry();
+  registry["@allw/sdk"].trust = [
+    { ...EXPECTED_TRUST, id: "direct", permissions: ["createPackage"] },
+  ];
+  const fake = fakeNpm({ registry, trustListOtp: "123456" });
+  const { exitCode, out, rows } = await run(fake, { otp: null });
+  assert.equal(exitCode, 1);
+  assert.deepEqual(trustTargets(fake), [], "no trust config created or revoked");
+  assert.ok(rows.every((r) => r.trust === "could not read"));
+  assert.match(out, /needs an npm one-time password, and none was given/);
+});
+
+test("--refresh-trust under EOTP still revokes every existing config before recreating", async () => {
+  const registry = configuredRegistry();
+  registry["@allw/hook"].trust.push({
+    ...EXPECTED_TRUST,
+    id: "direct",
+    permissions: ["createPackage"],
+  });
+  const fake = fakeNpm({ registry, trustListOtp: "654321" });
+  const { exitCode } = await run(fake, { refreshTrust: true, otp: "654321" });
+  assert.equal(exitCode, 0);
+  const revoked = fake
+    .writes()
+    .filter(({ args }) => args[1] === "revoke" && args[2] === "@allw/hook")
+    .map(({ args }) => args[3]);
+  assert.deepEqual(revoked.sort(), ["--id=direct", "--id=trust-1"]);
+  assert.deepEqual(
+    registry["@allw/hook"].trust.map((c) => c.permissions),
+    [["createStagedPackage"]],
+  );
+});
+
+test("a stage-only config beside a direct-publish one: the direct one is revoked, nothing added", async () => {
+  const registry = configuredRegistry();
+  registry["@allw/sdk"].trust.push({
+    ...EXPECTED_TRUST,
+    id: "direct",
+    permissions: ["createPackage"],
+  });
+  const fake = fakeNpm({ registry });
+  const { exitCode } = await run(fake);
+  assert.equal(exitCode, 0);
+  assert.deepEqual(
+    fake.writes().map(({ args }) => args.join(" ")),
+    ["trust revoke @allw/sdk --id=direct"],
+  );
+});
+
+test("--audit-trust lists every config, revokes only the wrong ones, and creates nothing", async () => {
+  const registry = configuredRegistry();
+  registry["@allw/sdk"].trust.push({
+    ...EXPECTED_TRUST,
+    id: "direct",
+    permissions: ["createPackage"],
+  });
+  registry["@allw/hook"].trust = [{ ...EXPECTED_TRUST, id: "fork", repository: "someone/fork" }];
+  const fake = fakeNpm({ registry, trustListOtp: "111111" });
+
+  const preview = await run(fake, { audit: true, dryRun: true, otp: "111111" });
+  assert.equal(preview.exitCode, 1, "wrong configs remain after a dry run");
+  assert.deepEqual(fake.writes(), []);
+  assert.match(preview.out, /✗ WRONG id direct: .*\[createPackage\] — can publish directly/);
+  assert.match(preview.out, /✗ WRONG id fork: .*repo someone\/fork/);
+  assert.match(preview.out, /✓ ok {4}id trust-1: .*\[createStagedPackage\]/);
+
+  const declined = await run(fake, { audit: true, otp: "111111", answer: false });
+  assert.equal(declined.exitCode, 1);
+  assert.deepEqual(fake.writes(), []);
+
+  const applied = await run(fake, { audit: true, otp: "111111" });
+  assert.equal(applied.exitCode, 0);
+  assert.deepEqual(
+    fake.writes().map(({ args }) => args.join(" ")),
+    ["trust revoke @allw/sdk --id=direct", "trust revoke @allw/hook --id=fork"],
+  );
+  assert.match(applied.out, /@allw\/hook:[\s\S]*no stage-only config: run the bootstrap/);
+  assert.deepEqual(fake.placeholders, [], "the audit never publishes");
+});
+
+test("--audit-trust fails closed when trust configs can't be read", async () => {
+  const fake = fakeNpm({ registry: configuredRegistry(), trustListOtp: "111111" });
+  const { exitCode } = await run(fake, { audit: true, otp: "" });
+  assert.equal(exitCode, 1);
+  assert.deepEqual(fake.writes(), []);
 });
 
 test("declining the confirmations writes nothing", async () => {
