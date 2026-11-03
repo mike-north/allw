@@ -62,6 +62,10 @@ struct VerifiedVerdictJson {
     approver: Approver,
     decided_at: i64,
     nonce_b64: String,
+    /// The approver's note from the **signed claims** (omitted when absent); audit records take
+    /// the note from here, never from the unverified outer verdict (`docs/contract.md`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
 }
 
 /// The device-prepared WYSIWYS payload returned by [`prepare_approval_json`].
@@ -420,7 +424,8 @@ pub fn sign_verdict_json(
         challenge_response: unsigned_json.challenge_response,
     };
     let device_key = SigningKeyPair::from_seed(&device_seed);
-    let verdict = core_sign_verdict(&unsigned, &device_key, &nonce, unsigned_json.device_cert);
+    let verdict = core_sign_verdict(&unsigned, &device_key, &nonce, unsigned_json.device_cert)
+        .map_err(|e| AllwFfiError::failure(format!("sign_verdict failed: {e}")))?;
     to_json(&verdict, "Verdict")
 }
 
@@ -455,6 +460,7 @@ pub fn verify_verdict_json(
             approver: verified.approver,
             decided_at: verified.decided_at,
             nonce_b64: URL_SAFE_NO_PAD.encode(verified.nonce),
+            note: verified.note,
         },
         "VerifiedVerdict",
     )

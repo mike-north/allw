@@ -1,13 +1,14 @@
 /**
  * Codex decision core: classify a PreToolUse input, request allw approval for gated actions, and
- * map the verified verdict to Codex's allow/deny JSON.
+ * map the verified verdict to a Codex hook result: no output (allw does not block the call) or a
+ * `deny` JSON.
  *
  * This deliberately mirrors the Claude Code hook's fail-closed matrix while using Codex-specific
  * actor identity. All syntactic `ActionRecord` construction stays delegated to the shared WASM
  * core through `@allw/hook` helpers.
  */
 
-import { gateToolCall, type HookConfig, type HookWasm } from "@allw/hook";
+import { agentSafeErrorText, gateToolCall, type HookConfig, type HookWasm } from "@allw/hook";
 
 import {
   denyOutput,
@@ -142,10 +143,9 @@ export async function decide(
   try {
     verdict = await deps.requestApproval(req);
   } catch (err) {
+    // The error text may carry relay-supplied text: escape and cap it before the agent reads it.
     return denyOutput(
-      `allw: approval request failed (fail-closed deny): ${
-        err instanceof Error ? err.message : String(err)
-      }`,
+      `allw: approval request failed (fail-closed deny): ${agentSafeErrorText(deps.wasm, err)}`,
       "transport-error",
     );
   }

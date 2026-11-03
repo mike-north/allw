@@ -61,8 +61,8 @@ pub use crypto::{
     verify_verdict_with_account_states_for_account, AccountState, AccountStateActor,
     AccountStateDevice, AccountStateError, AccountStatePreviousRoot, AccountStateRevocation,
     AccountStateRevocationKind, DeviceCertClaims, InMemoryNonceStore, JwsError, KeyError,
-    NonceStore, PublicKey, SigningKeyPair, UnsignedVerdict, VerdictClaims, VerifiedVerdict,
-    VerifyError,
+    NonceStore, PublicKey, SignVerdictError, SigningKeyPair, UnsignedVerdict, VerdictClaims,
+    VerifiedVerdict, VerifyError, MAX_NOTE_BYTES,
 };
 pub use display::{
     display_model, escape_for_display, has_hidden_or_control_chars, is_hidden_or_control_char,
@@ -71,7 +71,8 @@ pub use display::{
 pub use file_edit::action_from_file_edit;
 pub use hash::{canonical_request_bytes, compute_request_hash};
 pub use jwe::{
-    decrypt_context, encrypt_context, ContextRecipient, JweError, X25519KeyPair, X25519PublicKey,
+    decrypt_context, encrypt_context, is_small_order_x25519_public_key, ContextRecipient,
+    EncryptError, JweError, X25519KeyPair, X25519PublicKey, X25519_SMALL_ORDER_POINTS,
 };
 pub use mcp::{
     action_from_agent_tool_call, action_from_agent_tool_call_with_raw, action_from_mcp_tool_call,

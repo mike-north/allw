@@ -48,9 +48,10 @@ use allw_core::{
     derive_number_match_challenge as core_derive_number_match_challenge,
     display_model as core_display_model, encrypt_context as core_encrypt_context,
     escape_for_display as core_escape_for_display, evaluate as core_evaluate,
-    evaluate_for_actor as core_evaluate_for_actor, issue_device_cert as core_issue_device_cert,
-    revoked_device_ids as core_revoked_device_ids, select_recipients as core_select_recipients,
-    sign_account_state as core_sign_account_state,
+    evaluate_for_actor as core_evaluate_for_actor,
+    is_small_order_x25519_public_key as core_is_small_order_x25519_public_key,
+    issue_device_cert as core_issue_device_cert, revoked_device_ids as core_revoked_device_ids,
+    select_recipients as core_select_recipients, sign_account_state as core_sign_account_state,
     sign_actor_attestation as core_sign_actor_attestation,
     sign_pairing_start_authorization as core_sign_pairing_start_authorization,
     sign_policy_rule as core_sign_policy_rule, sign_verdict as core_sign_verdict,
@@ -69,6 +70,7 @@ use allw_core::{
     AccountState, ActionRecord, Actor, ApprovalContext, ApprovalRequest, Approver, CommandContext,
     ContextRecipient, Decision, PolicyRule, PolicyRuleScope, PublicKey, SigningKeyPair,
     UnsignedPolicyRule, UnsignedVerdict, Verdict, X25519KeyPair, X25519PublicKey,
+    X25519_SMALL_ORDER_POINTS,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::rngs::OsRng;
@@ -235,18 +237,13 @@ struct WasmRecipient {
 /// # Errors
 ///
 /// Throws if `context_json` / `recipients_json` are not valid JSON, a `public_key_b64` is not a
-/// 32-byte base64url value, or `recipients` is empty (a JWE no device could decrypt).
+/// 32-byte base64url value, `recipients` is empty (a JWE no device could decrypt), or a recipient's
+/// public key is a small-order X25519 point (the message names that device id). The core returns
+/// these as errors, never panics, so the WASM instance stays usable after a throw.
 #[wasm_bindgen]
 pub fn encrypt_context(context_json: &str, recipients_json: &str) -> Result<String, JsError> {
     let ctx: ApprovalContext = parse_json(context_json, "ApprovalContext")?;
     let recipients: Vec<WasmRecipient> = parse_json(recipients_json, "recipients")?;
-
-    if recipients.is_empty() {
-        // The core panics on empty recipients; surface it as a clean JS throw instead.
-        return Err(JsError::new(
-            "encrypt_context requires at least one recipient",
-        ));
-    }
 
     // Decode every public key first so a bad key is a clean error, then borrow into the core's
     // borrowing `ContextRecipient` shape.
@@ -267,7 +264,8 @@ pub fn encrypt_context(context_json: &str, recipients_json: &str) -> Result<Stri
         })
         .collect();
 
-    Ok(core_encrypt_context(&ctx, &core_recipients, &mut OsRng))
+    core_encrypt_context(&ctx, &core_recipients, &mut OsRng)
+        .map_err(|e| JsError::new(&e.to_string()))
 }
 
 // ── decrypt_context ──────────────────────────────────────────────────────────────────
@@ -315,13 +313,18 @@ struct VerifyResult {
     decided_at: i64,
     /// The signed anti-replay nonce, base64url-unpadded, for SDK/client-level replay stores.
     nonce_b64: String,
+    /// The approver's note from the **signed claims** (omitted when absent). Audit records take
+    /// the note from here, never from the unverified outer verdict (`docs/contract.md`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
 }
 
 /// Verifies a [`Verdict`](allw_core::Verdict) against the request it answers, the human-shown
 /// context, and the approver's account-root Ed25519 public key.
 ///
 /// On success returns a JSON
-/// `{ "approved": true, "device_id": string, "decided_at": number, "nonce_b64": string }`.
+/// `{ "approved": true, "device_id": string, "decided_at": number, "nonce_b64": string, "note"?: string }`
+/// (`note` is the signed note, present only when the verdict carries one).
 /// Uses a fresh single-shot [`InMemoryNonceStore`](allw_core::InMemoryNonceStore), then returns the
 /// verified nonce so SDK/client code can enforce cross-call replay protection in a long-lived
 /// store.
@@ -382,6 +385,7 @@ pub fn verify_verdict(
             device_id: verified.device_id,
             decided_at: verified.decided_at,
             nonce_b64: URL_SAFE_NO_PAD.encode(verified.nonce),
+            note: verified.note,
         },
         "VerifyResult",
     )
@@ -453,6 +457,7 @@ pub fn verify_verdict_with_account_states(
             device_id: verified.device_id,
             decided_at: verified.decided_at,
             nonce_b64: URL_SAFE_NO_PAD.encode(verified.nonce),
+            note: verified.note,
         },
         "VerifyResult",
     )
@@ -524,7 +529,8 @@ pub fn sign_verdict(
 
     let cert = required_device_cert(device_cert)?;
 
-    let verdict: Verdict = core_sign_verdict(&unsigned, &device_key, &nonce, Some(cert));
+    let verdict: Verdict = core_sign_verdict(&unsigned, &device_key, &nonce, Some(cert))
+        .map_err(|e| JsError::new(&format!("sign_verdict failed: {e}")))?;
     to_json(&verdict, "Verdict")
 }
 
@@ -1415,6 +1421,33 @@ pub fn action_from_file_edit(
     }
     let record = core_action_from_file_edit(operation, &paths, diff_summary, diff_bytes);
     to_json(&record, "ActionRecord")
+}
+
+// ── Small-order X25519 keys (#248) ────────────────────────────────────────────────
+
+/// Returns the core's static denylist of small-order X25519 public keys as a JSON array of
+/// base64url-unpadded strings ([`X25519_SMALL_ORDER_POINTS`](allw_core::X25519_SMALL_ORDER_POINTS)).
+/// A key matching an entry (ignoring bit 255) can never be a valid encryption target; components
+/// that register device keys can reject it up front.
+#[wasm_bindgen]
+pub fn x25519_small_order_points() -> Result<String, JsError> {
+    let encoded: Vec<String> = X25519_SMALL_ORDER_POINTS
+        .iter()
+        .map(|p| URL_SAFE_NO_PAD.encode(p))
+        .collect();
+    to_json(&encoded, "small-order point list")
+}
+
+/// Whether `public_key_b64` (a base64url-unpadded 32-byte X25519 public key) is a small-order
+/// point that [`encrypt_context`] would refuse.
+///
+/// # Errors
+///
+/// Throws if `public_key_b64` is not 32 base64url bytes.
+#[wasm_bindgen]
+pub fn is_small_order_x25519_public_key(public_key_b64: &str) -> Result<bool, JsError> {
+    let bytes = decode_b64_32(public_key_b64, "public_key_b64")?;
+    Ok(core_is_small_order_x25519_public_key(&bytes))
 }
 
 // ── Display safety (#246) ─────────────────────────────────────────────────────────

@@ -24,6 +24,8 @@ const DECLARED_GLUE_FUNCTIONS: Record<keyof typeof glue, true> = {
   check_account_id_for_root: true,
   verify_pairing_start_authorization: true,
   sign_pairing_start_authorization: true,
+  verify_account_state: true,
+  sign_account_state: true,
   ed25519_public_key: true,
 };
 

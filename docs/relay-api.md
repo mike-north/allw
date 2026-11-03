@@ -53,9 +53,21 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   | ----------------------- | ----------------------------- | ------------------------------------------------------------------- | ------------------------- |
   | `pairing_auth_token`    | `POST /pairing/start`         | `POST /pairing/complete`                                            | 10 min (`PAIRING_TTL_MS`) |
   | `enrollment_auth_token` | `POST /enrollments/start`     | **specified, not implemented (#199)** — the enrollment courier (§3) | 10 min (specified)        |
-  | `device_auth_token`     | `POST /pairing/complete`      | all `devices/{id}/…`, `actors`, `account-states`                    | until revoked             |
+  | `device_auth_token`     | `POST /pairing/complete`      | all `devices/{id}/…`, `actors`                                      | until revoked             |
   | `request_auth_token`    | `POST /requests` (integrator) | `requests/{id}` polling/wait, `requests/{id}/retract`               | 7 days post-terminal      |
 
+- **CORS (browser clients).** A browser page may call the relay only from an allowlisted origin
+  (`CORS_ALLOWED_ORIGINS`, `docs/relay-deploy.md` §2; the hosted relay allows
+  `https://allw-web-approver.pages.dev`). The policy covers every route, account and relay-level
+  (`/.well-known/allw/…`, e.g. the VAPID public key) alike. Preflights (`OPTIONS` with `Access-Control-Request-Method`)
+  from an allowed origin get **204** with `Access-Control-Allow-Methods: GET, POST, PUT`,
+  `Access-Control-Allow-Headers: Authorization, Content-Type` and `Access-Control-Max-Age: 600`.
+  Responses to an allowed origin echo it in `Access-Control-Allow-Origin`. A disallowed origin,
+  method or header gets a **403** preflight with no CORS headers. Every response except a WebSocket
+  upgrade (101, returned untouched) carries `Vary: Origin`, including a 500 when a handler fails. There is no credentials mode (`Access-Control-Allow-Credentials` is never sent):
+  auth is the bearer header, never a cookie. CORS does not apply to WebSocket upgrades, and the relay
+  does not check `Origin` there, since the socket authenticates with `?auth=`. Non-browser clients
+  send no `Origin` and are unaffected.
 - **Errors** are plain bodies with the status code; `400` covers malformed JSON / bad fields /
   unexpected envelope keys (zero-knowledge guard).
 
@@ -96,21 +108,28 @@ SUBMIT VERDICT   ⚠ WebSocket ONLY — there is no HTTP verdict endpoint
   → { type:"verdict", request_id, verdict }   (verdict = JWS signed by the device key)
   ← { type:"ack", request_id, status:"resolved" | "already_resolved" | "expired" | "retracted" }
 
+SUBSCRIBE / ROTATE PUSH  (any time after pairing; e.g. a browser's Web Push subscription)
+  PUT /{acct}/devices/{device_id}/push-tokens   (Bearer device_auth_token; self only)
+     body: { push_tokens: [{ transport, token }] }   ← REPLACES this device's set; [] clears
+                                        → { push_tokens }   (the stored set)
+     Re-send whenever the platform token or subscription changes (rotation, re-subscribe after a
+     VAPID key rotation, permission revoked → []). Repeating the same body is a no-op.
+
 REFRESH TRUST  (periodically, to verify actor attestation / feed AccountStateResolver)
-  GET /{acct}/account-states            (Bearer device_auth_token)
+  GET /{acct}/account-states            (no auth — public, relay-verified, root-signed)
      → { account_states: [ <compact JWS> … ], max_sequence }
 ```
 
 **Mapping to the `AllwIOSApprover` package seams:**
 
-| Need                                     | Endpoint                             | Package seam                                                                                                                                                                                                                                                        |
-| ---------------------------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Pair + store creds                       | `pairing/start` + `pairing/complete` | persist via `NativeCredentialStore` (`device_id`, `device_auth_token`, account-root pubkey)                                                                                                                                                                         |
-| Obtain the `device_cert`                 | `enrollments/{id}/csr` + `…/cert`    | **specified, not implemented (#199).** Scan the enrollment QR, generate keys on-device, deposit the MAC'd CSR, poll for the cert, verify against the pinned root, persist via `NativeCredentialStore` — no cert ⇒ no inbox                                          |
-| Register APNs token                      | `push_tokens` in `pairing/complete`  | `PushTokenRegistering` / `HexApnsTokenRegistrar` `send` closure posts it here                                                                                                                                                                                       |
-| Poll inbox                               | `GET …/inbox`                        | `RelayInboxFetching` / `UrlSessionRelayInboxClient.fetchPendingEnvelopes()`                                                                                                                                                                                         |
-| Live push + **verdict submit + retract** | `…/connect` WebSocket                | **NOT in the package yet — the app builds this WS client.** Feed `{type:"request"}` into `ApprovalInboxStore.sync`; on resolve, send the `SignedVerdict.signedVerdictJson` as `{type:"verdict"}`; on `{type:"retract"}` clear via `PushInboxCoordinator.didResolve` |
-| Verify origins (VERIFIED badge)          | `GET …/account-states`               | the `AccountStateResolver` feed (#155); verify root sig on device, keep a highest-sequence floor                                                                                                                                                                    |
+| Need                                     | Endpoint                                                       | Package seam                                                                                                                                                                                                                                                        |
+| ---------------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pair + store creds                       | `pairing/start` + `pairing/complete`                           | persist via `NativeCredentialStore` (`device_id`, `device_auth_token`, account-root pubkey)                                                                                                                                                                         |
+| Obtain the `device_cert`                 | `enrollments/{id}/csr` + `…/cert`                              | **specified, not implemented (#199).** Scan the enrollment QR, generate keys on-device, deposit the MAC'd CSR, poll for the cert, verify against the pinned root, persist via `NativeCredentialStore` — no cert ⇒ no inbox                                          |
+| Register APNs token                      | `push_tokens` in `pairing/complete`, later `PUT …/push-tokens` | `PushTokenRegistering` / `HexApnsTokenRegistrar` `send` closure posts it here                                                                                                                                                                                       |
+| Poll inbox                               | `GET …/inbox`                                                  | `RelayInboxFetching` / `UrlSessionRelayInboxClient.fetchPendingEnvelopes()`                                                                                                                                                                                         |
+| Live push + **verdict submit + retract** | `…/connect` WebSocket                                          | **NOT in the package yet — the app builds this WS client.** Feed `{type:"request"}` into `ApprovalInboxStore.sync`; on resolve, send the `SignedVerdict.signedVerdictJson` as `{type:"verdict"}`; on `{type:"retract"}` clear via `PushInboxCoordinator.didResolve` |
+| Verify origins (VERIFIED badge)          | `GET …/account-states`                                         | the `AccountStateResolver` feed (#155); verify root sig on device, keep a highest-sequence floor                                                                                                                                                                    |
 
 > ⚠ **Build note for the Xcode agent:** the package fetches the inbox but does **not** implement the
 > `/connect` WebSocket or verdict submission. The app must implement the WS client (URLSessionWebSocketTask):
@@ -144,7 +163,7 @@ authorization is rejected at or after `expires_at`. Sign it with the core
 
 → **201** `{ code: string (8-char Crockford base32), expires_at: number(ms), pairing_auth_token: string }`.
 Code is single-use, 10-min TTL. The first success binds `root_pubkey` to the account — but only into an account
-with no device, pairing, actor or account-state rows; otherwise the bind is refused (409), never purged
+with no device, pairing or actor rows; otherwise the bind is refused (409), never purged
 (`docs/enrollment.md` §Self-Certifying Account Id). A used `jti` is remembered until 60 s past its `expires_at`.
 
 | Status | When                                                                                                                                                                                                                                                        |
@@ -152,7 +171,7 @@ with no device, pairing, actor or account-state rows; otherwise the bind is refu
 | 400    | body is not a JSON object; `root_pubkey` missing, malformed, or not an Ed25519 key; `{acct}` does not derive from `root_pubkey`                                                                                                                             |
 | 401    | `authorization` missing (or not a string)                                                                                                                                                                                                                   |
 | 403    | bad signature, wrong `typ`, wrong `kid`/`account_id`, unsupported `v`, malformed `jti`, invalid/overlong window, not yet valid, expired, a `jti` already accepted for this account, or a `root_pubkey` different from the root already bound to the account |
-| 409    | no root is bound yet but the account already holds devices, pairing codes, actors or account state from before root binding                                                                                                                                 |
+| 409    | no root is bound yet but the account already holds devices, pairing codes or actors from before root binding                                                                                                                                                |
 | 500    | the relay's verification core failed to initialize (logged; the request is not judged)                                                                                                                                                                      |
 
 Every rejection leaves the account unchanged (no root bound, no code issued, nothing purged).
@@ -269,6 +288,20 @@ pending only, `expires_at > now`, oldest first. (404 if device not enrolled.)
 **`POST /{acct}/devices/{device_id}/revoke`** — Bearer the device's own token (self-revoke only;
 cross-device ⇒ 403). → **200** `{ revoked: true }`. Closes the live socket (1008). 404 if not enrolled.
 
+**`PUT /{acct}/devices/{device_id}/push-tokens`** — Bearer the device's own token (self only).
+Body `{ "push_tokens": [{ "transport": "apns" | "fcm" | "webpush", "token": "string" }] }` (required;
+`[]` clears). **Replaces** the device's push-token set, so it covers add, rotate, and clear after
+pairing. → **200** `{ push_tokens: [{ transport, token }] }`, the stored set (normalized, duplicates
+collapsed). Validation and per-registration budgets are exactly those of `push_tokens` in
+`pairing/complete` (§Pairing): 400 for a malformed body, a missing `push_tokens`, an unsupported
+transport, an invalid or over-long token, or over budget. The account budget (32) counts every other
+device's tokens plus this set (the device's own current tokens don't count, so a full account can
+still rotate); a set that grows past it is a **409** and nothing changes. A set that stays the same
+size or shrinks is never refused, so a device can always clear its tokens. The replace is one transaction and only
+touches tokens that change, so repeating a body is a no-op. Auth, in the revoke order: 401 (no
+bearer), 403 (not a device token, including a revoked device's own), 404 (device not enrolled or
+revoked), 403 (another device's token). Revoking a device deletes its push tokens.
+
 **`GET /{acct}/devices`** — no auth. → **200**
 `{ devices: [{ device_id, pubkey, label|null, created_at }] }`. No secrets / no push tokens.
 
@@ -278,13 +311,31 @@ cross-device ⇒ 403). → **200** `{ revoked: true }`. Closes the live socket (
 `{ actor_id }`. 409 if `actor_id` already enrolled. **`GET /{acct}/actors`** (no auth) → **200**
 `{ actors: [{ actor_id, pubkey, label|null, created_at }] }`.
 
-### Account state (trust distribution) — Bearer `device_auth_token`
+### Account state (trust distribution) — authorized by the account root, not a token
 
-**`GET /{acct}/account-states`** → **200**
-`{ account_states: [ "<compact JWS>" … ], max_sequence: number }`. Opaque JWS — **verify the
-account-root signature on device**; reject rollbacks below your highest-verified sequence floor.
-**`POST /{acct}/account-states`** body `{ account_states: string[] (≤16, ≤32KiB each), max_sequence }`
-→ **200** (echo). 409 on `max_sequence` regression.
+**`POST /{acct}/account-states`** (no auth header) body
+`{ account_states: string[] (1–16 compact JWS, ≤32 KiB each), max_sequence?: number }`.
+Authority is the root's signature: the relay verifies **every** document with the core's
+`verify_account_state` against the root bound to `{acct}` (by a root-signed `pairing/start`) and the
+path's account id. All-or-nothing — any rejection leaves the stored state unchanged. On success the
+relay replaces its stored set with the submitted documents at the **highest verified sequence**
+(lower-sequence documents in the same publish are dropped) and returns them:
+→ **200** `{ account_states: string[], max_sequence: number }` (`max_sequence` = that highest verified
+sequence). `max_sequence` in the body is optional and never trusted; when present it must equal the
+highest verified sequence.
+
+| Status | When                                                                                                                                                                                                        |
+| ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 400    | body is not JSON; `account_states` missing, empty, over 16, or not all compact JWS; `max_sequence` not a non-negative safe integer or not equal to the highest verified; a verified `sequence` above 2^53-1 |
+| 403    | any document fails verification: another signer, wrong `account_id`/`kid`, a `current_root` other than the bound root, wrong `typ`, unsupported `v`, or junk                                                |
+| 409    | no root is bound yet; or the highest verified sequence is not strictly above the stored one (an idempotent republish of the current document is a 409 too)                                                  |
+| 500    | the relay's verification core failed to initialize (logged; no document is judged)                                                                                                                          |
+
+**`GET /{acct}/account-states`** (no auth — the documents are public and root-signed; integrators hold
+no device token) → **200** `{ account_states: [ "<compact JWS>" … ], max_sequence: number }`: only
+relay-verified documents, `max_sequence` = their sequence (`0` when none). The relay is still not the
+trust anchor — **verify the account-root signature on device** and reject rollbacks below your
+highest-verified sequence floor. Rows from the pre-verification cache are dropped, never served.
 
 ### Integrator endpoints (the app does NOT call these — listed for completeness)
 

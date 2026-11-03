@@ -19,7 +19,8 @@
  * - relay under `wrangler dev`  → the real zero-knowledge routing path (pairing, submit, fan-out,
  *   verdict relay) actually runs under workerd, end to end.
  * - real hook `bin` subprocess  → the Node + WASM entrypoint blocks the tool call and maps the
- *   verified verdict to allow/deny at the real process boundary (stdin → stdout decision JSON).
+ *   verified verdict at the real process boundary: an approval prints nothing (no decision, so
+ *   Claude Code's own rules apply), anything else prints a deny JSON (#247: deny-only).
  * - real approver watch loop    → decrypt → recompute WYSIWYS request_hash → sign over a live socket.
  *
  * Usage:
@@ -61,11 +62,17 @@ function parseArgs(argv) {
   return opts;
 }
 
+/**
+ * The demo's name for a hook run that printed nothing: allw has no objection and leaves the call to
+ * Claude Code's own permission rules. The hook never prints `allow` (#247).
+ */
+const NO_DECISION = "no decision";
+
 /** Map the CLI decision word to the approver's auto-mode and the expected hook decision. */
 function resolveMode(decision) {
   switch (decision) {
     case "approve":
-      return { mode: "approved", expected: "allow", timeoutMs: 300_000 };
+      return { mode: "approved", expected: NO_DECISION, timeoutMs: 300_000 };
     case "deny":
       return { mode: "denied", expected: "deny", timeoutMs: 300_000 };
     case "timeout":
@@ -152,7 +159,10 @@ function runCapture(cmd, args, env) {
   });
 }
 
-/** Run the hook `bin` as a subprocess, feeding the PreToolUse JSON on stdin; return the decision. */
+/**
+ * Run the hook `bin` as a subprocess, feeding the PreToolUse JSON on stdin. Resolves the parsed deny
+ * JSON, or `null` when the hook printed nothing (no decision).
+ */
 function runHookBin(env, stdinJson) {
   return new Promise((resolveP, rejectP) => {
     const child = spawn(process.execPath, [HOOK_BIN], {
@@ -164,13 +174,17 @@ function runHookBin(env, stdinJson) {
     child.stderr.on("data", (d) => process.stderr.write(`[hook] ${d}`));
     child.on("error", rejectP);
     child.on("close", (code) => {
-      // The hook always exits 0 with a parseable decision (it speaks in decisions, not error codes).
+      // The hook always exits 0 with empty stdout (no decision) or a parseable deny JSON.
       // A non-zero exit means it crashed before emitting — fail fast rather than parsing partial
       // output, which would surface as a misleading parse error or a false pass.
       if (code !== 0) {
         rejectP(
           new Error(`hook exited ${code} (expected 0); stdout so far: ${stdout || "<none>"}`),
         );
+        return;
+      }
+      if (stdout === "") {
+        resolveP(null);
         return;
       }
       try {
@@ -241,8 +255,8 @@ async function main() {
     };
     process.stderr.write(`[demo] invoking the hook for: ${DESTRUCTIVE_COMMAND}\n`);
     const output = await runHookBin(env, bashStdin());
-    const decision = output.hookSpecificOutput?.permissionDecision;
-    const reason = output.hookSpecificOutput?.permissionDecisionReason ?? "";
+    const decision = output === null ? NO_DECISION : output.hookSpecificOutput?.permissionDecision;
+    const reason = output?.hookSpecificOutput?.permissionDecisionReason ?? "";
     process.stderr.write(`[demo] hook decision: ${decision} — ${reason}\n`);
 
     // 4. Assert the decision matches the mode (fail-closed both ways).
