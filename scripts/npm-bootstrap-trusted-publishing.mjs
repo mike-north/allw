@@ -28,7 +28,7 @@
  *      including a direct-publish (`--allow-publish`) one, counts as wrong, and the script offers
  *      to revoke it. A package can hold several configs, so adding a stage-only one is not enough.
  *      Reading the configs needs 2FA on accounts with auth-and-writes 2FA. In that case the
- *      script asks for a one-time password and retries with `--otp`, and it fails closed when it
+ *      script asks for a one-time password and retries with it, and it fails closed when it
  *      gets none. It never takes the operator's word for what is attached. If the CLI path fails,
  *      it prints the exact npmjs.com page and field values to enter by hand.
  *   3. Claims the unscoped names in CLAIM_ONLY_NAMES (every bin name `npx` could resolve to a
@@ -163,17 +163,25 @@ export function planTrust(configs, { refreshTrust = false } = {}) {
 const OTP_PATTERN = /^\d{6,8}$/;
 
 /**
+ * How a one-time password reaches npm: in the child's environment as `npm_config_otp`, never in
+ * argv. npm doesn't redact `--otp=<code>`, so argv would leak the code to `ps` and to npm's debug
+ * log. Reads that may carry a code also pass `--logs-max=0`, so npm writes no log file at all.
+ */
+export const NO_NPM_LOG = "--logs-max=0";
+export const otpEnv = (otp) => ({ npm_config_otp: otp });
+
+/**
  * Read every trust config on `name`. On accounts with auth-and-writes 2FA, npm wants a one-time
  * password even for this read. A captured read can't prompt, so on EOTP this asks the operator
- * for a code (`askOtp`) and retries with `--otp`. The last code is tried again for the next
+ * for a code (`askOtp`) and retries with it (see `otpEnv`). The last code is tried again for the next
  * package before asking anew. Throws PreconditionError (fail closed) when the configs can't be
  * read, including when no code is given.
  */
 export async function readTrustConfigs(name, { npm, askOtp, otpCache = {} }) {
-  const args = ["trust", "list", name, "--json"];
+  const args = ["trust", "list", name, "--json", NO_NPM_LOG];
   let res = npm(args);
   if (res.status !== 0 && needsOtp(res) && otpCache.value) {
-    res = npm([...args, `--otp=${otpCache.value}`]);
+    res = npm(args, { env: otpEnv(otpCache.value) });
   }
   for (let attempt = 0; res.status !== 0 && needsOtp(res) && attempt < 2; attempt++) {
     const otp = String((await askOtp(name)) ?? "").trim();
@@ -184,7 +192,7 @@ export async function readTrustConfigs(name, { npm, askOtp, otpCache = {} }) {
       );
     }
     otpCache.value = otp;
-    res = npm([...args, `--otp=${otp}`]);
+    res = npm(args, { env: otpEnv(otp) });
   }
   if (res.status !== 0) {
     throw new PreconditionError(`could not list trust configs for ${name}:\n${res.stderr.trim()}`);
@@ -287,10 +295,11 @@ export function placeholderPublishArgs(dir) {
  * otherwise stdout is captured while stdin/stderr stay attached, so an OTP prompt from a read
  * command (e.g. `npm trust list`) still reaches the operator.
  */
-function defaultNpm(args, { interactive = false } = {}) {
+function defaultNpm(args, { interactive = false, env } = {}) {
   const res = spawnSync("npm", args, {
     encoding: "utf8",
     stdio: interactive ? "inherit" : ["inherit", "pipe", "pipe"],
+    env: env ? { ...process.env, ...env } : process.env,
   });
   return { status: res.status ?? 1, stdout: res.stdout ?? "", stderr: res.stderr ?? "" };
 }

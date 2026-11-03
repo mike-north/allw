@@ -17,9 +17,14 @@
  *
  * It establishes, and exits non-zero unless every check holds:
  *
- *   0. **Its own trust root.** The checkout is clean (`git status --porcelain` is empty) and
- *      `HEAD` is exactly GitHub's current `main`. The verifier's code and the release constants
- *      it imports are then main's, not something edited locally.
+ *   0. **Not stale, not dirty.** The checkout is clean (`git status --porcelain` is empty) and
+ *      `HEAD` is exactly GitHub's current `main`. That catches an out-of-date or accidentally
+ *      modified checkout. It is **not** a defense against a hostile local agent or user. A
+ *      self-check can't stop that: `git update-index --skip-worktree` hides edits from
+ *      `git status`, and a PATH shim for `git`/`npm`/`gh`, `NODE_OPTIONS`, a git hook, or an
+ *      edited copy of this file can all fake the answers. docs/releasing.md says how to run it
+ *      from a fresh clone in a clean environment, and where to approve when the machine can't
+ *      be trusted.
  *   1. **The run.** A successful `release.yml` run for tag `v<x.y.z>` (the one named by `--run`,
  *      or the only successful one), whose commit is the commit the tag points at on GitHub.
  *   2. **The commit is on `main`.** That commit is an ancestor of GitHub's `main`, so the workflow
@@ -43,8 +48,9 @@
  * which reads the published attestation and checks it the same way. See docs/releasing.md.
  *
  * npm's stage reads don't prompt for 2FA. On accounts with auth-and-writes 2FA they fail with
- * EOTP, so the verifier asks for a one-time password and retries with `--otp`. Without one, it
- * fails closed.
+ * EOTP, so the verifier asks for a one-time password and retries with it. The code reaches npm
+ * through the environment (`npm_config_otp`), never argv, with npm's log file disabled. Without
+ * a code, it fails closed.
  *
  * Every external call (`gh`, `git`, `npm`, HTTP) goes through an injected runner, so tests drive
  * it without a registry, GitHub or network.
@@ -186,7 +192,11 @@ function parseJson(text, what) {
 export class VerifyError extends Error {}
 
 function defaultExec(cmd, args, opts = {}) {
-  const res = spawnSync(cmd, args, { encoding: "utf8", cwd: opts.cwd ?? REPO_ROOT });
+  const res = spawnSync(cmd, args, {
+    encoding: "utf8",
+    cwd: opts.cwd ?? REPO_ROOT,
+    env: opts.env ? { ...process.env, ...opts.env } : process.env,
+  });
   return { status: res.status ?? 1, stdout: res.stdout ?? "", stderr: res.stderr ?? "" };
 }
 
@@ -224,28 +234,34 @@ const OTP_PATTERN = /^\d{6,8}$/;
 /**
  * An `npm` runner for reads that may need 2FA. npm's `stage list`, `stage view` and `stage
  * download` don't prompt for a one-time password themselves. On an account with auth-and-writes
- * 2FA they fail with EOTP. So on EOTP this asks for a code, retries with `--otp`, and reuses the
- * code for later reads until npm rejects it. Without a code it throws (fail closed).
+ * 2FA they fail with EOTP. So on EOTP this asks for a code, retries with it, and reuses the code
+ * for later reads until npm rejects it. Without a code it throws (fail closed).
+ *
+ * The code goes to npm in the child's environment (`npm_config_otp`), never in argv. npm doesn't
+ * redact `--otp=<code>`, so argv would leak it to `ps` and to npm's debug log. Every read also
+ * passes `--logs-max=0`, so npm writes no log file. The code is never printed.
  */
 export function npmReader(exec, askOtp) {
   const cache = { otp: null };
-  return async (args, opts) => {
+  return async (baseArgs, opts = {}) => {
+    const args = [...baseArgs, "--logs-max=0"];
+    const withOtp = (otp) => ({ ...opts, env: { ...opts.env, npm_config_otp: otp } });
     let res = exec("npm", args, opts);
     if (res.status !== 0 && needsOtp(res) && cache.otp) {
-      res = exec("npm", [...args, `--otp=${cache.otp}`], opts);
+      res = exec("npm", args, withOtp(cache.otp));
     }
     for (let attempt = 0; res.status !== 0 && needsOtp(res) && attempt < 2; attempt++) {
-      const otp = String((await askOtp(`run npm ${args.slice(0, 2).join(" ")}`)) ?? "").trim();
+      const otp = String((await askOtp(`run npm ${baseArgs.slice(0, 2).join(" ")}`)) ?? "").trim();
       if (!OTP_PATTERN.test(otp)) {
         throw new VerifyError(
-          `npm ${args.join(" ")} needs a one-time password, and none was given`,
+          `npm ${baseArgs.join(" ")} needs a one-time password, and none was given`,
         );
       }
       cache.otp = otp;
-      res = exec("npm", [...args, `--otp=${otp}`], opts);
+      res = exec("npm", args, withOtp(otp));
     }
     if (res.status !== 0) {
-      throw new VerifyError(`npm ${args.join(" ")} failed:\n${res.stderr.trim()}`);
+      throw new VerifyError(`npm ${baseArgs.join(" ")} failed:\n${res.stderr.trim()}`);
     }
     return res.stdout;
   };
@@ -345,16 +361,20 @@ export function remoteMainCommit(exec) {
 }
 
 /**
- * The verifier's own trust root. Its code, and the release constants it imports, come from this
- * checkout, which an agent or anyone else with local access could edit. So it runs only from an
- * unmodified checkout of exactly GitHub's current `main`: `git status --porcelain` must be empty and
- * `HEAD` must equal the `main` SHA that `git ls-remote` reports. Returns that SHA. Throws otherwise.
+ * Refuse a stale or dirty checkout: `git status --porcelain` must be empty and `HEAD` must equal
+ * the `main` SHA that `git ls-remote` reports. Returns that SHA, and throws otherwise.
+ *
+ * This guards against verifying with yesterday's code or a stray local edit. It can't guard
+ * against a hostile local agent or user: skip-worktree hides edits, and PATH shims,
+ * `NODE_OPTIONS`, git hooks or an edited verifier can fake every answer it reads. That protection
+ * comes from where it runs (a fresh clone, a clean environment, a separate user); see
+ * docs/releasing.md.
  */
 export function checkTrustRoot(exec) {
   const dirty = must(exec, "git", ["status", "--porcelain"]).trim();
   if (dirty !== "") {
     throw new VerifyError(
-      `this checkout has local changes, so the verifier itself can't be trusted:\n${dirty}\n` +
+      `this checkout has local changes, so it may not be the verifier on main:\n${dirty}\n` +
         `Fix: run it from a clean checkout of main.`,
     );
   }

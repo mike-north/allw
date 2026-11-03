@@ -119,6 +119,8 @@ function fakeWorld({
   npmOtp = null,
 } = {}) {
   const calls = [];
+  /** Every spawn as the child would see it: argv and the extra environment. */
+  const spawned = [];
   const stageMap =
     stages ??
     Object.fromEntries(
@@ -142,6 +144,7 @@ function fakeWorld({
 
   function exec(cmd, args, opts = {}) {
     calls.push([cmd, ...args]);
+    spawned.push({ argv: [cmd, ...args], env: opts.env });
     const line = [cmd, ...args].join(" ");
     if (cmd === "gh" && args[1] === "view") return ok(JSON.stringify(run));
     if (cmd === "gh" && args[1] === "list") return ok(JSON.stringify(runs ?? [run]));
@@ -179,8 +182,8 @@ function fakeWorld({
       if (onMain === "error") return { status: 128, stdout: "", stderr: "fatal: disk on fire" };
       return { status: onMain ? 0 : 1, stdout: "", stderr: "" };
     }
-    // Auth-and-writes 2FA: npm's stage reads fail with EOTP unless given --otp.
-    if (cmd === "npm" && args[0] === "stage" && npmOtp && !args.includes(`--otp=${npmOtp}`)) {
+    // Auth-and-writes 2FA: npm's stage reads fail with EOTP unless given the code (npm_config_otp).
+    if (cmd === "npm" && args[0] === "stage" && npmOtp && opts.env?.npm_config_otp !== npmOtp) {
       return {
         status: 1,
         stdout: "",
@@ -235,7 +238,7 @@ function fakeWorld({
     };
   }
 
-  return { exec, fetchJson, calls };
+  return { exec, fetchJson, calls, spawned };
 }
 
 async function verify(world, opts = {}) {
@@ -506,7 +509,8 @@ test("refuses to run from a dirty checkout, or one that isn't GitHub's main", as
 });
 
 // npm 11.21's stage list/view/download don't prompt for 2FA, so on auth-and-writes accounts they
-// fail with EOTP. The verifier must ask for a code, retry with --otp, and reuse the code.
+// fail with EOTP. The verifier must ask for a code, retry with it, and reuse the code. The code
+// must never be in argv: npm doesn't redact `--otp=<code>`, so it would reach `ps` and npm's log.
 test("stage reads that fail with EOTP are retried with a one-time password", async () => {
   const world = fakeWorld({ npmOtp: "246810" });
   const asks = [];
@@ -519,8 +523,19 @@ test("stage reads that fail with EOTP are retried with a one-time password", asy
   assert.deepEqual(problems, []);
   assert.equal(ok, true);
   assert.equal(asks.length, 1, "asks once, then reuses the code");
-  const stageCalls = world.calls.filter(([cmd, sub]) => cmd === "npm" && sub === "stage");
-  assert.ok(stageCalls.some((c) => c.includes("--otp=246810")));
+  assert.ok(
+    world.spawned.every(({ argv }) => !argv.some((a) => a.includes("246810"))),
+    "the code is never in argv",
+  );
+  const npmCalls = world.spawned.filter(({ argv }) => argv[0] === "npm");
+  assert.ok(
+    npmCalls.some(({ env }) => env?.npm_config_otp === "246810"),
+    "the code goes via env",
+  );
+  assert.ok(
+    npmCalls.every(({ argv }) => argv.includes("--logs-max=0")),
+    "no npm log file",
+  );
 });
 
 test("stage reads that need a one-time password fail closed without one", async () => {

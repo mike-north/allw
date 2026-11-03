@@ -71,7 +71,7 @@ function fakeNpm({
   const err = (stderr) => ({ status: 1, stdout: "", stderr });
 
   function npm(args, opts = {}) {
-    calls.push({ args, interactive: Boolean(opts.interactive) });
+    calls.push({ args, interactive: Boolean(opts.interactive), env: opts.env });
     const [cmd, sub, name] = args;
     if (cmd === "--version") return ok(`${npmVersion}\n`);
     if (cmd === "whoami") return user ? ok(`${user}\n`) : err("npm error code ENEEDAUTH");
@@ -101,7 +101,7 @@ function fakeNpm({
     }
     if (cmd === "trust" && sub === "list") {
       // Accounts with auth-and-writes 2FA: npm refuses the read without a one-time password.
-      if (trustListOtp && !args.includes(`--otp=${trustListOtp}`)) {
+      if (trustListOtp && opts.env?.npm_config_otp !== trustListOtp) {
         return err("npm error code EOTP\nnpm error This operation requires a one-time password.");
       }
       return ok((registry[name]?.trust ?? []).map((c) => JSON.stringify(c, null, 2)).join("\n"));
@@ -337,7 +337,7 @@ test("a direct-publish trust config is revoked and replaced with a stage-only on
 // asked "does the output above look right?" without mentioning permissions, so a direct-publish
 // config was kept on `y`, and on `n` a stage-only config was added *beside* it (npm allows several
 // per package), which left direct publishing working either way.
-test("EOTP on trust list: retries with --otp, then revokes the direct-publish config", async () => {
+test("EOTP on trust list: retries with the code, then revokes the direct-publish config", async () => {
   const registry = configuredRegistry();
   for (const name of NAMES) {
     registry[name].trust = [
@@ -349,6 +349,21 @@ test("EOTP on trust list: retries with --otp, then revokes the direct-publish co
   assert.equal(exitCode, 0);
   assert.deepEqual(otpAsks, [NAMES[0]], "asks once; the code is reused for the other packages");
   assert.ok(!questions.some((q) => /Does the output/.test(q)), "never asks the operator to judge");
+  // npm doesn't redact `--otp=<code>`: in argv it would reach `ps` and npm's debug log. The code
+  // must travel only in the child's environment, with npm's log file disabled.
+  assert.ok(
+    fake.calls.every(({ args }) => !args.some((a) => a.includes("123456"))),
+    "the code is never in argv",
+  );
+  const lists = fake.calls.filter(({ args }) => args[0] === "trust" && args[1] === "list");
+  assert.ok(
+    lists.some(({ env }) => env?.npm_config_otp === "123456"),
+    "the code goes via env",
+  );
+  assert.ok(
+    lists.every(({ args }) => args.includes("--logs-max=0")),
+    "no npm log file",
+  );
   for (const name of NAMES) {
     assert.deepEqual(
       registry[name].trust.map((c) => c.permissions),
