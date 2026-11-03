@@ -1,0 +1,45 @@
+{
+  "description": "Shared Rust/WASM vector for the PowerShell command builder (#298). Every expected value is written by hand from the rules in crates/allw-core/src/powershell.rs (risk floor Medium; High when the POSIX split fails; raw verbatim); never regenerate it from program output.",
+  "cases": [
+    {
+      "class": "low-risk program raised to the Medium floor",
+      "command": "ls",
+      "cwd": "C:\\work",
+      "risk": "medium",
+      "bin": "ls",
+      "argv": ["ls"]
+    },
+    {
+      "class": "cmdlet the table doesn't know is Medium",
+      "command": "Remove-Item -Recurse -Force build",
+      "cwd": null,
+      "risk": "medium",
+      "bin": "Remove-Item",
+      "argv": ["Remove-Item", "-Recurse", "-Force", "build"]
+    },
+    {
+      "class": "risk above the floor is kept (High)",
+      "command": "rm -rf build",
+      "cwd": null,
+      "risk": "high",
+      "bin": "rm",
+      "argv": ["rm", "-rf", "build"]
+    },
+    {
+      "class": "risk above the floor is kept (Critical)",
+      "command": "dd if=x of=y",
+      "cwd": null,
+      "risk": "critical",
+      "bin": "dd",
+      "argv": ["dd", "if=x", "of=y"]
+    },
+    {
+      "class": "POSIX split fails: whitespace argv, High floor",
+      "command": "Write-Output \"it`\"s\"",
+      "cwd": null,
+      "risk": "high",
+      "bin": "Write-Output",
+      "argv": ["Write-Output", "\"it`\"s\""]
+    }
+  ]
+}

@@ -133,6 +133,12 @@ record's `risk` into the request's top-level `risk`, which the caller cannot ove
 into words: shell operators, substitutions and newlines are not parsed and the record describes only the first
 program, so callers must run `argv` without a shell.
 
+**PowerShell lines** (Claude Code's `PowerShell` tool, #298) are also `command` records, built by the core's
+`action_from_powershell_command` (decided 2026-11-03). `raw` is the exact line and argv is a POSIX split when one
+applies, else a whitespace split. Because the v1 risk table knows no PowerShell commands, risk is at least
+`medium`, and at least `high` when the POSIX split failed. There is no PowerShell field on the record and no
+schema change: surfaces label the line for the human in the summary (`PowerShell: <command>`).
+
 ### Forward-compat requirements on `allw-core` v1 (cheap now, painful later)
 
 1. **Capture the syntactic substrate** (tokenized command / MCP call) for every action — the durable base all

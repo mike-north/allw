@@ -108,6 +108,12 @@ export interface AllwWasm {
   /** Build an ActionRecord JSON for a shell command using the core T1 command parser. */
   action_from_command(commandLine: string, cwd?: string | null): string;
   /**
+   * Build an ActionRecord JSON for a **PowerShell** command line (the `command` surface). `raw` is
+   * the exact line; risk is at least Medium, or at least High when the POSIX split fails and argv
+   * falls back to a whitespace split. Never throws for PowerShell syntax.
+   */
+  action_from_powershell_command(commandLine: string, cwd?: string | null): string;
+  /**
    * Build an ActionRecord JSON from a **canonical, pre-tokenized** argv (JSON array of strings).
    * For callers that hold the exact token vector that will execute and must bind it verbatim —
    * re-tokenizing their command text would risk binding different tokens than the ones that run

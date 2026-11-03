@@ -43,6 +43,7 @@ use allw_core::{
     action_from_argv as core_action_from_argv, action_from_command as core_action_from_command,
     action_from_file_edit as core_action_from_file_edit,
     action_from_mcp_tool_call as core_action_from_mcp_tool_call,
+    action_from_powershell_command as core_action_from_powershell_command,
     check_account_id_for_root as core_check_account_id_for_root,
     compute_request_hash as core_compute_request_hash, decrypt_context as core_decrypt_context,
     derive_number_match_challenge as core_derive_number_match_challenge,
@@ -1266,6 +1267,26 @@ pub fn action_from_command(command_line: &str, cwd: Option<String>) -> Result<St
     let record = core_action_from_command(command_line, &ctx)
         .map_err(|e| JsError::new(&format!("action_from_command failed: {e}")))?;
     to_json(&record, "ActionRecord")
+}
+
+/// Builds an [`ActionRecord`](allw_core::ActionRecord) from a raw **PowerShell** command line,
+/// returning it as JSON (the `command` surface, for a host's PowerShell tool). `raw` is the exact
+/// line; argv is a POSIX split when it applies, else a whitespace split; risk is at least `Medium`,
+/// or at least `High` when the split had to fall back. See
+/// [`allw_core::powershell`](allw_core::powershell) for the rules.
+///
+/// Infallible by design: PowerShell syntax that POSIX splitting rejects is recorded (with the
+/// higher floor), never refused, so a valid PowerShell command is never denied for its quoting.
+#[wasm_bindgen]
+pub fn action_from_powershell_command(
+    command_line: &str,
+    cwd: Option<String>,
+) -> Result<String, JsError> {
+    let ctx = CommandContext { cwd };
+    to_json(
+        &core_action_from_powershell_command(command_line, &ctx),
+        "ActionRecord",
+    )
 }
 
 /// Builds an [`ActionRecord`](allw_core::ActionRecord) from a **pre-tokenized** argv, returning it
