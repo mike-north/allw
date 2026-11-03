@@ -38,9 +38,17 @@ git clone https://github.com/mike-north/allw.git
 cd allw
 pnpm install
 
-# 4. Preview the plan (no changes), then run it for real.
+# 4. Make sure no trust config can publish directly: list every config with its permissions,
+#    then revoke each one that isn't exactly stage-only. This creates nothing.
+node scripts/npm-bootstrap-trusted-publishing.mjs --audit-trust --dry-run
+node scripts/npm-bootstrap-trusted-publishing.mjs --audit-trust
+
+# 5. Preview the plan (no changes), then run it for real.
 node scripts/npm-bootstrap-trusted-publishing.mjs --dry-run
 node scripts/npm-bootstrap-trusted-publishing.mjs
+
+# 6. Log out of npm when you're done. Log back in only to release.
+npm logout
 ```
 
 The real run prompts you at these points, in this order. It only asks about steps that still have
@@ -51,15 +59,20 @@ can re-run the script later.
    `@allw/sdk`, `@allw/hook`, `@allw/approver`, `@allw/codex-hook` and `@allw/openclaw-bridge` that
    don't exist yet. npm asks for 2FA on each publish, either a one-time code or a browser approval.
 2. **`Configure N trusted publisher(s) now? [y/N]`** attaches the release workflow to those packages,
-   allowed to **stage only**. If a package already has a different config, including a direct-publish
-   (`--allow-publish`) one, the script revokes it and creates the stage-only one. npm asks for 2FA
-   again.
+   allowed to **stage only**. A package can hold several configs, and any one of them is enough to
+   publish. So the script revokes **every** config that isn't exactly the stage-only one, including
+   direct-publish (`--allow-publish`) ones. It revokes those first, then creates the stage-only
+   config if it's missing. It lists each revoke and create before asking. npm asks for 2FA on each
+   change.
 3. **`Publish N unscoped name-claim placeholder(s) now? [y/N]`** claims `allw-hook`, `allw-approver`,
    `allw-codex-hook` and `allw-openclaw-bridge` against squatting. npm asks for 2FA on each publish.
 
-If npm needs 2FA just to read a package's trust settings, the script shows them and asks
-**`Does the output above show repository mike-north/allw, file release.yml, environment npm-publish?`**
-Answer `y` only if they match **and** the allowed action is `npm stage publish` alone.
+If your npm account's 2FA covers authorization as well as writes, npm needs a one-time password just
+to read trust settings. The script then asks
+**`npm one-time password (2FA code) to read <package>'s trust configs:`**. Enter the current code
+from your authenticator. The script reuses it for the next package until it expires. If you give no
+code, or it isn't a terminal session, the script stops for that package and changes nothing there.
+It never asks you to judge the configs by eye. The audit (`--audit-trust`) reads them the same way.
 
 The run ends with a summary table and a **Still to do** list. A successful run shows every `@allw/*`
 row as `configured` and every unscoped row as `placeholder published`. Re-running it is safe: anything
@@ -147,31 +160,71 @@ only forward on `latest`.
      [packaged-install smoke](../scripts/smoke-packaged-install.mjs) on **exactly those tarballs**: a
      clean `npm install` of all five, every bin's `--version`, an import of every package, and a
      hook run. It uploads the tarballs as an artifact.
-   - **stage** (environment `npm-publish`, `id-token: write`): installs npm ≥ 11.15.0 and runs
+   - **stage** (environment `npm-publish`, `id-token: write`): installs an exactly pinned npm
+     (≥ 11.15.0, which `npm stage` needs) and runs
      `npm stage publish --provenance --tag latest` on those exact tarballs, in order. It installs no
      dependencies and runs no package scripts. It plans every package before staging any:
      - A version already on the registry is skipped only if its `dist.integrity` equals the local
        tarball's sha512.
      - Any mismatch fails the job, and so does a backport, with nothing staged.
-     - The job summary lists each stage id and the approval commands.
+     - Each tarball must still have the sha512 that `pack` recorded in `release-manifest.json`.
+     - The job summary lists each stage id and tarball sha512, plus the verify command.
 
-5. **Approve the staged versions.** This is the release gate. Open the run's job summary
-   (**Actions → Release → the run → Summary**). It lists one stage id per package, in dependency
-   order. For each one, in that order:
+5. **Verify, then approve the staged versions.** The approval is the release gate. The job summary
+   lists each stage id and tarball sha512, but the run writes that summary itself. Any run that gets
+   a stage-capable token can write one, for example a modified `release.yml` on a branch with a `v*`
+   tag pushed at it. So the summary proves nothing. Treat only these steps as evidence.
+   1. Log in to npm (`npm login`) and to `gh`, in an up-to-date checkout of `main`.
+   2. Run the verifier for the version, naming the run whose stages you mean to approve:
+
+      ```sh
+      node scripts/verify-staged-release.mjs 0.2.0 --run <run-id>
+      ```
+
+      [`scripts/verify-staged-release.mjs`](../scripts/verify-staged-release.mjs) exits non-zero
+      unless all of the following hold:
+      - The run is a successful `release.yml` run for tag `v0.2.0`.
+      - GitHub's `v0.2.0` tag points at the commit that run built.
+      - That commit is an ancestor of GitHub's `main`, so the workflow and code were reviewed.
+      - The run's `npm-tarballs` artifact lists exactly the five packages at `0.2.0`, and each
+        tarball matches the sha512 `pack` recorded in `release-manifest.json`.
+      - `npm stage list` shows exactly one open stage per package at `0.2.0`, and no open stage of
+        any other version.
+      - Each stage's bytes, fetched with `npm stage download`, have exactly the run's sha512.
+      - The stage's provenance names `.github/workflows/release.yml` at `refs/tags/v0.2.0` in
+        `mike-north/allw`, at that commit, from that run, for that sha512.
+
+   3. If it passes, approve **only the stage ids it prints**, in the order it prints them:
+
+      ```sh
+      npm stage approve <stage-id>   # asks for npm 2FA; the version goes public on `latest`
+      ```
+
+      Never approve a stage you didn't start, or one the verifier didn't list.
+
+   4. Log out of npm (`npm logout`). Stay logged out when you're not releasing, so a stray
+      `npm stage approve` can't happen.
+
+   **Provenance on a stage.** npm documents no read path for a _staged_ version's provenance:
+   `npm stage view --json` documents only id, package, version, status, tag, actor and shasum. The
+   verifier checks provenance whenever the stage view carries an attestation. If it doesn't, the
+   verifier fails and tells you so. You can then rerun it with `--provenance-after-approval`, which
+   relies on the byte-for-byte match. That match is the property that matters: the staged bytes are
+   exactly what the reviewed run built. Right after approving, run:
 
    ```sh
-   npm stage view <stage-id>      # what was staged: name, version, contents, provenance
-   npm stage approve <stage-id>   # asks for npm 2FA; the version goes public on `latest`
+   node scripts/verify-staged-release.mjs 0.2.0 --published --run <run-id>
    ```
 
-   - To inspect the tarball itself first, run `npm stage download <stage-id>`.
-   - If you've lost the summary, `npm stage list @allw/sdk` (and so on for each package) lists the
-     pending ids. They also appear under the **Staged Packages** tab on each package's npmjs.com page.
-   - To abandon a release, run `npm stage reject <stage-id>` for each staged package. Then fix the
-     problem and cut a new version.
-
-   Approve all five, or reject all five. Approving only some of them leaves a set whose exact
-   sibling pins can't install.
+   It checks each published `dist.integrity` against the run's tarball. It also checks that each
+   published SLSA provenance attestation names `release.yml` at `refs/tags/v0.2.0`, that commit and
+   that run. If it fails, deprecate the affected versions right away and cut a new release.
+   - If a check fails, or you didn't start the release, reject every stage of it with
+     `npm stage reject <stage-id>`. Then fix the problem and cut a new version.
+   - `npm stage list @allw/sdk` (and so on for each package) lists pending ids. They also appear
+     under the **Staged Packages** tab on each package's npmjs.com page.
+   - Approve all five, or reject all five. Approving only some of them leaves a set whose exact
+     sibling pins can't install.
 
 To rehearse a release, run the workflow manually (**Actions → Release → Run workflow**) from a branch.
 The rehearsal does everything except stage, and runs `npm stage publish --dry-run` instead.
@@ -195,11 +248,17 @@ reads registry state before every step and asks before every write.
    by a maintainer.
 3. **Trusted publishers.** It runs `npm trust github` on each `@allw/*` package (workflow
    `release.yml`, repo `mike-north/allw`, environment `npm-publish`, `--allow-stage-publish` only).
-   - A config that differs in any way is treated as wrong, and the script offers to revoke and
-     replace it. That includes one that allows direct `npm publish`, even alongside staging.
-   - `--refresh-trust` replaces all of them.
+   - It reads every config on the package. If reading needs 2FA, it asks for a one-time password
+     and retries with `--otp`, and it fails closed when it gets none.
+   - Every config that differs in any way is revoked: a different identity, or one that allows
+     direct `npm publish`, even alongside staging. The stage-only config is created only after the
+     revokes succeed.
+   - `--refresh-trust` revokes and recreates all of them.
+   - `--audit-trust` only lists every config with its permissions, then revokes the wrong ones. It
+     creates nothing and publishes nothing.
    - If the CLI call fails, it prints the npmjs.com page and the exact field values to enter by hand.
-     The allowed action to tick is **`npm stage publish` only**.
+     The allowed action to tick is **`npm stage publish` only**, and every other trusted publisher
+     on that page must be deleted.
 4. **Name claims.** For each name in `CLAIM_ONLY_NAMES` that is free, it publishes the inert claim
    placeholder. If someone else already owns one of those names, it reports that in the checklist
    and does not try to publish over it.
