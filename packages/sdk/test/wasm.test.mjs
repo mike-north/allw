@@ -154,6 +154,96 @@ test("verify_verdict rejects a verdict whose request_hash was mutated", async ()
   );
 });
 
+// ── signed note (S15, #251) ─────────────────────────────────────────────────────────
+
+/**
+ * The note is signed into the verdict claims, so the relay cannot rewrite, strip, or inject it.
+ *
+ * @see docs/contract.md §Wire encoding → verdict signature
+ */
+test("sign_verdict reproduces the Rust noted verdict byte-for-byte", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  const noted = JSON.parse(v.noted_verdict_json);
+  const { sig: _sig, device_cert: deviceCert, ...unsigned } = noted;
+  const deviceSeed = Buffer.alloc(32, 0x22).toString("base64url"); // DEVICE_SEED in wasm_vector.rs
+  assert.equal(
+    wasm.sign_verdict(JSON.stringify(unsigned), deviceSeed, v.noted_verdict_nonce_b64, deviceCert),
+    v.noted_verdict_json,
+    "the WASM signer must sign the note into the same claim bytes as the Rust core",
+  );
+  const claims = JSON.parse(Buffer.from(noted.sig.split(".")[1], "base64url").toString("utf8"));
+  assert.equal(claims.note, v.noted_verdict_note, "the note is carried verbatim in the claims");
+});
+
+test("verify_verdict accepts the noted vector and rejects a tampered, removed, or added note", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  const verify = (verdict) =>
+    wasm.verify_verdict(
+      JSON.stringify(verdict),
+      v.request_json,
+      v.context_json,
+      v.approver_root_pubkey_b64,
+      v.now_ms,
+    );
+
+  const noted = JSON.parse(v.noted_verdict_json);
+  const verified = JSON.parse(verify(noted));
+  assert.equal(verified.approved, true, "the untampered noted verdict verifies");
+  assert.equal(
+    verified.note,
+    v.noted_verdict_note,
+    "verify returns the note from the signed claims",
+  );
+  assert.equal(
+    "note" in JSON.parse(verify(JSON.parse(v.verdict_json))),
+    false,
+    "a note-less verdict's verify result has no note",
+  );
+
+  const tampered = { ...noted, note: "ok for prod" };
+  assert.throws(
+    () => verify(tampered),
+    /field 'note' disagrees with the signed claim/,
+    "a rewritten note must fail verification",
+  );
+
+  const { note: _note, ...removed } = noted;
+  assert.throws(
+    () => verify(removed),
+    /field 'note' disagrees with the signed claim/,
+    "a stripped note must fail verification",
+  );
+
+  const added = { ...JSON.parse(v.verdict_json), note: "injected" };
+  assert.throws(
+    () => verify(added),
+    /field 'note' disagrees with the signed claim/,
+    "an injected note must fail verification",
+  );
+});
+
+test("sign_verdict signs a note at the 2048-byte cap and refuses one byte over", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  const { sig: _sig, device_cert: deviceCert, ...unsigned } = JSON.parse(v.noted_verdict_json);
+  const deviceSeed = Buffer.alloc(32, 0x22).toString("base64url");
+  const sign = (note) =>
+    wasm.sign_verdict(
+      JSON.stringify({ ...unsigned, note }),
+      deviceSeed,
+      v.noted_verdict_nonce_b64,
+      deviceCert,
+    );
+  assert.equal(JSON.parse(sign("a".repeat(2048))).note.length, 2048, "at the cap signs");
+  assert.throws(
+    () => sign("a".repeat(2049)),
+    /sign_verdict failed: verdict note is 2049 bytes of UTF-8; the maximum is 2048/,
+    "one byte over the cap must not sign",
+  );
+});
+
 test("compute_request_hash throws on invalid context JSON", async () => {
   const wasm = await loadWasm();
   assert.throws(

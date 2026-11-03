@@ -62,8 +62,8 @@ pub use crypto::{
     verify_verdict_with_account_states_for_account, AccountState, AccountStateActor,
     AccountStateDevice, AccountStateError, AccountStatePreviousRoot, AccountStateRevocation,
     AccountStateRevocationKind, DeviceCertClaims, InMemoryNonceStore, JwsError, KeyError,
-    NonceStore, PublicKey, SigningKeyPair, UnsignedVerdict, VerdictClaims, VerifiedVerdict,
-    VerifyError,
+    NonceStore, PublicKey, SignVerdictError, SigningKeyPair, UnsignedVerdict, VerdictClaims,
+    VerifiedVerdict, VerifyError, MAX_NOTE_BYTES,
 };
 pub use display::{
     display_model, escape_for_display, has_hidden_or_control_chars, is_hidden_or_control_char,
