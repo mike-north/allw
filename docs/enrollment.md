@@ -67,13 +67,21 @@ It is fail-closed throughout:
   unrevoked, unexpired, and with the same encryption key (a conflict can only remove readers); likewise, within
   one document, a device id listed more than once counts only if every entry is active and unexpired with the
   same key;
-- an empty `device_id` in a highest-sequence document, or an all-zero encryption key on a selected device, is an
-  error;
+- an empty `device_id` in a highest-sequence document, or a small-order X25519 encryption key (the core's
+  `is_small_order_x25519_public_key` denylist) on a selected device, is an error;
 - no document, no remaining device, or more than `MAX_RECIPIENTS` (16) is an error, never an empty list.
 
 Revocation is not permanent across sequences. Only the highest sequence counts, so a later root-signed document
 that lists a previously revoked device as active, with no revocation entry, makes it a recipient again. That is
 root-authorized: the root holder can always re-enroll a device, and the signed sequence is the authority.
+
+**Sealing and the sequence floor.** Integrators never handle the selected keys. The core's
+`seal_context_for_account_state(context, account_states, account_id, account_root_pub, now_ms, min_sequence)`
+applies the selection rule above and encrypts the `ApprovalContext` to exactly that set, returning the ciphertext
+and the `sequence` it selected from — the highest verified sequence, never the caller's `min_sequence`. A caller
+that keeps a floor records that `sequence` (as `max(floor, sequence)`) **before** it sends the request, and passes
+the stored floor as `min_sequence` on every later seal, so a relay that later serves an older state is refused
+rather than trusted. If recording the floor fails, the request is not sent.
 
 The approval primitive has two independent device keys:
 
