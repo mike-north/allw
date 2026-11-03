@@ -106,10 +106,18 @@ export class RelayTimeoutError extends Error {
 const LOOPBACK_HOSTNAMES: ReadonlySet<string> = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 /**
- * Reject a relay URL that would carry bearer tokens and ciphertext without TLS (issue #249,
- * `docs/threat-model.md` §Relay and Transport). Accepts `https:`, or `http:` on a loopback host;
- * throws an actionable `Error` for anything else — including an unparseable URL — so a
- * misconfigured client fails at construction, before any request is built.
+ * Reject a relay URL that would carry bearer tokens and ciphertext without TLS, or that carries
+ * userinfo, a query, or a fragment (issue #249, `docs/threat-model.md` §Relay and Transport).
+ * Accepts `https:`, or `http:` on a loopback host; a path is allowed. Throws an actionable
+ * `Error` for anything else — including an unparseable URL — so a misconfigured client fails at
+ * construction, before any request is built.
+ *
+ * Userinfo makes a URL *look* like one host while pointing at another
+ * (`https://relay.example.com@evil.example` is `evil.example`); a query or fragment would corrupt
+ * the request paths {@link accountBase} appends. The empty forms (`https://host?`, `https://@host`)
+ * are rejected too, on the raw text, for the same reason. Mirrors
+ * `packages/web-approver/src/relay-config.ts` `checkRelayUrl`; both are pinned by the shared
+ * vectors in `test/fixtures/relay-url-vectors.json`.
  */
 export function assertRelayUrlTransport(relayUrl: string): void {
   let parsed: URL;
@@ -120,12 +128,29 @@ export function assertRelayUrlTransport(relayUrl: string): void {
       `allw: relayUrl '${relayUrl}' is not an absolute URL; expected e.g. https://relay.example.com`,
     );
   }
-  if (parsed.protocol === "https:") return;
-  if (parsed.protocol === "http:" && LOOPBACK_HOSTNAMES.has(parsed.hostname)) return;
-  throw new Error(
-    `allw: relayUrl '${relayUrl}' must use https:// — plain http:// is allowed only for a local ` +
-      "relay on localhost, 127.0.0.1, or [::1]",
-  );
+  const secure =
+    parsed.protocol === "https:" ||
+    (parsed.protocol === "http:" && LOOPBACK_HOSTNAMES.has(parsed.hostname));
+  if (!secure) {
+    throw new Error(
+      `allw: relayUrl '${relayUrl}' must use https:// — plain http:// is allowed only for a local ` +
+        "relay on localhost, 127.0.0.1, or [::1]",
+    );
+  }
+  const hasExtras =
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    parsed.search !== "" ||
+    parsed.hash !== "" ||
+    relayUrl.includes("?") ||
+    relayUrl.includes("#") ||
+    /^[a-z][a-z0-9+.-]*:\/\/[^/?#]*@/i.test(relayUrl.trim());
+  if (hasExtras) {
+    throw new Error(
+      `allw: relayUrl '${relayUrl}' must not include a username, password, query (?) or ` +
+        "fragment (#); expected e.g. https://relay.example.com",
+    );
+  }
 }
 
 /**

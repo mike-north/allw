@@ -10,10 +10,12 @@
  * @see https://github.com/mike-north/allw/issues/249
  * @see ../../../docs/threat-model.md (§Relay and Transport)
  * @see ../src/relay.ts (assertRelayUrlTransport)
+ * @see ./fixtures/relay-url-vectors.json (shared with the web approver and its site build)
  */
 
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import { createClient } from "../dist/index.js";
 
@@ -66,4 +68,27 @@ describe("createClient relay-URL transport rule (#249)", () => {
       assert.doesNotThrow(() => clientFor(loopback));
     });
   }
+});
+
+/** The accept/reject vectors shared with the web approver's runtime rule and its site build. */
+const { vectors } = JSON.parse(
+  readFileSync(new URL("./fixtures/relay-url-vectors.json", import.meta.url), "utf8"),
+);
+
+describe("createClient relay-URL rule — shared vectors (#249)", () => {
+  for (const { input, runtime, why } of vectors) {
+    test(`${runtime}s ${JSON.stringify(input)} (${why})`, () => {
+      if (runtime === "accept") {
+        assert.doesNotThrow(() => clientFor(input));
+      } else {
+        assert.throws(() => clientFor(input), /^Error: allw: relayUrl /);
+      }
+    });
+  }
+});
+
+test("rejects userinfo / query / fragment with an actionable message", () => {
+  assert.throws(() => clientFor("https://relay.example.com@evil.example"), {
+    message: /must not include a username, password, query \(\?\) or fragment \(#\)/,
+  });
 });
