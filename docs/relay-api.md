@@ -501,9 +501,11 @@ and the status, never the token (#326). 5xx, 429 and timeouts are transient and 
   the endpoint allowlist at send time (e.g. one registered before validation existed, or after the
   allowlist narrows) is refused, logged, and kept, never requested. A 4xx other than 404/410 is
   logged once per answer (`console.warn`): the transport, the push-service host, the status and, for
-  Web Push, a JSON body's `reason` when it is a short identifier (Apple: `BadWebPushTopic`). The
-  body is read only up to 1 KiB and 1 s, then released. The token, the endpoint path, credentials
-  and request ids are never logged (#326).
+  Web Push, a JSON body's `reason` when it is an identifier of at most 32 characters (Apple:
+  `BadWebPushTopic`) that does not occur anywhere in the subscription endpoint, so an echoed path
+  token is dropped. The body is read only up to 1 KiB and 1 s, then released without waiting for
+  the release to finish. The token, the endpoint path, credentials and request ids are never logged
+  (#326).
 - **Enablement.** Web Push is active only when the relay has a complete VAPID configuration whose
   keypair actually matches (`docs/relay-deploy.md` §3d); otherwise `webpush` tokens are stored but no
   wakeup is sent, and the public-key endpoint is 404.

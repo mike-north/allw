@@ -451,6 +451,42 @@ describe("APNs and FCM prune only on an unregistered answer (#260)", () => {
     }
   });
 
+  it.each([
+    ["APNs", 200, null],
+    ["APNs", 410, UndeliverablePushTokenError],
+    ["FCM", 200, null],
+    ["FCM", 404, UndeliverablePushTokenError],
+    ["FCM", 403, Error],
+  ] as const)(
+    "does not wait for a body cancel that never settles (%s HTTP %i)",
+    async (transport, status, expected) => {
+      const cancelled = vi.fn(() => new Promise<void>(() => undefined));
+      // FCM's 404 body is read for UNREGISTERED; the stream stays open so the read ends at its
+      // deadline and the cancel is still needed.
+      const response = () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              if (transport === "FCM" && status === 404) {
+                controller.enqueue(new TextEncoder().encode(JSON.stringify(FCM_UNREGISTERED)));
+              }
+            },
+            cancel: cancelled,
+          }),
+          { status },
+        );
+      const sender = transport === "APNs" ? apns(response) : fcm(response);
+      const result = await Promise.race([
+        outcome(sender, transport === "APNs" ? APNS_TOKEN : "fcm-token").then((r) => r.failure),
+        new Promise((resolve) => setTimeout(() => resolve("hung"), 3_000)),
+      ]);
+
+      if (expected === null) expect(result).toBeNull();
+      else expect(result).toBeInstanceOf(expected);
+      expect(cancelled).toHaveBeenCalledTimes(1);
+    },
+  );
+
   it("prunes an FCM token answered 404 with UNREGISTERED, without logging a rejection", async () => {
     const { failure, warnings } = await outcome(
       fcm(() => new Response(JSON.stringify(FCM_UNREGISTERED), { status: 404 })),

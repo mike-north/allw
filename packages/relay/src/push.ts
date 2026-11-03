@@ -86,9 +86,18 @@ export function warnPushServiceRejection(
 const PUSH_BODY_READ_MS = 1_000;
 
 /**
+ * Release a response body without waiting for it. Cancelling is how the relay frees the outbound
+ * connection, but a body whose `cancel()` never settles must not hold the send, so the cancel is
+ * fired and its outcome ignored.
+ */
+export function releaseBody(body: ReadableStream | null): void {
+  void body?.cancel().catch(() => undefined);
+}
+
+/**
  * A push service's JSON error body, parsed from at most `maxBytes` of it, or `undefined` when there
  * is no body or the prefix is not valid JSON. Reads for at most {@link PUSH_BODY_READ_MS}, then
- * always cancels the body, so a large or stalled body can neither hold the send nor leave the
+ * always cancels the body without waiting for the cancel, so a large or stalled body can neither hold the send nor leave the
  * connection unreleased. A body cut off at the limit fails to parse, so callers must treat
  * `undefined` as "no information", never as a positive signal.
  */
@@ -116,7 +125,7 @@ export async function readBoundedJsonBody(response: Response, maxBytes: number):
     // A body that fails mid-read just carries no information.
   } finally {
     clearTimeout(timer);
-    await reader.cancel().catch(() => undefined);
+    void reader.cancel().catch(() => undefined);
   }
   const bytes = new Uint8Array(Math.min(size, maxBytes));
   let offset = 0;
@@ -338,7 +347,7 @@ export class ApnsPushTransport implements PushTransport {
       },
     );
     // The relay never reads APNs bodies (the status alone decides); release the connection.
-    await response.body?.cancel();
+    releaseBody(response.body);
     if (response.ok) return;
     if (response.status === 410) {
       throw new UndeliverablePushTokenError("APNs device token is no longer active (HTTP 410)");
@@ -419,7 +428,7 @@ export class FcmPushTransport implements PushTransport {
         throw new UndeliverablePushTokenError("FCM registration token is unregistered (HTTP 404)");
       }
     } else {
-      await response.body?.cancel();
+      releaseBody(response.body);
     }
     if (response.ok) return;
     if (isClientErrorStatus(response.status)) {

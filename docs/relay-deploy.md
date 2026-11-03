@@ -199,9 +199,14 @@ push: webpush push service web.push.apple.com rejected a wakeup with HTTP 400 (r
 The relay logs one such warning for every 4xx a push service answers that does not prune the token,
 on any transport (for Web Push, a 4xx other than 404/410; APNs and FCM in `docs/relay-api.md` §5):
 the transport, the push-service host, the status and, for Web Push, the `reason` from a JSON body
-when it is a short identifier. It never logs the token, the endpoint path, credentials or request
-ids. 5xx answers and timeouts are not logged. A 400 is treated as transient, so the tokens stay
-registered and recover once the header is gone.
+when it is an identifier of at most 32 characters that does not occur in the subscription endpoint.
+It never logs the token, the endpoint path, credentials or request ids. 5xx answers and timeouts are
+not logged. A 400 is treated as transient, so the tokens stay registered and recover once the header
+is gone.
+
+The warning is per answer, not deduplicated. While a push service throttles the relay (429) or
+refuses its payload size (413), expect one line for each push it refuses; on APNs and FCM, which are
+not coalesced, that is up to one line per device token on every submit.
 
 ### Secrets inventory summary
 
