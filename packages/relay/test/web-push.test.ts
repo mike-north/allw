@@ -3,7 +3,8 @@
  * push-service endpoint allowlist (SSRF guard), VAPID configuration, and the relay-level public-key
  * endpoint. Runs in the Workers pool, so VAPID signing uses the real workerd WebCrypto.
  *
- * @see https://www.rfc-editor.org/rfc/rfc8030 (Web Push: §5 TTL, §5.3 Urgency, §6–7 404/410)
+ * @see https://www.rfc-editor.org/rfc/rfc8030 (Web Push: §5 TTL, §5.3 Urgency, §5.4 Topic, §6–7 404/410)
+ * @see https://autopush.readthedocs.io/en/latest/http.html (Mozilla autopush: Topic support)
  * @see https://www.rfc-editor.org/rfc/rfc8292 (VAPID: §2 JWT claims, §3 `vapid t=…, k=…`)
  * @see https://www.rfc-editor.org/rfc/rfc8615 (Well-Known URIs: the relay-level namespace)
  * @see ../../../docs/relay-api.md (§5 Push wakeups)
@@ -14,6 +15,7 @@ import { describe, expect, it, vi } from "vitest";
 import worker from "../src/index.js";
 import { UndeliverablePushTokenError } from "../src/push.js";
 import {
+  WEB_PUSH_TOPIC,
   WebPushTransport,
   loadVapidSigningKey,
   parseWebPushEndpoint,
@@ -231,6 +233,30 @@ describe("WebPushTransport — payload-less VAPID wakeup", () => {
     );
     // Never follow a redirect off the allowlisted host.
     expect(init.redirect).toBe("manual");
+  });
+
+  it.each([
+    // Autopush documents Topic: one queued wakeup per subscription instead of one per request.
+    ["Mozilla autopush", "https://updates.push.services.mozilla.com/wpush/v2/abc", WEB_PUSH_TOPIC],
+    // Apple answers any Topic with 400 BadWebPushTopic, which would fail every Safari/iOS wakeup.
+    ["Apple", "https://web.push.apple.com/QGx0abc", null],
+    // FCM and WNS document no Topic support for Web Push, so they get none until verified.
+    ["FCM", "https://fcm.googleapis.com/fcm/send/abc", null],
+    ["WNS", "https://wns2-by3p.notify.windows.com/w/?token=abc", null],
+  ])("sends the Topic header to %s only where documented", async (_name, endpoint, expected) => {
+    const { config } = await makeVapid();
+    const fetcher = capturingFetcher(201);
+    const transport = new WebPushTransport({ vapid: config, fetcher, now: () => NOW_MS });
+
+    await transport.sendWakeup(wakeup(endpoint));
+
+    const [, init] = onlyCall(fetcher);
+    expect(new Headers(init.headers).get("Topic")).toBe(expected);
+  });
+
+  it("uses a Topic that RFC 8030 §5.4 and autopush both accept", () => {
+    // §5.4: at most 32 characters from the base64url alphabet. Autopush: `[A-Za-z0-9_-]`, max 32.
+    expect(WEB_PUSH_TOPIC).toMatch(/^[A-Za-z0-9_-]{1,32}$/);
   });
 
   it("signs an ES256 VAPID JWT bound to the push-service origin (RFC 8292 §2)", async () => {
