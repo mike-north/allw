@@ -48,6 +48,17 @@ online routing/encryption view the relay enforces; signed account state is the v
 includes revocation, device signing keys, actor keys, and root rotation state. The relay may store the latest
 account state, but it cannot author it.
 
+**Recipient selection rule.** The devices a request may be encrypted to are defined by root-signed account state,
+never by the registry: the core's `select_recipients(account_states, account_id, account_root_pub)` returns
+`{ device_id, encryption_pubkey }` for each device that is `active` and not revoked in the highest-sequence
+documents that verify against the root. It is fail-closed throughout:
+
+- every supplied document must verify, or the selection fails (a bad document is never skipped);
+- lower-sequence documents contribute nothing;
+- when several verified documents share the highest sequence, a device counts only if all of them list it active,
+  unrevoked, and with the same encryption key (a conflict can only remove readers);
+- no document, no remaining device, or more than `MAX_RECIPIENTS` (16) is an error, never an empty list.
+
 The approval primitive has two independent device keys:
 
 | Key                   | Algorithm | Purpose                                        | Relay-visible?                        |
