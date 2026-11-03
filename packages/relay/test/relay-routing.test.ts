@@ -1656,12 +1656,12 @@ const HTTP_QUERY_AUTH_CASES: readonly QueryAuthCase[] = [
 ];
 
 /** Send one route's request with the given extra headers, bypassing the auto-auth helpers. */
-async function rawFetch(
+function rawFetch(
   accountId: string,
   call: { method: string; subPath: string; body?: Record<string, unknown> },
   headers: Record<string, string>,
 ): Promise<Response> {
-  return SELF.fetch(relayUrl(accountId, call.subPath), {
+  return exports.default.fetch(relayUrl(accountId, call.subPath), {
     method: call.method,
     headers: call.body === undefined ? headers : { "Content-Type": "application/json", ...headers },
     ...(call.body === undefined ? {} : { body: JSON.stringify(call.body) }),
@@ -1701,7 +1701,7 @@ describe("AccountRelay — ?auth= is accepted only on WebSocket upgrades (#303)"
       { url: appendAuthQuery(path, device.device_auth_token), headers: {} },
       { url: path, headers: bearer(device.device_auth_token) },
     ]) {
-      const resp = await SELF.fetch(relayUrl(acct, init.url), {
+      const resp = await exports.default.fetch(relayUrl(acct, init.url), {
         headers: { Upgrade: "websocket", ...init.headers },
       });
       expect(resp.status).toBe(101);
@@ -1738,7 +1738,7 @@ describe("AccountRelay — ?auth= is accepted only on WebSocket upgrades (#303)"
       appendAuthQuery(`/devices/${device.device_id}/connect`, device.device_auth_token),
     );
     for (const authorization of ["", "   "]) {
-      const resp = await SELF.fetch(url, {
+      const resp = await exports.default.fetch(url, {
         headers: { Upgrade: "websocket", Authorization: authorization },
       });
       expect(resp.status, JSON.stringify(authorization)).toBe(101);
@@ -1756,7 +1756,7 @@ describe("AccountRelay — ?auth= is accepted only on WebSocket upgrades (#303)"
       { url: appendAuthQuery(path, submit.data.request_auth_token), headers: {} },
       { url: path, headers: bearer(submit.data.request_auth_token) },
     ]) {
-      const resp = await SELF.fetch(relayUrl(acct, init.url), {
+      const resp = await exports.default.fetch(relayUrl(acct, init.url), {
         headers: { Upgrade: "websocket", ...init.headers },
       });
       expect(resp.status).toBe(101);
@@ -1771,14 +1771,14 @@ describe("AccountRelay — ?auth= is accepted only on WebSocket upgrades (#303)"
     const path = appendAuthQuery(`/devices/${device.device_id}/connect`, device.device_auth_token);
 
     // A wrong bearer header is judged on its own: the valid query token does not rescue it.
-    const wrongHeader = await SELF.fetch(relayUrl(acct, path), {
+    const wrongHeader = await exports.default.fetch(relayUrl(acct, path), {
       headers: { Upgrade: "websocket", ...bearer("wrong-device-token") },
     });
     expect(wrongHeader.status).toBe(403);
 
     // Nor does it rescue a header that is malformed or of another scheme.
     for (const authorization of ["Basic dXNlcjpwYXNz", "Bearer", "Bearer not a token"]) {
-      const resp = await SELF.fetch(relayUrl(acct, path), {
+      const resp = await exports.default.fetch(relayUrl(acct, path), {
         headers: { Upgrade: "websocket", Authorization: authorization },
       });
       expect(resp.status).toBe(401);

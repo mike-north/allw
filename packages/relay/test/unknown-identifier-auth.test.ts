@@ -154,7 +154,7 @@ describe("request ids: an unknown id answers like a wrong token (#357)", () => {
       rid("req-oracle-wait-query"),
       rid("req-oracle-wait-query-unknown"),
     );
-    const owner = await SELF.fetch(
+    const owner = await exports.default.fetch(
       relayUrl(acct, `/requests/${rid("req-oracle-wait-query")}/wait?auth=${token}`),
       { headers: { Upgrade: "websocket" } },
     );
