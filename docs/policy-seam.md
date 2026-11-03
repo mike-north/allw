@@ -207,20 +207,33 @@ a program it runs.
     `$"…"` strings are decoded first. A decoded NUL ends the word, as in bash. A decoding bash may do
     differently (`\u`, `\c`, an unknown escape) makes it at least `high`.
   - Substitutions (`$(…)`, backticks, `<(…)`, `>(…)`) are classified.
-  - Heredoc bodies are data: a quoted delimiter makes the body literal, and an unquoted one runs only its
-    substitutions. Delimiters are read as bash reads them (`<<''`, backslash-newline). One T1 can't read for
-    sure makes the line `high`.
-  - A heredoc or here-string fed to a shell is classified as a script. The shell may come directly or behind
-    a curated wrapper (`env bash <<'EOF'`).
+  - Heredoc delimiters are read as bash reads them (`<<''`, backslash-newline, `\"` inside double quotes). One
+    T1 can't read for sure makes the line `high`. An unquoted delimiter's body has its substitutions
+    classified.
+  - **Every heredoc and here-string body is also read as a script, whatever consumes it.** This is a deliberate
+    fail-upward rule. Which consumers run their input (a shell, a wrapper, `{ bash; }`, `( bash )`, `eval`,
+    an `if` / `while` compound) is a moving target. Reading every body as a script means a new consumer can't
+    hide one, and over-reading a `cat <<EOF` body only raises the tier.
+  - `((…))` at a command position (including `for ((…))`) is arithmetic, so a `<<` inside it is a shift.
   - Any operator, substitution or redirection makes the line at least `medium`. A line ending inside an open
     quote or substitution is `high`, because the shell runs what comes before the syntax error.
-  - bash grammar is authoritative. The two ambiguous readings are both analyzed and the higher tier wins: `#`
-    as a comment, and `$'…'` as an ANSI-C string.
+  - bash ≥ 4 grammar is authoritative. Where shells or versions disagree, the line is read both ways and the
+    higher tier wins:
+    - `#` as a comment or not;
+    - `$'…'` as an ANSI-C string or not;
+    - `((` as an arithmetic command or two subshells;
+    - a heredoc inside `$(…)` read before the closing `)` (bash ≥ 4, zsh) or the first `)` closing it (bash 3.2,
+      dash).
+
+    These alternate readings run only at the top level, so they don't multiply with nesting.
 - **Bounds.** Each bound fails upward to `high`:
   - nesting of `-c`, `eval` and substitutions past 4 levels;
   - argv words past the 256th, which count as a `high` candidate;
-  - one shared work budget per record (bytes scanned plus words classified), so classification time stays
-    linear and bounded inside the synchronous hook. Running out of it never lowers a tier already found.
+  - one shared work budget per record (bytes scanned, split or copied, plus words classified), so
+    classification time stays linear and bounded inside the synchronous hook. Running out of it never lowers a
+    tier already found. An unbudgeted linear pre-pass first records every program word visible at the top
+    level (each argv word and each segment's command word), so those keep their tier on exhaustion. Only text
+    never reached falls back to `high`.
 
 **Known T1 limits.** For these the tier can still understate what runs (decision B: curated list plus documented
 limits, no name-sniffing of later words):

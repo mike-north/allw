@@ -572,8 +572,8 @@ fn closing_paren_skips_ansi_c_strings() {
     let close = find_closing_paren(text, 0, Reading::BASH).expect("closed");
     assert_eq!(&text[close..], b") y");
     let plain = Reading {
-        honor_comments: true,
         ansi_c_quotes: false,
+        ..Reading::BASH
     };
     let close = find_closing_paren(text, 0, plain).expect("closed");
     assert_eq!(&text[close..], b")' x) y");
@@ -647,29 +647,45 @@ fn here_string_is_not_a_heredoc() {
     assert_eq!(line_risk("cat <<< \"it's\"; rm -rf /"), Risk::High);
 }
 
-/// A heredoc body is data: its lines aren't commands. An unquoted delimiter still runs the
-/// body's substitutions; a quoted one makes the body literal.
+/// Deliberate fail-upward rule (round 3 of the #284 review): a heredoc body is always also read
+/// as a script, whatever consumes it, quoted delimiter or not. An unquoted delimiter's body
+/// substitutions run in any case.
 #[test]
-fn heredoc_body_is_data_but_unquoted_substitutions_run() {
-    assert_eq!(line_risk("cat <<EOF\nrm -rf /\nEOF"), Risk::Medium);
-    assert_eq!(line_risk("cat <<EOF\n$(rm -rf ~)\nEOF"), Risk::High);
-    assert_eq!(line_risk("cat <<EOF\n`rm -rf ~`\nEOF"), Risk::High);
-    assert_eq!(line_risk("cat <<'EOF'\n$(rm -rf ~)\nEOF"), Risk::Medium);
-    assert_eq!(line_risk("cat <<\"EOF\"\n$(rm -rf ~)\nEOF"), Risk::Medium);
-    assert_eq!(line_risk("cat <<\\EOF\n$(rm -rf ~)\nEOF"), Risk::Medium);
+fn heredoc_bodies_are_always_also_scripts() {
+    assert_all(
+        &[
+            "cat <<EOF\nrm -rf /\nEOF",
+            "cat <<EOF\n$(rm -rf ~)\nEOF",
+            "cat <<EOF\n`rm -rf ~`\nEOF",
+            "cat <<'EOF'\n$(rm -rf ~)\nEOF",
+            "cat <<\"EOF\"\nrm -rf ~\nEOF",
+            "cat <<\\EOF\nrm -rf ~\nEOF",
+        ],
+        Risk::High,
+    );
+    // Negative: a harmless body keeps the line's own tier.
+    assert_eq!(line_risk("cat <<EOF\nhello world\nEOF"), Risk::Medium);
+    // Prose with paired apostrophes reads as a harmless script. (An odd apostrophe makes the line
+    // fail to tokenize before risk is computed.)
+    assert_eq!(
+        line_risk("cat > notes.md <<'EOF'\nDon't panic, it's fine\nEOF"),
+        Risk::Medium
+    );
 }
 
 /// With no delimiter line the body runs to the end of the text.
 #[test]
 fn heredoc_without_delimiter_runs_to_end() {
-    assert_eq!(line_risk("cat <<EOF\nrm -rf /"), Risk::Medium);
+    assert_eq!(line_risk("cat <<EOF\nrm -rf /"), Risk::High);
+    assert_eq!(line_risk("cat <<EOF\nhello"), Risk::Medium);
 }
 
-/// Two heredocs on one line are consumed in order.
+/// Two heredocs on one line are consumed in order, and both bodies are read as scripts.
 #[test]
 fn multiple_heredocs_are_consumed_in_order() {
     assert_eq!(line_risk("cat <<A <<B\nx\nA\ny\nB\nrm -rf /"), Risk::High);
-    assert_eq!(line_risk("cat <<A <<B\nx\nA\nrm -rf /\nB"), Risk::Medium);
+    assert_eq!(line_risk("cat <<A <<B\nx\nA\nrm -rf /\nB"), Risk::High);
+    assert_eq!(line_risk("cat <<A <<B\nx\nA\ny\nB"), Risk::Medium);
 }
 
 /// A heredoc fed to a shell is a script, so its body is classified as one even when quoted.
@@ -802,9 +818,9 @@ fn adversarial_scan_shapes_are_linear() {
         format!("echo {}", "{a,".repeat(n)),
         format!("echo {}", "a>b".repeat(n)),
     ] {
-        let (_, budget, scanned) = scanned_while(&line);
+        let (_, _, scanned) = scanned_while(&line);
         assert!(
-            scanned < 64 * line.len() || budget.exhausted,
+            scanned < 64 * line.len(),
             "scanned {scanned} bytes for {} bytes",
             line.len()
         );
@@ -865,8 +881,8 @@ fn empty_and_continued_heredoc_delimiters_do_not_hide_later_lines() {
         line_risk("cat <<E\\\nOF\nit's\nEOF\ndd # '\n"),
         Risk::Critical
     );
-    // The empty delimiter ends the body at the first empty line, so the body is data.
-    assert_eq!(line_risk("cat <<''\ndd\n\nls"), Risk::Medium);
+    // The empty delimiter ends the body at the first empty line; the body is read as a script.
+    assert_eq!(line_risk("cat <<''\ndd\n\nls"), Risk::Critical);
 }
 
 /// A delimiter T1 can't read for sure fails upward to at least High.
@@ -923,14 +939,11 @@ fn wrapped_shell_reads_heredoc_as_a_script() {
         ],
         Risk::Critical,
     );
-    // Negative: a wrapper running a non-shell doesn't feed a shell. (The record's word list still
-    // shows `dd` after `env`, which the argv wrapper rule counts.)
-    let mut budget = Budget::new(MAX_RISK_WORK);
-    assert!(!segment_risk("env cat <<'EOF'", 0, Reading::BASH, &mut budget).runs_shell);
-    assert!(segment_risk("env -i bash <<'EOF'", 0, Reading::BASH, &mut budget).runs_shell);
+    // A heredoc body is always also read as a script, so a non-shell consumer counts too
+    // (deliberate fail-upward rule, round 3 of the #284 review).
     assert_eq!(
         line_risk("cat <<'EOF'\ndd if=/dev/zero of=/dev/sda\nEOF"),
-        Risk::Medium
+        Risk::Critical
     );
 }
 
@@ -948,9 +961,125 @@ fn here_string_fed_to_a_shell_is_a_script() {
         ],
         Risk::Critical,
     );
-    // Negative: a here-string fed to a non-shell is data.
+    // A here-string is always also read as a script, whatever consumes it.
     assert_eq!(
         line_risk("cat <<< \"dd if=/dev/zero of=/dev/sda\""),
-        Risk::Medium
+        Risk::Critical
     );
+    // Negative: a harmless here-string keeps the line's own tier.
+    assert_eq!(line_risk("cat <<< hello"), Risk::Medium);
+}
+
+// ── Review of #284 (round 3): each repro is a regression test ────────────────
+
+const DD: &str = "dd if=/dev/zero of=/dev/sda";
+
+/// The reviewer's nested `#` + `$'…'` + `$(` bomb around `n` filler words.
+fn readings_bomb(n: usize) -> String {
+    let mut s = "x ".repeat(n);
+    for _ in 0..4 {
+        s = format!("#\n$'a' $({s})");
+    }
+    s
+}
+
+/// Regression (#284 review round 2, R2-1): `dd` runs first, but padding after it exhausted the
+/// budget before `argv[0]` was recorded, so the line was High. The unbudgeted pre-pass records
+/// every visible program word first.
+#[test]
+fn a_visible_first_program_survives_budget_exhaustion() {
+    let bomb = shlex::try_quote(&readings_bomb(4000))
+        .expect("quotable")
+        .into_owned();
+    for line in [
+        format!("{DD}; sh -c {bomb}"),
+        format!("{DD}; : sh {bomb}"),
+        format!("{DD}; :{}", " rm".repeat(17_000)),
+        format!("{DD}{}", " rm".repeat(20_000)),
+    ] {
+        assert_eq!(line_risk(&line), Risk::Critical, "{} bytes", line.len());
+    }
+}
+
+/// Alternate readings run only at the top level, so the reviewer's 8 KB bomb no longer spends
+/// the 4 MiB budget.
+#[test]
+fn alternate_readings_do_not_multiply_with_nesting() {
+    let line = format!(
+        "sh -c {}",
+        shlex::try_quote(&readings_bomb(4000)).expect("quotable")
+    );
+    let (_, budget) = analyze_with_budget(&line, MAX_RISK_WORK);
+    assert!(!budget.exhausted);
+    assert!(budget.used < 64 * line.len(), "used {}", budget.used);
+}
+
+/// Regression (R2-2): inside a double-quoted delimiter bash removes `\⏎`, so the delimiter is
+/// `EOF` and the line after the body runs.
+#[test]
+fn double_quoted_delimiter_drops_backslash_newline() {
+    assert_eq!(
+        line_risk(&format!("cat <<\"E\\\nOF\"\nit's\nEOF\n{DD} # '\n")),
+        Risk::Critical
+    );
+    // `\"` inside double quotes is a literal quote in the delimiter.
+    assert_eq!(
+        line_risk(&format!("cat <<\"E\\\"F\"\nit's\nE\"F\n{DD} # '\n")),
+        Risk::Critical
+    );
+}
+
+/// Regression (R2-3): `<<` inside an arithmetic command is a shift, not a heredoc.
+#[test]
+fn arithmetic_commands_have_no_heredocs() {
+    assert_all(
+        &[
+            &format!("(( x = 1<<2 ))\n{DD}"),
+            &format!("for ((i=1<<2; i<0; i++)); do :; done\n{DD}"),
+            &format!("if ((1<<2)); then :; fi\n{DD}"),
+        ],
+        Risk::Critical,
+    );
+    // Two subshells that aren't arithmetic are still read as subshells.
+    assert_eq!(line_risk(&format!("((ls); {DD})")), Risk::Critical);
+}
+
+/// Regression (R2-4): bash ≥ 4 reads a heredoc inside `$( )`, so a `)` in its body doesn't end
+/// the substitution. bash 3.2 closes at the first `)`; both readings are analyzed.
+#[test]
+fn heredoc_inside_substitution_does_not_end_it_early() {
+    assert_eq!(
+        line_risk(&format!("echo $(cat <<'EOF'\n) it's\nEOF\n)\n{DD} # '")),
+        Risk::Critical
+    );
+}
+
+/// Regression (R2-5): a heredoc or here-string on a compound command or behind `eval` feeds a
+/// shell. Bodies are now always read as scripts, whatever consumes them.
+#[test]
+fn heredoc_on_compound_command_or_eval_is_read() {
+    assert_all(
+        &[
+            &format!("{{ bash; }} <<'EOF'\n{DD}\nEOF"),
+            &format!("( bash ) <<'EOF'\n{DD}\nEOF"),
+            &format!("{{ bash; }} <<< '{DD}'"),
+            &format!("if true; then bash; fi <<'EOF'\n{DD}\nEOF"),
+            &format!("eval bash <<'EOF'\n{DD}\nEOF"),
+            &format!("while read x; do bash; done <<'EOF'\n{DD}\nEOF"),
+        ],
+        Risk::Critical,
+    );
+}
+
+/// R2-6: `rm`'s flag split copies `argv[j..]`, so it is charged by bytes copied, not by words.
+#[test]
+fn rm_flag_split_is_charged_by_bytes() {
+    let mut argv: Vec<String> = vec!["env".to_string()];
+    argv.extend(std::iter::repeat_n("rm".to_string(), 255));
+    argv.push("x".repeat(4 * 1024 * 1024));
+    SCANNED.with(|c| c.set(0));
+    let risk = action_from_argv(&argv, None, &ctx()).risk;
+    let scanned = SCANNED.with(std::cell::Cell::get);
+    assert!(matches!(risk, Risk::High | Risk::Critical), "{risk:?}");
+    assert!(scanned < 3 * MAX_RISK_WORK, "copied {scanned} bytes");
 }

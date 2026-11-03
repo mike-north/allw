@@ -231,9 +231,9 @@
     },
     {
       "command": "cat <<EOF\nrm -rf /\nEOF",
-      "risk": "medium",
+      "risk": "high",
       "bin": "cat",
-      "why": "negative: a heredoc body is data, not commands"
+      "why": "a heredoc body is always also read as a script, whatever consumes it (deliberate fail-upward rule): rm -rf /"
     },
     {
       "command": "cat <<EOF\n$(rm -rf ~)\nEOF",
@@ -243,9 +243,9 @@
     },
     {
       "command": "cat <<'EOF'\n$(rm -rf ~)\nEOF",
-      "risk": "medium",
+      "risk": "high",
       "bin": "cat",
-      "why": "negative: a quoted delimiter makes the body literal"
+      "why": "a heredoc body is always also read as a script, even with a quoted delimiter: rm -rf ~"
     },
     {
       "command": "bash <<'EOF'\nrm -rf /\nEOF",
@@ -435,9 +435,69 @@
     },
     {
       "command": "cat <<< \"dd if=/dev/zero of=/dev/sda\"",
+      "risk": "critical",
+      "bin": "cat",
+      "why": "a here-string is always also read as a script, whatever consumes it: dd"
+    },
+    {
+      "command": "cat <<\"E\\\nOF\"\nit's\nEOF\ndd if=/dev/zero of=/dev/sda # '\n",
+      "risk": "critical",
+      "bin": "cat",
+      "why": "in a double-quoted delimiter bash removes the backslash-newline (delimiter EOF); dd runs after the body"
+    },
+    {
+      "command": "(( x = 1<<2 ))\ndd if=/dev/zero of=/dev/sda",
+      "risk": "critical",
+      "bin": "((",
+      "why": "<< inside an arithmetic command is a shift, not a heredoc; dd runs on the next line"
+    },
+    {
+      "command": "for ((i=1<<2; i<0; i++)); do :; done\ndd if=/dev/zero of=/dev/sda",
+      "risk": "critical",
+      "bin": "for",
+      "why": "an arithmetic for loop has no heredoc; dd runs after it"
+    },
+    {
+      "command": "echo $(cat <<'EOF'\n) it's\nEOF\n)\ndd if=/dev/zero of=/dev/sda # '",
+      "risk": "critical",
+      "bin": "echo",
+      "why": "bash 4+ reads the heredoc inside $( ), so its ) doesn't close it; dd runs after"
+    },
+    {
+      "command": "{ bash; } <<'EOF'\ndd if=/dev/zero of=/dev/sda\nEOF",
+      "risk": "critical",
+      "bin": "{",
+      "why": "a heredoc on a group is read as a script"
+    },
+    {
+      "command": "( bash ) <<'EOF'\ndd if=/dev/zero of=/dev/sda\nEOF",
+      "risk": "critical",
+      "bin": "(",
+      "why": "a heredoc on a subshell is read as a script"
+    },
+    {
+      "command": "{ bash; } <<< 'dd if=/dev/zero of=/dev/sda'",
+      "risk": "critical",
+      "bin": "{",
+      "why": "a here-string on a group is read as a script"
+    },
+    {
+      "command": "if true; then bash; fi <<'EOF'\ndd if=/dev/zero of=/dev/sda\nEOF",
+      "risk": "critical",
+      "bin": "if",
+      "why": "a heredoc on an if compound is read as a script"
+    },
+    {
+      "command": "eval bash <<'EOF'\ndd if=/dev/zero of=/dev/sda\nEOF",
+      "risk": "critical",
+      "bin": "eval",
+      "why": "a heredoc behind eval is read as a script"
+    },
+    {
+      "command": "cat <<EOF\nhello world\nEOF",
       "risk": "medium",
       "bin": "cat",
-      "why": "negative: a here-string fed to a non-shell is data"
+      "why": "negative: a harmless heredoc body keeps the line's own tier"
     }
   ]
 }
