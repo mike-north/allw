@@ -130,7 +130,18 @@ warning, so check `claude --version`. Why this holds:
   [#298](https://github.com/mike-north/allw/issues/298) (it doesn't gate `PowerShell`, `Monitor` or
   `NotebookEdit`), keep those three out of the matcher and add
   `"permissions": { "deny": ["Monitor", "PowerShell", "NotebookEdit"] }`, so they are off rather
-  than ungated.
+  than ungated. To check, run the installed hook on a `Monitor` call with no config: a hook that
+  gates it prints a `deny`, and an older one prints nothing.
+
+  ```sh
+  echo '{"hook_event_name":"PreToolUse","tool_name":"Monitor","tool_input":{"command":"true"}}' \
+    | env -i PATH="$PATH" HOME="$(mktemp -d)" node /Users/you/.allw/hook/node_modules/@allw/hook/dist/cli.js
+  ```
+
+- **Plugin monitors aren't gated.** A plugin can declare
+  [monitors](https://code.claude.com/docs/en/plugins/components.md#monitors) that start their
+  commands when the plugin is active, with no `Monitor` tool call, so no `PreToolUse` fires and allw
+  never sees them. Install only plugins whose monitors you would approve.
 
 This is guidance, not a tamper-proof boundary: in `bypassPermissions` mode allw is the only gate, and
 the agent still runs as your OS user. Moving the account root off the agent's machine is tracked in
@@ -193,17 +204,17 @@ The matcher above routes candidate tool calls to the hook; `isGatedTool` /
 `gateToolCall` (`packages/hook/src/lib/gating.ts`) then decide what actually requires a human
 approval:
 
-| Tool name(s)                                            | Gated? | Substrate                                                                                                                                                                                                                                                                                |
-| ------------------------------------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Bash`                                                  | Yes    | `command` — built from `tool_input.command` (+ `cwd` when present).                                                                                                                                                                                                                      |
-| `Monitor` with `tool_input.command`                     | Yes    | `command`, exactly as for `Bash` (it runs the command in the background under your `Bash` rules); the summary says it runs under `Monitor`.                                                                                                                                              |
-| `Monitor` with `tool_input.ws`                          | No     | **No decision**: a WebSocket watch runs no command. Any other `Monitor` input (neither a string `command` nor a `ws` object with a string `url`, or both) is denied.                                                                                                                     |
-| `PowerShell`                                            | Yes    | `command`, built by the core's PowerShell builder: `raw` is the exact line; risk is at least `medium`, or `high` when the line doesn't split as POSIX ([`docs/policy-seam.md`](./policy-seam.md)). The summary reads `PowerShell: <command>`.                                            |
-| `Edit`, `Write`, `MultiEdit`                            | Yes    | `file_edit` — built from the operation kind, target path(s), a compact summary, and a hash of the full edit bytes.                                                                                                                                                                       |
-| `NotebookEdit`                                          | Yes    | `file_edit` with operation `notebook_edit`: the notebook path, and a hash of the cell-level change (`cell_id`, `cell_type`, `edit_mode`, `new_source`).                                                                                                                                  |
-| any `mcp__<server>__<tool>` name                        | Yes    | `mcp_tool_call` — built from the parsed server/tool name and the raw `tool_input` params object.                                                                                                                                                                                         |
-| `apply_patch`                                           | Yes    | `file_edit`, via the same Codex apply-patch-grammar parser. Claude Code has no `apply_patch` tool, so this branch is never reached in a Claude Code session; it exists because `gateToolCall` is the same shared function `@allw/codex-hook` imports (`packages/codex-hook/src/cli.ts`). |
-| everything else (`Read`, `Glob`, `Grep`, `WebFetch`, …) | No     | **No decision** (empty stdout) without contacting the relay, and **without requiring `allw` config** — a missing/misconfigured install never blocks reads; Claude Code's own permission rules apply.                                                                                     |
+| Tool name(s)                                            | Gated? | Substrate                                                                                                                                                                                                                                                                                                                                      |
+| ------------------------------------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Bash`                                                  | Yes    | `command` — built from `tool_input.command` (+ `cwd` when present).                                                                                                                                                                                                                                                                            |
+| `Monitor` with `tool_input.command`                     | Yes    | `command`, exactly as for `Bash` (it runs the command in the background under your `Bash` rules); the summary says it runs under `Monitor`.                                                                                                                                                                                                    |
+| `Monitor` with `tool_input.ws`                          | No     | **No decision**: a WebSocket watch runs no command. Any other `Monitor` input is denied: neither a string `command` nor a `ws` object with a string `url`, both at once, or a watch with a key outside Claude Code's watch schema (`ws` {`url`, `protocols`}, `description`, `timeout_ms`).                                                    |
+| `PowerShell`                                            | Yes    | `command`, built by the core's PowerShell builder: `raw` is the exact line; risk is at least `medium`, or `high` when the line doesn't split as POSIX ([`docs/policy-seam.md`](./policy-seam.md)). The summary reads `PowerShell: <command>`.                                                                                                  |
+| `Edit`, `Write`, `MultiEdit`                            | Yes    | `file_edit` — built from the operation kind, target path(s), a compact summary, and a hash of the full edit bytes.                                                                                                                                                                                                                             |
+| `NotebookEdit`                                          | Yes    | `file_edit` with operation `notebook_edit`: the notebook path, and a hash of the cell-level change (`cell_id`, `cell_type`, `edit_mode`, `new_source`). The summary names the cell (`replace cell <id>`, `insert after cell <id>`, `insert at start`). `replace` and `delete` without a string `cell_id`, and any other input key, are denied. |
+| any `mcp__<server>__<tool>` name                        | Yes    | `mcp_tool_call` — built from the parsed server/tool name and the raw `tool_input` params object.                                                                                                                                                                                                                                               |
+| `apply_patch`                                           | Yes    | `file_edit`, via the same Codex apply-patch-grammar parser. Claude Code has no `apply_patch` tool, so this branch is never reached in a Claude Code session; it exists because `gateToolCall` is the same shared function `@allw/codex-hook` imports (`packages/codex-hook/src/cli.ts`).                                                       |
+| everything else (`Read`, `Glob`, `Grep`, `WebFetch`, …) | No     | **No decision** (empty stdout) without contacting the relay, and **without requiring `allw` config** — a missing/misconfigured install never blocks reads; Claude Code's own permission rules apply.                                                                                                                                           |
 
 Two fail-closed subtleties worth calling out precisely, because they are easy to get wrong when
 widening the matcher:
@@ -305,7 +316,7 @@ in the same settings file as the hook:
 ```json
 {
   "permissions": {
-    "allow": ["Bash", "Edit", "MultiEdit", "Write", "mcp__<server>__*"]
+    "allow": ["Bash", "PowerShell", "Edit", "MultiEdit", "Write", "mcp__<server>__*"]
   }
 }
 ```

@@ -194,12 +194,14 @@ effects:
 - **`Bash`** — a shell command (`tool_input.command`).
 - **`Monitor`** with a `command` — gated exactly like `Bash` (it runs the command in the background
   under your `Bash` permission rules). A `Monitor` WebSocket watch (`tool_input.ws`) runs no command
-  and gets no decision; any other `Monitor` input is denied.
+  and gets no decision; any other `Monitor` input is denied. Monitors a plugin declares start
+  without a `Monitor` call, so allw never sees them.
 - **`PowerShell`** — a PowerShell line (`tool_input.command`), shown to the human as
   `PowerShell: <command>`; its risk is never below `medium`.
 - **`Edit` / `Write` / `MultiEdit`** — direct file edits (`tool_input.file_path` plus edit
   payload).
-- **`NotebookEdit`** — a notebook cell edit (`tool_input.notebook_path` plus the cell change).
+- **`NotebookEdit`** — a notebook cell edit (`tool_input.notebook_path` plus the cell change). An
+  edit that doesn't name its cell, or carries a key the hook doesn't know, is denied.
 - **`mcp__<server>__<tool>`** — any MCP tool call (`tool_input` is the raw params object).
 - **everything else** (`Read`, `Glob`, `Grep`, `WebFetch`, …) — **not gated**; allw makes no
   decision for it, without bothering the human (and without needing any `allw` config).

@@ -140,7 +140,9 @@ backtick and `\` is literal, so a POSIX split could hide a `; Remove-Item …` i
 Windows paths' backslashes). Every non-whitespace byte of `raw` stays visible in some token. Because the v1 risk table
 knows no PowerShell commands, risk is at least `medium`, and at least `high` when `raw` contains `;`, `|`, `&`, a line
 break, a backtick, `$(`, `{`, `iex` or `Invoke-Expression` (uncertain ⇒ upward). There is no PowerShell field on the
-record and no schema change: surfaces label the line for the human in the summary (`PowerShell: <command>`).
+record and no schema change: surfaces label the line for the human in the summary (`PowerShell: <command>`). The
+other substrate fields come from the command builder's T1 scans of the tokens and `raw`, so they can disagree with
+PowerShell: for example `$env:PATH` records `env` in `env_refs`. `raw` is authoritative.
 
 ### Forward-compat requirements on `allw-core` v1 (cheap now, painful later)
 
