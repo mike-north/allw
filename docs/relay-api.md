@@ -74,6 +74,14 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   send no `Origin` and are unaffected.
 - **Errors** are plain bodies with the status code; `400` covers malformed JSON / bad fields /
   unexpected envelope keys (zero-knowledge guard).
+- **Exact paths.** An account route answers only on its exact path, compared segment by segment as the URL
+  parser yields them (percent-encoding preserved, `.` and `..` segments resolved): the same number of segments, every literal equal, and every `{param}` non-empty
+  (#302). Anything else is **404** `{ "error": "not found" }`, whatever the method: an extra segment
+  (`…/revoke/extra`), a trailing slash (`/devices/`), an empty segment (`/devices//revoke`) or a missing
+  one. A path that is exactly a route's, reached with a method the route doesn't serve, is **405**
+  `{ "error": "method not allowed" }`. Dropping or adding a segment can still land exactly on _another_
+  route: `/requests/r1` is `GET /requests/{request_id}`, and `/requests/extra` is the same route with
+  `request_id = extra`. The route table is `packages/relay/src/routes.ts`.
 
 ---
 

@@ -65,6 +65,7 @@ import {
   vapidConfigFromEnv,
   type VapidEnv,
 } from "./web-push.js";
+import { accountSubPathSegments, resolveAccountRoute, routeParam } from "./routes.js";
 import { handleWellKnown, isWellKnownPath } from "./well-known.js";
 
 export interface Env extends VapidEnv, CorsEnv {
@@ -810,135 +811,87 @@ export class AccountRelay implements DurableObject {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    // Strip the leading "/<accountId>" segment forwarded by the Worker.
-    const segments = url.pathname.split("/").filter(Boolean);
-    // segments[0] is the accountId (stripped); the sub-path starts at [1].
-    const subSegments = segments.slice(1);
+    // The Worker forwards the full path; its first segment is the account id, and every route
+    // matches the rest exactly (`routes.ts`, #302).
+    const accountId = url.pathname.split("/")[1] ?? "";
     const method = request.method.toUpperCase();
-    const path0 = subSegments[0] ?? "";
-    const path1 = subSegments[1] ?? "";
-    const path2 = subSegments[2] ?? "";
-
-    // POST /pairing/start — root-signed; binds the account root on first success.
-    if (method === "POST" && path0 === "pairing" && path1 === "start") {
-      return this.handlePairingStart(request, segments[0] ?? "");
-    }
-
-    // POST /pairing/complete
-    if (method === "POST" && path0 === "pairing" && path1 === "complete") {
-      return this.handlePairingComplete(request);
-    }
-
-    // POST /actors
-    if (method === "POST" && path0 === "actors" && !path1) {
-      return this.handleActorEnroll(request);
-    }
-
-    // GET /actors
-    if (method === "GET" && path0 === "actors" && !path1) {
-      return this.handleActorList();
-    }
-
-    // POST /account-states — anyone may publish; only documents verified against the bound root
-    // are stored.
-    if (method === "POST" && path0 === "account-states" && !path1) {
-      return this.handleAccountStatePublish(request, segments[0] ?? "");
-    }
-
-    // GET /account-states — unauthenticated: the documents are public and relay-verified.
-    if (method === "GET" && path0 === "account-states" && !path1) {
-      return this.handleAccountStateList();
-    }
-
-    // GET /devices
-    if (method === "GET" && path0 === "devices" && !path1) {
-      return this.handleDeviceList();
-    }
-
-    // POST /devices/{device_id}/revoke
-    if (method === "POST" && path0 === "devices" && path1 !== "" && path2 === "revoke") {
-      return this.handleDeviceRevoke(path1, request);
-    }
-
-    // PUT /devices/{device_id}/push-tokens — the device replaces its own push-token set.
-    if (
-      method === "PUT" &&
-      path0 === "devices" &&
-      path1 !== "" &&
-      path2 === "push-tokens" &&
-      (subSegments[3] ?? "") === ""
-    ) {
-      return this.handleDevicePushTokens(path1, request);
-    }
-
-    // GET /devices/{device_id}/inbox — authenticated device polls its pending envelopes.
-    if (method === "GET" && path0 === "devices" && path1 !== "" && path2 === "inbox") {
-      return this.handleDeviceInbox(path1, request);
-    }
-
-    // GET /devices/{device_id}/connect (WebSocket) — device presence + offline-queue flush.
-    if (method === "GET" && path0 === "devices" && path1 !== "" && path2 === "connect") {
-      if (!isWebSocketUpgrade(request)) {
-        return json({ error: "WebSocket upgrade required" }, 426);
-      }
-      return this.handleDeviceConnect(path1, request);
-    }
-
-    // POST /requests — integrator submits an ApprovalRequest envelope (ciphertext + routing).
-    if (method === "POST" && path0 === "requests" && !path1) {
-      return this.handleSubmit(request, segments[0] ?? "");
-    }
-
-    // GET /requests/{request_id}/wait (WebSocket) — integrator awaits the verdict (pushed).
-    if (method === "GET" && path0 === "requests" && path1 !== "" && path2 === "wait") {
-      if (!isWebSocketUpgrade(request)) {
-        return json({ error: "WebSocket upgrade required" }, 426);
-      }
-      return this.handleIntegratorWait(path1, request);
-    }
-
-    // GET /requests/{request_id} — integrator polls request status / fetches the verdict.
-    if (method === "GET" && path0 === "requests" && path1 !== "" && path2 === "") {
-      return this.handleGetRequest(path1, request);
-    }
-
-    // POST /requests/{request_id}/retract — integrator cancels its own pending request (#195).
-    if (method === "POST" && path0 === "requests" && path1 !== "" && path2 === "retract") {
-      return this.handleRetract(path1, request);
-    }
+    const route = resolveAccountRoute(method, accountSubPathSegments(url.pathname));
 
     // 405 only for a KNOWN route path reached with an unsupported method; any other (unknown)
-    // sub-path is a 404 — e.g. `GET /devices/<id>` or `GET /pairing/unknown` are not routes.
-    const isKnownRoutePath =
-      (path0 === "pairing" && (path1 === "start" || path1 === "complete") && path2 === "") ||
-      (path0 === "actors" && path1 === "") ||
-      (path0 === "account-states" && path1 === "") ||
-      (path0 === "devices" && path1 === "") ||
-      (path0 === "devices" &&
-        path1 !== "" &&
-        path2 === "revoke" &&
-        (subSegments[3] ?? "") === "") ||
-      (path0 === "devices" && path1 !== "" && path2 === "inbox" && (subSegments[3] ?? "") === "") ||
-      (path0 === "devices" &&
-        path1 !== "" &&
-        path2 === "push-tokens" &&
-        (subSegments[3] ?? "") === "") ||
-      (path0 === "devices" &&
-        path1 !== "" &&
-        path2 === "connect" &&
-        (subSegments[3] ?? "") === "") ||
-      (path0 === "requests" && path1 === "") ||
-      (path0 === "requests" && path1 !== "" && path2 === "" && (subSegments[2] ?? "") === "") ||
-      (path0 === "requests" && path1 !== "" && path2 === "wait" && (subSegments[3] ?? "") === "") ||
-      (path0 === "requests" &&
-        path1 !== "" &&
-        path2 === "retract" &&
-        (subSegments[3] ?? "") === "");
-    if (isKnownRoutePath) {
-      return json({ error: "method not allowed" }, 405);
-    }
+    // sub-path is a 404 — e.g. `GET /devices/<id>`, `GET /pairing/unknown`, or any route with an
+    // extra segment or trailing slash.
+    if (route.kind === "method-not-allowed") return json({ error: "method not allowed" }, 405);
+    if (route.kind === "not-found") return json({ error: "not found" }, 404);
 
-    return json({ error: "not found" }, 404);
+    const { params } = route;
+    switch (route.name) {
+      // POST /pairing/start — root-signed; binds the account root on first success.
+      case "pairingStart":
+        return this.handlePairingStart(request, accountId);
+
+      // POST /pairing/complete
+      case "pairingComplete":
+        return this.handlePairingComplete(request);
+
+      // POST /actors
+      case "actorEnroll":
+        return this.handleActorEnroll(request);
+
+      // GET /actors
+      case "actorList":
+        return this.handleActorList();
+
+      // POST /account-states — anyone may publish; only documents verified against the bound
+      // root are stored.
+      case "accountStatePublish":
+        return this.handleAccountStatePublish(request, accountId);
+
+      // GET /account-states — unauthenticated: the documents are public and relay-verified.
+      case "accountStateList":
+        return this.handleAccountStateList();
+
+      // GET /devices
+      case "deviceList":
+        return this.handleDeviceList();
+
+      // POST /devices/{device_id}/revoke
+      case "deviceRevoke":
+        return this.handleDeviceRevoke(routeParam(params, "device_id"), request);
+
+      // PUT /devices/{device_id}/push-tokens — the device replaces its own push-token set.
+      case "devicePushTokens":
+        return this.handleDevicePushTokens(routeParam(params, "device_id"), request);
+
+      // GET /devices/{device_id}/inbox — authenticated device polls its pending envelopes.
+      case "deviceInbox":
+        return this.handleDeviceInbox(routeParam(params, "device_id"), request);
+
+      // GET /devices/{device_id}/connect (WebSocket) — device presence + offline-queue flush.
+      case "deviceConnect":
+        if (!isWebSocketUpgrade(request)) {
+          return json({ error: "WebSocket upgrade required" }, 426);
+        }
+        return this.handleDeviceConnect(routeParam(params, "device_id"), request);
+
+      // POST /requests — integrator submits an ApprovalRequest envelope (ciphertext + routing).
+      case "requestSubmit":
+        return this.handleSubmit(request, accountId);
+
+      // GET /requests/{request_id}/wait (WebSocket) — integrator awaits the verdict (pushed).
+      case "requestWait":
+        if (!isWebSocketUpgrade(request)) {
+          return json({ error: "WebSocket upgrade required" }, 426);
+        }
+        return this.handleIntegratorWait(routeParam(params, "request_id"), request);
+
+      // GET /requests/{request_id} — integrator polls request status / fetches the verdict.
+      case "requestGet":
+        return this.handleGetRequest(routeParam(params, "request_id"), request);
+
+      // POST /requests/{request_id}/retract — integrator cancels its own pending request (#195).
+      case "requestRetract":
+        return this.handleRetract(routeParam(params, "request_id"), request);
+    }
   }
 
   // ---------------------------------------------------------------------------
