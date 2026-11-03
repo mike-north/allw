@@ -70,8 +70,13 @@ function loadOrGenerate(wasm: AllwWasm, path: string): { keyfile: Keyfile; fresh
 export async function runPair(
   wasm: AllwWasm,
   options: PairOptions,
-  log: Logger = console.log,
+  rawLog: Logger = console.log,
 ): Promise<Keyfile> {
+  // The pairing code and device_id come from the relay: every printed line goes through the core's
+  // display escape so relay-supplied text cannot carry terminal control sequences (#246).
+  const log: Logger = (line) => {
+    rawLog(wasm.escape_for_display(line));
+  };
   const now = options.now ?? Date.now();
   const { keyfile: existing, fresh } = loadOrGenerate(wasm, options.keyfilePath);
 
