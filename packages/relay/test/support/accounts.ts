@@ -162,15 +162,16 @@ export const TEST_DECIDED_AT = 1_700_000_500_000;
 export interface VerdictOptions {
   /** The signed decision (default `approved`). */
   readonly decision?: "approved" | "denied" | "expired" | "aborted";
-  /** The signed `decided_at` (default {@link TEST_DECIDED_AT}). The certificate must be valid at it. */
+  /**
+   * The signed `decided_at` (default {@link TEST_DECIDED_AT}). The relay accepts it only inside the
+   * request envelope's `[created_at, expires_at]`, and the certificate must be valid at it.
+   */
   readonly decidedAt?: number;
   /**
    * The root that certifies the device key (default: the account's own root). Another account's
    * root yields a certificate the relay must not accept.
    */
   readonly certifiedBy?: TestAccount;
-  /** The device id the certificate names (default: the verdict's device id). */
-  readonly certifiedDeviceId?: string;
   /** Sign with a key the certificate does not vouch for (an uncertified key). */
   readonly uncertifiedKey?: boolean;
   /** The certificate's `expires_at` (default: none). */
@@ -201,7 +202,7 @@ export function signTestVerdict(
   const cert = glue.issue_device_cert(
     root.rootSeed,
     accountId,
-    options.certifiedDeviceId ?? deviceId,
+    deviceId,
     glue.ed25519_public_key(seed),
     TEST_CERT_ISSUED_AT,
     options.certExpiresAt ?? null,

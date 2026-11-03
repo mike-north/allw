@@ -1065,6 +1065,78 @@ describe("AccountRelay — verdict finality (#245)", () => {
     await expectStillAnswerable(ctx, "req-final-cert-expired");
   });
 
+  // Reviewer probe on #352: a device whose certificate expired in November 2023 signs a decision
+  // backdated to before the request existed, when its certificate was still valid. Judging the
+  // certificate at the device-chosen `decided_at` alone would accept it and let the device
+  // pre-empt every request; the request window bounds `decided_at` first.
+  it("refuses an expired-cert device backdating its decision to before the request", async () => {
+    const ctx = await setUp("acct-final-backdated", "req-final-backdated");
+    const backdated = signTestVerdict(ctx.acct, ctx.first, "req-final-backdated", {
+      decision: "denied",
+      certExpiresAt: 1_699_999_500_000,
+      decidedAt: 1_699_999_000_000, // before the envelope's created_at (CREATED_AT)
+    });
+    expect(backdated.decided_at).toBeLessThan(CREATED_AT);
+    await expectRefused(ctx, "req-final-backdated", backdated);
+    // No retract reached the other device, nothing was recorded, and the request still resolves.
+    await expectStillAnswerable(ctx, "req-final-backdated");
+  });
+
+  it("refuses a verdict decided after the request's expires_at", async () => {
+    const ctx = await setUp("acct-final-late", "req-final-late");
+    await expectRefused(
+      ctx,
+      "req-final-late",
+      signTestVerdict(ctx.acct, ctx.first, "req-final-late", {
+        decision: "denied",
+        decidedAt: FUTURE_EXPIRES_AT + 1,
+      }),
+    );
+    await expectStillAnswerable(ctx, "req-final-late");
+  });
+
+  it("accepts a decision on the window's edges (envelope created_at and expires_at)", async () => {
+    // The window is the envelope's, as the integrator's verify_verdict checks it: CREATED_AT is
+    // years before the relay received the request, so this also shows the relay's receive time is
+    // not the bound.
+    for (const [name, decidedAt] of [
+      ["created", CREATED_AT],
+      ["expires", FUTURE_EXPIRES_AT],
+    ] as const) {
+      const requestId = `req-final-edge-${name}`;
+      const ctx = await setUp(`acct-final-edge-${name}`, requestId);
+      const verdict = signTestVerdict(ctx.acct, ctx.first, requestId, { decidedAt });
+      ctx.d1.send({ type: "verdict", request_id: requestId, verdict });
+      expect(await ctx.d1.next()).toEqual({
+        type: "ack",
+        request_id: requestId,
+        status: "resolved",
+      });
+      expect((await ctx.integrator.next()).verdict).toEqual(verdict);
+    }
+  });
+
+  it("refuses another device's approver before any signature check", async () => {
+    const ctx = await setUp("acct-final-approver", "req-final-approver");
+    // A junk signature would fail provenance; naming another device is refused first, without
+    // verifying anything.
+    await expectRefused(
+      ctx,
+      "req-final-approver",
+      {
+        v: 1,
+        request_id: "req-final-approver",
+        request_hash: "ZmFrZS1yZXF1ZXN0LWhhc2gtMzItYnl0ZXMtYjY0dXI",
+        decision: "denied",
+        decided_at: TEST_DECIDED_AT,
+        approver: { account_id: ctx.acct, device_id: ctx.second },
+        sig: "not-a-jws",
+      },
+      "verdict is signed by another device",
+    );
+    await expectStillAnswerable(ctx, "req-final-approver");
+  });
+
   it("refuses every verdict when the account has no bound root (fail-closed)", async () => {
     const ctx = await setUp("acct-final-unbound", "req-final-unbound");
     // A pre-binding leftover: the device rows exist but no root is bound to check against.

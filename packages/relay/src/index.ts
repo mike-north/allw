@@ -2330,7 +2330,7 @@ export class AccountRelay implements DurableObject {
 
     const reqRows = [
       ...this.sql.exec<RequestRow>(
-        `SELECT request_id, status, expires_at FROM request WHERE request_id = ?`,
+        `SELECT request_id, envelope, status, expires_at FROM request WHERE request_id = ?`,
         requestId,
       ),
     ];
@@ -2361,14 +2361,29 @@ export class AccountRelay implements DurableObject {
       return;
     }
 
+    // The socket's device must be the device that answered: one device's token never carries
+    // another device's verdict, even a genuine one. The outer `approver.device_id` is checked here,
+    // before any crypto, so a mismatched verdict costs no signature work; the provenance check
+    // next ties it to the signature (`kid`) and the signed claims.
+    const approver = msg.verdict.approver;
+    if (isPlainObject(approver) && approver.device_id !== deviceId) {
+      trySendJson(ws, {
+        type: "error",
+        request_id: requestId,
+        error: "verdict is signed by another device",
+      });
+      return;
+    }
+
     // SECURITY (#245): only a verdict with valid provenance may become final. Any device could
     // otherwise resolve every request instantly with junk, retracting the prompt from the human's
     // other devices, so the relay, not the integrator, would decide which verdict counts. The core
-    // checks, without the plaintext, that the verdict was signed for this request by a device the
-    // bound account root certified and has not revoked. A failed check records nothing, retracts
-    // nothing, and leaves the request pending for another device's verdict.
+    // checks, without the plaintext, that the verdict was signed for this request, at a time inside
+    // the request's window, by a device the bound account root certified and has not revoked. A
+    // failed check records nothing, retracts nothing, and leaves the request pending for another
+    // device's verdict.
     const verdictJson = JSON.stringify(msg.verdict);
-    const signer = this.verdictSigner(verdictJson, requestId);
+    const signer = this.verdictSigner(verdictJson, requestId, req);
     if (signer === null) {
       trySendJson(ws, {
         type: "error",
@@ -2377,8 +2392,8 @@ export class AccountRelay implements DurableObject {
       });
       return;
     }
-    // The socket's device must be the device that signed: one device's token never carries another
-    // device's verdict, even a genuine one.
+    // Defense in depth: the certified signer must be the socket's device too (the outer
+    // `approver.device_id` was compared above; the core ties it to the signed `kid`).
     if (signer !== deviceId) {
       trySendJson(ws, {
         type: "error",
@@ -2432,17 +2447,31 @@ export class AccountRelay implements DurableObject {
   }
 
   /**
-   * The device that signed `verdictJson` for `requestId`, or `null` when its provenance does not
-   * verify against the bound account root and the relay's verified account states (#245). Fails
-   * closed: no bound root, a core that cannot load, or any failed check is `null`.
+   * The device that signed `verdictJson` for `req`, or `null` when its provenance does not verify
+   * against the request's window, the bound account root and the relay's verified account states
+   * (#245). Fails closed: no bound root, an envelope without an integer `created_at`, a core that
+   * cannot load, or any failed check is `null`.
+   *
+   * The window is the envelope's `created_at` and `expires_at`: the same values the integrator's
+   * `verify_verdict` step 5 checks `decided_at` against. (The row's `created_at` column is the
+   * relay's receive time, so it is not used here: a device clock slightly behind the relay's would
+   * otherwise be refused for a verdict the integrator accepts.)
    */
-  private verdictSigner(verdictJson: string, requestId: string): string | null {
+  private verdictSigner(
+    verdictJson: string,
+    requestId: string,
+    req: Pick<RequestRow, "envelope" | "expires_at">,
+  ): string | null {
     const root = this.boundRootPubkey();
     if (root === null) return null;
     try {
+      const envelope = JSON.parse(req.envelope) as unknown;
+      if (!isPlainObject(envelope) || typeof envelope.created_at !== "number") return null;
       return verifyVerdictProvenance(
         verdictJson,
         requestId,
+        envelope.created_at,
+        req.expires_at,
         accountIdForRoot(root),
         root,
         this.verifiedAccountStates().states,

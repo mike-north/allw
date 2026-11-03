@@ -64,11 +64,15 @@ declare module "@allw/sdk/vendor/allw-wasm/allw_wasm.js" {
 
   /**
    * Check a verdict's provenance without the plaintext (#245); returns `{ device_id, decided_at }`
-   * JSON. `account_states_json` is a JSON array of compact account-state JWS (`[]` for none).
+   * JSON. `created_at` / `expires_at` are the request window (integer Unix ms) the signed
+   * `decided_at` must fall in. `account_states_json` is a JSON array of compact account-state JWS
+   * (`[]` for none).
    */
   export function verify_verdict_provenance(
     verdict_json: string,
     request_id: string,
+    created_at: number,
+    expires_at: number,
     account_id: string,
     account_root_pubkey_b64: string,
     account_states_json: string,

@@ -123,8 +123,8 @@ export function verifyPairingStartAuthorization(
 
 /**
  * Who signed a verdict, per the core's provenance check (mirrors `allw_core::VerdictProvenance`).
- * **Not** a verified human decision: the request hash, decision window, replay and the decision
- * itself are unchecked. Only the integrator's full verification decides what a verdict means.
+ * **Not** a verified human decision: the request hash, replay and the decision itself are
+ * unchecked. Only the integrator's full verification decides what a verdict means.
  */
 export interface VerdictProvenance {
   /** The certified device that signed the verdict (equal to the JWS `kid`). */
@@ -142,6 +142,8 @@ export interface VerdictProvenance {
 export function verifyVerdictProvenance(
   verdictJson: string,
   requestId: string,
+  createdAt: number,
+  expiresAt: number,
   accountId: string,
   rootPubkey: string,
   accountStates: readonly string[],
@@ -150,6 +152,8 @@ export function verifyVerdictProvenance(
     core().verify_verdict_provenance(
       verdictJson,
       requestId,
+      createdAt,
+      expiresAt,
       accountId,
       rootPubkey,
       JSON.stringify(accountStates),
