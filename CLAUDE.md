@@ -23,6 +23,12 @@ When you change a design decision, update the doc that owns it in the same chang
 
 Polyglot workspace: a Cargo workspace (Rust) **and** a pnpm workspace (TypeScript).
 
+The Rust toolchain is pinned in `rust-toolchain.toml`: the channel, `rustfmt` / `clippy` and the
+`wasm32-unknown-unknown` target. rustup installs it on the first `cargo` command in the repo. If rustup's
+auto-install is off (`RUSTUP_AUTO_INSTALL=0` or `rustup set auto-install disable`) that command fails with
+"toolchain not installed"; run `rustup toolchain install` (no arguments) in the repo to fetch it. The workspace
+must also build on its MSRV, the `rust-version` in `Cargo.toml`; CI checks it (`.github/workflows/msrv.yml`).
+
 ```sh
 # Rust core
 cargo check                       # type-check
