@@ -30,8 +30,14 @@ accident. That module's comment lists exactly what they check. In short:
 
 Known limits:
 
-- A single cast to a named shape with optional members (`relay as LooseShape`) gets through.
-- So does laundering through a generic helper (`launder<Shape>(relay)`). Review has to catch these.
+- A single cast to a named shape with optional members (`relay as LooseShape`, or an alias such as
+  `type P = Partial<AccountRelay>`) gets through.
+- So does a single cast to an intersection (`relay as AccountRelay & { extra?: 1 }`).
+- So does laundering through a generic helper (`launder<Shape>(relay)`).
+- So does reflection the rules can't see by name: `({}).constructor`, `Function("return this")()`, `new Proxy`,
+  `structuredClone`, or a subclass of `AccountRelay`.
+
+Review has to catch these. `eslint/relay-private-state.js` lists them in full.
 
 `test/private-state-plants.ts` plants each violation. Its disable directives must stay in use, so lint fails if
 a rule stops firing. `test/lint-coverage.test.ts` fails if any other file disables `no-restricted-syntax`,

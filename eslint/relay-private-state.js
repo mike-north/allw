@@ -43,14 +43,19 @@
  *
  * Not covered (known limits):
  * - A single cast to a named interface or type alias declared with optional members
- *   (`relay as LooseShape`). Syntax alone can't tell that from a legitimate cast. The declaration
- *   has to live in a test file, where review sees it.
+ *   (`relay as LooseShape`), including an alias of a utility type (`type P = Partial<AccountRelay>`,
+ *   then `relay as P`). Syntax alone can't tell that from a legitimate cast. The declaration has to
+ *   live in a test file, where review sees it.
+ * - A single cast to an intersection (`relay as AccountRelay & { extra?: 1 }`), which TypeScript
+ *   accepts because the target is a subtype.
  * - Laundering through a generic (`function launder<T>(x: unknown): T { return x as T }`). The
  *   cast inside is a cast to a type parameter, which syntax can't tell from a legitimate generic
  *   helper.
- * - Reaching `Object` through a value the rules can't see by name, such as one passed in as a
- *   function argument, or a reflection name computed at runtime on anything but `Object` or
- *   `globalThis`.
+ * - Reaching `Object` or the global object through a value the rules can't see by name: one passed
+ *   in as a function argument, `({}).constructor`, `Function("return this")()`, or a reflection
+ *   name computed at runtime on anything but `Object` or `globalThis`.
+ * - Other ways to get an object that isn't a constructed relay, or to intercept one: `new Proxy`,
+ *   `structuredClone`, or a test subclass of `AccountRelay` that overrides members.
  * - Ambient declarations outside `test/`. `vitest-environment-d.ts` augments `Cloudflare.Env`,
  *   which is what types `env`.
  */

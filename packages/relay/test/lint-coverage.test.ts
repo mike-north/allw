@@ -30,35 +30,44 @@ const GUARDED_RULE = "no-restricted-syntax";
 const ESLINT = "eslint";
 
 /**
- * A directive comment: `//` or `/*`, optional whitespace, then `eslint`, `eslint-disable`,
- * `eslint-disable-line`, `eslint-disable-next-line` or `eslint-enable`, then the rest of the line.
+ * Every comment in a source, whole: a `/* … *\/` block (which may span lines) or a `//` line
+ * comment. A `//` or `/*` inside a string literal can be misread as a comment start; that can only
+ * add a false finding, never hide a directive that starts its own comment.
+ */
+const COMMENT = /\/\*([\s\S]*?)\*\/|\/\/([^\n]*)/g;
+
+/**
+ * A directive at the start of a comment's text: `eslint`, `eslint-disable`, `eslint-disable-line`,
+ * `eslint-disable-next-line` or `eslint-enable`, then the rest of the comment, newlines included.
  */
 const DIRECTIVE = new RegExp(
-  String.raw`(?:\/\/|\/\*)\s*(${ESLINT}(?:-disable(?:-next-line|-line)?|-enable)?)(?![\w-])([^\n]*)`,
-  "g",
+  String.raw`^\s*(${ESLINT}(?:-disable(?:-next-line|-line)?|-enable)?)(?![\w-])([\s\S]*)$`,
 );
 
-/** `path:line: reason` for each directive in `source` that would take code out of the guard. */
+/**
+ * `path:line: reason` for each directive in `source` that would take code out of the guard. A
+ * directive is read across its whole comment, so one that names the rule on a later line of a
+ * block comment still counts. Any mention of the rule in a directive's rule list counts, which errs
+ * toward flagging.
+ */
 function guardOptOuts(path: string, source: string): string[] {
   const found: string[] = [];
-  source.split("\n").forEach((line, index) => {
-    for (const [, kind = "", rest = ""] of line.matchAll(DIRECTIVE)) {
-      const where = `${path}:${String(index + 1)}`;
-      const rules = (rest.split("--")[0] ?? "")
-        .replace(/\*\/.*$/, "")
-        .split(",")
-        .map((rule) => rule.trim())
-        .filter((rule) => rule !== "");
-      if (kind === ESLINT) {
-        if (rest.includes(GUARDED_RULE)) found.push(`${where}: inline config for ${GUARDED_RULE}`);
-      } else if (kind.startsWith(`${ESLINT}-disable`)) {
-        if (rules.length === 0) found.push(`${where}: blanket disable`);
-        else if (rules.includes(GUARDED_RULE) && path !== PLANTS_PATH) {
-          found.push(`${where}: disables ${GUARDED_RULE}`);
-        }
+  for (const comment of source.matchAll(COMMENT)) {
+    const [, kind = "", rest = ""] = DIRECTIVE.exec(comment[1] ?? comment[2] ?? "") ?? [];
+    if (kind === "") continue;
+    const line = source.slice(0, comment.index).split("\n").length;
+    const where = `${path}:${String(line)}`;
+    // ESLint reads a directive's description after `--`; the rule list comes before it.
+    const ruleList = rest.split(/\s--\s/)[0] ?? "";
+    if (kind === ESLINT) {
+      if (rest.includes(GUARDED_RULE)) found.push(`${where}: inline config for ${GUARDED_RULE}`);
+    } else if (kind.startsWith(`${ESLINT}-disable`)) {
+      if (ruleList.replace(/[\s*]/g, "") === "") found.push(`${where}: blanket disable`);
+      else if (ruleList.includes(GUARDED_RULE) && path !== PLANTS_PATH) {
+        found.push(`${where}: disables ${GUARDED_RULE}`);
       }
     }
-  });
+  }
   return found;
 }
 
@@ -82,7 +91,7 @@ describe("relay test sources stay under the private-state lint rules", () => {
     expect(UNCOVERED).toEqual([]);
   });
 
-  it("flags planted opt-outs, and allows the plants file and other rules", () => {
+  it("flags planted opt-outs, multi-line ones included, and allows the plants file and other rules", () => {
     const disableGuarded = directive("-disable-next-line", `${GUARDED_RULE} -- planted`);
     const disableOther = directive(
       "-disable-next-line",
@@ -106,6 +115,14 @@ describe("relay test sources stay under the private-state lint rules", () => {
     ]);
     expect(guardOptOuts(PLANTS_PATH, blanket)).toEqual([`${PLANTS_PATH}:1: blanket disable`]);
     expect(guardOptOuts("./planted.test.ts", inlineConfig)).toEqual([
+      `./planted.test.ts:1: inline config for ${GUARDED_RULE}`,
+    ]);
+    const multiLineDisable = `/* ${ESLINT}-disable-next-line semi,\n  ${GUARDED_RULE} */`;
+    expect(guardOptOuts("./planted.test.ts", `x;\n${multiLineDisable}`)).toEqual([
+      `./planted.test.ts:2: disables ${GUARDED_RULE}`,
+    ]);
+    const multiLineConfig = `/* ${ESLINT}\n  ${GUARDED_RULE}: "off" */`;
+    expect(guardOptOuts("./planted.test.ts", multiLineConfig)).toEqual([
       `./planted.test.ts:1: inline config for ${GUARDED_RULE}`,
     ]);
     expect(guardOptOuts(PLANTS_PATH, disableGuarded)).toEqual([]);
