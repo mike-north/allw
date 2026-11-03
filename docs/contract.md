@@ -148,7 +148,9 @@ error names what broke the rule; surfaces only render it. Decided 2026-11-03 (#2
    lower than `action.risk` would hide the record's tier behind a milder one, so it is refused. The error names
    both tiers (`context risk low is lower than action.risk critical`). A context may **raise** the risk, since an
    integrator can ask for more care than the record's tier, so `risk >= action.risk` passes. Showing both tiers
-   when they differ is a later display change ([#340](https://github.com/mike-north/allw/issues/340)).
+   when they differ is a later display change ([#340](https://github.com/mike-north/allw/issues/340)). On the raw
+   SDK path both `risk` and `action.risk` are integrator inputs, so this is a consistency check: what is shown can't
+   be milder than what is recorded. It can't stop an integrator that writes `low` in both places.
 
 The integrator side doesn't check these today: an integrator that sends such a context gets a denial, not an
 error.
