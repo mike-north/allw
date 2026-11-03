@@ -418,7 +418,9 @@ every verdict in full (`docs/contract.md` §Verification checklist).
 
 A device can still backdate `decided_at` inside the request's window, so a device whose certificate
 expired partway through a request can answer it with a time when the certificate was valid. That
-holds only for a request created before the certificate expired, and the integrator's own
+holds only for a request whose envelope `created_at` precedes the certificate's expiry. That
+`created_at` is the submitter's clock, which the relay does not check at submit (see #248). The
+integrator's own
 `verify_verdict` accepts the same verdict. Revocation, not certificate expiry, is how a device is
 cut off at once.
 
