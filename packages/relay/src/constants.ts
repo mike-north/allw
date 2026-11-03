@@ -15,3 +15,44 @@
  * without waiting.
  */
 export const PAIRING_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+/**
+ * How long a terminal (expired / resolved / retracted) request row and its verdict are kept after
+ * `terminal_at` before the alarm's sweep deletes them.
+ */
+export const REQUEST_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+// ---------------------------------------------------------------------------
+// Abuse limits on the unauthenticated `POST /{acct}/requests` (#248). Exported so tests can probe
+// each boundary (at the limit and one past it) without restating the numbers.
+// ---------------------------------------------------------------------------
+
+/**
+ * Largest accepted `POST /{acct}/requests` body, in bytes. Checked before JSON parsing (from
+ * `Content-Length` when present, and again while reading the stream), so an oversized body is
+ * refused with 413 without being buffered or parsed. Leaves room for the routing fields around a
+ * maximum-size {@link MAX_CONTEXT_CIPHERTEXT_BYTES} ciphertext.
+ */
+export const MAX_REQUEST_BODY_BYTES = 128 * 1024;
+
+/** Largest accepted `context_ciphertext` (UTF-8 bytes of the JWE string); larger gets 413. */
+export const MAX_CONTEXT_CIPHERTEXT_BYTES = 64 * 1024;
+
+/**
+ * Default request horizon: `expires_at - now` above this gets 400. Fifteen minutes covers the
+ * hooks' 420 s `MAX_TIMEOUT_MS` with margin. Self-hosters may override it with the
+ * `MAX_REQUEST_TTL_MS` Worker var (see `parseMaxRequestTtlMs`).
+ */
+export const DEFAULT_MAX_REQUEST_TTL_MS = 15 * 60 * 1000;
+
+/**
+ * Most live pending requests one account may hold; the next submit gets 429. Requests past their
+ * `expires_at` (or past the horizon), resolved, expired and retracted requests do not count.
+ */
+export const MAX_PENDING_REQUESTS_PER_ACCOUNT = 64;
+
+/**
+ * Largest accepted `POST /{acct}/pairing/start` or `POST /{acct}/pairing/complete` body, in bytes
+ * (checked before parsing; larger gets 413). Both bodies are a few keys plus short tokens.
+ */
+export const MAX_PAIRING_BODY_BYTES = 16 * 1024;

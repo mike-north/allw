@@ -14,6 +14,14 @@ export default defineConfig({
   plugins: [
     cloudflareTest({
       wrangler: { configPath: "./wrangler.jsonc" },
+      miniflare: {
+        // Test requests carry no `CF-Connecting-IP`, so every test in a run would share the one
+        // `ip|unknown` bucket of the per-client limiter. Raise only that binding's limit here; the
+        // per-account bindings keep their `wrangler.jsonc` limits (see test/support/README.md).
+        ratelimits: {
+          RATE_LIMIT_CLIENT: { simple: { limit: 1_000_000, period: 60 } },
+        },
+      },
     }),
   ],
   test: {

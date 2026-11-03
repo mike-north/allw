@@ -31,15 +31,25 @@ import {
   type PushTransportRegistry,
 } from "../src/push.js";
 import { WebPushTransport, type VapidConfig } from "../src/web-push.js";
-import { pairingStartBody, testAccount } from "./support/accounts.js";
+import { pairingStartBody, testAccount, testRequestId as rid } from "./support/accounts.js";
 import { DEVICE_X25519_PUBKEY } from "./support/keys.js";
+import { bindAccountRoot, pinRelayClock } from "./support/relay-state.js";
 
 /** A full-order X25519 device key (pairing rejects small-order keys, #248). */
 const DEVICE_PUBKEY = DEVICE_X25519_PUBKEY;
-/** Far-future expiry (2100-01-01Z, ms) — deterministic and always after the relay's clock. */
+/** Far-future expiry (2100-01-01Z, ms) — deterministic and always after the real clock. */
 const FUTURE_EXPIRES_AT = 4102444800000;
-/** A fixed creation timestamp (2023-11-14Z, ms). */
-const CREATED_AT = 1700000000000;
+/**
+ * The relay's injected clock for accounts that submit: two minutes before
+ * {@link FUTURE_EXPIRES_AT}, so that fixed expiry is inside the request horizon (#248).
+ */
+const RELAY_NOW = FUTURE_EXPIRES_AT - 2 * 60 * 1000;
+/** Accounts whose root is bound and whose relay clock is pinned to {@link RELAY_NOW}. */
+const prepared = new Set<string>();
+/** A fixed creation timestamp: one minute before {@link RELAY_NOW}, inside the request horizon. */
+const CREATED_AT = RELAY_NOW - 60_000;
+/** The latest expiry the relay accepts at {@link RELAY_NOW}: the default 15-minute horizon (#248). */
+const HORIZON_EXPIRES_AT = RELAY_NOW + 15 * 60_000;
 
 const FCM_ENDPOINT = "https://fcm.googleapis.com/fcm/send/c3Vic2NyaXB0aW9uLWE";
 const MOZILLA_ENDPOINT = "https://updates.push.services.mozilla.com/wpush/v2/c3Vic2NyaXB0aW9uLWI";
@@ -54,6 +64,12 @@ async function post<T>(
   body: unknown,
   headers: Record<string, string> = {},
 ): Promise<{ status: number; data: T }> {
+  if (subPath === "/requests" && !prepared.has(accountId)) {
+    // Submits need a bound root (#248); accounts seeded without pairing bind the test root directly.
+    await bindAccountRoot(accountId);
+    await pinRelayClock(accountId, RELAY_NOW);
+    prepared.add(accountId);
+  }
   const resp = await SELF.fetch(relayUrl(accountId, subPath), {
     method: "POST",
     headers: { "Content-Type": "application/json", ...headers },
@@ -132,7 +148,8 @@ async function installWebPush(
     async (input) => new Response(null, { status: statusFor(String(input)) }),
   );
   await installPushTransports(accountId, {
-    webpush: new WebPushTransport({ vapid: await makeVapid(), fetcher }),
+    // Same clock as the relay instance, as `buildPushTransports` wires it in production.
+    webpush: new WebPushTransport({ vapid: await makeVapid(), fetcher, now: () => RELAY_NOW }),
   });
   return fetcher;
 }
@@ -378,7 +395,7 @@ describe("submit — APNs and FCM tokens are pruned only on an unregistered answ
       () => new Response(null, { status: 200 }),
     );
 
-    await submitAndSettle(acct, "req-native-prune-apns");
+    await submitAndSettle(acct, rid("req-native-prune-apns"));
 
     expect(await readPushTokens(acct)).toEqual([{ token: FCM_TOKEN }]);
   });
@@ -390,7 +407,7 @@ describe("submit — APNs and FCM tokens are pruned only on an unregistered answ
       () => new Response(FCM_UNREGISTERED, { status: 404 }),
     );
 
-    await submitAndSettle(acct, "req-native-prune-fcm");
+    await submitAndSettle(acct, rid("req-native-prune-fcm"));
 
     expect(await readPushTokens(acct)).toEqual([{ token: APNS_TOKEN }]);
   });
@@ -408,7 +425,7 @@ describe("submit — APNs and FCM tokens are pruned only on an unregistered answ
       () => new Response(body, { status }),
     );
 
-    await submitAndSettle(acct, `req-native-keep-${String(status)}`);
+    await submitAndSettle(acct, rid(`req-native-keep-${String(status)}`));
 
     expect(await readPushTokens(acct)).toEqual(
       expect.arrayContaining([{ token: APNS_TOKEN }, { token: FCM_TOKEN }]),
@@ -434,7 +451,7 @@ describe("submit — Web Push wakeups off the response path, with pruning", () =
       const submit = await post<{ status: string; push_wakeups: number }>(
         acct,
         "/requests",
-        envelope(`req-webpush-prune-${String(goneStatus)}`),
+        envelope(rid(`req-webpush-prune-${String(goneStatus)}`)),
       );
 
       expect(submit.status).toBe(202);
@@ -460,7 +477,7 @@ describe("submit — Web Push wakeups off the response path, with pruning", () =
       const submit = await post<{ status: string; push_wakeups: number }>(
         acct,
         "/requests",
-        envelope(`req-webpush-keep-${String(status)}`),
+        envelope(rid(`req-webpush-keep-${String(status)}`)),
       );
 
       expect(submit.status).toBe(202);
@@ -482,7 +499,7 @@ describe("submit — Web Push wakeups off the response path, with pruning", () =
     const submit = await post<{ push_wakeups: number }>(
       acct,
       "/requests",
-      envelope("req-webpush-network-error"),
+      envelope(rid("req-webpush-network-error")),
     );
 
     expect(submit.status).toBe(202);
@@ -511,7 +528,7 @@ describe("submit — Web Push wakeups off the response path, with pruning", () =
     const submit = await post<{ status: string; push_wakeups: number }>(
       acct,
       "/requests",
-      envelope("req-webpush-hanging"),
+      envelope(rid("req-webpush-hanging")),
     );
 
     // The submit answered without waiting on the hung push.
@@ -537,7 +554,7 @@ describe("submit — Web Push wakeups off the response path, with pruning", () =
       const submit = await post<{ push_wakeups: number }>(
         acct,
         "/requests",
-        envelope("req-webpush-legacy-row"),
+        envelope(rid("req-webpush-legacy-row")),
       );
 
       expect(submit.status).toBe(202);
@@ -558,7 +575,7 @@ describe("submit — Web Push wakeups off the response path, with pruning", () =
     const submit = await post<{ status: string; push_wakeups: number }>(
       acct,
       "/requests",
-      envelope("req-webpush-unconfigured"),
+      envelope(rid("req-webpush-unconfigured")),
     );
 
     expect(submit.status).toBe(202);
@@ -585,7 +602,7 @@ describe("submit — Web Push wakeups off the response path, with pruning", () =
     const submit = await post<{ push_wakeups: number }>(
       acct,
       "/requests",
-      envelope("req-webpush-newest-first"),
+      envelope(rid("req-webpush-newest-first")),
     );
 
     expect(submit.data.push_wakeups).toBe(32);
@@ -604,7 +621,7 @@ describe("submit — Web Push wakeups off the response path, with pruning", () =
     const submit = await post<{ push_wakeups: number }>(
       acct,
       "/requests",
-      envelope("req-webpush-payloadless"),
+      envelope(rid("req-webpush-payloadless")),
     );
 
     expect(submit.data.push_wakeups).toBe(1);
@@ -613,8 +630,8 @@ describe("submit — Web Push wakeups off the response path, with pruning", () =
     const [input, init] = fetcher.mock.calls[0] ?? [];
     const sent = new Request(String(input), init);
     expect((await sent.arrayBuffer()).byteLength).toBe(0);
-    // The fixture deadline is in 2100, so the TTL is the 28-day push-service ceiling.
-    expect(sent.headers.get("TTL")).toBe(String(28 * 24 * 60 * 60));
+    // The deadline is 2 minutes after the relay clock, rounded up to the 5-minute TTL bucket.
+    expect(sent.headers.get("TTL")).toBe(String(5 * 60));
     expect(sent.headers.get("Urgency")).toBe("high");
   });
 });
@@ -634,7 +651,7 @@ describe("submit — Web Push wakeups are coalesced per subscription", () => {
       const submit = await post<{ status: string; push_wakeups: number }>(
         acct,
         "/requests",
-        envelope(`req-webpush-coalesce-${String(n)}`),
+        envelope(rid(`req-webpush-coalesce-${String(n)}`)),
       );
       expect(submit.status).toBe(202);
       wakeups.push(submit.data.push_wakeups);
@@ -655,13 +672,13 @@ describe("submit — Web Push wakeups are coalesced per subscription", () => {
     const first = await post<{ push_wakeups: number }>(
       acct,
       "/requests",
-      envelope("req-webpush-coalesce-finish-1"),
+      envelope(rid("req-webpush-coalesce-finish-1")),
     );
     await pushFanOutSettled(acct);
     const second = await post<{ push_wakeups: number }>(
       acct,
       "/requests",
-      envelope("req-webpush-coalesce-finish-2"),
+      envelope(rid("req-webpush-coalesce-finish-2")),
     );
     await pushFanOutSettled(acct);
 
@@ -693,18 +710,18 @@ describe("submit — Web Push wakeups are coalesced per subscription", () => {
     const first = await post<{ push_wakeups: number }>(
       acct,
       "/requests",
-      envelope("req-coalesce-apns-1"),
+      envelope(rid("req-coalesce-apns-1")),
     );
     const second = await post<{ push_wakeups: number }>(
       acct,
       "/requests",
-      envelope("req-coalesce-apns-2"),
+      envelope(rid("req-coalesce-apns-2")),
     );
     await pushFanOutSettled(acct);
 
     expect(first.data.push_wakeups).toBe(2);
     expect(second.data.push_wakeups).toBe(1);
-    expect(apnsRequestIds).toEqual(["req-coalesce-apns-1", "req-coalesce-apns-2"]);
+    expect(apnsRequestIds).toEqual([rid("req-coalesce-apns-1"), rid("req-coalesce-apns-2")]);
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 });
@@ -826,10 +843,10 @@ describe("submit — a coalesced submit gets a trailing wakeup when the window e
     await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
     const fetcher = await installWebPush(acct, () => 201);
 
-    const before = Date.now();
-    expect(await submitRequest(acct, envelope("req-trailing-basic-1"))).toBe(1);
+    const before = RELAY_NOW;
+    expect(await submitRequest(acct, envelope(rid("req-trailing-basic-1")))).toBe(1);
     await pushFanOutSettled(acct);
-    expect(await submitRequest(acct, envelope("req-trailing-basic-2"))).toBe(0);
+    expect(await submitRequest(acct, envelope(rid("req-trailing-basic-2")))).toBe(0);
     await pushFanOutSettled(acct);
     expect(fetcher).toHaveBeenCalledTimes(1);
 
@@ -837,7 +854,7 @@ describe("submit — a coalesced submit gets a trailing wakeup when the window e
     const [row] = await readTrailingRows(acct);
     expect(row?.token).toBe(FCM_ENDPOINT);
     expect(row?.due_at).toBeGreaterThanOrEqual(before + WEB_PUSH_COALESCE_MS + 1);
-    expect(row?.due_at).toBeLessThanOrEqual(Date.now() + WEB_PUSH_COALESCE_MS + 1);
+    expect(row?.due_at).toBeLessThanOrEqual(RELAY_NOW + WEB_PUSH_COALESCE_MS + 1);
     const scheduled = await readAlarmSchedule(acct);
     expect(scheduled.purposes["webpush-trailing-wakeup"]).toBe(row?.due_at);
 
@@ -858,7 +875,7 @@ describe("submit — a coalesced submit gets a trailing wakeup when the window e
 
     const wakeups: number[] = [];
     for (let n = 0; n < 6; n++) {
-      wakeups.push(await submitRequest(acct, envelope(`req-trailing-burst-${String(n)}`)));
+      wakeups.push(await submitRequest(acct, envelope(rid(`req-trailing-burst-${String(n)}`))));
     }
     await pushFanOutSettled(acct);
     expect(wakeups).toEqual([2, 0, 0, 0, 0, 0]);
@@ -881,17 +898,20 @@ describe("submit — a coalesced submit gets a trailing wakeup when the window e
 
     // A short-lived request is woken first; a long-lived one is coalesced behind it.
     await submitRequest(acct, {
-      ...envelope("req-trailing-ttl-short"),
-      expires_at: Date.now() + 90_000,
+      ...envelope(rid("req-trailing-ttl-short")),
+      expires_at: RELAY_NOW + 90_000,
     });
     await pushFanOutSettled(acct);
-    await submitRequest(acct, envelope("req-trailing-ttl-long"));
+    await submitRequest(acct, {
+      ...envelope(rid("req-trailing-ttl-long")),
+      expires_at: HORIZON_EXPIRES_AT,
+    });
     await endWindowAndRunAlarm(acct);
 
     expect(fetcher).toHaveBeenCalledTimes(2);
-    // 90 s rounds up to the 5-minute bucket; the 2100 deadline is the 28-day ceiling.
+    // 90 s rounds up to the 5-minute bucket; the 15-minute horizon rounds up to the 1-hour one.
     expect(ttlOf(fetcher, 0)).toBe(String(5 * 60));
-    expect(ttlOf(fetcher, 1)).toBe(String(28 * 24 * 60 * 60));
+    expect(ttlOf(fetcher, 1)).toBe(String(60 * 60));
   });
 
   it("sends nothing when no request is still pending by the time the window ends", async () => {
@@ -899,9 +919,9 @@ describe("submit — a coalesced submit gets a trailing wakeup when the window e
     await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
     const fetcher = await installWebPush(acct, () => 201);
 
-    await submitRequest(acct, envelope("req-trailing-resolved-1"));
+    await submitRequest(acct, envelope(rid("req-trailing-resolved-1")));
     await pushFanOutSettled(acct);
-    await submitRequest(acct, envelope("req-trailing-resolved-2"));
+    await submitRequest(acct, envelope(rid("req-trailing-resolved-2")));
     await runInDurableObject(relayStub(acct), (instance: AccountRelay) => {
       (instance as unknown as RelayInternals).sql.exec(
         `UPDATE request SET status = 'resolved', terminal_at = ?`,
@@ -921,9 +941,9 @@ describe("submit — a coalesced submit gets a trailing wakeup when the window e
     await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
     const fetcher = await installWebPush(acct, () => 201);
 
-    await submitRequest(acct, envelope("req-trailing-removed-1"));
+    await submitRequest(acct, envelope(rid("req-trailing-removed-1")));
     await pushFanOutSettled(acct);
-    await submitRequest(acct, envelope("req-trailing-removed-2"));
+    await submitRequest(acct, envelope(rid("req-trailing-removed-2")));
     await runInDurableObject(relayStub(acct), (instance: AccountRelay) => {
       (instance as unknown as RelayInternals).sql.exec(`DELETE FROM device_push_token`);
     });
@@ -939,13 +959,13 @@ describe("submit — a coalesced submit gets a trailing wakeup when the window e
     await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
     const fetcher = await installWebPush(acct, () => 201);
 
-    await submitRequest(acct, envelope("req-trailing-blocked-1"));
+    await submitRequest(acct, envelope(rid("req-trailing-blocked-1")));
     await pushFanOutSettled(acct);
-    await submitRequest(acct, envelope("req-trailing-blocked-2"));
+    await submitRequest(acct, envelope(rid("req-trailing-blocked-2")));
 
     // The alarm fires while the coalescer still holds the first claim (as if the alarm ran early):
     // the per-window bound wins, and the owed wakeup moves to the next claimable time.
-    const fired = Date.now();
+    const fired = RELAY_NOW;
     await endWindowAndRunAlarm(acct, { keepClaims: true });
 
     expect(fetcher).toHaveBeenCalledTimes(1);
@@ -962,11 +982,11 @@ describe("submit — a coalesced submit gets a trailing wakeup when the window e
       { transport: "webpush", token: FCM_ENDPOINT },
     ]);
     const fetcher = await installWebPush(acct, () => 201);
-    await submitRequest(acct, envelope("req-trailing-in-flight-1"));
+    await submitRequest(acct, envelope(rid("req-trailing-in-flight-1")));
     await pushFanOutSettled(acct);
-    await submitRequest(acct, envelope("req-trailing-in-flight-2"));
+    await submitRequest(acct, envelope(rid("req-trailing-in-flight-2")));
 
-    const fired = Date.now();
+    const fired = RELAY_NOW;
     await runInDurableObject(relayStub(acct), async (instance: AccountRelay) => {
       const relay = instance as unknown as RelayInternals;
       // Claimed long ago and never released: in flight, with its window long over.
@@ -987,15 +1007,15 @@ describe("submit — a coalesced submit gets a trailing wakeup when the window e
     await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
     const fetcher = await installWebPush(acct, () => 201);
 
-    await submitRequest(acct, envelope("req-trailing-superseded-1"));
+    await submitRequest(acct, envelope(rid("req-trailing-superseded-1")));
     await pushFanOutSettled(acct);
-    await submitRequest(acct, envelope("req-trailing-superseded-2"));
+    await submitRequest(acct, envelope(rid("req-trailing-superseded-2")));
     expect(await readTrailingRows(acct)).toHaveLength(1);
 
     // The window passes and a third submit is woken directly: that wakeup is sent after request 2
     // was stored, so it covers it and nothing more is owed.
     await letWindowPassFor(acct);
-    expect(await submitRequest(acct, envelope("req-trailing-superseded-3"))).toBe(1);
+    expect(await submitRequest(acct, envelope(rid("req-trailing-superseded-3")))).toBe(1);
     await pushFanOutSettled(acct);
     expect(await readTrailingRows(acct)).toEqual([]);
 
@@ -1008,14 +1028,16 @@ describe("submit — a coalesced submit gets a trailing wakeup when the window e
     await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
     const fetcher = await installWebPush(acct, () => 201);
 
-    await submitRequest(acct, envelope("req-trailing-evicted-1"));
+    await submitRequest(acct, envelope(rid("req-trailing-evicted-1")));
     await pushFanOutSettled(acct);
-    await submitRequest(acct, envelope("req-trailing-evicted-2"));
+    await submitRequest(acct, envelope(rid("req-trailing-evicted-2")));
 
     // A new instance on the same storage: nothing in memory, only what SQLite kept.
     await runInDurableObject(relayStub(acct), async (instance: AccountRelay, state) => {
       const fresh = new AccountRelay(state, env as unknown as Env) as unknown as RelayInternals;
       fresh.pushTransports = (instance as unknown as RelayInternals).pushTransports;
+      // A fresh instance starts on the real clock; pin it like the evicted one (#248 horizon).
+      (fresh as unknown as { now: () => number }).now = () => RELAY_NOW;
       makeTrailingWakeupsDue(fresh);
       letWindowPass(fresh);
       await fresh.alarm();
@@ -1031,10 +1053,10 @@ describe("submit — a coalesced submit gets a trailing wakeup when the window e
     await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
     await installWebPush(acct, () => 201);
 
-    const expiresAt = Date.now() + 10 * 60_000;
-    await submitRequest(acct, { ...envelope("req-trailing-shared-1"), expires_at: expiresAt });
+    const expiresAt = RELAY_NOW + 10 * 60_000;
+    await submitRequest(acct, { ...envelope(rid("req-trailing-shared-1")), expires_at: expiresAt });
     await pushFanOutSettled(acct);
-    await submitRequest(acct, { ...envelope("req-trailing-shared-2"), expires_at: expiresAt });
+    await submitRequest(acct, { ...envelope(rid("req-trailing-shared-2")), expires_at: expiresAt });
 
     const both = await readAlarmSchedule(acct);
     const trailingDue = both.purposes["webpush-trailing-wakeup"];
@@ -1058,34 +1080,35 @@ describe("submit — a wakeup's TTL covers every pending request, not just its o
     await pairWithPushTokens(acct, [{ transport: "webpush", token: MOZILLA_ENDPOINT }]);
     const fetcher = await installWebPush(acct, () => 201);
 
-    await submitRequest(acct, envelope("req-ttl-long"));
+    await submitRequest(acct, { ...envelope(rid("req-ttl-long")), expires_at: HORIZON_EXPIRES_AT });
     await pushFanOutSettled(acct);
     await letWindowPassFor(acct);
     await submitRequest(acct, {
-      ...envelope("req-ttl-short-1"),
-      expires_at: Date.now() + 90_000,
+      ...envelope(rid("req-ttl-short-1")),
+      expires_at: RELAY_NOW + 90_000,
     });
     await pushFanOutSettled(acct);
 
     // Once the long-lived request is resolved, only the short-lived ones remain.
     await runInDurableObject(relayStub(acct), (instance: AccountRelay) => {
       (instance as unknown as RelayInternals).sql.exec(
-        `UPDATE request SET status = 'resolved', terminal_at = ? WHERE request_id = 'req-ttl-long'`,
+        `UPDATE request SET status = 'resolved', terminal_at = ? WHERE request_id = ?`,
         CREATED_AT,
+        rid("req-ttl-long"),
       );
     });
     await letWindowPassFor(acct);
     await submitRequest(acct, {
-      ...envelope("req-ttl-short-2"),
-      expires_at: Date.now() + 90_000,
+      ...envelope(rid("req-ttl-short-2")),
+      expires_at: RELAY_NOW + 90_000,
     });
     await pushFanOutSettled(acct);
 
     expect(fetcher).toHaveBeenCalledTimes(3);
-    const day28 = String(28 * 24 * 60 * 60);
-    expect(ttlOf(fetcher, 0)).toBe(day28);
-    // The 90 s request alone would get the 5-minute bucket; the pending 2100 request wins.
-    expect(ttlOf(fetcher, 1)).toBe(day28);
+    const hour = String(60 * 60);
+    expect(ttlOf(fetcher, 0)).toBe(hour);
+    // The 90 s request alone would get the 5-minute bucket; the pending horizon request wins.
+    expect(ttlOf(fetcher, 1)).toBe(hour);
     expect(ttlOf(fetcher, 2)).toBe(String(5 * 60));
   });
 });
@@ -1120,6 +1143,8 @@ describe("submit — the coalescing bound survives eviction (#319)", () => {
         fetch(request: Request): Promise<Response>;
       };
       fresh.pushTransports = (instance as unknown as RelayInternals).pushTransports;
+      // A fresh instance starts on the real clock; pin it like the evicted one (#248 horizon).
+      (fresh as unknown as { now: () => number }).now = () => RELAY_NOW;
       const response = await fresh.fetch(
         new Request(relayUrl(accountId, "/requests"), {
           method: "POST",
@@ -1139,9 +1164,9 @@ describe("submit — the coalescing bound survives eviction (#319)", () => {
     await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
     const fetcher = await installWebPush(acct, () => 201);
 
-    expect(await submitRequest(acct, envelope("req-claims-evicted-1"))).toBe(1);
+    expect(await submitRequest(acct, envelope(rid("req-claims-evicted-1")))).toBe(1);
     await pushFanOutSettled(acct);
-    expect(await submitViaFreshInstance(acct, envelope("req-claims-evicted-2"))).toBe(0);
+    expect(await submitViaFreshInstance(acct, envelope(rid("req-claims-evicted-2")))).toBe(0);
 
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect(await readTrailingRows(acct)).toHaveLength(1);
@@ -1152,10 +1177,10 @@ describe("submit — the coalescing bound survives eviction (#319)", () => {
     await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
     const fetcher = await installWebPush(acct, () => 201);
 
-    await submitRequest(acct, envelope("req-claims-later-1"));
+    await submitRequest(acct, envelope(rid("req-claims-later-1")));
     await pushFanOutSettled(acct);
     await letWindowPassFor(acct);
-    expect(await submitViaFreshInstance(acct, envelope("req-claims-later-2"))).toBe(1);
+    expect(await submitViaFreshInstance(acct, envelope(rid("req-claims-later-2")))).toBe(1);
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
@@ -1163,8 +1188,8 @@ describe("submit — the coalescing bound survives eviction (#319)", () => {
     const acct = testAccount("acct-webpush-claims-row");
     await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
     await installWebPush(acct, () => 201);
-    const before = Date.now();
-    await submitRequest(acct, envelope("req-claims-row-1"));
+    const before = RELAY_NOW;
+    await submitRequest(acct, envelope(rid("req-claims-row-1")));
     await pushFanOutSettled(acct);
 
     const rows = await runInDurableObject(relayStub(acct), (instance: AccountRelay) => [
@@ -1175,7 +1200,7 @@ describe("submit — the coalescing bound survives eviction (#319)", () => {
     ]);
     expect(rows).toHaveLength(1);
     expect(rows[0]?.last_wakeup_at).toBeGreaterThanOrEqual(before);
-    expect(rows[0]?.last_wakeup_at).toBeLessThanOrEqual(Date.now());
+    expect(rows[0]?.last_wakeup_at).toBeLessThanOrEqual(RELAY_NOW);
   });
 });
 
@@ -1186,7 +1211,7 @@ describe("submit — a future-dated stored claim blocks for one window at most (
     const acct = testAccount("acct-webpush-future-claim");
     await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
     const fetcher = await installWebPush(acct, () => 201);
-    const dayAhead = Date.now() + 24 * 60 * 60 * 1000;
+    const dayAhead = RELAY_NOW + 24 * 60 * 60 * 1000;
     await runInDurableObject(relayStub(acct), (instance: AccountRelay) => {
       (instance as unknown as RelayInternals).sql.exec(
         `UPDATE device_push_token SET last_wakeup_at = ?`,
@@ -1194,11 +1219,11 @@ describe("submit — a future-dated stored claim blocks for one window at most (
       );
     });
 
-    const before = Date.now();
-    expect(await submitRequest(acct, envelope("req-future-claim-1"))).toBe(0);
+    const before = RELAY_NOW;
+    expect(await submitRequest(acct, envelope(rid("req-future-claim-1")))).toBe(0);
     const [row] = await readTrailingRows(acct);
     expect(row?.due_at).toBeGreaterThanOrEqual(before + WEB_PUSH_COALESCE_MS + 1);
-    expect(row?.due_at).toBeLessThanOrEqual(Date.now() + WEB_PUSH_COALESCE_MS + 1);
+    expect(row?.due_at).toBeLessThanOrEqual(RELAY_NOW + WEB_PUSH_COALESCE_MS + 1);
 
     // At the window's end the trailing wakeup goes out: the future claim no longer blocks it.
     await runInDurableObject(relayStub(acct), async (instance: AccountRelay) => {
@@ -1224,16 +1249,16 @@ describe("submit — an owed trailing wakeup is cleared only by an accepted wake
     let status = 201;
     const fetcher = await installWebPush(acct, () => status);
 
-    await submitRequest(acct, envelope("req-n2-retry-1"));
+    await submitRequest(acct, envelope(rid("req-n2-retry-1")));
     await pushFanOutSettled(acct);
-    await submitRequest(acct, envelope("req-n2-retry-2"));
+    await submitRequest(acct, envelope(rid("req-n2-retry-2")));
     expect(await readTrailingRows(acct)).toHaveLength(1);
 
     // The window passes; the next submit is woken directly, but the push service fails it.
     await letWindowPassFor(acct);
     status = 503;
-    const claimed = Date.now();
-    expect(await submitRequest(acct, envelope("req-n2-retry-3"))).toBe(1);
+    const claimed = RELAY_NOW;
+    expect(await submitRequest(acct, envelope(rid("req-n2-retry-3")))).toBe(1);
     await pushFanOutSettled(acct);
 
     // The owed wakeup is kept, and is not due inside the new window.
@@ -1253,9 +1278,9 @@ describe("submit — an owed trailing wakeup is cleared only by an accepted wake
     let status = 201;
     const fetcher = await installWebPush(acct, () => status);
 
-    await submitRequest(acct, envelope("req-n2-once-1"));
+    await submitRequest(acct, envelope(rid("req-n2-once-1")));
     await pushFanOutSettled(acct);
-    await submitRequest(acct, envelope("req-n2-once-2"));
+    await submitRequest(acct, envelope(rid("req-n2-once-2")));
     status = 503;
     await endWindowAndRunAlarm(acct);
 
@@ -1269,9 +1294,9 @@ describe("submit — an owed trailing wakeup is cleared only by an accepted wake
     const acct = testAccount("acct-webpush-n2-in-flight-existing");
     await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
     await installWebPush(acct, () => 201);
-    await submitRequest(acct, envelope("req-n2-existing-1"));
+    await submitRequest(acct, envelope(rid("req-n2-existing-1")));
     await pushFanOutSettled(acct);
-    await submitRequest(acct, envelope("req-n2-existing-2"));
+    await submitRequest(acct, envelope(rid("req-n2-existing-2")));
     expect(await readTrailingRows(acct)).toHaveLength(1);
     await letWindowPassFor(acct);
     const vapid = await makeVapid();
@@ -1298,7 +1323,7 @@ describe("submit — an owed trailing wakeup is cleared only by an accepted wake
           new Request(relayUrl(acct, "/requests"), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(envelope(id)),
+            body: JSON.stringify(envelope(rid(id))),
           }),
         );
       }
@@ -1317,6 +1342,8 @@ describe("submit — an owed trailing wakeup is cleared only by an accepted wake
     // resolving the blocked push from another context.
     const acct = testAccount("acct-webpush-n2-in-flight");
     await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
+    // These submits call the instance directly, bypassing post()'s clock pin (#248 horizon).
+    await pinRelayClock(acct, RELAY_NOW);
     const vapid = await makeVapid();
 
     const outcome = await runInDurableObject(relayStub(acct), async (instance: AccountRelay) => {
@@ -1343,7 +1370,7 @@ describe("submit — an owed trailing wakeup is cleared only by an accepted wake
           new Request(relayUrl(acct, "/requests"), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(envelope(id)),
+            body: JSON.stringify(envelope(rid(id))),
           }),
         );
         return ((await response.json()) as { push_wakeups: number }).push_wakeups;
