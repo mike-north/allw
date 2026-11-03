@@ -138,8 +138,11 @@ program, so callers must run `argv` without a shell.
 whitespace split of it: PowerShell quoting is never interpreted with POSIX rules (inside `"…"` its escape is the
 backtick and `\` is literal, so a POSIX split could hide a `; Remove-Item …` inside one harmless token, and it strips
 Windows paths' backslashes). Every non-whitespace byte of `raw` stays visible in some token. Because the v1 risk table
-knows no PowerShell commands, risk is at least `medium`, and at least `high` when `raw` contains `;`, `|`, `&`, a line
-break, a backtick, `$(`, `{`, `iex` or `Invoke-Expression` (uncertain ⇒ upward). There is no PowerShell field on the
+knows no PowerShell commands, risk is at least `medium`, and at least `high` when `raw` contains a construct that runs more
+than one command, runs one T1 can't read, or builds one at run time (uncertain ⇒ upward): `;`, `|`, `&`, a line break,
+a backtick, `(` or `{`, `[scriptblock]` or `.Invoke`, a command word that runs other code (`iex`, `Invoke-Expression`,
+`Invoke-Command`, `Start-Process`, `Start-Job`, `powershell`, `pwsh`, `cmd`), an `-EncodedCommand` parameter or any
+prefix of it (or `-ec`), or a leading `.` (dot-sourcing). There is no PowerShell field on the
 record and no schema change: surfaces label the line for the human in the summary (`PowerShell: <command>`). The
 other substrate fields come from the command builder's T1 scans of the tokens and `raw`, so they can disagree with
 PowerShell: for example `$env:PATH` records `env` in `env_refs`. `raw` is authoritative.

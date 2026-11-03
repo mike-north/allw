@@ -19,10 +19,20 @@
 //!   will parse.
 //! - **risk** is never below `Medium`, because no part of the table knows PowerShell's low-risk
 //!   commands. It is never below `High` when `raw` contains a construct that runs more than one
-//!   command or builds one at run time: a statement or pipeline separator (`;`, `|`, `&`, a line
-//!   break), the backtick escape (which can also disguise a command name), a subexpression or script
-//!   block (`$(`, `{`), or `iex` / `Invoke-Expression`. Above the floor, the command builder's own
-//!   risk for the argv applies.
+//!   command, runs one T1 can't read, or builds one at run time:
+//!   - a statement or pipeline separator (`;`, `|`, `&`, a line break);
+//!   - the backtick escape, which can also disguise a command name;
+//!   - a parenthesis or brace: grouping, subexpressions (`(`, `$(`, `@(`), method calls such as
+//!     `.Invoke()` or `[scriptblock]::Create(…)`, and script blocks (`{`);
+//!   - a scriptblock factory or invoker (`[scriptblock]`, `.Invoke…`);
+//!   - a command that runs other code: `iex` / `Invoke-Expression`, `Invoke-Command`,
+//!     `Start-Process`, `Start-Job`, or a nested shell (`powershell`, `pwsh`, `cmd`);
+//!   - an encoded command: a `-EncodedCommand` parameter or any prefix of it (`-e`, `-enc`, …), or
+//!     `-ec`, whose payload the human can't read;
+//!   - dot-sourcing (`.` as the command), which runs a script in the current scope.
+//!
+//!   The triggers are deliberately broad; a false positive (`Get-Item (Join-Path a b)` is `High`) is
+//!   the intended direction. Above the floor, the command builder's own risk for the argv applies.
 //!
 //! The record has no PowerShell marker: the `command` surface and the schema are unchanged.
 //! Surfaces label the line for the human in the `ApprovalContext` summary (for example
@@ -48,13 +58,29 @@ pub const POWERSHELL_RISK_FLOOR: Risk = Risk::Medium;
 pub const POWERSHELL_COMPOUND_RISK_FLOOR: Risk = Risk::High;
 
 /// Substrings that make a PowerShell line run more than one command, or a command T1 can't see:
-/// statement and pipeline separators, line breaks, the backtick escape, subexpressions and script
-/// blocks.
-const COMPOUND_MARKERS: [&str; 8] = [";", "|", "&", "\n", "\r", "`", "$(", "{"];
+/// statement and pipeline separators, line breaks, the backtick escape, parentheses (grouping,
+/// subexpressions and method calls) and script blocks.
+const COMPOUND_MARKERS: [&str; 8] = [";", "|", "&", "\n", "\r", "`", "(", "{"];
 
-/// Command names that execute a string as PowerShell code (matched case-insensitively, as whole
-/// command words).
-const DYNAMIC_EXECUTION_COMMANDS: [&str; 2] = ["iex", "invoke-expression"];
+/// Substrings (ASCII, lower case; matched case-insensitively) that build or invoke a script block.
+const SCRIPTBLOCK_MARKERS: [&str; 2] = ["[scriptblock]", ".invoke"];
+
+/// Command names that run other code: a string as PowerShell, a script block, another process or a
+/// nested shell (ASCII, lower case; matched case-insensitively as whole command words).
+const NESTED_EXECUTION_COMMANDS: [&str; 8] = [
+    "iex",
+    "invoke-expression",
+    "invoke-command",
+    "start-process",
+    "start-job",
+    "powershell",
+    "pwsh",
+    "cmd",
+];
+
+/// The full name of PowerShell's encoded-command parameter (lower case). PowerShell accepts any
+/// unambiguous prefix of a parameter name, so every prefix from `-e` up counts.
+const ENCODED_COMMAND_PARAMETER: &str = "encodedcommand";
 
 /// Build an [`ActionRecord`] from a raw PowerShell command line. Infallible: no PowerShell line is
 /// refused for its syntax.
@@ -63,7 +89,7 @@ pub fn action_from_powershell_command(command_line: &str, ctx: &CommandContext) 
         .split_whitespace()
         .map(str::to_string)
         .collect();
-    let floor = if has_compound_construct(command_line) {
+    let floor = if has_compound_construct(command_line, &argv) {
         POWERSHELL_COMPOUND_RISK_FLOOR
     } else {
         POWERSHELL_RISK_FLOOR
@@ -73,12 +99,34 @@ pub fn action_from_powershell_command(command_line: &str, ctx: &CommandContext) 
     record
 }
 
-/// Whether `raw` contains a construct whose effect T1 can't read from the whitespace tokens.
-fn has_compound_construct(raw: &str) -> bool {
+/// Whether `raw` (split into `argv`) contains a construct whose effect T1 can't read from the
+/// whitespace tokens.
+fn has_compound_construct(raw: &str, argv: &[String]) -> bool {
+    let lower = raw.to_ascii_lowercase();
     COMPOUND_MARKERS.iter().any(|marker| raw.contains(marker))
-        || DYNAMIC_EXECUTION_COMMANDS
+        || SCRIPTBLOCK_MARKERS
+            .iter()
+            .any(|marker| lower.contains(marker))
+        || NESTED_EXECUTION_COMMANDS
             .iter()
             .any(|name| contains_command_word(raw, name))
+        || argv.iter().any(|token| is_encoded_command_parameter(token))
+        || argv.first().is_some_and(|bin| bin == ".")
+}
+
+/// Whether `token` names PowerShell's `-EncodedCommand` parameter: `-` or `/`, then a non-empty
+/// prefix of `encodedcommand` or the `ec` alias, case-insensitively, optionally followed by
+/// `:value`.
+fn is_encoded_command_parameter(token: &str) -> bool {
+    let Some(name) = token.strip_prefix('-').or_else(|| token.strip_prefix('/')) else {
+        return false;
+    };
+    let name = name
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    !name.is_empty() && (ENCODED_COMMAND_PARAMETER.starts_with(&name) || name == "ec")
 }
 
 /// Whether `haystack` contains `word` (ASCII, lower case) case-insensitively as a whole command
@@ -223,6 +271,30 @@ mod tests {
             "IEX $payload",
             "Invoke-Expression $payload",
             "invoke-expression $payload",
+            // Regression (#316 review round 2): grouping, subexpressions and computed invocations.
+            r"Write-Output (Remove-Item -Recurse -Force C:\Users)",
+            r"echo @(Remove-Item -Recurse -Force C:\Users)",
+            r".('ie'+'x') 'Remove-Item C:\Users -Recurse'",
+            // Scriptblock factories and invokers.
+            "[scriptblock]::Create('Remove-Item build').Invoke()",
+            "[ScriptBlock]::Create($s)",
+            "$sb.Invoke()",
+            "$ExecutionContext.InvokeCommand.InvokeScript('Remove-Item build')",
+            "Invoke-Command -ScriptBlock $sb",
+            "Start-Process cmd.exe -ArgumentList /c,del",
+            "start-job -FilePath x.ps1",
+            // Nested shells and encoded commands the human can't read.
+            r"powershell -Command Remove-Item C:\Users -Recurse",
+            "powershell.exe -File x.ps1",
+            "pwsh -enc SQBFAFgA",
+            "pwsh -e SQBFAFgA",
+            "pwsh -EncodedCommand SQBFAFgA",
+            "pwsh /encodedcommand SQBFAFgA",
+            "Write-Output -EC SQBFAFgA",
+            "Write-Output -encodedCommand:SQBFAFgA",
+            r"cmd /c del C:\x",
+            // Dot-sourcing runs a script in the current scope.
+            r". .\payload.ps1",
         ] {
             let record = action_from_powershell_command(line, &CommandContext::default());
             assert_eq!(record.risk, Risk::High, "{line:?} must be High");
@@ -230,14 +302,21 @@ mod tests {
     }
 
     #[test]
-    fn command_words_that_only_contain_iex_stay_at_the_floor() {
+    fn words_that_only_resemble_a_trigger_stay_at_the_floor() {
         for line in [
             "Get-Iexplore",
             "Write-Output index",
             "Get-Item iex-notes.txt",
+            // `-ex…` and `-Exclude` aren't prefixes of `-EncodedCommand`.
+            "Get-ChildItem -Exclude x",
+            "Get-ChildItem -ex x",
+            // A `.` that isn't the command, and a word that only contains `cmd` or `pwsh`.
+            r"Get-Item .\x.txt",
+            "Get-Command",
+            "Get-Item cmdlets.txt",
         ] {
             let record = action_from_powershell_command(line, &CommandContext::default());
-            assert_eq!(record.risk, Risk::Medium, "{line:?} is not iex");
+            assert_eq!(record.risk, Risk::Medium, "{line:?} has no trigger");
         }
     }
 
