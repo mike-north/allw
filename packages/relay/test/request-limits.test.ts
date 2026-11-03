@@ -629,6 +629,27 @@ describe("POST /requests per-account pending cap", () => {
     expect((await submit(acct, envelope(rid("req-cap-excluded-over")))).status).toBe(429);
   });
 
+  it("a row stops counting at its horizon deadline, while its expires_at is still ahead (#292)", async () => {
+    // A full account of live rows received at NOW - 1000, expiring at NOW + 60_000 (livePending).
+    // Lowering the horizon to 30 s, as a redeploy with a smaller MAX_REQUEST_TTL_MS would, puts
+    // their deadline at NOW + 29_000: 31 s before their expires_at.
+    const acct = await freshAccount("cap-horizon-deadline");
+    await seedRequests(acct, livePending("held", MAX_PENDING_REQUESTS_PER_ACCOUNT));
+    const lowered = 30_000;
+    await runInDurableObject(stubFor(acct), (instance: AccountRelay) => {
+      (instance as unknown as { maxRequestTtlMs: number }).maxRequestTtlMs = lowered;
+    });
+    const deadline = NOW - 1000 + lowered;
+    // Each submit's created_at is its own receipt time, inside the lowered past bound.
+    const at = (t: number, id: string) =>
+      envelope(rid(id), { created_at: t, expires_at: t + 10_000 });
+
+    await pinRelayClock(acct, deadline - 1);
+    expect((await submit(acct, at(deadline - 1, "req-cap-horizon-before"))).status).toBe(429);
+    await pinRelayClock(acct, deadline);
+    expect((await submit(acct, at(deadline, "req-cap-horizon-at"))).status).toBe(202);
+  });
+
   it("a pre-horizon row one millisecond younger than the horizon still counts", async () => {
     const acct = await freshAccount("cap-legacy-young");
     await seedRequests(acct, [

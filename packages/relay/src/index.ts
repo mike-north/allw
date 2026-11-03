@@ -1943,17 +1943,16 @@ export class AccountRelay implements DurableObject {
   }
 
   /**
-   * Live pending requests: status `pending`, not yet past `expires_at`, and within the horizon of
-   * when the relay received them (a pre-horizon row with a far-future `expires_at` stops counting —
-   * and is expired by the alarm — once it is older than `maxRequestTtlMs`).
+   * How many live pending requests the account holds at `now`: status `pending` and strictly before
+   * the deadline ({@link deadlineOf}), the same rule as {@link livePendingRequests}. A row past its
+   * horizon deadline stops counting even while its `expires_at` is still ahead.
    */
   private livePendingCount(now: number): number {
     const row = [
       ...this.sql.exec<{ n: number }>(
-        `SELECT COUNT(*) AS n FROM request
-         WHERE status = 'pending' AND expires_at > ? AND created_at > ?`,
+        `SELECT COUNT(*) AS n FROM request WHERE status = 'pending' AND ${DEADLINE_SQL} > ?`,
+        this.maxRequestTtlMs,
         now,
-        now - this.maxRequestTtlMs,
       ),
     ][0];
     return row?.n ?? 0;
