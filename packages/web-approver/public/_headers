@@ -16,3 +16,11 @@
   X-Content-Type-Options: nosniff
   Referrer-Policy: no-referrer
   X-Frame-Options: DENY
+
+# The web app manifest (#237), with its registered media type.
+/manifest.webmanifest
+  Content-Type: application/manifest+json
+
+# The service worker (#237): revalidate on every check so an update reaches browsers promptly.
+/sw.js
+  Cache-Control: no-cache

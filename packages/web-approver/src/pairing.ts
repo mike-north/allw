@@ -97,8 +97,9 @@ const REQUIRED_IDENTITY_FIELDS: readonly (keyof ApproverIdentity)[] = [
  *   does not accept as stored (#286). The identity is unusable (fail-closed: nothing is sent to
  *   that relay), but it is a distinct state from `corrupt` so the gate can tell the human why and
  *   ask before clearing it. `pinnedRelayUrl` is the stored text, unvalidated: render it only
- *   through the core escape ({@link DisplayEscape}), or withhold it. `snapshot` identifies exactly what was stored, so the clear the human
- *   confirms can be limited to that value ({@link PairingStore.clearIfUnchanged}).
+ *   through the core escape ({@link DisplayEscape}), or withhold it. `snapshot` identifies exactly
+ *   what was stored, so when the human confirms, only that value is cleared
+ *   ({@link PairingStore.clearIfUnchanged}).
  * - `corrupt` — anything else: unparseable JSON, a missing or empty field, a non-string pin.
  */
 export type StoredPairing =

@@ -4,12 +4,20 @@
  * Bundles `src/app.ts` (the production bootstrap — `../src/app.ts`) into `dist-site/app.js` with
  * esbuild, copies the vendored `allw-wasm` browser artifact next to it (so `app.ts`'s
  * `import.meta.url`-relative asset URLs resolve on any static host, at any subpath), and copies
- * the static `public/` shell (`index.html`, `theme.js`, `tokens.css`, `styles.css`, `_headers`) alongside. `tokens.css` is
+ * the static `public/` shell (`index.html`, `theme.js`, `tokens.css`, `styles.css`, `_headers`,
+ * `manifest.webmanifest`, `icons/`) alongside. `tokens.css` is
  * the vendored `design/web-approver/inbox/tokens.css` (issue #162) that `styles.css`'s `var(--…)`
  * declarations and `index.html`'s `theme-light`/`theme-dark` class resolve against — it must ship
  * next to `styles.css` or those custom properties are undefined on the deployed site. The result
  * is a flat directory of plain static files — no server-side runtime, no Cloudflare-specific API —
  * hostable on Cloudflare Pages or any static host (`docs/web-approver-deploy.md`).
+ *
+ * # Service worker (issue #237)
+ * `src/sw.ts` is bundled separately to `dist-site/sw.js`, at the site root next to `index.html`,
+ * because a service worker's scope can be no wider than the directory it is served from and the
+ * page registers it for the app's root scope. It is a classic script (`iife`), the format every
+ * browser with Web Push accepts for a service worker. `manifest.webmanifest` and `icons/` make the
+ * app installable, which iOS requires before it delivers Web Push.
  *
  * # Response headers (`_headers`, issue #249)
  * `public/_headers` is a Cloudflare Pages headers file carrying the site's Content-Security-Policy
@@ -211,6 +219,18 @@ export async function buildSite({
     logLevel: "warning",
   });
 
+  await build({
+    entryPoints: [join(packageDir, "src", "sw.ts")],
+    outfile: join(outDir, "sw.js"),
+    bundle: true,
+    format: "iife",
+    target: "es2022",
+    platform: "browser",
+    sourcemap: true,
+    minify: true,
+    logLevel: "warning",
+  });
+
   const vendorOutDir = join(outDir, "vendor", "allw-wasm");
   mkdirSync(vendorOutDir, { recursive: true });
   cpSync(wasmBinary, join(vendorOutDir, "allw_wasm_bg.wasm"));
@@ -220,6 +240,8 @@ export async function buildSite({
   cpSync(join(packageDir, "public", "tokens.css"), join(outDir, "tokens.css"));
   cpSync(join(packageDir, "public", "styles.css"), join(outDir, "styles.css"));
   cpSync(join(packageDir, "public", "theme.js"), join(outDir, "theme.js"));
+  cpSync(join(packageDir, "public", "manifest.webmanifest"), join(outDir, "manifest.webmanifest"));
+  cpSync(join(packageDir, "public", "icons"), join(outDir, "icons"), { recursive: true });
   writeFileSync(join(outDir, "_headers"), headers);
 
   console.log(`[web-approver] site bundle written to ${outDir}`);
