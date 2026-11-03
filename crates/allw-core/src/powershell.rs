@@ -27,7 +27,8 @@
 //!   - a scriptblock factory or invoker (`[scriptblock]`, `.Invoke…`);
 //!   - a command that runs other code: `iex` / `Invoke-Expression`, `Invoke-Command` (`icm`),
 //!     `Start-Process` (`start`, `saps`), `Start-Job` (`sajb`), or a nested shell (`powershell`,
-//!     `pwsh`, `cmd`);
+//!     `pwsh`, `cmd`). Quotes inside the word are ignored (`i''ex`, `I"nvoke-Expression`), since
+//!     PowerShell removes them from a bareword command name;
 //!   - an encoded command: a `-EncodedCommand` parameter or any prefix of it (`-e`, `-enc`, …), or
 //!     `-ec`, whose payload the human can't read. The parameter may start with one or two of the
 //!     dashes PowerShell accepts (`-`, `/`, U+2013, U+2014, U+2015; pwsh drops a doubled dash), and
@@ -135,14 +136,26 @@ fn has_compound_construct(raw: &str, argv: &[String]) -> bool {
         || SCRIPTBLOCK_MARKERS
             .iter()
             .any(|marker| lower.contains(marker))
-        || NESTED_EXECUTION_COMMANDS
-            .iter()
-            .any(|name| contains_command_word(raw, name))
+        || has_nested_execution_command(raw)
         || argv.iter().any(|token| is_encoded_command_parameter(token))
         || argv.first().is_some_and(|bin| is_dot_source(bin))
         || argv
             .first()
             .is_some_and(|bin| is_powershell_executable(bin))
+}
+
+/// Whether `raw` contains a [`NESTED_EXECUTION_COMMANDS`] word, as written or with every quote
+/// character deleted. PowerShell removes quotes from a bareword command name, so `i''ex` runs `iex`.
+/// Both spellings are checked, because deleting quotes can also join a word to its neighbour
+/// (`x'iex` → `xiex`). Only the check reads the de-quoted copy; `raw` and argv keep the quotes. A
+/// line with no quote character is its own de-quoted copy, so it is checked once.
+fn has_nested_execution_command(raw: &str) -> bool {
+    let matches = |line: &str| {
+        NESTED_EXECUTION_COMMANDS
+            .iter()
+            .any(|name| contains_command_word(line, name))
+    };
+    matches(raw) || (raw.contains(QUOTE_CHARS) && matches(&without_quotes(raw)))
 }
 
 /// Whether the command word names a PowerShell executable: its last path segment, with every quote
@@ -484,11 +497,52 @@ mod tests {
     }
 
     #[test]
+    fn quotes_inserted_in_a_command_word_still_fail_upward() {
+        // Regression (#341): PowerShell removes quotes from a bareword command name, so each line
+        // runs the command; each has no other trigger.
+        for line in [
+            "i''ex $payload",
+            "I\"\"EX $payload",
+            "I\"nvoke-Expression $payload",
+            "Invoke-Exp''ression $payload",
+            "i''cm -FilePath x.ps1",
+            "Invoke-Com''mand -FilePath x.ps1",
+            "sa''ps evil.exe",
+            "Start-Pro''cess evil.exe",
+            "Start-Jo''b -FilePath x.ps1",
+            "c\"\"md /c del C:\\x",
+            "i\u{2018}\u{2019}ex $payload",
+        ] {
+            assert!(
+                !has_compound_marker(line),
+                "{line:?} must isolate the word check"
+            );
+            let record = action_from_powershell_command(line, &CommandContext::default());
+            assert_eq!(record.risk, Risk::High, "{line:?} must be High");
+        }
+    }
+
+    #[test]
+    fn a_word_that_matches_only_with_its_quotes_still_counts() {
+        // Deleting the quote joins `iex` to the `x` before it (`xiex`), so the raw spelling must
+        // still be checked as well as the de-quoted one.
+        let line = "Write-Output x'iex";
+        assert!(!has_compound_marker(line));
+        let record = action_from_powershell_command(line, &CommandContext::default());
+        assert_eq!(record.risk, Risk::High, "{line:?} must be High");
+    }
+
+    #[test]
     fn words_that_only_resemble_a_trigger_stay_at_the_floor() {
         for line in [
             "Get-Iexplore",
             "Write-Output index",
             "Get-Item iex-notes.txt",
+            // Quotes that, once removed, still leave no whole trigger word.
+            "Get-Item 'iex-notes.txt'",
+            "Write-Output \"index\"",
+            "Get-Item 'c''mdlets.txt'",
+            "Write-Output 'st''arted'",
             // `-ex…` and `-Exclude` aren't prefixes of `-EncodedCommand`.
             "Get-ChildItem -Exclude x",
             "Get-ChildItem -ex x",

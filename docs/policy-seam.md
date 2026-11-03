@@ -141,7 +141,8 @@ Windows paths' backslashes). Every non-whitespace byte of `raw` stays visible in
 knows no PowerShell commands, risk is at least `medium`, and at least `high` when `raw` contains a construct that runs more
 than one command, runs one T1 can't read, or builds one at run time (uncertain ⇒ upward): `;`, `|`, `&`, a line break,
 a backtick, `(` or `{`, `[scriptblock]` or `.Invoke`, a command word that runs other code (`iex`, `Invoke-Expression`,
-`Invoke-Command` / `icm`, `Start-Process` / `start` / `saps`, `Start-Job` / `sajb`, `powershell`, `pwsh`, `cmd`), a
+`Invoke-Command` / `icm`, `Start-Process` / `start` / `saps`, `Start-Job` / `sajb`, `powershell`, `pwsh`, `cmd`;
+quotes inside the word are ignored, so `i''ex` and `I"nvoke-Expression` count (#341)), a
 program named like PowerShell itself (a name starting `pwsh` or `powershell` after any path, with its quotes removed,
 such as `pwsh-preview`, `powershell_ise` or `p''wsh`), an `-EncodedCommand` parameter or any prefix of it (or `-ec`) led
 by one or two of `-`, `/` and the Unicode dashes U+2013, U+2014, U+2015, with every quote character in the token
