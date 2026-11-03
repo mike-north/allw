@@ -151,6 +151,25 @@ function requestResult<T>(request: IDBRequest<T>): Promise<T> {
   });
 }
 
+/**
+ * Resolve once `transaction` has committed; reject if it aborts or fails. A request's `success`
+ * comes before the commit, and a page that closes in between aborts the transaction, so a write
+ * or clear counts as done only on `complete`.
+ */
+function transactionDone(transaction: IDBTransaction): Promise<void> {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = () => {
+      resolve();
+    };
+    transaction.onabort = () => {
+      reject(transaction.error ?? new Error("IndexedDB transaction aborted"));
+    };
+    transaction.onerror = () => {
+      reject(transaction.error ?? new Error("IndexedDB transaction failed"));
+    };
+  });
+}
+
 /** Open (creating on first use) the mirror database. */
 function openDatabase(factory: IDBFactory): Promise<IDBDatabase> {
   const request = factory.open(DB_NAME, DB_VERSION);
@@ -181,9 +200,9 @@ export function createIndexedDbPushCredentialStore(factory: IDBFactory): PushCre
   async function write(key: string, value: unknown): Promise<void> {
     const db = await openDatabase(factory);
     try {
-      await requestResult(
-        db.transaction(OBJECT_STORE, "readwrite").objectStore(OBJECT_STORE).put(value, key),
-      );
+      const transaction = db.transaction(OBJECT_STORE, "readwrite");
+      transaction.objectStore(OBJECT_STORE).put(value, key);
+      await transactionDone(transaction);
     } finally {
       db.close();
     }
@@ -192,9 +211,9 @@ export function createIndexedDbPushCredentialStore(factory: IDBFactory): PushCre
   async function clearAll(): Promise<void> {
     const db = await openDatabase(factory);
     try {
-      await requestResult(
-        db.transaction(OBJECT_STORE, "readwrite").objectStore(OBJECT_STORE).clear(),
-      );
+      const transaction = db.transaction(OBJECT_STORE, "readwrite");
+      transaction.objectStore(OBJECT_STORE).clear();
+      await transactionDone(transaction);
     } finally {
       db.close();
     }

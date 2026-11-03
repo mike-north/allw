@@ -13,7 +13,11 @@
  *   into a notification.
  *
  * Every call takes an injectable `fetch` and reports failure as a value, never a throw, so the
- * page's controls and the service worker's handlers can always reach a visible end state.
+ * page's controls and the service worker's handlers can always reach a visible end state. Every call
+ * also has a deadline ({@link RELAY_CALL_TIMEOUT_MS}) covering the response headers **and** body: a
+ * relay that accepts a request and then stalls is a failure, not a wait without end. That matters
+ * most in the service worker, which must show a notification for every push (browsers revoke
+ * subscriptions whose pushes show nothing).
  *
  * @see ../../../docs/relay-api.md (§3 relay-level and device endpoints, §5 Web Push)
  * @see https://www.rfc-editor.org/rfc/rfc8292 (VAPID)
@@ -24,6 +28,77 @@ import { inboxUrl } from "./relay-poll.js";
 
 /** An injectable `fetch`. */
 export type PushFetch = (input: string, init?: RequestInit) => Promise<Response>;
+
+/**
+ * How long one relay call may take, headers and body together, before it counts as failed. Well
+ * inside the time browsers give a push event, so a stalled relay still leaves the service worker
+ * time to show its generic notification.
+ */
+export const RELAY_CALL_TIMEOUT_MS = 8_000;
+
+/** What came back from one relay call, within its deadline. */
+type RelayAnswer =
+  | { readonly reached: false; readonly detail: string }
+  | {
+      readonly reached: true;
+      readonly status: number;
+      /** The parsed JSON body of a 2xx answer; `null` for a non-2xx answer (body not read). */
+      readonly json: { readonly ok: true; readonly value: unknown } | { readonly ok: false } | null;
+    };
+
+/**
+ * Make one relay call and, for a 2xx answer, read its JSON body, all within `timeoutMs`. On the
+ * deadline the request is aborted (so a real `fetch` stops reading too) and the call resolves as
+ * unreached. Never throws.
+ */
+async function callRelay(
+  fetchImpl: PushFetch,
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<RelayAnswer> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<RelayAnswer>((resolve) => {
+    timer = setTimeout(() => {
+      resolve({
+        reached: false,
+        detail: `the relay did not answer within ${String(timeoutMs / 1000)} s`,
+      });
+      controller.abort(new Error("relay call deadline"));
+    }, timeoutMs);
+  });
+  const call = async (): Promise<RelayAnswer> => {
+    let response: Response;
+    try {
+      response = await fetchImpl(url, { ...init, signal: controller.signal });
+    } catch (error) {
+      return { reached: false, detail: `could not reach the relay (${String(error)})` };
+    }
+    if (!response.ok) return { reached: true, status: response.status, json: null };
+    try {
+      return {
+        reached: true,
+        status: response.status,
+        json: { ok: true, value: (await response.json()) as unknown },
+      };
+    } catch {
+      return { reached: true, status: response.status, json: { ok: false } };
+    }
+  };
+  try {
+    return await Promise.race([call(), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** `field` of a JSON object body, or `undefined`. */
+function jsonField(value: unknown, field: string): unknown {
+  return typeof value === "object" && value !== null
+    ? (value as Record<string, unknown>)[field]
+    : undefined;
+}
 
 /** Strip trailing slashes from a relay base URL. */
 function relayBase(relayUrl: string): string {
@@ -68,29 +143,25 @@ export type VapidKeyResult =
 export async function fetchVapidPublicKey(
   relayUrl: string,
   fetchImpl: PushFetch,
+  timeoutMs: number = RELAY_CALL_TIMEOUT_MS,
 ): Promise<VapidKeyResult> {
-  let response: Response;
-  try {
-    response = await fetchImpl(vapidPublicKeyUrl(relayUrl), { method: "GET" });
-  } catch (error) {
-    return { ok: false, reason: "failed", detail: `could not reach the relay (${String(error)})` };
-  }
-  if (response.status === 404) {
+  const answer = await callRelay(
+    fetchImpl,
+    vapidPublicKeyUrl(relayUrl),
+    { method: "GET" },
+    timeoutMs,
+  );
+  if (!answer.reached) return { ok: false, reason: "failed", detail: answer.detail };
+  if (answer.status === 404) {
     return { ok: false, reason: "disabled", detail: "this relay has notifications turned off" };
   }
-  if (!response.ok) {
-    return { ok: false, reason: "failed", detail: `the relay answered ${String(response.status)}` };
+  if (answer.json === null) {
+    return { ok: false, reason: "failed", detail: `the relay answered ${String(answer.status)}` };
   }
-  let body: unknown;
-  try {
-    body = await response.json();
-  } catch {
+  if (!answer.json.ok) {
     return { ok: false, reason: "failed", detail: "the relay's key response was not JSON" };
   }
-  const encoded =
-    typeof body === "object" && body !== null
-      ? (body as Record<string, unknown>).vapid_public_key
-      : undefined;
+  const encoded = jsonField(answer.json.value, "vapid_public_key");
   const decoded = typeof encoded === "string" ? decodeBase64Url(encoded) : null;
   if (decoded?.length !== 65 || decoded[0] !== 0x04) {
     return { ok: false, reason: "failed", detail: "the relay's VAPID key is malformed" };
@@ -118,7 +189,9 @@ function normalizedEndpoint(value: string): string | null {
  * What a non-200 answer from `PUT …/push-tokens` means, for the human. The relay's statuses
  * (`docs/relay-api.md` §3): 401/403 when the device's own bearer token is refused (for example after
  * the device was revoked), 409 when the account's push-token budget is full, 400 for a body the
- * relay rejects.
+ * relay rejects. The 409 advice names the one action shipped today that frees a registration:
+ * forgetting the pairing on another browser clears that device's push tokens. (Revoking another
+ * device, e.g. a lost one, is not available yet: #204.)
  */
 function describePushTokensStatus(status: number): string {
   switch (status) {
@@ -126,7 +199,7 @@ function describePushTokensStatus(status: number): string {
     case 403:
       return `the relay refused this device's credentials (${String(status)}); it may have been revoked`;
     case 409:
-      return "this account already has the most push registrations the relay allows (409); revoke a device you no longer use, then try again";
+      return "this account already has as many push registrations as the relay allows (409). To free one, open allw approvals in a browser you no longer use and choose \u201cUse another device\u201d, then try again here";
     default:
       return `the relay answered ${String(status)}`;
   }
@@ -146,38 +219,33 @@ async function putPushTokens(
   credentials: PushCredentials,
   tokens: readonly { readonly transport: "webpush"; readonly token: string }[],
   fetchImpl: PushFetch,
+  timeoutMs: number,
 ): Promise<PutPushTokensResult> {
-  const url = pushTokensUrl(credentials.relayUrl, credentials.accountId, credentials.deviceId);
-  let response: Response;
-  try {
-    response = await fetchImpl(url, {
+  const answer = await callRelay(
+    fetchImpl,
+    pushTokensUrl(credentials.relayUrl, credentials.accountId, credentials.deviceId),
+    {
       method: "PUT",
       headers: {
         authorization: `Bearer ${credentials.deviceAuthToken}`,
         "content-type": "application/json",
       },
       body: JSON.stringify({ push_tokens: tokens }),
-    });
-  } catch (error) {
-    return { ok: false, status: null, detail: `could not reach the relay (${String(error)})` };
-  }
-  if (response.status !== 200) {
+    },
+    timeoutMs,
+  );
+  if (!answer.reached) return { ok: false, status: null, detail: answer.detail };
+  if (answer.status !== 200 || answer.json === null) {
     return {
       ok: false,
-      status: response.status,
-      detail: describePushTokensStatus(response.status),
+      status: answer.status,
+      detail: describePushTokensStatus(answer.status),
     };
   }
-  let body: unknown;
-  try {
-    body = await response.json();
-  } catch {
+  if (!answer.json.ok) {
     return { ok: false, status: 200, detail: "the relay's response was not JSON" };
   }
-  const stored =
-    typeof body === "object" && body !== null
-      ? (body as Record<string, unknown>).push_tokens
-      : undefined;
+  const stored = jsonField(answer.json.value, "push_tokens");
   if (!Array.isArray(stored)) {
     return { ok: false, status: 200, detail: "the relay's response had no push_tokens list" };
   }
@@ -193,11 +261,13 @@ export async function registerPushEndpoint(
   credentials: PushCredentials,
   endpoint: string,
   fetchImpl: PushFetch,
+  timeoutMs: number = RELAY_CALL_TIMEOUT_MS,
 ): Promise<RegisterResult> {
   const result = await putPushTokens(
     credentials,
     [{ transport: "webpush", token: endpoint }],
     fetchImpl,
+    timeoutMs,
   );
   if (!result.ok) return result;
   const wanted = normalizedEndpoint(endpoint);
@@ -224,8 +294,9 @@ export async function registerPushEndpoint(
 export async function clearPushTokens(
   credentials: PushCredentials,
   fetchImpl: PushFetch,
+  timeoutMs: number = RELAY_CALL_TIMEOUT_MS,
 ): Promise<RegisterResult> {
-  const result = await putPushTokens(credentials, [], fetchImpl);
+  const result = await putPushTokens(credentials, [], fetchImpl, timeoutMs);
   if (!result.ok) return result;
   if (result.stored.length !== 0) {
     return { ok: false, status: 200, detail: "the relay still lists push tokens for this device" };
@@ -235,32 +306,21 @@ export async function clearPushTokens(
 
 /**
  * How many requests are pending for this device, or `null` when the inbox could not be read
- * (network error, non-2xx, malformed body). Only the count is returned: envelope contents never
- * leave this function.
+ * (network error, no answer within the deadline, non-2xx, malformed body). Only the count is
+ * returned: envelope contents never leave this function.
  */
 export async function fetchPendingCount(
   credentials: PushCredentials,
   fetchImpl: PushFetch,
+  timeoutMs: number = RELAY_CALL_TIMEOUT_MS,
 ): Promise<number | null> {
-  let response: Response;
-  try {
-    response = await fetchImpl(
-      inboxUrl(credentials.relayUrl, credentials.accountId, credentials.deviceId),
-      { method: "GET", headers: { authorization: `Bearer ${credentials.deviceAuthToken}` } },
-    );
-  } catch {
-    return null;
-  }
-  if (!response.ok) return null;
-  let body: unknown;
-  try {
-    body = await response.json();
-  } catch {
-    return null;
-  }
-  const envelopes =
-    typeof body === "object" && body !== null
-      ? (body as Record<string, unknown>).envelopes
-      : undefined;
+  const answer = await callRelay(
+    fetchImpl,
+    inboxUrl(credentials.relayUrl, credentials.accountId, credentials.deviceId),
+    { method: "GET", headers: { authorization: `Bearer ${credentials.deviceAuthToken}` } },
+    timeoutMs,
+  );
+  if (!answer.reached || answer.json?.ok !== true) return null;
+  const envelopes = jsonField(answer.json.value, "envelopes");
   return Array.isArray(envelopes) ? envelopes.length : null;
 }

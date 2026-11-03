@@ -26,6 +26,7 @@
 
 import type { PushCredentialStore } from "./push-credentials.js";
 import {
+  RELAY_CALL_TIMEOUT_MS,
   fetchPendingCount,
   fetchVapidPublicKey,
   registerPushEndpoint,
@@ -86,20 +87,43 @@ export interface PushHandlerDeps {
   readonly fetchImpl: PushFetch;
   /** `registration.showNotification`. */
   readonly showNotification: (title: string, options: ApprovalNotificationOptions) => Promise<void>;
+  /** The deadline for reading the inbox; defaults to {@link RELAY_CALL_TIMEOUT_MS}. */
+  readonly relayTimeoutMs?: number;
+}
+
+/** The mirrored credentials, then the pending count; `null` if either is unavailable. */
+async function readPendingCount(deps: PushHandlerDeps, timeoutMs: number): Promise<number | null> {
+  try {
+    const credentials = await deps.store.readCredentials();
+    return credentials === null
+      ? null
+      : await fetchPendingCount(credentials, deps.fetchImpl, timeoutMs);
+  } catch {
+    return null;
+  }
 }
 
 /**
  * Handle a `push`: read the mirrored credentials, count the pending requests, and show a
- * notification. A notification is shown whatever fails before it; only `showNotification` itself
- * can reject.
+ * notification. A notification is shown whatever fails before it, and the count is bounded by the
+ * relay deadline (headers and body), so a stalled relay or credential read still ends in the
+ * generic notification. Only `showNotification` itself can reject.
  */
 export async function handlePush(deps: PushHandlerDeps): Promise<void> {
-  let count: number | null = null;
+  const timeoutMs = deps.relayTimeoutMs ?? RELAY_CALL_TIMEOUT_MS;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const giveUp = new Promise<null>((resolve) => {
+    // A little past the relay deadline, so `fetchPendingCount` normally reports its own timeout;
+    // this backstop also covers a credential read that never settles.
+    timer = setTimeout(() => {
+      resolve(null);
+    }, timeoutMs + 500);
+  });
+  let count: number | null;
   try {
-    const credentials = await deps.store.readCredentials();
-    if (credentials !== null) count = await fetchPendingCount(credentials, deps.fetchImpl);
-  } catch {
-    count = null;
+    count = await Promise.race([readPendingCount(deps, timeoutMs), giveUp]);
+  } finally {
+    clearTimeout(timer);
   }
   const notification = notificationForPendingCount(count);
   await deps.showNotification(notification.title, notification.options);
@@ -148,6 +172,8 @@ export interface SubscriptionChangeDeps {
   readonly resubscribe: (
     applicationServerKey: Uint8Array<ArrayBuffer>,
   ) => Promise<{ readonly endpoint: string }>;
+  /** The deadline for each relay call; defaults to {@link RELAY_CALL_TIMEOUT_MS}. */
+  readonly relayTimeoutMs?: number;
 }
 
 /** Outcome of {@link handleSubscriptionChange}, for logging and tests. */
@@ -166,10 +192,11 @@ export async function handleSubscriptionChange(
 ): Promise<SubscriptionChangeResult> {
   const credentials = await deps.store.readCredentials();
   if (credentials === null) return { status: "skipped", reason: "notifications not enabled" };
+  const timeoutMs = deps.relayTimeoutMs ?? RELAY_CALL_TIMEOUT_MS;
 
   let endpoint = deps.newSubscription?.endpoint;
   if (endpoint === undefined) {
-    const key = await fetchVapidPublicKey(credentials.relayUrl, deps.fetchImpl);
+    const key = await fetchVapidPublicKey(credentials.relayUrl, deps.fetchImpl, timeoutMs);
     if (!key.ok) return { status: "failed", reason: key.detail };
     try {
       endpoint = (await deps.resubscribe(key.key)).endpoint;
@@ -178,7 +205,7 @@ export async function handleSubscriptionChange(
     }
   }
 
-  const registered = await registerPushEndpoint(credentials, endpoint, deps.fetchImpl);
+  const registered = await registerPushEndpoint(credentials, endpoint, deps.fetchImpl, timeoutMs);
   if (!registered.ok) return { status: "failed", reason: registered.detail };
   await deps.store.writeRegistration({
     relayUrl: credentials.relayUrl,

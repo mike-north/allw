@@ -132,6 +132,13 @@ export interface NotificationControlsOptions {
   /** The paired identity; only its four relay-credential fields are used. */
   readonly identity: PushIdentity;
   readonly env: PushEnvironment;
+  /**
+   * Whether `identity` is still this browser's pairing (same device and bearer token). Another tab
+   * can forget or replace the pairing while these controls are mounted; the controls check this
+   * right before registering with the relay and again before writing the credential mirror, so a
+   * forgotten identity is never re-mirrored or re-registered. Defaults to always true.
+   */
+  readonly isStillPaired?: () => boolean;
 }
 
 /** The mounted controls: the current state and the enable action, for tests and callers. */
@@ -159,15 +166,30 @@ function isCurrentRegistration(
   );
 }
 
-/** Mirror the credentials, register `endpoint`, and record the registration. */
+/** Shown when another tab forgot or replaced this browser's pairing while the controls were up. */
+export const PAIRING_CHANGED_NOTE =
+  "This browser's pairing changed in another tab. Reload the page to set up notifications.";
+
+/**
+ * Register `endpoint` with the relay, then mirror the credentials and record the registration.
+ * The pairing is re-checked before the relay call and again before anything is written: if it was
+ * forgotten meanwhile, nothing is mirrored, and a registration already sent is withdrawn (best
+ * effort), so a forgotten identity's token never returns to the mirror or the relay.
+ */
 async function registerSubscription(
   env: PushEnvironment,
   credentials: PushCredentials,
   endpoint: string,
+  isStillPaired: () => boolean,
 ): Promise<NotificationControlState> {
-  await env.store.writeCredentials(credentials);
+  if (!isStillPaired()) return { kind: "off", note: PAIRING_CHANGED_NOTE };
   const result = await registerPushEndpoint(credentials, endpoint, env.fetchImpl);
   if (!result.ok) return { kind: "failed", detail: result.detail };
+  if (!isStillPaired()) {
+    await clearPushTokens(credentials, env.fetchImpl);
+    return { kind: "off", note: PAIRING_CHANGED_NOTE };
+  }
+  await env.store.writeCredentials(credentials);
   await env.store.writeRegistration({
     relayUrl: credentials.relayUrl,
     accountId: credentials.accountId,
@@ -248,6 +270,7 @@ export function mountNotificationControls(
   options: NotificationControlsOptions,
 ): NotificationControls {
   const { host, env } = options;
+  const isStillPaired = options.isStillPaired ?? (() => true);
   const credentials = pushCredentialsFrom(options.identity);
   let current: NotificationControlState = { kind: "checking" };
   let enabling = false;
@@ -291,10 +314,13 @@ export function mountNotificationControls(
         });
       }
       if (isCurrentRegistration(last, credentials, subscription.endpoint)) {
+        if (!isStillPaired()) return show({ kind: "off", note: PAIRING_CHANGED_NOTE });
         await env.store.writeCredentials(credentials);
         return show({ kind: "on" });
       }
-      return show(await registerSubscription(env, credentials, subscription.endpoint));
+      return show(
+        await registerSubscription(env, credentials, subscription.endpoint, isStillPaired),
+      );
     } catch (error) {
       return show({ kind: "failed", detail: describe(error) });
     }
@@ -328,7 +354,9 @@ export function mountNotificationControls(
         userVisibleOnly: true,
         applicationServerKey: key.key,
       });
-      return show(await registerSubscription(env, credentials, subscription.endpoint));
+      return show(
+        await registerSubscription(env, credentials, subscription.endpoint, isStillPaired),
+      );
     } catch (error) {
       return show({ kind: "failed", detail: describe(error) });
     } finally {

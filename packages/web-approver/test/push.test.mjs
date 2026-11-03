@@ -42,6 +42,7 @@ import {
   registerPushEndpoint,
 } from "../dist/push-relay.js";
 import {
+  PAIRING_CHANGED_NOTE,
   forgetNotifications,
   isAppleMobile,
   mountNotificationControls,
@@ -293,6 +294,96 @@ describe("handlePush — every push ends in a visible notification (#237)", () =
 
 // ── Service worker: notification tap ─────────────────────────────────────────────────────────────
 
+/**
+ * A relay that accepts a request and then stalls must not hold a push hostage: browsers end the push
+ * event with no notification, and Safari revokes subscriptions whose pushes show nothing. Every relay
+ * call has a deadline covering headers and body (review of #315, finding 1).
+ */
+describe("relay deadline — a stalled relay still ends in a notification (#237)", () => {
+  const SHORT = 30;
+  const never = () => new Promise(() => {});
+
+  /** A 200 whose body never finishes: a real `Response` over a stream that never closes. */
+  function stalledBody() {
+    return new Response(new ReadableStream({ start() {} }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  test("a fetch that never answers shows the generic notification", async () => {
+    const { showNotification: show, shown } = notificationSink();
+    await handlePush({
+      store: memoryPushStore({ credentials: CREDENTIALS }),
+      fetchImpl: never,
+      showNotification: show,
+      relayTimeoutMs: SHORT,
+    });
+    assert.equal(shown.length, 1);
+    assert.equal(shown[0].options.body, UNKNOWN_INBOX_BODY);
+    assert.equal(shown[0].options.tag, NOTIFICATION_TAG);
+  });
+
+  test("headers that arrive with a body that stalls show the generic notification", async () => {
+    const { showNotification: show, shown } = notificationSink();
+    await handlePush({
+      store: memoryPushStore({ credentials: CREDENTIALS }),
+      fetchImpl: async () => stalledBody(),
+      showNotification: show,
+      relayTimeoutMs: SHORT,
+    });
+    assert.equal(shown.length, 1);
+    assert.equal(shown[0].options.body, UNKNOWN_INBOX_BODY);
+  });
+
+  test("a credential read that never settles still shows the generic notification", async () => {
+    const { showNotification: show, shown } = notificationSink();
+    await handlePush({
+      store: { readCredentials: never },
+      fetchImpl: () => assert.fail("no relay call without credentials"),
+      showNotification: show,
+      relayTimeoutMs: SHORT,
+    });
+    assert.equal(shown.length, 1);
+    assert.equal(shown[0].options.body, UNKNOWN_INBOX_BODY);
+  });
+
+  test("the deadline aborts the request, so a real fetch stops reading", async () => {
+    let signal;
+    const count = await fetchPendingCount(
+      CREDENTIALS,
+      (_url, init) => {
+        signal = init.signal;
+        return never();
+      },
+      SHORT,
+    );
+    assert.equal(count, null);
+    assert.ok(signal instanceof AbortSignal);
+    assert.equal(signal.aborted, true);
+  });
+
+  test("a resubscribe whose relay calls stall fails instead of hanging", async () => {
+    for (const fetchImpl of [never, async () => stalledBody()]) {
+      const result = await handleSubscriptionChange({
+        store: memoryPushStore({ credentials: CREDENTIALS }),
+        fetchImpl,
+        newSubscription: null,
+        resubscribe: async () => ({ endpoint: ENDPOINT }),
+        relayTimeoutMs: SHORT,
+      });
+      assert.equal(result.status, "failed");
+      assert.match(result.reason, /did not answer within/);
+    }
+  });
+
+  test("a registration whose PUT stalls fails instead of hanging", async () => {
+    const result = await registerPushEndpoint(CREDENTIALS, ENDPOINT, never, SHORT);
+    assert.equal(result.ok, false);
+    assert.equal(result.status, null);
+  });
+});
+
 describe("handleNotificationClick (#237)", () => {
   const APP_URL = "https://approver.example/";
 
@@ -495,15 +586,17 @@ describe("relay calls (#237)", () => {
     });
   }
 
-  test("a 409 says the account's push-registration budget is full (#236: 409, nothing changes)", async () => {
+  test("a 409 says the budget is full and how to free a registration (#236: 409, nothing changes)", async () => {
     const result = await registerPushEndpoint(
       CREDENTIALS,
       ENDPOINT,
       fakeFetch(() => json(409, { error: "account push-token limit reached" })).impl,
     );
     assert.equal(result.ok, false);
-    assert.match(result.detail, /most push registrations the relay allows \(409\)/);
-    assert.match(result.detail, /revoke a device you no longer use/);
+    assert.match(result.detail, /as many push registrations as the relay allows \(409\)/);
+    // The advice names the one shipped action that frees a registration (forgetting the pairing on
+    // another browser clears its tokens); revoking another device isn't available yet (#204).
+    assert.match(result.detail, /in a browser you no longer use and choose .Use another device./);
   });
 
   for (const status of [401, 403]) {
@@ -829,6 +922,95 @@ describe("mountNotificationControls (#237)", () => {
 
   const text = () => host.querySelector(".push-controls-text")?.textContent ?? "";
   const button = () => host.querySelector("button.push-controls-btn");
+
+  /**
+   * Another tab forgets (or replaces) the pairing while this tab's controls are up (review of #315,
+   * finding 2). The controls must not write the forgotten token back into the shared mirror, and
+   * must not re-register it with the relay.
+   */
+  test("a forget during an in-flight enable writes nothing and sends no PUT", async () => {
+    const t = environment();
+    let releasePermission;
+    t.env.notifications.requestPermission = () =>
+      new Promise((resolve) => {
+        releasePermission = () => resolve("granted");
+      });
+    let paired = true;
+    const controls = mountNotificationControls({
+      host,
+      identity: IDENTITY,
+      env: t.env,
+      isStillPaired: () => paired,
+    });
+    await controls.ready;
+    const enabling = controls.enable();
+    await waitFor(() => releasePermission !== undefined);
+
+    // Tab B: "Use another device" while the permission prompt is open here.
+    paired = false;
+    await forgetNotifications({
+      store: t.store,
+      fetchImpl: t.env.fetchImpl,
+      getSubscription: null,
+    });
+    releasePermission();
+
+    assert.deepEqual(await enabling, { kind: "off", note: PAIRING_CHANGED_NOTE });
+    assert.deepEqual(t.store.writes, [["clear"]], "only the forget touched the mirror");
+    assert.equal(t.store.state.credentials, null);
+    assert.ok(
+      t.calls.every((call) => call.init.method !== "PUT"),
+      "no push-token PUT reached the relay",
+    );
+    assert.equal(text(), PAIRING_CHANGED_NOTE);
+  });
+
+  test("a forget during the registration PUT withdraws it and writes nothing", async () => {
+    let paired = true;
+    const t = environment({
+      relay: (url, init) => {
+        if (url === VAPID_URL) return json(200, { vapid_public_key: VAPID_KEY_B64URL });
+        const tokens = JSON.parse(init.body).push_tokens;
+        // Tab B forgets the pairing while this registration is in flight.
+        if (tokens.length > 0) paired = false;
+        return json(200, { push_tokens: tokens });
+      },
+    });
+    const controls = mountNotificationControls({
+      host,
+      identity: IDENTITY,
+      env: t.env,
+      isStillPaired: () => paired,
+    });
+    await controls.ready;
+    assert.deepEqual(await controls.enable(), { kind: "off", note: PAIRING_CHANGED_NOTE });
+
+    const puts = t.calls.filter((call) => call.init.method === "PUT");
+    assert.deepEqual(
+      puts.map((call) => JSON.parse(call.init.body)),
+      [{ push_tokens: [{ transport: "webpush", token: ENDPOINT }] }, { push_tokens: [] }],
+      "the registration is withdrawn",
+    );
+    assert.deepEqual(t.store.writes, [], "nothing was mirrored");
+  });
+
+  test("on load, a pairing forgotten elsewhere is not re-mirrored", async () => {
+    const store = memoryPushStore({ registration: { ...pick(CREDENTIALS), endpoint: ENDPOINT } });
+    const t = environment({
+      permission: "granted",
+      existing: subscriptionFor(ENDPOINT),
+      store,
+    });
+    const controls = mountNotificationControls({
+      host,
+      identity: IDENTITY,
+      env: t.env,
+      isStillPaired: () => false,
+    });
+    assert.deepEqual(await controls.ready, { kind: "off", note: PAIRING_CHANGED_NOTE });
+    assert.deepEqual(store.writes, []);
+    assert.equal(t.calls.length, 0);
+  });
 
   test("iOS in a browser tab shows Home Screen instructions instead of the enable button", async () => {
     const t = environment({ userAgent: IPHONE_SAFARI_UA });

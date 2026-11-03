@@ -231,6 +231,17 @@ describe("boot — notification controls (#237)", () => {
     assert.ok(forgets.count >= 1, "a corrupt identity's notification credentials are forgotten");
   });
 
+  test("a browser with no stored identity forgets at boot, before onboarding or any action", async () => {
+    // No identity and onboarding not done: the walkthrough comes first, so boot's own forget is
+    // the only one that runs before the human does anything (review of #315, finding 4). A relay
+    // is already persisted, so boot runs through to the walkthrough without prompting.
+    const storage = memoryStorage();
+    storage.setItem(RELAY_URL_STORAGE_KEY, PINNED_RELAY);
+    const { root, forgets } = await bootWith({ search: "", storage });
+    assert.equal(root.querySelector("form.pairing-form"), null, "the walkthrough is showing");
+    assert.equal(forgets.count, 1);
+  });
+
   test("'Use another device' forgets the notification credentials with the pairing", async () => {
     const storage = memoryStorage();
     storage.setItem(PAIRING_KEY, JSON.stringify(PINNED_IDENTITY));

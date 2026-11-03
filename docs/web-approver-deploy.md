@@ -308,7 +308,8 @@ never decrypts anything. A wakeup is payload-less, so the worker fetches
 **every** push: browsers throttle or revoke a subscription whose pushes show nothing (Safari after a
 few). When the inbox is already empty (another device answered, the request expired, or the relay
 coalesced several submits into one wakeup) it says "An approval request was handled or expired."
-When the inbox can't be read, it says "Open allw approvals to check for approval requests."
+When the inbox can't be read, including when the relay doesn't answer within 8 seconds (headers
+and body), it says "Open allw approvals to check for approval requests."
 Every notification uses one fixed tag (`allw-approvals`) with `renotify`, so repeated wakeups
 replace a single notification, which alerts again, instead of stacking. The collapsing has to happen
 here: Apple's push service rejects the Web Push `Topic` header, so the relay can't collapse wakeups
@@ -322,8 +323,9 @@ device id and `device_auth_token`. The device seeds, device cert and account roo
 mirrored. The token there has the same exposure as the identity in `localStorage`: any script
 running on the approver origin can read both (`docs/threat-model.md`).
 
-**Forgetting a pairing.** The mirror never outlives the pairing. Whenever the identity is forgotten
-(**Use another device**, a corrupt identity) and on any load with no usable identity, the page:
+**Forgetting a pairing.** The mirror is cleared with the pairing. When the identity is forgotten
+(**Use another device**, a corrupt identity, a confirmed re-pair) and on any load with a missing or
+corrupt identity, the page:
 
 1. reads the mirrored credentials into memory, then deletes both IndexedDB records, so the service
    worker has no token to use;
@@ -336,6 +338,15 @@ revoked), the relay keeps the endpoint until the device is revoked, or until the
 answers 404/410 for the dropped subscription and the relay prunes it (`docs/relay-api.md` §5).
 Until then, a wakeup can still reach a subscription that wasn't dropped. The worker, which has no
 credentials, then shows only "Open allw approvals to check for approval requests."
+
+An identity pinned to a relay this build rejects (§2, _Relay pinning_) is forgotten only when the
+human confirms the re-pair. Until then its mirrored credentials stay, but they are inert: the worker
+re-validates the relay on every read and makes no call to one this build rejects.
+
+Another tab can forget or replace the pairing while this one shows the strip. Before registering
+with the relay, and again before writing the mirror, the strip checks that the identity it was
+mounted for is still the stored one. If it isn't, nothing is mirrored, a registration already sent
+is withdrawn (best effort), and the strip asks for a reload.
 
 **Files.** `scripts/build-site.mjs` bundles the worker to `sw.js` at the site root (a worker's scope
 can't be wider than its directory), and ships `manifest.webmanifest` (name, `start_url`,

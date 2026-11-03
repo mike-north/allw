@@ -137,8 +137,10 @@ export interface BootEnvironment {
   /**
    * Mount the notification controls (#237) for a paired identity, outside the inbox. Called after
    * `startInbox`, and never awaited: notifications can't delay or block the inbox. Omit to skip.
+   * `isStillPaired` reports whether that identity is still this browser's pairing (another tab may
+   * forget or replace it), so the controls never re-mirror or re-register a forgotten identity.
    */
-  readonly startNotifications?: (identity: PinnedIdentity) => void;
+  readonly startNotifications?: (identity: PinnedIdentity, isStillPaired: () => boolean) => void;
   /**
    * Undo notifications for a forgotten pairing (#237): clear the service worker's credential
    * mirror, then best-effort clear the browser's subscription and the relay's push tokens. Called
@@ -381,7 +383,15 @@ export async function boot(env: BootEnvironment): Promise<void> {
         }
         const pinned: PinnedIdentity = { ...identity, relayUrl: identity.relayUrl };
         void env.startInbox(root, pinned);
-        env.startNotifications?.(pinned);
+        env.startNotifications?.(pinned, () => {
+          // Another tab may forget or replace the pairing while this one stays open.
+          const now = pairingStore.load();
+          return (
+            now.status === "paired" &&
+            now.identity.deviceId === pinned.deviceId &&
+            now.identity.deviceAuthToken === pinned.deviceAuthToken
+          );
+        });
       },
     });
   }
@@ -401,10 +411,11 @@ export async function boot(env: BootEnvironment): Promise<void> {
  * Mount the notification controls (#237) into `#notifications`, against the browser's real
  * service worker, Push API, Notifications API and IndexedDB.
  */
-function startBrowserNotifications(identity: PinnedIdentity): void {
+function startBrowserNotifications(identity: PinnedIdentity, isStillPaired: () => boolean): void {
   mountNotificationControls({
     host: requireElement("notifications"),
     identity,
+    isStillPaired,
     env: browserPushEnvironment(window, createIndexedDbPushCredentialStore(window.indexedDB)),
   });
 }
