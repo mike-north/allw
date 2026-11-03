@@ -1,4 +1,6 @@
 import {
+  CONTEXT_SUMMARY_LABEL,
+  RAW_ARGV_DIVERGENCE_WARNING,
   WebApproverController,
   type ApprovalDecision,
   type ApprovalEnvelope,
@@ -6,6 +8,7 @@ import {
   type WebApproverRuntime,
 } from "./index.js";
 import { mountPairingGate, type PairingStore } from "./pairing.js";
+import { plaintextBlock } from "./plaintext-block.js";
 import { createRelayPoller, type RelayPollerOptions } from "./relay-poll.js";
 import {
   createRetractListener,
@@ -355,6 +358,19 @@ function card(
     article.append(badge);
   }
   article.append(textElement("h3", detail.summary));
+  if (detail.rawArgvDiverges) {
+    const divergence = textElement("p", RAW_ARGV_DIVERGENCE_WARNING);
+    divergence.className = "raw-argv-divergence-warning verification-warning";
+    divergence.setAttribute("role", "alert");
+    article.append(divergence);
+  }
+  if (detail.contextSummary !== undefined) {
+    // Hash-bound, so shown — but labelled as the integrator's description and kept below the
+    // action heading, which stays the primary thing the human reads.
+    const summary = metaLine(CONTEXT_SUMMARY_LABEL, detail.contextSummary);
+    summary.classList.add("approval-context-summary");
+    article.append(summary);
+  }
   article.append(metaLine("Actor", detail.actor));
   article.append(
     metaLine("Risk", `${detail.riskLevel}${detail.reversible === false ? " · irreversible" : ""}`),
@@ -362,10 +378,7 @@ function card(
   article.append(metaLine("Expires", `${String(Math.ceil(detail.countdownMs / 1000))}s`));
   article.append(metaLine("Request hash", detail.requestHash ?? "unverified"));
 
-  const plaintext = document.createElement("pre");
-  plaintext.className = "approval-plaintext";
-  plaintext.textContent = detail.exactPlaintext;
-  article.append(plaintext);
+  article.append(plaintextBlock(detail.exactPlaintext, "approval-plaintext"));
 
   if (detail.verificationError) {
     const warning = textElement("p", `Verification failed: ${detail.verificationError}`);

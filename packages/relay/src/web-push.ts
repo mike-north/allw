@@ -51,6 +51,36 @@ const WEB_PUSH_EXACT_HOSTS: ReadonlySet<string> = new Set([
 const WNS_HOST_PATTERN = /^[a-z0-9-]+\.notify\.windows\.com$/;
 
 /**
+ * The RFC 8030 §5.4 `Topic` on every wakeup sent to a host in {@link WEB_PUSH_TOPIC_HOSTS}. It is
+ * one fixed value for every account and subscription. A push service keeps at most one undelivered
+ * message per topic per subscription, so an offline browser receives one queued wakeup instead of
+ * one per request. Nothing is lost: a wakeup is payload-less, and one inbox fetch returns every
+ * pending request. The value is 11 characters from the base64url alphabet, within the RFC's limit
+ * of 32.
+ */
+export const WEB_PUSH_TOPIC = "allw-wakeup";
+
+/**
+ * Push-service hosts that get a `Topic` header. Only hosts whose own documentation says they
+ * support it are listed. Sending `Topic` where it isn't supported can fail every wakeup, not merely
+ * skip collapsing:
+ *
+ * - Mozilla autopush documents `Topic` (at most 32 characters of `[A-Za-z0-9_-]`). Listed.
+ * - Apple (`web.push.apple.com`) has answered any `Topic` with `400 BadWebPushTopic` since about
+ *   September 2026, by many independent reports. Not listed.
+ * - FCM documents no `Topic` support for Web Push, and WNS documents only its own `X-WNS-*`
+ *   headers. Neither is listed until verified.
+ *
+ * The per-host table, with sources, is in `docs/relay-api.md` §5.
+ */
+const WEB_PUSH_TOPIC_HOSTS: ReadonlySet<string> = new Set(["updates.push.services.mozilla.com"]);
+
+/** The `Topic` header for a wakeup to `endpoint`, or `undefined` for a host that must not get one. */
+export function webPushTopicFor(endpoint: URL): string | undefined {
+  return WEB_PUSH_TOPIC_HOSTS.has(endpoint.hostname) ? WEB_PUSH_TOPIC : undefined;
+}
+
+/**
  * `TTL` values the relay sends, in seconds: 1 minute, 5 minutes, 1 hour, 1 day, and 28 days (the
  * common push-service ceiling). The TTL is visible to the push service, so it is rounded **up** to
  * one of these buckets rather than sent exactly; the provider learns a request's deadline only to
@@ -252,13 +282,16 @@ export class WebPushTransport implements PushTransport {
 
     const nowMs = this.now();
     const jwt = await signVapidJwt(signingKey, endpoint.origin, this.vapid.subject, nowMs);
+    const headers: Record<string, string> = {
+      Authorization: `vapid t=${jwt}, k=${this.vapid.publicKey}`,
+      TTL: String(webPushTtlSeconds(wakeup.expiresAt, nowMs)),
+      Urgency: "high",
+    };
+    const topic = webPushTopicFor(endpoint);
+    if (topic !== undefined) headers.Topic = topic;
     const response = await this.fetcher(endpoint.href, {
       method: "POST",
-      headers: {
-        Authorization: `vapid t=${jwt}, k=${this.vapid.publicKey}`,
-        TTL: String(webPushTtlSeconds(wakeup.expiresAt, nowMs)),
-        Urgency: "high",
-      },
+      headers,
       // Payload-less wakeup: an empty body (sent as `Content-Length: 0`), never request data.
       body: "",
       // A redirect would let an allowlisted host bounce the relay to an arbitrary target.
@@ -304,12 +337,14 @@ async function signVapidJwt(
 /**
  * `TTL` for a wakeup: the request's remaining lifetime rounded **up** to the next bucket in
  * {@link WEB_PUSH_TTL_BUCKETS_SECONDS} (anything beyond the largest is capped at 28 days), or `0`
- * once the deadline has passed. Rounding up never expires a wakeup before its request (which would
+ * once the deadline has passed or is not a number. Rounding up never expires a wakeup before its request (which would
  * drop a push); at worst it outlives the request by less than one bucket step.
  */
 export function webPushTtlSeconds(expiresAtMs: number, nowMs: number): number {
   const remaining = Math.ceil((expiresAtMs - nowMs) / 1000);
-  if (remaining <= 0) return 0;
+  // Fail toward a short TTL: a non-finite deadline (NaN) must never become the 28-day cap.
+  // An infinite one is capped like any other far-future deadline.
+  if (Number.isNaN(remaining) || remaining <= 0) return 0;
   const largest =
     WEB_PUSH_TTL_BUCKETS_SECONDS[WEB_PUSH_TTL_BUCKETS_SECONDS.length - 1] ?? remaining;
   return WEB_PUSH_TTL_BUCKETS_SECONDS.find((bucket) => remaining <= bucket) ?? largest;

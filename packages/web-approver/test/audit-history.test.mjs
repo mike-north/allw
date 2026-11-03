@@ -18,7 +18,11 @@ import test from "node:test";
 import { JSDOM } from "jsdom";
 
 import { mountAuditHistory } from "../dist/audit-history.js";
-import { WebApproverController } from "../dist/index.js";
+import {
+  CONTEXT_SUMMARY_LABEL,
+  RAW_ARGV_DIVERGENCE_WARNING,
+  WebApproverController,
+} from "../dist/index.js";
 
 // ── Deterministic time fixtures (never Date.now()) ────────────────────────────────────────────
 
@@ -48,7 +52,7 @@ function envelope(id, overrides = {}) {
 function context(overrides = {}) {
   return {
     kind: "command",
-    command: {
+    substrate: {
       cwd: "/repo",
       argv: ["git", "push", "origin", "main"],
       raw: "git push origin main",
@@ -371,7 +375,7 @@ test("mountAuditHistory renders the WYSIWYS plaintext verbatim without HTML inje
       {
         requestHash: "hash-xss-audit",
         context: context({
-          command: { cwd: "/repo", argv: ["echo", xssPayload], raw: xssPayload },
+          substrate: { cwd: "/repo", argv: ["echo", xssPayload], raw: xssPayload },
         }),
         resolvedDecision: "approved",
       },
@@ -506,6 +510,50 @@ test("mountAuditHistory: request hash and attestation are shown in evidence card
     );
     assert.ok(evidenceValues.includes("req_8F7B3A91"), "request hash appears in evidence cards");
     assert.ok(evidenceValues.includes("verified"), "actor attestation appears in evidence cards");
+  } finally {
+    globalThis.document = savedDoc;
+    globalThis.window = savedWin;
+  }
+});
+
+test("mountAuditHistory shows the context summary and any raw/argv divergence (#262, #295)", async () => {
+  const plainEnv = envelope("req-plain");
+  const divergentEnv = envelope("req-divergent");
+  const fixtures = new Map([
+    [plainEnv.id, { requestHash: "hash-plain", context: context(), resolvedDecision: "approved" }],
+    [
+      divergentEnv.id,
+      {
+        requestHash: "hash-divergent",
+        context: context({
+          substrate: { argv: ["rm", "-rf", "~"], raw: "git status" },
+          divergentArgv: "rm -rf '~'",
+        }),
+        resolvedDecision: "approved",
+      },
+    ],
+  ]);
+  const controller = await syncedController([plainEnv, divergentEnv], fixtures);
+
+  const savedDoc = globalThis.document;
+  const savedWin = globalThis.window;
+  const dom = new JSDOM('<div id="audit-root"></div>', { url: "https://approver.local/" });
+  const root = dom.window.document.getElementById("audit-root");
+  globalThis.document = dom.window.document;
+  globalThis.window = dom.window;
+  try {
+    mountAuditHistory(root, controller);
+    const summaries = Array.from(root.querySelectorAll(".audit-context-summary")).map(
+      (el) => el.textContent,
+    );
+    assert.deepEqual(summaries, [
+      `${CONTEXT_SUMMARY_LABEL}: pushes local commits to the remote`,
+      `${CONTEXT_SUMMARY_LABEL}: pushes local commits to the remote`,
+    ]);
+    const warnings = root.querySelectorAll(".audit-raw-argv-divergence");
+    assert.equal(warnings.length, 1, "only the divergent record carries the warning");
+    assert.equal(warnings[0].textContent, RAW_ARGV_DIVERGENCE_WARNING);
+    assert.equal(warnings[0].getAttribute("role"), "alert");
   } finally {
     globalThis.document = savedDoc;
     globalThis.window = savedWin;

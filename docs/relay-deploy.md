@@ -178,6 +178,13 @@ relay can never unregister every device. Stale endpoints stay registered until e
 replaces its push tokens with its new subscription (`PUT /{acct}/devices/{device_id}/push-tokens`,
 `docs/relay-api.md` §3), which a web approver should do when it re-subscribes (client flow: #237).
 
+**`Topic` is sent only to push services documented to accept it** (today Mozilla autopush; the
+per-host table and sources are in `docs/relay-api.md` §5). In particular Apple's
+`web.push.apple.com` rejects any `Topic` header with `400 BadWebPushTopic`. If Safari / iOS wakeups
+stop arriving while other browsers still get them, check that no `Topic` is being sent to Apple
+(the relay does not log push-service failures today). A 400 is treated as transient, so the tokens
+stay registered and recover once the header is gone.
+
 ### Secrets inventory summary
 
 | Secret / var           | Required  | Description                                                                                                                                        |

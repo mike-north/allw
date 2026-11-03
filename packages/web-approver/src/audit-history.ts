@@ -12,8 +12,9 @@
  * controls area is intentionally omitted — audit history is read-only by design (flow-notes.md).
  *
  * # WYSIWYS receipt
- * The exact plaintext from `detail.exactPlaintext` is rendered verbatim in a `<pre>` with
- * `textContent` only — no innerHTML, no interpolation — matching the inbox detail view.
+ * The exact plaintext from `detail.exactPlaintext` is rendered verbatim with `textContent` only — no
+ * innerHTML, no interpolation — through the same wrapping block as the inbox card
+ * (`plaintext-block.ts`).
  *
  * @see design/web-approver/audit-history/app.jsx (visual source of truth, design #125)
  * @see design/web-approver/inbox/tokens.css (verbatim token source)
@@ -21,7 +22,13 @@
  * @see packages/web-approver/src/index.ts (AuditHistoryItem, WebApproverController)
  */
 
-import type { AuditHistoryItem, WebApproverController } from "./index.js";
+import {
+  CONTEXT_SUMMARY_LABEL,
+  RAW_ARGV_DIVERGENCE_WARNING,
+  type AuditHistoryItem,
+  type WebApproverController,
+} from "./index.js";
+import { plaintextBlock } from "./plaintext-block.js";
 
 /**
  * Mount the audit-history view into `root`. Returns a disposer that tears down all DOM children
@@ -189,6 +196,23 @@ function detailPane(
 
   pane.append(statusGrid);
 
+  // The hash-bound context summary and any raw/argv divergence, as on the inbox card (#262, #295).
+  if (detail.contextSummary !== undefined) {
+    const summary = document.createElement("p");
+    summary.className = "audit-context-summary";
+    summary.append(
+      textElement("strong", `${CONTEXT_SUMMARY_LABEL}: `),
+      document.createTextNode(detail.contextSummary),
+    );
+    pane.append(summary);
+  }
+  if (detail.rawArgvDiverges) {
+    const divergence = textElement("p", RAW_ARGV_DIVERGENCE_WARNING);
+    divergence.className = "audit-raw-argv-divergence";
+    divergence.setAttribute("role", "alert");
+    pane.append(divergence);
+  }
+
   // WYSIWYS receipt — plain text, no innerHTML
   const wysiwys = document.createElement("div");
   wysiwys.className = "audit-wysiwys";
@@ -196,9 +220,7 @@ function detailPane(
   const codeLabel = textElement("span", "WYSIWYS render");
   codeLabel.className = "audit-wysiwys__label";
 
-  const pre = document.createElement("pre");
-  pre.className = "audit-wysiwys__pre";
-  pre.textContent = detail.exactPlaintext;
+  const pre = plaintextBlock(detail.exactPlaintext, "audit-wysiwys__pre");
 
   wysiwys.append(codeLabel, pre);
   pane.append(wysiwys);

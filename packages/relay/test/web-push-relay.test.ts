@@ -924,3 +924,71 @@ describe("submit — a coalesced submit gets a trailing wakeup when the window e
     expect(after.alarm).toBe(expiresAt);
   });
 });
+
+describe("submit — a wakeup's TTL covers every pending request, not just its own (#261)", () => {
+  /** The window has passed: the coalescer forgets its claims, so the next submit is woken directly. */
+  async function forgetCoalescerClaims(accountId: string): Promise<void> {
+    await runInDurableObject(relayStub(accountId), (instance: AccountRelay) => {
+      (instance as unknown as RelayInternals).webPushCoalescer = new WakeupCoalescer(
+        WEB_PUSH_COALESCE_MS,
+      );
+    });
+  }
+
+  it("uses the latest pending deadline, and only pending requests count", async () => {
+    // With an RFC 8030 Topic, a later wakeup replaces a queued earlier one along with its TTL, so a
+    // short-lived request must not cut short the wakeup a long-lived pending one still needs.
+    const acct = testAccount("acct-webpush-ttl-latest-pending");
+    await pairWithPushTokens(acct, [{ transport: "webpush", token: MOZILLA_ENDPOINT }]);
+    const fetcher = await installWebPush(acct, () => 201);
+
+    await submitRequest(acct, envelope("req-ttl-long"));
+    await pushFanOutSettled(acct);
+    await forgetCoalescerClaims(acct);
+    await submitRequest(acct, {
+      ...envelope("req-ttl-short-1"),
+      expires_at: Date.now() + 90_000,
+    });
+    await pushFanOutSettled(acct);
+
+    // Once the long-lived request is resolved, only the short-lived ones remain.
+    await runInDurableObject(relayStub(acct), (instance: AccountRelay) => {
+      (instance as unknown as RelayInternals).sql.exec(
+        `UPDATE request SET status = 'resolved', terminal_at = ? WHERE request_id = 'req-ttl-long'`,
+        CREATED_AT,
+      );
+    });
+    await forgetCoalescerClaims(acct);
+    await submitRequest(acct, {
+      ...envelope("req-ttl-short-2"),
+      expires_at: Date.now() + 90_000,
+    });
+    await pushFanOutSettled(acct);
+
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    const day28 = String(28 * 24 * 60 * 60);
+    expect(ttlOf(fetcher, 0)).toBe(day28);
+    // The 90 s request alone would get the 5-minute bucket; the pending 2100 request wins.
+    expect(ttlOf(fetcher, 1)).toBe(day28);
+    expect(ttlOf(fetcher, 2)).toBe(String(5 * 60));
+  });
+});
+
+describe("request table — the latest pending deadline is read through an index", () => {
+  it("plans latestPendingRequest's query on the partial pending-by-expiry index", async () => {
+    // Every unauthenticated submit runs this query, so it must not scan the whole request table.
+    const acct = testAccount("acct-request-pending-index");
+    const plan = await runInDurableObject(relayStub(acct), (instance: AccountRelay) => [
+      ...(instance as unknown as RelayInternals).sql.exec<{ detail: string }>(
+        `EXPLAIN QUERY PLAN
+         SELECT request_id, expires_at FROM request
+         WHERE status = 'pending' AND expires_at > ?
+         ORDER BY expires_at DESC LIMIT 1`,
+        0,
+      ),
+    ]);
+    const details = plan.map((row) => row.detail).join(" | ");
+    expect(details).toContain("request_pending_by_expiry");
+    expect(details).not.toContain("USE TEMP B-TREE FOR ORDER BY");
+  });
+});
