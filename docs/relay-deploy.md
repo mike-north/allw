@@ -235,6 +235,40 @@ anything in the approval contract.
 
 ---
 
+### 3d. Rate limiting (unauthenticated routes)
+
+The relay's unauthenticated routes are rate-limited with the
+[Workers rate-limiting binding](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/).
+Three bindings are declared under `"ratelimits"` in `packages/relay/wrangler.jsonc`, at the top level
+**and** under `env.production` (named environments do not inherit them). The client identity is
+`CF-Connecting-IP`, with an IPv6 address reduced to its /64:
+
+| Binding               | Routes                                                           | Key                 | Default      |
+| --------------------- | ---------------------------------------------------------------- | ------------------- | ------------ |
+| `RATE_LIMIT_CLIENT`   | `POST /{acct}/pairing/start`, `…/pairing/complete`, `…/requests` | client IP           | 120 per 60 s |
+| `RATE_LIMIT_PAIRING`  | `POST /{acct}/pairing/start`, `…/pairing/complete`               | account + client IP | 10 per 60 s  |
+| `RATE_LIMIT_REQUESTS` | `POST /{acct}/requests`                                          | account + client IP | 60 per 60 s  |
+
+The per-client binding is checked first, so minting fresh account ids does not buy a client new
+budget. That per-IP budget is shared by every client behind one address (a corporate NAT, a CGNAT
+pool, an IPv6 /64), so a busy office can exhaust it; raise `RATE_LIMIT_CLIENT`'s `limit` for such
+deployments. Tune `simple.limit` (and `period`, which must be `10` or `60`) per environment; keep the
+binding names. Each `namespace_id` must be unique within your Cloudflare account. **If a binding is
+missing the routes it covers fail closed with 503**, so a deploy that drops the block takes pairing
+and submission offline rather than running unlimited.
+
+Workers rate limiting is per Cloudflare location and eventually consistent, so treat it as flood
+damping. What the other limits bound (`docs/relay-api.md` §3 Integrator endpoints):
+
+- The per-account pending cap (64) bounds **live** requests only — what devices are shown and what
+  a submit flood can hold open at once.
+- **Stored bytes** are bounded by submit rate × the 7-day retention × a small per-row residue: the
+  request horizon (`MAX_REQUEST_TTL_MS`, above) ends every request within 15 minutes, and every
+  terminal transition (expired, retracted, resolved) blanks the stored envelope, so a retained row
+  keeps only its id (a UUID), timestamps, status, token hash and (if resolved) the signed verdict.
+
+---
+
 ## 4. Migrations
 
 The `AccountRelay` Durable Object uses a single migration tag: `"v1"` (declared in `wrangler.jsonc`

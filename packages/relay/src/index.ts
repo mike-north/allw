@@ -33,6 +33,7 @@ import {
   MAX_CONTEXT_CIPHERTEXT_BYTES,
   MAX_CREATED_AT_SKEW_MS,
   MAX_PAIRING_BODY_BYTES,
+  MAX_PENDING_REQUESTS_PER_ACCOUNT,
   MAX_REQUEST_BODY_BYTES,
   PAIRING_TTL_MS,
   REQUEST_RETENTION_MS,
@@ -46,7 +47,16 @@ import {
   verifyAccountState,
   verifyPairingStartAuthorization,
 } from "./core.js";
-import { parseMaxRequestTtlMs, readJsonObjectCapped, utf8ByteLength } from "./limits.js";
+import {
+  clientRateLimitKey,
+  enforceRateLimit,
+  parseMaxRequestTtlMs,
+  rateLimitKey,
+  rateLimitedRoute,
+  readJsonObjectCapped,
+  utf8ByteLength,
+  type RateLimiter,
+} from "./limits.js";
 import {
   ApnsPushTransport,
   FcmPushTransport,
@@ -83,6 +93,15 @@ export interface Env extends VapidEnv, CorsEnv {
   readonly APNS_BEARER_TOKEN?: string;
   readonly FCM_ENDPOINT?: string;
   readonly FCM_BEARER_TOKEN?: string;
+  /**
+   * Cloudflare rate-limiting bindings for the unauthenticated routes (`wrangler.jsonc`
+   * `ratelimits`): per account + client, `pairing/start` + `pairing/complete` and `requests`; and
+   * per client alone across all three. Missing ⇒ those routes fail closed with 503. See
+   * `./limits.ts`.
+   */
+  readonly RATE_LIMIT_PAIRING?: RateLimiter;
+  readonly RATE_LIMIT_REQUESTS?: RateLimiter;
+  readonly RATE_LIMIT_CLIENT?: RateLimiter;
   /** Optional request-horizon override in ms (default 15 min). See `parseMaxRequestTtlMs`. */
   readonly MAX_REQUEST_TTL_MS?: string;
 }
@@ -98,6 +117,19 @@ export default {
       // Route by account id → its Durable Object.
       const accountId = url.pathname.split("/")[1] ?? "";
       if (!accountId) return new Response("missing account", { status: 400 });
+      // Rate-limit the unauthenticated routes at the edge, before the account's Durable Object.
+      const route = rateLimitedRoute(req.method, url.pathname);
+      if (route !== null) {
+        // Per client across every account first, so minting fresh account ids buys no new budget.
+        const clientRefused = await enforceRateLimit(
+          env.RATE_LIMIT_CLIENT,
+          clientRateLimitKey(req),
+        );
+        if (clientRefused) return clientRefused;
+        const limiter = route === "pairing" ? env.RATE_LIMIT_PAIRING : env.RATE_LIMIT_REQUESTS;
+        const refused = await enforceRateLimit(limiter, rateLimitKey(accountId, req));
+        if (refused) return refused;
+      }
       const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
       return stub.fetch(req);
     });
@@ -1683,6 +1715,8 @@ export class AccountRelay implements DurableObject {
    * - 409: a request with this `id` was already submitted.
    * - 413: the body exceeds `MAX_REQUEST_BODY_BYTES` (checked before parsing) or
    *        `context_ciphertext` exceeds `MAX_CONTEXT_CIPHERTEXT_BYTES`.
+   * - 429: the account already holds `MAX_PENDING_REQUESTS_PER_ACCOUNT` live pending requests.
+   * (The Worker's rate limiter may also answer 429/503 before this handler runs.)
    */
   private async handleSubmit(request: Request, accountId: string): Promise<Response> {
     // No bound root ⇒ no device can have paired (#242), so nothing could ever decide this request.
@@ -1760,6 +1794,13 @@ export class AccountRelay implements DurableObject {
     ];
     if (existing.length > 0) return json({ error: "request already submitted" }, 409);
 
+    // Pending cap. Counted in the same synchronous section as the INSERT below (nothing awaits in
+    // between), so concurrent submits cannot overshoot it. Only live requests count: resolved,
+    // expired and retracted rows, and pending rows already past their deadline, do not.
+    if (this.livePendingCount(now) >= MAX_PENDING_REQUESTS_PER_ACCOUNT) {
+      return json({ error: "too many pending requests for this account" }, 429);
+    }
+
     // SECURITY: the whole envelope is routing/lifecycle + the opaque ciphertext — no plaintext.
     try {
       this.sql.exec(
@@ -1808,6 +1849,23 @@ export class AccountRelay implements DurableObject {
       return `'created_at' is more than ${String(MAX_CREATED_AT_SKEW_MS)} ms in the future`;
     }
     return null;
+  }
+
+  /**
+   * Live pending requests: status `pending`, not yet past `expires_at`, and within the horizon of
+   * when the relay received them (a pre-horizon row with a far-future `expires_at` stops counting —
+   * and is expired by the alarm — once it is older than `maxRequestTtlMs`).
+   */
+  private livePendingCount(now: number): number {
+    const row = [
+      ...this.sql.exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM request
+         WHERE status = 'pending' AND expires_at > ? AND created_at > ?`,
+        now,
+        now - this.maxRequestTtlMs,
+      ),
+    ][0];
+    return row?.n ?? 0;
   }
 
   private async authorizeRequestRead(
