@@ -1,0 +1,110 @@
+# Publishes the @allw/* npm packages via npm trusted publishing (GitHub Actions OIDC).
+#
+# There is deliberately no NPM_TOKEN: npm exchanges this workflow's short-lived OIDC token for a
+# one-shot publish credential, and only for packages whose trusted-publisher config names this repo,
+# this workflow file (release.yml) and the `npm-publish` environment. Provenance is attested
+# automatically. The identity values live in scripts/release-packages.mjs, which the bootstrap that
+# configures npm also reads — rename this file or the environment and you must re-run the bootstrap.
+#
+# Triggers:
+#   - push of a `v<version>` tag on main's history → build, smoke, pack, publish.
+#   - workflow_dispatch from a branch → rehearsal: everything up to `npm publish --dry-run`.
+#     (Dispatching on a `v*` tag ref behaves like the tag push — use it to retry a failed release.)
+#
+# See docs/releasing.md.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build, smoke, pack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Releases are cut only from commits already on main (reviewed + CI-gated there).
+      - name: Require the release commit to be on main
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
+            || { echo "::error::$GITHUB_REF_NAME ($GITHUB_SHA) is not on main"; exit 1; }
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # Lockstep versioning: the tag must equal every published package's version. A rehearsal
+      # (branch dispatch) checks the version currently in the manifests instead.
+      - name: Verify the release set
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="v$(node -p 'require("./packages/sdk/package.json").version')"
+          fi
+          node scripts/release-packages.mjs verify "$tag"
+      # The .wasm is a build artifact (not committed); it must be bundled into the @allw/sdk tarball.
+      - run: pnpm run build:wasm
+      - run: pnpm -r build
+      - run: pnpm run test:release
+      # pack → clean `npm install` → headless checks, with no Rust toolchain on the consumer side.
+      - run: pnpm run smoke:packaged-install
+      - run: node scripts/release-packages.mjs pack dist-release
+      - name: Rehearse the publish (dry run)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: node scripts/release-packages.mjs publish dist-release --dry-run
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarballs
+          path: dist-release/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish to npm
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # Must match RELEASE_ENVIRONMENT in scripts/release-packages.mjs and the npm trusted-publisher
+    # config. Add protection rules (required reviewers, `v*` tags only) to it in the repo settings.
+    environment: npm-publish
+    # The only job that can mint an OIDC token. It installs no dependencies and runs no package
+    # scripts — it publishes the exact tarballs the build job smoke-tested.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      # Trusted publishing needs npm >= 11.5.1.
+      - run: npm install -g npm@^11.5.1
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-tarballs
+          path: dist-release
+      # In dependency order; versions already on the registry are skipped, so re-running a partially
+      # failed release completes it.
+      - run: node scripts/release-packages.mjs publish dist-release
