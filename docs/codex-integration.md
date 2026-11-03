@@ -128,6 +128,37 @@ directory. The project contains:
   into the wrapper rather than placed in `hooks.json`.
 - `.codex/hooks.json` — the project-scoped Codex hook config; its `"command"` field invokes the
   wrapper via `bash <abs-path>/allw-hook.sh`. No manual `export` step is needed.
+- `.codex/config.toml` — the fail-closed granular `approval_policy` from
+  [Granular `approval_policy`](#granular-approval_policy), so the UAT exercises the recommended posture rather than
+  Codex's defaults.
+- `.codex/rules/uat.rules` — one execpolicy `prefix_rule` per decision (`allow`, `prompt`, `forbidden`), each on
+  its own `echo allw-uat-rules-…` command, for the `.rules` interaction cases.
+
+The project is also a git repository, because `codex exec` exits outside one unless it gets
+`--skip-git-repo-check` (`codex-rs/exec/src/lib.rs`).
+
+**One-time trust step.** Codex loads a project's `.codex/` config, hooks and rules only when the project is
+trusted. It runs a hook that isn't managed only after the hook is approved, and that approval is stored as a hash of
+the hook's config. A plain `codex exec` can grant neither, and an untrusted hook is **silently skipped**, so the gate
+fails open ([Fail-Open Residual](#structural-residual-unchanged-inherent-to-pretooluse),
+[#348](https://github.com/mike-north/allw/issues/348)). Before the cases, the operator runs the interactive `codex`
+once in the project, trusts the folder, approves the allw `PreToolUse` hook in the startup hook review, and quits.
+The helper prints this step.
+
+`codex exec --dangerously-bypass-hook-trust` is the one exception. Verified from codex-rs source at `openai/codex`
+main `ac558e2` (read, not run):
+
+- It runs every **enabled** hook without stored hook trust, for that one invocation. Disabled hooks stay off
+  (`codex-rs/hooks/src/engine/discovery.rs:917-923`).
+- It is a CLI flag, off by default (`codex-rs/utils/cli/src/shared_options.rs:61-64`). `codex exec` makes it
+  global (`codex-rs/exec/src/cli.rs:168`) and forwards it as a runtime override (`codex-rs/exec/src/lib.rs:618`).
+- It is not a `config.toml` key. The `Config` field is documented as runtime-only
+  (`codex-rs/core/src/config/mod.rs:1027-1030`).
+- It does not grant project trust. The config loader never reads it
+  (`codex-rs/config/src/loader/mod.rs:project_trust_context`).
+
+**The UAT does not use it.** It skips the exact check the trust step exists for, so a pass under it says nothing
+about whether the hook runs in a normal session. It also makes every enabled hook run unreviewed, not just allw's.
 
 The helper prints the exact `codex exec` commands for the operator to run in a second terminal,
 then runs `allw-approver watch` in the foreground. It never touches `~/.codex` global config
@@ -159,6 +190,17 @@ record the result on issue #97:
    schema-conformance tests (`packages/codex-hook/test/codex-io.test.mjs`, `regression-191.test.mjs`)
    match what a real Codex build actually accepts; a future Codex schema change would show up here
    as a rejected/ignored field before it reaches production.
+7. **`.rules` `allow`**: run `echo allw-uat-rules-allow`. The allw approval must still be requested on the second
+   device: an `allow` rule can't skip the gate. This is the coverage claim behind staying on `PreToolUse`.
+8. **`.rules` `prompt` (interactive `codex`)**: run `echo allw-uat-rules-prompt` in the TUI, because `codex exec`
+   never prompts. Record which prompt appears first. Expected: the allw approval first, then Codex's own prompt, and
+   a denial in allw skips Codex's prompt (see [execpolicy `.rules`](#execpolicy-rules)).
+9. **`.rules` `forbidden`**: run `echo allw-uat-rules-forbidden` and approve it on the second device. Codex must
+   still block it: tightening-only, consistent with `docs/contract.md` §6.
+10. **Granular auto-reject (interactive `codex`)**: ask Codex to use `request_permissions` for network access. With
+    `request_permissions = false` the request must be rejected without reaching a human.
+11. **Permission mode**: in the deny case, capture the hook's stdin as well, and confirm the hook ran with
+    `permission_mode: "bypassPermissions"` under `codex exec`.
 
 Fixed in [#191](https://github.com/mike-north/allw/issues/191): the hook used to emit an
 undocumented `denyReason` field that Codex rejected, silently discarding every deny (step 2 was
@@ -173,6 +215,11 @@ Timeout: PASS/FAIL - command failed closed after ALLW_TIMEOUT_MS
 Actor identity: PASS/FAIL - inbox showed codex:<hostname>
 File edit: PASS/FAIL - apply_patch was gated with path, summary, and diff hash
 Schema conformance: PASS/FAIL - deny stdout had only documented fields, no denyReason
+.rules allow: PASS/FAIL - the allw approval was still required
+.rules prompt: PASS/FAIL - order: allw first / Codex first; a denial in allw skipped Codex's prompt
+.rules forbidden: PASS/FAIL - an allw-approved command was still blocked
+Granular auto-reject: PASS/FAIL - request_permissions was rejected without reaching a human
+Permission mode: PASS/FAIL - the hook ran under codex exec (permission_mode bypassPermissions)
 Notes:
 ```
 
@@ -323,8 +370,10 @@ revisiting only if Codex adds a _tool-call_ approval category that bypasses the 
 **Correlation cost, for the record.** `PermissionRequest` input carries `session_id`, `turn_id`,
 `tool_name`, and `tool_input` — but **no `tool_use_id`** (`PreToolUse` has one). Any dual-homed
 design would have to correlate the two events by hashing canonicalized `tool_input`, and would
-need the two events' relative ordering, which is not documented. That ordering question is filed
-in [#192](https://github.com/mike-north/allw/issues/192) as a UAT item.
+need the two events' relative ordering. That ordering is not documented, but the source settles it:
+`PreToolUse` fires first, before the tool's handler runs, and `PermissionRequest` fires later, at the approval point
+inside the handler (`codex-rs/core/src/tools/approvals.rs`). Verified from codex-rs source at `openai/codex` main
+`ac558e2` (read, not run); see [execpolicy `.rules`](#execpolicy-rules).
 
 ### Revisit this decision if
 
@@ -355,18 +404,29 @@ widening rather than a tool call), and skill-script approvals. The config layer,
 is the right answer for those:
 
 ```toml
-approval_policy = { granular = {
-  sandbox_approval    = true,   # second gate after allw; can only tighten
-  rules               = true,   # execpolicy `prompt` rules stay interactive
-  mcp_elicitations    = false,  # invisible to the allw hook -> auto-reject
-  request_permissions = false,  # permission widening the hook cannot see -> auto-reject
-  skill_approval      = false,  # auto-reject
-} }
 approvals_reviewer = "user"
+
+[approval_policy.granular]
+sandbox_approval = true      # a second gate after allw; it can only tighten
+rules = true                 # execpolicy `prompt` rules stay interactive
+mcp_elicitations = false     # invisible to the allw hook, so auto-reject
+request_permissions = false  # permission widening the hook can't see, so auto-reject
+skill_approval = false       # auto-reject
 ```
 
-Wiring this posture into the generated UAT project is tracked in
-[#192](https://github.com/mike-north/allw/issues/192).
+This is the same value as the one-line inline form
+`approval_policy = { granular = { sandbox_approval = true, … } }`. It is written as a standard table because an
+inline table spread over several lines is TOML 1.1 syntax, which a TOML 1.0 parser rejects.
+`scripts/uat-codex.sh` writes exactly this block into the temporary project's `.codex/config.toml`
+(#192), and `scripts/uat-codex.test.mjs` parses it and checks every key.
+
+This posture governs the interactive `codex`. `codex exec` overrides it with `approval_policy = "never"` (unless
+the reviewer is `auto_review`), which also rejects every prompt rather than surfacing it, so headless runs are
+fail-closed too. Verified from codex-rs source at `openai/codex` main `ac558e2` (read, not run):
+`codex-rs/exec/src/lib.rs`, the headless `ConfigOverrides`. In the same source, `false` for `request_permissions`
+returns an empty grant without a prompt, for `mcp_elicitations` declines the elicitation, and for `rules` /
+`sandbox_approval` turns the prompt into a rejection. For `skill_approval`, the source shows no runtime enforcement
+beyond the prompt text, so its auto-reject is unconfirmed until the UAT.
 
 ### `approvals_reviewer = "auto_review"`
 
@@ -402,8 +462,22 @@ request and therefore the allw gate with it. On `PreToolUse` that path is closed
 
 Double-prompting under `prompt` rules is a real UX cost and is the honest price of refusing to
 emit `PermissionRequest` `allow`. `approval_policy.granular.rules = false` converts it into an
-auto-reject instead, which is fail-closed but blunt. The ordering of the two prompts is not
-documented and is a UAT item in [#192](https://github.com/mike-north/allw/issues/192).
+auto-reject instead, which is fail-closed but blunt.
+
+**Ordering**, verified from codex-rs source at `openai/codex` main `ac558e2` (read, not run):
+
+- `PreToolUse` runs **before** any Codex approval. `codex-rs/core/src/tools/registry.rs:dispatch_any_with_state`
+  calls `apply_pre_tool_use` before the tool's handler, and the execpolicy / sandbox approval requirement is
+  computed only inside that handler (`ToolOrchestrator::run` → `request_approval`).
+- So under a `prompt` rule the allw approval comes first and Codex's prompt second. If allw denies, the handler never
+  runs, so Codex never prompts.
+- A `.rules` `allow` becomes "skip approval" inside the handler, after the hook has already run, so it can't skip
+  the gate.
+- A `forbidden` rule rejects in the same place, also after the hook. If allw denies first, allw's reason is the one
+  Codex reports.
+- Shell commands the user types with `!` are not model tool calls and get no `PreToolUse`.
+
+The UAT checklist items 7–9 confirm this on a live build.
 
 ## Fail-Open Residual
 
@@ -425,6 +499,14 @@ explicit, well-formed `deny` before Codex's pinned 480 second hook timeout:
   hook timeout so the SDK reaches a verified approval or explicit denial first.
 - Hooks are disabled or never trusted: `[features] hooks = false`, a hook left un-trusted in
   `/hooks`, or an enterprise `allow_managed_hooks_only = true` that skips user and project hooks.
+  A hook that isn't managed runs only while its stored `trusted_hash` matches its current config. So an
+  **edited** allw hook (a new command path, matcher or timeout) is dropped silently, just like a new one, until it is
+  re-approved. `codex exec` has no review step to grant trust. Only the explicit, off-by-default
+  `--dangerously-bypass-hook-trust` flag runs such a hook, and it skips trust for every enabled hook
+  ([Human-Run UAT Setup](#human-run-uat-setup)). A project's `.codex/hooks.json` also needs a trusted project, which that
+  flag does not grant. Verified from codex-rs source at `openai/codex` main `ac558e2`:
+  `codex-rs/hooks/src/engine/discovery.rs:hook_trust_status`. Mitigation is tracked in
+  [#348](https://github.com/mike-north/allw/issues/348).
 - The handler is misconfigured as `"async": true`. Background hooks "can't block, approve, rewrite,
   or otherwise control the operation that triggered them" — the gate silently becomes advisory.
   **Never set `async` on the allw handler.**
@@ -467,9 +549,16 @@ runs inside it**, and deny it when you wouldn't approve that.
 - `approvals_reviewer = "auto_review"` — a second, downstream gate; can only tighten.
 - `.rules` `allow` — does not suppress `PreToolUse`.
 - `approval_policy = "never"` / `granular` with categories set to `false` — auto-rejects; tightening.
-- `permission_mode` (`dontAsk`, `bypassPermissions`) — Codex reports the mode to the hook rather
-  than skipping it. Worth confirming empirically; it is a UAT item in
-  [#192](https://github.com/mike-north/allw/issues/192).
+- `permission_mode` — Codex reports the mode to the hook rather than skipping it. Verified from codex-rs source at `openai/codex` main `ac558e2` (read, not run):
+  - `apply_pre_tool_use` has no approval-policy check, so no mode skips the hook.
+  - `codex-rs/core/src/hook_runtime.rs:hook_permission_mode` only ever sends two values:
+    - `bypassPermissions` for `approval_policy = never`, which includes `--dangerously-bypass-approvals-and-sandbox`
+      / `--yolo`, `-a never` and every `codex exec` run;
+    - `default` for everything else, including `granular` (`Granular(_)`, `OnRequest` and `UnlessTrusted`).
+  - `acceptEdits`, `plan` and `dontAsk` are in the input schema but never sent.
+  - So `--dangerously-bypass-approvals-and-sandbox` is not a hook residual. It removes Codex's own second gate, not
+    allw's.
+  - UAT checklist item 11 confirms this live.
 
 ## Codex Hook Constraints
 
