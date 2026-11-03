@@ -326,8 +326,10 @@ trust decision, and it lives in the core:
   difference remains: the web shows tool-call `params` as indented JSON lines, while the CLI prints compact JSON on
   one wrapped row. Pretty-printed continuation lines are always indented, quoted, or a bracket, so none can pose as a
   label.
-- Neither approver shows the hash-bound `action.risk`, `capabilities` or `scope` (both show the context `risk`).
-  `capabilities` and `scope` must be null in v1 but are not yet rejected on the device. Owner: #296.
+- Neither approver shows the hash-bound `action.risk`, `capabilities` or `scope` (both show the context `risk`). The
+  device now refuses a context that sets `capabilities` or `scope`, or whose shown `risk` is lower than `action.risk`
+  ([contract.md](./contract.md) §Device-side context checks, #296). The remaining residual is a context that
+  **raises** the risk: the human sees the higher tier but not the record's own. Owner: #340.
 - Relay-supplied text outside the context goes through `escape_for_display` too. The CLI approver escapes every
   `watch` log line (request ids, relay error strings, which could otherwise repaint the request block mid-prompt),
   every `pair` output line (the relay-issued pairing code and `device_id`), and the fatal error line (which can embed
