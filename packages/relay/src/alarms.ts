@@ -50,9 +50,15 @@ export class AlarmMultiplexer<Purpose extends string> {
    * firing. A due purpose missing from it did not reschedule itself, so its row is removed.
    */
   private scheduledDuringRun: Set<string> | undefined;
+  /**
+   * The owner's clock (epoch ms). It only clamps the real alarm so it is never set in the past;
+   * due times themselves are absolute and come from the purposes.
+   */
+  private readonly now: () => number;
 
-  constructor(storage: DurableObjectStorage) {
+  constructor(storage: DurableObjectStorage, now: () => number = () => Date.now()) {
     this.storage = storage;
+    this.now = now;
     storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS alarm_due (
         purpose TEXT    PRIMARY KEY,
@@ -165,6 +171,6 @@ export class AlarmMultiplexer<Purpose extends string> {
       await this.storage.deleteAlarm();
       return;
     }
-    await this.storage.setAlarm(Math.max(next, Date.now()));
+    await this.storage.setAlarm(Math.max(next, this.now()));
   }
 }

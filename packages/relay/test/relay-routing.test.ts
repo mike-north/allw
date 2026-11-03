@@ -839,8 +839,14 @@ describe("AccountRelay — cross-device coordination", () => {
     const relay = Object.create(AccountRelay.prototype) as {
       ctx: Pick<DurableObjectState, "acceptWebSocket" | "getWebSockets">;
       sql: Pick<SqlStorage, "exec">;
+      now: () => number;
+      maxRequestTtlMs: number;
       handleDeviceConnect(deviceId: string, request: Request): Response;
     };
+    // `Object.create` skips field initializers, so the clock and horizon the flush reads are set
+    // here. The stub `sql` ignores them: it returns the queued row whatever the deadline filter.
+    relay.now = () => 1_700_000_000_000;
+    relay.maxRequestTtlMs = 15 * 60_000;
     relay.ctx = {
       acceptWebSocket: (ws: WebSocket) => ws.accept(),
       getWebSockets: (tag: string) => (tag === "surface:mac-screen" ? [staleMac] : []),
@@ -1779,6 +1785,275 @@ describe("AccountRelay — fail-closed expiry", () => {
     // A de-enrolled device must not drive resolution — the request stays pending.
     const polled = await get<{ status: string }>(acct, `/requests/${rid("req-rev-1")}`);
     expect(polled.data.status).toBe("pending");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// One deadline for every lifecycle path (#292)
+// ---------------------------------------------------------------------------
+
+/**
+ * The horizon these tests lower the relay to after a submit: two minutes, under the five minutes
+ * between {@link RELAY_NOW} and {@link FUTURE_EXPIRES_AT}. This is an operator lowering
+ * `MAX_REQUEST_TTL_MS` while requests are pending. A request received at `RELAY_NOW` then has a
+ * horizon deadline ({@link HORIZON_DEADLINE}) three minutes before its `expires_at`.
+ */
+const LOWERED_HORIZON_MS = 2 * 60_000;
+/** `created_at + LOWERED_HORIZON_MS` for a request the relay received at {@link RELAY_NOW}. */
+const HORIZON_DEADLINE = RELAY_NOW + LOWERED_HORIZON_MS;
+
+describe("AccountRelay — one deadline for every lifecycle path (#292)", () => {
+  /**
+   * Each test holds a request past its horizon deadline but before its `expires_at`, on a pinned
+   * clock, and checks that one path neither delivers nor resolves it. Before #292 the inbox, the
+   * reconnect flush, lazy expiry (poll, wait, retract), verdict acceptance and the wakeup deadline
+   * all read `expires_at` alone, so such a row stayed live on them while the alarm expired it.
+   */
+  function stubFor(accountId: string): DurableObjectStub {
+    return env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
+  }
+
+  /** Lower the account's request horizon, as a redeploy with a smaller `MAX_REQUEST_TTL_MS` would. */
+  async function lowerHorizon(accountId: string): Promise<void> {
+    await runInDurableObject(stubFor(accountId), (instance: AccountRelay) => {
+      (instance as unknown as { maxRequestTtlMs: number }).maxRequestTtlMs = LOWERED_HORIZON_MS;
+    });
+  }
+
+  /**
+   * Submit `requestId` at {@link RELAY_NOW} (expiring at {@link FUTURE_EXPIRES_AT}), then lower the
+   * horizon. The relay's clock stays at `RELAY_NOW`; each test moves it.
+   */
+  async function submitThenLowerHorizon(accountId: string, requestId: string): Promise<void> {
+    const submit = await post<SubmitResult>(accountId, "/requests", makeEnvelope(requestId));
+    expect(submit.status).toBe(202);
+    await lowerHorizon(accountId);
+  }
+
+  async function storedVerdictCount(accountId: string, requestId: string): Promise<number> {
+    return runInDurableObject(stubFor(accountId), (instance: AccountRelay) => {
+      const relay = instance as unknown as { sql: SqlStorage };
+      return [...relay.sql.exec(`SELECT 1 FROM verdict WHERE request_id = ?`, requestId)].length;
+    });
+  }
+
+  it("submit: a wakeup's deadline ignores a pending request past its horizon deadline", async () => {
+    const acct = testAccount("acct-deadline-submit");
+    await pairDeviceWithPushToken(acct);
+    const wakeups: PushWakeup[] = [];
+    await installPushTransports(acct, { apns: recordingTransport("apns", wakeups) });
+    await submitThenLowerHorizon(acct, rid("req-deadline-submit-old"));
+    await vi.waitFor(() => {
+      expect(wakeups).toHaveLength(1);
+    });
+
+    // Past the coalescing window, and at the old request's horizon deadline.
+    await pinRelayClock(acct, HORIZON_DEADLINE);
+    const freshExpiresAt = HORIZON_DEADLINE + 60_000;
+    const submit = await post<SubmitResult>(acct, "/requests", {
+      ...makeEnvelope(rid("req-deadline-submit-new")),
+      // Inside the lowered horizon's `created_at` bound.
+      created_at: HORIZON_DEADLINE,
+      expires_at: freshExpiresAt,
+    });
+    expect(submit.status).toBe(202);
+    expect(submit.data.push_wakeups).toBe(1);
+    await vi.waitFor(() => {
+      expect(wakeups).toHaveLength(2);
+    });
+    // The old request's `expires_at` (FUTURE_EXPIRES_AT) is later, but it is no longer live.
+    expect(wakeups[1]).toMatchObject({
+      requestId: rid("req-deadline-submit-new"),
+      expiresAt: freshExpiresAt,
+    });
+  });
+
+  it("submit: refuses a request whose deadline is now", async () => {
+    const acct = testAccount("acct-deadline-submit-now");
+    await submitThenLowerHorizon(acct, rid("req-deadline-submit-now-a"));
+    await pinRelayClock(acct, RELAY_NOW);
+    const refused = await post<{ error: string }>(acct, "/requests", {
+      ...makeEnvelope(rid("req-deadline-submit-now-b")),
+      expires_at: RELAY_NOW,
+    });
+    expect(refused.status).toBe(400);
+    expect(refused.data.error).toBe("request already expired");
+  });
+
+  it("alarm: arms at the horizon deadline, not at expires_at", async () => {
+    const acct = testAccount("acct-deadline-alarm");
+    await submitThenLowerHorizon(acct, rid("req-deadline-alarm"));
+    expect(await readScheduledAlarm(acct)).toBe(FUTURE_EXPIRES_AT);
+
+    // Any firing re-arms request expiry from the stored rows, now under the lowered horizon.
+    await runAlarm(acct);
+    expect(await readScheduledAlarm(acct)).toBe(HORIZON_DEADLINE);
+  });
+
+  it("sweep: expires the request at its horizon deadline, and not 1 ms before", async () => {
+    const acct = testAccount("acct-deadline-sweep");
+    const deviceId = await enrollDevice(acct);
+    const device = await connectWs(acct, `/devices/${deviceId}/connect`);
+    await submitThenLowerHorizon(acct, rid("req-deadline-sweep"));
+    expect((await device.next()).request_id).toBe(rid("req-deadline-sweep"));
+    const integrator = await connectWs(acct, `/requests/${rid("req-deadline-sweep")}/wait`);
+
+    await pinRelayClock(acct, HORIZON_DEADLINE - 1);
+    await runAlarm(acct);
+    expect(await readRequestStatus(acct, rid("req-deadline-sweep"))).toBe("pending");
+    await device.expectNothingPending();
+
+    await pinRelayClock(acct, HORIZON_DEADLINE);
+    await runAlarm(acct);
+    expect(await readRequestStatus(acct, rid("req-deadline-sweep"))).toBe("expired");
+    expect(await device.next()).toEqual({ type: "retract", request_id: rid("req-deadline-sweep") });
+    expect(await integrator.next()).toEqual({
+      type: "expired",
+      request_id: rid("req-deadline-sweep"),
+    });
+  });
+
+  it("inbox: omits the request at its horizon deadline, lists it 1 ms before", async () => {
+    const acct = testAccount("acct-deadline-inbox");
+    const deviceId = await enrollDevice(acct);
+    await submitThenLowerHorizon(acct, rid("req-deadline-inbox"));
+    const inboxIds = async (): Promise<unknown[]> => {
+      const resp = await get<{ envelopes: Array<Record<string, unknown>> }>(
+        acct,
+        `/devices/${deviceId}/inbox`,
+        bearer(deviceAuthTokens.get(tokenKey(acct, deviceId)) ?? ""),
+      );
+      expect(resp.status).toBe(200);
+      return resp.data.envelopes.map((e) => e.id);
+    };
+
+    await pinRelayClock(acct, HORIZON_DEADLINE - 1);
+    expect(await inboxIds()).toEqual([rid("req-deadline-inbox")]);
+    await pinRelayClock(acct, HORIZON_DEADLINE);
+    expect(await inboxIds()).toEqual([]);
+  });
+
+  it("flush: a reconnect at the horizon deadline does not deliver the request", async () => {
+    const acct = testAccount("acct-deadline-flush");
+    const deviceId = await enrollDevice(acct);
+    await submitThenLowerHorizon(acct, rid("req-deadline-flush"));
+
+    await pinRelayClock(acct, HORIZON_DEADLINE - 1);
+    const before = await connectWs(acct, `/devices/${deviceId}/connect`);
+    expect((await before.next()).request_id).toBe(rid("req-deadline-flush"));
+
+    await pinRelayClock(acct, HORIZON_DEADLINE);
+    const after = await connectWs(acct, `/devices/${deviceId}/connect`);
+    await after.expectNothingPending();
+  });
+
+  it("poll: lazy-expires the request at its horizon deadline", async () => {
+    const acct = testAccount("acct-deadline-poll");
+    await submitThenLowerHorizon(acct, rid("req-deadline-poll"));
+
+    await pinRelayClock(acct, HORIZON_DEADLINE - 1);
+    expect(
+      (await get<{ status: string }>(acct, `/requests/${rid("req-deadline-poll")}`)).data,
+    ).toMatchObject({ status: "pending" });
+    await pinRelayClock(acct, HORIZON_DEADLINE);
+    expect(
+      (await get<{ status: string }>(acct, `/requests/${rid("req-deadline-poll")}`)).data,
+    ).toMatchObject({ status: "expired" });
+    expect(await readRequestStatus(acct, rid("req-deadline-poll"))).toBe("expired");
+  });
+
+  it("wait: a waiter that connects at the horizon deadline is told 'expired'", async () => {
+    const acct = testAccount("acct-deadline-wait");
+    await submitThenLowerHorizon(acct, rid("req-deadline-wait"));
+
+    await pinRelayClock(acct, HORIZON_DEADLINE);
+    const waiter = await connectWs(acct, `/requests/${rid("req-deadline-wait")}/wait`);
+    expect(await waiter.next()).toEqual({ type: "expired", request_id: rid("req-deadline-wait") });
+    expect(await readRequestStatus(acct, rid("req-deadline-wait"))).toBe("expired");
+  });
+
+  it("retract: 409 'already expired' at the horizon deadline", async () => {
+    const acct = testAccount("acct-deadline-retract");
+    await submitThenLowerHorizon(acct, rid("req-deadline-retract"));
+
+    await pinRelayClock(acct, HORIZON_DEADLINE);
+    const retract = await post<{ error: string }>(
+      acct,
+      `/requests/${rid("req-deadline-retract")}/retract`,
+      {},
+    );
+    expect(retract.status).toBe(409);
+    expect(retract.data.error).toBe("request already expired");
+    expect(await readRequestStatus(acct, rid("req-deadline-retract"))).toBe("expired");
+  });
+
+  it("verdict: a genuine verdict at the horizon deadline is acked 'expired' and not recorded", async () => {
+    const acct = testAccount("acct-deadline-verdict");
+    const deviceId = await enrollDevice(acct);
+    const device = await connectWs(acct, `/devices/${deviceId}/connect`);
+    await submitThenLowerHorizon(acct, rid("req-deadline-verdict"));
+    expect((await device.next()).request_id).toBe(rid("req-deadline-verdict"));
+
+    await pinRelayClock(acct, HORIZON_DEADLINE);
+    device.send({
+      type: "verdict",
+      request_id: rid("req-deadline-verdict"),
+      verdict: await makeVerdict(acct, rid("req-deadline-verdict")),
+    });
+    expect(await device.next()).toEqual({
+      type: "ack",
+      request_id: rid("req-deadline-verdict"),
+      status: "expired",
+    });
+    expect(await readRequestStatus(acct, rid("req-deadline-verdict"))).toBe("expired");
+    expect(await storedVerdictCount(acct, rid("req-deadline-verdict"))).toBe(0);
+  });
+
+  it("at exactly expires_at: poll reports 'expired' and a verdict is refused", async () => {
+    // The boundary every path shares: live strictly before the deadline, expired at it. Poll and
+    // verdict acceptance used to keep a request live at exactly `expires_at`.
+    const acct = testAccount("acct-deadline-expires-at");
+    const deviceId = await enrollDevice(acct);
+    const device = await connectWs(acct, `/devices/${deviceId}/connect`);
+    const pollId = rid("req-deadline-at-poll");
+    const verdictId = rid("req-deadline-at-verdict");
+    const expiresAt = RELAY_NOW + 60_000;
+    for (const id of [pollId, verdictId]) {
+      expect(
+        (await post(acct, "/requests", { ...makeEnvelope(id), expires_at: expiresAt })).status,
+      ).toBe(202);
+      expect((await device.next()).request_id).toBe(id);
+    }
+
+    await pinRelayClock(acct, expiresAt);
+    expect((await get<{ status: string }>(acct, `/requests/${pollId}`)).data).toMatchObject({
+      status: "expired",
+    });
+    expect(await device.next()).toEqual({ type: "retract", request_id: pollId });
+    device.send({
+      type: "verdict",
+      request_id: verdictId,
+      verdict: await makeVerdict(acct, verdictId),
+    });
+    expect(await device.next()).toEqual({ type: "ack", request_id: verdictId, status: "expired" });
+    expect(await storedVerdictCount(acct, verdictId)).toBe(0);
+  });
+
+  it("verdict: accepted 1 ms before the horizon deadline", async () => {
+    const acct = testAccount("acct-deadline-verdict-before");
+    const deviceId = await enrollDevice(acct);
+    const device = await connectWs(acct, `/devices/${deviceId}/connect`);
+    await submitThenLowerHorizon(acct, rid("req-deadline-verdict-before"));
+    expect((await device.next()).request_id).toBe(rid("req-deadline-verdict-before"));
+
+    await pinRelayClock(acct, HORIZON_DEADLINE - 1);
+    device.send({
+      type: "verdict",
+      request_id: rid("req-deadline-verdict-before"),
+      verdict: await makeVerdict(acct, rid("req-deadline-verdict-before")),
+    });
+    expect(await device.next()).toMatchObject({ type: "ack", status: "resolved" });
+    expect(await storedVerdictCount(acct, rid("req-deadline-verdict-before"))).toBe(1);
   });
 });
 

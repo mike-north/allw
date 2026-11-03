@@ -41,8 +41,9 @@ import { bindAccountRoot, pinRelayClock } from "./support/relay-state.js";
 // ---------------------------------------------------------------------------
 
 /**
- * The injected relay clock (2096-10-02Z). Far enough in the future that alarms the relay schedules
- * from it (`setAlarm(max(deadline, real now))`) are the fixture values, not the real time.
+ * The injected relay clock (2096-10-02Z). Far enough in the future that the alarms the relay
+ * schedules from it (`setAlarm(max(deadline, now))`, on this same clock) are the fixture values and
+ * never fire on their own during a test.
  */
 const NOW = 4_000_000_000_000;
 /** A fixed envelope `created_at`: one second before {@link NOW}, inside every created_at bound. */

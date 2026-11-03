@@ -319,7 +319,12 @@ sockets so stale surfaces clear.
 `surface_id` is caller-asserted, account-global topology metadata; it is trusted only from a
 connection authenticated with that enrolled device's relay bearer token (#89).
 
-**Fail-closed expiry** (§Invariants #6): once a request is past `expires_at` it can never become approvable. A
+**Fail-closed expiry** (§Invariants #6): once a request is past `expires_at` it can never become approvable. The
+relay refuses at `now >= deadline` on its own receipt clock (`docs/relay-api.md` §3, request deadline), so at
+exactly `expires_at` it already treats the request as expired, 1 ms before the window `verify_verdict` checks
+(`decided_at` in `[created_at, expires_at]`, inclusive) closes. This is intentional, not a mismatch to fix on
+either side: the two checks are in series, so the stricter relay rule only ever tightens, and it matches the SDK's own wait, which
+fails closed at `now >= deadline`. A
 verdict for an expired request is refused (acked `expired`, not stored); the offline-queue flush skips expired
 requests (no dead request is re-pushed); and a read after the deadline **lazy-expires** the row — poll returns the
 terminal `expired` status and `…/wait` is pushed `{ type: "expired", request_id }`. In addition, the relay's
