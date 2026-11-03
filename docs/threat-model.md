@@ -231,6 +231,10 @@ Validation:
 - Core/WASM tests cover tampered JWS claims, mismatched request hashes, expired windows, and replayed nonces.
 - SDK tests cover `verify()` returning true only for fully verified approvals.
 - Integrator tests cover fail-closed behavior when verification throws or resolves non-approved.
+- A verified non-approval is classified only from the structured WASM error (`kind: "not_approved"`, with the
+  signed `decision`), never from the message. A relay controls text echoed into parse errors (#311). The shared
+  vector (`crates/allw-core/tests/fixtures/wasm_vector.json`) carries signed and forged non-approvals. SDK and hook
+  tests pin that a forged outer decision resolves a synthesized `denied` and that both hooks deny.
 
 ### R3. WYSIWYS completeness
 
