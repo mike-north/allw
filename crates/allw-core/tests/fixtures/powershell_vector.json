@@ -1,5 +1,5 @@
 {
-  "description": "Shared Rust/WASM vector for the PowerShell command builder (#298). Every expected value is written by hand from the rules in crates/allw-core/src/powershell.rs (argv is always a whitespace split of raw; risk floor Medium; High when raw contains ; | & a line break, a backtick, ( {, [scriptblock] or .invoke, a nested-execution command word (iex, Invoke-Expression, Invoke-Command, icm, Start-Process, start, saps, Start-Job, sajb, powershell, pwsh, cmd), an -EncodedCommand parameter or prefix (or -ec), led by one or two of - / U+2013 U+2014 U+2015, with every quote character in the token ignored (or only the quoted segment it starts with), a command named like PowerShell itself (a name starting pwsh or powershell, after any path and with its quotes removed), or dot-sourcing (a leading . word, or . directly followed by a quote or $); raw verbatim); never regenerate it from program output.",
+  "description": "Shared Rust/WASM vector for the PowerShell command builder (#298). Every expected value is written by hand from the rules in crates/allw-core/src/powershell.rs (argv is always a whitespace split of raw; risk floor Medium; High when raw contains ; | & a line break, a backtick, ( {, [scriptblock] or .invoke, a nested-execution command word (iex, Invoke-Expression, Invoke-Command, icm, Start-Process, start, saps, Start-Job, sajb, powershell, pwsh, cmd), as written or with every quote character in raw deleted, an -EncodedCommand parameter or prefix (or -ec), led by one or two of - / U+2013 U+2014 U+2015, with every quote character in the token ignored (or only the quoted segment it starts with), a command named like PowerShell itself (a name starting pwsh or powershell, after any path and with its quotes removed), or dot-sourcing (a leading . word, or . directly followed by a quote or $); raw verbatim); never regenerate it from program output.",
   "cases": [
     {
       "class": "low-risk program raised to the Medium floor",
@@ -395,6 +395,54 @@
       "risk": "medium",
       "bin": "Set-Content",
       "argv": ["Set-Content", "-Encoding", "utf8", "x"]
+    },
+    {
+      "class": "#341: quote insertion in iex",
+      "command": "i''ex $payload",
+      "cwd": null,
+      "risk": "high",
+      "bin": "i''ex",
+      "argv": ["i''ex", "$payload"]
+    },
+    {
+      "class": "#341: a quote inside Invoke-Expression",
+      "command": "I\"nvoke-Expression $payload",
+      "cwd": null,
+      "risk": "high",
+      "bin": "I\"nvoke-Expression",
+      "argv": ["I\"nvoke-Expression", "$payload"]
+    },
+    {
+      "class": "#341: quote insertion in icm",
+      "command": "i''cm -FilePath x.ps1",
+      "cwd": null,
+      "risk": "high",
+      "bin": "i''cm",
+      "argv": ["i''cm", "-FilePath", "x.ps1"]
+    },
+    {
+      "class": "#341: quote insertion in cmd",
+      "command": "c\"\"md /c del C:\\x",
+      "cwd": null,
+      "risk": "high",
+      "bin": "c\"\"md",
+      "argv": ["c\"\"md", "/c", "del", "C:\\x"]
+    },
+    {
+      "class": "#341 near miss: a quoted file name starting with iex stays Medium",
+      "command": "Get-Item 'iex-notes.txt'",
+      "cwd": null,
+      "risk": "medium",
+      "bin": "Get-Item",
+      "argv": ["Get-Item", "'iex-notes.txt'"]
+    },
+    {
+      "class": "#341 near miss: a quoted word containing cmd stays Medium",
+      "command": "Get-Item 'c''mdlets.txt'",
+      "cwd": null,
+      "risk": "medium",
+      "bin": "Get-Item",
+      "argv": ["Get-Item", "'c''mdlets.txt'"]
     }
   ]
 }
