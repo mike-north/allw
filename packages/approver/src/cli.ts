@@ -172,7 +172,22 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err: unknown) => {
-  console.error(`allw-approver: ${(err as Error).message}`);
+/**
+ * Render a fatal error message for the terminal. Error text can embed relay-supplied bytes (an HTTP
+ * error body, an id), so it goes through the core's display escape (#246). If the core itself
+ * cannot load, the text is withheld rather than printed unescaped; escaping is never reimplemented
+ * here.
+ */
+async function displaySafeErrorText(err: unknown): Promise<string> {
+  const message = err instanceof Error ? err.message : String(err);
+  try {
+    return (await loadWasm()).escape_for_display(message);
+  } catch {
+    return "fatal error (details withheld: the display-escaping core could not be loaded)";
+  }
+}
+
+main().catch(async (err: unknown) => {
+  console.error(`allw-approver: ${await displaySafeErrorText(err)}`);
   process.exit(1);
 });

@@ -172,7 +172,8 @@ async function mountWebApproverInbox(config: BrowserConfig): Promise<WebApprover
       onPollResult: (result) => {
         if (!result.ok) {
           // Preserve last-known inbox but show an outage banner — never fail-open.
-          lastError = result.error;
+          // The error text can carry relay-supplied bytes: render it through the core escape.
+          lastError = controller.escapeForDisplay(result.error);
         } else {
           // Successful poll — clear any outage banner.
           lastError = null;
@@ -342,6 +343,17 @@ function card(
 
   const article = document.createElement("article");
   article.className = `approval-card approval-card--${statusClass(detail.status)}`;
+  if (detail.hasHiddenOrControlChars) {
+    // The core escaped hidden/control characters (bidi overrides, zero-width, C0/C1) in this
+    // request; tell the human that what they read contains stand-ins for invisible bytes (#246).
+    const badge = textElement(
+      "p",
+      "⚠ Contains hidden/control characters — shown escaped (e.g. ⟨U+202E⟩). Review carefully.",
+    );
+    badge.className = "hidden-chars-warning verification-warning";
+    badge.setAttribute("role", "alert");
+    article.append(badge);
+  }
   article.append(textElement("h3", detail.summary));
   article.append(metaLine("Actor", detail.actor));
   article.append(

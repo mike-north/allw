@@ -1,0 +1,228 @@
+{
+  "description": "Shared Rust/WASM display-escaping vector (#246). Every expected value is written by hand from the notation in crates/allw-core/src/display.rs; never regenerate it from program output.",
+  "escape_cases": [
+    {
+      "class": "printable (no escape)",
+      "input": "git status --short naïve 日本語 ✅",
+      "escaped": "git status --short naïve 日本語 ✅",
+      "has_hidden_or_control_chars": false
+    },
+    {
+      "class": "C0 named controls (TAB, LF, CR)",
+      "input": "a\tb\nc\rd",
+      "escaped": "a\\tb\\nc\\rd",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "C0 other controls (NUL, ESC, US)",
+      "input": "\u0000\u001b\u001f",
+      "escaped": "\\x00\\x1b\\x1f",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "DEL",
+      "input": "xy",
+      "escaped": "x\\x7fy",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "C1 controls",
+      "input": "",
+      "escaped": "⟨U+0080⟩⟨U+0085⟩⟨U+009B⟩⟨U+009F⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "bidi embeddings and overrides (U+202A-U+202E)",
+      "input": "‪‫‬‭‮",
+      "escaped": "⟨U+202A⟩⟨U+202B⟩⟨U+202C⟩⟨U+202D⟩⟨U+202E⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "bidi isolates (U+2066-U+2069)",
+      "input": "⁦⁧⁨⁩",
+      "escaped": "⟨U+2066⟩⟨U+2067⟩⟨U+2068⟩⟨U+2069⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "bidi marks (LRM, RLM, ALM)",
+      "input": "‎‏؜",
+      "escaped": "⟨U+200E⟩⟨U+200F⟩⟨U+061C⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "zero-width and invisible (ZWSP, ZWNJ, ZWJ, WJ, BOM)",
+      "input": "​‌‍⁠﻿",
+      "escaped": "⟨U+200B⟩⟨U+200C⟩⟨U+200D⟩⟨U+2060⟩⟨U+FEFF⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "other default-ignorables and separators (soft hyphen, LS, PS, tag A)",
+      "input": "­  󠁁",
+      "escaped": "⟨U+00AD⟩⟨U+2028⟩⟨U+2029⟩⟨U+E0041⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "mixed: the #246 ESC/CR line-erase spoof plus a bidi override and a zero-width space",
+      "input": "rm -rf ~/x; : \u001b[2K\rgit status ‮exe.​txt",
+      "escaped": "rm -rf ~/x; : \\x1b[2K\\rgit status ⟨U+202E⟩exe.⟨U+200B⟩txt",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "variation selector run after an emoji variation base (smuggling): only the first selector is shown",
+      "input": "Looks fine ❤️️︁󠄀󠇯",
+      "escaped": "Looks fine ❤️⟨U+FE0F⟩⟨U+FE01⟩⟨U+E0100⟩⟨U+E01EF⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "variation selector after ASCII",
+      "input": "main️",
+      "escaped": "main⟨U+FE0F⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "emoji and text presentation (VS-16 / VS-15 after listed emoji variation bases)",
+      "input": "⚠️ careful ❤️ ©︎",
+      "escaped": "⚠️ careful ❤️ ©︎",
+      "has_hidden_or_control_chars": false
+    },
+    {
+      "class": "emoji keycap (ASCII digit, VS-16, U+20E3)",
+      "input": "1️⃣ #️⃣",
+      "escaped": "1️⃣ #️⃣",
+      "has_hidden_or_control_chars": false
+    },
+    {
+      "class": "CJK ideographic variation sequence",
+      "input": "葛󠄀",
+      "escaped": "葛󠄀",
+      "has_hidden_or_control_chars": false
+    },
+    {
+      "class": "braille pattern blank",
+      "input": "rm⠀-rf⠀/",
+      "escaped": "rm⟨U+2800⟩-rf⟨U+2800⟩/",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "variation selector after a bullet (not a variation base)",
+      "input": "ok•️",
+      "escaped": "ok•⟨U+FE0F⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "variation selector after a em dash (not a variation base)",
+      "input": "ok—️",
+      "escaped": "ok—⟨U+FE0F⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "variation selector after a no-break space (not a variation base)",
+      "input": "ok ️",
+      "escaped": "ok ⟨U+FE0F⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "variation selector after a Cyrillic letter (not a variation base)",
+      "input": "okд️",
+      "escaped": "okд⟨U+FE0F⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "variation selector after a Thai tone mark (not a variation base)",
+      "input": "ok่️",
+      "escaped": "ok่⟨U+FE0F⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "variation selector after a emoji with no variation sequence (grinning face) (not a variation base)",
+      "input": "ok😀️",
+      "escaped": "ok😀⟨U+FE0F⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "ideographic variation selector after a non-ideograph",
+      "input": "❤󠄀",
+      "escaped": "❤⟨U+E0100⟩",
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "U+FE00–U+FE0D are always escaped",
+      "input": "葛︀",
+      "escaped": "葛⟨U+FE00⟩",
+      "has_hidden_or_control_chars": true
+    }
+  ],
+  "display_model_case": {
+    "context": {
+      "action": {
+        "record_schema_version": 1,
+        "surface": "command",
+        "syntactic": {
+          "bin": "rm",
+          "argv": ["rm", "-rf", "~/x;", ":", "\u001b[2K\rgit", "status"],
+          "cwd": "/home/dev/‮ppa",
+          "raw": "rm -rf ~/x; : \u001b[2K\rgit status"
+        },
+        "risk": "critical"
+      },
+      "summary": "check git status",
+      "actor": {
+        "id": "machine:ci​",
+        "kind": "claude-code"
+      },
+      "risk": "critical",
+      "reversible": false,
+      "constraints": {
+        "allowed_decisions": ["approved", "denied"],
+        "challenge_required": false
+      }
+    },
+    "expected": {
+      "surface": "command",
+      "risk": "critical",
+      "reversible": false,
+      "summary": "check git status",
+      "actor_id": "machine:ci⟨U+200B⟩",
+      "actor_kind": "claude-code",
+      "actor_label": "machine:ci⟨U+200B⟩ (claude-code)",
+      "syntactic": {
+        "bin": "rm",
+        "argv": ["rm", "-rf", "~/x;", ":", "\\x1b[2K\\rgit", "status"],
+        "cwd": "/home/dev/⟨U+202E⟩ppa",
+        "raw": "rm -rf ~/x; : \\x1b[2K\\rgit status",
+        "raw_lines": ["rm -rf ~/x; : \\x1b[2K\\rgit status"]
+      },
+      "has_hidden_or_control_chars": true
+    }
+  },
+  "raw_lines_cases": [
+    {
+      "class": "CRLF in a command is data, not a line ending: escaped and flagged (bash runs rm in the wrong directory)",
+      "surface": "command",
+      "raw": "cd ../scratch\r\nrm -rf -- *",
+      "raw_lines": ["cd ../scratch\\r", "rm -rf -- *"],
+      "has_hidden_or_control_chars": true
+    },
+    {
+      "class": "CRLF in a file edit is a line ending: marker, not flagged",
+      "surface": "file_edit",
+      "raw": "a\r\nb",
+      "raw_lines": ["a␍", "b"],
+      "has_hidden_or_control_chars": false
+    },
+    {
+      "class": "LF and TAB in a command are structure: not flagged",
+      "surface": "command",
+      "raw": "cat <<'EOF'\n\tline\nEOF",
+      "raw_lines": ["cat <<'EOF'", "→   line", "EOF"],
+      "has_hidden_or_control_chars": false
+    },
+    {
+      "class": "ESC/CR spoof on a later command line: escaped and flagged",
+      "surface": "command",
+      "raw": "echo ok\nrm -rf ~/x; : \u001b[2K\rgit status",
+      "raw_lines": ["echo ok", "rm -rf ~/x; : \\x1b[2K\\rgit status"],
+      "has_hidden_or_control_chars": true
+    }
+  ]
+}
