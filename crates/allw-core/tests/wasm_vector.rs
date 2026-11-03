@@ -31,17 +31,22 @@
 //! root) and a root-signed pairing-start authorization, so the WASM surface proves it derives the
 //! same id and signs/verifies the same `allw-pairing-start+jws` bytes as the core.
 //!
+//! And a root-signed account-state set with the recipients the selection rules allow, so the WASM
+//! `select_recipients` is checked against the same hand-derived answer as the core.
+//!
 //! @see docs/contract.md §Wire encoding, §Verification checklist
 //! @see docs/enrollment.md §Model (account id derivation, pairing-start authorization)
 //! @see crates/allw-core/src/hash.rs (FROZEN_HASH_HEX — the same value)
+//! @see crates/allw-core/src/recipients.rs (the recipient-selection rules)
 
 use std::path::PathBuf;
 
 use allw_core::{
     account_id_for_root, action_from_agent_tool_call, compute_request_hash, issue_device_cert,
-    sign_pairing_start_authorization, sign_verdict, ActionRecord, Actor, ApprovalContext,
-    ApprovalRequest, Approver, Constraints, Decision, Risk, SigningKeyPair, Surface,
-    SyntacticSubstrate, UnsignedVerdict,
+    select_recipients, sign_account_state, sign_pairing_start_authorization, sign_verdict,
+    AccountState, AccountStateDevice, AccountStateRevocation, AccountStateRevocationKind,
+    ActionRecord, Actor, ApprovalContext, ApprovalRequest, Approver, Constraints, Decision,
+    PublicKey, Recipient, Risk, SigningKeyPair, Surface, SyntacticSubstrate, UnsignedVerdict,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
@@ -67,6 +72,21 @@ const TS_PAIRING_ISSUED: i64 = 1_700_000_000_000;
 const TS_PAIRING_EXPIRES: i64 = 1_700_000_120_000;
 const PAIRING_NOW_MS: i64 = 1_700_000_001_000;
 const PAIRING_JTI: &str = "jti_wasm_vector_01";
+
+/// X25519 encryption keys of the recipient-vector devices (any 32 bytes serve as test keys).
+const RECIPIENT_KEY_A: [u8; 32] = [0xA1; 32];
+const RECIPIENT_KEY_B: [u8; 32] = [0xB2; 32];
+const RECIPIENT_KEY_C: [u8; 32] = [0xC3; 32];
+const RECIPIENT_KEY_D: [u8; 32] = [0xD4; 32];
+const RECIPIENT_KEY_E: [u8; 32] = [0xE5; 32];
+const RECIPIENT_KEY_F: [u8; 32] = [0xF6; 32];
+const RECIPIENT_KEY_G: [u8; 32] = [0x17; 32];
+const RECIPIENT_REVOKED_AT: i64 = 1_700_000_500_000;
+/// The selection time for the recipient vector: `dev-f`'s cert expires exactly now (excluded),
+/// `dev-g`'s one millisecond later (still a recipient).
+const RECIPIENT_NOW_MS: i64 = 1_800_000_000_000;
+/// The caller's persisted floor for the recipient vector: the current sequence, so it is met.
+const RECIPIENT_MIN_SEQUENCE: u64 = 2;
 
 /// Account id derived from the approver root (seed `[0x11; 32]`), computed independently of the
 /// core: `SHA-256("allw/account-id/v1" || 0x00 || root_pubkey)` via `shasum -a 256`, then
@@ -119,6 +139,17 @@ struct WasmVector {
     pairing_start_jti: String,
     /// A verifier time inside the authorization's validity window.
     pairing_start_now_ms: i64,
+
+    /// JSON array of root-signed account-state JWS for `expected_account_id_for_root` (see
+    /// [`recipient_account_states`]): a stale sequence-1 document plus two sequence-2 siblings.
+    recipient_account_states_json: String,
+    /// JSON array of `{ device_id, encryption_pubkey }` the selection rules allow for that set,
+    /// written from the rules (not captured from `select_recipients`).
+    expected_recipients_json: String,
+    /// The `now_ms` the recipient selection runs at (cert-expiry boundary).
+    recipient_now_ms: i64,
+    /// The `min_sequence` floor the recipient selection runs with.
+    recipient_min_sequence: u64,
 }
 
 // ── Builders (mirror hash::tests::make_minimal_context exactly) ───────────────────
@@ -188,6 +219,120 @@ fn make_agent_tool_call_context() -> ApprovalContext {
         },
         chain: None,
     }
+}
+
+fn recipient_device(id: &str, key: [u8; 32], status: &str) -> AccountStateDevice {
+    AccountStateDevice {
+        device_id: id.to_string(),
+        encryption_pubkey: key,
+        signing_pubkey: [0x01; 32],
+        status: status.to_string(),
+        cert_expires_at: None,
+    }
+}
+
+fn expiring_recipient_device(id: &str, key: [u8; 32], cert_expires_at: i64) -> AccountStateDevice {
+    AccountStateDevice {
+        cert_expires_at: Some(cert_expires_at),
+        ..recipient_device(id, key, "active")
+    }
+}
+
+/// The recipient vector's account-state set, exercising each selection rule once:
+/// - sequence 1 (stale): lists `dev-old`, which must not be selected;
+/// - sequence 2: `dev-a` and `dev-d` active; `dev-b` active but revoked; `dev-c` not active;
+///   `dev-e` active in only one of the two sequence-2 siblings (a conflict, so excluded);
+///   `dev-f` whose cert expires at [`RECIPIENT_NOW_MS`] (excluded) and `dev-g` whose cert expires
+///   one millisecond later (selected).
+fn recipient_account_states(root: &SigningKeyPair) -> Vec<String> {
+    let account_id = account_id_for_root(&root.public_key());
+    let state = |sequence: u64, devices: Vec<AccountStateDevice>, revoked: &[&str]| AccountState {
+        v: 1,
+        account_id: account_id.clone(),
+        sequence,
+        current_root: root.public_key().to_bytes(),
+        previous_roots: vec![],
+        devices,
+        actors: vec![],
+        revocations: revoked
+            .iter()
+            .map(|id| AccountStateRevocation {
+                kind: AccountStateRevocationKind::Device,
+                id: (*id).to_string(),
+                revoked_at: RECIPIENT_REVOKED_AT,
+                reason: None,
+            })
+            .collect(),
+    };
+    let stale = state(
+        1,
+        vec![
+            recipient_device("dev-a", RECIPIENT_KEY_A, "active"),
+            recipient_device("dev-old", RECIPIENT_KEY_E, "active"),
+        ],
+        &[],
+    );
+    let current = state(
+        2,
+        vec![
+            recipient_device("dev-a", RECIPIENT_KEY_A, "active"),
+            recipient_device("dev-b", RECIPIENT_KEY_B, "active"),
+            recipient_device("dev-c", RECIPIENT_KEY_C, "revoked"),
+            recipient_device("dev-d", RECIPIENT_KEY_D, "active"),
+            recipient_device("dev-e", RECIPIENT_KEY_E, "active"),
+            expiring_recipient_device("dev-f", RECIPIENT_KEY_F, RECIPIENT_NOW_MS),
+            expiring_recipient_device("dev-g", RECIPIENT_KEY_G, RECIPIENT_NOW_MS + 1),
+        ],
+        &["dev-b"],
+    );
+    let sibling = state(
+        2,
+        vec![
+            recipient_device("dev-a", RECIPIENT_KEY_A, "active"),
+            recipient_device("dev-b", RECIPIENT_KEY_B, "active"),
+            recipient_device("dev-d", RECIPIENT_KEY_D, "active"),
+            expiring_recipient_device("dev-f", RECIPIENT_KEY_F, RECIPIENT_NOW_MS),
+            expiring_recipient_device("dev-g", RECIPIENT_KEY_G, RECIPIENT_NOW_MS + 1),
+        ],
+        &["dev-b"],
+    );
+    [stale, current, sibling]
+        .iter()
+        .map(|s| sign_account_state(s, root))
+        .collect()
+}
+
+/// The recipients the rules allow for [`recipient_account_states`] at [`RECIPIENT_NOW_MS`]:
+/// exactly `dev-a`, `dev-d` and `dev-g`, sorted by device id.
+fn expected_recipients() -> Vec<Recipient> {
+    vec![
+        Recipient {
+            device_id: "dev-a".to_string(),
+            encryption_pubkey: RECIPIENT_KEY_A,
+        },
+        Recipient {
+            device_id: "dev-d".to_string(),
+            encryption_pubkey: RECIPIENT_KEY_D,
+        },
+        Recipient {
+            device_id: "dev-g".to_string(),
+            encryption_pubkey: RECIPIENT_KEY_G,
+        },
+    ]
+}
+
+/// The WASM `select_recipients` wire shape for a recipient list.
+fn recipients_wire_json(recipients: &[Recipient]) -> String {
+    let wire: Vec<serde_json::Value> = recipients
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "device_id": r.device_id,
+                "encryption_pubkey": URL_SAFE_NO_PAD.encode(r.encryption_pubkey),
+            })
+        })
+        .collect();
+    serde_json::to_string(&wire).expect("recipients serialize")
 }
 
 fn make_request() -> ApprovalRequest {
@@ -266,6 +411,11 @@ fn build_vector() -> WasmVector {
         pairing_start_expires_at: TS_PAIRING_EXPIRES,
         pairing_start_jti: PAIRING_JTI.to_string(),
         pairing_start_now_ms: PAIRING_NOW_MS,
+        recipient_account_states_json: serde_json::to_string(&recipient_account_states(&root))
+            .expect("account states serialize"),
+        expected_recipients_json: recipients_wire_json(&expected_recipients()),
+        recipient_now_ms: RECIPIENT_NOW_MS,
+        recipient_min_sequence: RECIPIENT_MIN_SEQUENCE,
     }
 }
 
@@ -374,4 +524,39 @@ fn fixture_account_id_equals_frozen_vector() {
     let committed: WasmVector =
         serde_json::from_str(&raw).expect("committed fixture is valid WasmVector JSON");
     assert_eq!(committed.expected_account_id_for_root, FROZEN_ACCOUNT_ID);
+}
+
+/// The core's `select_recipients` over the fixture's account-state set returns exactly the
+/// recipients the rules allow (`dev-a`, `dev-d`, `dev-g`); the node test checks the WASM surface returns
+/// the fixture's `expected_recipients_json` for the same set.
+#[test]
+fn fixture_recipients_follow_the_selection_rules() {
+    let raw = std::fs::read_to_string(fixture_path()).expect("fixture must exist for this test");
+    let committed: WasmVector =
+        serde_json::from_str(&raw).expect("committed fixture is valid WasmVector JSON");
+    let docs: Vec<String> = serde_json::from_str(&committed.recipient_account_states_json)
+        .expect("account-state array parses");
+    let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+    let root_bytes: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(&committed.approver_root_pubkey_b64)
+        .expect("root pubkey decodes")
+        .try_into()
+        .expect("root pubkey is 32 bytes");
+    let root = PublicKey::from_bytes(&root_bytes).expect("root pubkey is valid");
+
+    assert_eq!(committed.recipient_now_ms, RECIPIENT_NOW_MS);
+    assert_eq!(committed.recipient_min_sequence, RECIPIENT_MIN_SEQUENCE);
+    let selected = select_recipients(
+        &refs,
+        &committed.expected_account_id_for_root,
+        &root,
+        committed.recipient_now_ms,
+        Some(committed.recipient_min_sequence),
+    )
+    .expect("fixture state yields recipients");
+    assert_eq!(selected, expected_recipients());
+    assert_eq!(
+        committed.expected_recipients_json,
+        recipients_wire_json(&selected)
+    );
 }
