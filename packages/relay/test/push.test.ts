@@ -11,7 +11,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   ApnsPushTransport,
   FcmPushTransport,
-  PushTokenGoneError,
+  UndeliverablePushTokenError,
   buildPushWakeupPayload,
   dispatchPushWakeups,
   type PushTransport,
@@ -58,7 +58,7 @@ describe("push fan-out", () => {
       transports: { apns, fcm },
     });
 
-    expect(result).toEqual({ delivered: 2, goneTokens: [] });
+    expect(result).toEqual({ delivered: 2, undeliverableTokens: [] });
     expect(sent).toEqual([
       {
         kind: "apns",
@@ -148,16 +148,58 @@ describe("push fan-out", () => {
           transports: { apns, fcm },
         },
       ),
-    ).resolves.toEqual({ delivered: 1, goneTokens: [] });
+    ).resolves.toEqual({ delivered: 1, undeliverableTokens: [] });
   });
 
-  it("reports only tokens whose transport signalled PushTokenGoneError for pruning", async () => {
+  it("keeps at most `concurrency` wakeups in flight, and a slow one does not block the rest", async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const finished: string[] = [];
+    const releases: Array<() => void> = [];
+    const webpush: PushTransport = {
+      kind: "webpush",
+      async sendWakeup(wakeup) {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        if (wakeup.token === "slow") {
+          // Hangs until released at the end: the other sends must complete around it.
+          await new Promise<void>((resolve) => releases.push(resolve));
+        }
+        inFlight--;
+        finished.push(wakeup.token);
+      },
+    };
+    const tokens: StoredPushToken[] = ["slow", "a", "b", "c", "d", "e"].map((token) => ({
+      device_id: `dev-${token}`,
+      transport: "webpush",
+      token,
+    }));
+
+    const dispatched = dispatchPushWakeups(tokens, {
+      accountId: "acct-push-concurrency",
+      requestId: "req-push-concurrency",
+      expiresAt: EXPIRES_AT,
+      transports: { webpush },
+      concurrency: 2,
+    });
+    await vi.waitFor(() => {
+      expect(finished).toEqual(["a", "b", "c", "d", "e"]);
+    });
+    expect(peak).toBe(2);
+    releases.forEach((release) => {
+      release();
+    });
+
+    await expect(dispatched).resolves.toEqual({ delivered: 6, undeliverableTokens: [] });
+  });
+
+  it("reports only tokens whose transport signalled UndeliverablePushTokenError for pruning", async () => {
     const gone: StoredPushToken = { device_id: "dev-a", transport: "webpush", token: "gone" };
     const transient: StoredPushToken = { device_id: "dev-b", transport: "webpush", token: "flaky" };
     const webpush: PushTransport = {
       kind: "webpush",
       async sendWakeup(wakeup) {
-        if (wakeup.token === "gone") throw new PushTokenGoneError("HTTP 410");
+        if (wakeup.token === "gone") throw new UndeliverablePushTokenError("HTTP 410");
         throw new Error("HTTP 503");
       },
     };
@@ -169,6 +211,6 @@ describe("push fan-out", () => {
         expiresAt: EXPIRES_AT,
         transports: { webpush },
       }),
-    ).resolves.toEqual({ delivered: 0, goneTokens: [gone] });
+    ).resolves.toEqual({ delivered: 0, undeliverableTokens: [gone] });
   });
 });

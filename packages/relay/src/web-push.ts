@@ -26,7 +26,12 @@
  * @see https://www.rfc-editor.org/rfc/rfc8292 (VAPID)
  */
 
-import { PushTokenGoneError, type Fetcher, type PushTransport, type PushWakeup } from "./push.js";
+import {
+  UndeliverablePushTokenError,
+  type Fetcher,
+  type PushTransport,
+  type PushWakeup,
+} from "./push.js";
 
 /** Push-service hosts matched exactly (lowercase, as the WHATWG URL parser normalizes them). */
 const WEB_PUSH_EXACT_HOSTS: ReadonlySet<string> = new Set([
@@ -86,7 +91,7 @@ export function parseWebPushEndpoint(token: string): URL | null {
  * `sub` contact URI. The public key is not secret — browsers need it to subscribe.
  */
 export interface VapidConfig {
-  /** Uncompressed P-256 public point (65 bytes), base64url. Served by `GET /push/vapid-public-key`. */
+  /** Uncompressed P-256 public point (65 bytes), base64url. Served at `/.well-known/allw/vapid-public-key`. */
   readonly publicKey: string;
   /** P-256 private scalar (32 bytes), base64url. A Worker secret; never logged or returned. */
   readonly privateKey: string;
@@ -102,9 +107,10 @@ export interface VapidEnv {
 }
 
 /**
- * Read the VAPID configuration from Worker bindings. Returns `null` — Web Push disabled — unless
- * every binding is present and syntactically valid. This is the single switch for both the
- * `webpush` transport and the public-key endpoint, so they cannot disagree about enablement.
+ * Read the VAPID configuration from Worker bindings. Returns `null` (Web Push disabled) unless every
+ * binding is present and syntactically valid. This is the syntactic half of the single enablement
+ * switch shared by the `webpush` transport and the public-key endpoint; {@link loadVapidSigningKey}
+ * is the cryptographic half (the pair must actually match).
  */
 export function vapidConfigFromEnv(env: VapidEnv): VapidConfig | null {
   const publicKey = env.VAPID_PUBLIC_KEY?.trim();
@@ -128,12 +134,71 @@ function isVapidSubject(subject: string): boolean {
   }
 }
 
+/** Default per-request timeout for a push-service POST. A timeout is transient: never a prune. */
+const DEFAULT_WEB_PUSH_TIMEOUT_MS = 5_000;
+
+/**
+ * Validated VAPID signing keys, memoized per keypair for the isolate's lifetime. Bindings are fixed
+ * for a deployment, so a pair that fails validation keeps failing until a redeploy, and there is
+ * nothing to retry. Keyed by the configured key material, which is already in this isolate's memory.
+ */
+const vapidSigningKeys = new Map<string, Promise<CryptoKey | null>>();
+
+/**
+ * Import and **validate** the configured VAPID keypair, once per keypair. Resolves to the signing
+ * key, or `null` when the pair is unusable: an off-curve public point, a private scalar that does
+ * not belong to the public point, or a key the runtime refuses. Validation signs a probe message and
+ * verifies it against the configured public key, so success means push services will accept the
+ * relay's signatures under exactly the key that browsers subscribe with.
+ *
+ * Shared by {@link WebPushTransport} and the public-key endpoint, so a broken pair disables both:
+ * browsers are never handed a key the relay cannot sign for.
+ */
+export function loadVapidSigningKey(vapid: VapidConfig): Promise<CryptoKey | null> {
+  const cacheKey = `${vapid.publicKey}\0${vapid.privateKey}`;
+  let loaded = vapidSigningKeys.get(cacheKey);
+  if (!loaded) {
+    loaded = validateVapidKeypair(vapid).catch(() => null);
+    vapidSigningKeys.set(cacheKey, loaded);
+  }
+  return loaded;
+}
+
+async function validateVapidKeypair(vapid: VapidConfig): Promise<CryptoKey | null> {
+  const pub = base64UrlDecode(vapid.publicKey);
+  if (pub?.length !== P256_UNCOMPRESSED_POINT_LENGTH) return null;
+  const algorithm = { name: "ECDSA", namedCurve: "P-256" };
+  // Importing the raw point rejects an off-curve public key.
+  const verifyKey = await crypto.subtle.importKey("raw", pub, algorithm, false, ["verify"]);
+  const signingKey = await crypto.subtle.importKey(
+    "jwk",
+    {
+      kty: "EC",
+      crv: "P-256",
+      x: base64UrlEncode(pub.subarray(1, 33)),
+      y: base64UrlEncode(pub.subarray(33, 65)),
+      d: vapid.privateKey,
+      ext: false,
+    },
+    algorithm,
+    false,
+    ["sign"],
+  );
+  // Prove the private scalar belongs to the public point, independent of whether the runtime's JWK
+  // import checks consistency.
+  const probe = new TextEncoder().encode("allw vapid keypair check");
+  const ecdsa = { name: "ECDSA", hash: "SHA-256" };
+  const signature = await crypto.subtle.sign(ecdsa, signingKey, probe);
+  return (await crypto.subtle.verify(ecdsa, verifyKey, signature, probe)) ? signingKey : null;
+}
+
 /**
  * Web Push transport: one empty-body POST per subscription endpoint, authenticated with VAPID.
  *
  * Status handling follows RFC 8030 §§5–7: any 2xx (push services answer 201) is delivered; 404 or
- * 410 means the subscription no longer exists and surfaces as {@link PushTokenGoneError} so the
- * caller prunes the token; every other outcome is a transient failure that leaves the token alone.
+ * 410 means the subscription no longer exists and surfaces as {@link UndeliverablePushTokenError}
+ * so the caller prunes the token. Every other outcome is transient and leaves the token in place,
+ * including a timeout and a 401/403 (a VAPID mismatch is a relay-side problem, not a dead device).
  */
 export class WebPushTransport implements PushTransport {
   readonly kind = "webpush" as const;
@@ -141,28 +206,36 @@ export class WebPushTransport implements PushTransport {
   private readonly vapid: VapidConfig;
   private readonly fetcher: Fetcher;
   private readonly now: () => number;
-  private signingKey: Promise<CryptoKey> | undefined;
+  private readonly timeoutMs: number;
 
   constructor(options: {
     readonly vapid: VapidConfig;
     readonly fetcher?: Fetcher;
     /** Clock in epoch milliseconds; injectable so TTL and JWT `exp` are deterministic in tests. */
     readonly now?: () => number;
+    /** Per-request timeout for the push-service POST (default 5 s). */
+    readonly timeoutMs?: number;
   }) {
     this.vapid = options.vapid;
     // Wrapped rather than stored bare so the runtime's `fetch` is never invoked as a method.
     this.fetcher = options.fetcher ?? ((input, init) => fetch(input, init));
     this.now = options.now ?? Date.now;
+    this.timeoutMs = options.timeoutMs ?? DEFAULT_WEB_PUSH_TIMEOUT_MS;
   }
 
   async sendWakeup(wakeup: PushWakeup): Promise<void> {
     // Re-validate at send time: rows can predate the allowlist (the earlier stub accepted any
-    // string), and a stored value must never steer the relay at an arbitrary host.
+    // string), and a stored value must never steer the relay at an arbitrary host. Such a row can
+    // never be delivered, so it is reported as undeliverable and pruned.
     const endpoint = parseWebPushEndpoint(wakeup.token);
-    if (!endpoint) throw new Error("Web Push endpoint is not on the push-service allowlist");
+    if (!endpoint) {
+      throw new UndeliverablePushTokenError("stored Web Push endpoint is not on the allowlist");
+    }
+    const signingKey = await loadVapidSigningKey(this.vapid);
+    if (!signingKey) throw new Error("VAPID keypair is invalid; Web Push is disabled");
 
     const nowMs = this.now();
-    const jwt = await this.signVapidJwt(endpoint.origin, nowMs);
+    const jwt = await signVapidJwt(signingKey, endpoint.origin, this.vapid.subject, nowMs);
     const response = await this.fetcher(endpoint.href, {
       method: "POST",
       headers: {
@@ -174,41 +247,42 @@ export class WebPushTransport implements PushTransport {
       body: "",
       // A redirect would let an allowlisted host bounce the relay to an arbitrary target.
       redirect: "manual",
+      // Bound each push: a slow or hung push service must not hold a fan-out slot indefinitely.
+      signal: AbortSignal.timeout(this.timeoutMs),
     });
+    // The relay never reads push-service bodies; release the connection rather than leaving an
+    // unconsumed body holding one of the Worker's few outbound connection slots.
+    await response.body?.cancel();
     if (response.ok) return;
     if (response.status === 404 || response.status === 410) {
-      throw new PushTokenGoneError(
+      throw new UndeliverablePushTokenError(
         `Web Push subscription is gone (HTTP ${String(response.status)})`,
       );
     }
     throw new Error(`Web Push wakeup failed with HTTP ${String(response.status)}`);
   }
+}
 
-  /** Sign an RFC 8292 VAPID JWT for one push-service origin (ES256, raw `r || s` signature). */
-  private async signVapidJwt(audience: string, nowMs: number): Promise<string> {
-    const header = base64UrlEncodeJson({ typ: "JWT", alg: "ES256" });
-    const claims = base64UrlEncodeJson({
-      aud: audience,
-      exp: Math.floor(nowMs / 1000) + VAPID_JWT_LIFETIME_SECONDS,
-      sub: this.vapid.subject,
-    });
-    const signingInput = `${header}.${claims}`;
-    const signature = await crypto.subtle.sign(
-      { name: "ECDSA", hash: "SHA-256" },
-      await this.loadSigningKey(),
-      new TextEncoder().encode(signingInput),
-    );
-    return `${signingInput}.${base64UrlEncode(new Uint8Array(signature))}`;
-  }
-
-  private loadSigningKey(): Promise<CryptoKey> {
-    this.signingKey ??= importVapidPrivateKey(this.vapid).catch((error: unknown) => {
-      // Do not cache a failed import; the next send retries (and fails the same way if misconfigured).
-      this.signingKey = undefined;
-      throw error;
-    });
-    return this.signingKey;
-  }
+/** Sign an RFC 8292 VAPID JWT for one push-service origin (ES256, raw `r || s` signature). */
+async function signVapidJwt(
+  signingKey: CryptoKey,
+  audience: string,
+  subject: string,
+  nowMs: number,
+): Promise<string> {
+  const header = base64UrlEncodeJson({ typ: "JWT", alg: "ES256" });
+  const claims = base64UrlEncodeJson({
+    aud: audience,
+    exp: Math.floor(nowMs / 1000) + VAPID_JWT_LIFETIME_SECONDS,
+    sub: subject,
+  });
+  const signingInput = `${header}.${claims}`;
+  const signature = await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" },
+    signingKey,
+    new TextEncoder().encode(signingInput),
+  );
+  return `${signingInput}.${base64UrlEncode(new Uint8Array(signature))}`;
 }
 
 /**
@@ -218,24 +292,6 @@ export class WebPushTransport implements PushTransport {
 export function webPushTtlSeconds(expiresAtMs: number, nowMs: number): number {
   const remaining = Math.ceil((expiresAtMs - nowMs) / 1000);
   return Math.min(Math.max(remaining, 0), MAX_WEB_PUSH_TTL_SECONDS);
-}
-
-async function importVapidPrivateKey(vapid: VapidConfig): Promise<CryptoKey> {
-  const pub = base64UrlDecode(vapid.publicKey);
-  if (pub?.length !== P256_UNCOMPRESSED_POINT_LENGTH) {
-    throw new Error("VAPID public key is not an uncompressed P-256 point");
-  }
-  const jwk: JsonWebKey = {
-    kty: "EC",
-    crv: "P-256",
-    x: base64UrlEncode(pub.subarray(1, 33)),
-    y: base64UrlEncode(pub.subarray(33, 65)),
-    d: vapid.privateKey,
-    ext: false,
-  };
-  return crypto.subtle.importKey("jwk", jwk, { name: "ECDSA", namedCurve: "P-256" }, false, [
-    "sign",
-  ]);
 }
 
 function base64UrlEncodeJson(value: unknown): string {
@@ -249,7 +305,7 @@ function base64UrlEncode(bytes: Uint8Array): string {
 }
 
 /** Decode unpadded base64url; `null` for any character outside the base64url alphabet. */
-function base64UrlDecode(value: string): Uint8Array | null {
+function base64UrlDecode(value: string): Uint8Array<ArrayBuffer> | null {
   if (!/^[A-Za-z0-9_-]*$/.test(value)) return null;
   try {
     const binary = atob(value.replace(/-/g, "+").replace(/_/g, "/"));
@@ -259,25 +315,29 @@ function base64UrlDecode(value: string): Uint8Array | null {
   }
 }
 
-/**
- * Relay-level (not per-account) path serving the VAPID public key. It is matched before account
- * routing, so it never reaches an account's Durable Object.
- */
-export const VAPID_PUBLIC_KEY_PATH = "/push/vapid-public-key";
+/** How long clients and caches may reuse the public key. It changes only on a deliberate rotation. */
+const VAPID_PUBLIC_KEY_CACHE_CONTROL = "public, max-age=3600";
 
 /**
- * `GET /push/vapid-public-key` — unauthenticated. Browsers need the relay's VAPID public key as the
- * `applicationServerKey` to create a subscription this relay can push to; the key is public by
- * design. → 200 `{ vapid_public_key }`, 404 when Web Push is not configured, 405 for other methods.
+ * `GET`/`HEAD /.well-known/allw/vapid-public-key` (routed by `well-known.ts`), unauthenticated.
+ * Browsers need the relay's VAPID public key as the `applicationServerKey` to create a subscription
+ * this relay can push to, and the key is public by design. → 200 `{ vapid_public_key }`; 404 when
+ * Web Push is not configured **or the configured keypair fails validation**; 405 for other methods.
  */
-export function handleVapidPublicKey(request: Request, env: VapidEnv): Response {
-  if (request.method !== "GET") {
+export async function handleVapidPublicKey(request: Request, env: VapidEnv): Promise<Response> {
+  if (request.method !== "GET" && request.method !== "HEAD") {
     return Response.json(
       { error: "method not allowed" },
-      { status: 405, headers: { Allow: "GET" } },
+      { status: 405, headers: { Allow: "GET, HEAD" } },
     );
   }
   const vapid = vapidConfigFromEnv(env);
-  if (!vapid) return Response.json({ error: "web push is not configured" }, { status: 404 });
-  return Response.json({ vapid_public_key: vapid.publicKey });
+  if (!vapid || !(await loadVapidSigningKey(vapid))) {
+    return Response.json({ error: "web push is not configured" }, { status: 404 });
+  }
+  const headers = { "Cache-Control": VAPID_PUBLIC_KEY_CACHE_CONTROL };
+  if (request.method === "HEAD") {
+    return new Response(null, { headers: { ...headers, "Content-Type": "application/json" } });
+  }
+  return Response.json({ vapid_public_key: vapid.publicKey }, { headers });
 }

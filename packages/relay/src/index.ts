@@ -19,20 +19,24 @@ import { PAIRING_TTL_MS } from "./constants.js";
 import {
   ApnsPushTransport,
   FcmPushTransport,
+  MAX_PUSH_TOKENS_PER_ACCOUNT,
+  MAX_PUSH_TOKENS_PER_REGISTRATION,
+  MAX_PUSH_TOKENS_PER_TRANSPORT,
   NoopPushTransport,
   dispatchPushWakeups,
   isPushTransportKind,
+  schedulablePushTokens,
   type PushTransportRegistry,
   type PushTransportKind,
+  type StoredPushToken,
 } from "./push.js";
 import {
-  VAPID_PUBLIC_KEY_PATH,
   WebPushTransport,
-  handleVapidPublicKey,
   parseWebPushEndpoint,
   vapidConfigFromEnv,
   type VapidEnv,
 } from "./web-push.js";
+import { handleWellKnown, isWellKnownPath } from "./well-known.js";
 
 export interface Env extends VapidEnv {
   readonly ACCOUNT: DurableObjectNamespace;
@@ -46,8 +50,8 @@ export interface Env extends VapidEnv {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    // Relay-level routes (not per-account) are matched before account routing.
-    if (url.pathname === VAPID_PUBLIC_KEY_PATH) return handleVapidPublicKey(request, env);
+    // Relay-level routes live under `/.well-known/` and are dispatched before account routing.
+    if (isWellKnownPath(url.pathname)) return handleWellKnown(request, env);
     // Route by account id → its Durable Object.
     const accountId = url.pathname.split("/")[1] ?? "";
     if (!accountId) return new Response("missing account", { status: 400 });
@@ -301,24 +305,36 @@ function optionalPushTokens(body: Record<string, unknown>): IncomingPushToken[] 
   const raw = body.push_tokens;
   if (raw === undefined) return [];
   if (!Array.isArray(raw)) return null;
+  // Budget (push.ts): every stored token costs an outbound request per submit. Reject, never truncate.
+  if (raw.length > MAX_PUSH_TOKENS_PER_REGISTRATION) return null;
   const tokens: IncomingPushToken[] = [];
   const seenTokens = new Set<string>();
   for (const item of raw) {
     if (!isPlainObject(item)) return null;
     const transport = item.transport;
-    const token = item.token;
+    const rawToken = item.token;
     if (typeof transport !== "string" || !isPushTransportKind(transport)) return null;
-    if (typeof token !== "string" || token.length < 1 || token.length > 4096) return null;
+    if (typeof rawToken !== "string" || rawToken.length < 1 || rawToken.length > 4096) return null;
+    let token = rawToken;
     if (transport === "apns" && !/^[0-9a-fA-F]{64}$/.test(token)) return null;
     if (transport === "fcm" && !/^[A-Za-z0-9:_-]{1,4096}$/.test(token)) return null;
-    // SECURITY (SSRF): a webpush token is the subscription endpoint the relay will POST to.
-    if (transport === "webpush" && !parseWebPushEndpoint(token)) return null;
+    if (transport === "webpush") {
+      // SECURITY (SSRF): a webpush token is the subscription endpoint the relay will POST to.
+      // Store the normalized href, so one subscription spelled two ways is one row.
+      const endpoint = parseWebPushEndpoint(token);
+      if (!endpoint || endpoint.href.length > 4096) return null;
+      token = endpoint.href;
+    }
     // Duplicate registrations are idempotent for one device; collapse them before DB mutation so
     // a repeated token cannot half-complete pairing by tripping the push-token primary key.
     const tokenKey = `${transport}\0${token}`;
     if (seenTokens.has(tokenKey)) continue;
     seenTokens.add(tokenKey);
     tokens.push({ transport, token });
+  }
+  for (const transport of new Set(tokens.map((t) => t.transport))) {
+    const count = tokens.filter((t) => t.transport === transport).length;
+    if (count > MAX_PUSH_TOKENS_PER_TRANSPORT) return null;
   }
   return tokens;
 }
@@ -740,9 +756,9 @@ export class AccountRelay implements DurableObject {
    *
    * Validates the pairing code and enrolls the device's public key.
    * - 404: code not found
-   * - 409: code already used
+   * - 409: code already used, or the account's push-token budget is full (code not consumed)
    * - 410: code expired
-   * - 400: invalid pubkey (not base64url or not 32 bytes)
+   * - 400: invalid pubkey (not base64url or not 32 bytes), or invalid / over-budget push_tokens
    */
   private async handlePairingComplete(request: Request): Promise<Response> {
     const body = await parseJsonBody(request);
@@ -784,6 +800,9 @@ export class AccountRelay implements DurableObject {
     const deviceAuthToken = generateAuthToken();
     const deviceAuthTokenHash = await hashAuthToken(deviceAuthToken);
     const now = Date.now();
+    // Checked after the last await so the count and the inserts below are one atomic step.
+    const pushTokenBudget = this.pushTokenBudgetFailure(pushTokens.length);
+    if (pushTokenBudget) return pushTokenBudget;
 
     // Mark the code as used and insert the device record atomically.
     // SECURITY: only the public key (pubkey) is stored — no private key ever touches this table.
@@ -1225,7 +1244,7 @@ export class AccountRelay implements DurableObject {
     await this.armExpiryAlarm();
 
     const delivered = this.sendRequestToOneSocketPerSurface(id, envelope);
-    const pushWakeups = await this.sendPushWakeups(accountId, id, expiresAt);
+    const pushWakeups = this.schedulePushWakeups(accountId, id, expiresAt);
 
     return this.requestSubmitResponse(id, delivered, pushWakeups, requestAuthToken);
   }
@@ -1269,26 +1288,41 @@ export class AccountRelay implements DurableObject {
   }
 
   /**
-   * Send request-id-only push wakeups to every registered device push token, then prune tokens the
-   * push service reported as gone (404/410). Returns the number of accepted wakeups.
+   * Schedule request-id-at-most push wakeups (Web Push sends no payload at all) to every registered
+   * device push token, and return how many were scheduled. The fan-out runs **off the response
+   * path** under `waitUntil`, so a slow or hung push service can never delay or fail the submit.
    */
-  private async sendPushWakeups(
+  private schedulePushWakeups(accountId: string, requestId: string, expiresAt: number): number {
+    const tokens = schedulablePushTokens(
+      [
+        ...this.sql.exec<DevicePushTokenRow>(
+          `SELECT device_id, transport, token, created_at FROM device_push_token
+           ORDER BY created_at ASC LIMIT ?`,
+          MAX_PUSH_TOKENS_PER_ACCOUNT,
+        ),
+      ],
+      this.pushTransports,
+    );
+    if (tokens.length > 0) {
+      this.ctx.waitUntil(this.deliverPushWakeups(tokens, accountId, requestId, expiresAt));
+    }
+    return tokens.length;
+  }
+
+  /** Run one fan-out, then prune the tokens a transport reported permanently undeliverable. */
+  private async deliverPushWakeups(
+    tokens: readonly StoredPushToken[],
     accountId: string,
     requestId: string,
     expiresAt: number,
-  ): Promise<number> {
-    const tokens = [
-      ...this.sql.exec<DevicePushTokenRow>(
-        `SELECT device_id, transport, token, created_at FROM device_push_token ORDER BY created_at ASC`,
-      ),
-    ];
-    const { delivered, goneTokens } = await dispatchPushWakeups(tokens, {
+  ): Promise<void> {
+    const { undeliverableTokens } = await dispatchPushWakeups(tokens, {
       accountId,
       requestId,
       expiresAt,
       transports: this.pushTransports,
     });
-    for (const gone of goneTokens) {
+    for (const gone of undeliverableTokens) {
       this.sql.exec(
         `DELETE FROM device_push_token WHERE device_id = ? AND transport = ? AND token = ?`,
         gone.device_id,
@@ -1296,7 +1330,17 @@ export class AccountRelay implements DurableObject {
         gone.token,
       );
     }
-    return delivered;
+  }
+
+  /**
+   * Enforce the per-account push-token budget for registering `adding` more tokens: a 409 (the
+   * account is full; nothing is stored) or `null` when they fit.
+   */
+  private pushTokenBudgetFailure(adding: number): Response | null {
+    if (adding === 0) return null;
+    const row = [...this.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM device_push_token`)][0];
+    if ((row?.n ?? 0) + adding <= MAX_PUSH_TOKENS_PER_ACCOUNT) return null;
+    return json({ error: "account push-token limit reached" }, 409);
   }
 
   /**

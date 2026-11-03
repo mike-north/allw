@@ -1,8 +1,9 @@
 /**
  * Integration tests for Web Push inside the relay (#235), through the real Worker + `AccountRelay`
  * Durable Object: subscription-endpoint validation at pairing (SSRF allowlist), and pruning a
- * device's token row when the push service reports the subscription gone (404/410) — while a push
- * failure never fails the submit.
+ * device's token row when the push service reports the subscription gone (404/410), registration
+ * budgets, and the fan-out running off the response path, so a push failure or hang never fails or
+ * delays the submit.
  *
  * The `webpush` transport is a real `WebPushTransport` with an injected `fetcher`, installed into
  * the account's DO, so no request leaves the test runtime.
@@ -156,7 +157,96 @@ describe("pairing — webpush token is a validated subscription endpoint", () =>
   });
 });
 
-describe("submit — Web Push wakeups and gone-subscription pruning", () => {
+/** Let a background fan-out that has already made its requests finish its bookkeeping. */
+function settle(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 50));
+}
+
+async function seedPushTokenRows(
+  accountId: string,
+  rows: ReadonlyArray<{ device_id: string; transport: string; token: string }>,
+): Promise<void> {
+  const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
+  await runInDurableObject(stub, (instance: AccountRelay) => {
+    const relay = instance as unknown as { sql: SqlStorage };
+    for (const row of rows) {
+      relay.sql.exec(
+        `INSERT INTO device_push_token (device_id, transport, token, created_at) VALUES (?, ?, ?, ?)`,
+        row.device_id,
+        row.transport,
+        row.token,
+        CREATED_AT,
+      );
+    }
+  });
+}
+
+describe("pairing — push-token budgets (reject, never truncate)", () => {
+  it("rejects more than four push_tokens in one registration with 400, storing nothing", async () => {
+    const acct = "acct-webpush-budget-total";
+    const paired = await pairWithPushTokens(acct, [
+      { transport: "webpush", token: FCM_ENDPOINT },
+      { transport: "webpush", token: MOZILLA_ENDPOINT },
+      { transport: "apns", token: "a".repeat(64) },
+      { transport: "apns", token: "b".repeat(64) },
+      { transport: "fcm", token: "fcm-token-1" },
+    ]);
+
+    expect(paired.status).toBe(400);
+    expect(await readPushTokens(acct)).toEqual([]);
+  });
+
+  it("rejects more than two distinct tokens for one transport with 400, storing nothing", async () => {
+    const acct = "acct-webpush-budget-transport";
+    const paired = await pairWithPushTokens(acct, [
+      { transport: "webpush", token: `${FCM_ENDPOINT}1` },
+      { transport: "webpush", token: `${FCM_ENDPOINT}2` },
+      { transport: "webpush", token: `${FCM_ENDPOINT}3` },
+    ]);
+
+    expect(paired.status).toBe(400);
+    expect(await readPushTokens(acct)).toEqual([]);
+  });
+
+  it("rejects a registration that would exceed the account's 32-token budget (409), storing nothing", async () => {
+    const acct = "acct-webpush-budget-account";
+    await seedPushTokenRows(
+      acct,
+      Array.from({ length: 31 }, (_, n) => ({
+        device_id: `dev-seed-${String(n)}`,
+        transport: "webpush",
+        token: `${FCM_ENDPOINT}-seed-${String(n)}`,
+      })),
+    );
+
+    const overBudget = await pairWithPushTokens(acct, [
+      { transport: "webpush", token: FCM_ENDPOINT },
+      { transport: "webpush", token: MOZILLA_ENDPOINT },
+    ]);
+    expect(overBudget.status).toBe(409);
+    expect(await readPushTokens(acct)).toHaveLength(31);
+
+    const fits = await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
+    expect(fits.status).toBe(201);
+    expect(await readPushTokens(acct)).toHaveLength(32);
+  });
+
+  it("stores the normalized endpoint, so two spellings of one subscription are one row", async () => {
+    const acct = "acct-webpush-normalized";
+    const paired = await pairWithPushTokens(acct, [
+      { transport: "webpush", token: "https://FCM.googleapis.com/fcm/send/c3Vic2NyaXB0aW9uLWE" },
+      {
+        transport: "webpush",
+        token: "https://fcm.googleapis.com:443/fcm/send/c3Vic2NyaXB0aW9uLWE",
+      },
+    ]);
+
+    expect(paired.status).toBe(201);
+    expect(await readPushTokens(acct)).toEqual([{ token: FCM_ENDPOINT }]);
+  });
+});
+
+describe("submit — Web Push wakeups off the response path, with pruning", () => {
   it.each([404, 410])(
     "prunes only the token the push service answered %i for; submit still succeeds",
     async (goneStatus) => {
@@ -178,13 +268,16 @@ describe("submit — Web Push wakeups and gone-subscription pruning", () => {
 
       expect(submit.status).toBe(202);
       expect(submit.data.status).toBe("pending");
-      expect(submit.data.push_wakeups).toBe(1);
-      expect(fetcher).toHaveBeenCalledTimes(2);
-      expect(await readPushTokens(acct)).toEqual([{ token: MOZILLA_ENDPOINT }]);
+      // `push_wakeups` counts wakeups scheduled, not delivered (relay-api.md §5).
+      expect(submit.data.push_wakeups).toBe(2);
+      await vi.waitFor(async () => {
+        expect(fetcher).toHaveBeenCalledTimes(2);
+        expect(await readPushTokens(acct)).toEqual([{ token: MOZILLA_ENDPOINT }]);
+      });
     },
   );
 
-  it.each([429, 500, 503])(
+  it.each([401, 403, 429, 500, 503])(
     "keeps the token when the push service fails with %i; submit still succeeds",
     async (status) => {
       const acct = `acct-webpush-keep-${String(status)}`;
@@ -192,7 +285,7 @@ describe("submit — Web Push wakeups and gone-subscription pruning", () => {
         { transport: "webpush", token: FCM_ENDPOINT },
       ]);
       expect(paired.status).toBe(201);
-      await installWebPush(acct, () => status);
+      const fetcher = await installWebPush(acct, () => status);
 
       const submit = await post<{ status: string; push_wakeups: number }>(
         acct,
@@ -201,7 +294,11 @@ describe("submit — Web Push wakeups and gone-subscription pruning", () => {
       );
 
       expect(submit.status).toBe(202);
-      expect(submit.data.push_wakeups).toBe(0);
+      expect(submit.data.push_wakeups).toBe(1);
+      await vi.waitFor(() => {
+        expect(fetcher).toHaveBeenCalledTimes(1);
+      });
+      await settle();
       expect(await readPushTokens(acct)).toEqual([{ token: FCM_ENDPOINT }]);
     },
   );
@@ -209,11 +306,9 @@ describe("submit — Web Push wakeups and gone-subscription pruning", () => {
   it("keeps the token when the push service is unreachable (fetch rejects)", async () => {
     const acct = "acct-webpush-keep-network-error";
     await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
+    const fetcher = vi.fn<typeof fetch>(() => Promise.reject(new TypeError("network down")));
     await installPushTransports(acct, {
-      webpush: new WebPushTransport({
-        vapid: await makeVapid(),
-        fetcher: () => Promise.reject(new TypeError("network down")),
-      }),
+      webpush: new WebPushTransport({ vapid: await makeVapid(), fetcher }),
     });
 
     const submit = await post<{ push_wakeups: number }>(
@@ -223,8 +318,70 @@ describe("submit — Web Push wakeups and gone-subscription pruning", () => {
     );
 
     expect(submit.status).toBe(202);
-    expect(submit.data.push_wakeups).toBe(0);
+    await vi.waitFor(() => {
+      expect(fetcher).toHaveBeenCalledTimes(1);
+    });
+    await settle();
     expect(await readPushTokens(acct)).toEqual([{ token: FCM_ENDPOINT }]);
+  });
+
+  it("returns 202 while a push service hangs, then times the push out and keeps the token", async () => {
+    const acct = "acct-webpush-hanging";
+    await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
+    let fetchSettled = false;
+    const hanging = vi.fn<typeof fetch>(
+      (_input, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            fetchSettled = true;
+            reject(init.signal?.reason as Error);
+          });
+        }),
+    );
+    await installPushTransports(acct, {
+      webpush: new WebPushTransport({ vapid: await makeVapid(), fetcher: hanging, timeoutMs: 300 }),
+    });
+
+    const submit = await post<{ status: string; push_wakeups: number }>(
+      acct,
+      "/requests",
+      envelope("req-webpush-hanging"),
+    );
+
+    // The submit answered without waiting on the hung push.
+    expect(submit.status).toBe(202);
+    expect(submit.data.push_wakeups).toBe(1);
+    expect(fetchSettled).toBe(false);
+    // The per-request timeout then aborts it; a timeout is transient, so the token stays.
+    await vi.waitFor(
+      () => {
+        expect(fetchSettled).toBe(true);
+      },
+      { timeout: 3000 },
+    );
+    await settle();
+    expect(await readPushTokens(acct)).toEqual([{ token: FCM_ENDPOINT }]);
+  });
+
+  it("prunes a stored row that fails the allowlist without ever requesting it", async () => {
+    const acct = "acct-webpush-legacy-row";
+    // A row the earlier no-op stub accepted (any string) before endpoints were validated.
+    await seedPushTokenRows(acct, [
+      { device_id: "dev-legacy", transport: "webpush", token: "web-token" },
+    ]);
+    const fetcher = await installWebPush(acct, () => 201);
+
+    const submit = await post<{ push_wakeups: number }>(
+      acct,
+      "/requests",
+      envelope("req-webpush-legacy-row"),
+    );
+
+    expect(submit.status).toBe(202);
+    await vi.waitFor(async () => {
+      expect(await readPushTokens(acct)).toEqual([]);
+    });
+    expect(fetcher).not.toHaveBeenCalled();
   });
 
   it("sends a payload-less wakeup whose TTL is bounded by the request deadline", async () => {
@@ -239,6 +396,9 @@ describe("submit — Web Push wakeups and gone-subscription pruning", () => {
     );
 
     expect(submit.data.push_wakeups).toBe(1);
+    await vi.waitFor(() => {
+      expect(fetcher).toHaveBeenCalledTimes(1);
+    });
     const [input, init] = fetcher.mock.calls[0] ?? [];
     const sent = new Request(String(input), init);
     expect((await sent.arrayBuffer()).byteLength).toBe(0);

@@ -58,7 +58,7 @@
       //   APNS_TOPIC     — your app's bundle id, e.g. "com.example.myapp".
       //                    Safe to commit; it is public in your provisioning profile.
       //   VAPID_PUBLIC_KEY — Web Push VAPID public key (base64url P-256 point). Public by design;
-      //                    served at GET /push/vapid-public-key.
+      //                    served at GET /.well-known/allw/vapid-public-key.
       //   VAPID_SUBJECT  — Web Push operator contact, e.g. "mailto:ops@example.com".
       //
       // Secrets (set via `wrangler secret put --env production`; never committed):

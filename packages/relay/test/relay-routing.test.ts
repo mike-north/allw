@@ -458,7 +458,8 @@ describe("AccountRelay — routing (device offline)", () => {
     expect(submit.status).toBe(202);
     expect(submit.data.status).toBe("pending");
     expect(submit.data.delivered_to).toBe(1);
-    expect(submit.data.push_wakeups).toBe(0);
+    // `push_wakeups` counts wakeups scheduled; the throwing transport runs off the response path.
+    expect(submit.data.push_wakeups).toBe(1);
     const pushed = await device.next();
     expect(pushed.type).toBe("request");
     expect(pushed.request_id).toBe("req-push-throw");

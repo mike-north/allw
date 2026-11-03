@@ -5,16 +5,17 @@
  *
  * @see https://www.rfc-editor.org/rfc/rfc8030 (Web Push: §5 TTL, §5.3 Urgency, §6–7 404/410)
  * @see https://www.rfc-editor.org/rfc/rfc8292 (VAPID: §2 JWT claims, §3 `vapid t=…, k=…`)
+ * @see https://www.rfc-editor.org/rfc/rfc8615 (Well-Known URIs: the relay-level namespace)
  * @see ../../../docs/relay-api.md (§5 Push wakeups)
  */
 
 import { SELF, env } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import worker from "../src/index.js";
-import { PushTokenGoneError } from "../src/push.js";
+import { UndeliverablePushTokenError } from "../src/push.js";
 import {
   WebPushTransport,
-  handleVapidPublicKey,
+  loadVapidSigningKey,
   parseWebPushEndpoint,
   vapidConfigFromEnv,
   webPushTtlSeconds,
@@ -257,10 +258,12 @@ describe("WebPushTransport — payload-less VAPID wakeup", () => {
       now: () => NOW_MS,
     });
 
-    await expect(transport.sendWakeup(wakeup())).rejects.toBeInstanceOf(PushTokenGoneError);
+    await expect(transport.sendWakeup(wakeup())).rejects.toBeInstanceOf(
+      UndeliverablePushTokenError,
+    );
   });
 
-  it.each([400, 403, 413, 429, 500, 503, 301])(
+  it.each([400, 401, 403, 413, 429, 500, 503, 301])(
     "treats HTTP %i as a transient failure, not a gone subscription",
     async (status) => {
       const { config } = await makeVapid();
@@ -275,28 +278,124 @@ describe("WebPushTransport — payload-less VAPID wakeup", () => {
         (error: unknown) => error,
       );
       expect(failure).toBeInstanceOf(Error);
-      expect(failure).not.toBeInstanceOf(PushTokenGoneError);
+      expect(failure).not.toBeInstanceOf(UndeliverablePushTokenError);
     },
   );
 
-  it("refuses to send to a stored endpoint outside the allowlist without making a request", async () => {
+  it("reports a stored endpoint outside the allowlist as undeliverable, without a request", async () => {
     const { config } = await makeVapid();
     const fetcher = capturingFetcher(201);
     const transport = new WebPushTransport({ vapid: config, fetcher, now: () => NOW_MS });
 
     await expect(
       transport.sendWakeup(wakeup("https://169.254.169.254/latest/meta-data")),
-    ).rejects.toThrow(/allowlist/);
+    ).rejects.toBeInstanceOf(UndeliverablePushTokenError);
     expect(fetcher).not.toHaveBeenCalled();
   });
 
-  it("fails every send when the private key does not import", async () => {
+  it("aborts a hung push service at the timeout, as a transient failure", async () => {
+    const { config } = await makeVapid();
+    // Never answers; settles only when the transport's AbortSignal fires.
+    const hanging = vi.fn<typeof fetch>(
+      (_input, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            reject(init.signal?.reason as Error);
+          });
+        }),
+    );
+    const transport = new WebPushTransport({
+      vapid: config,
+      fetcher: hanging,
+      now: () => NOW_MS,
+      timeoutMs: 20,
+    });
+
+    const failure = await transport.sendWakeup(wakeup()).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(UndeliverablePushTokenError);
+    expect(hanging.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("cancels the push-service response body instead of leaving it unconsumed", async () => {
+    const { config } = await makeVapid();
+    const cancelled = vi.fn();
+    const fetcher = vi.fn<typeof fetch>(
+      async () =>
+        new Response(new ReadableStream({ cancel: cancelled }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        }),
+    );
+    const transport = new WebPushTransport({ vapid: config, fetcher, now: () => NOW_MS });
+
+    await expect(transport.sendWakeup(wakeup())).rejects.toBeInstanceOf(Error);
+    expect(cancelled).toHaveBeenCalledTimes(1);
+  });
+
+  it("makes no request when the private key is not a valid P-256 scalar", async () => {
     const { config } = await makeVapid();
     const fetcher = capturingFetcher(201);
     // A 32-byte scalar of all zeros is not a valid P-256 private key.
     const broken = { ...config, privateKey: b64url(new Uint8Array(32)) };
     const transport = new WebPushTransport({ vapid: broken, fetcher, now: () => NOW_MS });
 
+    const failure = await transport.sendWakeup(wakeup()).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(UndeliverablePushTokenError);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// VAPID keypair validation (shared by the transport and the endpoint)
+// ---------------------------------------------------------------------------
+
+/** A keypair whose public half is valid but belongs to a different private key. */
+async function mismatchedVapid(): Promise<VapidConfig> {
+  const a = await makeVapid();
+  const b = await makeVapid();
+  return { ...a.config, privateKey: b.config.privateKey };
+}
+
+/** A well-formed 65-byte `0x04…` point that is not on the P-256 curve. */
+async function offCurveVapid(): Promise<VapidConfig> {
+  const { config } = await makeVapid();
+  const point = b64urlDecode(config.publicKey);
+  point[64] = (point[64] ?? 0) ^ 0x01; // flip one bit of Y: (X, Y') is not on the curve
+  return { ...config, publicKey: b64url(point) };
+}
+
+describe("loadVapidSigningKey — the keypair must actually match", () => {
+  it("accepts a genuine keypair", async () => {
+    const { config } = await makeVapid();
+
+    await expect(loadVapidSigningKey(config)).resolves.toBeInstanceOf(CryptoKey);
+  });
+
+  it.each([
+    ["a mismatched pair (public and private from different keys)", mismatchedVapid],
+    ["an off-curve public point", offCurveVapid],
+  ])("rejects %s, and the transport then makes no request", async (_name, build) => {
+    const vapid = await build();
+    // Syntactically fine: only the cryptographic check can catch these.
+    expect(
+      vapidConfigFromEnv({
+        VAPID_PUBLIC_KEY: vapid.publicKey,
+        VAPID_PRIVATE_KEY: vapid.privateKey,
+        VAPID_SUBJECT: vapid.subject,
+      }),
+    ).not.toBeNull();
+    await expect(loadVapidSigningKey(vapid)).resolves.toBeNull();
+
+    const fetcher = capturingFetcher(201);
+    const transport = new WebPushTransport({ vapid, fetcher, now: () => NOW_MS });
     await expect(transport.sendWakeup(wakeup())).rejects.toBeInstanceOf(Error);
     expect(fetcher).not.toHaveBeenCalled();
   });
@@ -318,27 +417,41 @@ describe("webPushTtlSeconds", () => {
 });
 
 // ---------------------------------------------------------------------------
-// GET /push/vapid-public-key (relay-level, unauthenticated)
+// GET /.well-known/allw/vapid-public-key (relay-level, unauthenticated)
 // ---------------------------------------------------------------------------
 
-describe("GET /push/vapid-public-key", () => {
-  const url = "https://relay.allw.test/push/vapid-public-key";
+function vapidEnv(vapid: VapidConfig) {
+  return {
+    ...env,
+    VAPID_PUBLIC_KEY: vapid.publicKey,
+    VAPID_PRIVATE_KEY: vapid.privateKey,
+    VAPID_SUBJECT: vapid.subject,
+  };
+}
 
-  it("serves the configured VAPID public key without auth", async () => {
+describe("GET /.well-known/allw/vapid-public-key", () => {
+  const url = "https://relay.allw.test/.well-known/allw/vapid-public-key";
+
+  it("serves the configured VAPID public key without auth, cacheably", async () => {
     const { config } = await makeVapid();
-    const configuredEnv = {
-      ...env,
-      VAPID_PUBLIC_KEY: config.publicKey,
-      VAPID_PRIVATE_KEY: config.privateKey,
-      VAPID_SUBJECT: config.subject,
-    };
 
-    const resp = await worker.fetch(new Request(url), configuredEnv);
+    const resp = await worker.fetch(new Request(url), vapidEnv(config));
 
     expect(resp.status).toBe(200);
+    expect(resp.headers.get("Cache-Control")).toBe("public, max-age=3600");
     const body: unknown = await resp.json();
     // Only the public key — never the private key or subject.
     expect(body).toEqual({ vapid_public_key: config.publicKey });
+  });
+
+  it("answers HEAD with the GET headers and no body", async () => {
+    const { config } = await makeVapid();
+
+    const resp = await worker.fetch(new Request(url, { method: "HEAD" }), vapidEnv(config));
+
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get("Cache-Control")).toBe("public, max-age=3600");
+    expect(await resp.text()).toBe("");
   });
 
   it("is 404 when Web Push is not configured (the test Worker has no VAPID bindings)", async () => {
@@ -348,14 +461,49 @@ describe("GET /push/vapid-public-key", () => {
     expect(await resp.json()).toEqual({ error: "web push is not configured" });
   });
 
-  it("is 405 for a non-GET method", async () => {
+  it.each([
+    ["a mismatched pair", mismatchedVapid],
+    ["an off-curve public point", offCurveVapid],
+  ])("is 404 for %s, so browsers never subscribe with an unusable key", async (_name, build) => {
+    const resp = await worker.fetch(new Request(url), vapidEnv(await build()));
+
+    expect(resp.status).toBe(404);
+  });
+
+  it("is 405 for a method other than GET or HEAD", async () => {
     const { config } = await makeVapid();
-    const resp = handleVapidPublicKey(new Request(url, { method: "POST" }), {
-      VAPID_PUBLIC_KEY: config.publicKey,
-      VAPID_PRIVATE_KEY: config.privateKey,
-      VAPID_SUBJECT: config.subject,
-    });
+
+    const resp = await worker.fetch(new Request(url, { method: "POST" }), vapidEnv(config));
 
     expect(resp.status).toBe(405);
+    expect(resp.headers.get("Allow")).toBe("GET, HEAD");
+  });
+
+  it.each(["/.well-known/allw/unknown", "/.well-known/allw/vapid-public-key/", "/.well-known"])(
+    "keeps the relay-level namespace closed: %s is 404 and never reaches an account",
+    async (path) => {
+      const { config } = await makeVapid();
+
+      const resp = await worker.fetch(
+        new Request(`https://relay.allw.test${path}`),
+        vapidEnv(config),
+      );
+
+      expect(resp.status).toBe(404);
+      expect(await resp.json()).toEqual({ error: "not found" });
+    },
+  );
+
+  it("no longer serves the key under the account namespace (/push/…)", async () => {
+    const { config } = await makeVapid();
+
+    const resp = await worker.fetch(
+      new Request("https://relay.allw.test/push/vapid-public-key"),
+      vapidEnv(config),
+    );
+
+    // Routed to the account literally named "push", which has no such route.
+    expect(resp.status).toBe(404);
+    expect(await resp.text()).not.toContain(config.publicKey);
   });
 });

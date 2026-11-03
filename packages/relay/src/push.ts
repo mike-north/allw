@@ -24,19 +24,35 @@ export interface PushWakeup {
 }
 
 /**
- * Thrown by a transport when the push service reports that the token no longer exists (for Web
- * Push, HTTP 404 or 410). It is the only failure that removes a stored token: every other failure is
- * treated as transient, so a provider outage can never silently unregister a device.
+ * Thrown by a transport when a token is **permanently undeliverable**: the push service reports
+ * the subscription gone (for Web Push, HTTP 404 or 410), or the stored token can never be a valid
+ * target for its transport (e.g. a Web Push endpoint outside the push-service allowlist). It is the
+ * only failure that removes a stored token. Every other failure, including timeouts and auth
+ * errors, is treated as transient, so a provider outage or relay misconfiguration can never
+ * silently unregister a device.
  */
-export class PushTokenGoneError extends Error {
-  override readonly name = "PushTokenGoneError";
+export class UndeliverablePushTokenError extends Error {
+  override readonly name = "UndeliverablePushTokenError";
 }
 
 /** Outcome of one fan-out: how many wakeups were accepted, and which tokens should be pruned. */
 export interface PushDispatchResult {
   readonly delivered: number;
-  readonly goneTokens: readonly StoredPushToken[];
+  readonly undeliverableTokens: readonly StoredPushToken[];
 }
+
+// Registration budgets. Pairing is unauthenticated, and every stored token costs an outbound request
+// on every submit, so registration is bounded. Over-budget input is rejected, never truncated.
+
+/** Most `push_tokens` entries one registration may carry. */
+export const MAX_PUSH_TOKENS_PER_REGISTRATION = 4;
+/** Most distinct tokens one registration may carry for a single transport. */
+export const MAX_PUSH_TOKENS_PER_TRANSPORT = 2;
+/** Most `device_push_token` rows one account may hold across all its devices. */
+export const MAX_PUSH_TOKENS_PER_ACCOUNT = 32;
+
+/** Most wakeups in flight at once; Workers allow about six open outbound connections. */
+const DEFAULT_PUSH_CONCURRENCY = 4;
 
 export interface PushTransport {
   readonly kind: PushTransportKind;
@@ -60,9 +76,18 @@ export function isPushTransportKind(value: string): value is PushTransportKind {
   return value === "apns" || value === "fcm" || value === "webpush";
 }
 
+/** The tokens a fan-out will actually attempt: those whose transport is registered. */
+export function schedulablePushTokens(
+  tokens: readonly StoredPushToken[],
+  transports: PushTransportRegistry,
+): StoredPushToken[] {
+  return tokens.filter((token) => transports[token.transport] !== undefined);
+}
+
 /**
- * Dispatch all registered tokens through their matching transport. Never throws: push is a wakeup
- * optimization, so a failed send is counted out rather than propagated to the submit path.
+ * Dispatch every schedulable token through its transport, at most `concurrency` at a time. Never
+ * throws: push is a wakeup optimization, so a failed send is counted out rather than propagated.
+ * Devices still receive the ciphertext via WebSocket presence or polling.
  */
 export async function dispatchPushWakeups(
   tokens: readonly StoredPushToken[],
@@ -71,13 +96,16 @@ export async function dispatchPushWakeups(
     readonly requestId: string;
     readonly expiresAt: number;
     readonly transports: PushTransportRegistry;
+    readonly concurrency?: number;
   },
 ): Promise<PushDispatchResult> {
+  const queue = schedulablePushTokens(tokens, options.transports);
   let delivered = 0;
-  const goneTokens: StoredPushToken[] = [];
-  for (const token of tokens) {
+  const undeliverableTokens: StoredPushToken[] = [];
+
+  const sendOne = async (token: StoredPushToken): Promise<void> => {
     const transport = options.transports[token.transport];
-    if (!transport) continue;
+    if (!transport) return;
     try {
       await transport.sendWakeup({
         accountId: options.accountId,
@@ -88,12 +116,26 @@ export async function dispatchPushWakeups(
       });
       delivered++;
     } catch (error) {
-      // A provider outage must not break the pending request path; devices can still receive the
-      // ciphertext via WebSocket presence or polling. Only an explicit "token gone" prunes.
-      if (error instanceof PushTokenGoneError) goneTokens.push(token);
+      // Only an explicit "permanently undeliverable" prunes; everything else is transient.
+      if (error instanceof UndeliverablePushTokenError) undeliverableTokens.push(token);
     }
-  }
-  return { delivered, goneTokens };
+  };
+
+  // A small worker pool: each worker drains the shared queue, so at most `concurrency` sends are
+  // in flight and one slow push service delays only its own slot.
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < queue.length) {
+      const token = queue[next++];
+      if (token) await sendOne(token);
+    }
+  };
+  const width = Math.max(
+    1,
+    Math.min(options.concurrency ?? DEFAULT_PUSH_CONCURRENCY, queue.length),
+  );
+  await Promise.allSettled(Array.from({ length: width }, worker));
+  return { delivered, undeliverableTokens };
 }
 
 /** APNs token-auth transport. Credentials are supplied by Worker environment bindings. */
