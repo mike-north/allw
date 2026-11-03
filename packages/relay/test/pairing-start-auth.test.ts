@@ -452,14 +452,12 @@ describe("pairing — state from before root binding is never adopted", () => {
       params: () => Promise.resolve([ATTACKER_PUBKEY]),
     },
     {
-      table: "account_state",
-      sql: `INSERT INTO account_state (ordinal, state_jws, created_at) VALUES (0, 'a.b.c', 0)`,
+      // Unreachable on an unbound account through the API (publish needs the bound root); the
+      // check is defense in depth.
+      table: "verified_account_state",
+      sql: `INSERT INTO verified_account_state (state_jws, sequence, verified_at)
+            VALUES ('a.b.c', 1, 0)`,
       params: () => Promise.resolve([]),
-    },
-    {
-      table: "account_state_meta",
-      sql: `INSERT INTO account_state_meta (id, max_sequence, updated_at) VALUES (1, ?, 0)`,
-      params: () => Promise.resolve([Number.MAX_SAFE_INTEGER]),
     },
   ];
 
@@ -490,6 +488,22 @@ describe("pairing — state from before root binding is never adopted", () => {
     const resp = await SELF.fetch(`http://relay.test/${acct}/devices`);
     const listed = (await resp.json()) as { devices: { device_id: string }[] };
     expect(listed.devices.map((d) => d.device_id)).toEqual(["attacker-device"]);
+  });
+
+  it("drops the legacy unverified account-state tables instead of adopting them", async () => {
+    // The pre-binding relay cached unverified strings and a caller-asserted max_sequence there.
+    const acct = testAccount("pre-binding-legacy-account-state");
+    const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(acct));
+    const tables = await runInDurableObject(stub, (instance: AccountRelay) => {
+      const relay = instance as unknown as { sql: SqlStorage };
+      return [
+        ...relay.sql.exec<{ name: string }>(
+          `SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'account_state%'`,
+        ),
+      ].map((row) => row.name);
+    });
+    expect(tables).toEqual([]);
+    expect((await postStart(acct, pairingStartBody(acct))).status).toBe(201);
   });
 
   it("403 when completing a pre-binding pairing code on an unbound account", async () => {

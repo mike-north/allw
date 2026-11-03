@@ -24,6 +24,8 @@ export {
 } from "./lib/decision-output.js";
 
 export {
+  MAX_ERROR_TEXT_CHARS,
+  agentSafeErrorText,
   decide,
   type ApprovalVerdict,
   type DecideDeps,

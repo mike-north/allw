@@ -11,12 +11,15 @@
  *     the real core exactly as the relay does (derivation, signature, freshness, one-time `jti`),
  *   - sends only the **X25519 (encryption) public key** to `/pairing/complete` (never a seed),
  *   - mints + stores a device_cert and the relay/account/device metadata,
- *   - builds the correct `ws(s)://…/devices/:id/connect` presence URL.
+ *   - builds the correct `ws(s)://…/devices/:id/connect` presence URL,
+ *   - publishes and fetches account state with **no device token** — the fake relay verifies each
+ *     published document against the bound root with the real core, as the relay does.
  *
  * @see ../../relay/src/index.ts (the endpoints mimicked here)
  * @see ../../../docs/contract.md §Identity & keys, §Transport
  * @see ../../../docs/relay-api.md §3 Pairing (root-signed pairing/start)
  * @see ../../../docs/enrollment.md §Self-Certifying Account Id
+ * @see ../../../docs/relay-api.md §3 Account state (root-verified publish, unauthenticated fetch)
  */
 
 import { test } from "node:test";
@@ -33,6 +36,7 @@ import {
   fetchAccountStates,
   fetchAccountStatesWithMetadata,
   pairingStart,
+  publishAccountStates,
   pairingComplete,
   PAIRING_TIMEOUT_MS,
 } from "../dist/lib/relay-client.js";
@@ -44,12 +48,20 @@ const PAIRING_AUTH_TOKEN = "pairing-token-from-relay";
 const DEVICE_AUTH_TOKEN = "device-token-from-relay";
 /** The fixed clock both `runPair` (`now`) and the fake relay's verifier use. */
 const FIXED_NOW = 1700000000000;
+/** What the fake relay serves for an account nothing was published to (opaque to the client). */
+const DEFAULT_ACCOUNT_STATES = {
+  account_states: ["account-state-jws-1", "account-state-jws-2"],
+  max_sequence: 7,
+};
 
 /**
  * Start a fake relay mimicking the pairing endpoints. Captures every request body so tests can
  * assert exactly what the approver sent. `pairing/start` is verified like the real relay: the path's
  * account id must derive from `root_pubkey` (400), `authorization` is required (401), and the core
  * must accept it at `now` with an unused `jti` (403); the first success binds the root.
+ * `account-states` mirrors the relay too: `POST` needs a bound root (409), every document must pass
+ * the core's `verify_account_state` (403), and the highest sequence must rise (409); `GET` needs no
+ * token. Unpublished accounts serve `DEFAULT_ACCOUNT_STATES`.
  * Returns { url, requests, boundRoots, close }.
  */
 async function startFakeRelay({ now = FIXED_NOW } = {}) {
@@ -58,6 +70,8 @@ async function startFakeRelay({ now = FIXED_NOW } = {}) {
   /** account id → bound root pubkey. */
   const boundRoots = new Map();
   const seenJtis = new Set();
+  /** account id → { account_states, max_sequence } of verified published documents. */
+  const publishedStates = new Map();
   const server = createServer((req, res) => {
     let body = "";
     req.on("data", (chunk) => (body += chunk));
@@ -128,20 +142,45 @@ async function startFakeRelay({ now = FIXED_NOW } = {}) {
         );
         return;
       }
-      // GET /:acct/account-states → { account_states }
-      if (req.method === "GET" && req.url.endsWith("/account-states")) {
-        if (req.headers.authorization !== `Bearer ${DEVICE_AUTH_TOKEN}`) {
-          res.writeHead(403, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "authorization denied" }));
-          return;
+      // POST /:acct/account-states → { account_states, max_sequence } (root-verified, no token)
+      if (req.method === "POST" && req.url.endsWith("/account-states")) {
+        const accountId = decodeURIComponent(req.url.split("/")[1] ?? "");
+        const reply = (status, payload) => {
+          res.writeHead(status, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(payload));
+        };
+        const docs = parsed.account_states;
+        if (
+          !Array.isArray(docs) ||
+          docs.length === 0 ||
+          docs.length > 16 ||
+          !docs.every((doc) => typeof doc === "string")
+        ) {
+          return reply(400, { error: "'account_states' must be an array of 1 to 16 strings" });
         }
+        const root = boundRoots.get(accountId);
+        if (root === undefined) return reply(409, { error: "account root not bound" });
+        let highest = -1;
+        for (const jws of docs) {
+          let sequence;
+          try {
+            sequence = JSON.parse(wasm.verify_account_state(jws, accountId, root)).sequence;
+          } catch {
+            return reply(403, { error: "did not verify" });
+          }
+          highest = Math.max(highest, sequence);
+        }
+        const stored = publishedStates.get(accountId)?.max_sequence ?? -1;
+        if (highest <= stored) return reply(409, { error: "sequence not above current" });
+        const current = { account_states: parsed.account_states, max_sequence: highest };
+        publishedStates.set(accountId, current);
+        return reply(200, current);
+      }
+      // GET /:acct/account-states → { account_states, max_sequence } (unauthenticated)
+      if (req.method === "GET" && req.url.endsWith("/account-states")) {
+        const accountId = decodeURIComponent(req.url.split("/")[1] ?? "");
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            account_states: ["account-state-jws-1", "account-state-jws-2"],
-            max_sequence: 7,
-          }),
-        );
+        res.end(JSON.stringify(publishedStates.get(accountId) ?? DEFAULT_ACCOUNT_STATES));
         return;
       }
       res.writeHead(404, { "Content-Type": "application/json" });
@@ -288,15 +327,16 @@ test("pairingComplete sends ONLY the X25519 pubkey and returns the relay device_
   }
 });
 
-test("fetchAccountStates uses the paired device bearer token and returns compact state docs", async () => {
+test("fetchAccountStates sends no device token and returns compact state docs", async () => {
   const relay = await startFakeRelay();
   try {
-    const states = await fetchAccountStates(relay.url, "acct-2", DEVICE_AUTH_TOKEN);
+    const states = await fetchAccountStates(relay.url, "acct-2");
 
-    assert.deepEqual(states, ["account-state-jws-1", "account-state-jws-2"]);
+    assert.deepEqual(states, DEFAULT_ACCOUNT_STATES.account_states);
     const fetchReq = relay.requests.find((r) => r.url.endsWith("/account-states"));
     assert.equal(fetchReq.method, "GET");
-    assert.equal(fetchReq.authorization, `Bearer ${DEVICE_AUTH_TOKEN}`);
+    // GET account-states is unauthenticated (#242): the device token never leaves the keyfile.
+    assert.equal(fetchReq.authorization, undefined);
   } finally {
     await relay.close();
   }
@@ -305,10 +345,107 @@ test("fetchAccountStates uses the paired device bearer token and returns compact
 test("fetchAccountStatesWithMetadata returns relay max_sequence metadata", async () => {
   const relay = await startFakeRelay();
   try {
-    const result = await fetchAccountStatesWithMetadata(relay.url, "acct-2", DEVICE_AUTH_TOKEN);
+    const result = await fetchAccountStatesWithMetadata(relay.url, "acct-2");
 
-    assert.deepEqual(result.accountStates, ["account-state-jws-1", "account-state-jws-2"]);
+    assert.deepEqual(result.accountStates, DEFAULT_ACCOUNT_STATES.account_states);
     assert.equal(result.maxSequence, 7);
+  } finally {
+    await relay.close();
+  }
+});
+
+test("fetchAccountStatesWithMetadata rejects a response without max_sequence (fail-closed, no default)", async () => {
+  // Regression: a missing max_sequence used to be coerced to 0, silently disabling the approver's
+  // relay-metadata rollback check instead of failing closed.
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const body of [
+      { account_states: [] },
+      { account_states: [], max_sequence: null },
+      { account_states: [], max_sequence: -1 },
+      { account_states: [], max_sequence: 2 ** 53 },
+    ]) {
+      globalThis.fetch = async () =>
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      await assert.rejects(
+        fetchAccountStatesWithMetadata("https://relay.allw.test", "acct-2"),
+        /unexpected shape/,
+        JSON.stringify(body),
+      );
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+/** A root-signed account-state document for `root`'s own account at `sequence`. */
+function signedAccountState(wasm, root, sequence) {
+  return wasm.sign_account_state(
+    JSON.stringify({
+      v: 1,
+      account_id: root.accountId,
+      sequence,
+      current_root: root.pubkey,
+      previous_roots: [],
+      devices: [],
+      actors: [],
+      revocations: [{ kind: "device", id: "dev-lost", revoked_at: FIXED_NOW }],
+    }),
+    root.seed,
+  );
+}
+
+test("publishAccountStates publishes root-signed state with no device token", async () => {
+  const wasm = await loadWasm();
+  const relay = await startFakeRelay();
+  try {
+    const root = testRoot(wasm, 0x51);
+    relay.boundRoots.set(root.accountId, root.pubkey);
+    const doc = signedAccountState(wasm, root, 3);
+
+    const result = await publishAccountStates(relay.url, root.accountId, [doc]);
+
+    assert.deepEqual(result, { accountStates: [doc], maxSequence: 3 });
+    const publishReq = relay.requests.find(
+      (r) => r.method === "POST" && r.url.endsWith("/account-states"),
+    );
+    assert.equal(publishReq.authorization, undefined);
+    // The relay derives max_sequence from the verified documents; the client never asserts one.
+    assert.deepEqual(publishReq.body, { account_states: [doc] });
+    assert.deepEqual(
+      (await fetchAccountStatesWithMetadata(relay.url, root.accountId)).accountStates,
+      [doc],
+    );
+  } finally {
+    await relay.close();
+  }
+});
+
+test("publishAccountStates fails closed on a relay rejection", async () => {
+  const wasm = await loadWasm();
+  const relay = await startFakeRelay();
+  try {
+    const root = testRoot(wasm, 0x52);
+    const other = testRoot(wasm, 0x53);
+    const doc = signedAccountState(wasm, root, 3);
+
+    // No root bound yet → 409.
+    await assert.rejects(publishAccountStates(relay.url, root.accountId, [doc]), /HTTP 409/);
+
+    relay.boundRoots.set(root.accountId, root.pubkey);
+    // Signed by another root → 403.
+    const forged = signedAccountState(wasm, { ...other, accountId: root.accountId }, 4);
+    await assert.rejects(publishAccountStates(relay.url, root.accountId, [forged]), /HTTP 403/);
+
+    // An empty document set is malformed → 400 (the fake relay enforces the real 1–16 bound).
+    await assert.rejects(publishAccountStates(relay.url, root.accountId, []), /HTTP 400/);
+
+    // Republishing the current document (not a higher sequence) → 409.
+    await publishAccountStates(relay.url, root.accountId, [doc]);
+    await assert.rejects(publishAccountStates(relay.url, root.accountId, [doc]), /HTTP 409/);
   } finally {
     await relay.close();
   }
