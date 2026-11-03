@@ -39,7 +39,22 @@ pnpm -r lint                      # ESLint (type-checked)
 pnpm -r test                      # package tests: node:test plus relay Vitest workers-pool tests
 pnpm exec prettier --check "**/*.{ts,js,mjs,json,md}"   # --write to fix (incl. .mjs — the test files)
 pnpm --filter @allw/relay typecheck                 # a single package
+
+# Testing one package: build it and its workspace deps first (the `...` suffix selects the deps too)
+pnpm run build:wasm                                 # once; the SDK's dist loads the vendored WASM
+pnpm --filter "@allw/codex-hook..." build
+pnpm --filter @allw/codex-hook test
 ```
+
+**Build before validating; validation scripts never build other packages** (#275). Package `test` /
+`typecheck` / `lint` scripts only _read_ their workspace dependencies' `dist/` — they do not rebuild them, because
+`pnpm -r test` runs packages concurrently and a dependency rebuild there rewrote `dist/` under another package's
+running subprocess test. Each consumer script starts with `scripts/require-built-deps.mjs`, which fails with the
+exact build command if a (transitive) workspace dependency is unbuilt: `test` uses the runtime mode (`main` + `types`
+exist, `main` is newer than the dep's `src/`, plus the SDK's vendored WASM); `typecheck` / `lint` use `--types` (only
+`.d.ts`, so they work without `build:wasm`). A package's `test` may still compile _itself_ (`pnpm -r` starts
+dependents only after it finishes). `scripts/recursive-scripts.test.mjs` enforces an allowlist: guard, then only
+`tsc -p tsconfig.json [--noEmit]`, `node --test …`, `eslint src`, or `vitest run`.
 
 **Verification gate before declaring work done:** `cargo fmt --check` + `cargo clippy --all-targets --locked -- -D warnings` +
 `cargo check --locked` + `cargo test --locked` + `pnpm run build:wasm` + `pnpm -r build` + `pnpm -r typecheck` +

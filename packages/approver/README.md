@@ -202,6 +202,8 @@ All three are 32-byte seeds stored base64url in the keyfile — **software custo
 ## Tests
 
 ```sh
+pnpm run build:wasm                         # once, from the repo root
+pnpm --filter "@allw/approver..." build     # this package and its workspace deps
 pnpm --filter @allw/approver test
 ```
 

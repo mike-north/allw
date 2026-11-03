@@ -73,6 +73,8 @@ never emits `permissionDecision: "allow"` — see
 ## Development
 
 ```sh
+pnpm run build:wasm                          # once, from the repo root
+pnpm --filter "@allw/codex-hook..." build    # this package and its workspace deps
 pnpm --filter @allw/codex-hook typecheck
 pnpm --filter @allw/codex-hook lint
 pnpm --filter @allw/codex-hook test
