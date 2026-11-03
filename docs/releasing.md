@@ -155,7 +155,9 @@ only forward on `latest`.
 
 4. [`.github/workflows/release.yml`](../.github/workflows/release.yml) then runs in two jobs:
    - **build** (read-only token): refuses tags that are not on `main` and checks the tag against
-     every manifest. It builds the WASM and the packages and runs the release-script tests. It packs
+     every manifest. It builds **cold**, with no caches restored or saved: a cache entry is keyed
+     by name, not by who wrote it, so a run on a hostile tag could otherwise poison a later real
+     release. It builds the WASM and the packages and runs the release-script tests. It packs
      the five tarballs into `dist-release/`, then runs the
      [packaged-install smoke](../scripts/smoke-packaged-install.mjs) on **exactly those tarballs**: a
      clean `npm install` of all five, every bin's `--version`, an import of every package, and a
@@ -174,8 +176,27 @@ only forward on `latest`.
    lists each stage id and tarball sha512, but the run writes that summary itself. Any run that gets
    a stage-capable token can write one, for example a modified `release.yml` on a branch with a `v*`
    tag pushed at it. So the summary proves nothing. Treat only these steps as evidence.
-   1. Log in to npm (`npm login`) and to `gh`, in an up-to-date checkout of `main`.
-   2. Run the verifier for the version, naming the run whose stages you mean to approve:
+   1. Review what changed since the last release in everything that builds or ships it:
+
+      ```sh
+      git fetch https://github.com/mike-north/allw.git main --tags
+      git log --stat <previous-tag>..v0.2.0 -- .github scripts packages crates
+      ```
+
+      Every commit there is on `main`, so it was reviewed, but it's your last look before the
+      bytes go public.
+
+   2. Check out exactly GitHub's `main`, unmodified, and log in to npm (`npm login`) and to `gh`.
+      The verifier refuses to run otherwise: `git status --porcelain` must be empty and `HEAD` must
+      equal the `main` SHA that `git ls-remote` reports. Its code and the release constants it
+      imports come from this checkout, which an agent or anyone with local access could have
+      edited.
+
+      ```sh
+      git fetch https://github.com/mike-north/allw.git main && git checkout --detach FETCH_HEAD
+      ```
+
+   3. Run the verifier for the version, naming the run whose stages you mean to approve:
 
       ```sh
       node scripts/verify-staged-release.mjs 0.2.0 --run <run-id>
@@ -191,10 +212,13 @@ only forward on `latest`.
       - `npm stage list` shows exactly one open stage per package at `0.2.0`, and no open stage of
         any other version.
       - Each stage's bytes, fetched with `npm stage download`, have exactly the run's sha512.
-      - The stage's provenance names `.github/workflows/release.yml` at `refs/tags/v0.2.0` in
-        `mike-north/allw`, at that commit, from that run, for that sha512.
+      - If npm exposes provenance on the stage, it names `.github/workflows/release.yml` at
+        `refs/tags/v0.2.0` in `mike-north/allw`, at that commit, from that run, for that sha512.
 
-   3. If it passes, approve **only the stage ids it prints**, in the order it prints them:
+      npm's stage reads don't prompt for 2FA themselves. If your account's 2FA covers authorization,
+      the verifier asks for a one-time password and retries with it. Without one, it stops.
+
+   4. If it passes, approve **only the stage ids it prints**, in the order it prints them:
 
       ```sh
       npm stage approve <stage-id>   # asks for npm 2FA; the version goes public on `latest`
@@ -202,15 +226,16 @@ only forward on `latest`.
 
       Never approve a stage you didn't start, or one the verifier didn't list.
 
-   4. Log out of npm (`npm logout`). Stay logged out when you're not releasing, so a stray
+   5. Log out of npm (`npm logout`). Stay logged out when you're not releasing, so a stray
       `npm stage approve` can't happen.
 
-   **Provenance on a stage.** npm documents no read path for a _staged_ version's provenance:
-   `npm stage view --json` documents only id, package, version, status, tag, actor and shasum. The
-   verifier checks provenance whenever the stage view carries an attestation. If it doesn't, the
-   verifier fails and tells you so. You can then rerun it with `--provenance-after-approval`, which
-   relies on the byte-for-byte match. That match is the property that matters: the staged bytes are
-   exactly what the reviewed run built. Right after approving, run:
+   **What actually protects you before approval is the byte match.** The verifier checks that each
+   staged tarball is byte-for-byte what a successful run built from a reviewed commit on `main`.
+   Provenance is a **post-approval** check. npm documents no read path for a _staged_ version's
+   provenance: `npm stage view --json` documents only id, package, version, status, tag, actor and
+   shasum. The verifier checks provenance on a stage only if an attestation happens to be there.
+   Otherwise it fails and says so. Rerun it with `--provenance-after-approval` to rely on the byte
+   match alone. Then, right after approving, run:
 
    ```sh
    node scripts/verify-staged-release.mjs 0.2.0 --published --run <run-id>
@@ -271,8 +296,13 @@ place:
 
 - In the repo's settings, under [Environments](https://github.com/mike-north/allw/settings/environments),
   give `npm-publish` a required reviewer (you) and allow deployments only from `v*` tags.
-- Add a [tag ruleset](https://github.com/mike-north/allw/settings/rules) for `v*` that restricts
-  creation, update and deletion to maintainers, so nobody else can push a release tag.
+- Add a [tag ruleset](https://github.com/mike-north/allw/settings/rules) for `v*`:
+  - restrict creation to maintainers, so nobody else can push a release tag;
+  - block update and deletion **with no bypass actors**, so a release tag can never be moved or
+    reused once it exists. Otherwise a hostile run could take a tag name, and the real tag pushed
+    under that name later would inherit whatever that run left behind;
+  - this complements the cold builds in `release.yml`, which already leave a hostile run no cache to
+    poison.
 - After the first release, set each `@allw/*` package's npm _Settings → Publishing access_ to
   **Require two-factor authentication and disallow tokens**. Trusted publishing keeps working because
   it doesn't use tokens.
