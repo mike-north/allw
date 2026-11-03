@@ -1,0 +1,41 @@
+# Install the pinned wasm-pack release for a CI job: download the release tarball, check it
+# against the pinned SHA-256 (GitHub's recorded digest for that asset), and copy the binary into
+# ~/.cargo/bin.
+#
+# This replaces jetli/wasm-pack-action, which extracts under os.tmpdir() (/tmp) and then
+# renames the binary into ~/.cargo/bin. On runner hosts whose /tmp is on another filesystem,
+# that rename fails with EXDEV ("cross-device link not permitted"), so jobs failed at random
+# before building anything. Here the tarball is unpacked under $RUNNER_TEMP, and `install`
+# copies rather than renames, so mounts don't matter.
+#
+# The version and digest are pinned together for the same reason the Rust toolchain is pinned:
+# a floating `latest` could change the build under an unchanged commit. Bump both deliberately,
+# alongside rust-toolchain.toml if needed. This is the one place the pin lives.
+name: Install wasm-pack
+description: Install the pinned wasm-pack release, verified by SHA-256, into ~/.cargo/bin.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        WASM_PACK_VERSION: v0.15.1
+        # sha256 of wasm-pack-v0.15.1-x86_64-unknown-linux-musl.tar.gz, as GitHub records it for
+        # the release asset: https://github.com/wasm-bindgen/wasm-pack/releases/tag/v0.15.1
+        WASM_PACK_SHA256: 410101009739b9d01c7d5affaaad6e9c9a24b4cba6791a4805db8e89b9bf7af2
+      run: |
+        set -euo pipefail
+        if [ "$RUNNER_OS" != "Linux" ] || [ "$(uname -m)" != "x86_64" ]; then
+          echo "::error::the pinned wasm-pack digest is for x86_64 Linux; this runner is $RUNNER_OS/$(uname -m)"
+          exit 1
+        fi
+        name="wasm-pack-${WASM_PACK_VERSION}-x86_64-unknown-linux-musl"
+        dir="$RUNNER_TEMP/install-wasm-pack"
+        mkdir -p "$dir"
+        curl --proto '=https' --tlsv1.2 -sSfL --retry 3 -o "$dir/$name.tar.gz" \
+          "https://github.com/wasm-bindgen/wasm-pack/releases/download/${WASM_PACK_VERSION}/${name}.tar.gz"
+        echo "${WASM_PACK_SHA256}  $dir/$name.tar.gz" | sha256sum --check --strict
+        tar -xzf "$dir/$name.tar.gz" -C "$dir"
+        mkdir -p "$HOME/.cargo/bin"
+        install -m 0755 "$dir/$name/wasm-pack" "$HOME/.cargo/bin/wasm-pack"
+        rm -rf "$dir"
+        wasm-pack --version
