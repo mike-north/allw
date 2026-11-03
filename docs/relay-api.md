@@ -9,10 +9,9 @@ relay source + tests; this doc is the source of truth for client implementations
 > content. Honor `docs/contract.md` / `docs/threat-model.md` — clients decrypt/verify/sign **on
 > device** via the core; the relay is a dumb router.
 >
-> **Not yet zero-knowledge against the relay itself:** integrators encrypt to the device list the relay
-> serves (`GET /{acct}/devices`, unauthenticated, not root-vouched), so a malicious relay can add a
-> recipient key it holds. Fix: encrypt only to root-vouched devices (#243) from verified account state
-> (#242). See `docs/threat-model.md` §Residual Risks.
+> **Recipients are root-vouched:** integrators encrypt only to devices listed in verified root-signed
+> account state (`GET /{acct}/account-states`), never to `GET /{acct}/devices`, so a relay that adds a
+> key it holds cannot read requests (#243). See `docs/threat-model.md` §Residual Risks.
 
 ---
 
@@ -303,7 +302,8 @@ bearer), 403 (not a device token, including a revoked device's own), 404 (device
 revoked), 403 (another device's token). Revoking a device deletes its push tokens.
 
 **`GET /{acct}/devices`** — no auth. → **200**
-`{ devices: [{ device_id, pubkey, label|null, created_at }] }`. No secrets / no push tokens.
+`{ devices: [{ device_id, pubkey, label|null, created_at }] }`. No secrets / no push tokens. Routing
+information only: it is not root-vouched, and integrators never choose encryption recipients from it (#243).
 
 ### Actors (requester attestation) — Bearer `device_auth_token` for POST
 

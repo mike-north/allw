@@ -62,12 +62,12 @@ That's the `<RELAY_URL>` referenced in the steps below — no Cloudflare account
 > The relay is only ever sent **ciphertext + signed verdicts** — never plaintext or any signing key
 > (`docs/architecture.md`, `docs/contract.md`).
 >
-> **Caveat — not yet zero-knowledge against the relay itself.** The SDK encrypts each request to the
-> device list the relay returns (`GET /{account}/devices`), and the shipped hooks do not yet check that
-> list against root-signed account state. A malicious or compromised relay operator could therefore
-> list a key it holds as a device and decrypt the action context. Until the fix lands
-> ([#243](https://github.com/mike-north/allw/issues/243): encrypt only to root-vouched devices), only
-> use a relay whose operator you trust — or run your own. See `docs/threat-model.md` §Residual Risks.
+> **Who can read a request.** The SDK encrypts each request only to the devices your root key vouches
+> for in signed account state, never to the relay's own device list, so a relay that lists a key it
+> holds still cannot read the context ([#243](https://github.com/mike-north/allw/issues/243)).
+> `allw-approver pair` publishes that account state. Until it has, requests fail closed with an error
+> naming `allw-approver pair`. Each machine also records the highest account-state sequence it has
+> seen under `~/.allw/state/` and refuses an older one. See `docs/threat-model.md` §Residual Risks.
 
 **Prefer to self-host?** Either option below gives you a `<RELAY_URL>` to use in place of the
 hosted one — everything else in this quickstart is unchanged.

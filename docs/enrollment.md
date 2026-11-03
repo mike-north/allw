@@ -43,16 +43,16 @@ relay account object
   request/verdict routing state
 ```
 
-The relay device registry and the signed account-state document are deliberately separate. The registry is the
-online routing view the relay enforces (presence sockets, push fan-out); today it is also where `requestApproval`
-gets its encryption recipients, which the recipient selection rule below replaces. Signed account state is the
-verifier/device trust view that includes revocation, device signing keys, actor keys, and root rotation state. The
-relay may store the latest account state, but it cannot author it.
+The relay device registry and the signed account-state document are deliberately separate. The registry is
+**routing only**: the relay uses it for presence sockets and push fan-out, and no integrator reads keys from it.
+Signed account state is the trust view: who may read a request, plus revocation, device signing keys, actor keys,
+and root rotation state. The relay may store and serve the latest account state, but it cannot author it.
 
-**Recipient selection rule.** This is the core rule the SDK is adopting for who may read a request: the devices a
-request may be encrypted to are defined by root-signed account state, never by the registry. The core's
-`select_recipients(account_states, account_id, account_root_pub, now_ms, min_sequence)` implements it; the SDK
-adopts it in #243, and until then `requestApproval` still encrypts to every device in the registry. It returns
+**Recipient selection rule.** The devices a request may be encrypted to are defined by root-signed account state,
+never by the registry. The core's `select_recipients(account_states, account_id, account_root_pub, now_ms,
+min_sequence)` implements it, and `requestApproval` applies it through `seal_context_for_account_state` below
+(#243): `createClient` requires account state, and the SDK never reads `GET /devices`. A device the relay lists
+but account state does not name gets no way to decrypt. It returns
 `{ device_id, encryption_pubkey }` for each device that is `active`, not revoked, and whose signed
 `cert_expires_at` (when present) is after `now_ms`, in the highest-sequence documents that verify against the root.
 It is fail-closed throughout:
@@ -83,12 +83,23 @@ that keeps a floor records that `sequence` (as `max(floor, sequence)`) **before*
 the stored floor as `min_sequence` on every later seal, so a relay that later serves an older state is refused
 rather than trusted. If recording the floor fails, the request is not sent.
 
+The SDK's `relayAccountStateSource` fetches `GET /{account}/account-states` (unauthenticated: every document is
+verified in the core against the configured root) once per request and uses that one set for both sealing and
+verdict revocation checks. Its `fileSequenceFloorStore` keeps the floor at
+`~/.allw/state/<account_id>.floor.json` and fails closed on any file it cannot trust; only a missing file means
+"no floor yet". The Claude Code hook, the Codex hook and the OpenClaw bridge all use these two.
+
+Account state exists only once the root holder publishes it. `allw-approver pair` publishes the next state (the
+previous verified state's devices plus this one, at `sequence + 1`) before it writes the paired keyfile; until an
+account has a published state, every request is refused. A device that is not the root holder becomes reachable
+only when the root holder publishes a state naming it (§Cross-Device `device_cert` Issuance Ceremony, step 10).
+
 The approval primitive has two independent device keys:
 
-| Key                   | Algorithm | Purpose                                        | Relay-visible?                        |
-| --------------------- | --------- | ---------------------------------------------- | ------------------------------------- |
-| Device encryption key | X25519    | JWE recipient for `ApprovalContext` ciphertext | public key only, in `GET /devices`    |
-| Device signing key    | Ed25519   | Signs verdicts and policy rules                | public key only through `device_cert` |
+| Key                   | Algorithm | Purpose                                        | Relay-visible?                                       |
+| --------------------- | --------- | ---------------------------------------------- | ---------------------------------------------------- |
+| Device encryption key | X25519    | JWE recipient for `ApprovalContext` ciphertext | public key only, in `GET /devices` and account state |
+| Device signing key    | Ed25519   | Signs verdicts and policy rules                | public key only through `device_cert`                |
 
 These two keys are derived from **two independently-drawn 32-byte random seeds** — enrollment MUST NOT derive both
 from one seed. The cross-platform smoke tests (`crates/allw-uniffi/tests/*`, and the WASM vectors) reuse a single
@@ -137,9 +148,9 @@ account_id = base64url-unpadded( SHA-256( "allw/account-id/v1" || 0x00 || accoun
 ## Requirements
 
 1. Private keys and seeds must never cross the relay boundary.
-2. A device may receive encrypted requests only while it is enrolled in the relay device registry. Under the
-   recipient selection rule (§Model; adopted by the SDK in #243) it must also be listed `active`, unrevoked and
-   unexpired in the highest root-signed account state.
+2. A device may read encrypted requests only while it is listed `active`, unrevoked and unexpired in the highest
+   root-signed account state (§Model, recipient selection rule). The relay delivers requests only to devices in
+   its registry, but the registry never decides who can decrypt them.
 3. A device may resolve a request only while it is still enrolled.
 4. A verifier must accept a verdict only if its `device_cert` chains to an acceptable account root and the verdict
    itself verifies under the certified device signing key.
@@ -159,8 +170,8 @@ account_id = base64url-unpadded( SHA-256( "allw/account-id/v1" || 0x00 || accoun
 Device enrollment binds an approver device to an account in two places:
 
 1. **Relay device registry:** `device_id -> device_encryption_pubkey`, used by the relay to route presence sockets
-   and, until the SDK adopts the recipient selection rule (§Model, #243), by integrators to encrypt
-   `ApprovalContext` JWE recipients.
+   and push. It is routing only: integrators take JWE recipients from root-signed account state (§Model), and a
+   device is reachable only once a published account state names it.
 2. **Device certificate:** `device_cert`, an EdDSA compact JWS signed by the account root, binding
    `device_id -> device_signing_pubkey` for verdict verification.
 
@@ -383,8 +394,9 @@ let the relay choose which X25519 key the root vouches for.
    is never revoked.
 10. **A** `POST /{acct}/enrollments/{id}/cert` with the compact JWS, and **publishes updated account state**
     (`sequence + 1`, a `devices[]` entry carrying both pubkeys from the CSR plus `cert_expires_at`) via
-    `POST /{acct}/account-states`. Verdict verification chains through the cert alone, so this step is not
-    required for the device to work — but it is what gives offline verifiers and the inbox a complete trust view.
+    `POST /{acct}/account-states`. This step is **required**: integrators encrypt only to devices a verified
+    account state names (§Model, #243), so until it is published the device receives requests it cannot decrypt.
+    Verdict verification still chains through the cert alone.
 11. **B** polls `GET /{acct}/enrollments/{id}/cert` (Bearer `device_auth_token`) and, before persisting
     anything, verifies the cert against the **pinned** root: compact JWS with `typ = "allw-device-cert+jws"` and
     `alg = EdDSA`, `kid == account_id`, signature under the pinned `account_root_pubkey`, claims
@@ -807,9 +819,10 @@ account-state JWS documents, or must first enforce a durably stored highest sequ
 WASM core reject stale lower-sequence rollback within one supplied set, but monotonic persistence across calls is
 integrator-owned when using the SDK directly. The `allw-approver watch` CLI persists that floor in its keyfile;
 the web approver persists it in browser storage (`localStorage`, mirroring its paired-device identity's storage
-tradeoff), surviving page reloads.
-The plain `requestApproval` / `Verdict.verify` SDK path enforces account-state revocation only when
-`ClientConfig.accountStates` or `Verdict.verify(..., { accountStates })` is supplied.
+tradeoff), surviving page reloads. On the integrator side, `requestApproval` always has account state
+(`ClientConfig.accountStates` is required, #243): the set it loads for a request drives both recipient selection
+and verdict revocation, and the shipped hooks and bridge persist the floor with `fileSequenceFloorStore`
+(§Model). A standalone `Verdict.verify(..., { accountStates })` call enforces revocation only when given them.
 
 ## Key Rotation
 
@@ -820,7 +833,8 @@ same physical device remains trusted.
 
 Rules:
 
-- A rotated encryption key updates the relay device registry; new requests must encrypt only to the new key.
+- A rotated encryption key takes effect when the root holder publishes account state carrying it; new requests
+  encrypt only to the key in the highest verified state. The relay registry entry is updated for routing.
 - A rotated signing key requires a fresh `device_cert` signed by the account root.
 - During a grace period, verifiers may accept both old and new device signing certs for the same `device_id`.
 - After the grace period, the old cert is invalid even if it has not reached its embedded `expires_at`.
@@ -879,7 +893,7 @@ When a device is revoked:
 
 1. The relay deletes or marks inactive the device registry row.
 2. Any live device WebSocket for that device is closed.
-3. Future `GET /devices` responses omit the revoked device so new requests are not encrypted to it.
+3. Future `GET /devices` responses omit the revoked device (routing only; integrators never read keys there).
 4. Future verdict submissions from that device are rejected.
 5. Account state records a revocation entry with `revoked_at`.
 6. Offline verifiers reject verdicts whose device id appears in the highest-sequence revocation state they have
@@ -887,17 +901,13 @@ When a device is revoked:
 
 Steps 1–4 depend on the relay honestly reflecting the revocation, which the relay itself is not trusted to do
 (`docs/threat-model.md`'s zero-knowledge relay is also assumed adversarial for routing/registry integrity, not
-only for plaintext confidentiality). **The sender independently enforces the exclusion**: before encrypting a new
-request's `ApprovalContext`, the SDK resolves the revoked device id set from the caller's own verified
-account-state documents (the highest-sequence root-signed state(s) — same semantics as offline verdict
-verification) and drops any relay-listed device that appears there, regardless of what `GET /devices` actually
-returns. If every enrolled device is revoked, `requestApproval` throws rather than submitting a request no
-trusted device can decrypt (fail-closed, never a silent send-to-nobody). **This holds only when the caller passes
-verified `accountStates`; no shipped integrator (`@allw/hook`, `@allw/codex-hook`, `@allw/openclaw-bridge`) does
-yet (#243), and without them the filter is a no-op.** With them, it closes the gap where a revoked
-device would otherwise keep receiving every new request's plaintext context indefinitely, bounded only by how
-promptly the relay's registry converges — the relay is untrusted input, so sender-side filtering is the layer
-that actually holds. **A root-authorized relay-side eviction (the account root revoking another device's
+only for plaintext confidentiality). **The sender independently enforces the exclusion**: the SDK encrypts each
+new request only to the devices its verified, highest-sequence account state lists as active and unrevoked
+(§Model, recipient selection rule), whatever `GET /devices` returns, and the shipped integrators keep a
+sequence floor so a relay cannot roll back to a state from before the revocation. If no device remains,
+`requestApproval` throws rather than submitting a request no trusted device can decrypt (fail-closed, never a
+silent send-to-nobody). A revoked device therefore stops receiving readable requests as soon as the root holder
+publishes the revocation, however slowly the relay's registry converges. **A root-authorized relay-side eviction (the account root revoking another device's
 registry row, as opposed to today's self-revoke-only `POST /devices/{id}/revoke`) remains a separate, open
 piece of work** — defense in depth that stops push fan-out and registry staleness, but does not substitute for
 the sender-side check above.
@@ -906,8 +916,8 @@ Pending requests:
 
 - If a revoked device already holds a ciphertext, it may still be able to decrypt that old context.
 - It must not be able to resolve the request after revocation because the relay rejects its verdict and the
-  integrator checks account-state revocation before accepting a verdict — again only when the integrator passes
-  verified `accountStates`, which no shipped integrator does yet (#243).
+  integrator checks account-state revocation (from the same verified account state it encrypted to) before
+  accepting a verdict.
 
 ### Actor Revocation
 
