@@ -186,9 +186,23 @@ replaces its push tokens with its new subscription (`PUT /{acct}/devices/{device
 **`Topic` is sent only to push services documented to accept it** (today Mozilla autopush; the
 per-host table and sources are in `docs/relay-api.md` §5). In particular Apple's
 `web.push.apple.com` rejects any `Topic` header with `400 BadWebPushTopic`. If Safari / iOS wakeups
-stop arriving while other browsers still get them, check that no `Topic` is being sent to Apple
-(the relay does not log push-service failures today). A 400 is treated as transient, so the tokens
-stay registered and recover once the header is gone.
+stop arriving while other browsers still get them, check that no `Topic` is being sent to Apple:
+`wrangler tail` then shows
+
+```text
+push: webpush push service web.push.apple.com rejected a wakeup with HTTP 400 (reason BadWebPushTopic); token kept
+```
+
+The relay logs one such warning for every push-service answer that is a 4xx other than 404/410, on
+any transport: the transport, the push-service host, the status and, for Web Push, the `reason` from
+a JSON body when it is an identifier of at most 32 characters that does not occur in the
+subscription endpoint. It never logs the token, the endpoint path, credentials or request ids. 5xx
+answers and timeouts are not logged. A 400 is treated as transient, so the tokens stay registered
+and recover once the header is gone.
+
+The warning is per answer, not deduplicated. While a push service throttles the relay (429) or
+refuses its payload size (413), expect one line for each push it refuses; on APNs and FCM, which are
+not coalesced, that is up to one line per device token on every submit.
 
 ### Secrets inventory summary
 

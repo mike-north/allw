@@ -18,6 +18,7 @@ import {
   buildPushWakeupPayload,
   diffPushTokenSet,
   dispatchPushWakeups,
+  isPushServiceRejection,
   parseWebPushCoalesceKey,
   webPushCoalesceKey,
   type Fetcher,
@@ -234,6 +235,96 @@ describe("push fan-out", () => {
         transports: { webpush },
       }),
     ).resolves.toEqual({ deliveredTokens: [], undeliverableTokens: [gone] });
+  });
+});
+
+describe("push-service rejections are logged for operators (#326)", () => {
+  const APNS_DEVICE_TOKEN = "f".repeat(64);
+  const FCM_REGISTRATION = "fcm-registration-secret";
+
+  function apnsAnswering(status: number): ApnsPushTransport {
+    return new ApnsPushTransport({
+      endpoint: "https://api.push.apple.test",
+      topic: "com.example.allw",
+      bearerToken: "apns-bearer-secret",
+      fetcher: async () => new Response(JSON.stringify({ reason: "BadDeviceToken" }), { status }),
+    });
+  }
+
+  function fcmAnswering(status: number): FcmPushTransport {
+    return new FcmPushTransport({
+      endpoint: "https://fcm.googleapis.test/v1/projects/allw-secret-project/messages:send",
+      bearerToken: "fcm-bearer-secret",
+      fetcher: async () => new Response(null, { status }),
+    });
+  }
+
+  function wakeupFor(token: string) {
+    return {
+      accountId: "acct",
+      deviceId: "dev",
+      requestId: "req-rejected",
+      expiresAt: EXPIRES_AT,
+      token,
+    };
+  }
+
+  /** The relay's push-rejection warnings during `body`, ignoring any other console output. */
+  async function rejectionWarnings(body: () => Promise<unknown>): Promise<string[]> {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await body().catch(() => undefined);
+      return warn.mock.calls
+        .map((call) => String(call[0]))
+        .filter((message) => message.startsWith("push:"));
+    } finally {
+      warn.mockRestore();
+    }
+  }
+
+  it("logs an APNs 4xx with transport, host and status only, never the device token", async () => {
+    const warnings = await rejectionWarnings(() =>
+      apnsAnswering(400).sendWakeup(wakeupFor(APNS_DEVICE_TOKEN)),
+    );
+
+    expect(warnings).toEqual([
+      "push: apns push service api.push.apple.test rejected a wakeup with HTTP 400; token kept",
+    ]);
+    for (const secret of [APNS_DEVICE_TOKEN, "apns-bearer-secret", "req-rejected", "/3/device"]) {
+      expect(warnings[0]).not.toContain(secret);
+    }
+  });
+
+  it("logs an FCM 4xx with the host only, never the token or the project path", async () => {
+    const warnings = await rejectionWarnings(() =>
+      fcmAnswering(403).sendWakeup(wakeupFor(FCM_REGISTRATION)),
+    );
+
+    expect(warnings).toEqual([
+      "push: fcm push service fcm.googleapis.test rejected a wakeup with HTTP 403; token kept",
+    ]);
+    for (const secret of [FCM_REGISTRATION, "fcm-bearer-secret", "allw-secret-project"]) {
+      expect(warnings[0]).not.toContain(secret);
+    }
+  });
+
+  it.each([200, 202, 404, 410, 500, 503, 301])(
+    "does not log an APNs or FCM response with HTTP %i as a rejection",
+    async (status) => {
+      expect(
+        await rejectionWarnings(() =>
+          apnsAnswering(status).sendWakeup(wakeupFor(APNS_DEVICE_TOKEN)),
+        ),
+      ).toEqual([]);
+      expect(
+        await rejectionWarnings(() => fcmAnswering(status).sendWakeup(wakeupFor(FCM_REGISTRATION))),
+      ).toEqual([]);
+    },
+  );
+
+  it("classifies only a 4xx other than 404/410 as a rejection", () => {
+    expect([400, 401, 403, 413, 429, 499].every(isPushServiceRejection)).toBe(true);
+    expect([200, 201, 301, 399, 404, 410, 500, 503].some(isPushServiceRejection)).toBe(false);
   });
 });
 

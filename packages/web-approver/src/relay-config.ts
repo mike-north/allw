@@ -13,7 +13,8 @@
  * - **After pairing** the relay is *pinned* inside the stored identity (`./pairing.ts`
  *   `PairedIdentity.relayUrl`) and is the only relay any request goes to. A `?relay=` that differs
  *   is ignored — never persisted, never contacted — and {@link describeIgnoredRelayOverride} +
- *   {@link mountIgnoredRelayNotice} tell the human which origin was ignored. Without the pin, a
+ *   {@link mountIgnoredRelayNotice} tell the human that a link was ignored, naming it only through
+ *   the core's display escape (#307). Without the pin, a
  *   phishing link (`…/?relay=https://evil.example`) would re-point a paired device and hand its
  *   bearer `deviceAuthToken` to the attacker's relay (`docs/threat-model.md` §Trust Boundaries).
  *
@@ -26,6 +27,8 @@
  * @see ./app.ts (the production bootstrap that sequences these)
  * @see ../../../docs/web-approver-deploy.md §Runtime relay configuration, §Relay pinning
  */
+
+import { displayUntrusted, type DisplayEscape } from "./display-escape.js";
 
 /** The query-string parameter name used to seed the relay URL, e.g. `?relay=https%3A%2F%2F...`. */
 export const RELAY_URL_QUERY_PARAM = "relay";
@@ -175,14 +178,41 @@ function readRelayQueryValue(search: string): string | null {
   return new URLSearchParams(search).get(RELAY_URL_QUERY_PARAM);
 }
 
-/** Longest raw `?relay=` text echoed back in a notice when it is not a parseable URL. */
+/** Longest text, in code points, the notice echoes back for an ignored `?relay=` value. */
 const MAX_ECHOED_RELAY_TEXT = 120;
 
 /**
+ * What the notice names for a `?relay=` value that parses as a URL without a network origin
+ * (`javascript:`, `data:`, `file:`, or prose such as `word: …`, whose origin is `"null"`).
+ */
+export const NOT_A_RELAY_URL_TEXT = "(not a relay URL)";
+
+/**
+ * `text` cut to {@link MAX_ECHOED_RELAY_TEXT} code points, with `…` when cut. It reads only up to
+ * the limit, so an attacker-sized value costs no more than a short one, and never splits a
+ * surrogate pair.
+ */
+function clipEchoedText(text: string): string {
+  let clipped = "";
+  let count = 0;
+  for (const codePoint of text) {
+    if (count === MAX_ECHOED_RELAY_TEXT) return `${clipped}…`;
+    clipped += codePoint;
+    count += 1;
+  }
+  return clipped;
+}
+
+/**
  * For a **paired** device: if the page was opened with a `?relay=` that differs from the pinned
- * relay, return the text naming what was ignored (the requested URL's origin, or the raw value
- * truncated when it does not parse); otherwise `null`. Pure — it never persists or contacts
- * anything, so the override has no effect beyond the notice.
+ * relay, return the text naming what was ignored; otherwise `null`. The text is the requested URL's
+ * origin, {@link NOT_A_RELAY_URL_TEXT} for a URL with no network origin, or the raw value when it
+ * does not parse, each cut to {@link MAX_ECHOED_RELAY_TEXT} code points. Pure:
+ * it never persists or contacts anything, so the override has no effect beyond the notice.
+ *
+ * The result is **untrusted** (anyone can send the human a link) and may hold bidi overrides,
+ * zero-width or control characters. Print it only through the core escape
+ * ({@link mountIgnoredRelayNotice} does), never as is.
  */
 export function describeIgnoredRelayOverride(
   search: string,
@@ -192,12 +222,14 @@ export function describeIgnoredRelayOverride(
   if (requested === null) return null;
   const checked = checkRelayUrl(requested);
   if (checked.ok && checked.relayUrl === pinnedRelayUrl) return null;
+  let origin: string;
   try {
-    return new URL(requested.trim()).origin;
+    origin = new URL(requested.trim()).origin;
   } catch {
-    const raw = requested.trim();
-    return raw.length > MAX_ECHOED_RELAY_TEXT ? `${raw.slice(0, MAX_ECHOED_RELAY_TEXT)}…` : raw;
+    return clipEchoedText(requested.trim());
   }
+  // The URL parser enforces no host length, so an origin is clipped like any other echo.
+  return origin === "null" ? NOT_A_RELAY_URL_TEXT : clipEchoedText(origin);
 }
 
 /** The display origin of a canonical relay URL (falls back to the URL itself if unparseable). */
@@ -236,10 +268,20 @@ function text<Tag extends keyof HTMLElementTagNameMap>(
 export interface IgnoredRelayNoticeOptions {
   /** The element the notice renders into (`#notices` in `public/index.html`, outside `#app`). */
   readonly host: HTMLElement;
-  /** What {@link describeIgnoredRelayOverride} returned for the ignored `?relay=` value. */
+  /**
+   * What {@link describeIgnoredRelayOverride} returned for the ignored `?relay=` value. Untrusted:
+   * it is shown only as `escapeForDisplay`'s output, or withheld.
+   */
   readonly ignored: string;
   /** The relay URL pinned in the stored identity, or the relay a re-pair visit pairs against. */
   readonly pinnedRelayUrl: string;
+  /**
+   * The core's display escape, once the core has loaded; `null` when it can't. The notice renders
+   * at once, with the ignored link's name pending, and fills the name in when this settles: the
+   * core's escape of it, or the withheld text (`./display-escape.ts`) if there is no core. A core that never
+   * loads leaves the name pending; the notice still says a link was ignored.
+   */
+  readonly escapeForDisplay: Promise<DisplayEscape | null>;
   /**
    * Whether this browser is re-pairing (#286): it has no usable identity yet, but is treated as
    * previously paired, so the notice says it is re-pairing with the relay rather than paired.
@@ -247,30 +289,61 @@ export interface IgnoredRelayNoticeOptions {
   readonly repairing?: boolean;
 }
 
+/** Shown in place of the ignored link's name until the core escape is available. */
+export const PENDING_IGNORED_RELAY_TEXT = "(checking…)";
+
+/**
+ * Whether the notice may print the pinned relay's origin as is. A relay URL that {@link checkRelayUrl} accepts in this
+ * exact form has a WHATWG-parsed origin: ASCII only (an internationalized host is punycode), with no
+ * controls, bidi or zero-width characters, so it is printed as is, like the pairing screen does. Any
+ * other value is untrusted and goes through the core escape like the ignored link.
+ */
+function isCanonicalRelayUrl(relayUrl: string): boolean {
+  const checked = checkRelayUrl(relayUrl);
+  return checked.ok && checked.relayUrl === relayUrl;
+}
+
 /**
  * Render a persistent notice that a `?relay=` link was ignored because this browser is paired
  * with a pinned relay. It renders into a host outside `#app` so it stays visible as the pairing
- * gate hands off to the inbox. All attacker-influenced text goes through `textContent`.
+ * gate hands off to the inbox.
+ *
+ * The ignored link is attacker-chosen, so it is never put into the DOM: the notice shows the
+ * core's escape of it, or withholds it (`docs/threat-model.md`, display model). The notice itself
+ * renders immediately and never waits for the core. Resolves once the name has been filled in.
  */
-export function mountIgnoredRelayNotice(options: IgnoredRelayNoticeOptions): void {
+export async function mountIgnoredRelayNotice(options: IgnoredRelayNoticeOptions): Promise<void> {
   const { host, ignored, pinnedRelayUrl, repairing = false } = options;
   const relation = repairing ? "is re-pairing with" : "is paired with";
+  const pinnedIsCanonical = isCanonicalRelayUrl(pinnedRelayUrl);
   const notice = el("div", "relay-pin-notice");
   notice.setAttribute("role", "status");
   notice.append(text("strong", "Relay link ignored. ", "relay-pin-notice-title"));
-  notice.append(
-    document.createTextNode(
-      `This browser ${relation} ${relayOrigin(pinnedRelayUrl)} and only talks to that relay. ` +
-        "The link asked to use ",
-    ),
+  notice.append(document.createTextNode(`This browser ${relation} `));
+  const pinned = text(
+    "span",
+    pinnedIsCanonical ? relayOrigin(pinnedRelayUrl) : PENDING_IGNORED_RELAY_TEXT,
+    "relay-pin-notice-pinned",
   );
-  notice.append(text("code", ignored, "relay-pin-notice-origin"));
+  notice.append(pinned);
+  notice.append(document.createTextNode(" and only talks to that relay. The link asked to use "));
+  const name = text("code", PENDING_IGNORED_RELAY_TEXT, "relay-pin-notice-origin");
+  notice.append(name);
   notice.append(
     document.createTextNode(
       "; nothing was sent there. To use another relay, clear this site's data, then open the new link.",
     ),
   );
   host.replaceChildren(notice);
+
+  let escapeForDisplay: DisplayEscape | null;
+  try {
+    escapeForDisplay = await options.escapeForDisplay;
+  } catch {
+    escapeForDisplay = null;
+  }
+  name.textContent = displayUntrusted(ignored, escapeForDisplay);
+  if (!pinnedIsCanonical) pinned.textContent = displayUntrusted(pinnedRelayUrl, escapeForDisplay);
 }
 
 // ── Small config UI (issue #180's third allowed option) ─────────────────────────────────────────
