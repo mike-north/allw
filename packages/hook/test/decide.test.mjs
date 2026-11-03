@@ -172,7 +172,7 @@ test("gated Bash missing tool_input.command → deny (fail-closed)", async () =>
 });
 
 test("regression (#49): a malformed mcp__-prefixed tool name → deny, approver NOT called", async () => {
-  // The `mcp__.*` settings matcher routes these to the hook; before the fix they passed through as
+  // The `^mcp__` settings matcher routes these to the hook; before the fix they passed through as
   // `allow`. They must now deny (fail-closed) — and must never even reach the approver.
   const wasm = await loadWasm();
   for (const toolName of ["mcp__server__", "mcp__onlytwo"]) {

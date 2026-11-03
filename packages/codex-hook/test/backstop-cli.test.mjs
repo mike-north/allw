@@ -7,6 +7,10 @@
  * never settles and holds no refs makes the gate's SDK wait exactly that; the bin itself is the real,
  * unmodified `dist/cli.js`.
  *
+ * The other early ends the process can still see get the same treatment: `SIGTERM`/`SIGINT`/`SIGHUP`
+ * while waiting, an uncaught async throw, and a stray `process.exit(1)`. Each must end in exit 0 and
+ * **exactly one** deny (the whole of stdout is parsed as one JSON value, so a double write fails).
+ *
  * @see https://learn.chatgpt.com/docs/hooks (PreToolUse: exit 0 + no output = success)
  * @see ../../../docs/codex-integration.md §Decision Mapping
  * @see https://github.com/mike-north/allw/issues/265
@@ -23,13 +27,20 @@ import { fileURLToPath } from "node:url";
 import { loadWasm } from "@allw/hook";
 
 import { assertConformsToPreToolUseOutputContract } from "./support/codex-schema.mjs";
+import { FETCH_PENDING_MARKER } from "./support/stalled-fetch.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const CLI = join(here, "..", "dist", "cli.js");
 const NEVER_SETTLING_FETCH = join(here, "support", "never-settling-fetch.mjs");
+const STALLED_FETCH = join(here, "support", "stalled-fetch.mjs");
+const BACKSTOP_REASON =
+  "allw[premature-exit]: Codex hook exited before reaching a decision (fail-closed deny)";
 
-/** Run the hook bin with node flags + `stdin`; resolves `{ code, stdout, stderr }`. */
-function runCli(stdin, env, cwd, nodeArgs) {
+/**
+ * Run the hook bin with node flags + `stdin`; resolves `{ code, signal, stdout, stderr }`. With
+ * `signalOnPending`, that signal is sent once the bin reports it is waiting on the relay.
+ */
+function runCli(stdin, env, cwd, nodeArgs, { signalOnPending } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [...nodeArgs, CLI], {
       cwd,
@@ -43,10 +54,17 @@ function runCli(stdin, env, cwd, nodeArgs) {
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (d) => (stdout += d));
-    child.stderr.on("data", (d) => (stderr += d));
-    child.on("close", (code) => {
+    let signalled = false;
+    child.stderr.on("data", (d) => {
+      stderr += d;
+      if (signalOnPending !== undefined && !signalled && stderr.includes(FETCH_PENDING_MARKER)) {
+        signalled = true;
+        child.kill(signalOnPending);
+      }
+    });
+    child.on("close", (code, signal) => {
       clearTimeout(timer);
-      resolve({ code, stdout, stderr });
+      resolve({ code, signal, stdout, stderr });
     });
     child.stdin.end(stdin);
   });
@@ -78,8 +96,54 @@ test("backstop: an SDK wait that never settles (no refs) prints deny, not empty 
   const output = JSON.parse(stdout);
   assertConformsToPreToolUseOutputContract(output);
   assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
-  assert.equal(
-    output.hookSpecificOutput.permissionDecisionReason,
-    "allw[premature-exit]: Codex hook exited before reaching a decision (fail-closed deny)",
+  assert.equal(output.hookSpecificOutput.permissionDecisionReason, BACKSTOP_REASON);
+});
+
+/** Run a gated Bash call with the stalled-fetch preload; resolves the `runCli` result. */
+async function runStalled(t, extraEnv, opts) {
+  const cwd = mkdtempSync(join(tmpdir(), "allw-codex-backstop-"));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const wasm = await loadWasm();
+  return runCli(
+    JSON.stringify({
+      hook_event_name: "PreToolUse",
+      cwd,
+      tool_name: "Bash",
+      tool_input: { command: "git push origin main" },
+    }),
+    {
+      ALLW_RELAY_URL: "http://127.0.0.1:9",
+      ALLW_ACCOUNT_ID: "acct_backstop",
+      ALLW_APPROVER_ROOT_KEY: wasm.ed25519_public_key(Buffer.alloc(32, 7).toString("base64url")),
+      ...extraEnv,
+    },
+    cwd,
+    ["--import", STALLED_FETCH],
+    opts,
   );
+}
+
+/** Exit 0, and the whole of stdout is exactly one schema-conformant backstop deny. */
+function assertSingleBackstopDeny({ code, signal, stdout, stderr }) {
+  assert.equal(signal, null, `the hook must not die by a signal; stderr: ${stderr}`);
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  // JSON.parse of the whole of stdout fails on a second line, so this also proves one write.
+  const output = JSON.parse(stdout);
+  assertConformsToPreToolUseOutputContract(output);
+  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  assert.equal(output.hookSpecificOutput.permissionDecisionReason, BACKSTOP_REASON);
+}
+
+for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+  test(`backstop: ${signal} while waiting for a human prints one deny and exits 0 (#265)`, async (t) => {
+    assertSingleBackstopDeny(await runStalled(t, {}, { signalOnPending: signal }));
+  });
+}
+
+test("backstop: an uncaught async throw while waiting prints one deny and exits 0 (#265)", async (t) => {
+  assertSingleBackstopDeny(await runStalled(t, { ALLW_TEST_AFTER_FETCH: "throw" }));
+});
+
+test("backstop: a stray process.exit(1) while waiting prints one deny and exits 0 (#265)", async (t) => {
+  assertSingleBackstopDeny(await runStalled(t, { ALLW_TEST_AFTER_FETCH: "exit1" }));
 });

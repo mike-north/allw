@@ -1,6 +1,7 @@
 /**
  * Codex decision core: classify a PreToolUse input, request allw approval for gated actions, and
- * map the verified verdict to Codex's allow/deny JSON.
+ * map the verified verdict to a Codex hook result: no output (allw does not block the call) or a
+ * `deny` JSON.
  *
  * This deliberately mirrors the Claude Code hook's fail-closed matrix while using Codex-specific
  * actor identity. All syntactic `ActionRecord` construction stays delegated to the shared WASM

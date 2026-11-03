@@ -129,7 +129,7 @@ function handleDiagnosticFlags(argv: readonly string[]): boolean {
   return false;
 }
 
-/** Process entrypoint: always emit an explicit decision and exit 0. */
+/** Process entrypoint: write the decision (nothing, or a `deny`) and exit 0. */
 async function main(): Promise<void> {
   if (handleDiagnosticFlags(process.argv.slice(2))) {
     process.exit(0);
@@ -155,7 +155,8 @@ async function main(): Promise<void> {
   }
 
   // Append a deny line to the project log so operators can audit without parsing stdout. `output`
-  // is non-null only for an explicit `deny` (see `emit`); approvals/pass-throughs log nothing.
+  // is non-null only for an explicit `deny`; approvals and pass-throughs write nothing and log
+  // nothing.
   if (output !== null) {
     appendDenyLog(
       process.cwd(),

@@ -25,8 +25,10 @@ const DEVICE_ID = "dev_approving_relay";
 const CERT_ISSUED_AT_MS = 1_700_000_000_000;
 
 /**
- * Start the double. Resolves `{ url, accountId, accountRootPub, close }`: point the hook at `url`
- * with `ALLW_ACCOUNT_ID = accountId` and `ALLW_APPROVER_ROOT_KEY = accountRootPub`.
+ * Start the double. Resolves `{ url, accountId, accountRootPub, seen, close }`: point the hook at
+ * `url` with `ALLW_ACCOUNT_ID = accountId` and `ALLW_APPROVER_ROOT_KEY = accountRootPub`. `seen`
+ * counts the request submits and verdict fetches the double has served, so a test can prove the
+ * hook actually went through the relay.
  */
 export async function startApprovingRelay({ wasm, decision }) {
   const accountSeed = Buffer.alloc(32, 11).toString("base64url");
@@ -42,6 +44,7 @@ export async function startApprovingRelay({ wasm, decision }) {
   );
 
   let envelope = null;
+  const seen = { submits: 0, verdictFetches: 0 };
   const server = createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
@@ -65,6 +68,7 @@ export async function startApprovingRelay({ wasm, decision }) {
     }
     if (req.method === "POST" && path.endsWith("/requests")) {
       envelope = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      seen.submits += 1;
       return send(202, {
         request_id: envelope.id,
         status: "pending",
@@ -73,6 +77,7 @@ export async function startApprovingRelay({ wasm, decision }) {
       });
     }
     if (req.method === "GET" && /\/requests\/[^/]+$/.test(path) && envelope !== null) {
+      seen.verdictFetches += 1;
       const contextJson = wasm.decrypt_context(
         envelope.context_ciphertext,
         DEVICE_ID,
@@ -105,6 +110,7 @@ export async function startApprovingRelay({ wasm, decision }) {
     url: `http://127.0.0.1:${port}`,
     accountId: ACCOUNT_ID,
     accountRootPub,
+    seen,
     close: () => new Promise((resolve) => server.close(resolve)),
   };
 }

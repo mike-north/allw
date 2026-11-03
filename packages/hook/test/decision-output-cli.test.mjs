@@ -9,6 +9,10 @@
  * - Because empty stdout now means "no objection", a process that reaches exit before deciding must
  *   print a `deny`, not nothing. The backstop case preloads a `fetch` that never settles and holds no
  *   refs, so the event loop drains mid-wait (the #254 failure shape).
+ * - The same holds for every other way the wait can end early that the process can still see: a
+ *   `SIGTERM`/`SIGINT`/`SIGHUP`, an uncaught async throw, and a stray `process.exit(1)`. Each must
+ *   end in exit 0 and **exactly one** deny (the whole of stdout is parsed as one JSON value, so a
+ *   double write fails).
  *
  * @see https://code.claude.com/docs/en/hooks#exit-code-output (exit 0 + no JSON = no decision)
  * @see https://code.claude.com/docs/en/hooks#pretooluse-decision-control (the deny JSON)
@@ -24,13 +28,18 @@ import { fileURLToPath } from "node:url";
 
 import { loadWasm } from "../dist/lib/wasm.js";
 import { startApprovingRelay } from "./support/approving-relay.mjs";
+import { FETCH_PENDING_MARKER } from "./support/stalled-fetch.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const CLI = join(here, "..", "dist", "cli.js");
 const NEVER_SETTLING_FETCH = join(here, "support", "never-settling-fetch.mjs");
+const STALLED_FETCH = join(here, "support", "stalled-fetch.mjs");
 
-/** Run the hook bin (optionally with node flags first); resolves `{ code, stdout, stderr }`. */
-function runCli(stdin, env, nodeArgs = []) {
+/**
+ * Run the hook bin (optionally with node flags first); resolves `{ code, signal, stdout, stderr }`.
+ * With `signalOnPending`, that signal is sent once the bin reports it is waiting on the relay.
+ */
+function runCli(stdin, env, nodeArgs = [], { signalOnPending } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [...nodeArgs, CLI], {
       env: { PATH: process.env.PATH, ...env },
@@ -43,10 +52,17 @@ function runCli(stdin, env, nodeArgs = []) {
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (d) => (stdout += d));
-    child.stderr.on("data", (d) => (stderr += d));
-    child.on("close", (code) => {
+    let signalled = false;
+    child.stderr.on("data", (d) => {
+      stderr += d;
+      if (signalOnPending !== undefined && !signalled && stderr.includes(FETCH_PENDING_MARKER)) {
+        signalled = true;
+        child.kill(signalOnPending);
+      }
+    });
+    child.on("close", (code, signal) => {
       clearTimeout(timer);
-      resolve({ code, stdout, stderr });
+      resolve({ code, signal, stdout, stderr });
     });
     child.stdin.end(stdin);
   });
@@ -73,6 +89,10 @@ test("a verified approval exits 0 with EMPTY stdout — no decision, never allow
 
   assert.equal(code, 0, `stderr: ${stderr}`);
   assert.equal(stdout, "", "approval removes allw's objection; Claude Code's own rules decide");
+  // The empty stdout is the approval, not a silent no-op: the request reached the relay and the hook
+  // fetched (and verified) the signed verdict.
+  assert.equal(relay.seen.submits, 1, "the hook submitted the request to the relay");
+  assert.ok(relay.seen.verdictFetches >= 1, "the hook fetched the verdict");
 });
 
 test("a verified denial exits 0 with a deny decision JSON", async (t) => {
@@ -113,4 +133,53 @@ test("backstop: an SDK wait that never settles (no refs) prints deny, not empty 
     /exited before reaching a decision/,
     "the deny comes from the exit backstop",
   );
+});
+
+/** Env for a gated call against a relay that is never reached (the preload intercepts `fetch`). */
+async function stalledEnv(extra = {}) {
+  const wasm = await loadWasm();
+  return {
+    ALLW_RELAY_URL: "http://127.0.0.1:9",
+    ALLW_ACCOUNT_ID: "acct_backstop",
+    ALLW_APPROVER_ROOT_KEY: wasm.ed25519_public_key(Buffer.alloc(32, 7).toString("base64url")),
+    ...extra,
+  };
+}
+
+/** Exit 0, and the whole of stdout is exactly one backstop deny. */
+function assertSingleBackstopDeny({ code, signal, stdout, stderr }) {
+  assert.equal(signal, null, `the hook must not die by a signal; stderr: ${stderr}`);
+  assert.equal(code, 0, `stderr: ${stderr}`);
+  // JSON.parse of the whole of stdout fails on a second line, so this also proves one write.
+  const output = JSON.parse(stdout);
+  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(
+    output.hookSpecificOutput.permissionDecisionReason,
+    /exited before reaching a decision/,
+  );
+}
+
+for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+  test(`backstop: ${signal} while waiting for a human prints one deny and exits 0 (#265)`, async () => {
+    const result = await runCli(BASH_STDIN, await stalledEnv(), ["--import", STALLED_FETCH], {
+      signalOnPending: signal,
+    });
+    assertSingleBackstopDeny(result);
+  });
+}
+
+test("backstop: an uncaught async throw while waiting prints one deny and exits 0 (#265)", async () => {
+  const result = await runCli(BASH_STDIN, await stalledEnv({ ALLW_TEST_AFTER_FETCH: "throw" }), [
+    "--import",
+    STALLED_FETCH,
+  ]);
+  assertSingleBackstopDeny(result);
+});
+
+test("backstop: a stray process.exit(1) while waiting prints one deny and exits 0 (#265)", async () => {
+  const result = await runCli(BASH_STDIN, await stalledEnv({ ALLW_TEST_AFTER_FETCH: "exit1" }), [
+    "--import",
+    STALLED_FETCH,
+  ]);
+  assertSingleBackstopDeny(result);
 });
