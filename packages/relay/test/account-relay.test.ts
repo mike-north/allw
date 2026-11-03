@@ -121,9 +121,8 @@ async function enrollDevice(accountId: string): Promise<PairingCompleteResult> {
 async function expirePairing(accountId: string, code: string): Promise<void> {
   const id = env.ACCOUNT.idFromName(accountId);
   const stub = env.ACCOUNT.get(id);
-  await runInDurableObject(stub, (instance: AccountRelay) => {
-    const relay = instance as unknown as { sql: SqlStorage };
-    relay.sql.exec(`UPDATE pairing SET expires_at = ? WHERE code = ?`, Date.now() - 1, code);
+  await runInDurableObject(stub, (relay: AccountRelay) => {
+    relay["sql"].exec(`UPDATE pairing SET expires_at = ? WHERE code = ?`, Date.now() - 1, code);
   });
 }
 
@@ -133,10 +132,9 @@ async function readPushTokens(
 ): Promise<Array<{ transport: string; token: string }>> {
   const id = env.ACCOUNT.idFromName(accountId);
   const stub = env.ACCOUNT.get(id);
-  return runInDurableObject(stub, (instance: AccountRelay) => {
-    const relay = instance as unknown as { sql: SqlStorage };
+  return runInDurableObject(stub, (relay: AccountRelay) => {
     return [
-      ...relay.sql.exec<{ transport: string; token: string }>(
+      ...relay["sql"].exec<{ transport: string; token: string }>(
         `SELECT transport, token FROM device_push_token
          WHERE device_id = ? ORDER BY created_at ASC`,
         deviceId,
@@ -236,10 +234,12 @@ describe("AccountRelay — pairing", () => {
     const acct = testAccount("acct-pairing-null-auth-hash");
     const start = await startPairing(acct);
 
-    await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(acct)), (instance) => {
-      const relay = instance as unknown as { sql: SqlStorage };
-      relay.sql.exec(`UPDATE pairing SET auth_token_hash = NULL WHERE code = ?`, start.code);
-    });
+    await runInDurableObject(
+      env.ACCOUNT.get(env.ACCOUNT.idFromName(acct)),
+      (relay: AccountRelay) => {
+        relay["sql"].exec(`UPDATE pairing SET auth_token_hash = NULL WHERE code = ?`, start.code);
+      },
+    );
 
     const noAuth = await post<{ error: string }>(acct, "/pairing/complete", {
       code: start.code,

@@ -15,7 +15,6 @@
  */
 
 import { env, runInDurableObject } from "cloudflare:test";
-import type { SqlStorage } from "@cloudflare/workers-types";
 import type { AccountRelay } from "../../src/index.js";
 import { rootFor } from "./accounts.js";
 
@@ -26,7 +25,7 @@ const BOUND_AT = 1_700_000_000_000;
 export async function pinRelayClock(accountId: string, now: number): Promise<void> {
   const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
   await runInDurableObject(stub, (instance: AccountRelay) => {
-    (instance as unknown as { now: () => number }).now = () => now;
+    instance["now"] = () => now;
   });
 }
 
@@ -37,9 +36,8 @@ export async function pinRelayClock(accountId: string, now: number): Promise<voi
 export async function bindAccountRoot(accountId: string): Promise<void> {
   const rootPubkey = rootFor(accountId).rootPubkey;
   const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
-  await runInDurableObject(stub, (instance: AccountRelay) => {
-    const relay = instance as unknown as { sql: SqlStorage };
-    relay.sql.exec(
+  await runInDurableObject(stub, (relay: AccountRelay) => {
+    relay["sql"].exec(
       `INSERT OR IGNORE INTO account_meta (id, root_pubkey, bound_at) VALUES (1, ?, ?)`,
       rootPubkey,
       BOUND_AT,

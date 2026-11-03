@@ -29,7 +29,6 @@ import type {
   PushTransportRegistry,
   PushWakeup,
 } from "../src/push.js";
-import type { SqlStorage } from "@cloudflare/workers-types";
 import {
   pairingStartBody,
   rootFor,
@@ -288,9 +287,34 @@ async function installPushTransports(
 ): Promise<void> {
   const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
   await runInDurableObject(stub, (instance: AccountRelay) => {
-    (instance as unknown as { pushTransports: PushTransportRegistry }).pushTransports =
-      pushTransports;
+    instance["pushTransports"] = pushTransports;
   });
+}
+
+/**
+ * A real `AccountRelay` over a stub Durable Object state, for driving one private method without a
+ * runtime instance. `state` supplies the WebSocket methods the test needs; `exec` answers every SQL
+ * statement, the constructor's schema setup included. Alarm and transaction calls are no-ops.
+ *
+ * The constructor's migrations and alarm arming run against the stub and have no effect: nothing is
+ * persisted and no alarm is set, so a test can't rely on schema or alarm state from it.
+ */
+function relayOverStubState(
+  state: Partial<Pick<DurableObjectState, "acceptWebSocket" | "getWebSockets" | "getTags">>,
+  exec: (query: string) => unknown[] = () => [],
+): AccountRelay {
+  const ctx = {
+    ...state,
+    storage: {
+      sql: { exec: (query: string) => exec(query) },
+      transactionSync: (fn: () => unknown) => fn(),
+      setAlarm: () => Promise.resolve(),
+      deleteAlarm: () => Promise.resolve(),
+      getAlarm: () => Promise.resolve(null),
+    },
+    waitUntil: () => undefined,
+  } as unknown as DurableObjectState;
+  return new AccountRelay(ctx, env);
 }
 
 // ---------------------------------------------------------------------------
@@ -776,14 +800,10 @@ describe("AccountRelay — cross-device coordination", () => {
       [phone, ["device", "surface:phone-screen"]],
     ]);
 
-    const relay = Object.create(AccountRelay.prototype) as {
-      ctx: Pick<DurableObjectState, "getTags" | "getWebSockets">;
-      sendRequestToOneSocketPerSurface(requestId: string, envelope: unknown): number;
-    };
-    relay.ctx = {
+    const relay = relayOverStubState({
       getTags: (ws: WebSocket) => tags.get(ws) ?? [],
       getWebSockets: (tag: string) => (tag === "device" ? [staleMac, liveMac, phone] : []),
-    } as Pick<DurableObjectState, "getTags" | "getWebSockets">;
+    });
 
     // A closing hibernation socket can still be returned by the tag index but reject `send()`. It
     // must not claim the visible surface unless the relay actually sends the request to it.
@@ -791,7 +811,7 @@ describe("AccountRelay — cross-device coordination", () => {
       throw new Error("socket already closing");
     });
 
-    const delivered = relay.sendRequestToOneSocketPerSurface(
+    const delivered = relay["sendRequestToOneSocketPerSurface"](
       rid("req-surface-stale-1"),
       makeEnvelope(rid("req-surface-stale-1")),
     );
@@ -836,24 +856,16 @@ describe("AccountRelay — cross-device coordination", () => {
     const envelope = makeEnvelope(rid("req-surface-stale-queued"));
     const authTokenHash = await testAuthTokenHash("stale-device-token");
 
-    const relay = Object.create(AccountRelay.prototype) as {
-      ctx: Pick<DurableObjectState, "acceptWebSocket" | "getWebSockets">;
-      sql: Pick<SqlStorage, "exec">;
-      now: () => number;
-      maxRequestTtlMs: number;
-      handleDeviceConnect(deviceId: string, request: Request): Response;
-    };
-    // `Object.create` skips field initializers, so the clock and horizon the flush reads are set
-    // here. The stub `sql` ignores them: it returns the queued row whatever the deadline filter.
-    relay.now = () => 1_700_000_000_000;
-    relay.maxRequestTtlMs = 15 * 60_000;
-    relay.ctx = {
-      acceptWebSocket: (ws: WebSocket) => ws.accept(),
-      getWebSockets: (tag: string) => (tag === "surface:mac-screen" ? [staleMac] : []),
-    } as Pick<DurableObjectState, "acceptWebSocket" | "getWebSockets">;
-    relay.sql = {
-      exec: (query: string) => {
-        if (query.includes("FROM device")) {
+    // The stub `exec` ignores the deadline filter: it returns the queued row for any request query.
+    const relay = relayOverStubState(
+      {
+        acceptWebSocket: (ws: WebSocket) => {
+          ws.accept();
+        },
+        getWebSockets: (tag: string) => (tag === "surface:mac-screen" ? [staleMac] : []),
+      },
+      (query) => {
+        if (query.includes("FROM device WHERE")) {
           return [{ device_id: "dev-stale-flush", auth_token_hash: authTokenHash }];
         }
         if (query.includes("FROM request")) {
@@ -863,9 +875,10 @@ describe("AccountRelay — cross-device coordination", () => {
         }
         return [];
       },
-    } as unknown as Pick<SqlStorage, "exec">;
+    );
+    relay["now"] = () => RELAY_NOW;
 
-    const response = await relay.handleDeviceConnect(
+    const response = await relay["handleDeviceConnect"](
       "dev-stale-flush",
       new Request(
         "https://relay.allw.test/acct/devices/dev-stale-flush/connect?surface_id=mac-screen&auth=stale-device-token",
@@ -909,16 +922,15 @@ describe("AccountRelay — zero-knowledge (routing)", () => {
     const id = env.ACCOUNT.idFromName(acct);
     const stub = env.ACCOUNT.get(id);
     const readStored = () =>
-      runInDurableObject(stub, (instance: AccountRelay) => {
-        const relay = instance as unknown as { sql: SqlStorage };
+      runInDurableObject(stub, (relay: AccountRelay) => {
         const reqRows = [
-          ...relay.sql.exec<{ envelope: string; status: string }>(
+          ...relay["sql"].exec<{ envelope: string; status: string }>(
             `SELECT envelope, status FROM request WHERE request_id = ?`,
             rid("req-zk-1"),
           ),
         ];
         const verdictRows = [
-          ...relay.sql.exec<{ verdict: string }>(
+          ...relay["sql"].exec<{ verdict: string }>(
             `SELECT verdict FROM verdict WHERE request_id = ?`,
             rid("req-zk-1"),
           ),
@@ -990,15 +1002,17 @@ describe("AccountRelay — a late verdict on a blanked terminal row", () => {
   }
 
   async function storedRow(acct: string, requestId: string) {
-    return runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(acct)), (instance) => {
-      const relay = instance as unknown as { sql: SqlStorage };
-      return [
-        ...relay.sql.exec<{ envelope: string; status: string }>(
-          `SELECT envelope, status FROM request WHERE request_id = ?`,
-          requestId,
-        ),
-      ][0];
-    });
+    return runInDurableObject(
+      env.ACCOUNT.get(env.ACCOUNT.idFromName(acct)),
+      (relay: AccountRelay) => {
+        return [
+          ...relay["sql"].exec<{ envelope: string; status: string }>(
+            `SELECT envelope, status FROM request WHERE request_id = ?`,
+            requestId,
+          ),
+        ][0];
+      },
+    );
   }
 
   /** Send a genuine verdict and return the first ack, skipping the retract push before it. */
@@ -1034,9 +1048,8 @@ describe("AccountRelay — a late verdict on a blanked terminal row", () => {
     const ctx = await setUp("expired", expiresAt);
     await runInDurableObject(
       env.ACCOUNT.get(env.ACCOUNT.idFromName(ctx.acct)),
-      async (instance) => {
-        const relay = instance as unknown as { now: () => number; alarm(): Promise<void> };
-        relay.now = () => expiresAt + 1;
+      async (relay: AccountRelay) => {
+        relay["now"] = () => expiresAt + 1;
         await relay.alarm();
       },
     );
@@ -1341,7 +1354,7 @@ describe("AccountRelay — verdict finality (#245)", () => {
     // A pre-binding leftover: the device rows exist but no root is bound to check against.
     const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(ctx.acct));
     await runInDurableObject(stub, (instance: AccountRelay) => {
-      (instance as unknown as { sql: SqlStorage }).sql.exec(`DELETE FROM account_meta`);
+      instance["sql"].exec(`DELETE FROM account_meta`);
     });
     await expectRefused(
       ctx,
@@ -1421,17 +1434,19 @@ describe("AccountRelay — endpoint authentication", () => {
     );
     expect(submit.status).toBe(202);
 
-    await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(acct)), (instance) => {
-      const relay = instance as unknown as { sql: SqlStorage };
-      relay.sql.exec(
-        `UPDATE device SET auth_token_hash = NULL WHERE device_id = ?`,
-        device.device_id,
-      );
-      relay.sql.exec(
-        `UPDATE request SET auth_token_hash = NULL WHERE request_id = ?`,
-        submit.data.request_id,
-      );
-    });
+    await runInDurableObject(
+      env.ACCOUNT.get(env.ACCOUNT.idFromName(acct)),
+      (relay: AccountRelay) => {
+        relay["sql"].exec(
+          `UPDATE device SET auth_token_hash = NULL WHERE device_id = ?`,
+          device.device_id,
+        );
+        relay["sql"].exec(
+          `UPDATE request SET auth_token_hash = NULL WHERE request_id = ?`,
+          submit.data.request_id,
+        );
+      },
+    );
 
     const connect = await SELF.fetch(relayUrl(acct, `/devices/${device.device_id}/connect`), {
       headers: { Upgrade: "websocket" },
@@ -1816,7 +1831,7 @@ describe("AccountRelay — one deadline for every lifecycle path (#292)", () => 
   /** Lower the account's request horizon, as a redeploy with a smaller `MAX_REQUEST_TTL_MS` would. */
   async function lowerHorizon(accountId: string): Promise<void> {
     await runInDurableObject(stubFor(accountId), (instance: AccountRelay) => {
-      (instance as unknown as { maxRequestTtlMs: number }).maxRequestTtlMs = LOWERED_HORIZON_MS;
+      instance["maxRequestTtlMs"] = LOWERED_HORIZON_MS;
     });
   }
 
@@ -1831,9 +1846,8 @@ describe("AccountRelay — one deadline for every lifecycle path (#292)", () => 
   }
 
   async function storedVerdictCount(accountId: string, requestId: string): Promise<number> {
-    return runInDurableObject(stubFor(accountId), (instance: AccountRelay) => {
-      const relay = instance as unknown as { sql: SqlStorage };
-      return [...relay.sql.exec(`SELECT 1 FROM verdict WHERE request_id = ?`, requestId)].length;
+    return runInDurableObject(stubFor(accountId), (relay: AccountRelay) => {
+      return [...relay["sql"].exec(`SELECT 1 FROM verdict WHERE request_id = ?`, requestId)].length;
     });
   }
 
@@ -2475,9 +2489,8 @@ async function seedExpiredRequest(
   const requestAuthTokenHash = await testAuthTokenHash(requestAuthToken);
   requestAuthTokens.set(tokenKey(accountId, requestId), requestAuthToken);
   const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
-  await runInDurableObject(stub, (instance: AccountRelay) => {
-    const relay = instance as unknown as { sql: SqlStorage };
-    relay.sql.exec(
+  await runInDurableObject(stub, (relay: AccountRelay) => {
+    relay["sql"].exec(
       `INSERT OR REPLACE INTO request
        (request_id, envelope, created_at, expires_at, status, terminal_at, auth_token_hash)
        VALUES (?, ?, ?, ?, 'pending', NULL, ?)`,
@@ -2500,9 +2513,8 @@ async function runAlarm(accountId: string): Promise<void> {
 
 async function forceExpireAndRunAlarm(accountId: string, requestId: string): Promise<void> {
   const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
-  await runInDurableObject(stub, async (instance: AccountRelay) => {
-    const relay = instance as unknown as { sql: SqlStorage; alarm(): Promise<void> };
-    relay.sql.exec(
+  await runInDurableObject(stub, async (relay: AccountRelay) => {
+    relay["sql"].exec(
       `UPDATE request SET expires_at = ? WHERE request_id = ?`,
       PAST_EXPIRES_AT,
       requestId,
@@ -2513,9 +2525,8 @@ async function forceExpireAndRunAlarm(accountId: string, requestId: string): Pro
 
 async function forceExpireRequest(accountId: string, requestId: string): Promise<void> {
   const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
-  await runInDurableObject(stub, (instance: AccountRelay) => {
-    const relay = instance as unknown as { sql: SqlStorage };
-    relay.sql.exec(
+  await runInDurableObject(stub, (relay: AccountRelay) => {
+    relay["sql"].exec(
       `UPDATE request SET expires_at = ? WHERE request_id = ?`,
       PAST_EXPIRES_AT,
       requestId,
@@ -2525,18 +2536,16 @@ async function forceExpireRequest(accountId: string, requestId: string): Promise
 
 async function readScheduledAlarm(accountId: string): Promise<number | null> {
   const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
-  return runInDurableObject(stub, async (instance: AccountRelay) => {
-    const relay = instance as unknown as { ctx: DurableObjectState };
-    return relay.ctx.storage.getAlarm();
+  return runInDurableObject(stub, async (relay: AccountRelay) => {
+    return relay["ctx"].storage.getAlarm();
   });
 }
 
 async function readRequestStatus(accountId: string, requestId: string): Promise<string | null> {
   const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
-  return runInDurableObject(stub, (instance: AccountRelay) => {
-    const relay = instance as unknown as { sql: SqlStorage };
+  return runInDurableObject(stub, (relay: AccountRelay) => {
     const rows = [
-      ...relay.sql.exec<{ status: string }>(
+      ...relay["sql"].exec<{ status: string }>(
         `SELECT status FROM request WHERE request_id = ?`,
         requestId,
       ),
@@ -2547,8 +2556,7 @@ async function readRequestStatus(accountId: string, requestId: string): Promise<
 
 async function seedOldTerminalRows(accountId: string): Promise<void> {
   const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
-  await runInDurableObject(stub, (instance: AccountRelay) => {
-    const relay = instance as unknown as { sql: SqlStorage };
+  await runInDurableObject(stub, (relay: AccountRelay) => {
     const rows = [
       {
         request_id: rid("req-old-expired"),
@@ -2584,7 +2592,7 @@ async function seedOldTerminalRows(accountId: string): Promise<void> {
       },
     ];
     for (const row of rows) {
-      relay.sql.exec(
+      relay["sql"].exec(
         `INSERT OR REPLACE INTO request
          (request_id, envelope, created_at, expires_at, status, terminal_at)
          VALUES (?, ?, ?, ?, ?, ?)`,
@@ -2596,7 +2604,7 @@ async function seedOldTerminalRows(accountId: string): Promise<void> {
         row.terminal_at,
       );
     }
-    relay.sql.exec(
+    relay["sql"].exec(
       `INSERT OR REPLACE INTO verdict (request_id, verdict, device_id, received_at)
        VALUES (?, ?, ?, ?)`,
       rid("req-old-resolved"),
@@ -2604,7 +2612,7 @@ async function seedOldTerminalRows(accountId: string): Promise<void> {
       "dev-old",
       OLD_TERMINAL_AT,
     );
-    relay.sql.exec(
+    relay["sql"].exec(
       `INSERT OR REPLACE INTO verdict (request_id, verdict, device_id, received_at)
        VALUES (?, ?, ?, ?)`,
       rid("req-fresh-resolved"),
@@ -2619,15 +2627,14 @@ async function listRequestAndVerdictIds(
   accountId: string,
 ): Promise<{ requests: string[]; verdicts: string[] }> {
   const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
-  return runInDurableObject(stub, (instance: AccountRelay) => {
-    const relay = instance as unknown as { sql: SqlStorage };
+  return runInDurableObject(stub, (relay: AccountRelay) => {
     const requests = [
-      ...relay.sql.exec<{ request_id: string }>(
+      ...relay["sql"].exec<{ request_id: string }>(
         `SELECT request_id FROM request ORDER BY request_id ASC`,
       ),
     ].map((row) => row.request_id);
     const verdicts = [
-      ...relay.sql.exec<{ request_id: string }>(
+      ...relay["sql"].exec<{ request_id: string }>(
         `SELECT request_id FROM verdict ORDER BY request_id ASC`,
       ),
     ].map((row) => row.request_id);
@@ -2638,8 +2645,7 @@ async function listRequestAndVerdictIds(
 /** Delete a device row directly — simulates a revoke whose hibernation socket outlived the close. */
 async function deleteDeviceRow(accountId: string, deviceId: string): Promise<void> {
   const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
-  await runInDurableObject(stub, (instance: AccountRelay) => {
-    const relay = instance as unknown as { sql: SqlStorage };
-    relay.sql.exec(`DELETE FROM device WHERE device_id = ?`, deviceId);
+  await runInDurableObject(stub, (relay: AccountRelay) => {
+    relay["sql"].exec(`DELETE FROM device WHERE device_id = ?`, deviceId);
   });
 }

@@ -19,7 +19,6 @@
 
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import type { SqlStorage } from "@cloudflare/workers-types";
 import { AccountRelay, type Env } from "../src/index.js";
 import {
   ApnsPushTransport,
@@ -104,10 +103,9 @@ async function pairWithPushTokens(
 
 async function readPushTokens(accountId: string): Promise<Array<{ token: string }>> {
   const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
-  return runInDurableObject(stub, (instance: AccountRelay) => {
-    const relay = instance as unknown as { sql: SqlStorage };
+  return runInDurableObject(stub, (relay: AccountRelay) => {
     return [
-      ...relay.sql.exec<{ token: string }>(
+      ...relay["sql"].exec<{ token: string }>(
         `SELECT token FROM device_push_token ORDER BY created_at ASC, token ASC`,
       ),
     ];
@@ -120,7 +118,7 @@ async function installPushTransports(
 ): Promise<void> {
   const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
   await runInDurableObject(stub, (instance: AccountRelay) => {
-    (instance as unknown as { pushTransports: PushTransportRegistry }).pushTransports = transports;
+    instance["pushTransports"] = transports;
   });
 }
 
@@ -192,10 +190,7 @@ describe("pairing — webpush token is a validated subscription endpoint", () =>
 /** Wait until every push fan-out the account's DO has started has finished, pruning included. */
 async function pushFanOutSettled(accountId: string): Promise<void> {
   const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
-  await runInDurableObject(
-    stub,
-    (instance: AccountRelay) => (instance as unknown as { pushFanOut: Promise<void> }).pushFanOut,
-  );
+  await runInDurableObject(stub, (instance: AccountRelay) => instance["pushFanOut"]);
 }
 
 async function seedPushTokenRows(
@@ -203,10 +198,9 @@ async function seedPushTokenRows(
   rows: ReadonlyArray<{ device_id: string; transport: string; token: string; created_at?: number }>,
 ): Promise<void> {
   const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
-  await runInDurableObject(stub, (instance: AccountRelay) => {
-    const relay = instance as unknown as { sql: SqlStorage };
+  await runInDurableObject(stub, (relay: AccountRelay) => {
     for (const row of rows) {
-      relay.sql.exec(
+      relay["sql"].exec(
         `INSERT INTO device_push_token (device_id, transport, token, created_at) VALUES (?, ?, ?, ?)`,
         row.device_id,
         row.transport,
@@ -733,15 +727,6 @@ describe("submit — Web Push wakeups are coalesced per subscription", () => {
 // ---------------------------------------------------------------------------
 
 /** The relay internals these tests drive. The alarm and the coalescer are not reachable over HTTP. */
-type RelayInternals = {
-  sql: SqlStorage;
-  ctx: DurableObjectState;
-  pushCoalescer: WakeupCoalescer;
-  pushTransports: PushTransportRegistry;
-  pushFanOut: Promise<void>;
-  alarm(): Promise<void>;
-};
-
 type TrailingRow = { device_id: string; token: string; due_at: number };
 
 function relayStub(accountId: string): DurableObjectStub {
@@ -749,10 +734,9 @@ function relayStub(accountId: string): DurableObjectStub {
 }
 
 async function readTrailingRows(accountId: string): Promise<TrailingRow[]> {
-  return runInDurableObject(relayStub(accountId), (instance: AccountRelay) => {
-    const relay = instance as unknown as RelayInternals;
+  return runInDurableObject(relayStub(accountId), (relay: AccountRelay) => {
     return [
-      ...relay.sql.exec<TrailingRow>(
+      ...relay["sql"].exec<TrailingRow>(
         `SELECT device_id, token, due_at FROM webpush_trailing_wakeup ORDER BY token ASC`,
       ),
     ];
@@ -763,15 +747,14 @@ async function readTrailingRows(accountId: string): Promise<TrailingRow[]> {
 async function readAlarmSchedule(
   accountId: string,
 ): Promise<{ purposes: Record<string, number>; alarm: number | null }> {
-  return runInDurableObject(relayStub(accountId), async (instance: AccountRelay) => {
-    const relay = instance as unknown as RelayInternals;
+  return runInDurableObject(relayStub(accountId), async (relay: AccountRelay) => {
     const purposes: Record<string, number> = {};
-    for (const row of relay.sql.exec<{ purpose: string; due_at: number }>(
+    for (const row of relay["sql"].exec<{ purpose: string; due_at: number }>(
       `SELECT purpose, due_at FROM alarm_due`,
     )) {
       purposes[row.purpose] = row.due_at;
     }
-    return { purposes, alarm: await relay.ctx.storage.getAlarm() };
+    return { purposes, alarm: await relay["ctx"].storage.getAlarm() };
   });
 }
 
@@ -786,12 +769,11 @@ async function endWindowAndRunAlarm(
   accountId: string,
   options: { keepClaims?: boolean } = {},
 ): Promise<void> {
-  await runInDurableObject(relayStub(accountId), async (instance: AccountRelay) => {
-    const relay = instance as unknown as RelayInternals;
+  await runInDurableObject(relayStub(accountId), async (relay: AccountRelay) => {
     makeTrailingWakeupsDue(relay);
     if (options.keepClaims !== true) letWindowPass(relay);
     await relay.alarm();
-    await relay.pushFanOut;
+    await relay["pushFanOut"];
   });
 }
 
@@ -807,22 +789,22 @@ async function endWindowAndRunAlarm(
  * - "keeps an earlier owed wakeup when another submit is skipped while the accepted wakeup is in
  *   flight" needs the earlier skip to predate the claim, so only the in-flight skip keeps it owed.
  */
-function letWindowPass(relay: RelayInternals): void {
-  relay.sql.exec(
+function letWindowPass(relay: AccountRelay): void {
+  relay["sql"].exec(
     `UPDATE device_push_token SET last_wakeup_at = 1 WHERE last_wakeup_at IS NOT NULL`,
   );
-  relay.sql.exec(`UPDATE webpush_trailing_wakeup SET last_skipped_at = 1`);
+  relay["sql"].exec(`UPDATE webpush_trailing_wakeup SET last_skipped_at = 1`);
 }
 
 async function letWindowPassFor(accountId: string): Promise<void> {
   await runInDurableObject(relayStub(accountId), (instance: AccountRelay) => {
-    letWindowPass(instance as unknown as RelayInternals);
+    letWindowPass(instance);
   });
 }
 
-function makeTrailingWakeupsDue(relay: RelayInternals): void {
-  relay.sql.exec(`UPDATE webpush_trailing_wakeup SET due_at = 1`);
-  relay.sql.exec(`UPDATE alarm_due SET due_at = 1 WHERE purpose = 'webpush-trailing-wakeup'`);
+function makeTrailingWakeupsDue(relay: AccountRelay): void {
+  relay["sql"].exec(`UPDATE webpush_trailing_wakeup SET due_at = 1`);
+  relay["sql"].exec(`UPDATE alarm_due SET due_at = 1 WHERE purpose = 'webpush-trailing-wakeup'`);
 }
 
 /** Submit one request (no caller auth) and return its `push_wakeups` count. */
@@ -925,10 +907,7 @@ describe("submit — a coalesced submit gets a trailing wakeup when the window e
     await pushFanOutSettled(acct);
     await submitRequest(acct, envelope(rid("req-trailing-resolved-2")));
     await runInDurableObject(relayStub(acct), (instance: AccountRelay) => {
-      (instance as unknown as RelayInternals).sql.exec(
-        `UPDATE request SET status = 'resolved', terminal_at = ?`,
-        CREATED_AT,
-      );
+      instance["sql"].exec(`UPDATE request SET status = 'resolved', terminal_at = ?`, CREATED_AT);
     });
 
     await endWindowAndRunAlarm(acct);
@@ -947,7 +926,7 @@ describe("submit — a coalesced submit gets a trailing wakeup when the window e
     await pushFanOutSettled(acct);
     await submitRequest(acct, envelope(rid("req-trailing-removed-2")));
     await runInDurableObject(relayStub(acct), (instance: AccountRelay) => {
-      (instance as unknown as RelayInternals).sql.exec(`DELETE FROM device_push_token`);
+      instance["sql"].exec(`DELETE FROM device_push_token`);
     });
 
     await endWindowAndRunAlarm(acct);
@@ -989,15 +968,14 @@ describe("submit — a coalesced submit gets a trailing wakeup when the window e
     await submitRequest(acct, envelope(rid("req-trailing-in-flight-2")));
 
     const fired = RELAY_NOW;
-    await runInDurableObject(relayStub(acct), async (instance: AccountRelay) => {
-      const relay = instance as unknown as RelayInternals;
+    await runInDurableObject(relayStub(acct), async (relay: AccountRelay) => {
       // Claimed long ago and never released: in flight, with its window long over.
       const stuck = new WakeupCoalescer(PUSH_COALESCE_MS);
       stuck.tryClaim(
         pushCoalesceKey({ device_id: String(deviceId), transport: "webpush", token: FCM_ENDPOINT }),
         1,
       );
-      relay.pushCoalescer = stuck;
+      relay["pushCoalescer"] = stuck;
       makeTrailingWakeupsDue(relay);
       await relay.alarm();
     });
@@ -1039,14 +1017,14 @@ describe("submit — a coalesced submit gets a trailing wakeup when the window e
 
     // A new instance on the same storage: nothing in memory, only what SQLite kept.
     await runInDurableObject(relayStub(acct), async (instance: AccountRelay, state) => {
-      const fresh = new AccountRelay(state, env as unknown as Env) as unknown as RelayInternals;
-      fresh.pushTransports = (instance as unknown as RelayInternals).pushTransports;
+      const fresh = new AccountRelay(state, env as unknown as Env);
+      fresh["pushTransports"] = instance["pushTransports"];
       // A fresh instance starts on the real clock; pin it like the evicted one (#248 horizon).
-      (fresh as unknown as { now: () => number }).now = () => RELAY_NOW;
+      fresh["now"] = () => RELAY_NOW;
       makeTrailingWakeupsDue(fresh);
       letWindowPass(fresh);
       await fresh.alarm();
-      await fresh.pushFanOut;
+      await fresh["pushFanOut"];
     });
 
     expect(fetcher).toHaveBeenCalledTimes(2);
@@ -1096,7 +1074,7 @@ describe("submit — a wakeup's TTL covers every pending request, not just its o
 
     // Once the long-lived request is resolved, only the short-lived ones remain.
     await runInDurableObject(relayStub(acct), (instance: AccountRelay) => {
-      (instance as unknown as RelayInternals).sql.exec(
+      instance["sql"].exec(
         `UPDATE request SET status = 'resolved', terminal_at = ? WHERE request_id = ?`,
         CREATED_AT,
         rid("req-ttl-long"),
@@ -1123,7 +1101,7 @@ describe("request table — the latest pending deadline is read through an index
     // Every unauthenticated submit runs this query, so it must not scan the whole request table.
     const acct = testAccount("acct-request-pending-index");
     const plan = await runInDurableObject(relayStub(acct), (instance: AccountRelay) => [
-      ...(instance as unknown as RelayInternals).sql.exec<{ detail: string }>(
+      ...instance["sql"].exec<{ detail: string }>(
         `EXPLAIN QUERY PLAN
          SELECT request_id, expires_at FROM request
          WHERE status = 'pending' AND expires_at > ?
@@ -1144,12 +1122,10 @@ describe("submit — the coalescing bound survives eviction (#319)", () => {
     body: Record<string, unknown>,
   ): Promise<number> {
     return runInDurableObject(relayStub(accountId), async (instance: AccountRelay, state) => {
-      const fresh = new AccountRelay(state, env as unknown as Env) as unknown as RelayInternals & {
-        fetch(request: Request): Promise<Response>;
-      };
-      fresh.pushTransports = (instance as unknown as RelayInternals).pushTransports;
+      const fresh = new AccountRelay(state, env as unknown as Env);
+      fresh["pushTransports"] = instance["pushTransports"];
       // A fresh instance starts on the real clock; pin it like the evicted one (#248 horizon).
-      (fresh as unknown as { now: () => number }).now = () => RELAY_NOW;
+      fresh["now"] = () => RELAY_NOW;
       const response = await fresh.fetch(
         new Request(relayUrl(accountId, "/requests"), {
           method: "POST",
@@ -1158,7 +1134,7 @@ describe("submit — the coalescing bound survives eviction (#319)", () => {
         }),
       );
       expect(response.status).toBe(202);
-      await fresh.pushFanOut;
+      await fresh["pushFanOut"];
       return ((await response.json()) as { push_wakeups: number }).push_wakeups;
     });
   }
@@ -1198,7 +1174,7 @@ describe("submit — the coalescing bound survives eviction (#319)", () => {
     await pushFanOutSettled(acct);
 
     const rows = await runInDurableObject(relayStub(acct), (instance: AccountRelay) => [
-      ...(instance as unknown as RelayInternals).sql.exec<{
+      ...instance["sql"].exec<{
         token: string;
         last_wakeup_at: number | null;
       }>(`SELECT token, last_wakeup_at FROM device_push_token`),
@@ -1218,10 +1194,7 @@ describe("submit — a future-dated stored claim blocks for one window at most (
     const fetcher = await installWebPush(acct, () => 201);
     const dayAhead = RELAY_NOW + 24 * 60 * 60 * 1000;
     await runInDurableObject(relayStub(acct), (instance: AccountRelay) => {
-      (instance as unknown as RelayInternals).sql.exec(
-        `UPDATE device_push_token SET last_wakeup_at = ?`,
-        dayAhead,
-      );
+      instance["sql"].exec(`UPDATE device_push_token SET last_wakeup_at = ?`, dayAhead);
     });
 
     const before = RELAY_NOW;
@@ -1231,16 +1204,15 @@ describe("submit — a future-dated stored claim blocks for one window at most (
     expect(row?.due_at).toBeLessThanOrEqual(RELAY_NOW + PUSH_COALESCE_MS + 1);
 
     // At the window's end the trailing wakeup goes out: the future claim no longer blocks it.
-    await runInDurableObject(relayStub(acct), async (instance: AccountRelay) => {
-      const relay = instance as unknown as RelayInternals;
+    await runInDurableObject(relayStub(acct), async (relay: AccountRelay) => {
       makeTrailingWakeupsDue(relay);
       // Exactly one window passes; the claim is not aged past it.
-      relay.sql.exec(
+      relay["sql"].exec(
         `UPDATE device_push_token SET last_wakeup_at = last_wakeup_at - ?`,
         PUSH_COALESCE_MS + 1,
       );
       await relay.alarm();
-      await relay.pushFanOut;
+      await relay["pushFanOut"];
     });
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect(await readTrailingRows(acct)).toHaveLength(0);
@@ -1306,15 +1278,12 @@ describe("submit — an owed trailing wakeup is cleared only by an accepted wake
     await letWindowPassFor(acct);
     const vapid = await makeVapid();
 
-    const owed = await runInDurableObject(relayStub(acct), async (instance: AccountRelay) => {
-      const relay = instance as unknown as RelayInternals & {
-        fetch(request: Request): Promise<Response>;
-      };
+    const owed = await runInDurableObject(relayStub(acct), async (relay: AccountRelay) => {
       let release: () => void = () => undefined;
       const blocked = new Promise<void>((resolve) => {
         release = resolve;
       });
-      relay.pushTransports = {
+      relay["pushTransports"] = {
         webpush: new WebPushTransport({
           vapid,
           fetcher: async () => {
@@ -1333,8 +1302,8 @@ describe("submit — an owed trailing wakeup is cleared only by an accepted wake
         );
       }
       release();
-      await relay.pushFanOut;
-      return [...relay.sql.exec<{ token: string }>(`SELECT token FROM webpush_trailing_wakeup`)]
+      await relay["pushFanOut"];
+      return [...relay["sql"].exec<{ token: string }>(`SELECT token FROM webpush_trailing_wakeup`)]
         .length;
     });
 
@@ -1351,16 +1320,13 @@ describe("submit — an owed trailing wakeup is cleared only by an accepted wake
     await pinRelayClock(acct, RELAY_NOW);
     const vapid = await makeVapid();
 
-    const outcome = await runInDurableObject(relayStub(acct), async (instance: AccountRelay) => {
-      const relay = instance as unknown as RelayInternals & {
-        fetch(request: Request): Promise<Response>;
-      };
+    const outcome = await runInDurableObject(relayStub(acct), async (relay: AccountRelay) => {
       let release: () => void = () => undefined;
       const blocked = new Promise<void>((resolve) => {
         release = resolve;
       });
       let calls = 0;
-      relay.pushTransports = {
+      relay["pushTransports"] = {
         webpush: new WebPushTransport({
           vapid,
           fetcher: async () => {
@@ -1385,9 +1351,9 @@ describe("submit — an owed trailing wakeup is cleared only by an accepted wake
       // Skipped while the first wakeup is still in flight.
       const second = await submit("req-n2-in-flight-2");
       release();
-      await relay.pushFanOut;
+      await relay["pushFanOut"];
       const owed = [
-        ...relay.sql.exec<{ token: string }>(`SELECT token FROM webpush_trailing_wakeup`),
+        ...relay["sql"].exec<{ token: string }>(`SELECT token FROM webpush_trailing_wakeup`),
       ];
       return { first, second, calls, owed: owed.length };
     });

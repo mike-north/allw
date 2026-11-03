@@ -623,12 +623,17 @@ class DevicePushTokenClaimStore implements WakeupClaimStore {
 export class AccountRelay implements DurableObject {
   private readonly sql: SqlStorage;
   private readonly ctx: DurableObjectState;
-  private readonly pushTransports: PushTransportRegistry;
+  /**
+   * Assigned only at construction in production; mutable so tests can inject through checked
+   * element access.
+   */
+  private pushTransports: PushTransportRegistry;
   /**
    * Request horizon: `expires_at - now` above this is refused at submit (#248), and a stored row's
-   * deadline is never later than `created_at + maxRequestTtlMs` ({@link deadlineOf}).
+   * deadline is never later than `created_at + maxRequestTtlMs` ({@link deadlineOf}). Assigned only
+   * at construction in production; mutable so tests can inject through checked element access.
    */
-  private readonly maxRequestTtlMs: number;
+  private maxRequestTtlMs: number;
   /**
    * The relay's one clock (#292). Every time-dependent decision reads it: the request lifecycle
    * (submit, delivery, expiry, retract, verdict acceptance), the alarm clamp, push-wakeup
@@ -641,9 +646,10 @@ export class AccountRelay implements DurableObject {
   private now: () => number = () => Date.now();
   /**
    * Spaces wakeups per push token, every transport (`PUSH_COALESCE_MS`); see `schedulePushWakeups`.
-   * Last claims are kept in SQLite ({@link DevicePushTokenClaimStore}).
+   * Last claims are kept in SQLite ({@link DevicePushTokenClaimStore}). Assigned only at
+   * construction in production; mutable so tests can inject through checked element access.
    */
-  private readonly pushCoalescer: WakeupCoalescer;
+  private pushCoalescer: WakeupCoalescer;
   /**
    * Settles once every push fan-out started so far has finished, pruning included. Never rejects.
    * Only tests read it (to assert on the outcome of background delivery without sleeping).

@@ -14,7 +14,7 @@
  */
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
-import type { SqlStorage } from "@cloudflare/workers-types";
+import type { AccountRelay } from "../src/index.js";
 import { pairingStartBody, testAccount, testRequestId as rid } from "./support/accounts.js";
 import { DEVICE_X25519_PUBKEY } from "./support/keys.js";
 import { bindAccountRoot, pinRelayClock } from "./support/relay-state.js";
@@ -158,13 +158,15 @@ describe("request ids: an unknown id answers like a wrong token (#357)", () => {
   it("POST /requests/{id}/retract on an expired request: 403 to a stranger, never 409", async () => {
     const acct = testAccount("acct-oracle-retract-expired");
     const token = await submit(acct, rid("req-oracle-retract-expired"));
-    await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(acct)), (instance) => {
-      const relay = instance as unknown as { sql: SqlStorage };
-      relay.sql.exec(
-        `UPDATE request SET expires_at = 1 WHERE request_id = ?`,
-        rid("req-oracle-retract-expired"),
-      );
-    });
+    await runInDurableObject(
+      env.ACCOUNT.get(env.ACCOUNT.idFromName(acct)),
+      (relay: AccountRelay) => {
+        relay["sql"].exec(
+          `UPDATE request SET expires_at = 1 WHERE request_id = ?`,
+          rid("req-oracle-retract-expired"),
+        );
+      },
+    );
     await expectIndistinguishable(
       (id, t) => call(acct, "POST", `/requests/${id}/retract`, { token: t, body: {} }),
       rid("req-oracle-retract-expired"),
@@ -236,10 +238,12 @@ describe("pairing codes: an unknown code answers like a wrong token (#357)", () 
   it("an expired code answers a stranger like an unknown code, not 410", async () => {
     const acct = testAccount("acct-oracle-pairing-expired");
     const start = await startPairing(acct);
-    await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(acct)), (instance) => {
-      const relay = instance as unknown as { sql: SqlStorage };
-      relay.sql.exec(`UPDATE pairing SET expires_at = 1 WHERE code = ?`, start.code);
-    });
+    await runInDurableObject(
+      env.ACCOUNT.get(env.ACCOUNT.idFromName(acct)),
+      (relay: AccountRelay) => {
+        relay["sql"].exec(`UPDATE pairing SET expires_at = 1 WHERE code = ?`, start.code);
+      },
+    );
     const unknown = (await startPairing(testAccount("acct-oracle-pairing-expired-elsewhere"))).code;
 
     await expectIndistinguishable(complete(acct), start.code, unknown);
@@ -249,10 +253,12 @@ describe("pairing codes: an unknown code answers like a wrong token (#357)", () 
   it("a legacy code with no stored token hash answers like an unknown code", async () => {
     const acct = testAccount("acct-oracle-pairing-legacy");
     const start = await startPairing(acct);
-    await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(acct)), (instance) => {
-      const relay = instance as unknown as { sql: SqlStorage };
-      relay.sql.exec(`UPDATE pairing SET auth_token_hash = NULL WHERE code = ?`, start.code);
-    });
+    await runInDurableObject(
+      env.ACCOUNT.get(env.ACCOUNT.idFromName(acct)),
+      (relay: AccountRelay) => {
+        relay["sql"].exec(`UPDATE pairing SET auth_token_hash = NULL WHERE code = ?`, start.code);
+      },
+    );
     const unknown = (await startPairing(testAccount("acct-oracle-pairing-legacy-elsewhere"))).code;
 
     await expectIndistinguishable(complete(acct), start.code, unknown);
