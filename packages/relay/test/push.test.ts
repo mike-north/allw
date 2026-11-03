@@ -11,12 +11,15 @@ import { describe, expect, it, vi } from "vitest";
 import {
   ApnsPushTransport,
   FcmPushTransport,
+  InMemoryWakeupClaimStore,
   UndeliverablePushTokenError,
   WEB_PUSH_COALESCE_MS,
   WakeupCoalescer,
   buildPushWakeupPayload,
   diffPushTokenSet,
   dispatchPushWakeups,
+  parseWebPushCoalesceKey,
+  webPushCoalesceKey,
   type Fetcher,
   type PushTransport,
   type StoredPushToken,
@@ -62,7 +65,8 @@ describe("push fan-out", () => {
       transports: { apns, fcm },
     });
 
-    expect(result).toEqual({ delivered: 2, undeliverableTokens: [] });
+    // Both providers accepted their wakeup, so both tokens are reported delivered.
+    expect(result).toEqual({ deliveredTokens: tokens, undeliverableTokens: [] });
     expect(sent).toEqual([
       {
         kind: "apns",
@@ -152,7 +156,11 @@ describe("push fan-out", () => {
           transports: { apns, fcm },
         },
       ),
-    ).resolves.toEqual({ delivered: 1, undeliverableTokens: [] });
+    ).resolves.toEqual({
+      // Only FCM accepted; the rejected APNs wakeup is neither delivered nor prunable.
+      deliveredTokens: [{ device_id: "dev-b", transport: "fcm", token: "fcm-token" }],
+      undeliverableTokens: [],
+    });
   });
 
   it("keeps at most `concurrency` wakeups in flight, and a slow one does not block the rest", async () => {
@@ -194,7 +202,17 @@ describe("push fan-out", () => {
       release();
     });
 
-    await expect(dispatched).resolves.toEqual({ delivered: 6, undeliverableTokens: [] });
+    // Every send succeeded, the slow one last.
+    const result = await dispatched;
+    expect(result.deliveredTokens.map((token) => token.token)).toEqual([
+      "a",
+      "b",
+      "c",
+      "d",
+      "e",
+      "slow",
+    ]);
+    expect(result.undeliverableTokens).toEqual([]);
   });
 
   it("reports only tokens whose transport signalled UndeliverablePushTokenError for pruning", async () => {
@@ -215,7 +233,7 @@ describe("push fan-out", () => {
         expiresAt: EXPIRES_AT,
         transports: { webpush },
       }),
-    ).resolves.toEqual({ delivered: 0, undeliverableTokens: [gone] });
+    ).resolves.toEqual({ deliveredTokens: [], undeliverableTokens: [gone] });
   });
 });
 
@@ -275,6 +293,28 @@ describe("WakeupCoalescer — at most one wakeup per subscription per window", (
     expect(coalescer.nextClaimableAt(KEY, late)).toBe(late);
     // It is a lower bound: the in-flight claim still blocks until released.
     expect(coalescer.tryClaim(KEY, late)).toBe(false);
+  });
+
+  it("remembers claims through its store, so a second coalescer on the same store still coalesces (#319)", () => {
+    // Models a Durable Object evicted and recreated over the same SQLite: in-flight state is new,
+    // but the last claim is read back from the store.
+    const store = new InMemoryWakeupClaimStore(WEB_PUSH_COALESCE_MS);
+    const before = new WakeupCoalescer(WEB_PUSH_COALESCE_MS, store);
+    expect(before.tryClaim(KEY, T0)).toBe(true);
+    before.release(KEY);
+
+    const after = new WakeupCoalescer(WEB_PUSH_COALESCE_MS, store);
+    expect(after.tryClaim(KEY, T0 + 1)).toBe(false);
+    expect(after.nextClaimableAt(KEY, T0 + 1)).toBe(T0 + WEB_PUSH_COALESCE_MS + 1);
+    expect(after.tryClaim(KEY, T0 + WEB_PUSH_COALESCE_MS + 1)).toBe(true);
+  });
+
+  it("round-trips a subscription through its coalescing key", () => {
+    const key = webPushCoalesceKey("dev-a", "https://fcm.googleapis.com/fcm/send/a?x=1");
+    expect(parseWebPushCoalesceKey(key)).toEqual({
+      deviceId: "dev-a",
+      token: "https://fcm.googleapis.com/fcm/send/a?x=1",
+    });
   });
 
   it("keeps subscriptions independent", () => {
