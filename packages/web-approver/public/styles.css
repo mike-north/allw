@@ -59,12 +59,21 @@ input {
   letter-spacing: 0.06em;
 }
 
+/*
+ * No hash-bound text may be clipped or pushed off-screen at any width (WYSIWYS,
+ * docs/threat-model.md R3). A grid item defaults to `min-width: auto`, so one long unbroken value
+ * would widen the track and the page past the viewport. The single `minmax(0, 1fr)` track and
+ * `min-width: 0` keep every card inside the viewport, and long tokens wrap instead.
+ */
 .approval-list {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 12px;
 }
 
 .approval-card {
+  min-width: 0;
+  overflow-wrap: anywhere;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--surface);
@@ -87,11 +96,26 @@ input {
 }
 
 .approval-plaintext {
-  overflow: auto;
   margin: 12px 0;
   padding: 12px;
   border-radius: 6px;
   background: var(--surface-sunk);
+}
+
+/*
+ * The exact plaintext (plaintext-block.ts): wraps at any width, and each logical line has a hanging
+ * indent, so a wrapped row of a long or padded value always starts indented and never in column 0
+ * where field labels start.
+ */
+.plaintext-block {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.plaintext-line {
+  display: block;
+  padding-inline-start: 4ch;
+  text-indent: -4ch;
 }
 
 .verification-warning {
@@ -236,21 +260,18 @@ input {
   min-width: 0;
 }
 
+/* The row's action and actor wrap in full; untrusted text is never clipped (see .approval-list). */
 .audit-row__summary {
-  overflow: hidden;
+  overflow-wrap: anywhere;
   font-size: 14px;
   font-weight: 700;
   color: var(--ink);
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .audit-row__meta {
-  overflow: hidden;
+  overflow-wrap: anywhere;
   font-size: 12px;
   color: var(--ink-3);
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 /* Decision chip */
@@ -357,9 +378,8 @@ input {
   font-size: 12px;
   font-weight: 700;
   font-family: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace; /* --font-mono */
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  /* Hashes and signer ids are evidence: wrap them in full, never clip them. */
+  overflow-wrap: anywhere;
 }
 
 /* WYSIWYS receipt */
@@ -380,8 +400,6 @@ input {
 
 .audit-wysiwys__pre {
   margin: 8px 0 0;
-  white-space: pre-wrap;
-  word-break: break-word;
   font-family: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace; /* --font-mono */
   font-size: 13px;
   line-height: 1.55;

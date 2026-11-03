@@ -12,8 +12,9 @@
  * controls area is intentionally omitted — audit history is read-only by design (flow-notes.md).
  *
  * # WYSIWYS receipt
- * The exact plaintext from `detail.exactPlaintext` is rendered verbatim in a `<pre>` with
- * `textContent` only — no innerHTML, no interpolation — matching the inbox detail view.
+ * The exact plaintext from `detail.exactPlaintext` is rendered verbatim with `textContent` only — no
+ * innerHTML, no interpolation — through the same wrapping block as the inbox card
+ * (`plaintext-block.ts`).
  *
  * @see design/web-approver/audit-history/app.jsx (visual source of truth, design #125)
  * @see design/web-approver/inbox/tokens.css (verbatim token source)
@@ -27,6 +28,7 @@ import {
   type AuditHistoryItem,
   type WebApproverController,
 } from "./index.js";
+import { plaintextBlock } from "./plaintext-block.js";
 
 /**
  * Mount the audit-history view into `root`. Returns a disposer that tears down all DOM children
@@ -218,9 +220,7 @@ function detailPane(
   const codeLabel = textElement("span", "WYSIWYS render");
   codeLabel.className = "audit-wysiwys__label";
 
-  const pre = document.createElement("pre");
-  pre.className = "audit-wysiwys__pre";
-  pre.textContent = detail.exactPlaintext;
+  const pre = plaintextBlock(detail.exactPlaintext, "audit-wysiwys__pre");
 
   wysiwys.append(codeLabel, pre);
   pane.append(wysiwys);

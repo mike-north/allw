@@ -8,6 +8,7 @@ import {
   type WebApproverRuntime,
 } from "./index.js";
 import { mountPairingGate, type PairingStore } from "./pairing.js";
+import { plaintextBlock } from "./plaintext-block.js";
 import { createRelayPoller, type RelayPollerOptions } from "./relay-poll.js";
 import {
   createRetractListener,
@@ -377,10 +378,7 @@ function card(
   article.append(metaLine("Expires", `${String(Math.ceil(detail.countdownMs / 1000))}s`));
   article.append(metaLine("Request hash", detail.requestHash ?? "unverified"));
 
-  const plaintext = document.createElement("pre");
-  plaintext.className = "approval-plaintext";
-  plaintext.textContent = detail.exactPlaintext;
-  article.append(plaintext);
+  article.append(plaintextBlock(detail.exactPlaintext, "approval-plaintext"));
 
   if (detail.verificationError) {
     const warning = textElement("p", `Verification failed: ${detail.verificationError}`);
