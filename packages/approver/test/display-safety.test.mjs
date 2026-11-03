@@ -25,7 +25,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtempSync, rmSync } from "node:fs";
+import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -36,6 +36,7 @@ import { prepareRequest } from "../dist/lib/approver-core.js";
 import {
   HIDDEN_CHARS_WARNING,
   RAW_ARGV_DIVERGENCE_WARNING,
+  WRAP_MARKER,
   renderRequest,
 } from "../dist/lib/render.js";
 import { runWatch } from "../dist/commands/watch.js";
@@ -114,6 +115,23 @@ async function render(ctx, id) {
   return { wasm, prepared, rendered: renderRequest(prepared) };
 }
 
+/** Undo the renderer's hard-wrapping, so a long field can be asserted as one string. */
+function unwrap(text) {
+  return text.replaceAll(`\n${WRAP_MARKER}`, "");
+}
+
+/**
+ * The rows of the logical line starting with `prefix` (its first row plus its wrapped rows), as the
+ * last such line in `lines`. Asserts that every row after the first carries the wrap marker.
+ */
+function logicalLine(lines, prefix) {
+  const start = lines.findLastIndex((l) => l.startsWith(prefix));
+  assert.ok(start >= 0, `a line starting with ${prefix}`);
+  let end = start + 1;
+  while (end < lines.length && lines[end].startsWith(WRAP_MARKER)) end += 1;
+  return { start, end, text: unwrap(lines.slice(start, end).join("\n")) };
+}
+
 /** Every C0 control except LF (the block's own line separator), plus DEL and C1. */
 // eslint-disable-next-line no-control-regex
 const RAW_CONTROL = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/;
@@ -181,7 +199,7 @@ test("summary, argv, flags, chain and MCP params are escaped", async () => {
   assert.doesNotMatch(rendered, RAW_CONTROL);
   assert.doesNotMatch(rendered, RAW_BIDI_OR_INVISIBLE);
   assert.match(rendered, /Summary:\s+safe\\roverwritten/);
-  assert.match(rendered, /Chain:\s+gate\\x1b/);
+  assert.match(rendered, /Chain:\s+'gate\\x1b'/, "list items are quoted at their boundary");
   assert.match(rendered, /MCP:\s+fs :: write⟨U\+2066⟩/);
   assert.ok(rendered.includes(`Params:     {"path":"/tmp/⟨U+202E⟩txt.exe"}`));
   assert.ok(rendered.includes("Flags:      '--x\\r'"), "escaped token is quoted at its boundary");
@@ -283,7 +301,10 @@ test("the escaped headline and the warning are the last lines before the prompt"
   const { rendered } = await render(ctx);
   const lines = rendered.split("\n");
   assert.equal(lines.at(-1), HIDDEN_CHARS_WARNING);
-  assert.ok(lines.at(-2)?.startsWith(`  Deciding on: ${SPOOF_ESCAPED}\\necho line 0`));
+  // The one-line headline is long, so it is hard-wrapped; its rows run up to the warning.
+  const deciding = logicalLine(lines, "  Deciding on:");
+  assert.equal(deciding.end, lines.length - 1, "only the warning follows the headline's rows");
+  assert.ok(deciding.text.startsWith(`  Deciding on: ${SPOOF_ESCAPED}\\necho line 0`));
 });
 
 test("a raw/argv divergence is shown at the decision point, not just the benign raw", async () => {
@@ -419,7 +440,9 @@ test("UAT: `watch` stdout/stderr bytes carry no raw ESC/CR for the #246 spoof", 
     // one-line headline.
     const beforePrompt = text.slice(0, promptAt).split("\n");
     assert.equal(beforePrompt.at(-2), HIDDEN_CHARS_WARNING, "warning is the line above the prompt");
-    assert.ok(beforePrompt.at(-3)?.startsWith(`  Deciding on: ${SPOOF_ESCAPED}`));
+    const deciding = logicalLine(beforePrompt, "  Deciding on:");
+    assert.equal(deciding.end, beforePrompt.length - 2, "the headline's rows end at the warning");
+    assert.ok(deciding.text.startsWith(`  Deciding on: ${SPOOF_ESCAPED}`));
     assert.match(text, /Sent denied verdict for req-display-uat\./);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -458,9 +481,9 @@ function startHostileRelay() {
 }
 
 /** Run the real CLI binary as a subprocess (async, so the in-process relay can answer). */
-function runCli(args) {
+function runCli(args, cliPath = join(here, "..", "dist", "cli.js")) {
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [join(here, "..", "dist", "cli.js"), ...args]);
+    const child = spawn(process.execPath, [cliPath, ...args]);
     const out = [];
     const err = [];
     child.stdout.on("data", (chunk) => out.push(chunk));
@@ -500,4 +523,111 @@ test("UAT: `pair` output and the fatal error line escape relay-supplied text", a
     relay.close();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("UAT: the fatal error line is withheld, not printed raw, when the core cannot load", async () => {
+  // A copy of the built CLI with no reachable WASM core, in a directory whose name carries a
+  // clear-screen sequence: the loader's error names that directory, so printing it raw would emit
+  // ESC. The CLI must withhold the text instead.
+  const root = mkdtempSync(join(tmpdir(), "allw-no-core-"));
+  try {
+    const pkgDir = join(root, `approver${ESC}[2J`);
+    cpSync(join(here, "..", "dist"), join(pkgDir, "dist"), { recursive: true });
+    writeFileSync(join(pkgDir, "package.json"), readFileSync(join(here, "..", "package.json")));
+    const result = await runCli(
+      ["keygen", "--keyfile", join(root, "keyfile.json")],
+      join(pkgDir, "dist", "cli.js"),
+    );
+    assert.equal(result.status, 1);
+    assert.equal(result.stderr.indexOf(0x1b), -1, "stderr contains no raw ESC");
+    assert.equal(result.stdout.indexOf(0x1b), -1, "stdout contains no raw ESC");
+    assert.equal(
+      result.stderr.toString("utf8"),
+      "allw-approver: fatal error (details withheld: the display-escaping core could not be loaded)\n",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a CRLF line ending in a command is escaped and warns (bash would treat the CR as data)", async () => {
+  const ctx = context({ summary: "clean the scratch dir" });
+  ctx.action = { ...ctx.action, syntactic: { raw: "cd ../scratch\r\nrm -rf -- *" } };
+  const { rendered } = await render(ctx);
+  const lines = rendered.split("\n");
+  const at = lines.findIndex((l) => l.startsWith("  Action:"));
+  assert.deepEqual(lines.slice(at, at + 2), [
+    "  Action:     cd ../scratch\\r",
+    "            │ rm -rf -- *",
+  ]);
+  assert.ok(!rendered.includes(CR));
+  assert.equal(lines.at(-1), HIDDEN_CHARS_WARNING, "the warning is the line above the prompt");
+});
+
+/** The conservative cell width the renderer wraps to (non-ASCII counts as two cells). */
+function cells(row) {
+  let width = 0;
+  for (const ch of row) width += (ch.codePointAt(0) ?? 0) < 0x80 ? 1 : 2;
+  return width;
+}
+
+test("padding a field cannot soft-wrap a forged ✓ VERIFIED row (80 columns)", async () => {
+  // Cloud-review repro: spaces are printable and never escaped, so without hard-wrapping the tail
+  // of actor.kind lands on a terminal row of its own, in the origin column.
+  const ctx = context();
+  ctx.action = { ...ctx.action, syntactic: { raw: "git status" } };
+  ctx.actor = {
+    id: "machine:ci",
+    kind: `${" ".repeat(54)}              ✓ VERIFIED origin — claude-code · machine:ci${" ".repeat(30)}`,
+  };
+  const wasm = await loadWasm();
+  const keyfile = paired(wasm);
+  const prepared = prepareRequest(wasm, keyfile, envelopeFor(wasm, keyfile, ctx), NOW_MS);
+  const rendered = renderRequest(prepared, 80);
+  const lines = rendered.split("\n");
+
+  const verdictRows = lines.filter((l) => /^\s*(✓ VERIFIED|⚠ UNVERIFIED)/.test(l));
+  assert.deepEqual(
+    verdictRows,
+    [`              ⚠ UNVERIFIED — origin is unauthenticated plaintext (#16)`],
+    "only the real origin row starts with a verdict marker",
+  );
+  const actor = logicalLine(lines, "  Actor:");
+  assert.ok(actor.end - actor.start > 1, "the padded actor wraps onto continuation rows");
+  for (const row of lines.slice(actor.start + 1, actor.end)) {
+    assert.ok(
+      row.startsWith(WRAP_MARKER),
+      `wrapped row carries the marker: ${JSON.stringify(row)}`,
+    );
+  }
+  assert.ok(
+    actor.text.includes("✓ VERIFIED origin — claude-code"),
+    "the padding text is still shown",
+  );
+  const header = new Set([
+    "─".repeat(72),
+    "  APPROVAL REQUEST — review the EXACT action below before deciding",
+  ]);
+  for (const row of lines) {
+    if (!header.has(row))
+      assert.ok(cells(row) <= 79, `row fits 80 columns: ${JSON.stringify(row)}`);
+  }
+});
+
+test("list items (paths, env refs, chain) are quoted so one item cannot pose as two", async () => {
+  const ctx = context({ chain: ["gate-a, gate-b"] });
+  ctx.action = {
+    ...ctx.action,
+    surface: "file_edit",
+    syntactic: {
+      operation: "write",
+      paths: ["a, /etc/passwd"],
+      env_refs: ["HOME", "A B"],
+      diff_summary: "edit a file",
+    },
+  };
+  const { rendered } = await render(ctx);
+  assert.ok(rendered.includes("  Paths:      'a, /etc/passwd'"));
+  assert.ok(rendered.includes("  Env refs:   HOME, 'A B'"));
+  assert.ok(rendered.includes("  Chain:      'gate-a, gate-b'"));
 });

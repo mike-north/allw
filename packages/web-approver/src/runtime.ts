@@ -290,10 +290,15 @@ function toToolCallAction(
  * Map the decrypted wire context + the core's escaped display model + verified attestation +
  * (optional) derived challenge onto the controller's {@link ApprovalContext} view model. Every
  * string in the result comes from `display` (escaped by the core, #246); `wire` supplies only the
- * non-text fields (surface, risk level, reversibility, allowed decisions). Surfaces other than `command`/`mcp_tool_call`/
- * `agent_tool_call` (e.g. `file_edit`) render as `command` with an empty action so the controller
- * shows them as an "Unknown action" rather than fabricating structure — the WYSIWYS hash still
- * binds the full plaintext regardless of this display mapping.
+ * non-text fields (surface, risk level, reversibility, allowed decisions).
+ *
+ * Every surface other than `mcp_tool_call`/`agent_tool_call` — including `file_edit` — is mapped to
+ * a `command` action carrying only `argv`, `cwd` and `raw`/`raw_lines` (so a file edit shows its
+ * content under `raw:` with an empty `argv:`). This view is **narrower than the CLI approver's**:
+ * the web card does not yet show `bin`, `flags`, `positionals`, `host`, `env_refs`, `chain`, a file
+ * edit's `operation`/`paths`/`diff_summary`/`diff_hash`, or a raw/argv divergence warning, although
+ * all of them are bound into `request_hash`. Closing that gap is tracked as a follow-up; until then
+ * the CLI is the complete view.
  *
  * `agent_tool_call` (an agent-runtime/plugin-owned tool call, e.g. an OpenClaw plugin permission
  * request — `docs/openclaw-integration.md` §5.2) is its own `kind`, distinct from `mcp`: it shares

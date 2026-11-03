@@ -23,7 +23,7 @@ import {
 } from "../lib/approver-core.js";
 import { readKeyfile, writeKeyfile, type Keyfile } from "../lib/keyfile.js";
 import { deviceConnectWsUrl, fetchAccountStatesWithMetadata } from "../lib/relay-client.js";
-import { renderRequest } from "../lib/render.js";
+import { DEFAULT_COLUMNS, renderRequest } from "../lib/render.js";
 import type { AllwWasm } from "../lib/wasm.js";
 import type { Decision, DeviceInboundMessage } from "../lib/types.js";
 
@@ -291,7 +291,7 @@ export async function handleRequest(
   }
   const preparedWithOrigin: RenderableRequest = { ...prepared, origin };
 
-  const rendered = renderRequest(preparedWithOrigin);
+  const rendered = renderRequest(preparedWithOrigin, terminalColumns());
   const promptDecision = normalizePromptResult(await prompter.decide(rendered, preparedWithOrigin));
   if (promptDecision === null) {
     log.info(`No decision recorded for ${prepared.displayRequestId} — leaving it pending.`);
@@ -329,6 +329,15 @@ export async function handleRequest(
   ws.send(JSON.stringify({ type: "verdict", request_id: prepared.requestId, verdict }));
   log.info(`Sent ${promptDecision.decision} verdict for ${prepared.displayRequestId}.`);
   return promptDecision.decision;
+}
+
+/**
+ * The width the request block is wrapped to: the terminal's when stdout is a TTY, else
+ * {@link DEFAULT_COLUMNS}.
+ */
+function terminalColumns(): number {
+  const { isTTY, columns } = process.stdout;
+  return isTTY && columns > 0 ? columns : DEFAULT_COLUMNS;
 }
 
 /** A readline-backed prompter for the interactive CLI. */

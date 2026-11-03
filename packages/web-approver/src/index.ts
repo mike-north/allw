@@ -564,15 +564,19 @@ export class WebApproverController {
   }
 }
 
+/**
+ * One-line headline for a list row. A tool call is `server :: tool` (as in the CLI): a `.` join
+ * would make server `fs.delete` + tool `x` look like server `fs` + tool `delete.x`.
+ */
 export function actionSummary(context: ApprovalContext): string {
   if (context.kind === "command" && context.command) {
     return context.command.raw ?? shellQuote(context.command.argv);
   }
   if (context.kind === "mcp" && context.mcp) {
-    return `${context.mcp.server}.${context.mcp.tool}`;
+    return `${context.mcp.server} :: ${context.mcp.tool}`;
   }
   if (context.kind === "agent_tool_call" && context.agentToolCall) {
-    return `${context.agentToolCall.server}.${context.agentToolCall.tool}`;
+    return `${context.agentToolCall.server} :: ${context.agentToolCall.tool}`;
   }
   return "Unknown action";
 }
@@ -590,12 +594,12 @@ export function exactPlaintext(context: ApprovalContext): string {
     return `${cwd}argv: ${shellQuote(context.command.argv)}\nraw: ${raw}`;
   }
   if (context.kind === "mcp" && context.mcp) {
-    return `mcp: ${context.mcp.server}.${context.mcp.tool}\nparams: ${
+    return `mcp: ${context.mcp.server} :: ${context.mcp.tool}\nparams: ${
       context.mcp.paramsDisplay ?? "(none)"
     }`;
   }
   if (context.kind === "agent_tool_call" && context.agentToolCall) {
-    return `agent_tool_call: ${context.agentToolCall.server}.${context.agentToolCall.tool}\nparams: ${
+    return `agent_tool_call: ${context.agentToolCall.server} :: ${context.agentToolCall.tool}\nparams: ${
       context.agentToolCall.paramsDisplay ?? "(none)"
     }`;
   }

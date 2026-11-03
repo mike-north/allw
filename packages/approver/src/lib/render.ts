@@ -90,6 +90,15 @@ function quoteToken(token: string): string {
   return `'${token.replace(/'/g, "'\\''")}'`;
 }
 
+/**
+ * Join list items (paths, env refs, chain ids) with `, `, each quoted by {@link quoteToken} so an
+ * item containing `, ` or whitespace stays visibly one item: `["a, /etc/passwd"]` renders as
+ * `'a, /etc/passwd'`, never like the two items `a, /etc/passwd`.
+ */
+function renderList(items: readonly string[]): string {
+  return items.map(quoteToken).join(", ");
+}
+
 /** Join argv tokens into one unambiguous, display-safe command line. */
 function renderArgv(argv: readonly string[]): string {
   return argv.map(quoteToken).join(" ");
@@ -177,7 +186,7 @@ function renderActionHeadline(display: DisplayModel): string {
   if (display.surface === "file_edit") {
     if (s.diff_summary !== undefined) return s.diff_summary;
     if (s.operation !== undefined && s.paths !== undefined && s.paths.length > 0) {
-      return `${s.operation} ${s.paths.join(", ")}`;
+      return `${s.operation} ${renderList(s.paths)}`;
     }
   }
 
@@ -194,7 +203,7 @@ function renderActionHeadline(display: DisplayModel): string {
 
   // File-edit headline when no raw summary is present: "patch src/app.ts".
   if (s.operation !== undefined && s.paths !== undefined && s.paths.length > 0) {
-    return `${s.operation} ${s.paths.join(", ")}`;
+    return `${s.operation} ${renderList(s.paths)}`;
   }
   return s.params_json ?? "(no command, tool, or file-edit fields)";
 }
@@ -237,7 +246,7 @@ function substrateDetailLines(action: ActionRecord, display: DisplayModel): stri
   if (s.cwd !== undefined) lines.push(`  Cwd:        ${s.cwd}`);
   if (s.host !== undefined) lines.push(`  Host:       ${s.host}`);
   if (s.env_refs !== undefined && s.env_refs.length > 0) {
-    lines.push(`  Env refs:   ${s.env_refs.join(", ")}`);
+    lines.push(`  Env refs:   ${renderList(s.env_refs)}`);
   }
 
   // Server/tool are hash-bound but were rendered on NO line when a `raw` headline ran — so a
@@ -261,7 +270,7 @@ function substrateDetailLines(action: ActionRecord, display: DisplayModel): stri
   // generic summary would let the human sign over a different file mutation than they reviewed.
   if (s.operation !== undefined) lines.push(`  File edit:  ${s.operation}`);
   if (s.paths !== undefined && s.paths.length > 0) {
-    lines.push(`  Paths:      ${s.paths.join(", ")}`);
+    lines.push(`  Paths:      ${renderList(s.paths)}`);
   }
   if (s.diff_summary !== undefined) lines.push(`  Diff summary: ${s.diff_summary}`);
   if (s.diff_hash !== undefined) lines.push(`  Diff hash:  ${s.diff_hash}`);
@@ -305,6 +314,59 @@ export const RAW_ARGV_DIVERGENCE_WARNING =
 export const HIDDEN_CHARS_WARNING =
   "  ⚠ WARNING: contains hidden/control characters — shown escaped below (e.g. \\x1b, \\r, ⟨U+202E⟩). Review carefully.";
 
+/** The block's fixed title line. */
+const HEADER = "  APPROVAL REQUEST — review the EXACT action below before deciding";
+
+/** The terminal width assumed when the output is not a TTY (or reports no width). */
+export const DEFAULT_COLUMNS = 80;
+
+/**
+ * Prefix of every row produced by wrapping a long printed line. Field labels start in column 2
+ * (`  Actor:`), and the origin row's `✓ VERIFIED` / `⚠ UNVERIFIED` marker in column 14; a wrapped
+ * row always starts with this marker instead, so no part of an untrusted value can begin a row that
+ * looks like a label or an origin verdict.
+ */
+export const WRAP_MARKER = "  ↪ ";
+
+/**
+ * Conservative terminal cell width of `text`: ASCII counts as one cell and **every** other code
+ * point as two (the widest a terminal renders one). Over-estimating only wraps earlier than
+ * necessary; under-estimating would let the terminal soft-wrap the row itself, unmarked.
+ */
+function cellWidth(text: string): number {
+  let width = 0;
+  for (const ch of text) width += (ch.codePointAt(0) ?? 0) < 0x80 ? 1 : 2;
+  return width;
+}
+
+/**
+ * Hard-wrap one printed row to fit `columns` terminal cells, prefixing every continuation row with
+ * {@link WRAP_MARKER}. The CLI owns wrapping (rather than leaving it to the terminal) because
+ * printable padding — spaces are never escaped — would otherwise push the tail of an untrusted
+ * value onto a soft-wrapped row of its own, starting in column 0, where it can pose as a field label
+ * or a `✓ VERIFIED` origin row. Wrapping is layout only; no character is changed or dropped.
+ */
+export function wrapRow(row: string, columns: number): string[] {
+  // Leave the last column free: some terminals wrap when a row fills the final cell exactly.
+  const limit = Math.max(Math.floor(columns), 24) - 1;
+  if (cellWidth(row) <= limit) return [row];
+  const rows: string[] = [];
+  let current = "";
+  let width = 0;
+  for (const ch of row) {
+    const w = cellWidth(ch);
+    if (width + w > limit) {
+      rows.push(current);
+      current = WRAP_MARKER;
+      width = cellWidth(WRAP_MARKER);
+    }
+    current += ch;
+    width += w;
+  }
+  rows.push(current);
+  return rows;
+}
+
 /**
  * Produce the full WYSIWYS block for a prepared request. Every line here is content the human is
  * attesting to by approving; the `request_hash` is shown verbatim so an out-of-band check is
@@ -313,14 +375,20 @@ export const HIDDEN_CHARS_WARNING =
  * Context text comes only from `prepared.display` (the core's escaped model); the request id is
  * `prepared.displayRequestId`; origin strings are escaped by their producers. No raw context string
  * is ever interpolated into the output.
+ *
+ * Every row that can carry untrusted text is hard-wrapped to `columns` terminal cells with
+ * {@link wrapRow}; pass the terminal's width (the default suits a non-TTY).
  */
-export function renderRequest(prepared: RenderableRequest): string {
+export function renderRequest(
+  prepared: RenderableRequest,
+  columns: number = DEFAULT_COLUMNS,
+): string {
   const { context, display, expiresAt, requestHash, origin } = prepared;
   const lines: string[] = [];
   const rule = "─".repeat(72);
 
   lines.push(rule);
-  lines.push("  APPROVAL REQUEST — review the EXACT action below before deciding");
+  lines.push(HEADER);
   lines.push(rule);
   if (display.has_hidden_or_control_chars) {
     lines.push(HIDDEN_CHARS_WARNING);
@@ -354,7 +422,7 @@ export function renderRequest(prepared: RenderableRequest): string {
   }
   lines.push(`  Expires:    ${formatTimestamp(expiresAt)}`);
   if (display.chain !== undefined && display.chain.length > 0) {
-    lines.push(`  Chain:      ${display.chain.join(", ")}`);
+    lines.push(`  Chain:      ${renderList(display.chain)}`);
   }
   lines.push(`  request_hash (WYSIWYS): ${requestHash}`);
   lines.push(rule);
@@ -372,5 +440,8 @@ export function renderRequest(prepared: RenderableRequest): string {
     lines.push(RAW_ARGV_DIVERGENCE_WARNING);
   }
 
-  return lines.join("\n");
+  // Every row that can carry untrusted text is hard-wrapped with a continuation marker. The fixed
+  // chrome (rules, header, warnings) contains no untrusted text and is left whole.
+  const fixed = new Set([rule, HEADER, HIDDEN_CHARS_WARNING, RAW_ARGV_DIVERGENCE_WARNING]);
+  return lines.flatMap((line) => (fixed.has(line) ? [line] : wrapRow(line, columns))).join("\n");
 }

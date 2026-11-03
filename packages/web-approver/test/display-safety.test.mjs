@@ -257,3 +257,19 @@ test("the relay-outage banner escapes the relay error text (#246)", async () => 
   assert.doesNotMatch(text, RAW_HIDDEN);
   assert.ok(text.includes("relay down\\x1b[2J⟨U+202E⟩evil"));
 });
+
+test("a tool call shows server :: tool, so a dotted server or tool name stays unambiguous", async () => {
+  const call = (server, tool) => ({
+    ...context({}),
+    action: {
+      record_schema_version: 1,
+      surface: "mcp_tool_call",
+      syntactic: { server, tool },
+      risk: "high",
+    },
+  });
+  const root = await mountWith([call("fs.delete", "x")]);
+  const text = root.textContent ?? "";
+  assert.ok(text.includes("mcp: fs.delete :: x"));
+  assert.ok(!text.includes("fs :: delete.x"));
+});
