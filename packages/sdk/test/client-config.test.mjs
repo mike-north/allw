@@ -350,6 +350,26 @@ test("a relative HOME → error: the default path is never resolved against the 
   );
 });
 
+test("an empty HOME → error: Node's homedir() is then '', and the default would be cwd-relative (#301)", (t) => {
+  // With HOME="" (Node 24), homedir() returns "" and the default path became .allw/config.json,
+  // read from the cwd. Plant a valid config there to show the loader refuses it.
+  const cwd = tempDir(t);
+  mkdirSync(join(cwd, ".allw"), { mode: 0o700 });
+  writeFileSync(join(cwd, ".allw", "config.json"), JSON.stringify(VALID_FILE), { mode: 0o600 });
+  const prevCwd = process.cwd();
+  process.chdir(cwd);
+  t.after(() => process.chdir(prevCwd));
+  withHome(t, "");
+  assert.throws(
+    () => loadClientConfig({ env: {} }),
+    (err) => {
+      assert.ok(err instanceof ClientConfigError, String(err));
+      assert.match(err.message, /default config path is not absolute/);
+      return true;
+    },
+  );
+});
+
 test("a relative HOME with an absolute ALLW_CONFIG still loads (the suggested way out)", (t) => {
   const path = writeConfig(t, VALID_FILE);
   withHome(t, "rel");
@@ -604,6 +624,25 @@ for (const [label, badKey] of [
     ]);
   });
 }
+
+test("a malformed approver_root_key from the file is described, never quoted (#301)", (t) => {
+  // The base64 decoder's own message names the offending byte and its offset ("Invalid symbol 27,
+  // offset 6"), which is a piece of the file value. From the file, only the rule is stated.
+  const badKey = "AAAAAA!!IGNORE-PREVIOUS";
+  const path = writeConfig(t, { ...VALID_FILE, approver_root_key: badKey });
+  assert.throws(
+    () => loadClientConfig({ env: {}, path }),
+    (err) => {
+      assert.ok(err instanceof ClientConfigError, String(err));
+      assert.match(err.message, /not a base64url-unpadded 32-byte Ed25519 public key\. Copy/);
+      assert.doesNotMatch(err.message, /Invalid symbol|offset|base64url: /);
+      assert.ok(!err.message.includes("IGNORE"), "no part of the value");
+      assert.ok(err.cause instanceof Error, "the core's error stays on cause");
+      assert.match(err.cause.message, /not valid base64url/);
+      return true;
+    },
+  );
+});
 
 test("a malformed ALLW_APPROVER_ROOT_KEY override → error naming the env var", (t) => {
   const path = writeConfig(t, VALID_FILE);

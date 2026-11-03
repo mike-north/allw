@@ -220,15 +220,24 @@ function initGlue(glue: WasmGlue, dir: string): AllwWasm {
 /** The vendored files the loader reads; if any is missing, the core was never built here. */
 const VENDOR_FILES = ["allw_wasm.js", "allw_wasm_bg.wasm"] as const;
 
-/** The most characters of a load failure's cause that {@link wasmLoadError} quotes. */
+/**
+ * The most characters of a load failure's escaped cause that {@link wasmLoadError} quotes, before the
+ * `...` that marks a clip.
+ */
 export const MAX_WASM_LOAD_CAUSE_CHARS = 200;
 
 /**
  * A load failure's cause as one bounded line of printable ASCII. The display-escaping core is the
- * thing that failed to load, so it can't be used here. Instead every character outside
- * printable ASCII (including newlines and ESC) becomes a `\uXXXX` escape, so a cause can't move
- * the cursor or spoof lines in a terminal or a hook's deny reason. The result is then clipped to
- * {@link MAX_WASM_LOAD_CAUSE_CHARS}, with `…` when cut.
+ * thing that failed to load, so it can't be used here. Instead:
+ *
+ * - every UTF-16 unit outside printable ASCII (newlines, ESC, bidi controls, any non-ASCII text)
+ *   becomes a `\uXXXX` escape, and so does a backslash (`\u005c`), so a literal `\u001b` in the
+ *   cause reads differently from an escaped ESC;
+ * - the result is clipped to at most {@link MAX_WASM_LOAD_CAUSE_CHARS} characters, on an escape
+ *   boundary (never inside a `\uXXXX`), with `...` appended when cut.
+ *
+ * So a cause can't move the cursor or spoof lines in a terminal or a hook's deny reason, and the
+ * whole result is printable ASCII.
  */
 function describeLoadCause(cause: unknown): string {
   let text: string;
@@ -240,13 +249,17 @@ function describeLoadCause(cause: unknown): string {
   } catch {
     text = "a cause that could not be described";
   }
-  const escaped = text.replace(
-    /[^\x20-\x7e]/g,
-    (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`,
-  );
-  return escaped.length > MAX_WASM_LOAD_CAUSE_CHARS
-    ? `${escaped.slice(0, MAX_WASM_LOAD_CAUSE_CHARS)}…`
-    : escaped;
+  let out = "";
+  for (let i = 0; i < text.length; i += 1) {
+    const unit = text.charCodeAt(i);
+    const token =
+      unit >= 0x20 && unit <= 0x7e && unit !== 0x5c
+        ? text.charAt(i)
+        : `\\u${unit.toString(16).padStart(4, "0")}`;
+    if (out.length + token.length > MAX_WASM_LOAD_CAUSE_CHARS) return `${out}...`;
+    out += token;
+  }
+  return out;
 }
 
 /**
@@ -274,7 +287,7 @@ export function wasmLoadError(
     );
   }
   return new Error(
-    `allw: failed to load the vendored WASM core from ${dir}: ${describeLoadCause(cause)}. ` +
+    `allw: failed to load the vendored WASM core from ${dir} (${describeLoadCause(cause)}). ` +
       `The vendored files are present, so rebuilding may not help; reinstall @allw/sdk or ` +
       `rebuild the core (\`pnpm run build:wasm\`) if the files are damaged.`,
     { cause },

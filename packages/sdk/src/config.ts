@@ -499,15 +499,20 @@ export function loadClientConfigWith(
   try {
     wasm.account_id_for_root(root.value);
   } catch (cause) {
+    // The core's message can quote part of the value (the base64 decoder names the offending byte
+    // and its offset). That is fine for an env value, but a value from the file is file content
+    // (#301), so only the rule is stated; the core's error stays on `cause`.
+    const detail = root.fromEnv
+      ? ` (${cause instanceof Error ? cause.message : String(cause)})`
+      : "";
     throw new ClientConfigError(
       `allw: approver_root_key from ${describeSource(
         ROOT_FIELD,
         root.fromEnv,
         path,
-      )} is not a base64url-unpadded 32-byte Ed25519 public key (${
-        cause instanceof Error ? cause.message : String(cause)
-      }). Copy the account-root public key printed by \`allw-approver pair\` into ${path} ` +
-        `or ALLW_APPROVER_ROOT_KEY (fail-closed)`,
+      )} is not a base64url-unpadded 32-byte Ed25519 public key${detail}. Copy the ` +
+        `account-root public key printed by \`allw-approver pair\` into ${path} or ` +
+        `ALLW_APPROVER_ROOT_KEY (fail-closed)`,
       path,
       { cause },
     );
