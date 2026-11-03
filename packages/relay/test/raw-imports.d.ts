@@ -8,8 +8,9 @@ declare module "*?raw" {
 }
 
 /**
- * Vite's `import.meta.glob`, as the one-clock guard (`request-deadline.test.ts`) uses it: eager,
- * `?raw`, default import, so each matched source file maps to its text. Declared here because the
+ * Vite's `import.meta.glob`, as the source guards (`request-deadline.test.ts`,
+ * `private-state-access.test.ts`) use it: eager, `?raw`, default import, so each matched source file
+ * maps to its text. Declared here because the
  * test tsconfig does not load `vite/client` types.
  */
 interface ImportMeta {
