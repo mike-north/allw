@@ -110,7 +110,9 @@ ActionRecord {
     // surface=file_edit:
     operation?, paths?, diff_summary?, diff_hash?
                                                 // target paths + compact WYSIWYS summary/hash
-    raw?                                        // original form, for fallback + display
+    raw?                                        // original form, for fallback + display; on
+                                                //   mcp_tool_call / agent_tool_call, the caller's
+                                                //   description of the call (see below)
   }
 
   // --- semantic enrichment (T3, reserved; null in v1) ---
@@ -121,6 +123,18 @@ ActionRecord {
   risk: "low" | "medium" | "high" | "critical" // v1: coarse heuristic; T3: capability-derived
 }
 ```
+
+**On a tool surface, `raw` is a description, not the action.** On `mcp_tool_call` and `agent_tool_call` the action
+is the hash-bound `server`/`tool` (plus `params`), and `raw` is the caller's own prose about the call: an OpenClaw
+plugin's `description` and `detail`, for example ([openclaw-integration.md](./openclaw-integration.md) §5.2). Both
+approvers therefore head a tool call with its identity (`server :: tool`) and show `raw` labelled as the
+description, never as the action (#321). A tool-surface record is not meant to carry `bin`/`argv`: the core's tool-call
+builders leave them unset, and every in-repo producer gates a shell tool on the `command` surface (the Claude Code
+hook's Bash and PowerShell tools, OpenClaw exec). If a hand-built record does pair a tool with a command form (say
+`agent_tool_call` with `tool: "Bash"`, `raw: "rm -rf /tmp/x"` and the same tokens as `argv`), both are hash-bound, so
+the approvers show the command next to the tool identity with a warning on every such request, even when `argv`
+matches `raw`. An integrator gating a command should use the `command` surface instead
+([threat-model.md](./threat-model.md) R3).
 
 **Every caller that runs a command uses the `command` surface.** A plain script or CLI about to run a command
 (for example `stripe refunds create …`) is a `command` caller, exactly like the agent hooks. There is no

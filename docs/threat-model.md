@@ -328,12 +328,19 @@ trust decision, and it lives in the core:
   badge shows, the escaped character is visible on the card. When `raw` and the hash-bound argv diverge, the card
   heading is the argv form and a "raw and argv differ" alert shows, as on the CLI; the two approvers decide divergence
   with the same rule, tested against one shared fixture. Both approvers head a request the same way, pinned by a second
-  shared fixture. On a tool surface (`mcp_tool_call`, `agent_tool_call`) with a tool, the heading is the tool
-  identity (`server :: tool`, or the tool alone), never `raw`: there `raw` is the caller's description (an OpenClaw
-  plugin's prose, say), not what executes. It is shown labelled as the description (CLI `Description:`, web
-  `description:`). Raw/argv divergence does not apply there; instead, a hash-bound bin/argv on a tool call is shown
-  with an alert that the call also carries a command (#321). Every other record heads with the first of: a file edit's
-  summary, `raw`, the reconstructed argv.
+  shared fixture. On a tool surface (`mcp_tool_call`, `agent_tool_call`) naming a tool or a server, the heading is
+  the tool identity (`server :: tool`, the tool alone, or `server :: (tool missing)`), never `raw`: there `raw` is the
+  caller's description (an OpenClaw plugin's prose, say), not what executes. It is shown labelled as the description
+  (CLI `Description:`, web `description:`), and the hash-bound `server` always has its own row. Each half of the
+  identity is shown bare only when it is printable ASCII with no `::` and nothing that would quote a command token;
+  otherwise it is single-quoted, so server `fs :: read_file` + tool `delete_all` and server `fs` + tool
+  `read_file :: delete_all` never look alike, and a non-ASCII lookalike of the separator can't fake a split.
+  Raw/argv divergence does not apply there; instead, a hash-bound bin/argv on a tool call is shown with an alert that
+  the call also carries a command (#321). On the CLI that command is repeated on an `Argv:` row directly under
+  `Deciding on:`, above the alert, because agent-controlled `params` can push the block's own `Argv:` row a screen or
+  more up. The alert fires whenever a tool call carries a command, even one that matches its `raw`; no in-repo
+  producer emits that shape ([policy-seam.md](./policy-seam.md) §The action record). Every other record heads with the
+  first of: a file edit's summary, `raw`, the reconstructed argv.
 - **Nothing on the web card or the audit receipt is clipped at any width.** Every value wraps
   (`overflow-wrap: anywhere`) and nothing is hidden behind `overflow: hidden` or a sideways scroll. The card's grid
   track is `minmax(0, 1fr)`, and the receipt's detail pane sets `min-width: 0`, so one long token cannot widen the page
