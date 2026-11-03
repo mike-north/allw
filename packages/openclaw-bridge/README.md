@@ -81,6 +81,16 @@ bridge that cannot gate must not appear to be gating.
 `<gateway-id>` is **asserted, not cryptographically verified** — the inbox presents it as an asserted
 origin (§7.1).
 
+The SDK encrypts each request only to the devices your account root vouches for in signed account
+state (`GET /{acct}/account-states`), never to the relay's device list, so a relay that lists a key it
+holds cannot read the request (`docs/enrollment.md` §Model, #243). `allw-approver pair` publishes that
+state. If the relay has none, the approval is denied with an error naming `allw-approver pair`; a state that does not verify is denied too. Each machine records the highest account-state sequence it has accepted in
+`~/.allw/state/<account-id>.floor.json` (`0600` in a `0700` directory) before sending, and denies a
+request when the relay serves an older state. A floor file that is unreadable, corrupt, or not owned
+by you also denies; delete it only if you know why it is wrong.
+The floor lives under `~/.allw/state/`, not `ALLW_OPENCLAW_STATE_DIR`, so every allw integrator on the
+machine shares one floor per account.
+
 ## Pairing
 
 ```sh

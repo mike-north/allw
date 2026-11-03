@@ -12,7 +12,7 @@ import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { pathToFileURL } from "node:url";
 
-import { createClient } from "@allw/sdk";
+import { createClient, fileSequenceFloorStore, relayAccountStateSource } from "@allw/sdk";
 import { loadWasm } from "@allw/hook";
 
 import { OpenClawBridge } from "./lib/bridge.js";
@@ -44,10 +44,20 @@ export async function runBridge(argv: readonly string[]): Promise<number> {
 
   const wasm = await loadWasm();
   const store = openCredentialStore(config.stateDir, config.gatewayId);
+  // Recipients come from the root-signed account state the relay serves, never from its device
+  // list; the per-account sequence floor under `~/.allw/state` refuses a rollback across restarts.
+  // A load, verification or floor failure throws inside `requestApproval`, which the bridge denies.
   const client = createClient({
     relayUrl: config.relayUrl,
     accountId: config.accountId,
     approverRootKey: config.approverRootKey,
+    expectedAccountId: config.accountId,
+    accountStates: relayAccountStateSource({
+      relayUrl: config.relayUrl,
+      accountId: config.accountId,
+      floorStore: fileSequenceFloorStore({ accountId: config.accountId }),
+      fetchTimeoutMs: config.fetchTimeoutMs,
+    }),
     fetchTimeoutMs: config.fetchTimeoutMs,
   });
 
