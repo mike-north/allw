@@ -292,9 +292,14 @@ interface WsClient {
   /**
    * Assert that no message is waiting on this socket, without waiting out a timeout. Sends a frame
    * the relay always answers (a non-JSON message gets an `error`) and requires that answer to be the
-   * next message. A Durable Object handles one event at a time, and every send this test caused
-   * (a connect's queue flush, a submit's fan-out, a verdict's retract) completed inside an earlier
-   * event, so any such message is already ahead of the answer on the socket.
+   * next message. A Durable Object handles one event at a time, and the sends these tests check (a
+   * connect's queue flush, a submit's fan-out) complete inside an earlier event, so any such message
+   * is already ahead of the answer on the socket.
+   *
+   * The guarantee is narrower than a long wait's: it covers only messages sent synchronously by
+   * events that have already completed. A send the relay defers to a timer, or makes after an
+   * `await` that lets the barrier's event run first, can land after the answer and go unseen. So
+   * this relies on the relay's message and connect handlers sending synchronously, as they do now.
    */
   expectNothingPending(): Promise<void>;
   send(obj: unknown): void;
@@ -362,8 +367,22 @@ async function connectWs(accountId: string, subPath: string): Promise<WsClient> 
       ws.send(JSON.stringify(obj));
     },
     async expectNothingPending(): Promise<void> {
+      // Created before the await, so a missing answer's stack names the calling test line rather
+      // than next()'s timer.
+      const callSite = new Error(
+        "expectNothingPending: the relay never answered the barrier frame",
+      );
       ws.send("barrier: not a JSON message");
-      expect(await next()).toEqual({ type: "error", error: "invalid JSON message" });
+      let answer: WsMessage;
+      try {
+        answer = await next();
+      } catch {
+        throw callSite;
+      }
+      expect(answer, "a message was already pending ahead of the barrier's answer").toEqual({
+        type: "error",
+        error: "invalid JSON message",
+      });
     },
     raw: ws,
   };
