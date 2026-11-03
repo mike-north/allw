@@ -26,7 +26,7 @@ import { AccountRelay } from "../src/index.js";
 import type { PushTransportRegistry } from "../src/push.js";
 import type { SqlStorage } from "@cloudflare/workers-types";
 import { pairingStartBody, testAccount } from "./support/accounts.js";
-import { pinRelayClock } from "./support/relay-clock.js";
+import { bindAccountRoot, pinRelayClock } from "./support/relay-state.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures (deterministic; never `Date.now()` in data — see fixed-dates rule)
@@ -88,7 +88,7 @@ function relayUrl(accountId: string, subPath: string): string {
   return `https://relay.allw.test/${accountId}${subPath}`;
 }
 
-/** Accounts whose relay clock has been pinned to {@link RELAY_NOW}. */
+/** Accounts whose root is bound and whose relay clock is pinned to {@link RELAY_NOW}. */
 const clockPinned = new Set<string>();
 
 async function post<T>(
@@ -113,6 +113,8 @@ async function post<T>(
     if (token !== undefined) finalHeaders.Authorization = `Bearer ${token}`;
   }
   if (subPath === "/requests" && !clockPinned.has(accountId)) {
+    // Submits need a bound account root (#248); tests that never pair bind the test root directly.
+    await bindAccountRoot(accountId);
     await pinRelayClock(accountId, RELAY_NOW);
     clockPinned.add(accountId);
   }
@@ -781,30 +783,29 @@ describe("AccountRelay — zero-knowledge (routing)", () => {
     const envelope = makeEnvelope("req-zk-1");
     await post(acct, "/requests", envelope);
     await device.next();
-    const verdict = makeVerdict("req-zk-1");
-    device.send({ type: "verdict", request_id: "req-zk-1", verdict });
-    await device.next();
 
-    // Inspect the DO's SQLite directly.
     const id = env.ACCOUNT.idFromName(acct);
     const stub = env.ACCOUNT.get(id);
-    const stored = await runInDurableObject(stub, (instance: AccountRelay) => {
-      const relay = instance as unknown as { sql: SqlStorage };
-      const reqRows = [
-        ...relay.sql.exec<{ envelope: string; status: string }>(
-          `SELECT envelope, status FROM request WHERE request_id = 'req-zk-1'`,
-        ),
-      ];
-      const verdictRows = [
-        ...relay.sql.exec<{ verdict: string }>(
-          `SELECT verdict FROM verdict WHERE request_id = 'req-zk-1'`,
-        ),
-      ];
-      return { reqRows, verdictRows };
-    });
+    const readStored = () =>
+      runInDurableObject(stub, (instance: AccountRelay) => {
+        const relay = instance as unknown as { sql: SqlStorage };
+        const reqRows = [
+          ...relay.sql.exec<{ envelope: string; status: string }>(
+            `SELECT envelope, status FROM request WHERE request_id = 'req-zk-1'`,
+          ),
+        ];
+        const verdictRows = [
+          ...relay.sql.exec<{ verdict: string }>(
+            `SELECT verdict FROM verdict WHERE request_id = 'req-zk-1'`,
+          ),
+        ];
+        return { reqRows, verdictRows };
+      });
 
-    // The stored envelope is exactly what was submitted — routing/lifecycle + opaque ciphertext.
-    const storedEnvelope = JSON.parse(stored.reqRows[0]?.envelope ?? "{}") as Record<
+    // While pending, the stored envelope is exactly what was submitted — routing/lifecycle +
+    // opaque ciphertext.
+    const pending = await readStored();
+    const storedEnvelope = JSON.parse(pending.reqRows[0]?.envelope ?? "{}") as Record<
       string,
       unknown
     >;
@@ -821,6 +822,17 @@ describe("AccountRelay — zero-knowledge (routing)", () => {
     ]) {
       expect(storedEnvelope[plaintextField]).toBeUndefined();
     }
+
+    const verdict = makeVerdict("req-zk-1");
+    device.send({ type: "verdict", request_id: "req-zk-1", verdict });
+    await device.next();
+
+    // Once resolved, the envelope (and its ciphertext) is blanked — only the verdict remains (#248).
+    const stored = await readStored();
+    expect(stored.reqRows[0]).toEqual({ envelope: "", status: "resolved" });
+    const polled = await get<{ status: string; verdict: unknown }>(acct, "/requests/req-zk-1");
+    expect(polled.data.status).toBe("resolved");
+    expect(polled.data.verdict).toEqual(verdict);
     // The verdict round-trips byte-for-byte (relay holds no key that could forge it).
     const storedVerdict = JSON.parse(stored.verdictRows[0]?.verdict ?? "{}") as Record<
       string,

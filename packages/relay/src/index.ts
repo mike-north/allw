@@ -29,6 +29,7 @@
 
 import {
   MAX_CONTEXT_CIPHERTEXT_BYTES,
+  MAX_PAIRING_BODY_BYTES,
   MAX_PENDING_REQUESTS_PER_ACCOUNT,
   MAX_REQUEST_BODY_BYTES,
   PAIRING_TTL_MS,
@@ -41,11 +42,12 @@ import {
   verifyPairingStartAuthorization,
 } from "./core.js";
 import {
+  clientRateLimitKey,
   enforceRateLimit,
   parseMaxRequestTtlMs,
   rateLimitKey,
   rateLimitedRoute,
-  readBodyCapped,
+  readJsonObjectCapped,
   utf8ByteLength,
   type RateLimiter,
 } from "./limits.js";
@@ -69,11 +71,13 @@ export interface Env {
   readonly FCM_BEARER_TOKEN?: string;
   /**
    * Cloudflare rate-limiting bindings for the unauthenticated routes (`wrangler.jsonc`
-   * `ratelimits`): `pairing/start` + `pairing/complete`, and `requests`. Missing ⇒ those routes
-   * fail closed with 503. See `./limits.ts`.
+   * `ratelimits`): per account + client, `pairing/start` + `pairing/complete` and `requests`; and
+   * per client alone across all three. Missing ⇒ those routes fail closed with 503. See
+   * `./limits.ts`.
    */
   readonly RATE_LIMIT_PAIRING?: RateLimiter;
   readonly RATE_LIMIT_REQUESTS?: RateLimiter;
+  readonly RATE_LIMIT_CLIENT?: RateLimiter;
   /** Optional request-horizon override in ms (default 15 min). See `parseMaxRequestTtlMs`. */
   readonly MAX_REQUEST_TTL_MS?: string;
 }
@@ -87,6 +91,12 @@ export default {
     // Rate-limit the unauthenticated routes at the edge, before the account's Durable Object.
     const route = rateLimitedRoute(request.method, url.pathname);
     if (route !== null) {
+      // Per client across every account first, so minting fresh account ids buys no new budget.
+      const clientRefused = await enforceRateLimit(
+        env.RATE_LIMIT_CLIENT,
+        clientRateLimitKey(request),
+      );
+      if (clientRefused) return clientRefused;
       const limiter = route === "pairing" ? env.RATE_LIMIT_PAIRING : env.RATE_LIMIT_REQUESTS;
       const refused = await enforceRateLimit(limiter, rateLimitKey(accountId, request));
       if (refused) return refused;
@@ -145,6 +155,11 @@ interface AccountMetaRow extends Record<string, string | number | null | ArrayBu
 
 interface RequestRow extends Record<string, string | number | null | ArrayBuffer> {
   request_id: string;
+  /**
+   * The submitted envelope while `pending`; blanked to `''` on every terminal transition (expired,
+   * retracted, resolved) — only pending requests are ever delivered, and status/verdict reads do
+   * not need it — so a retained terminal row costs a small residue, not its ciphertext (#248).
+   */
   envelope: string;
   created_at: number;
   expires_at: number;
@@ -448,6 +463,10 @@ const integratorTag = (requestId: string): string => `integrator:${requestId}`;
 // The exact, exhaustive set of ApprovalRequest envelope keys the relay accepts (contract.md
 // §Messages). Anything else is rejected at submit time to keep plaintext out of the relay.
 const ENVELOPE_KEYS = ["v", "id", "created_at", "expires_at", "approver", "context_ciphertext"];
+
+function pairingBodyTooLarge(): Response {
+  return json({ error: `request body exceeds ${String(MAX_PAIRING_BODY_BYTES)} bytes` }, 413);
+}
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
@@ -839,8 +858,10 @@ export class AccountRelay implements DurableObject {
       return coreUnavailable(err);
     }
 
-    const body = await parseJsonBody(request);
-    if (!body) return json({ error: "invalid JSON body" }, 400);
+    const read = await readJsonObjectCapped(request, MAX_PAIRING_BODY_BYTES);
+    if (read.kind === "too_large") return pairingBodyTooLarge();
+    if (read.kind === "invalid") return json({ error: "invalid JSON body" }, 400);
+    const body = read.body;
 
     const rootPubkey = requiredString(body, "root_pubkey");
     if (rootPubkey === null || !validatePubkey(rootPubkey)) {
@@ -952,8 +973,10 @@ export class AccountRelay implements DurableObject {
       return json({ error: "account root not bound; start a root-signed pairing first" }, 403);
     }
 
-    const body = await parseJsonBody(request);
-    if (!body) return json({ error: "invalid JSON body" }, 400);
+    const read = await readJsonObjectCapped(request, MAX_PAIRING_BODY_BYTES);
+    if (read.kind === "too_large") return pairingBodyTooLarge();
+    if (read.kind === "invalid") return json({ error: "invalid JSON body" }, 400);
+    const body = read.body;
 
     const code = requiredString(body, "code");
     if (!code) return json({ error: "'code' is required (string)" }, 400);
@@ -1366,6 +1389,7 @@ export class AccountRelay implements DurableObject {
    *
    * Stores the request and fans the ciphertext out to every online device. If no device is
    * connected it stays queued and is delivered on the next `…/connect` (see handleDeviceConnect).
+   * - 404: the account has no bound root (`unknown account`): no device can have paired.
    * - 400: not exactly the contract's envelope fields, already expired, or `expires_at - now`
    *        beyond the request horizon (`maxRequestTtlMs`, default 15 min).
    * - 409: a request with this `id` was already submitted.
@@ -1375,21 +1399,18 @@ export class AccountRelay implements DurableObject {
    * (The Worker's rate limiter may also answer 429/503 before this handler runs.)
    */
   private async handleSubmit(request: Request, accountId: string): Promise<Response> {
+    // No bound root ⇒ no device can have paired (#242), so nothing could ever decide this request.
+    // Refuse before reading the body rather than store requests for accounts nobody owns.
+    if (this.boundRootPubkey() === null) return json({ error: "unknown account" }, 404);
+
     // Size-check the body BEFORE parsing it: an unauthenticated caller must not make the relay
     // buffer or parse an arbitrarily large document.
-    const body = await readBodyCapped(request, MAX_REQUEST_BODY_BYTES);
-    if (body.kind === "too_large") {
+    const read = await readJsonObjectCapped(request, MAX_REQUEST_BODY_BYTES);
+    if (read.kind === "too_large") {
       return json({ error: `request body exceeds ${String(MAX_REQUEST_BODY_BYTES)} bytes` }, 413);
     }
-    if (body.kind === "unreadable") return json({ error: "invalid JSON body" }, 400);
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(body.text);
-    } catch {
-      return json({ error: "invalid JSON body" }, 400);
-    }
-    if (!isPlainObject(parsed)) return json({ error: "invalid JSON body" }, 400);
-    const envelope = parsed;
+    if (read.kind === "invalid") return json({ error: "invalid JSON body" }, 400);
+    const envelope = read.body;
 
     // SECURITY (zero-knowledge): the ApprovalRequest envelope must be EXACTLY the contract's
     // routing/lifecycle fields wrapping the opaque ciphertext (contract.md §Messages). Rejecting
@@ -1600,7 +1621,7 @@ export class AccountRelay implements DurableObject {
 
     const now = Date.now();
     this.sql.exec(
-      `UPDATE request SET status = 'retracted', terminal_at = ?
+      `UPDATE request SET status = 'retracted', terminal_at = ?, envelope = ''
        WHERE request_id = ? AND status = 'pending'`,
       now,
       requestId,
@@ -1680,7 +1701,7 @@ export class AccountRelay implements DurableObject {
   ): string {
     if (status === "pending" && now > expiresAt) {
       this.sql.exec(
-        `UPDATE request SET status = 'expired', terminal_at = ?
+        `UPDATE request SET status = 'expired', terminal_at = ?, envelope = ''
          WHERE request_id = ? AND status = 'pending'`,
         now,
         requestId,
@@ -1886,7 +1907,7 @@ export class AccountRelay implements DurableObject {
       return;
     }
     this.sql.exec(
-      `UPDATE request SET status = 'resolved', terminal_at = ? WHERE request_id = ?`,
+      `UPDATE request SET status = 'resolved', terminal_at = ?, envelope = '' WHERE request_id = ?`,
       now,
       requestId,
     );
@@ -1966,7 +1987,7 @@ export class AccountRelay implements DurableObject {
     ];
     for (const request of overdue) {
       this.sql.exec(
-        `UPDATE request SET status = 'expired', terminal_at = ?
+        `UPDATE request SET status = 'expired', terminal_at = ?, envelope = ''
          WHERE request_id = ? AND status = 'pending'`,
         now,
         request.request_id,
@@ -2025,6 +2046,8 @@ export class AccountRelay implements DurableObject {
     );
 
     this.sql.exec(`DELETE FROM verdict WHERE request_id NOT IN (SELECT request_id FROM request)`);
+    // Rows that went terminal before envelopes were blanked on transition: drop their ciphertext.
+    this.sql.exec(`UPDATE request SET envelope = '' WHERE status != 'pending' AND envelope != ''`);
   }
 }
 
