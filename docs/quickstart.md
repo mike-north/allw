@@ -11,7 +11,8 @@ stand-ins, called out inline. Where a step is **not yet wired**, it says so rath
 > - One audited Rust core (crypto, contract, verdict verification), shipped as **WASM** — every
 >   surface below runs it under `node`, with **no Rust toolchain at install time**.
 > - A fail-closed Claude Code **PreToolUse hook** (`@allw/hook`) that turns a gated tool call into an
->   approval request and only emits `allow` for a verified human "yes".
+>   approval request and denies anything but a verified human "yes". It never grants: on a "yes"
+>   it steps aside and Claude Code's own permission rules decide.
 > - The same gate for **Codex** (`@allw/codex-hook`) — see [`docs/codex-integration.md`](./codex-integration.md)
 >   for the Codex-specific hook config; steps 0–3 below (relay, install, pairing, watch) are identical.
 > - A **second-device approver** (`@allw/approver`) that renders the exact action (WYSIWYS), prompts
@@ -167,14 +168,17 @@ export ALLW_APPROVER_ROOT_KEY="<ACCOUNT_ROOT_PUBLIC_KEY_FROM_STEP_2>"
 ```
 
 Then register the hook in your project's (or user's) `.claude/settings.json` as a **PreToolUse**
-hook. The matcher `Bash|mcp__.*` gates shell commands and any MCP tool call:
+hook. The matcher `Bash|Edit|MultiEdit|Write|mcp__.*` gates shell commands, direct file edits and
+any MCP tool call. (Beyond a demo, install the hook outside the project and register it in
+`~/.claude/settings.json`, so the agent can't edit the gate:
+[Install the hook where the agent can't write it](./claude-code-integration.md#install-the-hook-where-the-agent-cant-write-it).)
 
 ```json
 {
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|mcp__.*",
+        "matcher": "Bash|Edit|MultiEdit|Write|mcp__.*",
         "hooks": [
           {
             "type": "command",
@@ -189,7 +193,7 @@ hook. The matcher `Bash|mcp__.*` gates shell commands and any MCP tool call:
 ```
 
 > **Always pin `"timeout": 480`** (seconds). Without it the hook inherits Claude Code's 600s default;
-> the pin guarantees the hook always emits an explicit `allow`/`deny` before Claude Code could time
+> the pin guarantees the hook always reaches its decision before Claude Code could time
 > it out (the fail-closed timeout-ordering invariant — see [`@allw/hook`](../packages/hook/README.md)).
 >
 > `npx allw-hook` resolves the installed bin. If your Claude Code launch environment does not see the
@@ -212,8 +216,11 @@ What happens:
    over the relay.
 3. Your **watch terminal (step 3) prints the exact command** (WYSIWYS) and prompts
    `Approve / Deny / Skip?`.
-4. Press **`a`** to approve. The hook receives the verified verdict and emits `allow`; Claude Code
-   runs the command.
+4. Press **`a`** to approve. The hook verifies the verdict and steps aside (no decision; it never
+   emits `allow`). Claude Code then applies its own permission rules, so in the default mode it may
+   still ask you at the desk; see
+   [After an approval](./claude-code-integration.md#after-an-approval-claude-codes-own-permissions-still-apply)
+   to make the phone the only prompt.
 5. Press **`d`** to deny (or just wait for the timeout): the hook emits `deny` and Claude Code is
    blocked. **Fail-closed both ways.**
 
@@ -230,7 +237,7 @@ end-to-end-encrypted and cryptographically verified.
 | Hook denies with "vendored wasm not found"   | You're running an unbuilt checkout, not the installed package. `npm install @allw/hook` (it bundles the WASM via `@allw/sdk`). |
 | No prompt appears in the watch terminal      | The account id / `--relay` printed by `pair` must match the hook's `ALLW_ACCOUNT_ID` / `ALLW_RELAY_URL`.                       |
 | Request times out immediately                | Check the relay is running (step 0) and reachable at `ALLW_RELAY_URL`.                                                         |
-| `git status` runs without prompting          | Only `Bash` and `mcp__*` are gated. Reads/edits/greps pass through by design (v0 conservative matcher).                        |
+| A read or search runs without your approver  | By design: only `Bash`, `Edit`/`MultiEdit`/`Write` and `mcp__*` are gated. allw makes no decision for the rest.                |
 
 ---
 

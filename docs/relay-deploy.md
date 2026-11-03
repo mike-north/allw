@@ -247,7 +247,8 @@ EOF
 
 The watch terminal should display the pending approval. Press `a` to approve.
 
-The hook should emit `allow` and exit 0. This confirms:
+The hook should exit 0 with **empty stdout**: after a verified approval allw makes no decision (it
+never emits `allow`), so Claude Code's own permission rules apply. This confirms:
 
 1. The relay is reachable at the deployed URL.
 2. Pairing, device presence (WebSocket), and request submission all work.
