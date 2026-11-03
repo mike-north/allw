@@ -29,7 +29,14 @@
  */
 
 import { AlarmMultiplexer } from "./alarms.js";
-import { PAIRING_TTL_MS } from "./constants.js";
+import {
+  MAX_CONTEXT_CIPHERTEXT_BYTES,
+  MAX_CREATED_AT_SKEW_MS,
+  MAX_PAIRING_BODY_BYTES,
+  MAX_REQUEST_BODY_BYTES,
+  PAIRING_TTL_MS,
+  REQUEST_RETENTION_MS,
+} from "./constants.js";
 import { withCors, type CorsEnv } from "./cors.js";
 import {
   CoreUnavailableError,
@@ -41,6 +48,7 @@ import {
   verifyPairingStartAuthorization,
   verifyVerdictProvenance,
 } from "./core.js";
+import { parseMaxRequestTtlMs, readJsonObjectCapped, utf8ByteLength } from "./limits.js";
 import {
   ApnsPushTransport,
   FcmPushTransport,
@@ -77,6 +85,8 @@ export interface Env extends VapidEnv, CorsEnv {
   readonly APNS_BEARER_TOKEN?: string;
   readonly FCM_ENDPOINT?: string;
   readonly FCM_BEARER_TOKEN?: string;
+  /** Optional request-horizon override in ms (default 15 min). See `parseMaxRequestTtlMs`. */
+  readonly MAX_REQUEST_TTL_MS?: string;
 }
 
 export default {
@@ -159,6 +169,11 @@ interface AccountMetaRow extends Record<string, string | number | null | ArrayBu
 
 interface RequestRow extends Record<string, string | number | null | ArrayBuffer> {
   request_id: string;
+  /**
+   * The submitted envelope while `pending`; blanked to `''` on every terminal transition (expired,
+   * retracted, resolved) — only pending requests are ever delivered, and status/verdict reads do
+   * not need it — so a retained terminal row costs a small residue, not its ciphertext (#248).
+   */
   envelope: string;
   created_at: number;
   expires_at: number;
@@ -211,7 +226,6 @@ if (PAIRING_ALPHABET.length !== 32) {
 }
 
 const PAIRING_CODE_LENGTH = 8;
-const REQUEST_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const AUTH_TOKEN_BYTES = 32;
 const MAX_ACCOUNT_STATE_DOCS = 16;
 const MAX_ACCOUNT_STATE_JWS_BYTES = 32 * 1024;
@@ -523,9 +537,20 @@ const deviceTag = (deviceId: string): string => `device:${deviceId}`;
 const surfaceTag = (surfaceId: string): string => `surface:${surfaceId}`;
 const integratorTag = (requestId: string): string => `integrator:${requestId}`;
 
+/**
+ * Canonical UUID text form (RFC 9562 §4, which generators MUST emit in lowercase): 8-4-4-4-12
+ * lowercase hex digits. Only that one spelling is accepted, and ids are never normalized: the id is
+ * inside the envelope the device sees and binds to, so one UUID must have exactly one identity.
+ */
+const REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
 // The exact, exhaustive set of ApprovalRequest envelope keys the relay accepts (contract.md
 // §Messages). Anything else is rejected at submit time to keep plaintext out of the relay.
 const ENVELOPE_KEYS = ["v", "id", "created_at", "expires_at", "approver", "context_ciphertext"];
+
+function pairingBodyTooLarge(): Response {
+  return json({ error: `request body exceeds ${String(MAX_PAIRING_BODY_BYTES)} bytes` }, 413);
+}
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
@@ -601,6 +626,14 @@ export class AccountRelay implements DurableObject {
   private readonly sql: SqlStorage;
   private readonly ctx: DurableObjectState;
   private readonly pushTransports: PushTransportRegistry;
+  /** Request horizon: `expires_at - now` above this is refused at submit (#248). */
+  private readonly maxRequestTtlMs: number;
+  /**
+   * Clock for the submit limits, push-wakeup scheduling and Web Push TTL, and the expiry
+   * alarm/sweep. Tests replace it on the instance (via
+   * `runInDurableObject`) to probe exact boundaries; production always reads the real time.
+   */
+  private now: () => number = () => Date.now();
   /**
    * Spaces Web Push wakeups per subscription (`WEB_PUSH_COALESCE_MS`); see `schedulePushWakeups`.
    * Last claims are kept in SQLite ({@link DevicePushTokenClaimStore}).
@@ -617,7 +650,9 @@ export class AccountRelay implements DurableObject {
   constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
     this.sql = ctx.storage.sql;
-    this.pushTransports = buildPushTransports(env);
+    // The Web Push TTL is derived from the same injectable clock as the submit limits.
+    this.pushTransports = buildPushTransports(env, () => this.now());
+    this.maxRequestTtlMs = parseMaxRequestTtlMs(env.MAX_REQUEST_TTL_MS);
     this.initSchema();
     this.webPushCoalescer = new WakeupCoalescer(
       WEB_PUSH_COALESCE_MS,
@@ -1004,8 +1039,10 @@ export class AccountRelay implements DurableObject {
       return coreUnavailable(err);
     }
 
-    const body = await parseJsonBody(request);
-    if (!body) return json({ error: "invalid JSON body" }, 400);
+    const read = await readJsonObjectCapped(request, MAX_PAIRING_BODY_BYTES);
+    if (read.kind === "too_large") return pairingBodyTooLarge();
+    if (read.kind === "invalid") return json({ error: "invalid JSON body" }, 400);
+    const body = read.body;
 
     const rootPubkey = requiredString(body, "root_pubkey");
     if (rootPubkey === null || !validatePubkey(rootPubkey)) {
@@ -1120,8 +1157,10 @@ export class AccountRelay implements DurableObject {
       return json({ error: "account root not bound; start a root-signed pairing first" }, 403);
     }
 
-    const body = await parseJsonBody(request);
-    if (!body) return json({ error: "invalid JSON body" }, 400);
+    const read = await readJsonObjectCapped(request, MAX_PAIRING_BODY_BYTES);
+    if (read.kind === "too_large") return pairingBodyTooLarge();
+    if (read.kind === "invalid") return json({ error: "invalid JSON body" }, 400);
+    const body = read.body;
 
     const code = requiredString(body, "code");
     if (!code) return json({ error: "'code' is required (string)" }, 400);
@@ -1666,12 +1705,28 @@ export class AccountRelay implements DurableObject {
    *
    * Stores the request and fans the ciphertext out to every online device. If no device is
    * connected it stays queued and is delivered on the next `…/connect` (see handleDeviceConnect).
-   * - 400: not exactly the contract's envelope fields, or already expired.
+   * - 404: the account has no bound root (`unknown account`): no device can have paired.
+   * - 400: not exactly the contract's envelope fields, an `id` that is not a lowercase canonical
+   *        UUID, an `expires_at` that is not an integer or is already past, `expires_at - now` beyond the request horizon (`maxRequestTtlMs`,
+   *        default 15 min), or a `created_at` that is not an integer, is after `expires_at`, is
+   *        more than the horizon in the past, or is more than `MAX_CREATED_AT_SKEW_MS` ahead.
    * - 409: a request with this `id` was already submitted.
+   * - 413: the body exceeds `MAX_REQUEST_BODY_BYTES` (checked before parsing) or
+   *        `context_ciphertext` exceeds `MAX_CONTEXT_CIPHERTEXT_BYTES`.
    */
   private async handleSubmit(request: Request, accountId: string): Promise<Response> {
-    const envelope = await parseJsonBody(request);
-    if (!envelope) return json({ error: "invalid JSON body" }, 400);
+    // No bound root ⇒ no device can have paired (#242), so nothing could ever decide this request.
+    // Refuse before reading the body rather than store requests for accounts nobody owns.
+    if (this.boundRootPubkey() === null) return json({ error: "unknown account" }, 404);
+
+    // Size-check the body BEFORE parsing it: an unauthenticated caller must not make the relay
+    // buffer or parse an arbitrarily large document.
+    const read = await readJsonObjectCapped(request, MAX_REQUEST_BODY_BYTES);
+    if (read.kind === "too_large") {
+      return json({ error: `request body exceeds ${String(MAX_REQUEST_BODY_BYTES)} bytes` }, 413);
+    }
+    if (read.kind === "invalid") return json({ error: "invalid JSON body" }, 400);
+    const envelope = read.body;
 
     // SECURITY (zero-knowledge): the ApprovalRequest envelope must be EXACTLY the contract's
     // routing/lifecycle fields wrapping the opaque ciphertext (contract.md §Messages). Rejecting
@@ -1684,24 +1739,50 @@ export class AccountRelay implements DurableObject {
 
     const id = requiredString(envelope, "id");
     if (!id) return json({ error: "'id' is required (string)" }, 400);
+    // Lowercase canonical UUID syntax only (contract §Transport: UUIDv4+). Bounds the id's size —
+    // it is a primary key, a WebSocket tag and part of every retained row — and its character set,
+    // and gives each UUID one spelling (never normalized: the device binds to the id as sent).
+    if (!REQUEST_ID_PATTERN.test(id)) {
+      return json({ error: "'id' must be a lowercase canonical UUID (8-4-4-4-12 hex)" }, 400);
+    }
     if (requiredNumber(envelope, "v") === null) {
       return json({ error: "'v' is required (number)" }, 400);
     }
-    if (requiredNumber(envelope, "created_at") === null) {
-      return json({ error: "'created_at' is required (i64 ms)" }, 400);
-    }
+    const createdAt = requiredNumber(envelope, "created_at");
+    if (createdAt === null) return json({ error: "'created_at' is required (i64 ms)" }, 400);
     if (!requiredString(envelope, "approver")) {
       return json({ error: "'approver' is required (string)" }, 400);
     }
-    // The ciphertext is opaque to the relay — present and a string is all we check.
-    if (!requiredString(envelope, "context_ciphertext")) {
+    // The ciphertext is opaque to the relay — present, a string, and within the size cap is all
+    // we check.
+    const contextCiphertext = requiredString(envelope, "context_ciphertext");
+    if (!contextCiphertext) {
       return json({ error: "'context_ciphertext' is required (opaque JWE string)" }, 400);
+    }
+    if (utf8ByteLength(contextCiphertext) > MAX_CONTEXT_CIPHERTEXT_BYTES) {
+      return json(
+        { error: `'context_ciphertext' exceeds ${String(MAX_CONTEXT_CIPHERTEXT_BYTES)} bytes` },
+        413,
+      );
     }
     const expiresAt = requiredNumber(envelope, "expires_at");
     if (expiresAt === null) return json({ error: "'expires_at' is required (i64 ms)" }, 400);
+    if (!Number.isInteger(expiresAt)) {
+      return json({ error: "'expires_at' must be an integer (i64 ms)" }, 400);
+    }
 
-    const now = Date.now();
+    const now = this.now();
     if (expiresAt <= now) return json({ error: "request already expired" }, 400);
+    // Horizon: a far-future `expires_at` would otherwise keep a request pending (stored, counted,
+    // shown to devices) indefinitely.
+    if (expiresAt - now > this.maxRequestTtlMs) {
+      return json(
+        { error: `'expires_at' is more than ${String(this.maxRequestTtlMs)} ms in the future` },
+        400,
+      );
+    }
+    const createdAtFailure = this.createdAtFailure(createdAt, expiresAt, now);
+    if (createdAtFailure !== null) return json({ error: createdAtFailure }, 400);
     const requestAuthToken = generateAuthToken();
     const requestAuthTokenHash = await hashAuthToken(requestAuthToken);
 
@@ -1740,6 +1821,27 @@ export class AccountRelay implements DurableObject {
     if (coalesced > 0) await this.armTrailingWakeupAlarm();
 
     return this.requestSubmitResponse(id, delivered, pushWakeups, requestAuthToken);
+  }
+
+  /**
+   * Why a submitted `created_at` is not plausible, or `null` when it is. The window is the
+   * submitter's own, so this closes no attack: it turns a request the device would reject as
+   * unverifiable after the human taps into a 400 at submit. Each bound is inclusive:
+   * - an integer (contract §Transport: i64 ms);
+   * - no later than `expires_at`;
+   * - no further back than the request horizon (`now - maxRequestTtlMs`);
+   * - no further ahead than `MAX_CREATED_AT_SKEW_MS` (clock skew).
+   */
+  private createdAtFailure(createdAt: number, expiresAt: number, now: number): string | null {
+    if (!Number.isInteger(createdAt)) return "'created_at' must be an integer (i64 ms)";
+    if (createdAt > expiresAt) return "'created_at' is after 'expires_at'";
+    if (createdAt < now - this.maxRequestTtlMs) {
+      return `'created_at' is more than ${String(this.maxRequestTtlMs)} ms in the past`;
+    }
+    if (createdAt > now + MAX_CREATED_AT_SKEW_MS) {
+      return `'created_at' is more than ${String(MAX_CREATED_AT_SKEW_MS)} ms in the future`;
+    }
+    return null;
   }
 
   private async authorizeRequestRead(
@@ -1812,7 +1914,7 @@ export class AccountRelay implements DurableObject {
     requestId: string,
     expiresAt: number,
   ): { scheduled: number; coalesced: number } {
-    const now = Date.now();
+    const now = this.now();
     const claimedWebPushKeys: string[] = [];
     let coalesced = 0;
     const tokens = schedulablePushTokens(
@@ -2109,7 +2211,7 @@ export class AccountRelay implements DurableObject {
 
     const now = Date.now();
     this.sql.exec(
-      `UPDATE request SET status = 'retracted', terminal_at = ?
+      `UPDATE request SET status = 'retracted', terminal_at = ?, envelope = ''
        WHERE request_id = ? AND status = 'pending'`,
       now,
       requestId,
@@ -2190,7 +2292,7 @@ export class AccountRelay implements DurableObject {
   ): string {
     if (status === "pending" && now > expiresAt) {
       this.sql.exec(
-        `UPDATE request SET status = 'expired', terminal_at = ?
+        `UPDATE request SET status = 'expired', terminal_at = ?, envelope = ''
          WHERE request_id = ? AND status = 'pending'`,
         now,
         requestId,
@@ -2449,7 +2551,7 @@ export class AccountRelay implements DurableObject {
       return;
     }
     this.sql.exec(
-      `UPDATE request SET status = 'resolved', terminal_at = ? WHERE request_id = ?`,
+      `UPDATE request SET status = 'resolved', terminal_at = ?, envelope = '' WHERE request_id = ?`,
       now,
       requestId,
     );
@@ -2519,7 +2621,7 @@ export class AccountRelay implements DurableObject {
    */
   async alarm(): Promise<void> {
     await this.alarms.run(
-      Date.now(),
+      this.now(),
       {
         "request-expiry": (now) => this.expireDueRequests(now),
         "webpush-trailing-wakeup": (now) => this.sendTrailingWakeups(now),
@@ -2531,7 +2633,7 @@ export class AccountRelay implements DurableObject {
   /**
    * Alarm purpose `request-expiry`: fail-close expired pending requests, retract them from
    * connected devices, wake live integrator waiters, sweep old terminal rows, and then schedule the
-   * next pending expiry.
+   * next pending deadline.
    */
   private async expireDueRequests(now: number): Promise<void> {
     const expired = this.expirePendingDue(now);
@@ -2542,28 +2644,43 @@ export class AccountRelay implements DurableObject {
     await this.armExpiryAlarm();
   }
 
-  /** Point the `request-expiry` alarm purpose at the nearest pending expiry, or clear it when none remains. */
+  /**
+   * Point the `request-expiry` alarm purpose at the nearest pending deadline, or clear it when no
+   * pending request remains. A pending row's deadline is its `expires_at`, capped at
+   * `created_at + maxRequestTtlMs` so a row stored before the horizon existed (far-future
+   * `expires_at`) is still expired and swept.
+   */
   private async armExpiryAlarm(): Promise<void> {
     const next = [
-      ...this.sql.exec<{ expires_at: number }>(
-        `SELECT expires_at FROM request WHERE status = 'pending' ORDER BY expires_at ASC LIMIT 1`,
+      ...this.sql.exec<{ deadline: number }>(
+        `SELECT MIN(expires_at, created_at + ?) AS deadline FROM request
+         WHERE status = 'pending' ORDER BY deadline ASC LIMIT 1`,
+        this.maxRequestTtlMs,
       ),
     ][0];
-    await this.alarms.schedule("request-expiry", next?.expires_at ?? null);
+    await this.alarms.schedule("request-expiry", next?.deadline ?? null);
   }
 
-  /** Mark every overdue pending request expired and return the rows that changed state. */
+  /**
+   * Mark every overdue pending request expired and return the rows that changed state. Overdue
+   * means past `expires_at`, or older than the horizon (`created_at + maxRequestTtlMs <= now`) —
+   * the latter only happens to rows stored before the horizon was enforced. Once expired, a row is
+   * removed by {@link sweepTerminalRows} after the retention window, so no pending row is stored
+   * forever.
+   */
   private expirePendingDue(now: number): RequestRow[] {
     const overdue = [
       ...this.sql.exec<RequestRow>(
         `SELECT request_id, envelope, created_at, expires_at, status, terminal_at FROM request
-         WHERE status = 'pending' AND expires_at <= ? ORDER BY expires_at ASC`,
+         WHERE status = 'pending' AND (expires_at <= ? OR created_at <= ?)
+         ORDER BY expires_at ASC`,
         now,
+        now - this.maxRequestTtlMs,
       ),
     ];
     for (const request of overdue) {
       this.sql.exec(
-        `UPDATE request SET status = 'expired', terminal_at = ?
+        `UPDATE request SET status = 'expired', terminal_at = ?, envelope = ''
          WHERE request_id = ? AND status = 'pending'`,
         now,
         request.request_id,
@@ -2607,7 +2724,12 @@ export class AccountRelay implements DurableObject {
     }
   }
 
-  /** Bound storage growth by removing old terminal request rows and their stored verdicts. */
+  /**
+   * Bound storage growth by removing old terminal request rows and their stored verdicts. Pending
+   * rows reach this sweep through {@link expirePendingDue}, which the alarm runs first: every
+   * pending row past its deadline (including the horizon cap) is expired there, so no pending row
+   * outlives `deadline + REQUEST_RETENTION_MS`.
+   */
   private sweepTerminalRows(now: number): void {
     const cutoff = now - REQUEST_RETENTION_MS;
     this.sql.exec(
@@ -2615,7 +2737,10 @@ export class AccountRelay implements DurableObject {
        WHERE status IN ('expired', 'resolved', 'retracted') AND terminal_at IS NOT NULL AND terminal_at < ?`,
       cutoff,
     );
+
     this.sql.exec(`DELETE FROM verdict WHERE request_id NOT IN (SELECT request_id FROM request)`);
+    // Rows that went terminal before envelopes were blanked on transition: drop their ciphertext.
+    this.sql.exec(`UPDATE request SET envelope = '' WHERE status != 'pending' AND envelope != ''`);
   }
 }
 
@@ -2625,7 +2750,7 @@ export class AccountRelay implements DurableObject {
  * picks them up) but are neither sent nor counted in `push_wakeups`; devices then rely on WebSocket
  * presence and polling.
  */
-function buildPushTransports(env: Env): PushTransportRegistry {
+function buildPushTransports(env: Env, now: () => number): PushTransportRegistry {
   const transports: PushTransportRegistry = {};
   if (env.APNS_ENDPOINT && env.APNS_TOPIC && env.APNS_BEARER_TOKEN) {
     transports.apns = new ApnsPushTransport({
@@ -2641,6 +2766,6 @@ function buildPushTransports(env: Env): PushTransportRegistry {
     });
   }
   const vapid = vapidConfigFromEnv(env);
-  if (vapid) transports.webpush = new WebPushTransport({ vapid });
+  if (vapid) transports.webpush = new WebPushTransport({ vapid, now });
   return transports;
 }

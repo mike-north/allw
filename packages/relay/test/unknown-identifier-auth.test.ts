@@ -15,12 +15,18 @@
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import type { SqlStorage } from "@cloudflare/workers-types";
-import { pairingStartBody, testAccount } from "./support/accounts.js";
+import { pairingStartBody, testAccount, testRequestId as rid } from "./support/accounts.js";
 import { DEVICE_X25519_PUBKEY } from "./support/keys.js";
+import { bindAccountRoot, pinRelayClock } from "./support/relay-state.js";
 
-/** Fixed envelope timestamps (never `Date.now()` in data); the expiry is far in the future. */
-const CREATED_AT = 1_700_000_000_000;
+/**
+ * Fixed times (never `Date.now()` in data): the relay's clock is pinned five minutes before the
+ * request's expiry, and the request was created a minute before that, inside the submit limits
+ * (`docs/relay-api.md` §3).
+ */
 const FUTURE_EXPIRES_AT = 4_102_444_800_000;
+const RELAY_NOW = FUTURE_EXPIRES_AT - 5 * 60 * 1000;
+const CREATED_AT = RELAY_NOW - 60_000;
 
 const NO_TOKEN = { status: 401, body: { error: "authorization required" } };
 const WRONG_TOKEN = { status: 403, body: { error: "authorization denied" } };
@@ -75,8 +81,13 @@ async function expectIndistinguishable(
   }
 }
 
-/** Submit a pending request; returns its request-scoped auth token. */
+/**
+ * Submit a pending request (binding the account's root and pinning the relay clock first, as a
+ * submit requires); returns its request-scoped auth token.
+ */
 async function submit(accountId: string, requestId: string): Promise<string> {
+  await bindAccountRoot(accountId);
+  await pinRelayClock(accountId, RELAY_NOW);
   const resp = await SELF.fetch(relayUrl(accountId, "/requests"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -97,28 +108,28 @@ async function submit(accountId: string, requestId: string): Promise<string> {
 describe("request ids: an unknown id answers like a wrong token (#357)", () => {
   it("GET /requests/{id}", async () => {
     const acct = testAccount("acct-oracle-poll");
-    const token = await submit(acct, "req-oracle-poll");
+    const token = await submit(acct, rid("req-oracle-poll"));
     await expectIndistinguishable(
       (id, t) => call(acct, "GET", `/requests/${id}`, { token: t }),
-      "req-oracle-poll",
-      "req-oracle-poll-unknown",
+      rid("req-oracle-poll"),
+      rid("req-oracle-poll-unknown"),
     );
-    const owner = await call(acct, "GET", "/requests/req-oracle-poll", { token });
+    const owner = await call(acct, "GET", `/requests/${rid("req-oracle-poll")}`, { token });
     expect(owner).toEqual({
       status: 200,
-      body: { request_id: "req-oracle-poll", status: "pending" },
+      body: { request_id: rid("req-oracle-poll"), status: "pending" },
     });
   });
 
   it("GET /requests/{id}/wait", async () => {
     const acct = testAccount("acct-oracle-wait");
-    const token = await submit(acct, "req-oracle-wait");
+    const token = await submit(acct, rid("req-oracle-wait"));
     await expectIndistinguishable(
       (id, t) => call(acct, "GET", `/requests/${id}/wait`, { token: t, websocket: true }),
-      "req-oracle-wait",
-      "req-oracle-wait-unknown",
+      rid("req-oracle-wait"),
+      rid("req-oracle-wait-unknown"),
     );
-    const owner = await SELF.fetch(relayUrl(acct, "/requests/req-oracle-wait/wait"), {
+    const owner = await SELF.fetch(relayUrl(acct, `/requests/${rid("req-oracle-wait")}/wait`), {
       headers: { Upgrade: "websocket", Authorization: `Bearer ${token}` },
     });
     expect(owner.status).toBe(101);
@@ -128,14 +139,14 @@ describe("request ids: an unknown id answers like a wrong token (#357)", () => {
 
   it("POST /requests/{id}/retract", async () => {
     const acct = testAccount("acct-oracle-retract");
-    const token = await submit(acct, "req-oracle-retract");
+    const token = await submit(acct, rid("req-oracle-retract"));
     await expectIndistinguishable(
       (id, t) => call(acct, "POST", `/requests/${id}/retract`, { token: t, body: {} }),
-      "req-oracle-retract",
-      "req-oracle-retract-unknown",
+      rid("req-oracle-retract"),
+      rid("req-oracle-retract-unknown"),
     );
     // The probes changed nothing: the owner's retract is the first to land.
-    const owner = await call(acct, "POST", "/requests/req-oracle-retract/retract", {
+    const owner = await call(acct, "POST", `/requests/${rid("req-oracle-retract")}/retract`, {
       token,
       body: {},
     });
@@ -146,24 +157,29 @@ describe("request ids: an unknown id answers like a wrong token (#357)", () => {
   // request's state is no more visible than its existence.
   it("POST /requests/{id}/retract on an expired request: 403 to a stranger, never 409", async () => {
     const acct = testAccount("acct-oracle-retract-expired");
-    const token = await submit(acct, "req-oracle-retract-expired");
+    const token = await submit(acct, rid("req-oracle-retract-expired"));
     await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(acct)), (instance) => {
       const relay = instance as unknown as { sql: SqlStorage };
       relay.sql.exec(
         `UPDATE request SET expires_at = 1 WHERE request_id = ?`,
-        "req-oracle-retract-expired",
+        rid("req-oracle-retract-expired"),
       );
     });
     await expectIndistinguishable(
       (id, t) => call(acct, "POST", `/requests/${id}/retract`, { token: t, body: {} }),
-      "req-oracle-retract-expired",
-      "req-oracle-retract-expired-unknown",
+      rid("req-oracle-retract-expired"),
+      rid("req-oracle-retract-expired-unknown"),
     );
     // Only the owner learns the state.
-    const owner = await call(acct, "POST", "/requests/req-oracle-retract-expired/retract", {
-      token,
-      body: {},
-    });
+    const owner = await call(
+      acct,
+      "POST",
+      `/requests/${rid("req-oracle-retract-expired")}/retract`,
+      {
+        token,
+        body: {},
+      },
+    );
     expect(owner.status).toBe(409);
   });
 });

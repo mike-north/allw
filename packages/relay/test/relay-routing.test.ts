@@ -37,9 +37,11 @@ import {
   signTestVerdict,
   TEST_DECIDED_AT,
   testAccount,
+  testRequestId as rid,
   testRoot,
 } from "./support/accounts.js";
 import { DEVICE_X25519_PUBKEY } from "./support/keys.js";
+import { bindAccountRoot, pinRelayClock } from "./support/relay-state.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures (deterministic; never `Date.now()` in data — see fixed-dates rule)
@@ -52,8 +54,17 @@ const DEVICE_PUBKEY = DEVICE_X25519_PUBKEY;
 const FUTURE_EXPIRES_AT = 4102444800000;
 /** A past expiry (1970-01-01T00:00:01Z, ms) — always < the relay's real `Date.now()` (fail-closed tests). */
 const PAST_EXPIRES_AT = 1000;
-/** A fixed creation timestamp (2023-11-14Z, ms). */
-const CREATED_AT = 1700000000000;
+/**
+ * The relay's injected clock for accounts that submit requests: five minutes before
+ * {@link FUTURE_EXPIRES_AT}, so that fixed expiry is inside the request horizon (#248).
+ */
+const RELAY_NOW = FUTURE_EXPIRES_AT - 5 * 60 * 1000;
+/**
+ * A fixed creation timestamp: one minute before {@link RELAY_NOW}, so a submitted `created_at` is
+ * within the relay's bounds (#248). Test verdicts are decided at `TEST_DECIDED_AT`, inside
+ * `[CREATED_AT, FUTURE_EXPIRES_AT]`.
+ */
+const CREATED_AT = RELAY_NOW - 60_000;
 /** Retention cutoff fixture: far enough in the past to be swept deterministically. */
 const OLD_TERMINAL_AT = 2000;
 
@@ -96,12 +107,21 @@ function relayUrl(accountId: string, subPath: string): string {
   return `https://relay.allw.test/${accountId}${subPath}`;
 }
 
+/** Accounts whose root is bound and whose relay clock is pinned to {@link RELAY_NOW}. */
+const clockPinned = new Set<string>();
+
 async function post<T>(
   accountId: string,
   subPath: string,
   body: unknown,
   headers: Record<string, string> = {},
 ): Promise<{ status: number; data: T }> {
+  if (subPath === "/requests" && !clockPinned.has(accountId)) {
+    // Submits need a bound account root (#248); tests that never pair bind the test root directly.
+    await bindAccountRoot(accountId);
+    await pinRelayClock(accountId, RELAY_NOW);
+    clockPinned.add(accountId);
+  }
   const finalHeaders = { ...headers };
   const revokeMatch = /^\/devices\/([^/]+)\/revoke$/.exec(subPath);
   if (revokeMatch && finalHeaders.Authorization === undefined) {
@@ -367,7 +387,7 @@ describe("AccountRelay — routing (device online)", () => {
     const device = await connectWs(acct, `/devices/${await firstDeviceId(acct)}/connect`);
 
     // Integrator submits the ciphertext envelope.
-    const envelope = makeEnvelope("req-online-1");
+    const envelope = makeEnvelope(rid("req-online-1"));
     const submit = await post<{ request_id: string; status: string; delivered_to: number }>(
       acct,
       "/requests",
@@ -380,12 +400,12 @@ describe("AccountRelay — routing (device online)", () => {
     // Device receives the ciphertext push.
     const pushed = await device.next();
     expect(pushed.type).toBe("request");
-    expect(pushed.request_id).toBe("req-online-1");
+    expect(pushed.request_id).toBe(rid("req-online-1"));
     expect(pushed.envelope?.context_ciphertext).toBe(envelope.context_ciphertext);
 
     // Device returns a signed verdict over the same socket.
-    const verdict = await makeVerdict(acct, "req-online-1");
-    device.send({ type: "verdict", request_id: "req-online-1", verdict });
+    const verdict = await makeVerdict(acct, rid("req-online-1"));
+    device.send({ type: "verdict", request_id: rid("req-online-1"), verdict });
     const ack = await device.next();
     expect(ack.type).toBe("ack");
     expect(ack.status).toBe("resolved");
@@ -393,7 +413,7 @@ describe("AccountRelay — routing (device online)", () => {
     // Integrator polls and receives the verdict.
     const polled = await get<{ status: string; verdict: Record<string, unknown> }>(
       acct,
-      "/requests/req-online-1",
+      `/requests/${rid("req-online-1")}`,
     );
     expect(polled.status).toBe(200);
     expect(polled.data.status).toBe("resolved");
@@ -405,18 +425,18 @@ describe("AccountRelay — routing (device online)", () => {
     await enrollDevice(acct);
     const device = await connectWs(acct, `/devices/${await firstDeviceId(acct)}/connect`);
 
-    await post(acct, "/requests", makeEnvelope("req-wait-1"));
+    await post(acct, "/requests", makeEnvelope(rid("req-wait-1")));
     await device.next(); // drain the request push
 
     // Integrator opens a wait socket BEFORE the device decides.
-    const integrator = await connectWs(acct, "/requests/req-wait-1/wait");
+    const integrator = await connectWs(acct, `/requests/${rid("req-wait-1")}/wait`);
 
-    const verdict = await makeVerdict(acct, "req-wait-1", "denied");
-    device.send({ type: "verdict", request_id: "req-wait-1", verdict });
+    const verdict = await makeVerdict(acct, rid("req-wait-1"), "denied");
+    device.send({ type: "verdict", request_id: rid("req-wait-1"), verdict });
 
     const pushed = await integrator.next();
     expect(pushed.type).toBe("verdict");
-    expect(pushed.request_id).toBe("req-wait-1");
+    expect(pushed.request_id).toBe(rid("req-wait-1"));
     expect(pushed.verdict).toEqual(verdict);
   });
 
@@ -425,14 +445,14 @@ describe("AccountRelay — routing (device online)", () => {
     await enrollDevice(acct);
     const device = await connectWs(acct, `/devices/${await firstDeviceId(acct)}/connect`);
 
-    await post(acct, "/requests", makeEnvelope("req-late-1"));
+    await post(acct, "/requests", makeEnvelope(rid("req-late-1")));
     await device.next();
-    const verdict = await makeVerdict(acct, "req-late-1");
-    device.send({ type: "verdict", request_id: "req-late-1", verdict });
+    const verdict = await makeVerdict(acct, rid("req-late-1"));
+    device.send({ type: "verdict", request_id: rid("req-late-1"), verdict });
     await device.next(); // ack
 
     // Now connect the waiter — it should receive the persisted verdict at once.
-    const integrator = await connectWs(acct, "/requests/req-late-1/wait");
+    const integrator = await connectWs(acct, `/requests/${rid("req-late-1")}/wait`);
     const pushed = await integrator.next();
     expect(pushed.type).toBe("verdict");
     expect(pushed.verdict).toEqual(verdict);
@@ -464,14 +484,14 @@ describe("AccountRelay — routing (device offline)", () => {
       delivered_to: number;
       push_wakeups: number;
       status: string;
-    }>(acct, "/requests", makeEnvelope("req-push-wakeup"));
+    }>(acct, "/requests", makeEnvelope(rid("req-push-wakeup")));
 
     expect(submit.status).toBe(202);
     expect(submit.data.status).toBe("pending");
     expect(submit.data.delivered_to).toBe(0);
     expect(submit.data.push_wakeups).toBe(1);
     await vi.waitFor(() => {
-      expect(wakeups.map((w) => w.requestId)).toEqual(["req-push-wakeup"]);
+      expect(wakeups.map((w) => w.requestId)).toEqual([rid("req-push-wakeup")]);
     });
   });
 
@@ -483,7 +503,7 @@ describe("AccountRelay — routing (device offline)", () => {
     const submit = await post<{ push_wakeups: number }>(
       acct,
       "/requests",
-      makeEnvelope("req-push-unconfigured"),
+      makeEnvelope(rid("req-push-unconfigured")),
     );
 
     expect(submit.status).toBe(202);
@@ -507,7 +527,7 @@ describe("AccountRelay — routing (device offline)", () => {
       delivered_to: number;
       push_wakeups: number;
       status: string;
-    }>(acct, "/requests", makeEnvelope("req-push-throw"));
+    }>(acct, "/requests", makeEnvelope(rid("req-push-throw")));
 
     expect(submit.status).toBe(202);
     expect(submit.data.status).toBe("pending");
@@ -516,7 +536,7 @@ describe("AccountRelay — routing (device offline)", () => {
     expect(submit.data.push_wakeups).toBe(1);
     const pushed = await device.next();
     expect(pushed.type).toBe("request");
-    expect(pushed.request_id).toBe("req-push-throw");
+    expect(pushed.request_id).toBe(rid("req-push-throw"));
   });
 
   it("stops scheduling push wakeups after the target device is revoked", async () => {
@@ -527,7 +547,7 @@ describe("AccountRelay — routing (device offline)", () => {
     const beforeRevoke = await post<{ push_wakeups: number }>(
       acct,
       "/requests",
-      makeEnvelope("req-push-before-revoke"),
+      makeEnvelope(rid("req-push-before-revoke")),
     );
     expect(beforeRevoke.status).toBe(202);
     expect(beforeRevoke.data.push_wakeups).toBe(1);
@@ -538,7 +558,7 @@ describe("AccountRelay — routing (device offline)", () => {
     const afterRevoke = await post<{ push_wakeups: number }>(
       acct,
       "/requests",
-      makeEnvelope("req-push-after-revoke"),
+      makeEnvelope(rid("req-push-after-revoke")),
     );
     expect(afterRevoke.status).toBe(202);
     expect(afterRevoke.data.push_wakeups).toBe(0);
@@ -552,7 +572,7 @@ describe("AccountRelay — routing (device offline)", () => {
     const submit = await post<{ delivered_to: number; status: string }>(
       acct,
       "/requests",
-      makeEnvelope("req-offline-1"),
+      makeEnvelope(rid("req-offline-1")),
     );
     expect(submit.data.delivered_to).toBe(0);
     expect(submit.data.status).toBe("pending");
@@ -561,7 +581,7 @@ describe("AccountRelay — routing (device offline)", () => {
     const device = await connectWs(acct, `/devices/${await firstDeviceId(acct)}/connect`);
     const flushed = await device.next();
     expect(flushed.type).toBe("request");
-    expect(flushed.request_id).toBe("req-offline-1");
+    expect(flushed.request_id).toBe(rid("req-offline-1"));
   });
 
   it("flushes only still-pending requests (already-resolved ones are not re-delivered)", async () => {
@@ -570,26 +590,26 @@ describe("AccountRelay — routing (device offline)", () => {
     const deviceId = await firstDeviceId(acct);
 
     // Two requests submitted while offline.
-    await post(acct, "/requests", makeEnvelope("req-mixed-1"));
-    await post(acct, "/requests", makeEnvelope("req-mixed-2"));
+    await post(acct, "/requests", makeEnvelope(rid("req-mixed-1")));
+    await post(acct, "/requests", makeEnvelope(rid("req-mixed-2")));
 
     // First device resolves req-mixed-1.
     const d1 = await connectWs(acct, `/devices/${deviceId}/connect`);
     const first = await d1.next();
     const second = await d1.next();
     const ids = [first.request_id, second.request_id].sort();
-    expect(ids).toEqual(["req-mixed-1", "req-mixed-2"]);
+    expect(ids).toEqual([rid("req-mixed-1"), rid("req-mixed-2")].sort());
     d1.send({
       type: "verdict",
-      request_id: "req-mixed-1",
-      verdict: await makeVerdict(acct, "req-mixed-1"),
+      request_id: rid("req-mixed-1"),
+      verdict: await makeVerdict(acct, rid("req-mixed-1")),
     });
     await d1.next(); // ack
 
     // A second device connecting later should receive ONLY the still-pending req-mixed-2.
     const d2 = await connectWs(acct, `/devices/${deviceId}/connect`);
     const flushed = await d2.next();
-    expect(flushed.request_id).toBe("req-mixed-2");
+    expect(flushed.request_id).toBe(rid("req-mixed-2"));
     // No further pending request should arrive.
     await expect(d2.next(500)).rejects.toThrow(/timeout/);
   });
@@ -609,7 +629,7 @@ describe("AccountRelay — cross-device coordination", () => {
     const dA = await connectWs(acct, `/devices/${deviceId}/connect`);
     const dB = await connectWs(acct, `/devices/${deviceId}/connect`);
 
-    await post(acct, "/requests", makeEnvelope("req-retract-1"));
+    await post(acct, "/requests", makeEnvelope(rid("req-retract-1")));
     // Both receive the request push.
     expect((await dA.next()).type).toBe("request");
     expect((await dB.next()).type).toBe("request");
@@ -617,14 +637,14 @@ describe("AccountRelay — cross-device coordination", () => {
     // Device A resolves.
     dA.send({
       type: "verdict",
-      request_id: "req-retract-1",
-      verdict: await makeVerdict(acct, "req-retract-1"),
+      request_id: rid("req-retract-1"),
+      verdict: await makeVerdict(acct, rid("req-retract-1")),
     });
 
     // Device B must receive a retract for that request.
     const retract = await dB.next();
     expect(retract.type).toBe("retract");
-    expect(retract.request_id).toBe("req-retract-1");
+    expect(retract.request_id).toBe(rid("req-retract-1"));
   });
 
   it("first verdict wins: a second verdict is ignored (dedupe)", async () => {
@@ -633,25 +653,28 @@ describe("AccountRelay — cross-device coordination", () => {
     const deviceId = await firstDeviceId(acct);
     const device = await connectWs(acct, `/devices/${deviceId}/connect`);
 
-    await post(acct, "/requests", makeEnvelope("req-dedupe-1"));
+    await post(acct, "/requests", makeEnvelope(rid("req-dedupe-1")));
     await device.next();
 
-    const winning = await makeVerdict(acct, "req-dedupe-1", "approved");
-    device.send({ type: "verdict", request_id: "req-dedupe-1", verdict: winning });
+    const winning = await makeVerdict(acct, rid("req-dedupe-1"), "approved");
+    device.send({ type: "verdict", request_id: rid("req-dedupe-1"), verdict: winning });
     const ack1 = await device.next();
     expect(ack1.status).toBe("resolved");
 
     // A second, conflicting verdict for the same request is acknowledged but does not overwrite.
     device.send({
       type: "verdict",
-      request_id: "req-dedupe-1",
-      verdict: await makeVerdict(acct, "req-dedupe-1", "denied"),
+      request_id: rid("req-dedupe-1"),
+      verdict: await makeVerdict(acct, rid("req-dedupe-1"), "denied"),
     });
     const ack2 = await device.next();
     expect(ack2.type).toBe("ack");
     expect(ack2.status).toBe("already_resolved");
 
-    const polled = await get<{ verdict: Record<string, unknown> }>(acct, "/requests/req-dedupe-1");
+    const polled = await get<{ verdict: Record<string, unknown> }>(
+      acct,
+      `/requests/${rid("req-dedupe-1")}`,
+    );
     expect(polled.data.verdict).toEqual(winning); // the first decision stands
   });
 
@@ -672,12 +695,12 @@ describe("AccountRelay — cross-device coordination", () => {
     const submit = await post<{ delivered_to: number }>(
       acct,
       "/requests",
-      makeEnvelope("req-surface-1"),
+      makeEnvelope(rid("req-surface-1")),
     );
     expect(submit.data.delivered_to).toBe(2);
 
-    expect((await nativeMac.next()).request_id).toBe("req-surface-1");
-    expect((await phone.next()).request_id).toBe("req-surface-1");
+    expect((await nativeMac.next()).request_id).toBe(rid("req-surface-1"));
+    expect((await phone.next()).request_id).toBe(rid("req-surface-1"));
     await expect(mirroredPhone.next(500)).rejects.toThrow(/timeout/);
   });
 
@@ -714,18 +737,18 @@ describe("AccountRelay — cross-device coordination", () => {
     });
 
     const delivered = relay.sendRequestToOneSocketPerSurface(
-      "req-surface-stale-1",
-      makeEnvelope("req-surface-stale-1"),
+      rid("req-surface-stale-1"),
+      makeEnvelope(rid("req-surface-stale-1")),
     );
 
     expect(delivered).toBe(2);
     expect(JSON.parse(liveMacMessages[0] ?? "{}")).toMatchObject({
       type: "request",
-      request_id: "req-surface-stale-1",
+      request_id: rid("req-surface-stale-1"),
     });
     expect(JSON.parse(phoneMessages[0] ?? "{}")).toMatchObject({
       type: "request",
-      request_id: "req-surface-stale-1",
+      request_id: rid("req-surface-stale-1"),
     });
   });
 
@@ -734,7 +757,7 @@ describe("AccountRelay — cross-device coordination", () => {
     await enrollDevice(acct);
     const deviceId = await firstDeviceId(acct);
 
-    await post(acct, "/requests", makeEnvelope("req-surface-queued"));
+    await post(acct, "/requests", makeEnvelope(rid("req-surface-queued")));
 
     const nativeMac = await connectWs(acct, `/devices/${deviceId}/connect?surface_id=mac-screen`);
     const mirroredPhone = await connectWs(
@@ -743,8 +766,8 @@ describe("AccountRelay — cross-device coordination", () => {
     );
     const phone = await connectWs(acct, `/devices/${deviceId}/connect?surface_id=phone-screen`);
 
-    expect((await nativeMac.next()).request_id).toBe("req-surface-queued");
-    expect((await phone.next()).request_id).toBe("req-surface-queued");
+    expect((await nativeMac.next()).request_id).toBe(rid("req-surface-queued"));
+    expect((await phone.next()).request_id).toBe(rid("req-surface-queued"));
     await expect(mirroredPhone.next(500)).rejects.toThrow(/timeout/);
   });
 
@@ -755,7 +778,7 @@ describe("AccountRelay — cross-device coordination", () => {
         throw new Error("socket already closing");
       },
     } as unknown as WebSocket;
-    const envelope = makeEnvelope("req-surface-stale-queued");
+    const envelope = makeEnvelope(rid("req-surface-stale-queued"));
     const authTokenHash = await testAuthTokenHash("stale-device-token");
 
     const relay = Object.create(AccountRelay.prototype) as {
@@ -773,7 +796,9 @@ describe("AccountRelay — cross-device coordination", () => {
           return [{ device_id: "dev-stale-flush", auth_token_hash: authTokenHash }];
         }
         if (query.includes("FROM request")) {
-          return [{ request_id: "req-surface-stale-queued", envelope: JSON.stringify(envelope) }];
+          return [
+            { request_id: rid("req-surface-stale-queued"), envelope: JSON.stringify(envelope) },
+          ];
         }
         return [];
       },
@@ -800,7 +825,7 @@ describe("AccountRelay — cross-device coordination", () => {
 
     await expect(queued).resolves.toMatchObject({
       type: "request",
-      request_id: "req-surface-stale-queued",
+      request_id: rid("req-surface-stale-queued"),
     });
   });
 });
@@ -816,33 +841,34 @@ describe("AccountRelay — zero-knowledge (routing)", () => {
     const deviceId = await firstDeviceId(acct);
     const device = await connectWs(acct, `/devices/${deviceId}/connect`);
 
-    const envelope = makeEnvelope("req-zk-1");
+    const envelope = makeEnvelope(rid("req-zk-1"));
     await post(acct, "/requests", envelope);
     await device.next();
-    const verdict = await makeVerdict(acct, "req-zk-1");
-    device.send({ type: "verdict", request_id: "req-zk-1", verdict });
-    await device.next();
 
-    // Inspect the DO's SQLite directly.
     const id = env.ACCOUNT.idFromName(acct);
     const stub = env.ACCOUNT.get(id);
-    const stored = await runInDurableObject(stub, (instance: AccountRelay) => {
-      const relay = instance as unknown as { sql: SqlStorage };
-      const reqRows = [
-        ...relay.sql.exec<{ envelope: string; status: string }>(
-          `SELECT envelope, status FROM request WHERE request_id = 'req-zk-1'`,
-        ),
-      ];
-      const verdictRows = [
-        ...relay.sql.exec<{ verdict: string }>(
-          `SELECT verdict FROM verdict WHERE request_id = 'req-zk-1'`,
-        ),
-      ];
-      return { reqRows, verdictRows };
-    });
+    const readStored = () =>
+      runInDurableObject(stub, (instance: AccountRelay) => {
+        const relay = instance as unknown as { sql: SqlStorage };
+        const reqRows = [
+          ...relay.sql.exec<{ envelope: string; status: string }>(
+            `SELECT envelope, status FROM request WHERE request_id = ?`,
+            rid("req-zk-1"),
+          ),
+        ];
+        const verdictRows = [
+          ...relay.sql.exec<{ verdict: string }>(
+            `SELECT verdict FROM verdict WHERE request_id = ?`,
+            rid("req-zk-1"),
+          ),
+        ];
+        return { reqRows, verdictRows };
+      });
 
-    // The stored envelope is exactly what was submitted — routing/lifecycle + opaque ciphertext.
-    const storedEnvelope = JSON.parse(stored.reqRows[0]?.envelope ?? "{}") as Record<
+    // While pending, the stored envelope is exactly what was submitted — routing/lifecycle +
+    // opaque ciphertext.
+    const pending = await readStored();
+    const storedEnvelope = JSON.parse(pending.reqRows[0]?.envelope ?? "{}") as Record<
       string,
       unknown
     >;
@@ -859,12 +885,108 @@ describe("AccountRelay — zero-knowledge (routing)", () => {
     ]) {
       expect(storedEnvelope[plaintextField]).toBeUndefined();
     }
+
+    const verdict = await makeVerdict(acct, rid("req-zk-1"));
+    device.send({ type: "verdict", request_id: rid("req-zk-1"), verdict });
+    await device.next();
+
+    // Once resolved, the envelope (and its ciphertext) is blanked — only the verdict remains (#248).
+    const stored = await readStored();
+    expect(stored.reqRows[0]).toEqual({ envelope: "", status: "resolved" });
+    const polled = await get<{ status: string; verdict: unknown }>(
+      acct,
+      `/requests/${rid("req-zk-1")}`,
+    );
+    expect(polled.data.status).toBe("resolved");
+    expect(polled.data.verdict).toEqual(verdict);
     // The verdict round-trips byte-for-byte (relay holds no key that could forge it).
     const storedVerdict = JSON.parse(stored.verdictRows[0]?.verdict ?? "{}") as Record<
       string,
       unknown
     >;
     expect(storedVerdict).toEqual(verdict);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Late verdicts on terminal rows whose envelope was blanked (#248, #352)
+// ---------------------------------------------------------------------------
+
+describe("AccountRelay — a late verdict on a blanked terminal row", () => {
+  /**
+   * Terminal rows keep no envelope (#248), and the provenance check (#352) reads the window from
+   * the envelope. A late verdict on a retracted or expired row must therefore get that status from
+   * the early returns, which run before the provenance check: never a provenance or parse error.
+   */
+  async function setUp(name: string, expiresAt = FUTURE_EXPIRES_AT) {
+    const acct = testAccount(`acct-late-blank-${name}`);
+    await enrollDevice(acct);
+    const device = await connectWs(acct, `/devices/${await firstDeviceId(acct)}/connect`);
+    const requestId = rid(`req-late-blank-${name}`);
+    await post(acct, "/requests", { ...makeEnvelope(requestId), expires_at: expiresAt });
+    expect((await device.next()).request_id).toBe(requestId);
+    return { acct, device, requestId };
+  }
+
+  async function storedRow(acct: string, requestId: string) {
+    return runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(acct)), (instance) => {
+      const relay = instance as unknown as { sql: SqlStorage };
+      return [
+        ...relay.sql.exec<{ envelope: string; status: string }>(
+          `SELECT envelope, status FROM request WHERE request_id = ?`,
+          requestId,
+        ),
+      ][0];
+    });
+  }
+
+  /** Send a genuine verdict and return the first ack, skipping the retract push before it. */
+  async function sendLateVerdict(ctx: {
+    acct: string;
+    device: WsClient;
+    requestId: string;
+  }): Promise<WsMessage> {
+    const verdict = await makeVerdict(ctx.acct, ctx.requestId);
+    ctx.device.send({ type: "verdict", request_id: ctx.requestId, verdict });
+    for (;;) {
+      const msg = await ctx.device.next();
+      if (msg.type !== "retract") return msg;
+    }
+  }
+
+  it("a retracted row answers its status", async () => {
+    const ctx = await setUp("retracted");
+    const retract = await post(ctx.acct, `/requests/${ctx.requestId}/retract`, {});
+    expect(retract.status).toBe(200);
+    expect(await storedRow(ctx.acct, ctx.requestId)).toEqual({ envelope: "", status: "retracted" });
+
+    expect(await sendLateVerdict(ctx)).toEqual({
+      type: "ack",
+      request_id: ctx.requestId,
+      status: "retracted",
+    });
+    expect(await storedRow(ctx.acct, ctx.requestId)).toEqual({ envelope: "", status: "retracted" });
+  });
+
+  it("an expired row answers its status", async () => {
+    const expiresAt = RELAY_NOW + 60_000;
+    const ctx = await setUp("expired", expiresAt);
+    await runInDurableObject(
+      env.ACCOUNT.get(env.ACCOUNT.idFromName(ctx.acct)),
+      async (instance) => {
+        const relay = instance as unknown as { now: () => number; alarm(): Promise<void> };
+        relay.now = () => expiresAt + 1;
+        await relay.alarm();
+      },
+    );
+    expect(await storedRow(ctx.acct, ctx.requestId)).toEqual({ envelope: "", status: "expired" });
+
+    expect(await sendLateVerdict(ctx)).toEqual({
+      type: "ack",
+      request_id: ctx.requestId,
+      status: "expired",
+    });
+    expect(await storedRow(ctx.acct, ctx.requestId)).toEqual({ envelope: "", status: "expired" });
   });
 });
 
@@ -878,22 +1000,22 @@ describe("AccountRelay — verdict authenticity", () => {
     await enrollDevice(acct);
     const device = await connectWs(acct, `/devices/${await firstDeviceId(acct)}/connect`);
 
-    await post(acct, "/requests", makeEnvelope("req-sec-1"));
+    await post(acct, "/requests", makeEnvelope(rid("req-sec-1")));
     await device.next(); // drain the request push to the legitimate device
 
     // A non-device client opens the integrator wait socket and tries to forge a verdict.
-    const integrator = await connectWs(acct, "/requests/req-sec-1/wait");
+    const integrator = await connectWs(acct, `/requests/${rid("req-sec-1")}/wait`);
     integrator.send({
       type: "verdict",
-      request_id: "req-sec-1",
-      verdict: await makeVerdict(acct, "req-sec-1"),
+      request_id: rid("req-sec-1"),
+      verdict: await makeVerdict(acct, rid("req-sec-1")),
     });
 
     const resp = await integrator.next();
     expect(resp.type).toBe("error");
 
     // The request must remain pending — the forged verdict did NOT resolve it.
-    const polled = await get<{ status: string }>(acct, "/requests/req-sec-1");
+    const polled = await get<{ status: string }>(acct, `/requests/${rid("req-sec-1")}`);
     expect(polled.data.status).toBe("pending");
   });
 });
@@ -962,12 +1084,12 @@ describe("AccountRelay — verdict finality (#245)", () => {
   }
 
   it("refuses a junk verdict (a JSON object that is not a signed verdict)", async () => {
-    const ctx = await setUp("acct-final-junk", "req-final-junk");
+    const ctx = await setUp("acct-final-junk", rid("req-final-junk"));
     for (const junk of [
       { decision: "denied" },
       {
         v: 1,
-        request_id: "req-final-junk",
+        request_id: rid("req-final-junk"),
         request_hash: "ZmFrZS1yZXF1ZXN0LWhhc2gtMzItYnl0ZXMtYjY0dXI",
         decision: "denied",
         decided_at: CREATED_AT,
@@ -975,61 +1097,64 @@ describe("AccountRelay — verdict finality (#245)", () => {
         sig: "eyJhbGciOiJFZERTQSJ9..FAKE_JWS_SIGNATURE",
       },
     ]) {
-      await expectRefused(ctx, "req-final-junk", junk);
+      await expectRefused(ctx, rid("req-final-junk"), junk);
     }
-    await expectStillAnswerable(ctx, "req-final-junk");
+    await expectStillAnswerable(ctx, rid("req-final-junk"));
   });
 
   it("refuses a verdict signed by a key no certificate vouches for", async () => {
-    const ctx = await setUp("acct-final-uncertified", "req-final-uncertified");
+    const ctx = await setUp("acct-final-uncertified", rid("req-final-uncertified"));
     await expectRefused(
       ctx,
-      "req-final-uncertified",
-      signTestVerdict(ctx.acct, ctx.first, "req-final-uncertified", {
+      rid("req-final-uncertified"),
+      signTestVerdict(ctx.acct, ctx.first, rid("req-final-uncertified"), {
         decision: "denied",
         uncertifiedKey: true,
       }),
     );
-    await expectStillAnswerable(ctx, "req-final-uncertified");
+    await expectStillAnswerable(ctx, rid("req-final-uncertified"));
   });
 
   it("refuses a device certificate issued by another account's root", async () => {
-    const ctx = await setUp("acct-final-foreign-root", "req-final-foreign-root");
+    const ctx = await setUp("acct-final-foreign-root", rid("req-final-foreign-root"));
     await expectRefused(
       ctx,
-      "req-final-foreign-root",
-      signTestVerdict(ctx.acct, ctx.first, "req-final-foreign-root", {
+      rid("req-final-foreign-root"),
+      signTestVerdict(ctx.acct, ctx.first, rid("req-final-foreign-root"), {
         decision: "denied",
         certifiedBy: testRoot("acct-final-foreign-root-attacker"),
       }),
     );
-    await expectStillAnswerable(ctx, "req-final-foreign-root");
+    await expectStillAnswerable(ctx, rid("req-final-foreign-root"));
   });
 
   it("refuses a genuine verdict replayed for a different request id", async () => {
-    const ctx = await setUp("acct-final-replay", "req-final-replay");
-    const forOther = signTestVerdict(ctx.acct, ctx.first, "req-final-other", {
+    const ctx = await setUp("acct-final-replay", rid("req-final-replay"));
+    const forOther = signTestVerdict(ctx.acct, ctx.first, rid("req-final-other"), {
       decision: "denied",
     });
-    await expectRefused(ctx, "req-final-replay", forOther);
+    await expectRefused(ctx, rid("req-final-replay"), forOther);
     // Rewriting only the outer request_id does not help: it no longer matches the signed one.
-    await expectRefused(ctx, "req-final-replay", { ...forOther, request_id: "req-final-replay" });
-    await expectStillAnswerable(ctx, "req-final-replay");
+    await expectRefused(ctx, rid("req-final-replay"), {
+      ...forOther,
+      request_id: rid("req-final-replay"),
+    });
+    await expectStillAnswerable(ctx, rid("req-final-replay"));
   });
 
   it("refuses a genuine verdict whose kid is another device than the socket's", async () => {
-    const ctx = await setUp("acct-final-kid", "req-final-kid");
+    const ctx = await setUp("acct-final-kid", rid("req-final-kid"));
     await expectRefused(
       ctx,
-      "req-final-kid",
-      signTestVerdict(ctx.acct, ctx.second, "req-final-kid", { decision: "denied" }),
+      rid("req-final-kid"),
+      signTestVerdict(ctx.acct, ctx.second, rid("req-final-kid"), { decision: "denied" }),
       "verdict is signed by another device",
     );
-    await expectStillAnswerable(ctx, "req-final-kid");
+    await expectStillAnswerable(ctx, rid("req-final-kid"));
   });
 
   it("refuses a verdict from a device revoked in the relay's verified account state", async () => {
-    const ctx = await setUp("acct-final-revoked", "req-final-revoked");
+    const ctx = await setUp("acct-final-revoked", rid("req-final-revoked"));
     const published = await post(ctx.acct, "/account-states", {
       account_states: [
         signAccountState(rootFor(ctx.acct), { sequence: 1, revokedDevices: [ctx.second] }),
@@ -1038,32 +1163,32 @@ describe("AccountRelay — verdict finality (#245)", () => {
     expect(published.status).toBe(200);
     await expectRefused(
       ctx,
-      "req-final-revoked",
-      signTestVerdict(ctx.acct, ctx.second, "req-final-revoked", { decision: "denied" }),
+      rid("req-final-revoked"),
+      signTestVerdict(ctx.acct, ctx.second, rid("req-final-revoked"), { decision: "denied" }),
       "verdict failed provenance verification",
       ctx.d2,
     );
     // The revoked device's socket got its error; the legitimate device still resolves.
-    const polled = await get<{ status: string }>(ctx.acct, "/requests/req-final-revoked");
+    const polled = await get<{ status: string }>(ctx.acct, `/requests/${rid("req-final-revoked")}`);
     expect(polled.data.status).toBe("pending");
-    const genuine = signTestVerdict(ctx.acct, ctx.first, "req-final-revoked");
-    ctx.d1.send({ type: "verdict", request_id: "req-final-revoked", verdict: genuine });
+    const genuine = signTestVerdict(ctx.acct, ctx.first, rid("req-final-revoked"));
+    ctx.d1.send({ type: "verdict", request_id: rid("req-final-revoked"), verdict: genuine });
     expect((await ctx.d1.next()).status).toBe("resolved");
     expect((await ctx.integrator.next()).verdict).toEqual(genuine);
   });
 
   it("refuses a verdict whose certificate had expired at its decided_at", async () => {
-    const ctx = await setUp("acct-final-cert-expired", "req-final-cert-expired");
+    const ctx = await setUp("acct-final-cert-expired", rid("req-final-cert-expired"));
     await expectRefused(
       ctx,
-      "req-final-cert-expired",
-      signTestVerdict(ctx.acct, ctx.first, "req-final-cert-expired", {
+      rid("req-final-cert-expired"),
+      signTestVerdict(ctx.acct, ctx.first, rid("req-final-cert-expired"), {
         decision: "denied",
         // Expired one millisecond before the signed decision time.
         certExpiresAt: TEST_DECIDED_AT - 1,
       }),
     );
-    await expectStillAnswerable(ctx, "req-final-cert-expired");
+    await expectStillAnswerable(ctx, rid("req-final-cert-expired"));
   });
 
   // Reviewer probe on #352: a device whose certificate expired in November 2023 signs a decision
@@ -1071,40 +1196,40 @@ describe("AccountRelay — verdict finality (#245)", () => {
   // certificate at the device-chosen `decided_at` alone would accept it and let the device
   // pre-empt every request; the request window bounds `decided_at` first.
   it("refuses an expired-cert device backdating its decision to before the request", async () => {
-    const ctx = await setUp("acct-final-backdated", "req-final-backdated");
-    const backdated = signTestVerdict(ctx.acct, ctx.first, "req-final-backdated", {
+    const ctx = await setUp("acct-final-backdated", rid("req-final-backdated"));
+    const backdated = signTestVerdict(ctx.acct, ctx.first, rid("req-final-backdated"), {
       decision: "denied",
       certExpiresAt: 1_699_999_500_000,
       decidedAt: 1_699_999_000_000, // before the envelope's created_at (CREATED_AT)
     });
     expect(backdated.decided_at).toBeLessThan(CREATED_AT);
-    await expectRefused(ctx, "req-final-backdated", backdated);
+    await expectRefused(ctx, rid("req-final-backdated"), backdated);
     // No retract reached the other device, nothing was recorded, and the request still resolves.
-    await expectStillAnswerable(ctx, "req-final-backdated");
+    await expectStillAnswerable(ctx, rid("req-final-backdated"));
   });
 
   it("refuses a verdict decided after the request's expires_at", async () => {
-    const ctx = await setUp("acct-final-late", "req-final-late");
+    const ctx = await setUp("acct-final-late", rid("req-final-late"));
     await expectRefused(
       ctx,
-      "req-final-late",
-      signTestVerdict(ctx.acct, ctx.first, "req-final-late", {
+      rid("req-final-late"),
+      signTestVerdict(ctx.acct, ctx.first, rid("req-final-late"), {
         decision: "denied",
         decidedAt: FUTURE_EXPIRES_AT + 1,
       }),
     );
-    await expectStillAnswerable(ctx, "req-final-late");
+    await expectStillAnswerable(ctx, rid("req-final-late"));
   });
 
   it("accepts a decision on the window's edges (envelope created_at and expires_at)", async () => {
-    // The window is the envelope's, as the integrator's verify_verdict checks it: CREATED_AT is
-    // years before the relay received the request, so this also shows the relay's receive time is
+    // The window is the envelope's, as the integrator's verify_verdict checks it: CREATED_AT is a
+    // minute before the relay received the request, so this also shows the relay's receive time is
     // not the bound.
     for (const [name, decidedAt] of [
       ["created", CREATED_AT],
       ["expires", FUTURE_EXPIRES_AT],
     ] as const) {
-      const requestId = `req-final-edge-${name}`;
+      const requestId = rid(`req-final-edge-${name}`);
       const ctx = await setUp(`acct-final-edge-${name}`, requestId);
       const verdict = signTestVerdict(ctx.acct, ctx.first, requestId, { decidedAt });
       ctx.d1.send({ type: "verdict", request_id: requestId, verdict });
@@ -1118,15 +1243,15 @@ describe("AccountRelay — verdict finality (#245)", () => {
   });
 
   it("refuses another device's approver before any signature check", async () => {
-    const ctx = await setUp("acct-final-approver", "req-final-approver");
+    const ctx = await setUp("acct-final-approver", rid("req-final-approver"));
     // A junk signature would fail provenance; naming another device is refused first, without
     // verifying anything.
     await expectRefused(
       ctx,
-      "req-final-approver",
+      rid("req-final-approver"),
       {
         v: 1,
-        request_id: "req-final-approver",
+        request_id: rid("req-final-approver"),
         request_hash: "ZmFrZS1yZXF1ZXN0LWhhc2gtMzItYnl0ZXMtYjY0dXI",
         decision: "denied",
         decided_at: TEST_DECIDED_AT,
@@ -1135,23 +1260,23 @@ describe("AccountRelay — verdict finality (#245)", () => {
       },
       "verdict is signed by another device",
     );
-    await expectStillAnswerable(ctx, "req-final-approver");
+    await expectStillAnswerable(ctx, rid("req-final-approver"));
   });
 
   it("gives a malformed approver the provenance error, not 'another device'", async () => {
-    const ctx = await setUp("acct-final-approver-shape", "req-final-approver-shape");
-    const genuine = signTestVerdict(ctx.acct, ctx.first, "req-final-approver-shape", {
+    const ctx = await setUp("acct-final-approver-shape", rid("req-final-approver-shape"));
+    const genuine = signTestVerdict(ctx.acct, ctx.first, rid("req-final-approver-shape"), {
       decision: "denied",
     });
-    await expectRefused(ctx, "req-final-approver-shape", {
+    await expectRefused(ctx, rid("req-final-approver-shape"), {
       ...genuine,
       approver: { account_id: ctx.acct, device_id: 42 },
     });
-    await expectStillAnswerable(ctx, "req-final-approver-shape");
+    await expectStillAnswerable(ctx, rid("req-final-approver-shape"));
   });
 
   it("refuses every verdict when the account has no bound root (fail-closed)", async () => {
-    const ctx = await setUp("acct-final-unbound", "req-final-unbound");
+    const ctx = await setUp("acct-final-unbound", rid("req-final-unbound"));
     // A pre-binding leftover: the device rows exist but no root is bound to check against.
     const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(ctx.acct));
     await runInDurableObject(stub, (instance: AccountRelay) => {
@@ -1159,21 +1284,21 @@ describe("AccountRelay — verdict finality (#245)", () => {
     });
     await expectRefused(
       ctx,
-      "req-final-unbound",
-      signTestVerdict(ctx.acct, ctx.first, "req-final-unbound"),
+      rid("req-final-unbound"),
+      signTestVerdict(ctx.acct, ctx.first, rid("req-final-unbound")),
     );
-    const polled = await get<{ status: string }>(ctx.acct, "/requests/req-final-unbound");
+    const polled = await get<{ status: string }>(ctx.acct, `/requests/${rid("req-final-unbound")}`);
     expect(polled.data.status).toBe("pending");
   });
 
   it("records a genuine denial: provenance is not a decision, the integrator judges it", async () => {
-    const ctx = await setUp("acct-final-denial", "req-final-denial");
-    const denial = signTestVerdict(ctx.acct, ctx.first, "req-final-denial", {
+    const ctx = await setUp("acct-final-denial", rid("req-final-denial"));
+    const denial = signTestVerdict(ctx.acct, ctx.first, rid("req-final-denial"), {
       decision: "denied",
     });
-    ctx.d1.send({ type: "verdict", request_id: "req-final-denial", verdict: denial });
+    ctx.d1.send({ type: "verdict", request_id: rid("req-final-denial"), verdict: denial });
     expect((await ctx.d1.next()).status).toBe("resolved");
-    expect(await ctx.d2.next()).toEqual({ type: "retract", request_id: "req-final-denial" });
+    expect(await ctx.d2.next()).toEqual({ type: "retract", request_id: rid("req-final-denial") });
     expect((await ctx.integrator.next()).verdict).toEqual(denial);
   });
 });
@@ -1228,7 +1353,11 @@ describe("AccountRelay — endpoint authentication", () => {
   it("fails closed when legacy device or request rows have no stored auth-token hash", async () => {
     const acct = testAccount("acct-auth-null-hash");
     const device = await pairDevice(acct);
-    const submit = await post<SubmitResult>(acct, "/requests", makeEnvelope("req-auth-null-hash"));
+    const submit = await post<SubmitResult>(
+      acct,
+      "/requests",
+      makeEnvelope(rid("req-auth-null-hash")),
+    );
     expect(submit.status).toBe(202);
 
     await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(acct)), (instance) => {
@@ -1259,29 +1388,32 @@ describe("AccountRelay — endpoint authentication", () => {
 
   it("requires the per-request token for polling and wait sockets", async () => {
     const acct = testAccount("acct-auth-request-token");
-    const submit = await post<SubmitResult>(acct, "/requests", makeEnvelope("req-auth-token"));
+    const submit = await post<SubmitResult>(acct, "/requests", makeEnvelope(rid("req-auth-token")));
     expect(submit.status).toBe(202);
 
-    const noAuthPoll = await SELF.fetch(relayUrl(acct, "/requests/req-auth-token"));
+    const noAuthPoll = await SELF.fetch(relayUrl(acct, `/requests/${rid("req-auth-token")}`));
     expect(noAuthPoll.status).toBe(401);
 
-    const wrongAuthPoll = await SELF.fetch(relayUrl(acct, "/requests/req-auth-token"), {
+    const wrongAuthPoll = await SELF.fetch(relayUrl(acct, `/requests/${rid("req-auth-token")}`), {
       headers: bearer("wrong-request-token"),
     });
     expect(wrongAuthPoll.status).toBe(403);
 
-    const okPoll = await SELF.fetch(relayUrl(acct, "/requests/req-auth-token"), {
+    const okPoll = await SELF.fetch(relayUrl(acct, `/requests/${rid("req-auth-token")}`), {
       headers: bearer(submit.data.request_auth_token),
     });
     expect(okPoll.status).toBe(200);
 
-    const noAuthWait = await SELF.fetch(relayUrl(acct, "/requests/req-auth-token/wait"), {
+    const noAuthWait = await SELF.fetch(relayUrl(acct, `/requests/${rid("req-auth-token")}/wait`), {
       headers: { Upgrade: "websocket" },
     });
     expect(noAuthWait.status).toBe(401);
 
     const wrongAuthWait = await SELF.fetch(
-      relayUrl(acct, appendAuthQuery("/requests/req-auth-token/wait", "wrong-request-token")),
+      relayUrl(
+        acct,
+        appendAuthQuery(`/requests/${rid("req-auth-token")}/wait`, "wrong-request-token"),
+      ),
       { headers: { Upgrade: "websocket" } },
     );
     expect(wrongAuthWait.status).toBe(403);
@@ -1289,7 +1421,7 @@ describe("AccountRelay — endpoint authentication", () => {
     const okWait = await SELF.fetch(
       relayUrl(
         acct,
-        appendAuthQuery("/requests/req-auth-token/wait", submit.data.request_auth_token),
+        appendAuthQuery(`/requests/${rid("req-auth-token")}/wait`, submit.data.request_auth_token),
       ),
       { headers: { Upgrade: "websocket" } },
     );
@@ -1306,7 +1438,7 @@ describe("AccountRelay — endpoint authentication", () => {
 describe("AccountRelay — routing negative paths", () => {
   it("rejects a submit missing context_ciphertext (400)", async () => {
     const acct = testAccount("acct-neg-noct");
-    const body = makeEnvelope("req-noct");
+    const body = makeEnvelope(rid("req-noct"));
     delete body.context_ciphertext;
     const { status } = await post(acct, "/requests", body);
     expect(status).toBe(400);
@@ -1314,20 +1446,20 @@ describe("AccountRelay — routing negative paths", () => {
 
   it("rejects an envelope carrying an unexpected key (zero-knowledge guard) (400)", async () => {
     // A stray plaintext-looking field must be refused so it can never be persisted by the relay.
-    const body = { ...makeEnvelope("req-extra"), summary: "rm -rf / — please approve" };
+    const body = { ...makeEnvelope(rid("req-extra")), summary: "rm -rf / — please approve" };
     const { status } = await post(testAccount("acct-neg-extra"), "/requests", body);
     expect(status).toBe(400);
   });
 
   it("rejects a submit missing approver (400)", async () => {
-    const body = makeEnvelope("req-noappr");
+    const body = makeEnvelope(rid("req-noappr"));
     delete body.approver;
     const { status } = await post(testAccount("acct-neg-noappr"), "/requests", body);
     expect(status).toBe(400);
   });
 
   it("rejects a submit missing v (400)", async () => {
-    const body = makeEnvelope("req-nov");
+    const body = makeEnvelope(rid("req-nov"));
     delete body.v;
     const { status } = await post(testAccount("acct-neg-nov"), "/requests", body);
     expect(status).toBe(400);
@@ -1341,7 +1473,7 @@ describe("AccountRelay — routing negative paths", () => {
   });
 
   it("rejects a submit missing expires_at (400)", async () => {
-    const body = makeEnvelope("req-noexp");
+    const body = makeEnvelope(rid("req-noexp"));
     delete body.expires_at;
     const { status } = await post(testAccount("acct-neg-noexp"), "/requests", body);
     expect(status).toBe(400);
@@ -1351,16 +1483,16 @@ describe("AccountRelay — routing negative paths", () => {
     const { status } = await post(
       testAccount("acct-neg-expired"),
       "/requests",
-      makeEnvelope("req-expired", { expires_at: 1 }),
+      makeEnvelope(rid("req-expired"), { expires_at: 1 }),
     );
     expect(status).toBe(400);
   });
 
   it("rejects a duplicate request id (409)", async () => {
     const acct = testAccount("acct-neg-dup");
-    const first = await post(acct, "/requests", makeEnvelope("req-dup"));
+    const first = await post(acct, "/requests", makeEnvelope(rid("req-dup")));
     expect(first.status).toBe(202);
-    const second = await post(acct, "/requests", makeEnvelope("req-dup"));
+    const second = await post(acct, "/requests", makeEnvelope(rid("req-dup")));
     expect(second.status).toBe(409);
   });
 
@@ -1419,13 +1551,13 @@ describe("AccountRelay — routing negative paths", () => {
     const acct = testAccount("acct-neg-scalarverdict");
     const deviceId = await enrollDevice(acct);
     const device = await connectWs(acct, `/devices/${deviceId}/connect`);
-    await post(acct, "/requests", makeEnvelope("req-scalar"));
+    await post(acct, "/requests", makeEnvelope(rid("req-scalar")));
     await device.next();
     // A scalar the integrator could never JWS-verify must be refused before storage.
-    device.send({ type: "verdict", request_id: "req-scalar", verdict: 42 });
+    device.send({ type: "verdict", request_id: rid("req-scalar"), verdict: 42 });
     const err = await device.next();
     expect(err.type).toBe("error");
-    const polled = await get<{ status: string }>(acct, "/requests/req-scalar");
+    const polled = await get<{ status: string }>(acct, `/requests/${rid("req-scalar")}`);
     expect(polled.data.status).toBe("pending");
   });
 });
@@ -1439,13 +1571,13 @@ describe("AccountRelay — fail-closed expiry", () => {
     const acct = testAccount("acct-exp-verdict");
     await enrollDevice(acct);
     const deviceId = await firstDeviceId(acct);
-    await seedExpiredRequest(acct, "req-exp-v");
+    await seedExpiredRequest(acct, rid("req-exp-v"));
 
     const device = await connectWs(acct, `/devices/${deviceId}/connect`);
     device.send({
       type: "verdict",
-      request_id: "req-exp-v",
-      verdict: await makeVerdict(acct, "req-exp-v"),
+      request_id: rid("req-exp-v"),
+      verdict: await makeVerdict(acct, rid("req-exp-v")),
     });
 
     const ack = await device.next();
@@ -1453,7 +1585,10 @@ describe("AccountRelay — fail-closed expiry", () => {
     expect(ack.status).toBe("expired");
 
     // The request is terminal `expired`, NOT `resolved` — a timed-out request is never approvable.
-    const polled = await get<{ status: string; verdict?: unknown }>(acct, "/requests/req-exp-v");
+    const polled = await get<{ status: string; verdict?: unknown }>(
+      acct,
+      `/requests/${rid("req-exp-v")}`,
+    );
     expect(polled.data.status).toBe("expired");
     expect(polled.data.verdict).toBeUndefined();
   });
@@ -1462,7 +1597,7 @@ describe("AccountRelay — fail-closed expiry", () => {
     const acct = testAccount("acct-exp-flush");
     await enrollDevice(acct);
     const deviceId = await firstDeviceId(acct);
-    await seedExpiredRequest(acct, "req-exp-q");
+    await seedExpiredRequest(acct, rid("req-exp-q"));
 
     // Connecting must NOT deliver the expired queued request.
     const device = await connectWs(acct, `/devices/${deviceId}/connect`);
@@ -1471,9 +1606,9 @@ describe("AccountRelay — fail-closed expiry", () => {
 
   it("lazy-expires on poll: a past-deadline pending request reports terminal 'expired'", async () => {
     const acct = testAccount("acct-exp-poll");
-    await seedExpiredRequest(acct, "req-exp-p");
+    await seedExpiredRequest(acct, rid("req-exp-p"));
 
-    const polled = await get<{ status: string }>(acct, "/requests/req-exp-p");
+    const polled = await get<{ status: string }>(acct, `/requests/${rid("req-exp-p")}`);
     expect(polled.status).toBe(200);
     expect(polled.data.status).toBe("expired");
   });
@@ -1484,33 +1619,33 @@ describe("AccountRelay — fail-closed expiry", () => {
     const deviceId = await firstDeviceId(acct);
     const device = await connectWs(acct, `/devices/${deviceId}/connect`);
 
-    await post(acct, "/requests", makeEnvelope("req-exp-poll-notify"));
-    expect((await device.next()).request_id).toBe("req-exp-poll-notify");
+    await post(acct, "/requests", makeEnvelope(rid("req-exp-poll-notify")));
+    expect((await device.next()).request_id).toBe(rid("req-exp-poll-notify"));
 
-    const integrator = await connectWs(acct, "/requests/req-exp-poll-notify/wait");
-    await forceExpireRequest(acct, "req-exp-poll-notify");
+    const integrator = await connectWs(acct, `/requests/${rid("req-exp-poll-notify")}/wait`);
+    await forceExpireRequest(acct, rid("req-exp-poll-notify"));
 
-    const polled = await get<{ status: string }>(acct, "/requests/req-exp-poll-notify");
+    const polled = await get<{ status: string }>(acct, `/requests/${rid("req-exp-poll-notify")}`);
     expect(polled.status).toBe(200);
     expect(polled.data.status).toBe("expired");
 
     const retract = await device.next();
     expect(retract.type).toBe("retract");
-    expect(retract.request_id).toBe("req-exp-poll-notify");
+    expect(retract.request_id).toBe(rid("req-exp-poll-notify"));
 
     const expired = await integrator.next();
     expect(expired.type).toBe("expired");
-    expect(expired.request_id).toBe("req-exp-poll-notify");
+    expect(expired.request_id).toBe(rid("req-exp-poll-notify"));
   });
 
   it("lazy-expires on …/wait: pushes terminal 'expired' and closes", async () => {
     const acct = testAccount("acct-exp-wait");
-    await seedExpiredRequest(acct, "req-exp-w");
+    await seedExpiredRequest(acct, rid("req-exp-w"));
 
-    const integrator = await connectWs(acct, "/requests/req-exp-w/wait");
+    const integrator = await connectWs(acct, `/requests/${rid("req-exp-w")}/wait`);
     const msg = await integrator.next();
     expect(msg.type).toBe("expired");
-    expect(msg.request_id).toBe("req-exp-w");
+    expect(msg.request_id).toBe(rid("req-exp-w"));
   });
 
   it("alarm proactively expires overdue pending requests, retracts devices, and wakes waiters", async () => {
@@ -1519,23 +1654,23 @@ describe("AccountRelay — fail-closed expiry", () => {
     const deviceId = await firstDeviceId(acct);
     const device = await connectWs(acct, `/devices/${deviceId}/connect`);
 
-    const submit = await post(acct, "/requests", makeEnvelope("req-exp-alarm"));
+    const submit = await post(acct, "/requests", makeEnvelope(rid("req-exp-alarm")));
     expect(submit.status).toBe(202);
-    expect((await device.next()).request_id).toBe("req-exp-alarm");
+    expect((await device.next()).request_id).toBe(rid("req-exp-alarm"));
 
-    const integrator = await connectWs(acct, "/requests/req-exp-alarm/wait");
+    const integrator = await connectWs(acct, `/requests/${rid("req-exp-alarm")}/wait`);
 
-    await forceExpireAndRunAlarm(acct, "req-exp-alarm");
+    await forceExpireAndRunAlarm(acct, rid("req-exp-alarm"));
 
     const retract = await device.next();
     expect(retract.type).toBe("retract");
-    expect(retract.request_id).toBe("req-exp-alarm");
+    expect(retract.request_id).toBe(rid("req-exp-alarm"));
 
     const expired = await integrator.next();
     expect(expired.type).toBe("expired");
-    expect(expired.request_id).toBe("req-exp-alarm");
+    expect(expired.request_id).toBe(rid("req-exp-alarm"));
 
-    const status = await readRequestStatus(acct, "req-exp-alarm");
+    const status = await readRequestStatus(acct, rid("req-exp-alarm"));
     expect(status).toBe("expired");
   });
 
@@ -1543,17 +1678,17 @@ describe("AccountRelay — fail-closed expiry", () => {
     const acct = testAccount("acct-exp-rearm");
     const firstExpiry = 4102444800000;
     const secondExpiry = firstExpiry + 60_000;
-    await post(acct, "/requests", makeEnvelope("req-exp-a", { expires_at: firstExpiry }));
-    await post(acct, "/requests", makeEnvelope("req-exp-b", { expires_at: secondExpiry }));
+    await post(acct, "/requests", makeEnvelope(rid("req-exp-a"), { expires_at: firstExpiry }));
+    await post(acct, "/requests", makeEnvelope(rid("req-exp-b"), { expires_at: secondExpiry }));
 
     expect(await readScheduledAlarm(acct)).toBe(firstExpiry);
 
-    await forceExpireAndRunAlarm(acct, "req-exp-a");
-    expect(await readRequestStatus(acct, "req-exp-a")).toBe("expired");
+    await forceExpireAndRunAlarm(acct, rid("req-exp-a"));
+    expect(await readRequestStatus(acct, rid("req-exp-a"))).toBe("expired");
     expect(await readScheduledAlarm(acct)).toBe(secondExpiry);
 
-    await forceExpireAndRunAlarm(acct, "req-exp-b");
-    expect(await readRequestStatus(acct, "req-exp-b")).toBe("expired");
+    await forceExpireAndRunAlarm(acct, rid("req-exp-b"));
+    expect(await readRequestStatus(acct, rid("req-exp-b"))).toBe("expired");
     expect(await readScheduledAlarm(acct)).toBeNull();
   });
 
@@ -1564,8 +1699,8 @@ describe("AccountRelay — fail-closed expiry", () => {
     await runAlarm(acct);
 
     const rows = await listRequestAndVerdictIds(acct);
-    expect(rows.requests).toEqual(["req-fresh-expired", "req-fresh-resolved"]);
-    expect(rows.verdicts).toEqual(["req-fresh-resolved"]);
+    expect(rows.requests).toEqual([rid("req-fresh-expired"), rid("req-fresh-resolved")].sort());
+    expect(rows.verdicts).toEqual([rid("req-fresh-resolved")]);
   });
 
   it("refuses a verdict from a device whose enrollment was removed", async () => {
@@ -1574,20 +1709,20 @@ describe("AccountRelay — fail-closed expiry", () => {
     const deviceId = await firstDeviceId(acct);
     const device = await connectWs(acct, `/devices/${deviceId}/connect`);
 
-    await post(acct, "/requests", makeEnvelope("req-rev-1"));
+    await post(acct, "/requests", makeEnvelope(rid("req-rev-1")));
     await device.next(); // request push
 
     // A genuine verdict, signed while the device was still enrolled.
-    const verdict = await makeVerdict(acct, "req-rev-1");
+    const verdict = await makeVerdict(acct, rid("req-rev-1"));
     // Simulate a revoke whose hibernation socket outlived the best-effort close.
     await deleteDeviceRow(acct, deviceId);
-    device.send({ type: "verdict", request_id: "req-rev-1", verdict });
+    device.send({ type: "verdict", request_id: rid("req-rev-1"), verdict });
 
     const err = await device.next();
     expect(err.type).toBe("error");
 
     // A de-enrolled device must not drive resolution — the request stays pending.
-    const polled = await get<{ status: string }>(acct, "/requests/req-rev-1");
+    const polled = await get<{ status: string }>(acct, `/requests/${rid("req-rev-1")}`);
     expect(polled.data.status).toBe("pending");
   });
 });
@@ -1599,12 +1734,16 @@ describe("AccountRelay — fail-closed expiry", () => {
 describe("AccountRelay — retract (issue #195)", () => {
   it("retracts a pending request: terminal 'retracted', no verdict, distinct from expired", async () => {
     const acct = testAccount("acct-retract-basic");
-    const submit = await post<SubmitResult>(acct, "/requests", makeEnvelope("req-retract-basic"));
+    const submit = await post<SubmitResult>(
+      acct,
+      "/requests",
+      makeEnvelope(rid("req-retract-basic")),
+    );
     expect(submit.status).toBe(202);
 
     const retract = await post<{ request_id: string; status: string }>(
       acct,
-      "/requests/req-retract-basic/retract",
+      `/requests/${rid("req-retract-basic")}/retract`,
       {},
     );
     expect(retract.status).toBe(200);
@@ -1612,7 +1751,7 @@ describe("AccountRelay — retract (issue #195)", () => {
 
     const polled = await get<{ status: string; verdict?: unknown }>(
       acct,
-      "/requests/req-retract-basic",
+      `/requests/${rid("req-retract-basic")}`,
     );
     expect(polled.data.status).toBe("retracted");
     expect(polled.data.status).not.toBe("expired");
@@ -1625,52 +1764,52 @@ describe("AccountRelay — retract (issue #195)", () => {
     const deviceId = await firstDeviceId(acct);
     const device = await connectWs(acct, `/devices/${deviceId}/connect`);
 
-    await post(acct, "/requests", makeEnvelope("req-retract-devices"));
+    await post(acct, "/requests", makeEnvelope(rid("req-retract-devices")));
     expect((await device.next()).type).toBe("request");
 
-    await post(acct, "/requests/req-retract-devices/retract", {});
+    await post(acct, `/requests/${rid("req-retract-devices")}/retract`, {});
 
     const retract = await device.next();
     expect(retract.type).toBe("retract");
-    expect(retract.request_id).toBe("req-retract-devices");
+    expect(retract.request_id).toBe(rid("req-retract-devices"));
   });
 
   it("pushes {type:'retracted'} to a live integrator wait socket and closes it", async () => {
     const acct = testAccount("acct-retract-wait-live");
-    await post(acct, "/requests", makeEnvelope("req-retract-wait-live"));
-    const integrator = await connectWs(acct, "/requests/req-retract-wait-live/wait");
+    await post(acct, "/requests", makeEnvelope(rid("req-retract-wait-live")));
+    const integrator = await connectWs(acct, `/requests/${rid("req-retract-wait-live")}/wait`);
 
-    await post(acct, "/requests/req-retract-wait-live/retract", {});
+    await post(acct, `/requests/${rid("req-retract-wait-live")}/retract`, {});
 
     const msg = await integrator.next();
     expect(msg.type).toBe("retracted");
-    expect(msg.request_id).toBe("req-retract-wait-live");
+    expect(msg.request_id).toBe(rid("req-retract-wait-live"));
   });
 
   it("…/wait opened AFTER a retract immediately reports 'retracted' and closes (symmetric with expired)", async () => {
     const acct = testAccount("acct-retract-wait-late");
-    await post(acct, "/requests", makeEnvelope("req-retract-wait-late"));
-    await post(acct, "/requests/req-retract-wait-late/retract", {});
+    await post(acct, "/requests", makeEnvelope(rid("req-retract-wait-late")));
+    await post(acct, `/requests/${rid("req-retract-wait-late")}/retract`, {});
 
-    const integrator = await connectWs(acct, "/requests/req-retract-wait-late/wait");
+    const integrator = await connectWs(acct, `/requests/${rid("req-retract-wait-late")}/wait`);
     const msg = await integrator.next();
     expect(msg.type).toBe("retracted");
-    expect(msg.request_id).toBe("req-retract-wait-late");
+    expect(msg.request_id).toBe(rid("req-retract-wait-late"));
   });
 
   it("is idempotent: retracting an already-retracted request succeeds (200)", async () => {
     const acct = testAccount("acct-retract-idempotent");
-    await post(acct, "/requests", makeEnvelope("req-retract-idempotent"));
+    await post(acct, "/requests", makeEnvelope(rid("req-retract-idempotent")));
     const first = await post<{ status: string }>(
       acct,
-      "/requests/req-retract-idempotent/retract",
+      `/requests/${rid("req-retract-idempotent")}/retract`,
       {},
     );
     expect(first.status).toBe(200);
 
     const second = await post<{ status: string }>(
       acct,
-      "/requests/req-retract-idempotent/retract",
+      `/requests/${rid("req-retract-idempotent")}/retract`,
       {},
     );
     expect(second.status).toBe(200);
@@ -1683,15 +1822,15 @@ describe("AccountRelay — retract (issue #195)", () => {
     const deviceId = await firstDeviceId(acct);
     const device = await connectWs(acct, `/devices/${deviceId}/connect`);
 
-    await post(acct, "/requests", makeEnvelope("req-retract-then-verdict"));
+    await post(acct, "/requests", makeEnvelope(rid("req-retract-then-verdict")));
     await device.next(); // request push
-    await post(acct, "/requests/req-retract-then-verdict/retract", {});
+    await post(acct, `/requests/${rid("req-retract-then-verdict")}/retract`, {});
     await device.next(); // the cross-device retract fan-out
 
     device.send({
       type: "verdict",
-      request_id: "req-retract-then-verdict",
-      verdict: await makeVerdict(acct, "req-retract-then-verdict"),
+      request_id: rid("req-retract-then-verdict"),
+      verdict: await makeVerdict(acct, rid("req-retract-then-verdict")),
     });
     const ack = await device.next();
     expect(ack.type).toBe("ack");
@@ -1700,7 +1839,7 @@ describe("AccountRelay — retract (issue #195)", () => {
     // A late verdict must never resurrect a retracted request as resolved.
     const polled = await get<{ status: string; verdict?: unknown }>(
       acct,
-      "/requests/req-retract-then-verdict",
+      `/requests/${rid("req-retract-then-verdict")}`,
     );
     expect(polled.data.status).toBe("retracted");
     expect(polled.data.verdict).toBeUndefined();
@@ -1712,15 +1851,15 @@ describe("AccountRelay — retract (issue #195)", () => {
     const deviceId = await firstDeviceId(acct);
     const device = await connectWs(acct, `/devices/${deviceId}/connect`);
 
-    await post(acct, "/requests", makeEnvelope("req-retract-vs-resolved"));
+    await post(acct, "/requests", makeEnvelope(rid("req-retract-vs-resolved")));
     await device.next();
-    const winning = await makeVerdict(acct, "req-retract-vs-resolved", "approved");
-    device.send({ type: "verdict", request_id: "req-retract-vs-resolved", verdict: winning });
+    const winning = await makeVerdict(acct, rid("req-retract-vs-resolved"), "approved");
+    device.send({ type: "verdict", request_id: rid("req-retract-vs-resolved"), verdict: winning });
     expect((await device.next()).status).toBe("resolved");
 
     const retract = await post<{ error: string }>(
       acct,
-      "/requests/req-retract-vs-resolved/retract",
+      `/requests/${rid("req-retract-vs-resolved")}/retract`,
       {},
     );
     expect(retract.status).toBe(409);
@@ -1728,7 +1867,7 @@ describe("AccountRelay — retract (issue #195)", () => {
     // A retract that lost the race must never discard the already-recorded human decision.
     const polled = await get<{ status: string; verdict: Record<string, unknown> }>(
       acct,
-      "/requests/req-retract-vs-resolved",
+      `/requests/${rid("req-retract-vs-resolved")}`,
     );
     expect(polled.data.status).toBe("resolved");
     expect(polled.data.verdict).toEqual(winning);
@@ -1736,16 +1875,19 @@ describe("AccountRelay — retract (issue #195)", () => {
 
   it("SECURITY: refuses to retract an already-expired request (409)", async () => {
     const acct = testAccount("acct-retract-vs-expired");
-    await seedExpiredRequest(acct, "req-retract-vs-expired");
+    await seedExpiredRequest(acct, rid("req-retract-vs-expired"));
 
     const retract = await post<{ error: string }>(
       acct,
-      "/requests/req-retract-vs-expired/retract",
+      `/requests/${rid("req-retract-vs-expired")}/retract`,
       {},
     );
     expect(retract.status).toBe(409);
 
-    const polled = await get<{ status: string }>(acct, "/requests/req-retract-vs-expired");
+    const polled = await get<{ status: string }>(
+      acct,
+      `/requests/${rid("req-retract-vs-expired")}`,
+    );
     expect(polled.data.status).toBe("expired");
   });
 
@@ -1760,45 +1902,72 @@ describe("AccountRelay — retract (issue #195)", () => {
 
   it("SECURITY: requires the per-request token, scoped to exactly that request (no cross-request retract)", async () => {
     const acct = testAccount("acct-retract-auth-scoped");
-    const submitA = await post<SubmitResult>(acct, "/requests", makeEnvelope("req-retract-auth-a"));
-    const submitB = await post<SubmitResult>(acct, "/requests", makeEnvelope("req-retract-auth-b"));
+    const submitA = await post<SubmitResult>(
+      acct,
+      "/requests",
+      makeEnvelope(rid("req-retract-auth-a")),
+    );
+    const submitB = await post<SubmitResult>(
+      acct,
+      "/requests",
+      makeEnvelope(rid("req-retract-auth-b")),
+    );
     expect(submitA.status).toBe(202);
     expect(submitB.status).toBe(202);
 
-    const noAuth = await SELF.fetch(relayUrl(acct, "/requests/req-retract-auth-a/retract"), {
-      method: "POST",
-    });
+    const noAuth = await SELF.fetch(
+      relayUrl(acct, `/requests/${rid("req-retract-auth-a")}/retract`),
+      {
+        method: "POST",
+      },
+    );
     expect(noAuth.status).toBe(401);
 
-    const wrongAuth = await SELF.fetch(relayUrl(acct, "/requests/req-retract-auth-a/retract"), {
-      method: "POST",
-      headers: bearer("wrong-request-token"),
-    });
+    const wrongAuth = await SELF.fetch(
+      relayUrl(acct, `/requests/${rid("req-retract-auth-a")}/retract`),
+      {
+        method: "POST",
+        headers: bearer("wrong-request-token"),
+      },
+    );
     expect(wrongAuth.status).toBe(403);
 
     // An integrator holding a REAL, currently-valid token for a DIFFERENT request must not be able
     // to retract this one — the token is scoped to exactly the request it was issued for (#195).
-    const crossRequest = await SELF.fetch(relayUrl(acct, "/requests/req-retract-auth-a/retract"), {
-      method: "POST",
-      headers: bearer(submitB.data.request_auth_token),
-    });
+    const crossRequest = await SELF.fetch(
+      relayUrl(acct, `/requests/${rid("req-retract-auth-a")}/retract`),
+      {
+        method: "POST",
+        headers: bearer(submitB.data.request_auth_token),
+      },
+    );
     expect(crossRequest.status).toBe(403);
 
-    const ok = await post<{ status: string }>(acct, "/requests/req-retract-auth-a/retract", {});
+    const ok = await post<{ status: string }>(
+      acct,
+      `/requests/${rid("req-retract-auth-a")}/retract`,
+      {},
+    );
     expect(ok.status).toBe(200);
 
     // The OTHER request is unaffected by the cross-scoped attempt above.
-    const stillPendingB = await get<{ status: string }>(acct, "/requests/req-retract-auth-b");
+    const stillPendingB = await get<{ status: string }>(
+      acct,
+      `/requests/${rid("req-retract-auth-b")}`,
+    );
     expect(stillPendingB.data.status).toBe("pending");
   });
 
   it("returns 405 retracting via the wrong method", async () => {
     const acct = testAccount("acct-retract-method");
-    await post(acct, "/requests", makeEnvelope("req-retract-method"));
-    const resp = await SELF.fetch(relayUrl(acct, "/requests/req-retract-method/retract"), {
-      method: "GET",
-      headers: bearer(requestAuthTokens.get(tokenKey(acct, "req-retract-method")) ?? ""),
-    });
+    await post(acct, "/requests", makeEnvelope(rid("req-retract-method")));
+    const resp = await SELF.fetch(
+      relayUrl(acct, `/requests/${rid("req-retract-method")}/retract`),
+      {
+        method: "GET",
+        headers: bearer(requestAuthTokens.get(tokenKey(acct, rid("req-retract-method"))) ?? ""),
+      },
+    );
     expect(resp.status).toBe(405);
   });
 });
@@ -1812,8 +1981,8 @@ describe("AccountRelay — device inbox (HTTP poll)", () => {
     const acct = testAccount("acct-inbox-basic");
     const device = await pairDevice(acct);
     const token = device.device_auth_token;
-    const envA = makeEnvelope("req-inbox-a");
-    const envB = makeEnvelope("req-inbox-b");
+    const envA = makeEnvelope(rid("req-inbox-a"));
+    const envB = makeEnvelope(rid("req-inbox-b"));
     await post(acct, "/requests", envA);
     await post(acct, "/requests", envB);
 
@@ -1824,8 +1993,8 @@ describe("AccountRelay — device inbox (HTTP poll)", () => {
     );
     expect(resp.status).toBe(200);
     const ids = resp.data.envelopes.map((e) => (e as Record<string, unknown>).id);
-    expect(ids).toContain("req-inbox-a");
-    expect(ids).toContain("req-inbox-b");
+    expect(ids).toContain(rid("req-inbox-a"));
+    expect(ids).toContain(rid("req-inbox-b"));
     // Zero-knowledge: only relay-visible envelope fields, never plaintext context
     for (const env of resp.data.envelopes) {
       const keys = Object.keys(env as Record<string, unknown>);
@@ -1842,16 +2011,16 @@ describe("AccountRelay — device inbox (HTTP poll)", () => {
     const token = device.device_auth_token;
 
     // Submit two requests; resolve one via the WebSocket.
-    await post(acct, "/requests", makeEnvelope("req-exclude-pending"));
-    await post(acct, "/requests", makeEnvelope("req-exclude-resolved"));
+    await post(acct, "/requests", makeEnvelope(rid("req-exclude-pending")));
+    await post(acct, "/requests", makeEnvelope(rid("req-exclude-resolved")));
     const wsDevice = await connectWs(acct, `/devices/${device.device_id}/connect`);
     // drain both offline-queue messages
     await wsDevice.next();
     await wsDevice.next();
     wsDevice.send({
       type: "verdict",
-      request_id: "req-exclude-resolved",
-      verdict: await makeVerdict(acct, "req-exclude-resolved"),
+      request_id: rid("req-exclude-resolved"),
+      verdict: await makeVerdict(acct, rid("req-exclude-resolved")),
     });
     await wsDevice.next(); // ack
 
@@ -1862,8 +2031,8 @@ describe("AccountRelay — device inbox (HTTP poll)", () => {
     );
     expect(resp.status).toBe(200);
     const ids = resp.data.envelopes.map((e) => (e as Record<string, unknown>).id);
-    expect(ids).toContain("req-exclude-pending");
-    expect(ids).not.toContain("req-exclude-resolved");
+    expect(ids).toContain(rid("req-exclude-pending"));
+    expect(ids).not.toContain(rid("req-exclude-resolved"));
   });
 
   it("excludes already-expired requests from the inbox (fail-closed)", async () => {
@@ -1872,9 +2041,9 @@ describe("AccountRelay — device inbox (HTTP poll)", () => {
     const token = device.device_auth_token;
 
     // Seed an expired request directly (POST /requests rejects already-expired).
-    await seedExpiredRequest(acct, "req-inbox-already-expired");
+    await seedExpiredRequest(acct, rid("req-inbox-already-expired"));
     // Submit a live request.
-    await post(acct, "/requests", makeEnvelope("req-inbox-live"));
+    await post(acct, "/requests", makeEnvelope(rid("req-inbox-live")));
 
     const resp = await get<{ envelopes: unknown[] }>(
       acct,
@@ -1883,8 +2052,8 @@ describe("AccountRelay — device inbox (HTTP poll)", () => {
     );
     expect(resp.status).toBe(200);
     const ids = resp.data.envelopes.map((e) => (e as Record<string, unknown>).id);
-    expect(ids).not.toContain("req-inbox-already-expired");
-    expect(ids).toContain("req-inbox-live");
+    expect(ids).not.toContain(rid("req-inbox-already-expired"));
+    expect(ids).toContain(rid("req-inbox-live"));
   });
 
   it("returns 401 without a bearer token", async () => {
@@ -2052,32 +2221,32 @@ async function seedOldTerminalRows(accountId: string): Promise<void> {
     const relay = instance as unknown as { sql: SqlStorage };
     const rows = [
       {
-        request_id: "req-old-expired",
-        envelope: makeEnvelope("req-old-expired", { expires_at: OLD_TERMINAL_AT }),
+        request_id: rid("req-old-expired"),
+        envelope: makeEnvelope(rid("req-old-expired"), { expires_at: OLD_TERMINAL_AT }),
         created_at: OLD_TERMINAL_AT - 1000,
         expires_at: OLD_TERMINAL_AT,
         status: "expired",
         terminal_at: OLD_TERMINAL_AT,
       },
       {
-        request_id: "req-fresh-expired",
-        envelope: makeEnvelope("req-fresh-expired"),
+        request_id: rid("req-fresh-expired"),
+        envelope: makeEnvelope(rid("req-fresh-expired")),
         created_at: CREATED_AT,
         expires_at: FUTURE_EXPIRES_AT,
         status: "expired",
         terminal_at: FUTURE_EXPIRES_AT,
       },
       {
-        request_id: "req-old-resolved",
-        envelope: makeEnvelope("req-old-resolved", { expires_at: OLD_TERMINAL_AT }),
+        request_id: rid("req-old-resolved"),
+        envelope: makeEnvelope(rid("req-old-resolved"), { expires_at: OLD_TERMINAL_AT }),
         created_at: OLD_TERMINAL_AT - 1000,
         expires_at: OLD_TERMINAL_AT,
         status: "resolved",
         terminal_at: OLD_TERMINAL_AT,
       },
       {
-        request_id: "req-fresh-resolved",
-        envelope: makeEnvelope("req-fresh-resolved"),
+        request_id: rid("req-fresh-resolved"),
+        envelope: makeEnvelope(rid("req-fresh-resolved")),
         created_at: CREATED_AT,
         expires_at: FUTURE_EXPIRES_AT,
         status: "resolved",
@@ -2100,16 +2269,16 @@ async function seedOldTerminalRows(accountId: string): Promise<void> {
     relay.sql.exec(
       `INSERT OR REPLACE INTO verdict (request_id, verdict, device_id, received_at)
        VALUES (?, ?, ?, ?)`,
-      "req-old-resolved",
-      JSON.stringify({ request_id: "req-old-resolved", sig: "stored-verdict" }),
+      rid("req-old-resolved"),
+      JSON.stringify({ request_id: rid("req-old-resolved"), sig: "stored-verdict" }),
       "dev-old",
       OLD_TERMINAL_AT,
     );
     relay.sql.exec(
       `INSERT OR REPLACE INTO verdict (request_id, verdict, device_id, received_at)
        VALUES (?, ?, ?, ?)`,
-      "req-fresh-resolved",
-      JSON.stringify({ request_id: "req-fresh-resolved", sig: "stored-verdict" }),
+      rid("req-fresh-resolved"),
+      JSON.stringify({ request_id: rid("req-fresh-resolved"), sig: "stored-verdict" }),
       "dev-fresh",
       FUTURE_EXPIRES_AT,
     );
