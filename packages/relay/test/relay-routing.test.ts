@@ -25,6 +25,7 @@ import { describe, it, expect, vi } from "vitest";
 import { AccountRelay } from "../src/index.js";
 import type { PushTransportRegistry } from "../src/push.js";
 import type { SqlStorage } from "@cloudflare/workers-types";
+import { pairingStartBody, testAccount } from "./support/accounts.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures (deterministic; never `Date.now()` in data — see fixed-dates rule)
@@ -187,7 +188,11 @@ function rememberRequest(accountId: string, submit: SubmitResult): void {
 
 /** Enroll a device via the pairing flow and retain its token for helper-built auth headers. */
 async function pairDevice(accountId: string, pubkey = DEVICE_PUBKEY): Promise<DeviceEnrollment> {
-  const start = await post<PairingStartResult>(accountId, "/pairing/start", {});
+  const start = await post<PairingStartResult>(
+    accountId,
+    "/pairing/start",
+    pairingStartBody(accountId),
+  );
   const complete = await post<DeviceEnrollment>(
     accountId,
     "/pairing/complete",
@@ -206,7 +211,11 @@ async function pairDeviceWithPushToken(
   accountId: string,
   token = "a".repeat(64),
 ): Promise<DeviceEnrollment> {
-  const start = await post<PairingStartResult>(accountId, "/pairing/start", {});
+  const start = await post<PairingStartResult>(
+    accountId,
+    "/pairing/start",
+    pairingStartBody(accountId),
+  );
   const complete = await post<DeviceEnrollment>(
     accountId,
     "/pairing/complete",
@@ -327,7 +336,7 @@ async function connectWs(accountId: string, subPath: string): Promise<WsClient> 
 
 describe("AccountRelay — routing (device online)", () => {
   it("E2E: submit → device receives ciphertext → verdict → integrator polls resolved", async () => {
-    const acct = "acct-e2e-online";
+    const acct = testAccount("acct-e2e-online");
     await enrollDevice(acct);
 
     const device = await connectWs(acct, `/devices/${await firstDeviceId(acct)}/connect`);
@@ -367,7 +376,7 @@ describe("AccountRelay — routing (device online)", () => {
   });
 
   it("pushes the verdict to a live integrator waiting on …/wait", async () => {
-    const acct = "acct-e2e-wait";
+    const acct = testAccount("acct-e2e-wait");
     await enrollDevice(acct);
     const device = await connectWs(acct, `/devices/${await firstDeviceId(acct)}/connect`);
 
@@ -387,7 +396,7 @@ describe("AccountRelay — routing (device online)", () => {
   });
 
   it("delivers immediately when …/wait opens after the verdict already landed", async () => {
-    const acct = "acct-wait-late";
+    const acct = testAccount("acct-wait-late");
     await enrollDevice(acct);
     const device = await connectWs(acct, `/devices/${await firstDeviceId(acct)}/connect`);
 
@@ -411,8 +420,8 @@ describe("AccountRelay — routing (device online)", () => {
 
 describe("AccountRelay — routing (device offline)", () => {
   it("submitting a request schedules request-id-only push wakeups for registered tokens", async () => {
-    const acct = "acct-push-wakeup";
-    const start = await post<PairingStartResult>(acct, "/pairing/start", {});
+    const acct = testAccount("acct-push-wakeup");
+    const start = await post<PairingStartResult>(acct, "/pairing/start", pairingStartBody(acct));
     await post(
       acct,
       "/pairing/complete",
@@ -437,7 +446,7 @@ describe("AccountRelay — routing (device offline)", () => {
   });
 
   it("still delivers over WebSocket when a push transport throws", async () => {
-    const acct = "acct-push-throw-still-ws";
+    const acct = testAccount("acct-push-throw-still-ws");
     const deviceId = await enrollDeviceWithPushToken(acct);
     const device = await connectWs(acct, `/devices/${deviceId}/connect`);
     await installPushTransports(acct, {
@@ -465,7 +474,7 @@ describe("AccountRelay — routing (device offline)", () => {
   });
 
   it("stops scheduling push wakeups after the target device is revoked", async () => {
-    const acct = "acct-push-revoke-clears-wakeups";
+    const acct = testAccount("acct-push-revoke-clears-wakeups");
     const deviceId = await enrollDeviceWithPushToken(acct);
 
     const beforeRevoke = await post<{ push_wakeups: number }>(
@@ -489,7 +498,7 @@ describe("AccountRelay — routing (device offline)", () => {
   });
 
   it("queues a request submitted while offline and flushes it on reconnect", async () => {
-    const acct = "acct-offline-queue";
+    const acct = testAccount("acct-offline-queue");
     await enrollDevice(acct);
 
     // Submit with NO device connected → delivered_to 0, request stays pending.
@@ -509,7 +518,7 @@ describe("AccountRelay — routing (device offline)", () => {
   });
 
   it("flushes only still-pending requests (already-resolved ones are not re-delivered)", async () => {
-    const acct = "acct-offline-mixed";
+    const acct = testAccount("acct-offline-mixed");
     await enrollDevice(acct);
     const deviceId = await firstDeviceId(acct);
 
@@ -541,7 +550,7 @@ describe("AccountRelay — routing (device offline)", () => {
 
 describe("AccountRelay — cross-device coordination", () => {
   it("retracts the request from other devices once one resolves it", async () => {
-    const acct = "acct-retract";
+    const acct = testAccount("acct-retract");
     await enrollDevice(acct);
     const deviceId = await firstDeviceId(acct);
 
@@ -568,7 +577,7 @@ describe("AccountRelay — cross-device coordination", () => {
   });
 
   it("first verdict wins: a second verdict is ignored (dedupe)", async () => {
-    const acct = "acct-dedupe";
+    const acct = testAccount("acct-dedupe");
     await enrollDevice(acct);
     const deviceId = await firstDeviceId(acct);
     const device = await connectWs(acct, `/devices/${deviceId}/connect`);
@@ -596,7 +605,7 @@ describe("AccountRelay — cross-device coordination", () => {
   });
 
   it("fans out to only one connection per visible surface", async () => {
-    const acct = "acct-surface-dedupe";
+    const acct = testAccount("acct-surface-dedupe");
     await enrollDevice(acct);
     const deviceId = await firstDeviceId(acct);
 
@@ -670,7 +679,7 @@ describe("AccountRelay — cross-device coordination", () => {
   });
 
   it("flushes queued requests to only one reconnecting connection per visible surface", async () => {
-    const acct = "acct-surface-flush";
+    const acct = testAccount("acct-surface-flush");
     await enrollDevice(acct);
     const deviceId = await firstDeviceId(acct);
 
@@ -751,7 +760,7 @@ describe("AccountRelay — cross-device coordination", () => {
 
 describe("AccountRelay — zero-knowledge (routing)", () => {
   it("stores ONLY the opaque ciphertext envelope and the signed verdict — no plaintext", async () => {
-    const acct = "acct-zk-routing";
+    const acct = testAccount("acct-zk-routing");
     await enrollDevice(acct);
     const deviceId = await firstDeviceId(acct);
     const device = await connectWs(acct, `/devices/${deviceId}/connect`);
@@ -814,7 +823,7 @@ describe("AccountRelay — zero-knowledge (routing)", () => {
 
 describe("AccountRelay — verdict authenticity", () => {
   it("rejects a verdict sent from a non-device (integrator …/wait) socket", async () => {
-    const acct = "acct-sec-verdict";
+    const acct = testAccount("acct-sec-verdict");
     await enrollDevice(acct);
     const device = await connectWs(acct, `/devices/${await firstDeviceId(acct)}/connect`);
 
@@ -844,7 +853,7 @@ describe("AccountRelay — verdict authenticity", () => {
 
 describe("AccountRelay — endpoint authentication", () => {
   it("requires the enrolled device token for device presence sockets", async () => {
-    const acct = "acct-auth-device-connect";
+    const acct = testAccount("acct-auth-device-connect");
     const device = await pairDevice(acct);
 
     const noAuth = await SELF.fetch(relayUrl(acct, `/devices/${device.device_id}/connect`), {
@@ -871,7 +880,7 @@ describe("AccountRelay — endpoint authentication", () => {
   });
 
   it("rejects another enrolled device's real token for a target device presence socket", async () => {
-    const acct = "acct-auth-device-connect-scoped";
+    const acct = testAccount("acct-auth-device-connect-scoped");
     const deviceA = await pairDevice(acct);
     const deviceB = await pairDevice(acct, "__________________________________________8");
 
@@ -886,7 +895,7 @@ describe("AccountRelay — endpoint authentication", () => {
   });
 
   it("fails closed when legacy device or request rows have no stored auth-token hash", async () => {
-    const acct = "acct-auth-null-hash";
+    const acct = testAccount("acct-auth-null-hash");
     const device = await pairDevice(acct);
     const submit = await post<SubmitResult>(acct, "/requests", makeEnvelope("req-auth-null-hash"));
     expect(submit.status).toBe(202);
@@ -918,7 +927,7 @@ describe("AccountRelay — endpoint authentication", () => {
   });
 
   it("requires the per-request token for polling and wait sockets", async () => {
-    const acct = "acct-auth-request-token";
+    const acct = testAccount("acct-auth-request-token");
     const submit = await post<SubmitResult>(acct, "/requests", makeEnvelope("req-auth-token"));
     expect(submit.status).toBe(202);
 
@@ -965,7 +974,7 @@ describe("AccountRelay — endpoint authentication", () => {
 
 describe("AccountRelay — routing negative paths", () => {
   it("rejects a submit missing context_ciphertext (400)", async () => {
-    const acct = "acct-neg-noct";
+    const acct = testAccount("acct-neg-noct");
     const body = makeEnvelope("req-noct");
     delete body.context_ciphertext;
     const { status } = await post(acct, "/requests", body);
@@ -975,41 +984,41 @@ describe("AccountRelay — routing negative paths", () => {
   it("rejects an envelope carrying an unexpected key (zero-knowledge guard) (400)", async () => {
     // A stray plaintext-looking field must be refused so it can never be persisted by the relay.
     const body = { ...makeEnvelope("req-extra"), summary: "rm -rf / — please approve" };
-    const { status } = await post("acct-neg-extra", "/requests", body);
+    const { status } = await post(testAccount("acct-neg-extra"), "/requests", body);
     expect(status).toBe(400);
   });
 
   it("rejects a submit missing approver (400)", async () => {
     const body = makeEnvelope("req-noappr");
     delete body.approver;
-    const { status } = await post("acct-neg-noappr", "/requests", body);
+    const { status } = await post(testAccount("acct-neg-noappr"), "/requests", body);
     expect(status).toBe(400);
   });
 
   it("rejects a submit missing v (400)", async () => {
     const body = makeEnvelope("req-nov");
     delete body.v;
-    const { status } = await post("acct-neg-nov", "/requests", body);
+    const { status } = await post(testAccount("acct-neg-nov"), "/requests", body);
     expect(status).toBe(400);
   });
 
   it("rejects a submit missing id (400)", async () => {
     const body = makeEnvelope("ignored");
     delete body.id;
-    const { status } = await post("acct-neg-noid", "/requests", body);
+    const { status } = await post(testAccount("acct-neg-noid"), "/requests", body);
     expect(status).toBe(400);
   });
 
   it("rejects a submit missing expires_at (400)", async () => {
     const body = makeEnvelope("req-noexp");
     delete body.expires_at;
-    const { status } = await post("acct-neg-noexp", "/requests", body);
+    const { status } = await post(testAccount("acct-neg-noexp"), "/requests", body);
     expect(status).toBe(400);
   });
 
   it("rejects a submit whose expires_at is already in the past (400)", async () => {
     const { status } = await post(
-      "acct-neg-expired",
+      testAccount("acct-neg-expired"),
       "/requests",
       makeEnvelope("req-expired", { expires_at: 1 }),
     );
@@ -1017,7 +1026,7 @@ describe("AccountRelay — routing negative paths", () => {
   });
 
   it("rejects a duplicate request id (409)", async () => {
-    const acct = "acct-neg-dup";
+    const acct = testAccount("acct-neg-dup");
     const first = await post(acct, "/requests", makeEnvelope("req-dup"));
     expect(first.status).toBe(202);
     const second = await post(acct, "/requests", makeEnvelope("req-dup"));
@@ -1025,19 +1034,22 @@ describe("AccountRelay — routing negative paths", () => {
   });
 
   it("returns 404 polling an unknown request", async () => {
-    const { status } = await get("acct-neg-poll", "/requests/does-not-exist");
+    const { status } = await get(testAccount("acct-neg-poll"), "/requests/does-not-exist");
     expect(status).toBe(404);
   });
 
   it("returns 404 connecting a WebSocket for an unenrolled device", async () => {
-    const resp = await SELF.fetch(relayUrl("acct-neg-wsdev", "/devices/ghost/connect"), {
-      headers: { Upgrade: "websocket" },
-    });
+    const resp = await SELF.fetch(
+      relayUrl(testAccount("acct-neg-wsdev"), "/devices/ghost/connect"),
+      {
+        headers: { Upgrade: "websocket" },
+      },
+    );
     expect(resp.status).toBe(404);
   });
 
   it("returns 426 hitting a WebSocket route without an upgrade header", async () => {
-    const acct = "acct-neg-noupgrade";
+    const acct = testAccount("acct-neg-noupgrade");
     const deviceId = await enrollDevice(acct);
     const connectResp = await SELF.fetch(relayUrl(acct, `/devices/${deviceId}/connect`), {
       method: "GET",
@@ -1049,7 +1061,7 @@ describe("AccountRelay — routing negative paths", () => {
   });
 
   it("sends an error over the socket for a verdict on an unknown request", async () => {
-    const acct = "acct-neg-badverdict";
+    const acct = testAccount("acct-neg-badverdict");
     const deviceId = await enrollDevice(acct);
     const device = await connectWs(acct, `/devices/${deviceId}/connect`);
     device.send({ type: "verdict", request_id: "no-such-request", verdict: makeVerdict("x") });
@@ -1059,14 +1071,17 @@ describe("AccountRelay — routing negative paths", () => {
   });
 
   it("returns 404 opening …/wait for an unknown request", async () => {
-    const resp = await SELF.fetch(relayUrl("acct-neg-waitunknown", "/requests/nope/wait"), {
-      headers: { Upgrade: "websocket" },
-    });
+    const resp = await SELF.fetch(
+      relayUrl(testAccount("acct-neg-waitunknown"), "/requests/nope/wait"),
+      {
+        headers: { Upgrade: "websocket" },
+      },
+    );
     expect(resp.status).toBe(404);
   });
 
   it("rejects a degenerate (non-object) verdict value", async () => {
-    const acct = "acct-neg-scalarverdict";
+    const acct = testAccount("acct-neg-scalarverdict");
     const deviceId = await enrollDevice(acct);
     const device = await connectWs(acct, `/devices/${deviceId}/connect`);
     await post(acct, "/requests", makeEnvelope("req-scalar"));
@@ -1086,7 +1101,7 @@ describe("AccountRelay — routing negative paths", () => {
 
 describe("AccountRelay — fail-closed expiry", () => {
   it("refuses a verdict for an expired request and does not resolve it", async () => {
-    const acct = "acct-exp-verdict";
+    const acct = testAccount("acct-exp-verdict");
     await enrollDevice(acct);
     const deviceId = await firstDeviceId(acct);
     await seedExpiredRequest(acct, "req-exp-v");
@@ -1105,7 +1120,7 @@ describe("AccountRelay — fail-closed expiry", () => {
   });
 
   it("does not re-flush a request that expired while queued", async () => {
-    const acct = "acct-exp-flush";
+    const acct = testAccount("acct-exp-flush");
     await enrollDevice(acct);
     const deviceId = await firstDeviceId(acct);
     await seedExpiredRequest(acct, "req-exp-q");
@@ -1116,7 +1131,7 @@ describe("AccountRelay — fail-closed expiry", () => {
   });
 
   it("lazy-expires on poll: a past-deadline pending request reports terminal 'expired'", async () => {
-    const acct = "acct-exp-poll";
+    const acct = testAccount("acct-exp-poll");
     await seedExpiredRequest(acct, "req-exp-p");
 
     const polled = await get<{ status: string }>(acct, "/requests/req-exp-p");
@@ -1125,7 +1140,7 @@ describe("AccountRelay — fail-closed expiry", () => {
   });
 
   it("lazy-expires on poll: retracts devices and wakes existing waiters", async () => {
-    const acct = "acct-exp-poll-notify";
+    const acct = testAccount("acct-exp-poll-notify");
     await enrollDevice(acct);
     const deviceId = await firstDeviceId(acct);
     const device = await connectWs(acct, `/devices/${deviceId}/connect`);
@@ -1150,7 +1165,7 @@ describe("AccountRelay — fail-closed expiry", () => {
   });
 
   it("lazy-expires on …/wait: pushes terminal 'expired' and closes", async () => {
-    const acct = "acct-exp-wait";
+    const acct = testAccount("acct-exp-wait");
     await seedExpiredRequest(acct, "req-exp-w");
 
     const integrator = await connectWs(acct, "/requests/req-exp-w/wait");
@@ -1160,7 +1175,7 @@ describe("AccountRelay — fail-closed expiry", () => {
   });
 
   it("alarm proactively expires overdue pending requests, retracts devices, and wakes waiters", async () => {
-    const acct = "acct-exp-alarm";
+    const acct = testAccount("acct-exp-alarm");
     await enrollDevice(acct);
     const deviceId = await firstDeviceId(acct);
     const device = await connectWs(acct, `/devices/${deviceId}/connect`);
@@ -1186,7 +1201,7 @@ describe("AccountRelay — fail-closed expiry", () => {
   });
 
   it("alarm tracks the nearest pending expiry and clears itself when no pending work remains", async () => {
-    const acct = "acct-exp-rearm";
+    const acct = testAccount("acct-exp-rearm");
     const firstExpiry = 4102444800000;
     const secondExpiry = firstExpiry + 60_000;
     await post(acct, "/requests", makeEnvelope("req-exp-a", { expires_at: firstExpiry }));
@@ -1204,7 +1219,7 @@ describe("AccountRelay — fail-closed expiry", () => {
   });
 
   it("alarm retention sweep deletes old terminal rows and their verdicts", async () => {
-    const acct = "acct-exp-retention";
+    const acct = testAccount("acct-exp-retention");
     await seedOldTerminalRows(acct);
 
     await runAlarm(acct);
@@ -1215,7 +1230,7 @@ describe("AccountRelay — fail-closed expiry", () => {
   });
 
   it("refuses a verdict from a device whose enrollment was removed", async () => {
-    const acct = "acct-exp-revoked";
+    const acct = testAccount("acct-exp-revoked");
     await enrollDevice(acct);
     const deviceId = await firstDeviceId(acct);
     const device = await connectWs(acct, `/devices/${deviceId}/connect`);
@@ -1242,7 +1257,7 @@ describe("AccountRelay — fail-closed expiry", () => {
 
 describe("AccountRelay — retract (issue #195)", () => {
   it("retracts a pending request: terminal 'retracted', no verdict, distinct from expired", async () => {
-    const acct = "acct-retract-basic";
+    const acct = testAccount("acct-retract-basic");
     const submit = await post<SubmitResult>(acct, "/requests", makeEnvelope("req-retract-basic"));
     expect(submit.status).toBe(202);
 
@@ -1264,7 +1279,7 @@ describe("AccountRelay — retract (issue #195)", () => {
   });
 
   it("clears the pending prompt from connected devices (reuses the {type:'retract'} fan-out)", async () => {
-    const acct = "acct-retract-devices";
+    const acct = testAccount("acct-retract-devices");
     await enrollDevice(acct);
     const deviceId = await firstDeviceId(acct);
     const device = await connectWs(acct, `/devices/${deviceId}/connect`);
@@ -1280,7 +1295,7 @@ describe("AccountRelay — retract (issue #195)", () => {
   });
 
   it("pushes {type:'retracted'} to a live integrator wait socket and closes it", async () => {
-    const acct = "acct-retract-wait-live";
+    const acct = testAccount("acct-retract-wait-live");
     await post(acct, "/requests", makeEnvelope("req-retract-wait-live"));
     const integrator = await connectWs(acct, "/requests/req-retract-wait-live/wait");
 
@@ -1292,7 +1307,7 @@ describe("AccountRelay — retract (issue #195)", () => {
   });
 
   it("…/wait opened AFTER a retract immediately reports 'retracted' and closes (symmetric with expired)", async () => {
-    const acct = "acct-retract-wait-late";
+    const acct = testAccount("acct-retract-wait-late");
     await post(acct, "/requests", makeEnvelope("req-retract-wait-late"));
     await post(acct, "/requests/req-retract-wait-late/retract", {});
 
@@ -1303,7 +1318,7 @@ describe("AccountRelay — retract (issue #195)", () => {
   });
 
   it("is idempotent: retracting an already-retracted request succeeds (200)", async () => {
-    const acct = "acct-retract-idempotent";
+    const acct = testAccount("acct-retract-idempotent");
     await post(acct, "/requests", makeEnvelope("req-retract-idempotent"));
     const first = await post<{ status: string }>(
       acct,
@@ -1322,7 +1337,7 @@ describe("AccountRelay — retract (issue #195)", () => {
   });
 
   it("refuses a device verdict for an already-retracted request (retract is not overridable)", async () => {
-    const acct = "acct-retract-then-verdict";
+    const acct = testAccount("acct-retract-then-verdict");
     await enrollDevice(acct);
     const deviceId = await firstDeviceId(acct);
     const device = await connectWs(acct, `/devices/${deviceId}/connect`);
@@ -1351,7 +1366,7 @@ describe("AccountRelay — retract (issue #195)", () => {
   });
 
   it("SECURITY: refuses to retract a request that already resolved — the recorded verdict stands (409)", async () => {
-    const acct = "acct-retract-vs-resolved";
+    const acct = testAccount("acct-retract-vs-resolved");
     await enrollDevice(acct);
     const deviceId = await firstDeviceId(acct);
     const device = await connectWs(acct, `/devices/${deviceId}/connect`);
@@ -1379,7 +1394,7 @@ describe("AccountRelay — retract (issue #195)", () => {
   });
 
   it("SECURITY: refuses to retract an already-expired request (409)", async () => {
-    const acct = "acct-retract-vs-expired";
+    const acct = testAccount("acct-retract-vs-expired");
     await seedExpiredRequest(acct, "req-retract-vs-expired");
 
     const retract = await post<{ error: string }>(
@@ -1394,12 +1409,16 @@ describe("AccountRelay — retract (issue #195)", () => {
   });
 
   it("SECURITY: returns 404 retracting an unknown request", async () => {
-    const { status } = await post("acct-retract-unknown", "/requests/does-not-exist/retract", {});
+    const { status } = await post(
+      testAccount("acct-retract-unknown"),
+      "/requests/does-not-exist/retract",
+      {},
+    );
     expect(status).toBe(404);
   });
 
   it("SECURITY: requires the per-request token, scoped to exactly that request (no cross-request retract)", async () => {
-    const acct = "acct-retract-auth-scoped";
+    const acct = testAccount("acct-retract-auth-scoped");
     const submitA = await post<SubmitResult>(acct, "/requests", makeEnvelope("req-retract-auth-a"));
     const submitB = await post<SubmitResult>(acct, "/requests", makeEnvelope("req-retract-auth-b"));
     expect(submitA.status).toBe(202);
@@ -1433,7 +1452,7 @@ describe("AccountRelay — retract (issue #195)", () => {
   });
 
   it("returns 405 retracting via the wrong method", async () => {
-    const acct = "acct-retract-method";
+    const acct = testAccount("acct-retract-method");
     await post(acct, "/requests", makeEnvelope("req-retract-method"));
     const resp = await SELF.fetch(relayUrl(acct, "/requests/req-retract-method/retract"), {
       method: "GET",
@@ -1449,7 +1468,7 @@ describe("AccountRelay — retract (issue #195)", () => {
 
 describe("AccountRelay — device inbox (HTTP poll)", () => {
   it("returns pending envelopes for the authenticated device", async () => {
-    const acct = "acct-inbox-basic";
+    const acct = testAccount("acct-inbox-basic");
     const device = await pairDevice(acct);
     const token = device.device_auth_token;
     const envA = makeEnvelope("req-inbox-a");
@@ -1477,7 +1496,7 @@ describe("AccountRelay — device inbox (HTTP poll)", () => {
   });
 
   it("excludes resolved and expired requests from the inbox", async () => {
-    const acct = "acct-inbox-exclude";
+    const acct = testAccount("acct-inbox-exclude");
     const device = await pairDevice(acct);
     const token = device.device_auth_token;
 
@@ -1507,7 +1526,7 @@ describe("AccountRelay — device inbox (HTTP poll)", () => {
   });
 
   it("excludes already-expired requests from the inbox (fail-closed)", async () => {
-    const acct = "acct-inbox-expired";
+    const acct = testAccount("acct-inbox-expired");
     const device = await pairDevice(acct);
     const token = device.device_auth_token;
 
@@ -1528,7 +1547,7 @@ describe("AccountRelay — device inbox (HTTP poll)", () => {
   });
 
   it("returns 401 without a bearer token", async () => {
-    const acct = "acct-inbox-noauth";
+    const acct = testAccount("acct-inbox-noauth");
     const device = await pairDevice(acct);
 
     const resp = await SELF.fetch(relayUrl(acct, `/devices/${device.device_id}/inbox`), {
@@ -1538,7 +1557,7 @@ describe("AccountRelay — device inbox (HTTP poll)", () => {
   });
 
   it("returns 403 with a wrong bearer token", async () => {
-    const acct = "acct-inbox-wrongauth";
+    const acct = testAccount("acct-inbox-wrongauth");
     const device = await pairDevice(acct);
 
     const resp = await SELF.fetch(relayUrl(acct, `/devices/${device.device_id}/inbox`), {
@@ -1549,7 +1568,7 @@ describe("AccountRelay — device inbox (HTTP poll)", () => {
   });
 
   it("returns 404 for an unenrolled device id", async () => {
-    const acct = "acct-inbox-notfound";
+    const acct = testAccount("acct-inbox-notfound");
     await pairDevice(acct);
 
     const resp = await SELF.fetch(relayUrl(acct, `/devices/not-a-real-device/inbox`), {
@@ -1560,7 +1579,7 @@ describe("AccountRelay — device inbox (HTTP poll)", () => {
   });
 
   it("405 on POST to the inbox route", async () => {
-    const acct = "acct-inbox-405";
+    const acct = testAccount("acct-inbox-405");
     const device = await pairDevice(acct);
     const token = device.device_auth_token;
 
@@ -1576,7 +1595,7 @@ describe("AccountRelay — device inbox (HTTP poll)", () => {
   });
 
   it("returns an empty array when no pending requests exist", async () => {
-    const acct = "acct-inbox-empty";
+    const acct = testAccount("acct-inbox-empty");
     const device = await pairDevice(acct);
     const token = device.device_auth_token;
 

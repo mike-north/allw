@@ -13,9 +13,16 @@
  * Registry and request endpoints use relay-scoped bearer capability tokens. Tokens are random,
  * short protocol secrets; the DO stores only SHA-256 hashes so persisted state cannot be replayed
  * as a bearer credential. See issue #89 and `docs/enrollment.md`.
+ *
+ * # Self-certifying accounts
+ * An account id is derived from its account-root public key (`docs/enrollment.md` §Model). Starting
+ * a pairing — the only way to add a device — requires a root-signed authorization that the core
+ * verifies against a root that derives to the path's account id; the first verified root is then
+ * bound to the account's Durable Object. Root verification runs in the audited core (`./core.ts`).
  */
 
 import { PAIRING_TTL_MS } from "./constants.js";
+import { checkAccountIdForRoot, verifyPairingStartAuthorization } from "./core.js";
 import {
   ApnsPushTransport,
   FcmPushTransport,
@@ -88,6 +95,10 @@ interface PairingRow extends Record<string, string | number | null | ArrayBuffer
   expires_at: number;
   used: number;
   auth_token_hash: string | null;
+}
+
+interface AccountMetaRow extends Record<string, string | number | null | ArrayBuffer> {
+  root_pubkey: string;
 }
 
 interface RequestRow extends Record<string, string | number | null | ArrayBuffer> {
@@ -406,7 +417,9 @@ function parseSurfaceId(request: Request): string | null | undefined {
  * # Endpoint auth
  * Pairing completion, device presence, actor enrollment, device revocation, and request poll/wait
  * use relay-scoped bearer capability tokens introduced by #89. Token hashes are stored in SQLite;
- * plaintext bearer values are returned once to the caller.
+ * plaintext bearer values are returned once to the caller. Pairing start is authorized by the
+ * account root itself (a root-signed authorization verified by the core), and the first verified
+ * root is bound in `account_meta`.
  */
 export class AccountRelay implements DurableObject {
   private readonly sql: SqlStorage;
@@ -452,6 +465,23 @@ export class AccountRelay implements DurableObject {
         pubkey     TEXT    NOT NULL,
         label      TEXT,
         created_at INTEGER NOT NULL
+      );
+
+      -- The account root this Durable Object is bound to: written once, by the first pairing
+      -- start whose root-signed authorization verified against a root that derives to this
+      -- account's id. Later root-signed calls are verified against this row. Public key only.
+      CREATE TABLE IF NOT EXISTS account_meta (
+        id          INTEGER PRIMARY KEY CHECK (id = 1),
+        root_pubkey TEXT    NOT NULL,
+        bound_at    INTEGER NOT NULL
+      );
+
+      -- One-time ids of accepted pairing-start authorizations, kept until the authorization
+      -- expires so a replay inside its validity window is rejected. Expired rows are swept on the
+      -- next pairing start; an authorization past expires_at is rejected by the core anyway.
+      CREATE TABLE IF NOT EXISTS pairing_start_jti (
+        jti        TEXT    PRIMARY KEY,
+        expires_at INTEGER NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS pairing (
@@ -551,9 +581,9 @@ export class AccountRelay implements DurableObject {
     const path1 = subSegments[1] ?? "";
     const path2 = subSegments[2] ?? "";
 
-    // POST /pairing/start
+    // POST /pairing/start — root-signed; binds the account root on first success.
     if (method === "POST" && path0 === "pairing" && path1 === "start") {
-      return this.handlePairingStart(request);
+      return this.handlePairingStart(request, segments[0] ?? "");
     }
 
     // POST /pairing/complete
@@ -691,32 +721,108 @@ export class AccountRelay implements DurableObject {
   }
 
   /**
-   * POST /pairing/start
-   * Body: { label?: string }
-   * Response: { code: string, expires_at: number }
-   *
-   * Generates a short human-enterable pairing code and stores it with a TTL.
-   * The code is shown to the account owner (e.g. as a QR or typed string) to enroll a new device.
+   * The account-root public key this Durable Object is bound to, or `null` before the first
+   * verified root-signed pairing start. Root-authorized operations verify against this row.
    */
-  private async handlePairingStart(request: Request): Promise<Response> {
-    const body = await parseJsonBody(request);
-    const label = body ? optionalString(body, "label") : undefined;
+  private boundRootPubkey(): string | null {
+    const rows = [
+      ...this.sql.exec<AccountMetaRow>(`SELECT root_pubkey FROM account_meta WHERE id = 1`),
+    ];
+    return rows[0]?.root_pubkey ?? null;
+  }
 
+  /**
+   * POST /pairing/start
+   * Body: { root_pubkey: string (b64url Ed25519), authorization: string (allw-pairing-start+jws),
+   *         label?: string }
+   * Response: { code: string, expires_at: number, pairing_auth_token: string }
+   *
+   * Only the account root may start a pairing, because a pairing code enrolls a device that every
+   * later request is encrypted to. The relay checks, fail-closed:
+   * - 400: invalid JSON, `root_pubkey` malformed, or `{acct}` does not derive from `root_pubkey`
+   * - 401: `authorization` missing
+   * - 403: the core rejects `authorization` (bad signature, wrong `typ`, wrong `account_id`,
+   *        expired / not-yet-valid / overlong window), its `jti` was already used, or the presented
+   *        root differs from the root already bound to this account
+   *
+   * On success the root is bound to the account (first time only) and a short pairing code plus its
+   * pairing auth token are issued. See `docs/relay-api.md` §3 Pairing.
+   */
+  private async handlePairingStart(request: Request, accountId: string): Promise<Response> {
+    const body = await parseJsonBody(request);
+    if (!body) return json({ error: "invalid JSON body" }, 400);
+
+    const rootPubkey = requiredString(body, "root_pubkey");
+    if (rootPubkey === null || !validatePubkey(rootPubkey)) {
+      return json({ error: "'root_pubkey' must be a base64url-unpadded 32-byte public key" }, 400);
+    }
+    try {
+      checkAccountIdForRoot(accountId, rootPubkey);
+    } catch {
+      return json(
+        {
+          error:
+            "'root_pubkey' is not a valid Ed25519 key or the account id does not derive from it",
+        },
+        400,
+      );
+    }
+
+    const authorization = requiredString(body, "authorization");
+    if (authorization === null) return authError(401);
+    const label = optionalString(body, "label");
+
+    // Mint the pairing secret before the critical section so nothing below awaits: the verify,
+    // replay check, root bind, and code insert run without interleaving another request.
     const code = generatePairingCode();
     const pairingAuthToken = generateAuthToken();
     const pairingAuthTokenHash = await hashAuthToken(pairingAuthToken);
     const now = Date.now();
-    const expiresAt = now + PAIRING_TTL_MS;
 
-    this.sql.exec(
-      `INSERT INTO pairing (code, label, created_at, expires_at, used, auth_token_hash)
-       VALUES (?, ?, ?, ?, 0, ?)`,
-      code,
-      label ?? null,
-      now,
-      expiresAt,
-      pairingAuthTokenHash,
-    );
+    let jti: string;
+    let jtiExpiresAt: number;
+    try {
+      const claims = verifyPairingStartAuthorization(authorization, accountId, rootPubkey, now);
+      jti = claims.jti;
+      jtiExpiresAt = claims.expires_at;
+    } catch {
+      return authError(403);
+    }
+
+    // Defense in depth: the id derives from the root, so a different bound root would need a
+    // SHA-256 collision. Never let a second root act on an account regardless.
+    const boundRoot = this.boundRootPubkey();
+    if (boundRoot !== null && boundRoot !== rootPubkey) return authError(403);
+
+    this.sql.exec(`DELETE FROM pairing_start_jti WHERE expires_at <= ?`, now);
+    const replayed = [...this.sql.exec(`SELECT jti FROM pairing_start_jti WHERE jti = ?`, jti)]
+      .length;
+    if (replayed > 0) return authError(403);
+
+    const expiresAt = now + PAIRING_TTL_MS;
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec(
+        `INSERT INTO pairing_start_jti (jti, expires_at) VALUES (?, ?)`,
+        jti,
+        jtiExpiresAt,
+      );
+      if (boundRoot === null) {
+        this.sql.exec(
+          `INSERT INTO account_meta (id, root_pubkey, bound_at) VALUES (1, ?, ?)`,
+          rootPubkey,
+          now,
+        );
+      }
+      this.sql.exec(
+        `INSERT INTO pairing (code, label, created_at, expires_at, used, auth_token_hash)
+         VALUES (?, ?, ?, ?, 0, ?)`,
+        code,
+        label ?? null,
+        now,
+        expiresAt,
+        pairingAuthTokenHash,
+      );
+    });
 
     return json({ code, expires_at: expiresAt, pairing_auth_token: pairingAuthToken }, 201);
   }
