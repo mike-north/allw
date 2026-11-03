@@ -15,7 +15,13 @@
  * @see ../../../docs/contract.md §Invariants #6 (fail-closed)
  */
 
-export { runHook } from "./cli.js";
+export { BACKSTOP_DENY_REASON, runHook } from "./cli.js";
+
+export {
+  installDecisionBackstop,
+  writeDecision,
+  type DecisionBackstop,
+} from "./lib/decision-output.js";
 
 export {
   decide,
@@ -27,10 +33,10 @@ export {
 
 export {
   HOOK_EVENT_NAME,
-  allowOutput,
   denyOutput,
-  makeOutput,
+  noDecisionOutput,
   parseHookInput,
+  type ClaudeHookResult,
   type HookSpecificOutput,
   type ParseResult,
   type PermissionDecision,

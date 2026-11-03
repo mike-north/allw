@@ -45,7 +45,7 @@ const CLAUDE_FILE_EDIT_TOOLS = new Set(["Edit", "MultiEdit", "Write"]);
 /**
  * The outcome of classifying + reducing a tool call:
  * - `gated`: build succeeded; `actionRecord` (JSON) + a one-line `summary` are ready to submit.
- * - `pass-through`: not a gated tool; allow without prompting (`reason` explains why).
+ * - `pass-through`: not a gated tool; allw makes no decision (`reason` explains why).
  * - `build-error`: gated, but the `ActionRecord` could not be built; deny (`reason` explains why).
  */
 export type GateOutcome =
