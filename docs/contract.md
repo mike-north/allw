@@ -307,8 +307,8 @@ submit (#195).
 `{ type: "verdict", request_id, verdict }` (the signed [`Verdict`](#verdict--one-shot-and-scope-free)), answered
 with `{ type: "ack", request_id, status }`. **First verdict wins** — a later verdict for a resolved request is
 acked as `already_resolved` and does not overwrite. Only a verdict with valid provenance can win (#245): the relay
-checks in the core, without plaintext, that it was signed for this request by the socket's own device, certified by
-the bound account root and not revoked. Any other verdict is refused with an `error` frame and changes nothing, so
+checks in the core, without plaintext, that it was signed for this request by the socket's own device, with a
+`decided_at` inside the request's `[created_at, expires_at]`, certified by the bound account root and not revoked. Any other verdict is refused with an `error` frame and changes nothing, so
 the request stays pending. The relay only forwards provenance-valid verdicts; it never decides what a verdict
 means. The integrator runs the full [verification checklist](#verification-checklist-integrator-must) and decides
 finality ([relay-api.md](./relay-api.md) §4). A device that was offline when a request arrived receives it

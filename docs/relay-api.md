@@ -391,23 +391,36 @@ offline queue (still-pending, non-expired) as `request` messages. Hibernatable.
 
 Only device sockets may submit verdicts, and only a verdict with valid **provenance** is recorded
 (#245). The relay checks it in the core (`verify_verdict_provenance`), without the plaintext,
-against the account root bound at pairing (#242) and the account-state documents it has verified:
+against the account root bound at pairing (#242), the account-state documents it has verified,
+and the request it holds:
 
+- the signing device, named by the outer `approver.device_id`, is the device this socket
+  authenticated as (checked first, before any signature work);
+- the verdict's `decided_at` lies in the request envelope's `[created_at, expires_at]`, the same
+  window the integrator's `verify_verdict` checks (`docs/contract.md` §Verification checklist,
+  step 5). This runs before the certificate is judged, because `decided_at` is the time chosen by
+  the device;
 - the device certificate chains to that root, names this account and the signing device, and was
-  unexpired at the verdict's `decided_at`;
+  unexpired at that `decided_at`;
 - the device is not revoked in the highest-sequence verified account state (when any is stored);
 - the JWS verifies under the certified device key, its `kid` is that device, and every outer field
   equals its signed claim;
-- the signed `request_id` is the frame's `request_id`;
-- the signing device is the device this socket authenticated as.
+- the signed `request_id` is the frame's `request_id`, and the certified signer is the socket's
+  device.
 
 A verdict that fails any of these gets the `error` frame above. The request stays `pending`,
 nothing is stored, and no device is retracted, so one bad or compromised device can no longer
 answer every request first. A genuine verdict, approving or not, is recorded as before: on the
 first one the relay marks the request `resolved`, retracts it from other device sockets, and pushes
 it to any waiting integrator. Provenance is not a decision. The relay cannot check the WYSIWYS
-`request_hash`, the decision window or the nonce, so the integrator still verifies every verdict in
-full (`docs/contract.md` §Verification checklist).
+`request_hash` (it never sees the plaintext) or nonce replay, so the integrator still verifies
+every verdict in full (`docs/contract.md` §Verification checklist).
+
+A device can still backdate `decided_at` inside the request's window, so a device whose certificate
+expired partway through a request can answer it with a time when the certificate was valid. That
+holds only for a request created before the certificate expired, and the integrator's own
+`verify_verdict` accepts the same verdict. Revocation, not certificate expiry, is how a device is
+cut off at once.
 
 ### `ApprovalEnvelope` (relay-visible; wire field names)
 
