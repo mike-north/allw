@@ -220,7 +220,7 @@ KEYFILE="/tmp/allw-smoke-$(date +%s).json"
 
 # Use a throwaway keyfile so the smoke test gets a fresh account root (and so a fresh account id,
 # which is derived from the root).
-npx allw-approver pair \
+npx --no-install allw-approver pair \
   --relay "$RELAY_URL" \
   --keyfile "$KEYFILE" \
   --label "smoke-test-device"
@@ -229,7 +229,7 @@ npx allw-approver pair \
 Copy the printed account id and account-root public key, then start watching:
 
 ```sh
-npx allw-approver watch --keyfile "$KEYFILE"
+npx --no-install allw-approver watch --keyfile "$KEYFILE"
 ```
 
 In a third terminal, wire the hook and run a test request. Set the env vars printed during pairing:
@@ -240,7 +240,7 @@ export ALLW_ACCOUNT_ID="<ACCOUNT_ID_FROM_PAIR_OUTPUT>"
 export ALLW_APPROVER_ROOT_KEY="<ROOT_KEY_FROM_PAIR_OUTPUT>"
 
 # Trigger a request (simulating the Claude Code hook):
-npx allw-hook <<'EOF'
+npx --no-install allw-hook <<'EOF'
 {"tool_name":"Bash","tool_input":{"command":"echo smoke-test"}}
 EOF
 ```
