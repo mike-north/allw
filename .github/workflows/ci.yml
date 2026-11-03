@@ -55,11 +55,8 @@ jobs:
       # never a floating `stable`, so a new Rust release cannot turn CI red on its own.
       - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
-      # Pinned for the same reason as the Rust toolchain: a floating `latest` can change the build
-      # under an unchanged commit. Bump deliberately, alongside rust-toolchain.toml if needed.
-      - uses: jetli/wasm-pack-action@v0.4.0
-        with:
-          version: v0.15.1
+      # The pinned wasm-pack, verified by SHA-256 (see the action for the pin and why).
+      - uses: ./.github/actions/wasm-pack
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -97,8 +94,9 @@ jobs:
       # above because several package tests load the generated WASM glue or compiled workspace deps.
       - run: pnpm -r test
       # Repo-level script guards live outside any package, so `pnpm -r test` does not reach them:
-      # the recursive-script contract and the operator-run UAT helpers (which must never require a
-      # live agent runtime to exist).
+      # the no-raw-bidi-controls source scan, the recursive-script contract and the operator-run
+      # UAT helpers (which must never require a live agent runtime to exist).
+      - run: pnpm run test:no-bidi-controls
       - run: pnpm run test:recursive-scripts
       - run: pnpm run test:uat-codex
       - run: pnpm run test:uat-openclaw
@@ -113,9 +111,7 @@ jobs:
       # the wasm built first — same pinned toolchain + wasm-pack as the `wasm` job.
       - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
-      - uses: jetli/wasm-pack-action@v0.4.0
-        with:
-          version: v0.15.1
+      - uses: ./.github/actions/wasm-pack
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -174,11 +170,8 @@ jobs:
       # never a floating `stable`, so a new Rust release cannot turn CI red on its own.
       - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
-      # Pinned for the same reason as the Rust toolchain: a floating `latest` can change the build
-      # under an unchanged commit. Bump deliberately, alongside rust-toolchain.toml if needed.
-      - uses: jetli/wasm-pack-action@v0.4.0
-        with:
-          version: v0.15.1
+      # The pinned wasm-pack, verified by SHA-256 (see the action for the pin and why).
+      - uses: ./.github/actions/wasm-pack
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:

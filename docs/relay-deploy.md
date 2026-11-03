@@ -61,21 +61,26 @@ Open `packages/relay/wrangler.jsonc` and replace every `REPLACE_ME` value under 
 
 **Browser origins (CORS).** `env.production.vars.CORS_ALLOWED_ORIGINS` is a comma-separated list of
 the origins a browser approver may call the relay from. It ships as the hosted web approver,
-`https://allw-web-approver.pages.dev`. If you serve your own web approver (`docs/web-approver-deploy.md`),
-put its origin here: scheme, host and port only, with no path or trailing slash, e.g.
-`https://approver.example.com`. Each entry is normalized to the origin a browser sends (lowercase
-host, punycode for an internationalized host, default port dropped), so `https://Approver.example.com:443`
-works too. An entry that is not an origin (a path or trailing slash, a query or fragment,
-credentials, a non-http(s) scheme, a wildcard host, `null`) is ignored and logged once
-(`wrangler tail`); it never widens the list. Matching is exact: Cloudflare Pages preview and branch
-origins (`<hash>.allw-web-approver.pages.dev`) are not admitted by the hosted origin and there is no
-suffix wildcard. A port of `*` matches any port and is meant for loopback dev only
-(the top-level dev config allows `http://localhost:*` and `http://127.0.0.1:*`). Setting the var
-replaces the default, and an empty value allows no browser origin. This is not a secret and not an
-access control: non-browser clients are unaffected, and every request is still authorized by its
-bearer token. Other plain vars (`APNS_*`, `FCM_ENDPOINT`, `VAPID_PUBLIC_KEY`, `VAPID_SUBJECT`) go in
-the same `vars` block, because Wrangler does not inherit top-level vars into an environment, and a
-second `"vars"` key in `env.production` silently replaces the first (dropping `CORS_ALLOWED_ORIGINS`).
+`https://allw-web-approver.pages.dev`. If you serve your own web approver
+(`docs/web-approver-deploy.md`), put its origin here: scheme, host and port only, with no path or
+trailing slash, e.g. `https://approver.example.com`. Each entry is normalized to the origin a browser
+sends (lowercase host, punycode for an internationalized host, default port dropped), so
+`https://Approver.example.com:443` works too. An entry that is not an origin (a path or trailing
+slash, a query or fragment, credentials, a non-http(s) scheme, a wildcard host, `null`) is ignored and
+logged once (`wrangler tail`); it never widens the list. That is judged on the entry as written,
+before any normalization: nothing may follow the host and port, so a dot segment (`/.`, `/..`,
+`/%2e`), a backslash, an `@` (even with empty credentials, `https://@host`), an empty port
+(`https://host:`) or whitespace inside the entry also drops it, including in a `:*` entry. Whitespace
+around each comma-separated entry is trimmed first. The scheme may be in any case and is lowercased,
+as the host is. Matching is exact: Cloudflare Pages preview and branch origins
+(`<hash>.allw-web-approver.pages.dev`) are not admitted by the hosted origin and there is no suffix
+wildcard. A port of `*` matches any port and is meant for loopback dev only (the top-level dev config
+allows `http://localhost:*` and `http://127.0.0.1:*`). Setting the var replaces the default, and an
+empty value allows no browser origin. This is not a secret and not an access control: non-browser
+clients are unaffected, and every request is still authorized by its bearer token. Other plain vars
+(`APNS_*`, `FCM_ENDPOINT`, `VAPID_PUBLIC_KEY`, `VAPID_SUBJECT`) go in the same `vars` block, because
+Wrangler does not inherit top-level vars into an environment, and a second `"vars"` key in
+`env.production` silently replaces the first (dropping `CORS_ALLOWED_ORIGINS`).
 
 **[OPERATOR]** Commit the filled-in placeholders (no secrets — they go in the next step):
 
@@ -119,6 +124,14 @@ node_modules/.bin/wrangler secret put APNS_BEARER_TOKEN --env production
 # Paste the JWT when prompted. Note: APNs JWTs expire after 1 hour; you will need to rotate this
 # secret periodically until automatic token refresh is implemented.
 ```
+
+**Match `APNS_ENDPOINT` to the app build.** A development build registers sandbox tokens, and a
+TestFlight or App Store build registers production tokens. APNs answers a token sent to the other
+environment with `400 BadDeviceToken`. The relay deliberately does **not** prune on that answer,
+since a wrong `APNS_ENDPOINT` would otherwise unregister every device. It keeps the tokens and logs
+`push: apns push service <host> rejected a wakeup with HTTP 400; token kept` in `wrangler tail`. If
+every APNs wakeup logs that line, check the endpoint. Only `410` (the token is no longer active)
+prunes an APNs token (`docs/relay-api.md` §5).
 
 ### 3c. Optional: Firebase Cloud Messaging (FCM) — Android push wakeups
 
@@ -181,23 +194,39 @@ replaces its push tokens with its new subscription (`PUT /{acct}/devices/{device
 **`Topic` is sent only to push services documented to accept it** (today Mozilla autopush; the
 per-host table and sources are in `docs/relay-api.md` §5). In particular Apple's
 `web.push.apple.com` rejects any `Topic` header with `400 BadWebPushTopic`. If Safari / iOS wakeups
-stop arriving while other browsers still get them, check that no `Topic` is being sent to Apple
-(the relay does not log push-service failures today). A 400 is treated as transient, so the tokens
-stay registered and recover once the header is gone.
+stop arriving while other browsers still get them, check that no `Topic` is being sent to Apple:
+`wrangler tail` then shows
+
+```text
+push: webpush push service web.push.apple.com rejected a wakeup with HTTP 400 (reason BadWebPushTopic); token kept
+```
+
+The relay logs one such warning for every 4xx a push service answers that does not prune the token,
+on any transport (for Web Push, a 4xx other than 404/410; APNs and FCM in `docs/relay-api.md` §5):
+the transport, the push-service host, the status and, for Web Push, the `reason` from a JSON body
+when it is an identifier of at most 32 characters that does not occur in the subscription endpoint.
+It never logs the token, the endpoint path, credentials or request ids. 5xx answers and timeouts are
+not logged. A 400 is treated as transient, so the tokens stay registered and recover once the header
+is gone.
+
+The warning is per answer, not deduplicated. While a push service throttles the relay (429) or
+refuses its payload size (413), expect one line for each push it refuses; on APNs and FCM, which are
+not coalesced, that is up to one line per device token on every submit.
 
 ### Secrets inventory summary
 
-| Secret / var           | Required  | Description                                                                                                                                        |
-| ---------------------- | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `CORS_ALLOWED_ORIGINS` | Defaulted | Comma-separated browser origins allowed to read relay responses (plain var in `wrangler.jsonc`, §2). Default: the hosted web approver.             |
-| `APNS_ENDPOINT`        | Optional  | APNs base URL (plain var in `wrangler.jsonc`). Production: `https://api.push.apple.com`; sandbox: `https://api.development.push.apple.com`.        |
-| `APNS_TOPIC`           | Optional  | App bundle id, e.g. `com.example.allw` (plain var in `wrangler.jsonc`).                                                                            |
-| `APNS_BEARER_TOKEN`    | Optional  | APNs token-auth JWT (set via `wrangler secret put`). Short-lived; rotate hourly.                                                                   |
-| `FCM_ENDPOINT`         | Optional  | FCM HTTP v1 send URL (plain var in `wrangler.jsonc`).                                                                                              |
-| `FCM_BEARER_TOKEN`     | Optional  | FCM OAuth 2.0 access token for a service account (set via `wrangler secret put`).                                                                  |
-| `VAPID_PUBLIC_KEY`     | Optional  | Web Push VAPID public key, base64url uncompressed P-256 point (plain var in `wrangler.jsonc`). Served at `GET /.well-known/allw/vapid-public-key`. |
-| `VAPID_PRIVATE_KEY`    | Optional  | Web Push VAPID private key, base64url 32-byte scalar (set via `wrangler secret put`). Long-lived; rotating it invalidates subscriptions.           |
-| `VAPID_SUBJECT`        | Optional  | Web Push operator contact, `mailto:` or `https:` URI (plain var in `wrangler.jsonc`).                                                              |
+| Secret / var           | Required  | Description                                                                                                                                                                                                                                                                                                                                                                 |
+| ---------------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CORS_ALLOWED_ORIGINS` | Defaulted | Comma-separated browser origins allowed to read relay responses (plain var in `wrangler.jsonc`, §2). Default: the hosted web approver.                                                                                                                                                                                                                                      |
+| `APNS_ENDPOINT`        | Optional  | APNs base URL (plain var in `wrangler.jsonc`). Production: `https://api.push.apple.com`; sandbox: `https://api.development.push.apple.com`.                                                                                                                                                                                                                                 |
+| `APNS_TOPIC`           | Optional  | App bundle id, e.g. `com.example.allw` (plain var in `wrangler.jsonc`).                                                                                                                                                                                                                                                                                                     |
+| `APNS_BEARER_TOKEN`    | Optional  | APNs token-auth JWT (set via `wrangler secret put`). Short-lived; rotate hourly.                                                                                                                                                                                                                                                                                            |
+| `FCM_ENDPOINT`         | Optional  | FCM HTTP v1 send URL (plain var in `wrangler.jsonc`).                                                                                                                                                                                                                                                                                                                       |
+| `FCM_BEARER_TOKEN`     | Optional  | FCM OAuth 2.0 access token for a service account (set via `wrangler secret put`).                                                                                                                                                                                                                                                                                           |
+| `VAPID_PUBLIC_KEY`     | Optional  | Web Push VAPID public key, base64url uncompressed P-256 point (plain var in `wrangler.jsonc`). Served at `GET /.well-known/allw/vapid-public-key`.                                                                                                                                                                                                                          |
+| `VAPID_PRIVATE_KEY`    | Optional  | Web Push VAPID private key, base64url 32-byte scalar (set via `wrangler secret put`). Long-lived; rotating it invalidates subscriptions.                                                                                                                                                                                                                                    |
+| `VAPID_SUBJECT`        | Optional  | Web Push operator contact, `mailto:` or `https:` URI (plain var in `wrangler.jsonc`).                                                                                                                                                                                                                                                                                       |
+| `MAX_REQUEST_TTL_MS`   | Optional  | Request horizon in ms (plain var). Default `900000` (15 min). A submit whose `expires_at` is further out gets 400. Must stay above the hooks' 420 s timeout, or hook requests fail closed. Lowering it also shortens requests already pending: each expires at `created_at + MAX_REQUEST_TTL_MS` if that is before its `expires_at`. Invalid values are logged and ignored. |
 
 No other secrets are required. The relay derives all per-account auth tokens internally and stores
 only SHA-256 hashes in the Durable Object SQLite database. Its only static signing key is the

@@ -25,7 +25,7 @@ supported, evaluated install path this doc documents:
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "^(Bash|Edit|MultiEdit|Write)$|^mcp__",
+        "matcher": "^(Bash|PowerShell|Monitor|Edit|MultiEdit|Write|NotebookEdit)$|^mcp__",
         "hooks": [
           {
             "type": "command",
@@ -36,27 +36,20 @@ supported, evaluated install path this doc documents:
         ]
       }
     ]
-  },
-  "permissions": {
-    "deny": ["Monitor", "PowerShell", "NotebookEdit"]
   }
 }
 ```
 
-- `matcher` is evaluated against `tool_name`. `^(Bash|Edit|MultiEdit|Write)$|^mcp__` contains
-  regex characters, so Claude Code reads it as a JavaScript regular expression, and the anchors make
-  it match whole names: exactly `Bash`, `Edit`, `MultiEdit` and `Write`, plus every tool whose name
-  starts with `mcp__` (every MCP tool). Unanchored, `Edit` would also match `NotebookEdit`, which
-  the hook doesn't gate. (Claude Code now calls `MultiEdit` legacy; it stays in the matcher for
-  versions that still have it.)
-- **The `deny` rules turn off the tools that can run commands or change files but that allw doesn't
-  gate yet** ([#298](https://github.com/mike-north/allw/issues/298)): `Monitor` and `PowerShell` run
-  shell commands, and `NotebookEdit` edits notebook files. A deny rule that names a bare tool removes
-  it from Claude's context ([Permissions](https://code.claude.com/docs/en/permissions#manage-permissions)).
-  Without them, those tools reach your files and shell under Claude Code's own rules alone, with no
-  approver in the loop. **`Monitor` uses your `Bash` permission rules**
+- `matcher` is evaluated against `tool_name`. The matcher contains regex characters, so Claude Code
+  reads it as a JavaScript regular expression, and the anchors make it match whole names: exactly
+  the shell tools `Bash`, `PowerShell` and `Monitor`, the file-edit tools `Edit`, `MultiEdit`,
+  `Write` and `NotebookEdit`, plus every tool whose name starts with `mcp__` (every MCP tool). Those
+  are every tool that runs a command or changes a file; see [What Is Gated](#what-is-gated). (Claude
+  Code now calls `MultiEdit` legacy; it stays in the matcher for versions that still have it.)
+- **`Monitor` uses your `Bash` permission rules**
   ([Monitor tool](https://code.claude.com/docs/en/tools-reference#monitor-tool)), so a `Bash` allow
-  rule also lets it run any command with no prompt at all.
+  rule also lets it run commands without Claude Code's own prompt. Keep `Monitor` in the matcher
+  whenever `Bash` is: allw gates a `Monitor` command exactly like a `Bash` one.
 - **Always pin `"timeout": 480`** (seconds). Without it the hook inherits Claude Code's 600s
   command-hook default, and the timeout-ordering invariant below depends on a known pinned value.
 - Use an absolute path to `dist/cli.js`, or `npx --no-install allw-hook` — `command` runs under
@@ -106,7 +99,7 @@ cover it too:
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "^(Bash|Edit|MultiEdit|Write)$|^mcp__",
+        "matcher": "^(Bash|PowerShell|Monitor|Edit|MultiEdit|Write|NotebookEdit)$|^mcp__",
         "hooks": [
           {
             "type": "command",
@@ -117,9 +110,6 @@ cover it too:
         ]
       }
     ]
-  },
-  "permissions": {
-    "deny": ["Monitor", "PowerShell", "NotebookEdit"]
   }
 }
 ```
@@ -132,14 +122,26 @@ warning, so check `claude --version`. Why this holds:
   are never auto-approved (except in `bypassPermissions`), and allow rules don't pre-approve them.
 - `~/.allw/hook` and `~/.allw/config.json` (the trust anchor the hook verifies verdicts against) are
   outside the working directory, so `acceptEdits` doesn't auto-approve edits to them.
-- **allw gates exactly these tools:** `Bash`, `Edit`, `MultiEdit`, `Write` and every MCP tool. A
-  change to either location through one of them reaches your approver first. **Deny any request that
-  writes under `~/.allw/` or `~/.claude/`.**
-- **allw doesn't gate `Monitor`, `PowerShell` or `NotebookEdit`**
-  ([#298](https://github.com/mike-north/allw/issues/298)), and `Monitor` and `PowerShell` can run
-  any shell command, including one that edits or deletes the hook. That is why the config above
-  denies all three. If you remove those deny rules, these tools reach the hook's files under Claude
-  Code's own rules alone, and a `Bash` allow rule lets `Monitor` do it with no prompt.
+- **allw gates exactly these tools:** `Bash`, `PowerShell`, `Monitor` (when it runs a command),
+  `Edit`, `MultiEdit`, `Write`, `NotebookEdit` and every MCP tool. A change to either location
+  through one of them reaches your approver first. **Deny any request that writes under `~/.allw/`
+  or `~/.claude/`.**
+- If your installed `@allw/hook` predates
+  [#298](https://github.com/mike-north/allw/issues/298) (it doesn't gate `PowerShell`, `Monitor` or
+  `NotebookEdit`), keep those three out of the matcher and add
+  `"permissions": { "deny": ["Monitor", "PowerShell", "NotebookEdit"] }`, so they are off rather
+  than ungated. To check, run the installed hook on a `Monitor` call with no config: a hook that
+  gates it prints a `deny`, and an older one prints nothing.
+
+  ```sh
+  echo '{"hook_event_name":"PreToolUse","tool_name":"Monitor","tool_input":{"command":"true"}}' \
+    | env -i PATH="$PATH" HOME="$(mktemp -d)" node /Users/you/.allw/hook/node_modules/@allw/hook/dist/cli.js
+  ```
+
+- **Plugin monitors aren't gated.** A plugin can declare
+  [monitors](https://code.claude.com/docs/en/plugins/components.md#monitors) that start their
+  commands when the plugin is active, with no `Monitor` tool call, so no `PreToolUse` fires and allw
+  never sees them. Install only plugins whose monitors you would approve.
 
 This is guidance, not a tamper-proof boundary: in `bypassPermissions` mode allw is the only gate, and
 the agent still runs as your OS user. Moving the account root off the agent's machine is tracked in
@@ -163,7 +165,8 @@ the agent still runs as your OS user. Moving the account root off the agent's ma
 
 `parseHookInput` (`packages/hook/src/lib/hook-io.ts`) reads only `hook_event_name`, `tool_name`,
 `tool_input`, and `cwd`; every other field (`session_id`, `permission_mode`, `tool_use_id`, …) is
-ignored. `permission_mode` is not consulted — the hook's decision is uniform regardless of the
+ignored. Claude Code sends `cwd: ""` when it does not know the working directory, so a blank or
+whitespace-only `cwd` is treated as absent: the record is left unbound and the human is still asked. `permission_mode` is not consulted — the hook's decision is uniform regardless of the
 session's Claude Code permission mode. See [Permission-Mode Interactions](#permission-mode-interactions).
 
 **stdout** (the hook always exits `0`): **empty** when allw has no objection, or one `deny`:
@@ -202,14 +205,17 @@ The matcher above routes candidate tool calls to the hook; `isGatedTool` /
 `gateToolCall` (`packages/hook/src/lib/gating.ts`) then decide what actually requires a human
 approval:
 
-| Tool name(s)                                            | Gated? | Substrate                                                                                                                                                                                                                                                                                |
-| ------------------------------------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Bash`                                                  | Yes    | `command` — built from `tool_input.command` (+ `cwd` when present).                                                                                                                                                                                                                      |
-| `Edit`, `Write`, `MultiEdit`                            | Yes    | `file_edit` — built from the operation kind, target path(s), a compact summary, and a hash of the full edit bytes.                                                                                                                                                                       |
-| any `mcp__<server>__<tool>` name                        | Yes    | `mcp_tool_call` — built from the parsed server/tool name and the raw `tool_input` params object.                                                                                                                                                                                         |
-| `apply_patch`                                           | Yes    | `file_edit`, via the same Codex apply-patch-grammar parser. Claude Code has no `apply_patch` tool, so this branch is never reached in a Claude Code session; it exists because `gateToolCall` is the same shared function `@allw/codex-hook` imports (`packages/codex-hook/src/cli.ts`). |
-| `Monitor`, `PowerShell`, `NotebookEdit`                 | No     | **Not gated yet** ([#298](https://github.com/mike-north/allw/issues/298)), though they run shell commands (`Monitor`, `PowerShell`) or edit files (`NotebookEdit`). The recommended config denies them outright; see [Integration Shape](#integration-shape).                            |
-| everything else (`Read`, `Glob`, `Grep`, `WebFetch`, …) | No     | **No decision** (empty stdout) without contacting the relay, and **without requiring `allw` config** — a missing/misconfigured install never blocks reads; Claude Code's own permission rules apply.                                                                                     |
+| Tool name(s)                                            | Gated? | Substrate                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ------------------------------------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Bash`                                                  | Yes    | `command` — built from `tool_input.command` (+ `cwd` when present) through `@allw/sdk`'s `commandRequest`, the path a plain script uses, with the hook's actor (`machine:<hostname>` / `claude-code`), timeout and risk-derived `reversible` (#269). A blank command or an empty program word (`''`) is denied without asking: there is no program to show the human.                                                                                                                                                                                |
+| `Monitor` with `tool_input.command`                     | Yes    | `command`, exactly as for `Bash` (it runs the command in the background under your `Bash` rules); the summary says it runs under `Monitor`.                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `Monitor` with `tool_input.ws`                          | No     | **No decision**: a WebSocket watch runs no command. Any other `Monitor` input is denied: neither a string `command` nor a `ws` object with a string `url`, both at once, or a watch with a key outside Claude Code's watch schema (`ws` {`url`, `protocols`}, `description`, `timeout_ms`).                                                                                                                                                                                                                                                          |
+| `PowerShell`                                            | Yes    | `command`, built by the core's PowerShell builder: `raw` is the exact line; argv is its whitespace split; risk is at least `medium`, or `high` when `raw` contains a compound, escape or dynamic-execution construct: a statement or pipeline separator, a backtick, a parenthesis or brace, a scriptblock factory, a command that runs other code (`iex`, `Start-Process`, a nested shell, …), an `-EncodedCommand` parameter, or dot-sourcing (full list in [`docs/policy-seam.md`](./policy-seam.md)). The summary reads `PowerShell: <command>`. |
+| `Edit`, `Write`, `MultiEdit`                            | Yes    | `file_edit` — built from the operation kind, target path(s), a compact summary, and a hash of the full edit bytes.                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `NotebookEdit`                                          | Yes    | `file_edit` with operation `notebook_edit`: the notebook path, and a hash of the cell-level change (`cell_id`, `cell_type`, `edit_mode`, `new_source`). The summary names the cell (`replace cell <id>`, `insert after cell <id>`, `insert at start`). `replace` and `delete` without a non-empty string `cell_id`, and any other input key, are denied.                                                                                                                                                                                             |
+| any `mcp__<server>__<tool>` name                        | Yes    | `mcp_tool_call` — built from the parsed server/tool name and the raw `tool_input` params object.                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `apply_patch`                                           | Yes    | `file_edit`, via the same Codex apply-patch-grammar parser. Claude Code has no `apply_patch` tool, so this branch is never reached in a Claude Code session; it exists because `gateToolCall` is the same shared function `@allw/codex-hook` imports (`packages/codex-hook/src/lib/decide.ts`) for `apply_patch` and MCP calls. (Both hooks build `Bash` requests through `@allw/sdk`'s `commandRequest` instead.)                                                                                                                                   |
+| everything else (`Read`, `Glob`, `Grep`, `WebFetch`, …) | No     | **No decision** (empty stdout) without contacting the relay, and **without requiring `allw` config** — a missing/misconfigured install never blocks reads; Claude Code's own permission rules apply.                                                                                                                                                                                                                                                                                                                                                 |
 
 Two fail-closed subtleties worth calling out precisely, because they are easy to get wrong when
 widening the matcher:
@@ -220,7 +226,7 @@ widening the matcher:
   which then returns a `build-error` (→ `deny`). Treating an unparseable MCP name as non-gated would
   let it through without a human, which would break fail-closed for MCP calls — so the hook denies
   instead.
-- **Widening the matcher only adds gating; it never grants.** A tool name that isn't `Bash`, a
+- **Widening the matcher only adds gating; it never grants.** A tool name that isn't a gated shell tool, a
   file-edit tool, or `mcp__`-prefixed falls through to the `pass-through` branch, which makes **no
   decision**: Claude Code applies its own permission rules to that call exactly as it would without
   the hook. (Before [#247](https://github.com/mike-north/allw/issues/247) the pass-through emitted
@@ -270,7 +276,7 @@ equivalent field, nor should there be:
 | non-gated tool (`Read`, `Grep`, `Glob`, `WebFetch`, …)                                                                                                                                                      | none (empty stdout)  | —                                                                                                        |
 | gated, verified verdict `decision === "approved"`                                                                                                                                                           | none (empty stdout)  | —                                                                                                        |
 | gated, verified verdict `denied` / `expired` / `aborted`                                                                                                                                                    | `deny`               | `allw: <summary> — not approved (verdict: <decision>)`                                                   |
-| gated, `ActionRecord` could not be built (malformed `tool_input`, invalid shell syntax, unparseable MCP name/params, malformed file-edit payload)                                                           | `deny`               | `allw: <reason> (fail-closed deny)` — reason names the specific field/shape problem                      |
+| gated, `ActionRecord` could not be built (malformed `tool_input`, invalid shell syntax, a blank command or program, unparseable MCP name/params, malformed file-edit payload)                               | `deny`               | `allw: <reason> (fail-closed deny)` — reason names the specific field/shape problem                      |
 | gated, the built `ActionRecord` JSON was not in the expected shape (defense in depth; the core always emits a well-formed record)                                                                           | `deny`               | `allw: built ActionRecord was not in the expected shape (fail-closed deny)`                              |
 | gated, `requestApproval` threw (network/relay error, no enrolled devices, relay rejection)                                                                                                                  | `deny`               | `allw: approval request failed (fail-closed deny): <error message>`                                      |
 | malformed hook stdin (not JSON, not an object, wrong `hook_event_name`, missing/non-string `tool_name`)                                                                                                     | `deny`               | `allw: hook input was not valid JSON (fail-closed deny)` (or the sibling reason for the specific defect) |
@@ -311,19 +317,19 @@ in the same settings file as the hook:
 ```json
 {
   "permissions": {
-    "allow": ["Bash", "Edit", "MultiEdit", "Write", "mcp__<server>__*"],
-    "deny": ["Monitor", "PowerShell", "NotebookEdit"]
+    "allow": ["Bash", "PowerShell", "Edit", "MultiEdit", "Write", "mcp__<server>__*"]
   }
 }
 ```
 
-> **Keep the `deny` rules whenever you add these allow rules.** A `Bash` allow rule also covers the
-> `Monitor` tool, which runs shell commands under your `Bash` rules
-> ([Monitor tool](https://code.claude.com/docs/en/tools-reference#monitor-tool)) and which allw
-> doesn't gate. An `Edit` allow rule also covers `NotebookEdit`
+> **Keep `Monitor` and `NotebookEdit` in the hook's matcher whenever you add these allow rules.** A
+> `Bash` allow rule also covers the `Monitor` tool, which runs shell commands under your `Bash` rules
+> ([Monitor tool](https://code.claude.com/docs/en/tools-reference#monitor-tool)), and an `Edit` allow
+> rule also covers `NotebookEdit`
 > ([tool-specific rules](https://code.claude.com/docs/en/tools-reference#configure-tools-with-permission-rules-and-hooks)).
-> Without the deny rules, the agent could run any command through `Monitor`, or edit notebooks,
-> with no phone approval and no prompt at the desk.
+> With them in the matcher, those calls still reach your approver first; without, the agent could
+> run any command through `Monitor`, or edit notebooks, with no phone approval and no prompt at the
+> desk.
 
 - An allow rule never overrides allw: a hook `deny` blocks the call even when an allow rule matches
   ([Extend permissions with hooks](https://code.claude.com/docs/en/permissions#extend-permissions-with-hooks)).

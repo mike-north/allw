@@ -23,6 +23,7 @@ import {
 } from "../lib/approver-core.js";
 import { readKeyfile, writeKeyfile, type Keyfile } from "../lib/keyfile.js";
 import { deviceConnectWsUrl, fetchAccountStatesWithMetadata } from "../lib/relay-client.js";
+import { assertCliRelayUrl } from "../lib/relay-url.js";
 import { DEFAULT_COLUMNS, renderRequest } from "../lib/render.js";
 import type { AllwWasm } from "../lib/wasm.js";
 import type { Decision, DeviceInboundMessage } from "../lib/types.js";
@@ -30,7 +31,10 @@ import type { Decision, DeviceInboundMessage } from "../lib/types.js";
 /** Options for `watch`. */
 export interface WatchOptions {
   readonly keyfilePath: string;
-  /** Override the paired relay URL (defaults to the keyfile's `relay_url`). */
+  /**
+   * Override the paired relay URL (defaults to the keyfile's `relay_url`). Whichever is used must
+   * pass the relay transport rule (`../lib/relay-url.ts`), or `runWatch` throws before connecting.
+   */
   readonly relayUrl?: string;
 }
 
@@ -391,12 +395,12 @@ export async function runWatch(
   // (field absent) from paired.
   let keyfile = readKeyfile(options.keyfilePath);
 
-  const relayUrl = options.relayUrl ?? keyfile.relay_url;
+  const configuredRelayUrl = options.relayUrl ?? keyfile.relay_url;
   const accountId = keyfile.account_id;
   const deviceId = keyfile.device_id;
   const deviceAuthToken = keyfile.device_auth_token;
   if (
-    relayUrl === undefined ||
+    configuredRelayUrl === undefined ||
     accountId === undefined ||
     deviceId === undefined ||
     deviceAuthToken === undefined
@@ -406,6 +410,15 @@ export async function runWatch(
   if (keyfile.device_cert === undefined || keyfile.device_cert.length === 0) {
     throw new Error("keyfile has no device_cert — re-pair to mint one before watching");
   }
+
+  // The presence socket carries the device bearer token in its query, and account-state fetches
+  // carry it as a header: refuse a plaintext or malformed relay URL before either is built (#267).
+  // The URL in use is checked and named by its source, `--relay` when it overrides the keyfile;
+  // from here on only its canonical form is used, for the socket and for account-state fetches.
+  const relayUrl = assertCliRelayUrl(
+    configuredRelayUrl,
+    options.relayUrl !== undefined ? "--relay" : "keyfile relay_url",
+  );
 
   const url = deviceConnectWsUrl(relayUrl, accountId, deviceId, deviceAuthToken);
   log.info(`Connecting to ${redactAuthQuery(url)} …`);

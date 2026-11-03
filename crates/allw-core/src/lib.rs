@@ -34,6 +34,7 @@ pub mod hash;
 pub mod jwe;
 pub mod mcp;
 pub mod policy;
+pub mod powershell;
 pub mod recipients;
 pub mod sealing;
 
@@ -53,21 +54,23 @@ pub use audit::{
 pub use command::{action_from_argv, action_from_command, CommandContext, CommandError};
 pub use contract::{
     ActionRecord, Actor, ApprovalContext, ApprovalRequest, Approver, AuditRecord, Constraints,
-    Decision, PolicyBlock, PolicyDecision, Risk, Surface, SyntacticSubstrate, Verdict,
+    ContextViolation, Decision, PolicyBlock, PolicyDecision, ReservedField, Risk, Surface,
+    SyntacticSubstrate, Verdict,
 };
 pub use crypto::{
     derive_number_match_challenge, effective_allow, issue_device_cert, revoked_device_ids,
     sign_account_state, sign_verdict, verify_account_state, verify_verdict,
-    verify_verdict_for_account, verify_verdict_with_account_states,
+    verify_verdict_for_account, verify_verdict_provenance, verify_verdict_with_account_states,
     verify_verdict_with_account_states_for_account, AccountState, AccountStateActor,
     AccountStateDevice, AccountStateError, AccountStatePreviousRoot, AccountStateRevocation,
     AccountStateRevocationKind, DeviceCertClaims, InMemoryNonceStore, JwsError, KeyError,
     NonceStore, PublicKey, SignVerdictError, SigningKeyPair, UnsignedVerdict, VerdictClaims,
-    VerifiedVerdict, VerifyError, MAX_NOTE_BYTES,
+    VerdictProvenance, VerifiedVerdict, VerifyError, MAX_NOTE_BYTES,
 };
 pub use display::{
-    display_model, escape_for_display, has_hidden_or_control_chars, is_hidden_or_control_char,
-    is_variation_selector, DisplayModel, DisplaySubstrate, CRLF_MARKER, TAB_MARKER,
+    display_model, escape_for_display, has_hidden_or_control_chars, is_combining_mark,
+    is_hidden_or_control_char, is_variation_selector, DisplayModel, DisplaySubstrate, CRLF_MARKER,
+    MAX_STACKED_COMBINING_MARKS, TAB_MARKER,
 };
 pub use file_edit::action_from_file_edit;
 pub use hash::{canonical_request_bytes, compute_request_hash};
@@ -86,6 +89,7 @@ pub use policy::{
     PolicyRuleBuildError, PolicyRuleError, PolicyRuleScope, PolicyTier, UnsignedPolicyRule,
     VerifiedPolicyRule,
 };
+pub use powershell::action_from_powershell_command;
 pub use recipients::{
     select_recipients, Recipient, RecipientSelectionError, DEVICE_STATUS_ACTIVE,
     MAX_ACCOUNT_STATES, MAX_RECIPIENTS,

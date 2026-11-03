@@ -138,7 +138,7 @@ function logicalLine(lines, prefix) {
 /** Every C0 control except LF (the block's own line separator), plus DEL and C1. */
 // eslint-disable-next-line no-control-regex
 const RAW_CONTROL = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/;
-const RAW_BIDI_OR_INVISIBLE = /[؜​-‏‪-‮⁠⁦-⁩﻿]/;
+const RAW_BIDI_OR_INVISIBLE = /[\u061c\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/;
 
 test("ESC/CR line-erase spoof renders escaped, with no raw control byte (#246)", async () => {
   const { rendered } = await render(context());
@@ -172,9 +172,9 @@ test("bidi override in cwd and zero-width space in actor id are escaped", async 
   const ctx = context();
   ctx.action = {
     ...ctx.action,
-    syntactic: { raw: "ls", cwd: "/home/dev/‮ppa" },
+    syntactic: { raw: "ls", cwd: "/home/dev/\u202eppa" },
   };
-  ctx.actor = { id: "machine:ci​", kind: "claude-code" };
+  ctx.actor = { id: "machine:ci\u200b", kind: "claude-code" };
   const { rendered } = await render(ctx);
   assert.doesNotMatch(rendered, RAW_BIDI_OR_INVISIBLE);
   assert.match(rendered, /Cwd:\s+\/home\/dev\/⟨U\+202E⟩ppa/);
@@ -192,8 +192,8 @@ test("summary, argv, flags, chain and MCP params are escaped", async () => {
     surface: "mcp_tool_call",
     syntactic: {
       server: "fs",
-      tool: "write⁦",
-      params: { path: "/tmp/‮txt.exe" },
+      tool: "write\u2066",
+      params: { path: "/tmp/\u202etxt.exe" },
       argv: ["echo", `a${ESC}b`],
       flags: [`--x${CR}`],
     },
@@ -342,6 +342,73 @@ test("without a divergence, the decision line is the raw headline and no diverge
   const { rendered } = await render(ctx);
   assert.equal(rendered.split("\n").at(-1), "  Deciding on: git status");
   assert.ok(!rendered.includes(RAW_ARGV_DIVERGENCE_WARNING));
+});
+
+// ── PowerShell records (#298, review #316 B1) ─────────────────────────────────────────────────────
+//
+// The core records a PowerShell line's argv as a plain whitespace split of `raw`, so no byte of the
+// line hides inside a token. Records here are built by the real WASM builder, never by hand.
+
+/** The #316 B1 repro: PowerShell runs the `Remove-Item` (`\` is literal inside `"…"`). */
+const PS_HIDDEN_STATEMENT = String.raw`echo "a\" ; Remove-Item -Recurse -Force C:\Users ; echo \"b"`;
+
+async function renderPowerShell(line) {
+  const wasm = await loadWasm();
+  const ctx = context({ summary: `PowerShell: ${line}` });
+  ctx.action = JSON.parse(wasm.action_from_powershell_command(line, String.raw`C:\Users\me`));
+  ctx.risk = ctx.action.risk;
+  return render(ctx);
+}
+
+test("a PowerShell line can't hide a statement from the decision line (#316 B1)", async () => {
+  const { rendered } = await renderPowerShell(PS_HIDDEN_STATEMENT);
+  const lines = rendered.split("\n");
+  const deciding = lines.at(-1);
+  assert.equal(
+    deciding,
+    `  Deciding on: ${PS_HIDDEN_STATEMENT}`,
+    "the decision line is raw, verbatim",
+  );
+  assert.match(deciding, / ; Remove-Item -Recurse -Force /, "Remove-Item is its own word");
+  assert.ok(!rendered.includes(RAW_ARGV_DIVERGENCE_WARNING), "argv is raw's whitespace split");
+  assert.match(rendered, /^ {2}Risk:\s+high$/m, "a compound line fails upward");
+});
+
+test("a PowerShell Windows path renders verbatim with no divergence warning (#316 B1)", async () => {
+  const line = String.raw`Remove-Item C:\Users\me\proj\build -Recurse`;
+  const { rendered } = await renderPowerShell(line);
+  assert.equal(rendered.split("\n").at(-1), `  Deciding on: ${line}`);
+  assert.ok(!rendered.includes(RAW_ARGV_DIVERGENCE_WARNING));
+  assert.ok(!rendered.includes("C:Usersmeprojbuild"), "no backslash is stripped");
+});
+
+test("an argv that differs from raw's whitespace split still warns (#316 B1 negative)", async () => {
+  // Same words, but one token carries a space that raw splits on: a different command line.
+  const ctx = context();
+  ctx.action = {
+    ...ctx.action,
+    syntactic: { raw: String.raw`Remove-Item C:\a b`, argv: ["Remove-Item", String.raw`C:\a b`] },
+  };
+  const { rendered } = await render(ctx);
+  assert.equal(rendered.split("\n").at(-1), RAW_ARGV_DIVERGENCE_WARNING);
+});
+
+// Regression (#316 review round 2, R2-2): only shlex's ASCII whitespace counts. A Unicode space
+// separates argv tokens but reads as part of a word in raw, so it must still warn.
+test("an argv split on a Unicode space (U+00A0) inside a raw word still warns", async () => {
+  const ctx = context();
+  ctx.action = {
+    ...ctx.action,
+    syntactic: { raw: "rm\u00a0-rf /", argv: ["rm", "-rf", "/"] },
+  };
+  const { rendered } = await render(ctx);
+  assert.equal(rendered.split("\n").at(-1), RAW_ARGV_DIVERGENCE_WARNING);
+});
+
+test("a PowerShell line with an ideographic space (U+3000) still warns", async () => {
+  // The core's whitespace split cuts at U+3000; the approver's ASCII split does not.
+  const { rendered } = await renderPowerShell("Remove-Item\u3000build");
+  assert.equal(rendered.split("\n").at(-1), RAW_ARGV_DIVERGENCE_WARNING);
 });
 
 test("a variation selector after ASCII cannot make a divergent argv look identical", async () => {

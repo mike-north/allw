@@ -33,7 +33,13 @@ import { realpathSync } from "node:fs";
 import { hostname as osHostname } from "node:os";
 import { pathToFileURL } from "node:url";
 
-import { createClient, type ClientConfig } from "@allw/sdk";
+import {
+  MAX_ESCAPED_DIAGNOSTIC_CHARS,
+  commandRequest,
+  createClient,
+  escapeToPrintableAscii,
+  type ClientConfig,
+} from "@allw/sdk";
 
 import { readConfig } from "./lib/config.js";
 import { decide, type RequestApprovalFn } from "./lib/decide.js";
@@ -133,7 +139,7 @@ export async function runHook(
     // The SDK's ApprovalRequest is structurally what the hook builds; the SDK validates it.
     client.requestApproval(req as Parameters<typeof client.requestApproval>[0]);
 
-  return decide(parsed.input, { wasm, config, requestApproval }, osHostname());
+  return decide(parsed.input, { wasm, config, commandRequest, requestApproval }, osHostname());
 }
 
 /**
@@ -169,11 +175,14 @@ async function main(): Promise<void> {
     const raw = await readStdin();
     output = await runHook(raw, process.env);
   } catch (err) {
-    // Defense in depth: an unexpected internal failure must still produce a parseable deny.
+    // Defense in depth: an unexpected internal failure must still produce a parseable deny. Its
+    // message is unknown text, possibly from before the WASM core loaded, so it is quoted escaped
+    // and bounded (#358).
     output = denyOutput(
-      `allw: hook failed unexpectedly (fail-closed deny): ${
-        err instanceof Error ? err.message : String(err)
-      }`,
+      `allw: hook failed unexpectedly (fail-closed deny): ${escapeToPrintableAscii(
+        err instanceof Error ? err.message : String(err),
+        MAX_ESCAPED_DIAGNOSTIC_CHARS,
+      )}`,
     );
   }
   decision.finalize(output);

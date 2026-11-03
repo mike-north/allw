@@ -48,14 +48,13 @@ async function accountState(
   accountId: string,
 ): Promise<{ boundRoot: string | null; pairings: number }> {
   const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
-  return runInDurableObject(stub, (instance: AccountRelay) => {
-    const relay = instance as unknown as { sql: SqlStorage };
+  return runInDurableObject(stub, (relay: AccountRelay) => {
     const meta = [
-      ...relay.sql.exec<{ root_pubkey: string }>(
+      ...relay["sql"].exec<{ root_pubkey: string }>(
         `SELECT root_pubkey FROM account_meta WHERE id = 1`,
       ),
     ];
-    const pairings = [...relay.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM pairing`)];
+    const pairings = [...relay["sql"].exec<{ n: number }>(`SELECT COUNT(*) AS n FROM pairing`)];
     return { boundRoot: meta[0]?.root_pubkey ?? null, pairings: pairings[0]?.n ?? 0 };
   });
 }
@@ -345,9 +344,8 @@ describe("pairing/start — root-signed authorization", () => {
     const otherRoot = testRoot("auth-bound-mismatch-other").rootPubkey;
     // Simulate a bound root that differs from the presented one (unreachable without a SHA-256
     // collision); the relay must still refuse rather than act for a second root.
-    await runInDurableObject(stub, (instance: AccountRelay) => {
-      const relay = instance as unknown as { sql: SqlStorage };
-      relay.sql.exec(
+    await runInDurableObject(stub, (relay: AccountRelay) => {
+      relay["sql"].exec(
         `INSERT INTO account_meta (id, root_pubkey, bound_at) VALUES (1, ?, 0)`,
         otherRoot,
       );
@@ -363,14 +361,12 @@ describe("pairing/start — root-signed authorization", () => {
     const acct = testAccount("auth-jti-retention");
     expect((await postStart(acct, pairingStartBody(acct))).status).toBe(201);
     const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(acct));
-    await runInDurableObject(stub, (instance: AccountRelay) => {
-      const relay = instance as unknown as { sql: SqlStorage };
-      relay.sql.exec(`UPDATE pairing_start_jti SET expires_at = ?`, Date.now() - 30 * 1000);
+    await runInDurableObject(stub, (relay: AccountRelay) => {
+      relay["sql"].exec(`UPDATE pairing_start_jti SET expires_at = ?`, Date.now() - 30 * 1000);
     });
     expect((await postStart(acct, pairingStartBody(acct))).status).toBe(201);
-    const remaining = await runInDurableObject(stub, (instance: AccountRelay) => {
-      const relay = instance as unknown as { sql: SqlStorage };
-      return [...relay.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM pairing_start_jti`)][0]
+    const remaining = await runInDurableObject(stub, (relay: AccountRelay) => {
+      return [...relay["sql"].exec<{ n: number }>(`SELECT COUNT(*) AS n FROM pairing_start_jti`)][0]
         ?.n;
     });
     expect(remaining).toBe(2);
@@ -380,14 +376,12 @@ describe("pairing/start — root-signed authorization", () => {
     const acct = testAccount("auth-jti-sweep");
     expect((await postStart(acct, pairingStartBody(acct))).status).toBe(201);
     const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(acct));
-    await runInDurableObject(stub, (instance: AccountRelay) => {
-      const relay = instance as unknown as { sql: SqlStorage };
-      relay.sql.exec(`UPDATE pairing_start_jti SET expires_at = 0`);
+    await runInDurableObject(stub, (relay: AccountRelay) => {
+      relay["sql"].exec(`UPDATE pairing_start_jti SET expires_at = 0`);
     });
     expect((await postStart(acct, pairingStartBody(acct))).status).toBe(201);
-    const remaining = await runInDurableObject(stub, (instance: AccountRelay) => {
-      const relay = instance as unknown as { sql: SqlStorage };
-      return [...relay.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM pairing_start_jti`)][0]
+    const remaining = await runInDurableObject(stub, (relay: AccountRelay) => {
+      return [...relay["sql"].exec<{ n: number }>(`SELECT COUNT(*) AS n FROM pairing_start_jti`)][0]
         ?.n;
     });
     expect(remaining).toBe(1);
@@ -408,15 +402,14 @@ describe("pairing — state from before root binding is never adopted", () => {
   async function seed(accountId: string, sql: string, ...params: (string | number)[]) {
     const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
     await runInDurableObject(stub, (instance: AccountRelay) => {
-      (instance as unknown as { sql: SqlStorage }).sql.exec(sql, ...params);
+      instance["sql"].exec(sql, ...params);
     });
   }
 
   async function count(accountId: string, table: string): Promise<number> {
     const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
-    return runInDurableObject(stub, (instance: AccountRelay) => {
-      const relay = instance as unknown as { sql: SqlStorage };
-      return [...relay.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`)][0]?.n ?? 0;
+    return runInDurableObject(stub, (relay: AccountRelay) => {
+      return [...relay["sql"].exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`)][0]?.n ?? 0;
     });
   }
 
@@ -494,10 +487,9 @@ describe("pairing — state from before root binding is never adopted", () => {
     // The pre-binding relay cached unverified strings and a caller-asserted max_sequence there.
     const acct = testAccount("pre-binding-legacy-account-state");
     const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(acct));
-    const tables = await runInDurableObject(stub, (instance: AccountRelay) => {
-      const relay = instance as unknown as { sql: SqlStorage };
+    const tables = await runInDurableObject(stub, (relay: AccountRelay) => {
       return [
-        ...relay.sql.exec<{ name: string }>(
+        ...relay["sql"].exec<{ name: string }>(
           `SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'account_state%'`,
         ),
       ].map((row) => row.name);
@@ -523,9 +515,8 @@ describe("pairing — state from before root binding is never adopted", () => {
     expect(resp.status).toBe(403);
     expect(await count(acct, "device")).toBe(0);
     const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(acct));
-    const used = await runInDurableObject(stub, (instance: AccountRelay) => {
-      const relay = instance as unknown as { sql: SqlStorage };
-      return [...relay.sql.exec<{ used: number }>(`SELECT used FROM pairing`)][0]?.used;
+    const used = await runInDurableObject(stub, (relay: AccountRelay) => {
+      return [...relay["sql"].exec<{ used: number }>(`SELECT used FROM pairing`)][0]?.used;
     });
     expect(used).toBe(0);
   });
