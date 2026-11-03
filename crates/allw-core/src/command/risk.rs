@@ -46,19 +46,26 @@
 //!   a lone `{` / `}` word) are classified on their own.
 //! - Leading words that aren't the command are skipped before the command word is found:
 //!   - keywords (`if`, `then`, `do`, `!`, `time [-p]`, …)
-//!   - redirections (`2>/dev/null`, `> f`)
+//!   - redirections (`2>/dev/null`, `> f`), including ones attached to a word: bash reads `<` and
+//!     `>` as metacharacters, so `dd>/dev/null` runs `dd`
 //!   - zsh precommand words (`noglob`, `nocorrect`, `-`, `repeat N`)
 //!
 //!   Assignments are kept for the argv rules, and zsh `=cmd` is read as `cmd`.
 //! - A command word holding an expansion (`$x`, `$(…)`, a backtick, a glob `* ? [`, or a brace list
 //!   `{a,b}`) can't be known statically: `High`. In bash, `$'…'` and `$"…"` are decoded first, so
-//!   `$'rm'` is `rm`.
+//!   `$'rm'` is `rm`, and a decoded NUL ends the word (`$'dd\0x'` is `dd`). A decoding bash may do
+//!   differently (`\u`, `\c`, an unknown escape, a byte that isn't UTF-8) makes it at least `High`.
+//!   The decoded name still applies, so `$'\u0064\u0064'` is `Critical`.
 //! - Command and process substitutions (`$(…)`, backticks, `<(…)`, `>(…)`) are classified as
 //!   command lines.
-//! - Heredocs (`<<`, `<<-`; not `<<<`) are recognized:
-//!   - a quoted delimiter makes the body literal;
-//!   - an unquoted one makes only its substitutions run;
-//!   - a body fed to a shell is classified as a script.
+//! - Heredocs (`<<`, `<<-`) are recognized:
+//!   - the delimiter is read as bash reads it: an empty quoted delimiter (`<<''`) ends the body at
+//!     the first empty line, and a backslash-newline inside it is removed;
+//!   - a delimiter T1 can't read for sure (`$'…'`, a backtick, none at all) makes the line `High`;
+//!   - a quoted delimiter makes the body literal, and an unquoted one makes only its substitutions
+//!     run.
+//! - A heredoc or here-string (`<<<`) fed to a shell is classified as a script. The shell may be
+//!   the command word or a later word after a curated wrapper (`env bash <<'EOF'`).
 //! - Any operator, substitution or redirection makes the line at least `Medium`. A line that ends
 //!   inside an open quote or substitution is `High`: the shell runs what comes before the syntax
 //!   error.
@@ -74,8 +81,10 @@
 //! - Argv positions past [`MAX_PROGRAM_CANDIDATES`] are not analyzed. They count as a `High`
 //!   candidate for any wrapper, shell or assignment in front of them.
 //! - All analysis of one record shares one budget of [`MAX_RISK_WORK`] units (bytes scanned or
-//!   split, plus argv positions classified). Exhausting it makes the record at least `High`. Every
-//!   candidate string is analyzed once per level, so work grows linearly with input size.
+//!   split, plus argv positions classified). Exhausting it makes the record at least `High`, and
+//!   never lowers a tier already found (a `dd` seen before the budget ran out stays `Critical`).
+//!   Every candidate string is analyzed once per level, and every look-ahead scan is linear, so
+//!   work grows linearly with input size.
 //!
 //! # Known T1 limits (the tier can understate these)
 //!
@@ -189,11 +198,16 @@ fn line_and_words_risk(line: &str, words: &[String], budget: &mut Budget) -> Ris
 // ── Work budget ───────────────────────────────────────────────────────────────
 
 /// The work left for one record's risk analysis. Once exhausted, every step returns
-/// [`Risk::High`] at once, and [`Budget::finish`] raises the result to at least `High`.
+/// [`Risk::High`] at once, and [`Budget::finish`] raises the result to at least `High` and to
+/// every tier already found, so running out of budget never lowers a tier (a `dd` found before
+/// the budget ran out stays `Critical`).
 struct Budget {
     limit: usize,
     used: usize,
     exhausted: bool,
+    /// The highest program-table tier found so far, for any word classified as a program start.
+    /// Only read on exhaustion, where it may over-count a word that turned out not to run.
+    found: Risk,
 }
 
 impl Budget {
@@ -202,7 +216,13 @@ impl Budget {
             limit,
             used: 0,
             exhausted: false,
+            found: Risk::Low,
         }
+    }
+
+    /// Record a tier the analysis found.
+    fn note(&mut self, tier: Risk) {
+        self.found = max_risk(self.found, tier);
     }
 
     /// Spend `units`. Returns `false`, and marks the budget exhausted, if they don't fit.
@@ -215,9 +235,10 @@ impl Budget {
         true
     }
 
+    /// The record's tier: `risk`, or on exhaustion at least `High` and every tier already found.
     fn finish(&self, risk: Risk) -> Risk {
         if self.exhausted {
-            max_risk(risk, Risk::High)
+            max_risk(max_risk(risk, Risk::High), self.found)
         } else {
             risk
         }
@@ -401,7 +422,7 @@ fn command_string_risk(text: &str, depth: usize, budget: &mut Budget) -> Option<
 /// own flags, so only they pay for the split.
 fn direct_risk(argv: &[String], j: usize, budget: &mut Budget) -> Risk {
     let program = argv[j].as_str();
-    match basename(program) {
+    let tier = match basename(program) {
         "rm" | "git" | "chmod" => {
             if !budget.spend(argv.len() - j) {
                 return Risk::High;
@@ -410,7 +431,9 @@ fn direct_risk(argv: &[String], j: usize, budget: &mut Budget) -> Risk {
             classify_program(program, &flags, &positionals)
         }
         _ => classify_program(program, &[], &[]),
-    }
+    };
+    budget.note(tier);
+    tier
 }
 
 /// The tier of `argv[j + 1..]` joined by spaces and read as a command line (`eval`).
@@ -597,7 +620,8 @@ struct ShellLine<'a> {
     heredocs: Vec<(usize, &'a str)>,
     /// Any operator, substitution or redirection: shell syntax beyond plain words.
     has_shell_syntax: bool,
-    /// The line ends inside an open quote, substitution or backtick.
+    /// The line ends inside an open quote, substitution or backtick, or holds syntax T1 can't
+    /// read for sure (an uncertain heredoc delimiter). Either way the line is at least High.
     unterminated: bool,
     /// The line holds an unquoted `#` at a word start (the comment reading is ambiguous).
     saw_comment: bool,
@@ -605,12 +629,31 @@ struct ShellLine<'a> {
     saw_ansi_c: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Bytes examined by the look-ahead scans below, so tests can measure the work actually done
+    /// rather than only what was charged to the [`Budget`].
+    static SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Count `n` bytes examined by a look-ahead scan (tests only).
+#[cfg(test)]
+fn note_scanned(n: usize) {
+    SCANNED.with(|c| c.set(c.get() + n));
+}
+
+#[cfg(not(test))]
+fn note_scanned(_: usize) {}
+
 /// Index of the next `byte` at or after `from`, or `None`.
 fn find_byte(b: &[u8], from: usize, byte: u8) -> Option<usize> {
-    b.get(from..)?
+    let found = b
+        .get(from..)?
         .iter()
         .position(|&c| c == byte)
-        .map(|p| from + p)
+        .map(|p| from + p);
+    note_scanned(found.map_or(b.len(), |f| f + 1).saturating_sub(from));
+    found
 }
 
 /// Index just past the `'` closing an ANSI-C string whose body starts at `start`, or `None`.
@@ -619,10 +662,14 @@ fn skip_ansi_c_string(b: &[u8], start: usize) -> Option<usize> {
     while i < b.len() {
         match b[i] {
             b'\\' => i += 2,
-            b'\'' => return Some(i + 1),
+            b'\'' => {
+                note_scanned(i + 1 - start);
+                return Some(i + 1);
+            }
             _ => i += 1,
         }
     }
+    note_scanned(b.len().saturating_sub(start));
     None
 }
 
@@ -651,6 +698,7 @@ fn find_closing_paren(b: &[u8], start: usize, reading: Reading) -> Option<usize>
             b')' if !in_double => {
                 depth -= 1;
                 if depth == 0 {
+                    note_scanned(i + 1 - start);
                     return Some(i);
                 }
             }
@@ -658,6 +706,7 @@ fn find_closing_paren(b: &[u8], start: usize, reading: Reading) -> Option<usize>
         }
         i += 1;
     }
+    note_scanned(b.len().saturating_sub(start));
     None
 }
 
@@ -667,10 +716,14 @@ fn find_closing_backtick(b: &[u8], start: usize) -> Option<usize> {
     while i < b.len() {
         match b[i] {
             b'\\' => i += 2,
-            b'`' => return Some(i),
+            b'`' => {
+                note_scanned(i + 1 - start);
+                return Some(i);
+            }
             _ => i += 1,
         }
     }
+    note_scanned(b.len().saturating_sub(start));
     None
 }
 
@@ -682,13 +735,29 @@ fn is_word_break(c: u8) -> bool {
     )
 }
 
-/// Read a heredoc delimiter word starting at `i`: its unquoted text, whether any part was quoted,
-/// and the index just past it.
-fn read_heredoc_delimiter(b: &[u8], mut i: usize) -> (String, bool, usize) {
+/// A heredoc delimiter word as bash reads it.
+struct HeredocDelimiter {
+    /// The delimiter text after quote removal; may be empty (`<<''`).
+    text: String,
+    /// Any part was quoted or escaped, so the body is literal.
+    quoted: bool,
+    /// The word holds syntax whose delimiter meaning T1 doesn't model (`$'…'`, `$"…"`, a
+    /// backtick, an unterminated quote) or is missing: the caller fails upward.
+    uncertain: bool,
+    /// Index just past the word.
+    end: usize,
+}
+
+/// Read a heredoc delimiter word starting at `i`. A backslash-newline inside it is a line
+/// continuation and is removed, as bash does before reading the word.
+fn read_heredoc_delimiter(b: &[u8], mut i: usize) -> HeredocDelimiter {
+    let start = i;
     let mut word = Vec::new();
     let mut quoted = false;
+    let mut uncertain = false;
     while i < b.len() && !is_word_break(b[i]) {
         match b[i] {
+            b'\\' if b.get(i + 1) == Some(&b'\n') => i += 2,
             b'\\' => {
                 quoted = true;
                 if let Some(&c) = b.get(i + 1) {
@@ -696,9 +765,24 @@ fn read_heredoc_delimiter(b: &[u8], mut i: usize) -> (String, bool, usize) {
                 }
                 i += 2;
             }
+            b'$' if matches!(b.get(i + 1), Some(b'\'' | b'"')) => {
+                uncertain = true;
+                i += 1;
+            }
+            b'`' => {
+                uncertain = true;
+                word.push(b'`');
+                i += 1;
+            }
             q @ (b'\'' | b'"') => {
                 quoted = true;
-                let end = find_byte(b, i + 1, q).unwrap_or(b.len());
+                let end = match find_byte(b, i + 1, q) {
+                    Some(end) => end,
+                    None => {
+                        uncertain = true;
+                        b.len()
+                    }
+                };
                 word.extend_from_slice(&b[i + 1..end]);
                 i = end + 1;
             }
@@ -708,11 +792,14 @@ fn read_heredoc_delimiter(b: &[u8], mut i: usize) -> (String, bool, usize) {
             }
         }
     }
-    (
-        String::from_utf8_lossy(&word).into_owned(),
+    // `<<` with no word at all is a syntax error.
+    uncertain |= i == start;
+    HeredocDelimiter {
+        text: String::from_utf8_lossy(&word).into_owned(),
         quoted,
-        i.min(b.len()),
-    )
+        uncertain,
+        end: i.min(b.len()),
+    }
 }
 
 /// Consume a heredoc body starting at `pos`: the body's byte range and the index just past its
@@ -866,16 +953,17 @@ fn scan_shell_line(text: &str, reading: Reading) -> ShellLine<'_> {
                 while p < b.len() && (b[p] == b' ' || b[p] == b'\t') {
                     p += 1;
                 }
-                let (delimiter, quoted, end) = read_heredoc_delimiter(b, p);
-                if !delimiter.is_empty() {
-                    pending.push(PendingHeredoc {
-                        delimiter,
-                        strip_tabs,
-                        quoted,
-                        segment: line.segments.len(),
-                    });
-                }
-                i = end;
+                let delimiter = read_heredoc_delimiter(b, p);
+                // A delimiter T1 can't read for sure fails upward: the body and what follows it
+                // are still scanned as well as T1 can, and the line is at least High.
+                line.unterminated |= delimiter.uncertain;
+                pending.push(PendingHeredoc {
+                    delimiter: delimiter.text,
+                    strip_tabs,
+                    quoted: delimiter.quoted,
+                    segment: line.segments.len(),
+                });
+                i = delimiter.end;
                 continue;
             }
             b'<' | b'>' if !in_double => line.has_shell_syntax = true,
@@ -934,7 +1022,10 @@ fn scan_shell_line(text: &str, reading: Reading) -> ShellLine<'_> {
 
 // ── Words of a segment ────────────────────────────────────────────────────────
 
-/// Split a segment into its raw words at unquoted blanks, keeping quotes and substitutions intact.
+/// Split a segment into its raw words, keeping quotes and substitutions intact. Words end at
+/// unquoted blanks, and also where an unquoted redirection operator (`<`, `>`, `&>`) starts after
+/// other text, since bash reads those as metacharacters: `dd>/dev/null` is the word `dd` and the
+/// redirection `>/dev/null`. A leading file-descriptor number stays with its operator (`2>&1`).
 fn raw_words(segment: &str, reading: Reading) -> Vec<&str> {
     let b = segment.as_bytes();
     let mut words = Vec::new();
@@ -948,8 +1039,20 @@ fn raw_words(segment: &str, reading: Reading) -> Vec<&str> {
         }
         let start = i;
         let mut in_double = false;
+        // The word so far holds text other than an fd number or operator characters.
+        let mut has_text = false;
         while i < b.len() && (in_double || !b[i].is_ascii_whitespace()) {
-            match b[i] {
+            let c = b[i];
+            let starts_redirection = !in_double
+                && ((matches!(c, b'<' | b'>') && b.get(i + 1) != Some(&b'('))
+                    || (c == b'&' && b.get(i + 1) == Some(&b'>')));
+            if starts_redirection && has_text {
+                break;
+            }
+            if !matches!(c, b'<' | b'>' | b'&' | b'|') && !c.is_ascii_digit() {
+                has_text = true;
+            }
+            match c {
                 b'\\' => i += 2,
                 b'\'' if !in_double => {
                     i = find_byte(b, i + 1, b'\'').map_or(b.len(), |q| q + 1);
@@ -957,7 +1060,8 @@ fn raw_words(segment: &str, reading: Reading) -> Vec<&str> {
                 b'$' if reading.ansi_c_quotes && !in_double && b.get(i + 1) == Some(&b'\'') => {
                     i = skip_ansi_c_string(b, i + 2).unwrap_or(b.len());
                 }
-                b'$' if b.get(i + 1) == Some(&b'(') => {
+                b'$' | b'<' | b'>' if b.get(i + 1) == Some(&b'(') && (c == b'$' || !in_double) => {
+                    has_text = true;
                     i = find_closing_paren(b, i + 2, reading).map_or(b.len(), |e| e + 1);
                 }
                 b'`' => {
@@ -977,10 +1081,12 @@ fn raw_words(segment: &str, reading: Reading) -> Vec<&str> {
 }
 
 /// Decode one ANSI-C escape at `b[i]` (just after the backslash) into `out`; returns the index
-/// after it.
-fn decode_ansi_c_escape(b: &[u8], i: usize, out: &mut Vec<u8>) -> usize {
+/// after it, and whether the decoding is uncertain: an escape bash may decode differently (or not
+/// at all, depending on its version), such as `\u` / `\U`, `\c`, an unknown escape, or a value
+/// that isn't one byte.
+fn decode_ansi_c_escape(b: &[u8], i: usize, out: &mut Vec<u8>) -> (usize, bool) {
     let Some(&c) = b.get(i) else {
-        return i;
+        return (i, true);
     };
     let simple = match c {
         b'n' => Some(b'\n'),
@@ -996,43 +1102,91 @@ fn decode_ansi_c_escape(b: &[u8], i: usize, out: &mut Vec<u8>) -> usize {
     };
     if let Some(byte) = simple {
         out.push(byte);
-        return i + 1;
+        return (i + 1, false);
     }
-    if c == b'x' {
-        let mut j = i + 1;
+    let hex_value = |from: usize, max_digits: usize| {
+        let mut j = from;
         let mut value = 0u32;
-        while j < b.len() && j < i + 3 && b[j].is_ascii_hexdigit() {
+        while j < b.len() && j < from + max_digits && b[j].is_ascii_hexdigit() {
             value = value * 16 + char::from(b[j]).to_digit(16).unwrap_or(0);
             j += 1;
         }
-        if j > i + 1 {
-            out.push(u8::try_from(value).unwrap_or(b'?'));
-            return j;
+        (j, value)
+    };
+    match c {
+        b'x' => {
+            let (j, value) = hex_value(i + 1, 2);
+            if j > i + 1 {
+                out.push(u8::try_from(value).unwrap_or(b'?'));
+                return (j, false);
+            }
         }
-    }
-    if (b'0'..=b'7').contains(&c) {
-        let mut j = i;
-        let mut value = 0u32;
-        while j < b.len() && j < i + 3 && (b'0'..=b'7').contains(&b[j]) {
-            value = value * 8 + u32::from(b[j] - b'0');
-            j += 1;
+        b'u' | b'U' => {
+            // Unicode escapes exist in bash 4.2 and later only: decode them, but as uncertain.
+            let (j, value) = hex_value(i + 1, if c == b'u' { 4 } else { 8 });
+            if j > i + 1 {
+                if let Some(ch) = char::from_u32(value) {
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                }
+                return (j, true);
+            }
         }
-        out.push(u8::try_from(value).unwrap_or(b'?'));
-        return j;
+        b'c' => {
+            if let Some(&ctl) = b.get(i + 1) {
+                out.push(ctl & 0x1f);
+                return (i + 2, true);
+            }
+        }
+        b'0'..=b'7' => {
+            let mut j = i;
+            let mut value = 0u32;
+            while j < b.len() && j < i + 3 && (b'0'..=b'7').contains(&b[j]) {
+                value = value * 8 + u32::from(b[j] - b'0');
+                j += 1;
+            }
+            let byte = u8::try_from(value);
+            out.push(*byte.as_ref().unwrap_or(&b'?'));
+            return (j, byte.is_err());
+        }
+        _ => {}
     }
     out.push(b'\\');
     out.push(c);
-    i + 1
+    (i + 1, true)
 }
 
-/// A word with its quotes removed, and whether it holds an expansion whose value T1 can't know:
-/// a parameter or command substitution (`$x`, `${x}`, `$(…)`, a backtick; quoted or not, since
-/// double quotes don't stop expansion), or an unquoted glob (`*`, `?`, `[…]`) or brace list
-/// (`{a,b}`).
-fn unquote_word(raw: &str, reading: Reading) -> (String, bool) {
+/// One word after quote removal.
+struct Word {
+    /// The word's text as the shell would pass it.
+    text: String,
+    /// It holds an expansion whose value T1 can't know: a parameter or command substitution
+    /// (`$x`, `${x}`, `$(…)`, `<(…)`, a backtick; quoted or not, since double quotes don't stop
+    /// expansion), or an unquoted glob (`*`, `?`, `[…]`) or brace list (`{a,b}`).
+    expansion: bool,
+    /// Its text may not be what bash passes: an ANSI-C escape bash may decode differently, a
+    /// decoded NUL (bash ends the word there), or bytes that aren't UTF-8.
+    uncertain: bool,
+}
+
+/// Remove a word's quotes the way bash would, charging its bytes to `budget`. Linear in the word:
+/// no byte is examined more than twice (once to find the last `]`, once to unquote).
+fn unquote_word(raw: &str, reading: Reading, budget: &mut Budget) -> Word {
     let b = raw.as_bytes();
+    if !budget.spend(b.len()) {
+        return Word {
+            text: String::new(),
+            expansion: true,
+            uncertain: true,
+        };
+    }
+    // `[` starts a glob only with a later `]` (`[` and `[[` alone are commands). One pass finds
+    // the last `]`, so the check costs nothing per `[`.
+    let last_close_bracket = b.iter().rposition(|&c| c == b']');
+    note_scanned(b.len());
     let mut out = Vec::with_capacity(b.len());
     let mut expansion = false;
+    let mut uncertain = false;
     let mut brace_open = false;
     let mut i = 0;
     while i < b.len() {
@@ -1054,7 +1208,9 @@ fn unquote_word(raw: &str, reading: Reading) -> (String, bool) {
                 let mut j = i + 2;
                 while j < b.len() && b[j] != b'\'' {
                     if b[j] == b'\\' {
-                        j = decode_ansi_c_escape(b, j + 1, &mut out);
+                        let (next, unsure) = decode_ansi_c_escape(b, j + 1, &mut out);
+                        uncertain |= unsure;
+                        j = next;
                     } else {
                         out.push(b[j]);
                         j += 1;
@@ -1095,14 +1251,18 @@ fn unquote_word(raw: &str, reading: Reading) -> (String, bool) {
                 out.push(b'$');
                 i += 1;
             }
+            b'<' | b'>' if b.get(i + 1) == Some(&b'(') => {
+                expansion = true;
+                out.push(b[i]);
+                i += 1;
+            }
             b'`' | b'*' | b'?' => {
                 expansion = true;
                 out.push(b[i]);
                 i += 1;
             }
             b'[' => {
-                // `[` is a glob only with a later `]` (`[` and `[[` alone are commands).
-                expansion |= find_byte(b, i + 1, b']').is_some();
+                expansion |= last_close_bracket.is_some_and(|close| close > i);
                 out.push(b'[');
                 i += 1;
             }
@@ -1122,7 +1282,23 @@ fn unquote_word(raw: &str, reading: Reading) -> (String, bool) {
             }
         }
     }
-    (String::from_utf8_lossy(&out).into_owned(), expansion)
+    // bash passes words as C strings: a decoded NUL ends the word.
+    if let Some(nul) = out.iter().position(|&c| c == 0) {
+        out.truncate(nul);
+        uncertain = true;
+    }
+    let text = match String::from_utf8(out) {
+        Ok(text) => text,
+        Err(e) => {
+            uncertain = true;
+            String::from_utf8_lossy(e.as_bytes()).into_owned()
+        }
+    };
+    Word {
+        text,
+        expansion,
+        uncertain,
+    }
 }
 
 /// Does `$` followed by `c` start an expansion (a name, `{`, `(`, a digit, or a special
@@ -1139,6 +1315,9 @@ fn starts_expansion(c: u8) -> bool {
 /// If `word` is a redirection, whether its target is the next word (`>` alone) rather than
 /// attached (`>f`, `2>&1`). `None` if it isn't one.
 fn redirection(word: &str) -> Option<bool> {
+    if word.contains("<(") || word.contains(">(") {
+        return None; // a process substitution, not a redirection
+    }
     let rest = word
         .strip_prefix("&>>")
         .or_else(|| word.strip_prefix("&>"))
@@ -1152,73 +1331,122 @@ fn redirection(word: &str) -> Option<bool> {
     Some(rest.is_empty())
 }
 
-/// What one segment runs: its tier (`None` when it runs nothing), and its command word.
-fn segment_risk(
-    segment: &str,
-    depth: usize,
-    reading: Reading,
-    budget: &mut Budget,
-) -> (Option<Risk>, Option<String>) {
+/// Is `word` (after quote removal) a shell that reads a script from stdin?
+fn is_shell(word: &str) -> bool {
+    let base = basename(word);
+    SHELLS.contains(&base) || POWERSHELLS.contains(&base)
+}
+
+/// If `word` is a here-string redirection (`<<<`, optionally after an fd number), its attached
+/// text (`Some("")` when the text is the next word).
+fn here_string(word: &str) -> Option<&str> {
+    let digits = word.bytes().take_while(u8::is_ascii_digit).count();
+    word[digits..].strip_prefix("<<<")
+}
+
+/// What one segment runs.
+struct Segment {
+    /// Its tier, or `None` when it runs nothing.
+    risk: Option<Risk>,
+    /// It runs a shell that reads a script from stdin: the shell is the command word, or a later
+    /// word after a curated wrapper (`env bash`, `sudo -u x sh`). A heredoc or here-string fed to
+    /// it is a script.
+    runs_shell: bool,
+}
+
+/// Classify one segment: skip the words in front of the command word, then classify the argv.
+/// A here-string fed to a shell is classified as a script.
+fn segment_risk(segment: &str, depth: usize, reading: Reading, budget: &mut Budget) -> Segment {
     if !budget.spend(segment.len()) {
-        return (Some(Risk::High), None);
+        return Segment {
+            risk: Some(Risk::High),
+            runs_shell: false,
+        };
     }
     let raw = raw_words(segment, reading);
+    let unquoted: Vec<Word> = raw
+        .iter()
+        .map(|w| unquote_word(w, reading, budget))
+        .collect();
     let mut words: Vec<String> = Vec::new();
     let mut has_assignment = false;
     let mut i = 0;
-    let mut command: Option<(String, bool)> = None;
-    while i < raw.len() {
-        let (word, expansion) = unquote_word(raw[i], reading);
-        if !expansion {
-            if SHELL_KEYWORDS.contains(&word.as_str()) {
-                let skip_p = word == "time"
-                    && raw
-                        .get(i + 1)
-                        .is_some_and(|w| unquote_word(w, reading).0 == "-p");
+    let mut command: Option<usize> = None;
+    while i < unquoted.len() {
+        let word = &unquoted[i];
+        let text = word.text.as_str();
+        if !word.expansion {
+            if SHELL_KEYWORDS.contains(&text) {
+                let skip_p = text == "time" && unquoted.get(i + 1).is_some_and(|w| w.text == "-p");
                 i += 1 + usize::from(skip_p);
                 continue;
             }
-            if ZSH_PRECOMMANDS.contains(&word.as_str()) {
+            if ZSH_PRECOMMANDS.contains(&text) {
                 i += 1;
                 continue;
             }
-            if word == "repeat" {
+            if text == "repeat" {
                 i += 2;
                 continue;
             }
-            if let Some(target_is_next) = redirection(&word) {
+            if let Some(target_is_next) = redirection(text) {
                 i += 1 + usize::from(target_is_next);
                 continue;
             }
-            if is_assignment_like(&word) {
+            if is_assignment_like(text) {
                 has_assignment = true;
-                words.push(word);
+                words.push(word.text.clone());
                 i += 1;
                 continue;
             }
         }
-        command = Some((word, expansion));
-        i += 1;
+        command = Some(i);
         break;
     }
-    let Some((command_word, expansion)) = command else {
-        return (has_assignment.then_some(Risk::Medium), None);
+    let Some(c) = command else {
+        return Segment {
+            risk: has_assignment.then_some(Risk::Medium),
+            runs_shell: false,
+        };
     };
-    if expansion {
+    let word = &unquoted[c];
+    if word.expansion {
         // The command word is computed at run time (decision: unknowable ⇒ High).
-        return (Some(Risk::High), None);
+        return Segment {
+            risk: Some(Risk::High),
+            runs_shell: false,
+        };
     }
     // zsh `=cmd` expands to the path of `cmd`.
-    let command_word = match command_word.strip_prefix('=') {
-        Some(name) if !name.is_empty() => name.to_string(),
-        _ => command_word,
+    let command_word = match word.text.strip_prefix('=') {
+        Some(name) if !name.is_empty() => name,
+        _ => word.text.as_str(),
     };
-    words.push(command_word.clone());
-    words.extend(raw[i..].iter().map(|w| unquote_word(w, reading).0));
-    (
-        Some(classify_argv(&words, depth, budget)),
-        Some(command_word),
-    )
+    words.push(command_word.to_string());
+    words.extend(unquoted[c + 1..].iter().map(|w| w.text.clone()));
+    let mut tier = classify_argv(&words, depth, budget);
+    if word.uncertain {
+        // bash may run a different name than the one decoded: at least High.
+        tier = max_risk(tier, Risk::High);
+    }
+    let runs_shell = is_shell(command_word)
+        || (WRAPPERS.contains(&basename(command_word))
+            && unquoted[c + 1..].iter().any(|w| is_shell(&w.text)));
+    let mut risk = Some(tier);
+    if runs_shell {
+        // A here-string fed to a shell is a script (`bash <<< 'cmd'`).
+        for (k, w) in unquoted.iter().enumerate() {
+            let script = match here_string(&w.text) {
+                Some("") => unquoted.get(k + 1).map(|t| t.text.as_str()),
+                Some(attached) => Some(attached),
+                None => None,
+            };
+            if let Some(script) = script {
+                risk = raise_opt(risk, command_string_risk(script, depth, budget));
+            }
+        }
+    }
+    Segment { risk, runs_shell }
 }
 
 /// The tier of one reading of a line: its segments, substitutions and heredoc bodies.
@@ -1229,22 +1457,18 @@ fn reading_risk(
     budget: &mut Budget,
 ) -> Option<Risk> {
     let mut tier = None;
-    let mut commands: Vec<Option<String>> = Vec::with_capacity(line.segments.len());
+    let mut runs_shell: Vec<bool> = Vec::with_capacity(line.segments.len());
     for segment in &line.segments {
-        let (risk, command) = segment_risk(segment, depth, reading, budget);
-        tier = raise_opt(tier, risk);
-        commands.push(command);
+        let classified = segment_risk(segment, depth, reading, budget);
+        tier = raise_opt(tier, classified.risk);
+        runs_shell.push(classified.runs_shell);
     }
     for body in &line.substitutions {
         tier = raise_opt(tier, command_string_risk(body, depth, budget));
     }
     for (segment, body) in &line.heredocs {
-        // A heredoc fed to a shell is a script.
-        let fed_to_shell = commands
-            .get(*segment)
-            .and_then(Option::as_deref)
-            .is_some_and(|c| SHELLS.contains(&basename(c)) || POWERSHELLS.contains(&basename(c)));
-        if fed_to_shell {
+        // A heredoc fed to a shell (directly or through a curated wrapper) is a script.
+        if runs_shell.get(*segment).copied().unwrap_or(false) {
             tier = raise_opt(tier, command_string_risk(body, depth, budget));
         }
     }
@@ -1287,13 +1511,14 @@ fn shell_line_risk(text: &str, depth: usize, budget: &mut Budget) -> Option<Risk
     }
     for reading in alternates {
         if !budget.spend(text.len()) {
-            return Some(Risk::High);
+            break;
         }
         let line = scan_shell_line(text, reading);
         tier = raise_opt(tier, reading_risk(&line, depth, reading, budget));
     }
     if budget.exhausted {
-        return Some(Risk::High);
+        // Keep what was found; what wasn't read counts as High.
+        return raise(tier, Risk::High);
     }
     tier
 }

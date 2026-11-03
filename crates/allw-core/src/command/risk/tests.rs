@@ -749,7 +749,208 @@ fn budget_exhaustion_keeps_a_higher_tier() {
         limit: 0,
         used: 0,
         exhausted: true,
+        found: Risk::Low,
     };
     assert_eq!(budget.finish(Risk::Critical), Risk::Critical);
     assert_eq!(budget.finish(Risk::Low), Risk::High);
+}
+
+// ── Review of #284 (second round): each probe is a regression test ───────────
+
+/// Measure the bytes the look-ahead scans actually examine while analyzing `line`.
+fn scanned_while(line: &str) -> (Risk, Budget, usize) {
+    SCANNED.with(|c| c.set(0));
+    let (risk, budget) = analyze_with_budget(line, MAX_RISK_WORK);
+    (risk, budget, SCANNED.with(std::cell::Cell::get))
+}
+
+/// Regression (#284 review, finding 1): each `[` rescanned the rest of the word for a `]`, so
+/// `[` × n cost n²/2 byte examinations that the budget never saw. The work actually done is now
+/// linear, measured by the scan counter rather than the budget's own debits.
+#[test]
+fn repeated_brackets_are_scanned_in_linear_work() {
+    for line in [
+        "[".repeat(160_000),
+        format!("echo {}", "[".repeat(160_000)),
+        format!("sh -c '{}'", "[".repeat(160_000)),
+    ] {
+        let (risk, budget, scanned) = scanned_while(&line);
+        assert!(!budget.exhausted, "{} bytes", line.len());
+        assert!(
+            scanned < 16 * line.len(),
+            "scanned {scanned} bytes for a {}-byte line",
+            line.len()
+        );
+        assert!(budget.used < 16 * line.len());
+        assert_eq!(risk, line_risk(&line));
+    }
+    // With a closing bracket the command word is a glob.
+    assert_eq!(line_risk(&format!("{}]", "[".repeat(1_000))), Risk::High);
+}
+
+/// Other look-ahead shapes stay linear too: unclosed quotes, substitutions, backticks, ANSI-C
+/// strings and heredocs.
+#[test]
+fn adversarial_scan_shapes_are_linear() {
+    let n = 50_000;
+    for line in [
+        format!("echo {}", "$(".repeat(n)),
+        format!("echo {}", "`a` ".repeat(n)),
+        format!("echo {}", "$'a' ".repeat(n)),
+        format!("echo {}", "'a' ".repeat(n)),
+        format!("cat {}\nx", "<<A ".repeat(n)),
+        format!("echo {}", "{a,".repeat(n)),
+        format!("echo {}", "a>b".repeat(n)),
+    ] {
+        let (_, budget, scanned) = scanned_while(&line);
+        assert!(
+            scanned < 64 * line.len() || budget.exhausted,
+            "scanned {scanned} bytes for {} bytes",
+            line.len()
+        );
+    }
+}
+
+/// Regression (#284 review, finding 2): padding after a found `dd` exhausted the budget, and the
+/// exhaustion path returned High, erasing Critical. Exhaustion now keeps every tier found.
+#[test]
+fn budget_exhaustion_never_lowers_a_found_tier() {
+    let line = format!("echo $(dd) $(echo {})", "x".repeat(1_100_000));
+    let (risk, budget) = analyze_with_budget(&line, MAX_RISK_WORK);
+    assert!(budget.exhausted);
+    assert_eq!(risk, Risk::Critical);
+    assert_eq!(line_risk(&line), Risk::Critical);
+
+    // A tier found in an earlier segment survives exhaustion in a later one.
+    let line = format!("dd; echo $(echo {})", "x".repeat(2_000_000));
+    let (risk, budget) = analyze_with_budget(&line, MAX_RISK_WORK);
+    assert!(budget.exhausted);
+    assert_eq!(risk, Risk::Critical);
+
+    // The same through the alternate (no-comment) reading running out of budget.
+    let line = format!("dd if=/dev/zero of=/dev/sda # {}", "x".repeat(1_500_000));
+    let (risk, budget) = analyze_with_budget(&line, MAX_RISK_WORK);
+    assert!(budget.exhausted);
+    assert_eq!(risk, Risk::Critical);
+}
+
+/// Regression (#284 review, finding 3): bash reads `<` / `>` as metacharacters, so `dd>/dev/null`
+/// runs `dd`. The word splitter took `dd>/dev/null` as one command name.
+#[test]
+fn adjacent_redirections_do_not_hide_the_program() {
+    assert_all(
+        &[
+            "dd>/dev/null",
+            "dd</dev/null",
+            "dd&>/dev/null",
+            "dd 2>/dev/null",
+            "dd>>log",
+            "bash -c 'dd</dev/null'",
+            "X=1>out dd",
+        ],
+        Risk::Critical,
+    );
+    assert_eq!(line_risk("rm -rf ~>/dev/null"), Risk::High);
+    // Negative: an fd number stays with its operator, and redirections alone are Medium.
+    assert_eq!(line_risk("ls 2>&1"), Risk::Medium);
+    assert_eq!(line_risk("echo hi>out"), Risk::Medium);
+}
+
+/// Regression (#284 review, finding 4): an empty quoted delimiter (`<<''`) was dropped, and a
+/// backslash-newline inside a delimiter was kept, so the body's quote hid the next command.
+#[test]
+fn empty_and_continued_heredoc_delimiters_do_not_hide_later_lines() {
+    assert_eq!(line_risk("cat <<''\nit's\n\ndd # '\n"), Risk::Critical);
+    assert_eq!(
+        line_risk("cat <<E\\\nOF\nit's\nEOF\ndd # '\n"),
+        Risk::Critical
+    );
+    // The empty delimiter ends the body at the first empty line, so the body is data.
+    assert_eq!(line_risk("cat <<''\ndd\n\nls"), Risk::Medium);
+}
+
+/// A delimiter T1 can't read for sure fails upward to at least High.
+#[test]
+fn uncertain_heredoc_delimiters_fail_upward() {
+    assert_eq!(line_risk("cat <<$'EOF'\nx\nEOF"), Risk::High);
+    assert_eq!(line_risk("cat <<`x`\nx\n`x`"), Risk::High);
+    assert_eq!(line_risk("cat <<"), Risk::High);
+}
+
+/// Regression (#284 review, finding 5): bash ends a word at a decoded NUL, and modern bash
+/// decodes `\u` escapes, so both of these run `dd`. The decoder kept NUL and its suffix, and left
+/// `\u` undecoded, inventing a Medium name.
+#[test]
+fn ansi_c_decoding_matches_bash_or_fails_upward() {
+    assert_eq!(
+        line_risk("$'dd\\0ignored' if=/dev/zero of=/dev/sda"),
+        Risk::Critical
+    );
+    assert_eq!(
+        line_risk("$'\\u0064\\u0064' if=/dev/zero of=/dev/sda"),
+        Risk::Critical
+    );
+    assert_eq!(
+        line_risk("$'\\U00000064d' if=/dev/zero of=/dev/sda"),
+        Risk::Critical
+    );
+    // Decodings bash may do differently are at least High even when they name a Low program.
+    assert_all(
+        &[
+            "$'\\u006c\\u0073'",
+            "$'l\\0x's",
+            "$'\\q'",
+            "$'\\777'",
+            "$'\\xff'",
+        ],
+        Risk::High,
+    );
+    // Negative: plain escapes decode exactly and aren't raised (the shlex word `$l\x73` reading
+    // keeps it at Medium).
+    assert_eq!(line_risk("$'l\\x73' -la"), Risk::Medium);
+}
+
+/// Regression (#284 review, finding 6): `fed_to_shell` checked only the first word, so a curated
+/// wrapper in front of the shell hid a heredoc script.
+#[test]
+fn wrapped_shell_reads_heredoc_as_a_script() {
+    assert_all(
+        &[
+            "env bash <<'EOF'\necho hi;dd if=/dev/zero of=/dev/sda\nEOF",
+            "nohup sh <<EOF\ndd if=/dev/zero of=/dev/sda\nEOF",
+            "sudo -u nobody bash <<'EOF'\ndd if=/dev/zero of=/dev/sda\nEOF",
+            "FOO=1 env -i zsh <<'EOF'\ndd if=/dev/zero of=/dev/sda\nEOF",
+        ],
+        Risk::Critical,
+    );
+    // Negative: a wrapper running a non-shell doesn't feed a shell. (The record's word list still
+    // shows `dd` after `env`, which the argv wrapper rule counts.)
+    let mut budget = Budget::new(MAX_RISK_WORK);
+    assert!(!segment_risk("env cat <<'EOF'", 0, Reading::BASH, &mut budget).runs_shell);
+    assert!(segment_risk("env -i bash <<'EOF'", 0, Reading::BASH, &mut budget).runs_shell);
+    assert_eq!(
+        line_risk("cat <<'EOF'\ndd if=/dev/zero of=/dev/sda\nEOF"),
+        Risk::Medium
+    );
+}
+
+/// #284 review, finding 7: a here-string fed to a shell is a script, through the same
+/// shell detection as heredocs.
+#[test]
+fn here_string_fed_to_a_shell_is_a_script() {
+    assert_all(
+        &[
+            "bash <<< \"dd if=/dev/zero of=/dev/sda\"",
+            "bash<<<'dd if=/dev/zero of=/dev/sda'",
+            "env sh <<< 'ls; dd if=/dev/zero of=/dev/sda'",
+            "<<< 'dd if=/dev/zero of=/dev/sda' bash",
+            "bash 0<<<'dd if=/dev/zero of=/dev/sda'",
+        ],
+        Risk::Critical,
+    );
+    // Negative: a here-string fed to a non-shell is data.
+    assert_eq!(
+        line_risk("cat <<< \"dd if=/dev/zero of=/dev/sda\""),
+        Risk::Medium
+    );
 }
