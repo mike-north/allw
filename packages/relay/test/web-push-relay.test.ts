@@ -2,8 +2,9 @@
  * Integration tests for Web Push inside the relay (#235), through the real Worker + `AccountRelay`
  * Durable Object: subscription-endpoint validation at pairing (SSRF allowlist), and pruning a
  * device's token row when the push service reports the subscription gone (404/410), registration
- * budgets, per-subscription coalescing of wakeups from unauthenticated submits, and the fan-out
- * running off the response path, so a push failure or hang never fails or delays the submit.
+ * budgets, per-subscription coalescing of wakeups from unauthenticated submits (with one trailing
+ * wakeup once the window ends, #313), and the fan-out running off the response path, so a push
+ * failure or hang never fails or delays the submit.
  *
  * Background delivery is awaited through the DO's `pushFanOut` promise, never a fixed sleep, so a
  * "token kept" assertion runs only after every send and prune has finished.
@@ -19,8 +20,14 @@
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import type { SqlStorage } from "@cloudflare/workers-types";
-import type { AccountRelay } from "../src/index.js";
-import type { PushTransport, PushTransportRegistry } from "../src/push.js";
+import { AccountRelay, type Env } from "../src/index.js";
+import {
+  WEB_PUSH_COALESCE_MS,
+  WEB_PUSH_TRAILING_RETRY_MS,
+  WakeupCoalescer,
+  type PushTransport,
+  type PushTransportRegistry,
+} from "../src/push.js";
 import { WebPushTransport, type VapidConfig } from "../src/web-push.js";
 import { pairingStartBody, testAccount } from "./support/accounts.js";
 
@@ -594,5 +601,326 @@ describe("submit — Web Push wakeups are coalesced per subscription", () => {
     expect(second.data.push_wakeups).toBe(1);
     expect(apnsRequestIds).toEqual(["req-coalesce-apns-1", "req-coalesce-apns-2"]);
     expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Trailing wakeups (#313): a submit skipped by coalescing still gets a wakeup when the window ends
+// ---------------------------------------------------------------------------
+
+/** The relay internals these tests drive. The alarm and the coalescer are not reachable over HTTP. */
+type RelayInternals = {
+  sql: SqlStorage;
+  ctx: DurableObjectState;
+  webPushCoalescer: WakeupCoalescer;
+  pushTransports: PushTransportRegistry;
+  pushFanOut: Promise<void>;
+  alarm(): Promise<void>;
+};
+
+type TrailingRow = { device_id: string; token: string; due_at: number };
+
+function relayStub(accountId: string): DurableObjectStub {
+  return env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
+}
+
+async function readTrailingRows(accountId: string): Promise<TrailingRow[]> {
+  return runInDurableObject(relayStub(accountId), (instance: AccountRelay) => {
+    const relay = instance as unknown as RelayInternals;
+    return [
+      ...relay.sql.exec<TrailingRow>(
+        `SELECT device_id, token, due_at FROM webpush_trailing_wakeup ORDER BY token ASC`,
+      ),
+    ];
+  });
+}
+
+/** The `alarm_due` time of each relay alarm purpose, plus the alarm actually set. */
+async function readAlarmSchedule(
+  accountId: string,
+): Promise<{ purposes: Record<string, number>; alarm: number | null }> {
+  return runInDurableObject(relayStub(accountId), async (instance: AccountRelay) => {
+    const relay = instance as unknown as RelayInternals;
+    const purposes: Record<string, number> = {};
+    for (const row of relay.sql.exec<{ purpose: string; due_at: number }>(
+      `SELECT purpose, due_at FROM alarm_due`,
+    )) {
+      purposes[row.purpose] = row.due_at;
+    }
+    return { purposes, alarm: await relay.ctx.storage.getAlarm() };
+  });
+}
+
+/**
+ * Let the coalescing window end, then fire the alarm and wait for its fan-out.
+ *
+ * Time is not faked inside the Durable Object, so "the window ends" is modelled directly: every
+ * owed trailing wakeup (and its alarm purpose) becomes due now. Unless `keepClaims` is set, the
+ * coalescer also forgets its claims, which is its state once the window has passed.
+ */
+async function endWindowAndRunAlarm(
+  accountId: string,
+  options: { keepClaims?: boolean } = {},
+): Promise<void> {
+  await runInDurableObject(relayStub(accountId), async (instance: AccountRelay) => {
+    const relay = instance as unknown as RelayInternals;
+    makeTrailingWakeupsDue(relay);
+    if (options.keepClaims !== true) {
+      relay.webPushCoalescer = new WakeupCoalescer(WEB_PUSH_COALESCE_MS);
+    }
+    await relay.alarm();
+    await relay.pushFanOut;
+  });
+}
+
+function makeTrailingWakeupsDue(relay: RelayInternals): void {
+  relay.sql.exec(`UPDATE webpush_trailing_wakeup SET due_at = 1`);
+  relay.sql.exec(`UPDATE alarm_due SET due_at = 1 WHERE purpose = 'webpush-trailing-wakeup'`);
+}
+
+/** Submit one request (no caller auth) and return its `push_wakeups` count. */
+async function submitRequest(accountId: string, body: Record<string, unknown>): Promise<number> {
+  const submit = await post<{ push_wakeups: number }>(accountId, "/requests", body);
+  expect(submit.status).toBe(202);
+  return submit.data.push_wakeups;
+}
+
+function ttlOf(fetcher: ReturnType<typeof vi.fn<typeof fetch>>, call: number): string | null {
+  const [input, init] = fetcher.mock.calls[call] ?? [];
+  return new Request(String(input), init).headers.get("TTL");
+}
+
+describe("submit — a coalesced submit gets a trailing wakeup when the window ends (#313)", () => {
+  it("sends one more wakeup after the window to a subscription whose submit was coalesced", async () => {
+    // The bug: request 1's wakeup was delivered and the inbox fetched before request 2 existed,
+    // and request 2's own wakeup was coalesced away, so it was never pushed at all.
+    const acct = testAccount("acct-webpush-trailing-basic");
+    await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
+    const fetcher = await installWebPush(acct, () => 201);
+
+    const before = Date.now();
+    expect(await submitRequest(acct, envelope("req-trailing-basic-1"))).toBe(1);
+    await pushFanOutSettled(acct);
+    expect(await submitRequest(acct, envelope("req-trailing-basic-2"))).toBe(0);
+    await pushFanOutSettled(acct);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+
+    // The owed wakeup is due just past the window of the first claim, and the alarm is set for it.
+    const [row] = await readTrailingRows(acct);
+    expect(row?.token).toBe(FCM_ENDPOINT);
+    expect(row?.due_at).toBeGreaterThanOrEqual(before + WEB_PUSH_COALESCE_MS + 1);
+    expect(row?.due_at).toBeLessThanOrEqual(Date.now() + WEB_PUSH_COALESCE_MS + 1);
+    const scheduled = await readAlarmSchedule(acct);
+    expect(scheduled.purposes["webpush-trailing-wakeup"]).toBe(row?.due_at);
+
+    await endWindowAndRunAlarm(acct);
+
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(await readTrailingRows(acct)).toEqual([]);
+    expect((await readAlarmSchedule(acct)).purposes["webpush-trailing-wakeup"]).toBeUndefined();
+  });
+
+  it("owes one trailing wakeup per subscription however many submits were coalesced", async () => {
+    const acct = testAccount("acct-webpush-trailing-burst");
+    await pairWithPushTokens(acct, [
+      { transport: "webpush", token: FCM_ENDPOINT },
+      { transport: "webpush", token: MOZILLA_ENDPOINT },
+    ]);
+    const fetcher = await installWebPush(acct, () => 201);
+
+    const wakeups: number[] = [];
+    for (let n = 0; n < 6; n++) {
+      wakeups.push(await submitRequest(acct, envelope(`req-trailing-burst-${String(n)}`)));
+    }
+    await pushFanOutSettled(acct);
+    expect(wakeups).toEqual([2, 0, 0, 0, 0, 0]);
+    expect((await readTrailingRows(acct)).map((row) => row.token)).toEqual([
+      FCM_ENDPOINT,
+      MOZILLA_ENDPOINT,
+    ]);
+
+    await endWindowAndRunAlarm(acct);
+
+    // Two leading wakeups plus exactly one trailing wakeup per subscription.
+    expect(fetcher).toHaveBeenCalledTimes(4);
+    expect(await readTrailingRows(acct)).toEqual([]);
+  });
+
+  it("gives the trailing wakeup the TTL of the longest-lived pending request", async () => {
+    const acct = testAccount("acct-webpush-trailing-ttl");
+    await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
+    const fetcher = await installWebPush(acct, () => 201);
+
+    // A short-lived request is woken first; a long-lived one is coalesced behind it.
+    await submitRequest(acct, {
+      ...envelope("req-trailing-ttl-short"),
+      expires_at: Date.now() + 90_000,
+    });
+    await pushFanOutSettled(acct);
+    await submitRequest(acct, envelope("req-trailing-ttl-long"));
+    await endWindowAndRunAlarm(acct);
+
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    // 90 s rounds up to the 5-minute bucket; the 2100 deadline is the 28-day ceiling.
+    expect(ttlOf(fetcher, 0)).toBe(String(5 * 60));
+    expect(ttlOf(fetcher, 1)).toBe(String(28 * 24 * 60 * 60));
+  });
+
+  it("sends nothing when no request is still pending by the time the window ends", async () => {
+    const acct = testAccount("acct-webpush-trailing-none-pending");
+    await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
+    const fetcher = await installWebPush(acct, () => 201);
+
+    await submitRequest(acct, envelope("req-trailing-resolved-1"));
+    await pushFanOutSettled(acct);
+    await submitRequest(acct, envelope("req-trailing-resolved-2"));
+    await runInDurableObject(relayStub(acct), (instance: AccountRelay) => {
+      (instance as unknown as RelayInternals).sql.exec(
+        `UPDATE request SET status = 'resolved', terminal_at = ?`,
+        CREATED_AT,
+      );
+    });
+
+    await endWindowAndRunAlarm(acct);
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(await readTrailingRows(acct)).toEqual([]);
+    expect((await readAlarmSchedule(acct)).purposes["webpush-trailing-wakeup"]).toBeUndefined();
+  });
+
+  it("sends nothing to a subscription that was removed before the window ended", async () => {
+    const acct = testAccount("acct-webpush-trailing-removed");
+    await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
+    const fetcher = await installWebPush(acct, () => 201);
+
+    await submitRequest(acct, envelope("req-trailing-removed-1"));
+    await pushFanOutSettled(acct);
+    await submitRequest(acct, envelope("req-trailing-removed-2"));
+    await runInDurableObject(relayStub(acct), (instance: AccountRelay) => {
+      (instance as unknown as RelayInternals).sql.exec(`DELETE FROM device_push_token`);
+    });
+
+    await endWindowAndRunAlarm(acct);
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(await readTrailingRows(acct)).toEqual([]);
+  });
+
+  it("retries later, without sending, while the subscription is still blocked", async () => {
+    const acct = testAccount("acct-webpush-trailing-blocked");
+    await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
+    const fetcher = await installWebPush(acct, () => 201);
+
+    await submitRequest(acct, envelope("req-trailing-blocked-1"));
+    await pushFanOutSettled(acct);
+    await submitRequest(acct, envelope("req-trailing-blocked-2"));
+
+    // The alarm fires while the coalescer still holds the first claim (as if the alarm ran early):
+    // the per-window bound wins, and the owed wakeup moves to the next claimable time.
+    const fired = Date.now();
+    await endWindowAndRunAlarm(acct, { keepClaims: true });
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    const [row] = await readTrailingRows(acct);
+    expect(row?.due_at).toBeGreaterThanOrEqual(fired + WEB_PUSH_TRAILING_RETRY_MS);
+    expect((await readAlarmSchedule(acct)).purposes["webpush-trailing-wakeup"]).toBe(row?.due_at);
+  });
+
+  it("waits at least the retry interval while a wakeup is still in flight past its window", async () => {
+    // A fan-out can outlast the window (5 s per send, 4 at a time). The owed wakeup must not be
+    // re-armed for "now" while the claim is held, which would spin the alarm.
+    const acct = testAccount("acct-webpush-trailing-in-flight");
+    const { deviceId } = await pairWithPushTokens(acct, [
+      { transport: "webpush", token: FCM_ENDPOINT },
+    ]);
+    const fetcher = await installWebPush(acct, () => 201);
+    await submitRequest(acct, envelope("req-trailing-in-flight-1"));
+    await pushFanOutSettled(acct);
+    await submitRequest(acct, envelope("req-trailing-in-flight-2"));
+
+    const fired = Date.now();
+    await runInDurableObject(relayStub(acct), async (instance: AccountRelay) => {
+      const relay = instance as unknown as RelayInternals;
+      // Claimed long ago and never released: in flight, with its window long over.
+      const stuck = new WakeupCoalescer(WEB_PUSH_COALESCE_MS);
+      stuck.tryClaim(`${String(deviceId)}\0${FCM_ENDPOINT}`, 1);
+      relay.webPushCoalescer = stuck;
+      makeTrailingWakeupsDue(relay);
+      await relay.alarm();
+    });
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    const [row] = await readTrailingRows(acct);
+    expect(row?.due_at).toBeGreaterThanOrEqual(fired + WEB_PUSH_TRAILING_RETRY_MS);
+  });
+
+  it("clears the owed wakeup when a later submit claims a fresh one after the window", async () => {
+    const acct = testAccount("acct-webpush-trailing-superseded");
+    await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
+    const fetcher = await installWebPush(acct, () => 201);
+
+    await submitRequest(acct, envelope("req-trailing-superseded-1"));
+    await pushFanOutSettled(acct);
+    await submitRequest(acct, envelope("req-trailing-superseded-2"));
+    expect(await readTrailingRows(acct)).toHaveLength(1);
+
+    // The window passes and a third submit is woken directly: that wakeup is sent after request 2
+    // was stored, so it covers it and nothing more is owed.
+    await runInDurableObject(relayStub(acct), (instance: AccountRelay) => {
+      (instance as unknown as RelayInternals).webPushCoalescer = new WakeupCoalescer(
+        WEB_PUSH_COALESCE_MS,
+      );
+    });
+    expect(await submitRequest(acct, envelope("req-trailing-superseded-3"))).toBe(1);
+    await pushFanOutSettled(acct);
+    expect(await readTrailingRows(acct)).toEqual([]);
+
+    await endWindowAndRunAlarm(acct, { keepClaims: true });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("sends the owed wakeup from a fresh instance, after the object was evicted", async () => {
+    const acct = testAccount("acct-webpush-trailing-evicted");
+    await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
+    const fetcher = await installWebPush(acct, () => 201);
+
+    await submitRequest(acct, envelope("req-trailing-evicted-1"));
+    await pushFanOutSettled(acct);
+    await submitRequest(acct, envelope("req-trailing-evicted-2"));
+
+    // A new instance on the same storage: nothing in memory, only what SQLite kept.
+    await runInDurableObject(relayStub(acct), async (instance: AccountRelay, state) => {
+      const fresh = new AccountRelay(state, env as unknown as Env) as unknown as RelayInternals;
+      fresh.pushTransports = (instance as unknown as RelayInternals).pushTransports;
+      makeTrailingWakeupsDue(fresh);
+      await fresh.alarm();
+      await fresh.pushFanOut;
+    });
+
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(await readTrailingRows(acct)).toEqual([]);
+  });
+
+  it("shares the alarm with request expiry: the earlier wins and neither drops the other", async () => {
+    const acct = testAccount("acct-webpush-trailing-shared-alarm");
+    await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
+    await installWebPush(acct, () => 201);
+
+    const expiresAt = Date.now() + 10 * 60_000;
+    await submitRequest(acct, { ...envelope("req-trailing-shared-1"), expires_at: expiresAt });
+    await pushFanOutSettled(acct);
+    await submitRequest(acct, { ...envelope("req-trailing-shared-2"), expires_at: expiresAt });
+
+    const both = await readAlarmSchedule(acct);
+    const trailingDue = both.purposes["webpush-trailing-wakeup"];
+    expect(both.purposes["request-expiry"]).toBe(expiresAt);
+    expect(trailingDue).toBeLessThan(expiresAt);
+    expect(both.alarm).toBe(trailingDue);
+
+    await endWindowAndRunAlarm(acct);
+
+    const after = await readAlarmSchedule(acct);
+    expect(after.purposes).toEqual({ "request-expiry": expiresAt });
+    expect(after.alarm).toBe(expiresAt);
   });
 });
