@@ -139,11 +139,26 @@ The project is also a git repository, because `codex exec` exits outside one unl
 
 **One-time trust step.** Codex loads a project's `.codex/` config, hooks and rules only when the project is
 trusted. It runs a hook that isn't managed only after the hook is approved, and that approval is stored as a hash of
-the hook's config. `codex exec` can grant neither, and an untrusted hook is **silently skipped**, so the gate fails
-open ([Fail-Open Residual](#structural-residual-unchanged-inherent-to-pretooluse),
+the hook's config. A plain `codex exec` can grant neither, and an untrusted hook is **silently skipped**, so the gate
+fails open ([Fail-Open Residual](#structural-residual-unchanged-inherent-to-pretooluse),
 [#348](https://github.com/mike-north/allw/issues/348)). Before the cases, the operator runs the interactive `codex`
 once in the project, trusts the folder, approves the allw `PreToolUse` hook in the startup hook review, and quits.
 The helper prints this step.
+
+`codex exec --dangerously-bypass-hook-trust` is the one exception. Verified from codex-rs source at `openai/codex`
+main `ac558e2` (read, not run):
+
+- It runs every **enabled** hook without stored hook trust, for that one invocation. Disabled hooks stay off
+  (`codex-rs/hooks/src/engine/discovery.rs:917-923`).
+- It is a CLI flag, off by default (`codex-rs/utils/cli/src/shared_options.rs:61-64`). `codex exec` makes it
+  global (`codex-rs/exec/src/cli.rs:168`) and forwards it as a runtime override (`codex-rs/exec/src/lib.rs:618`).
+- It is not a `config.toml` key. The `Config` field is documented as runtime-only
+  (`codex-rs/core/src/config/mod.rs:1027-1030`).
+- It does not grant project trust. The config loader never reads it
+  (`codex-rs/config/src/loader/mod.rs:project_trust_context`).
+
+**The UAT does not use it.** It skips the exact check the trust step exists for, so a pass under it says nothing
+about whether the hook runs in a normal session. It also makes every enabled hook run unreviewed, not just allw's.
 
 The helper prints the exact `codex exec` commands for the operator to run in a second terminal,
 then runs `allw-approver watch` in the foreground. It never touches `~/.codex` global config
@@ -486,8 +501,10 @@ explicit, well-formed `deny` before Codex's pinned 480 second hook timeout:
   `/hooks`, or an enterprise `allow_managed_hooks_only = true` that skips user and project hooks.
   A hook that isn't managed runs only while its stored `trusted_hash` matches its current config. So an
   **edited** allw hook (a new command path, matcher or timeout) is dropped silently, just like a new one, until it is
-  re-approved. `codex exec` has no review step to grant trust, and a project's `.codex/hooks.json` also needs a
-  trusted project. Verified from codex-rs source at `openai/codex` main `ac558e2`:
+  re-approved. `codex exec` has no review step to grant trust. Only the explicit, off-by-default
+  `--dangerously-bypass-hook-trust` flag runs such a hook, and it skips trust for every enabled hook
+  ([Human-Run UAT Setup](#human-run-uat-setup)). A project's `.codex/hooks.json` also needs a trusted project, which that
+  flag does not grant. Verified from codex-rs source at `openai/codex` main `ac558e2`:
   `codex-rs/hooks/src/engine/discovery.rs:hook_trust_status`. Mitigation is tracked in
   [#348](https://github.com/mike-north/allw/issues/348).
 - The handler is misconfigured as `"async": true`. Background hooks "can't block, approve, rewrite,
@@ -537,7 +554,7 @@ runs inside it**, and deny it when you wouldn't approve that.
   - `codex-rs/core/src/hook_runtime.rs:hook_permission_mode` only ever sends two values:
     - `bypassPermissions` for `approval_policy = never`, which includes `--dangerously-bypass-approvals-and-sandbox`
       / `--yolo`, `-a never` and every `codex exec` run;
-    - `default` for everything else.
+    - `default` for everything else, including `granular` (`Granular(_)`, `OnRequest` and `UnlessTrusted`).
   - `acceptEdits`, `plan` and `dontAsk` are in the input schema but never sent.
   - So `--dangerously-bypass-approvals-and-sandbox` is not a hook residual. It removes Codex's own second gate, not
     allw's.
