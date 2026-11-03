@@ -21,6 +21,7 @@ import { mountAuditHistory } from "../dist/audit-history.js";
 import {
   CONTEXT_SUMMARY_LABEL,
   RAW_ARGV_DIVERGENCE_WARNING,
+  TOOL_COMMAND_FORM_WARNING,
   WebApproverController,
 } from "../dist/index.js";
 
@@ -554,6 +555,43 @@ test("mountAuditHistory shows the context summary and any raw/argv divergence (#
     assert.equal(warnings.length, 1, "only the divergent record carries the warning");
     assert.equal(warnings[0].textContent, RAW_ARGV_DIVERGENCE_WARNING);
     assert.equal(warnings[0].getAttribute("role"), "alert");
+  } finally {
+    globalThis.document = savedDoc;
+    globalThis.window = savedWin;
+  }
+});
+
+test("mountAuditHistory flags a tool call that also carries a command (#321)", async () => {
+  const toolEnv = envelope("req-tool");
+  const mixedEnv = envelope("req-tool-argv");
+  const tool = { server: "fs", tool: "read_file", raw: "read the hosts file" };
+  const fixtures = new Map([
+    [
+      toolEnv.id,
+      {
+        requestHash: "hash-tool",
+        context: context({ kind: "mcp", substrate: tool }),
+        resolvedDecision: "approved",
+      },
+    ],
+    [
+      mixedEnv.id,
+      {
+        requestHash: "hash-tool-argv",
+        context: context({ kind: "mcp", substrate: { ...tool, argv: ["rm", "-rf", "~"] } }),
+        resolvedDecision: "approved",
+      },
+    ],
+  ]);
+  const controller = await syncedController([toolEnv, mixedEnv], fixtures);
+  const { root, savedDoc, savedWin } = await mountInDom(controller);
+  try {
+    const alerts = root.querySelectorAll(".audit-tool-command-form");
+    assert.equal(alerts.length, 1, "only the tool call with a command form carries the alert");
+    assert.equal(alerts[0].textContent, TOOL_COMMAND_FORM_WARNING);
+    assert.equal(alerts[0].getAttribute("role"), "alert");
+    // A tool call's raw is its description, never a divergent raw.
+    assert.equal(root.querySelectorAll(".audit-raw-argv-divergence").length, 0);
   } finally {
     globalThis.document = savedDoc;
     globalThis.window = savedWin;

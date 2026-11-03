@@ -1,6 +1,7 @@
 import {
   CONTEXT_SUMMARY_LABEL,
   RAW_ARGV_DIVERGENCE_WARNING,
+  TOOL_COMMAND_FORM_WARNING,
   WebApproverController,
   type ApprovalDecision,
   type ApprovalEnvelope,
@@ -363,6 +364,13 @@ function card(
     divergence.className = "raw-argv-divergence-warning verification-warning";
     divergence.setAttribute("role", "alert");
     article.append(divergence);
+  }
+  if (detail.toolCommandForm) {
+    // The heading is the tool identity, so a hash-bound command the call also carries is flagged.
+    const commandForm = textElement("p", TOOL_COMMAND_FORM_WARNING);
+    commandForm.className = "tool-command-form-warning verification-warning";
+    commandForm.setAttribute("role", "alert");
+    article.append(commandForm);
   }
   if (detail.contextSummary !== undefined) {
     // Hash-bound, so shown — but labelled as the integrator's description and kept below the

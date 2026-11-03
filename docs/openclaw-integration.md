@@ -356,14 +356,14 @@ event only when the snapshot omits it, and a value present on **both** that disa
 two sources both carry, including `severity` (the sharpest case: a lower event severity must never
 silently suppress a higher, canonical snapshot severity and its number-match challenge).
 
-| `ActionRecord` field | Source                                                                     | Notes                                                                                   |
-| -------------------- | -------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| `surface`            | constant `"agent_tool_call"`                                               | New surface; see the decision below.                                                    |
-| `syntactic.server`   | pinned `pluginId` → else event `pluginId` → else `"openclaw"`              | The gating provider identity — the function-identity slot, shared with `mcp_tool_call`. |
-| `syntactic.tool`     | pinned `toolName` → else event `toolName` → else a slug of `title`         | Fail closed if neither yields a non-empty token.                                        |
-| `syntactic.params`   | **absent**                                                                 | OpenClaw exposes no structured parameters to a reviewer. Do not synthesize one.         |
-| `syntactic.raw`      | pinned `description`, plus pinned `detail` when present                    | The prose the plugin author wrote for the approver; display + fallback matching.        |
-| `risk`               | pinned `severity`: `info`→`low`, `warning`→`medium`, `critical`→`critical` | `severity` defaults to `warning` upstream when genuinely absent from both sources.      |
+| `ActionRecord` field | Source                                                                     | Notes                                                                                                                                                         |
+| -------------------- | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `surface`            | constant `"agent_tool_call"`                                               | New surface; see the decision below.                                                                                                                          |
+| `syntactic.server`   | pinned `pluginId` → else event `pluginId` → else `"openclaw"`              | The gating provider identity — the function-identity slot, shared with `mcp_tool_call`.                                                                       |
+| `syntactic.tool`     | pinned `toolName` → else event `toolName` → else a slug of `title`         | Fail closed if neither yields a non-empty token.                                                                                                              |
+| `syntactic.params`   | **absent**                                                                 | OpenClaw exposes no structured parameters to a reviewer. Do not synthesize one.                                                                               |
+| `syntactic.raw`      | pinned `description`, plus pinned `detail` when present                    | The prose the plugin author wrote for the approver; fallback matching. Approvers show it labelled as the description; the heading is `server :: tool` (#321). |
+| `risk`               | pinned `severity`: `info`→`low`, `warning`→`medium`, `critical`→`critical` | `severity` defaults to `warning` upstream when genuinely absent from both sources.                                                                            |
 
 **Decision: a new `agent_tool_call` surface, not `mcp_tool_call`.** `surface` is a permanent,
 relay-visible (`action_structure`), policy-matchable namespace — the single most expensive kind of

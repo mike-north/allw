@@ -3,12 +3,14 @@
  *
  * Runs the real `runWatch` loop with the real readline prompter (`createReadlinePrompter`, which
  * writes to `process.stdout`) and the default console logger, against a stub relay socket that
- * delivers one request carrying the ESC/CR line-erase spoof. The parent pipes a decision on stdin
- * and inspects this process's raw stdout/stderr bytes.
+ * delivers one request: by default the ESC/CR line-erase spoof, or the `ApprovalContext` in
+ * `<context-file>` when one is given (the tool-surface headline UAT, #321). The parent pipes a
+ * decision on stdin and inspects this process's raw stdout/stderr bytes.
  *
- * Usage: node watch-spoof-driver.mjs <scratch-dir>
+ * Usage: node watch-spoof-driver.mjs <scratch-dir> [<context-file>]
  */
 
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { createReadlinePrompter, loadWasm, runWatch } from "../../dist/index.js";
@@ -22,7 +24,9 @@ const EXPIRES_AT = 1700003600000;
 const NOW_MS = 1700001500000;
 
 const dir = process.argv[2];
-if (dir === undefined) throw new Error("usage: watch-spoof-driver.mjs <scratch-dir>");
+if (dir === undefined)
+  throw new Error("usage: watch-spoof-driver.mjs <scratch-dir> [<context-file>]");
+const contextFile = process.argv[3];
 
 const wasm = await loadWasm();
 const fresh = generateKeyfile(wasm);
@@ -43,7 +47,7 @@ const keyfile = {
 const keyfilePath = join(dir, "keyfile.json");
 writeKeyfile(keyfilePath, keyfile);
 
-const context = {
+const spoofContext = {
   action: {
     record_schema_version: 1,
     surface: "command",
@@ -62,6 +66,8 @@ const context = {
   reversible: false,
   constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
 };
+const context =
+  contextFile === undefined ? spoofContext : JSON.parse(readFileSync(contextFile, "utf8"));
 const envelope = {
   v: 1,
   id: REQUEST_ID,

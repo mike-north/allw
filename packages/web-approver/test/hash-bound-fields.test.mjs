@@ -22,7 +22,11 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { rawDivergesFromArgv, reconstructCommand } from "../dist/command-line.js";
-import { CONTEXT_SUMMARY_LABEL, RAW_ARGV_DIVERGENCE_WARNING } from "../dist/index.js";
+import {
+  CONTEXT_SUMMARY_LABEL,
+  RAW_ARGV_DIVERGENCE_WARNING,
+  TOOL_COMMAND_FORM_WARNING,
+} from "../dist/index.js";
 import { mountWith } from "./support/real-runtime.mjs";
 import { loadTestWasm } from "./wasm-helper.mjs";
 
@@ -136,14 +140,14 @@ test("agent_tool_call: the plugin id, tool, params and raw are on the card", asy
     }),
   ]);
   const card = onlyCard(root);
-  // The CLI's headline precedence: `raw` heads the card; the tool identity leads the plaintext.
-  assert.equal(card.querySelector("h3")?.textContent, "This plugin wants to deploy to production.");
+  // A tool call heads with its tool identity; the plugin's raw is its own description (#321).
+  assert.equal(card.querySelector("h3")?.textContent, "deploy-plugin :: deploy_service");
   assert.equal(
     plaintextOf(card),
     [
       "agent_tool_call: deploy-plugin :: deploy_service",
       'params: {\n  "env": "prod"\n}',
-      "raw: This plugin wants to deploy to production.",
+      "description: This plugin wants to deploy to production.",
     ].join("\n"),
   );
 });
@@ -324,12 +328,46 @@ test("the context summary is escaped, labelled, and not the card heading (#262)"
 });
 
 test("the card heading follows the CLI's precedence: shared CLI/web headline fixture", async () => {
-  // One fixture for both approvers (S1 of the #309 review): a record that mixes substrates heads
-  // with its command, never only the tool name.
+  // One fixture for both approvers: a record heads the same way on each, and a tool call heads
+  // with its tool identity while any command it carries is flagged (#321).
   const fixture = JSON.parse(readFileSync(join(here, "fixtures", "action-headline.json"), "utf8"));
-  assert.equal(fixture.cases.length, 12);
+  assert.equal(fixture.cases.length, 20);
+  const shown = new Map();
   for (const c of fixture.cases) {
     const card = onlyCard(await mountWith([context(c.surface, c.syntactic)]));
-    assert.equal(card.querySelector("h3")?.textContent, c.heading, c.name);
+    const heading = card.querySelector("h3")?.textContent;
+    assert.equal(heading, c.heading, c.name);
+    // On a tool surface the caller's raw is a labelled description, never the heading (#321).
+    const plaintext = plaintextOf(card);
+    shown.set(c.name, { heading, plaintext });
+    if (c.description !== undefined) {
+      assert.ok(plaintext.includes(`description: ${c.description}`), `${c.name}: description row`);
+      assert.ok(!plaintext.includes("raw: "), `${c.name}: raw is not labelled raw`);
+    } else {
+      assert.doesNotMatch(plaintext, /^description: /m, `${c.name}: no description row`);
+    }
+    const commandForm = card.querySelector(".tool-command-form-warning");
+    assert.equal(
+      commandForm !== null,
+      c.tool_command_form === true,
+      `${c.name}: command-form warning`,
+    );
+    if (commandForm !== null) {
+      assert.equal(commandForm.textContent, TOOL_COMMAND_FORM_WARNING);
+      assert.equal(commandForm.getAttribute("role"), "alert");
+      assert.equal(
+        card.querySelector(".raw-argv-divergence-warning"),
+        null,
+        `${c.name}: no divergence`,
+      );
+      assert.match(plaintext, /^(bin|argv): /m, `${c.name}: the command form is in the plaintext`);
+    }
+  }
+  // Two records that differ only in how a name splits into server and tool must not look alike.
+  for (const c of fixture.cases) {
+    if (c.distinct_from === undefined) continue;
+    assert.ok(shown.has(c.distinct_from), `${c.name}: names a real case`);
+    assert.notDeepEqual(shown.get(c.name), shown.get(c.distinct_from), `${c.name}: distinct`);
+    assert.notEqual(shown.get(c.name).heading, shown.get(c.distinct_from).heading, c.name);
   }
 });
