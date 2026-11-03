@@ -48,8 +48,8 @@ async function postJson(
 }
 
 /**
- * GET JSON with the same bounded relay failure behavior as pairing POSTs. Device-facing reads use
- * bearer authorization; callers decide whether an error aborts or downgrades their UI.
+ * GET JSON with the same bounded relay failure behavior as pairing POSTs. Callers pass any bearer
+ * authorization the route needs, and decide whether an error aborts or downgrades their UI.
  */
 async function getJson(
   url: string,
@@ -167,23 +167,25 @@ export async function pairingComplete(
 }
 
 /**
- * Fetch the latest root-signed account-state documents distributed by the relay. These are compact
- * JWS strings signed by the account root; the relay only caches and serves them, while the approver
- * core decides whether any document actually verifies and enrolls the actor key.
+ * The relay's account-state distribution set (`GET`/`POST /:acct/account-states`): compact
+ * root-signed `allw-account-state+jws` documents plus the relay's `max_sequence` bookkeeping.
+ *
+ * The relay stores only documents it verified against the account's bound root, and
+ * `maxSequence` is the highest *verified* sequence it holds (0 when none). Neither makes the relay
+ * a trust anchor: the approver core still verifies every document against the configured account
+ * root, and a `maxSequence` no verified document backs is treated as a misbehaving relay.
  */
 export interface AccountStateFetchResult {
   readonly accountStates: readonly string[];
   readonly maxSequence: number;
 }
 
-export async function fetchAccountStatesWithMetadata(
-  relayUrl: string,
-  accountId: string,
-  deviceAuthToken: string,
-  timeoutMs: number = PAIRING_TIMEOUT_MS,
-): Promise<AccountStateFetchResult> {
-  const url = `${normalizeBase(relayUrl)}/${encodeURIComponent(accountId)}/account-states`;
-  const result = await getJson(url, timeoutMs, { Authorization: `Bearer ${deviceAuthToken}` });
+function accountStatesUrl(relayUrl: string, accountId: string): string {
+  return `${normalizeBase(relayUrl)}/${encodeURIComponent(accountId)}/account-states`;
+}
+
+/** Validate an `{ account_states, max_sequence? }` relay response body (fail-closed on any drift). */
+function parseAccountStateSet(result: unknown): AccountStateFetchResult {
   if (
     typeof result !== "object" ||
     result === null ||
@@ -207,14 +209,52 @@ export async function fetchAccountStatesWithMetadata(
   };
 }
 
+/**
+ * Fetch the account's relay-verified account-state documents (`GET /:acct/account-states`). The
+ * route is unauthenticated — the documents are public and root-signed — so no device token is
+ * sent.
+ */
+export async function fetchAccountStatesWithMetadata(
+  relayUrl: string,
+  accountId: string,
+  timeoutMs: number = PAIRING_TIMEOUT_MS,
+): Promise<AccountStateFetchResult> {
+  return parseAccountStateSet(await getJson(accountStatesUrl(relayUrl, accountId), timeoutMs));
+}
+
+/** {@link fetchAccountStatesWithMetadata} without the relay's sequence bookkeeping. */
 export async function fetchAccountStates(
   relayUrl: string,
   accountId: string,
-  deviceAuthToken: string,
   timeoutMs: number = PAIRING_TIMEOUT_MS,
 ): Promise<readonly string[]> {
-  return (await fetchAccountStatesWithMetadata(relayUrl, accountId, deviceAuthToken, timeoutMs))
-    .accountStates;
+  return (await fetchAccountStatesWithMetadata(relayUrl, accountId, timeoutMs)).accountStates;
+}
+
+/**
+ * Publish root-signed account-state documents (`POST /:acct/account-states`) for distribution.
+ *
+ * Authority is the account root's signature, not a device token: the relay verifies every
+ * document against the root bound to `accountId` (bound by a root-signed `pairing/start`) and
+ * stores only the documents at the highest verified sequence. No `max_sequence` is asserted — the
+ * relay derives it from the verified documents.
+ *
+ * Throws (fail-closed) on any relay rejection: 403 when a document does not verify, 409 when no
+ * root is bound yet or the highest sequence is not above the one the relay already holds (an
+ * idempotent republish of the current document is a 409 too), 400 for a malformed request.
+ */
+export async function publishAccountStates(
+  relayUrl: string,
+  accountId: string,
+  accountStates: readonly string[],
+  timeoutMs: number = PAIRING_TIMEOUT_MS,
+): Promise<AccountStateFetchResult> {
+  const result = await postJson(
+    accountStatesUrl(relayUrl, accountId),
+    { account_states: accountStates },
+    timeoutMs,
+  );
+  return parseAccountStateSet(result);
 }
 
 /**
