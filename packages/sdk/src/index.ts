@@ -854,6 +854,8 @@ export function createClient(config: ClientConfig): Client {
         device_id: d.device_id,
         public_key_b64: d.pubkey,
       }));
+      // Throws (fail-closed, rethrown below) if any relay-listed device key is a small-order
+      // X25519 point: the core refuses the whole encryption and names the device (#248).
       contextCiphertext = wasm.encrypt_context(contextJson, JSON.stringify(recipients));
 
       // Build the relay-visible envelope (exactly the contract's key set) and submit it.

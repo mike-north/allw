@@ -1197,3 +1197,66 @@ test("(i''') a failed retract call is best-effort: the original deadline still g
   assert.equal(relay.state.retractCalls, 1, "the retract attempt was still made");
   assert.equal(relay.state.retracted, false, "the relay-side status was never actually flipped");
 });
+
+// ── Small-order recipient keys (#248) ─────────────────────────────────────────────────
+
+/** All-zero X25519 public key — the first entry of the core's small-order denylist. */
+const SMALL_ORDER_ZERO_KEY = Buffer.alloc(32, 0).toString("base64url");
+
+test("(d-low-order) a relay-listed small-order device key → rejects naming the device, nothing submitted (#248)", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const evil = {
+    device_id: "dev_small_order",
+    pubkey: SMALL_ORDER_ZERO_KEY,
+    label: null,
+    created_at: 0,
+  };
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver), evil],
+    behavior: { poll: () => null },
+  });
+
+  await assert.rejects(
+    () => pollClient(approver, relay).requestApproval(sampleRequest()),
+    /recipient device 'dev_small_order' has a small-order X25519 public key/,
+    "a small-order recipient key fails the whole request closed (the hook maps the throw to deny)",
+  );
+  assert.equal(relay.state.submitted, false, "no envelope reaches the relay");
+});
+
+test("(d-low-order') after a small-order refusal, the SDK's WASM instance still serves the next request (#248)", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const req = sampleRequest();
+  const evil = {
+    device_id: "dev_small_order",
+    pubkey: SMALL_ORDER_ZERO_KEY,
+    label: null,
+    created_at: 0,
+  };
+
+  const bad = makeRelayDouble({ devices: [evil], behavior: { poll: () => null } });
+  await assert.rejects(
+    () => pollClient(approver, bad).requestApproval(req),
+    /small-order X25519 public key/,
+  );
+
+  // A panic would have aborted the shared wasm instance; a Result error must leave it usable.
+  const good = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: {
+      poll: (env) => (env ? signVerdict(wasm, approver, req, env, { decision: "approved" }) : null),
+    },
+  });
+  const verdict = await pollClient(approver, good).requestApproval(req);
+  assert.equal(verdict.decision, "approved");
+  const plaintext = JSON.parse(
+    wasm.decrypt_context(
+      good.state.captured.context_ciphertext,
+      approver.deviceId,
+      approver.deviceX25519Seed,
+    ),
+  );
+  assert.equal(plaintext.summary, req.summary, "the follow-up ciphertext decrypts for the device");
+});
