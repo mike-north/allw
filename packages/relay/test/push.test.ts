@@ -18,7 +18,7 @@ import {
   buildPushWakeupPayload,
   diffPushTokenSet,
   dispatchPushWakeups,
-  isPushServiceRejection,
+  isClientErrorStatus,
   parseWebPushCoalesceKey,
   webPushCoalesceKey,
   type Fetcher,
@@ -308,7 +308,7 @@ describe("push-service rejections are logged for operators (#326)", () => {
     }
   });
 
-  it.each([200, 202, 404, 410, 500, 503, 301])(
+  it.each([200, 202, 500, 503, 301])(
     "does not log an APNs or FCM response with HTTP %i as a rejection",
     async (status) => {
       expect(
@@ -322,10 +322,183 @@ describe("push-service rejections are logged for operators (#326)", () => {
     },
   );
 
-  it("classifies only a 4xx other than 404/410 as a rejection", () => {
-    expect([400, 401, 403, 413, 429, 499].every(isPushServiceRejection)).toBe(true);
-    expect([200, 201, 301, 399, 404, 410, 500, 503].some(isPushServiceRejection)).toBe(false);
+  it("classifies exactly the 4xx statuses as client errors", () => {
+    expect([400, 401, 403, 404, 410, 429, 499].every((s) => isClientErrorStatus(s))).toBe(true);
+    expect([200, 201, 301, 399, 500, 503].some((s) => isClientErrorStatus(s))).toBe(false);
   });
+});
+
+/**
+ * @see https://developer.apple.com/documentation/usernotifications/handling-notification-responses-from-apns
+ * @see https://firebase.google.com/docs/reference/fcm/rest/v1/ErrorCode
+ */
+describe("APNs and FCM prune only on an unregistered answer (#260)", () => {
+  const APNS_TOKEN = "e".repeat(64);
+  /** FCM HTTP v1's error body for a registration token that is no longer valid. */
+  const FCM_UNREGISTERED = {
+    error: {
+      code: 404,
+      message: "Requested entity was not found.",
+      status: "NOT_FOUND",
+      details: [
+        {
+          "@type": "type.googleapis.com/google.firebase.fcm.v1.FcmError",
+          errorCode: "UNREGISTERED",
+        },
+      ],
+    },
+  };
+
+  function apns(response: () => Response): ApnsPushTransport {
+    return new ApnsPushTransport({
+      endpoint: "https://api.push.apple.test",
+      topic: "com.example.allw",
+      bearerToken: "apns-bearer",
+      fetcher: async () => response(),
+    });
+  }
+
+  function fcm(response: () => Response): FcmPushTransport {
+    return new FcmPushTransport({
+      endpoint: "https://fcm.googleapis.test/v1/projects/allw/messages:send",
+      bearerToken: "fcm-bearer",
+      fetcher: async () => response(),
+    });
+  }
+
+  /** Send one wakeup; the error it failed with (or null) and the push-rejection warnings logged. */
+  async function outcome(
+    transport: PushTransport,
+    token: string,
+  ): Promise<{ failure: unknown; warnings: string[] }> {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const failure = await transport
+        .sendWakeup({
+          accountId: "acct",
+          deviceId: "dev",
+          requestId: "req",
+          expiresAt: EXPIRES_AT,
+          token,
+        })
+        .then(
+          () => null,
+          (error: unknown) => error,
+        );
+      return {
+        failure,
+        warnings: warn.mock.calls
+          .map((call) => String(call[0]))
+          .filter((message) => message.startsWith("push:")),
+      };
+    } finally {
+      warn.mockRestore();
+    }
+  }
+
+  it("prunes an APNs token answered 410 (Unregistered), without logging a rejection", async () => {
+    const { failure, warnings } = await outcome(
+      apns(() => new Response(JSON.stringify({ reason: "Unregistered" }), { status: 410 })),
+      APNS_TOKEN,
+    );
+
+    expect(failure).toBeInstanceOf(UndeliverablePushTokenError);
+    expect(warnings).toEqual([]);
+  });
+
+  it("keeps an APNs token answered 400 BadDeviceToken, which a wrong APNs environment also causes", async () => {
+    const { failure, warnings } = await outcome(
+      apns(() => new Response(JSON.stringify({ reason: "BadDeviceToken" }), { status: 400 })),
+      APNS_TOKEN,
+    );
+
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(UndeliverablePushTokenError);
+    expect(warnings).toEqual([
+      "push: apns push service api.push.apple.test rejected a wakeup with HTTP 400; token kept",
+    ]);
+  });
+
+  it.each([403, 404, 429, 500, 503])("keeps an APNs token answered %i", async (status) => {
+    const { failure } = await outcome(
+      apns(() => new Response(null, { status })),
+      APNS_TOKEN,
+    );
+
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(UndeliverablePushTokenError);
+  });
+
+  it("logs an APNs 404 (a wrong request path) as a rejection, since it does not prune", async () => {
+    const { warnings } = await outcome(
+      apns(() => new Response(null, { status: 404 })),
+      APNS_TOKEN,
+    );
+
+    expect(warnings).toEqual([
+      "push: apns push service api.push.apple.test rejected a wakeup with HTTP 404; token kept",
+    ]);
+  });
+
+  it("releases every APNs response body unread", async () => {
+    for (const status of [200, 400, 410, 500]) {
+      const cancelled = vi.fn();
+      await outcome(
+        apns(() => new Response(new ReadableStream({ cancel: cancelled }), { status })),
+        APNS_TOKEN,
+      );
+      expect(cancelled).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("prunes an FCM token answered 404 with UNREGISTERED, without logging a rejection", async () => {
+    const { failure, warnings } = await outcome(
+      fcm(() => new Response(JSON.stringify(FCM_UNREGISTERED), { status: 404 })),
+      "fcm-token",
+    );
+
+    expect(failure).toBeInstanceOf(UndeliverablePushTokenError);
+    expect(warnings).toEqual([]);
+  });
+
+  it.each([
+    ["no body", null],
+    ["a non-JSON body", "Not Found"],
+    [
+      "another error code",
+      JSON.stringify({ error: { details: [{ errorCode: "SENDER_ID_MISMATCH" }] } }),
+    ],
+    ["UNREGISTERED outside error.details", JSON.stringify({ errorCode: "UNREGISTERED" })],
+    // Cut off at the read limit, the prefix does not parse: no information, so no prune.
+    [
+      "UNREGISTERED past the read limit",
+      JSON.stringify({ padding: " ".repeat(8192), ...FCM_UNREGISTERED }),
+    ],
+  ])("keeps an FCM token answered 404 with %s, and logs it", async (_name, body) => {
+    const { failure, warnings } = await outcome(
+      fcm(() => new Response(body, { status: 404 })),
+      "fcm-token",
+    );
+
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(UndeliverablePushTokenError);
+    expect(warnings).toEqual([
+      "push: fcm push service fcm.googleapis.test rejected a wakeup with HTTP 404; token kept",
+    ]);
+  });
+
+  it.each([400, 403, 429, 500, 503])(
+    "keeps an FCM token answered %i, even with an UNREGISTERED body",
+    async (status) => {
+      const { failure } = await outcome(
+        fcm(() => new Response(JSON.stringify(FCM_UNREGISTERED), { status })),
+        "fcm-token",
+      );
+
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure).not.toBeInstanceOf(UndeliverablePushTokenError);
+    },
+  );
 });
 
 describe("WakeupCoalescer — at most one wakeup per subscription per window", () => {

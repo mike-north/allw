@@ -420,6 +420,16 @@ the submit response is the number of wakeups **scheduled** (tokens with a config
 the 32-token account budget, newest registrations first, minus coalesced Web Push wakeups), not the
 number delivered.
 
+**Pruning, APNs and FCM.** A token is deleted only when its push service says it is no longer valid:
+**APNs 410** (`Unregistered`: the app was uninstalled or the token rotated), and **FCM 404 whose
+body carries the `UNREGISTERED` error code** (`error.details[].errorCode`; read from at most 4 KiB
+of the body, then released). Every other answer keeps the token (#260). In particular APNs `400
+BadDeviceToken` never prunes: APNs also returns it for a token sent to the wrong APNs environment
+(sandbox or production), so a misconfigured `APNS_ENDPOINT` would otherwise unregister every device.
+A bare FCM 404, one with another error code, or one whose body cannot be read is likewise kept. Any
+4xx that does not prune is logged once (`console.warn`) with the transport, the push-service host
+and the status, never the token (#326). 5xx, 429 and timeouts are transient and not logged.
+
 **Web Push** (RFC 8030, browser approvers):
 
 - **Token format.** The `webpush` token is the `PushSubscription.endpoint` URL. It must be `https:`,
