@@ -29,6 +29,13 @@
 //! tampered, expired, replayed, …) is a `throw`, not a falsy return — matching the fail-closed
 //! invariant (`docs/contract.md` §Invariants #6) at the language boundary.
 //!
+//! Messages are diagnostics only; **never classify a failure by its message.** Untrusted input
+//! (e.g. a relay-delivered verdict) is echoed into parse errors, so any substring can be forged.
+//! The one failure a caller may act on, a *verified* non-approval from `verify_verdict` /
+//! `verify_verdict_with_account_states`, is reported structurally: the thrown `Error` carries own
+//! properties `kind: "not_approved"` and `decision` (`"denied"` | `"expired"` | `"aborted"`), the
+//! decision taken from the **signed claims**. No other error carries `kind`.
+//!
 //! # `expires_at` / `now_ms` are `f64`
 //!
 //! JS numbers are IEEE-754 doubles, so the millisecond timestamps cross the boundary as `f64` and
@@ -51,6 +58,7 @@ use allw_core::{
     evaluate_for_actor as core_evaluate_for_actor,
     is_small_order_x25519_public_key as core_is_small_order_x25519_public_key,
     issue_device_cert as core_issue_device_cert, revoked_device_ids as core_revoked_device_ids,
+    seal_context_for_account_state as core_seal_context_for_account_state,
     select_recipients as core_select_recipients, sign_account_state as core_sign_account_state,
     sign_actor_attestation as core_sign_actor_attestation,
     sign_pairing_start_authorization as core_sign_pairing_start_authorization,
@@ -69,7 +77,7 @@ use allw_core::{
     verify_verdict_with_account_states_for_account as core_verify_verdict_with_account_states_for_account,
     AccountState, ActionRecord, Actor, ApprovalContext, ApprovalRequest, Approver, CommandContext,
     ContextRecipient, Decision, PolicyRule, PolicyRuleScope, PublicKey, SigningKeyPair,
-    UnsignedPolicyRule, UnsignedVerdict, Verdict, X25519KeyPair, X25519PublicKey,
+    UnsignedPolicyRule, UnsignedVerdict, Verdict, VerifyError, X25519KeyPair, X25519PublicKey,
     X25519_SMALL_ORDER_POINTS,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -296,6 +304,47 @@ pub fn decrypt_context(
 
 // ── verify_verdict ───────────────────────────────────────────────────────────────────
 
+/// The `kind` a structured verify error carries when the verdict is authenticated, bound and fresh
+/// but the human did not approve (core [`VerifyError::NotApproved`]).
+const NOT_APPROVED_KIND: &str = "not_approved";
+
+/// The wire string of a **non-approving** decision, or `None` for `Approved`. The structured
+/// not-approved error can therefore never report `approved`, even if the core misreported one.
+fn non_approval_wire(decision: Decision) -> Option<&'static str> {
+    match decision {
+        Decision::Approved => None,
+        Decision::Denied => Some("denied"),
+        Decision::Expired => Some("expired"),
+        Decision::Aborted => Some("aborted"),
+    }
+}
+
+/// Maps a core verification failure to the value `verify_verdict*` throws.
+///
+/// [`VerifyError::NotApproved`] becomes a JS `Error` with own properties
+/// `kind: "not_approved"` and `decision` (the signed non-approving decision from the claims). Every
+/// other failure is a plain `Error` with no `kind`, which callers must treat as unverifiable. The
+/// message (`"{function} failed: {error}"`) is diagnostic text and is never a classification
+/// channel: untrusted input is echoed into some messages, so a substring can be forged.
+fn verify_failure(function: &str, error: VerifyError) -> JsValue {
+    let message = format!("{function} failed: {error}");
+    let signed_non_approval = match error {
+        VerifyError::NotApproved { decision } => non_approval_wire(decision),
+        _ => None,
+    };
+    match signed_non_approval {
+        Some(decision) => {
+            let thrown = js_sys::Error::new(&message);
+            // Setting an own property on a fresh `Error` cannot fail; if it ever did, the error
+            // would lack `kind` and callers would fail closed to an unverifiable denial.
+            let _ = js_sys::Reflect::set(&thrown, &"kind".into(), &NOT_APPROVED_KIND.into());
+            let _ = js_sys::Reflect::set(&thrown, &"decision".into(), &decision.into());
+            thrown.into()
+        }
+        None => JsError::new(&message).into(),
+    }
+}
+
 /// The successful result of [`verify_verdict`] — an *authenticated, bound, fresh, approved*
 /// decision. Serialized to JSON for the JS caller.
 ///
@@ -334,9 +383,11 @@ struct VerifyResult {
 /// Throws on **any** verification failure (fail-closed): a verified denial/expiry/abort, a bad
 /// signature, a broken WYSIWYS binding, an expired/out-of-window decision, an optional
 /// `expected_account_id` mismatch, etc. The thrown message is the core
-/// [`VerifyError`](allw_core::VerifyError) `Display`, so callers can distinguish a verified "no"
-/// from a forgery by inspecting the message. Also throws if any input JSON is invalid, the root key
-/// is not a 32-byte base64url value, or `now_ms` is out of range.
+/// [`VerifyError`](allw_core::VerifyError) `Display`, for diagnostics only. A verified "no" is
+/// distinguished from a forgery **only** by the structured error (see [`verify_failure`]): an
+/// `Error` with `kind: "not_approved"` and the signed `decision`. Also throws (unclassified) if any
+/// input JSON is invalid, the root key is not a 32-byte base64url value, or `now_ms` is out of
+/// range.
 #[wasm_bindgen]
 pub fn verify_verdict(
     verdict_json: &str,
@@ -345,7 +396,7 @@ pub fn verify_verdict(
     approver_root_pubkey_b64: &str,
     now_ms: f64,
     expected_account_id: Option<String>,
-) -> Result<String, JsError> {
+) -> Result<String, JsValue> {
     let verdict: Verdict = parse_json(verdict_json, "Verdict")?;
     let request: ApprovalRequest = parse_json(request_json, "ApprovalRequest")?;
     let context: ApprovalContext = parse_json(context_json, "ApprovalContext")?;
@@ -377,7 +428,7 @@ pub fn verify_verdict(
             now_ms,
         ),
     }
-    .map_err(|e| JsError::new(&format!("verify_verdict failed: {e}")))?;
+    .map_err(|e| verify_failure("verify_verdict", e))?;
 
     to_json(
         &VerifyResult {
@@ -389,6 +440,7 @@ pub fn verify_verdict(
         },
         "VerifyResult",
     )
+    .map_err(JsValue::from)
 }
 
 /// Verifies a [`Verdict`](allw_core::Verdict) exactly like [`verify_verdict`], but additionally
@@ -413,7 +465,7 @@ pub fn verify_verdict_with_account_states(
     now_ms: f64,
     account_states_json: &str,
     expected_account_id: Option<String>,
-) -> Result<String, JsError> {
+) -> Result<String, JsValue> {
     let verdict: Verdict = parse_json(verdict_json, "Verdict")?;
     let request: ApprovalRequest = parse_json(request_json, "ApprovalRequest")?;
     let context: ApprovalContext = parse_json(context_json, "ApprovalContext")?;
@@ -449,7 +501,7 @@ pub fn verify_verdict_with_account_states(
             &account_state_refs,
         ),
     }
-    .map_err(|e| JsError::new(&format!("verify_verdict_with_account_states failed: {e}")))?;
+    .map_err(|e| verify_failure("verify_verdict_with_account_states", e))?;
 
     to_json(
         &VerifyResult {
@@ -461,6 +513,7 @@ pub fn verify_verdict_with_account_states(
         },
         "VerifyResult",
     )
+    .map_err(JsValue::from)
 }
 
 // ── sign_verdict ──────────────────────────────────────────────────────────────────────
@@ -751,6 +804,81 @@ pub fn select_recipients(
         .collect();
     to_json(&wire, "selected recipients")
 }
+
+// ── seal_context_for_account_state ───────────────────────────────────────────────────
+
+/// The JSON shape [`seal_context_for_account_state`] returns.
+#[derive(Serialize)]
+struct WasmSealedContext<'a> {
+    ciphertext: &'a str,
+    sequence: u64,
+}
+
+/// Encrypts an [`ApprovalContext`](allw_core::ApprovalContext) to exactly the devices root-signed
+/// account state selects (core
+/// [`seal_context_for_account_state`](allw_core::seal_context_for_account_state)), returning JSON
+/// `{ "ciphertext": string, "sequence": number }`.
+///
+/// The selected recipient keys never cross into JavaScript: the only way to get a ciphertext here
+/// is through the core's selection rules ([`select_recipients`]). `sequence` is the highest
+/// verified account-state sequence the recipients came from; a caller that persists a floor records
+/// it before sending the ciphertext. Randomness comes from the platform CSPRNG, as for
+/// [`encrypt_context`].
+///
+/// # Errors
+///
+/// Throws, with nothing encrypted, on any [`select_recipients`] error (same inputs, same rules), a
+/// malformed `context_json`, or a selected sequence above JS safe-integer range (it could not be
+/// persisted exactly as a floor).
+#[wasm_bindgen]
+pub fn seal_context_for_account_state(
+    context_json: &str,
+    account_states_json: &str,
+    expected_account_id: &str,
+    account_root_pubkey_b64: &str,
+    now_ms: f64,
+    min_sequence: Option<f64>,
+) -> Result<String, JsError> {
+    let context: ApprovalContext = parse_json(context_json, "ApprovalContext")?;
+    let root = parse_account_root_pubkey(account_root_pubkey_b64)?;
+    let now_ms = ms_to_i64(now_ms, "now_ms")?;
+    if now_ms < 0 {
+        return Err(JsError::new(&format!(
+            "now_ms must be a non-negative Unix millisecond timestamp, got {now_ms}"
+        )));
+    }
+    let min_sequence = sequence_floor_from_f64(min_sequence)?;
+    let account_states = parse_account_states_json(account_states_json)?;
+    let account_state_refs: Vec<&str> = account_states.iter().map(String::as_str).collect();
+
+    let sealed = core_seal_context_for_account_state(
+        &context,
+        &account_state_refs,
+        expected_account_id,
+        &root,
+        now_ms,
+        min_sequence,
+        &mut OsRng,
+    )
+    .map_err(|e| JsError::new(&format!("seal_context_for_account_state failed: {e}")))?;
+    // The floor round-trips through a JS number; refuse a sequence it cannot hold exactly.
+    if sealed.sequence > JS_MAX_SAFE_SEQUENCE {
+        return Err(JsError::new(&format!(
+            "selected account-state sequence {} exceeds JS safe-integer range (2^53-1)",
+            sealed.sequence
+        )));
+    }
+    to_json(
+        &WasmSealedContext {
+            ciphertext: &sealed.ciphertext,
+            sequence: sealed.sequence,
+        },
+        "sealed context",
+    )
+}
+
+/// `Number.MAX_SAFE_INTEGER` as a `u64`: the largest sequence a JS caller can persist exactly.
+const JS_MAX_SAFE_SEQUENCE: u64 = (1 << 53) - 1;
 
 // ── self-certifying account id + pairing-start authorization ────────────────────────
 

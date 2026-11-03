@@ -20,6 +20,9 @@ workspace = true
 # JSON in, calls the core, and serializes JSON out. wasm-bindgen lives ONLY here, never in core.
 allw-core = { path = "../allw-core" }
 wasm-bindgen = "0.2"
+# Only to build the structured `not_approved` verify error (a JS `Error` with `kind`/`decision`
+# own properties); no other JS API is used.
+js-sys = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
