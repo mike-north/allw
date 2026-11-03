@@ -309,6 +309,10 @@ never decrypts anything. A wakeup is payload-less, so the worker fetches
 few). When the inbox is already empty (another device answered, the request expired, or the relay
 coalesced several submits into one wakeup) it says "An approval request was handled or expired."
 When the inbox can't be read, it says "Open allw approvals to check for approval requests."
+Every notification uses one fixed tag (`allw-approvals`) with `renotify`, so repeated wakeups
+replace a single notification, which alerts again, instead of stacking. The collapsing has to happen
+here: Apple's push service rejects the Web Push `Topic` header, so the relay can't collapse wakeups
+for iOS and Safari.
 Tapping a notification focuses an open approver window or opens the app; deciding and number-match
 still happen only in the full UI, behind the pairing gate.
 
