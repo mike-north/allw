@@ -2202,3 +2202,72 @@ test("verify_pairing_start_authorization accepts the vector and rejects misuse",
     /does not derive/,
   );
 });
+
+// ── Recipient selection from root-signed account state (#243) ───────────────────────
+// @see crates/allw-core/src/recipients.rs (the selection rules)
+// @see docs/enrollment.md §Model (registry vs. signed account state)
+
+test("select_recipients reproduces the Rust recipient vector", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  const selected = JSON.parse(
+    wasm.select_recipients(
+      v.recipient_account_states_json,
+      v.expected_account_id_for_root,
+      v.approver_root_pubkey_b64,
+    ),
+  );
+  assert.deepEqual(selected, JSON.parse(v.expected_recipients_json));
+  // Spec (rules in recipients.rs): only dev-a and dev-d survive — the stale sequence-1 dev-old,
+  // the revoked dev-b, the non-active dev-c and the sibling-conflicted dev-e are all excluded.
+  assert.deepEqual(
+    selected.map((r) => r.device_id),
+    ["dev-a", "dev-d"],
+  );
+});
+
+test("select_recipients throws — never returns [] — when no recipient set is allowed", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  // No account state at all.
+  assert.throws(
+    () => wasm.select_recipients("[]", v.expected_account_id_for_root, v.approver_root_pubkey_b64),
+    /no account-state document/,
+  );
+  // State for a different account id than the caller expects.
+  assert.throws(
+    () =>
+      wasm.select_recipients(
+        v.recipient_account_states_json,
+        "acc_wasm_vector_01",
+        v.approver_root_pubkey_b64,
+      ),
+    /account_id does not match/,
+  );
+  // State checked against a root that did not sign it.
+  const otherRoot = wasm.ed25519_public_key(Buffer.alloc(32, 0x33).toString("base64url"));
+  assert.throws(
+    () =>
+      wasm.select_recipients(
+        v.recipient_account_states_json,
+        v.expected_account_id_for_root,
+        otherRoot,
+      ),
+    /did not verify/,
+  );
+  // Malformed inputs.
+  assert.throws(
+    () =>
+      wasm.select_recipients(
+        "not json",
+        v.expected_account_id_for_root,
+        v.approver_root_pubkey_b64,
+      ),
+    /account state JWS array/,
+  );
+  assert.throws(
+    () =>
+      wasm.select_recipients(v.recipient_account_states_json, v.expected_account_id_for_root, "x"),
+    /account_root_pubkey_b64/,
+  );
+});

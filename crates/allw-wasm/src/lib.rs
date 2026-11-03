@@ -48,7 +48,8 @@ use allw_core::{
     derive_number_match_challenge as core_derive_number_match_challenge,
     encrypt_context as core_encrypt_context, evaluate as core_evaluate,
     evaluate_for_actor as core_evaluate_for_actor, issue_device_cert as core_issue_device_cert,
-    revoked_device_ids as core_revoked_device_ids, sign_account_state as core_sign_account_state,
+    revoked_device_ids as core_revoked_device_ids, select_recipients as core_select_recipients,
+    sign_account_state as core_sign_account_state,
     sign_actor_attestation as core_sign_actor_attestation,
     sign_pairing_start_authorization as core_sign_pairing_start_authorization,
     sign_policy_rule as core_sign_policy_rule, sign_verdict as core_sign_verdict,
@@ -663,6 +664,54 @@ pub fn revoked_device_ids(
     // Sort for a deterministic wire result (a `HashSet` has no defined iteration order).
     ids.sort_unstable();
     to_json(&ids, "revoked device ids")
+}
+
+/// One recipient chosen by [`select_recipients`]: the device id and its X25519 encryption public
+/// key (base64url-unpadded, 32 bytes), as the account root signed them in account state.
+#[derive(Serialize)]
+struct WasmSelectedRecipient<'a> {
+    device_id: &'a str,
+    encryption_pubkey: String,
+}
+
+/// Selects the devices an `ApprovalContext` may be encrypted to from root-signed account state
+/// (core [`select_recipients`](allw_core::select_recipients)), returned as a JSON array of
+/// `{ "device_id": string, "encryption_pubkey": string }` sorted by `device_id`.
+///
+/// `account_states_json` is a JSON array of compact `allw-account-state+jws` documents. Only the
+/// highest-sequence documents count; recipients are their `active`, unrevoked devices, narrowed to
+/// the devices every same-sequence sibling agrees on.
+///
+/// # Errors
+///
+/// Throws — never returns an empty array — when `account_root_pubkey_b64` is not a valid Ed25519
+/// key, the array is malformed or empty, any document fails verification, no recipient remains,
+/// or more than `MAX_RECIPIENTS` (16) remain.
+#[wasm_bindgen]
+pub fn select_recipients(
+    account_states_json: &str,
+    expected_account_id: &str,
+    account_root_pubkey_b64: &str,
+) -> Result<String, JsError> {
+    let root_bytes = decode_b64_32(account_root_pubkey_b64, "account_root_pubkey_b64")?;
+    let root = PublicKey::from_bytes(&root_bytes).map_err(|e| {
+        JsError::new(&format!(
+            "account_root_pubkey_b64 is not a valid Ed25519 key: {e}"
+        ))
+    })?;
+    let account_states = parse_account_states_json(account_states_json)?;
+    let account_state_refs: Vec<&str> = account_states.iter().map(String::as_str).collect();
+
+    let recipients = core_select_recipients(&account_state_refs, expected_account_id, &root)
+        .map_err(|e| JsError::new(&format!("select_recipients failed: {e}")))?;
+    let wire: Vec<WasmSelectedRecipient<'_>> = recipients
+        .iter()
+        .map(|r| WasmSelectedRecipient {
+            device_id: &r.device_id,
+            encryption_pubkey: URL_SAFE_NO_PAD.encode(r.encryption_pubkey),
+        })
+        .collect();
+    to_json(&wire, "selected recipients")
 }
 
 // ── self-certifying account id + pairing-start authorization ────────────────────────
