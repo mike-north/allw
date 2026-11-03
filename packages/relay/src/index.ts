@@ -54,15 +54,27 @@ import {
 import {
   ApnsPushTransport,
   FcmPushTransport,
-  NoopPushTransport,
-  WebPushStubTransport,
+  MAX_PUSH_TOKENS_PER_ACCOUNT,
+  MAX_PUSH_TOKENS_PER_REGISTRATION,
+  MAX_PUSH_TOKENS_PER_TRANSPORT,
+  WEB_PUSH_COALESCE_MS,
+  WakeupCoalescer,
   dispatchPushWakeups,
   isPushTransportKind,
+  schedulablePushTokens,
   type PushTransportRegistry,
   type PushTransportKind,
+  type StoredPushToken,
 } from "./push.js";
+import {
+  WebPushTransport,
+  parseWebPushEndpoint,
+  vapidConfigFromEnv,
+  type VapidEnv,
+} from "./web-push.js";
+import { handleWellKnown, isWellKnownPath } from "./well-known.js";
 
-export interface Env {
+export interface Env extends VapidEnv {
   readonly ACCOUNT: DurableObjectNamespace;
   readonly APNS_ENDPOINT?: string;
   readonly APNS_TOPIC?: string;
@@ -85,6 +97,8 @@ export interface Env {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    // Relay-level routes live under `/.well-known/` and are dispatched before account routing.
+    if (isWellKnownPath(url.pathname)) return handleWellKnown(request, env);
     // Route by account id → its Durable Object.
     const accountId = url.pathname.split("/")[1] ?? "";
     if (!accountId) return new Response("missing account", { status: 400 });
@@ -379,22 +393,36 @@ function optionalPushTokens(body: Record<string, unknown>): IncomingPushToken[] 
   const raw = body.push_tokens;
   if (raw === undefined) return [];
   if (!Array.isArray(raw)) return null;
+  // Budget (push.ts): every stored token costs an outbound request per submit. Reject, never truncate.
+  if (raw.length > MAX_PUSH_TOKENS_PER_REGISTRATION) return null;
   const tokens: IncomingPushToken[] = [];
   const seenTokens = new Set<string>();
   for (const item of raw) {
     if (!isPlainObject(item)) return null;
     const transport = item.transport;
-    const token = item.token;
+    const rawToken = item.token;
     if (typeof transport !== "string" || !isPushTransportKind(transport)) return null;
-    if (typeof token !== "string" || token.length < 1 || token.length > 4096) return null;
+    if (typeof rawToken !== "string" || rawToken.length < 1 || rawToken.length > 4096) return null;
+    let token = rawToken;
     if (transport === "apns" && !/^[0-9a-fA-F]{64}$/.test(token)) return null;
     if (transport === "fcm" && !/^[A-Za-z0-9:_-]{1,4096}$/.test(token)) return null;
+    if (transport === "webpush") {
+      // SECURITY (SSRF): a webpush token is the subscription endpoint the relay will POST to.
+      // Store the normalized href, so one subscription spelled two ways is one row.
+      const endpoint = parseWebPushEndpoint(token);
+      if (!endpoint || endpoint.href.length > 4096) return null;
+      token = endpoint.href;
+    }
     // Duplicate registrations are idempotent for one device; collapse them before DB mutation so
     // a repeated token cannot half-complete pairing by tripping the push-token primary key.
     const tokenKey = `${transport}\0${token}`;
     if (seenTokens.has(tokenKey)) continue;
     seenTokens.add(tokenKey);
     tokens.push({ transport, token });
+  }
+  for (const transport of new Set(tokens.map((t) => t.transport))) {
+    const count = tokens.filter((t) => t.transport === transport).length;
+    if (count > MAX_PUSH_TOKENS_PER_TRANSPORT) return null;
   }
   return tokens;
 }
@@ -460,6 +488,9 @@ const deviceTag = (deviceId: string): string => `device:${deviceId}`;
 const surfaceTag = (surfaceId: string): string => `surface:${surfaceId}`;
 const integratorTag = (requestId: string): string => `integrator:${requestId}`;
 
+/** Canonical UUID text form (RFC 9562 §4): 8-4-4-4-12 hex digits, either case. */
+const REQUEST_ID_PATTERN = /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/;
+
 // The exact, exhaustive set of ApprovalRequest envelope keys the relay accepts (contract.md
 // §Messages). Anything else is rejected at submit time to keep plaintext out of the relay.
 const ENVELOPE_KEYS = ["v", "id", "created_at", "expires_at", "approver", "context_ciphertext"];
@@ -508,15 +539,24 @@ export class AccountRelay implements DurableObject {
   /** Request horizon: `expires_at - now` above this is refused at submit (#248). */
   private readonly maxRequestTtlMs: number;
   /**
-   * Clock for the submit limits and the expiry alarm/sweep. Tests replace it on the instance (via
+   * Clock for the submit limits, push-wakeup scheduling and Web Push TTL, and the expiry
+   * alarm/sweep. Tests replace it on the instance (via
    * `runInDurableObject`) to probe exact boundaries; production always reads the real time.
    */
   private now: () => number = () => Date.now();
+  /** Spaces Web Push wakeups per subscription (`WEB_PUSH_COALESCE_MS`); see `schedulePushWakeups`. */
+  private readonly webPushCoalescer = new WakeupCoalescer(WEB_PUSH_COALESCE_MS);
+  /**
+   * Settles once every push fan-out started so far has finished, pruning included. Never rejects.
+   * Only tests read it (to assert on the outcome of background delivery without sleeping).
+   */
+  private pushFanOut: Promise<void> = Promise.resolve();
 
   constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
     this.sql = ctx.storage.sql;
-    this.pushTransports = buildPushTransports(env);
+    // The Web Push TTL is derived from the same injectable clock as the submit limits.
+    this.pushTransports = buildPushTransports(env, () => this.now());
     this.maxRequestTtlMs = parseMaxRequestTtlMs(env.MAX_REQUEST_TTL_MS);
     this.initSchema();
     // On reactivation, restore the alarm from persisted pending rows in case the previous
@@ -962,9 +1002,9 @@ export class AccountRelay implements DurableObject {
    * - 403: no account root is bound (a pairing code on an unbound account predates root binding,
    *        so it was never root-authorized), or the pairing auth token is wrong
    * - 404: code not found
-   * - 409: code already used
+   * - 409: code already used, or the account's push-token budget is full (code not consumed)
    * - 410: code expired
-   * - 400: invalid pubkey (not base64url or not 32 bytes)
+   * - 400: invalid pubkey (not base64url or not 32 bytes), or invalid / over-budget push_tokens
    */
   private async handlePairingComplete(request: Request): Promise<Response> {
     // Every pairing row this relay issues is created together with (or after) the root bind, so a
@@ -1014,6 +1054,9 @@ export class AccountRelay implements DurableObject {
     const deviceAuthToken = generateAuthToken();
     const deviceAuthTokenHash = await hashAuthToken(deviceAuthToken);
     const now = Date.now();
+    // Checked after the last await so the count and the inserts below are one atomic step.
+    const pushTokenBudget = this.pushTokenBudgetFailure(pushTokens.length);
+    if (pushTokenBudget) return pushTokenBudget;
 
     // Mark the code as used and insert the device record atomically.
     // SECURITY: only the public key (pubkey) is stored — no private key ever touches this table.
@@ -1390,7 +1433,8 @@ export class AccountRelay implements DurableObject {
    * Stores the request and fans the ciphertext out to every online device. If no device is
    * connected it stays queued and is delivered on the next `…/connect` (see handleDeviceConnect).
    * - 404: the account has no bound root (`unknown account`): no device can have paired.
-   * - 400: not exactly the contract's envelope fields, already expired, or `expires_at - now`
+   * - 400: not exactly the contract's envelope fields, an `id` that is not a canonical UUID,
+   *        already expired, or `expires_at - now`
    *        beyond the request horizon (`maxRequestTtlMs`, default 15 min).
    * - 409: a request with this `id` was already submitted.
    * - 413: the body exceeds `MAX_REQUEST_BODY_BYTES` (checked before parsing) or
@@ -1423,6 +1467,11 @@ export class AccountRelay implements DurableObject {
 
     const id = requiredString(envelope, "id");
     if (!id) return json({ error: "'id' is required (string)" }, 400);
+    // Canonical UUID syntax only (contract §Transport: UUIDv4+). Bounds the id's size — it is a
+    // primary key, a WebSocket tag and part of every retained row — and its character set.
+    if (!REQUEST_ID_PATTERN.test(id)) {
+      return json({ error: "'id' must be a canonical UUID (8-4-4-4-12 hex)" }, 400);
+    }
     if (requiredNumber(envelope, "v") === null) {
       return json({ error: "'v' is required (number)" }, 400);
     }
@@ -1494,7 +1543,7 @@ export class AccountRelay implements DurableObject {
     await this.armExpiryAlarm();
 
     const delivered = this.sendRequestToOneSocketPerSurface(id, envelope);
-    const pushWakeups = await this.sendPushWakeups(accountId, id);
+    const pushWakeups = this.schedulePushWakeups(accountId, id, expiresAt);
 
     return this.requestSubmitResponse(id, delivered, pushWakeups, requestAuthToken);
   }
@@ -1554,18 +1603,87 @@ export class AccountRelay implements DurableObject {
     );
   }
 
-  /** Send request-id-only push wakeups to every registered device push token. */
-  private async sendPushWakeups(accountId: string, requestId: string): Promise<number> {
-    const tokens = [
-      ...this.sql.exec<DevicePushTokenRow>(
-        `SELECT device_id, transport, token, created_at FROM device_push_token ORDER BY created_at ASC`,
-      ),
-    ];
-    return dispatchPushWakeups(tokens, {
-      accountId,
-      requestId,
-      transports: this.pushTransports,
+  /**
+   * Schedule request-id-at-most push wakeups (Web Push sends no payload at all) to registered device
+   * push tokens, and return how many were scheduled. Only tokens whose transport is configured are
+   * scheduled, newest registrations first, up to the account budget. A Web Push wakeup to a
+   * subscription that has one in flight or was woken within `WEB_PUSH_COALESCE_MS` is skipped: submit
+   * needs no caller auth, so this is what bounds push volume per subscription. The check-and-claim
+   * runs synchronously here, before any `await`, so concurrent submits cannot both claim.
+   *
+   * The fan-out runs **off the response path** under `waitUntil`, so a slow or hung push service can
+   * never delay or fail the submit.
+   */
+  private schedulePushWakeups(accountId: string, requestId: string, expiresAt: number): number {
+    const now = this.now();
+    const claimedWebPushKeys: string[] = [];
+    const tokens = schedulablePushTokens(
+      [
+        ...this.sql.exec<DevicePushTokenRow>(
+          `SELECT device_id, transport, token, created_at FROM device_push_token
+           ORDER BY created_at DESC LIMIT ?`,
+          MAX_PUSH_TOKENS_PER_ACCOUNT,
+        ),
+      ],
+      this.pushTransports,
+    ).filter((token) => {
+      if (token.transport !== "webpush") return true;
+      const key = `${token.device_id}\0${token.token}`;
+      if (!this.webPushCoalescer.tryClaim(key, now)) return false;
+      claimedWebPushKeys.push(key);
+      return true;
     });
+    if (tokens.length > 0) {
+      const fanOut = this.deliverPushWakeups(tokens, accountId, requestId, expiresAt).finally(
+        () => {
+          for (const key of claimedWebPushKeys) this.webPushCoalescer.release(key);
+        },
+      );
+      this.pushFanOut = Promise.all([this.pushFanOut, fanOut]).then(() => undefined);
+      this.ctx.waitUntil(fanOut);
+    }
+    return tokens.length;
+  }
+
+  /**
+   * Run one fan-out, then prune the tokens a transport reported permanently undeliverable. Never
+   * rejects: push is best-effort, and devices still receive requests via WebSocket or polling.
+   */
+  private async deliverPushWakeups(
+    tokens: readonly StoredPushToken[],
+    accountId: string,
+    requestId: string,
+    expiresAt: number,
+  ): Promise<void> {
+    try {
+      const { undeliverableTokens } = await dispatchPushWakeups(tokens, {
+        accountId,
+        requestId,
+        expiresAt,
+        transports: this.pushTransports,
+      });
+      for (const gone of undeliverableTokens) {
+        this.sql.exec(
+          `DELETE FROM device_push_token WHERE device_id = ? AND transport = ? AND token = ?`,
+          gone.device_id,
+          gone.transport,
+          gone.token,
+        );
+      }
+    } catch (error) {
+      console.warn("push fan-out bookkeeping failed", error);
+    }
+  }
+
+  /**
+   * Enforce the per-account push-token budget for registering `adding` more tokens: a 409 (the
+   * account is full; nothing is stored) or `null` when they fit.
+   */
+  private pushTokenBudgetFailure(adding: number): Response | null {
+    if (adding === 0) return null;
+    const row = [...this.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM device_push_token`)][0];
+    if ((row?.n ?? 0) + adding <= MAX_PUSH_TOKENS_PER_ACCOUNT) return null;
+    return json({ error: "account push-token limit reached" }, 409);
   }
 
   /**
@@ -2051,12 +2169,14 @@ export class AccountRelay implements DurableObject {
   }
 }
 
-function buildPushTransports(env: Env): PushTransportRegistry {
-  const transports: PushTransportRegistry = {
-    apns: new NoopPushTransport("apns"),
-    fcm: new NoopPushTransport("fcm"),
-    webpush: new WebPushStubTransport(),
-  };
+/**
+ * The push transports this deployment can deliver through: a kind is registered only when its
+ * credentials are configured. Tokens for an unregistered kind stay stored (a later configuration
+ * picks them up) but are neither sent nor counted in `push_wakeups`; devices then rely on WebSocket
+ * presence and polling.
+ */
+function buildPushTransports(env: Env, now: () => number): PushTransportRegistry {
+  const transports: PushTransportRegistry = {};
   if (env.APNS_ENDPOINT && env.APNS_TOPIC && env.APNS_BEARER_TOKEN) {
     transports.apns = new ApnsPushTransport({
       endpoint: env.APNS_ENDPOINT,
@@ -2070,5 +2190,7 @@ function buildPushTransports(env: Env): PushTransportRegistry {
       bearerToken: env.FCM_BEARER_TOKEN,
     });
   }
+  const vapid = vapidConfigFromEnv(env);
+  if (vapid) transports.webpush = new WebPushTransport({ vapid, now });
   return transports;
 }

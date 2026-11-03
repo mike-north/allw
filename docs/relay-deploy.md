@@ -75,11 +75,11 @@ the repository.
 ### 3a. Mandatory secrets
 
 None are mandatory for a working relay. The relay degrades gracefully when push credentials are
-absent: it falls back to `NoopPushTransport` for every transport, so devices receive requests via
-WebSocket presence and polling rather than push wakeups. This is confirmed in
-`packages/relay/src/index.ts` at `buildPushTransports` (line 1602): all three transports default to
-`NoopPushTransport`/`WebPushStubTransport`, and only switch to live transports when all required
-env vars for that transport are present.
+absent: a transport without credentials is simply not registered, so its tokens stay stored but are
+never sent (nor counted in a submit's `push_wakeups`), and devices receive requests via WebSocket
+presence and polling rather than push wakeups. This is confirmed in `packages/relay/src/index.ts` at
+`buildPushTransports`: each transport is registered only when all of its required env vars are
+present (for Web Push, a well-formed VAPID keypair and subject).
 
 ### 3b. Optional: Apple Push Notification service (APNs)
 
@@ -119,6 +119,44 @@ node_modules/.bin/wrangler secret put FCM_BEARER_TOKEN --env production
 # Paste the token when prompted.
 ```
 
+### 3d. Optional: Web Push (VAPID) — browser approver wakeups
+
+Required only if you want the web approver to be woken by a push notification when no tab is open.
+The relay authenticates to browser push services with a VAPID keypair (P-256, RFC 8292). The private
+key is a secret; the public key and the contact subject are not.
+
+**[OPERATOR]**
+
+```sh
+# Generate a VAPID keypair (Node 20+, no dependencies). Prints both halves as base64url.
+node -e '
+const { subtle } = globalThis.crypto;
+const b64 = (b) => Buffer.from(b).toString("base64url");
+subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign"]).then(async (k) => {
+  console.log("VAPID_PUBLIC_KEY=" + b64(await subtle.exportKey("raw", k.publicKey)));
+  console.log("VAPID_PRIVATE_KEY=" + (await subtle.exportKey("jwk", k.privateKey)).d);
+});'
+
+# The public key and subject are plain vars. Add them to wrangler.jsonc under env.production:
+#   "vars": { "VAPID_PUBLIC_KEY": "<the printed public key>",
+#             "VAPID_SUBJECT": "mailto:ops@yourcompany.example" }
+# VAPID_SUBJECT is the operator contact push services may use; it must be mailto: or https:.
+
+node_modules/.bin/wrangler secret put VAPID_PRIVATE_KEY --env production
+# Paste the printed private key when prompted. Then discard the local copy.
+```
+
+Verify after deploy: `curl https://<relay>/.well-known/allw/vapid-public-key` returns
+`{"vapid_public_key":"<your public key>"}`. A 404 means one of the three values is missing or
+malformed, or the public and private keys are not one keypair (the relay checks by signing and
+verifying once).
+
+**Rotating the keypair invalidates every existing browser subscription**: browsers must re-subscribe
+with the new public key. The relay does **not** prune the old endpoints: a push service rejects them
+with an auth error (401/403), which the relay deliberately treats as transient, so a misconfigured
+relay can never unregister every device. Stale endpoints stay registered until the device
+re-registers its push tokens (#236).
+
 ### Secrets inventory summary
 
 | Secret / var         | Required | Description                                                                                                                                                                                                                       |
@@ -128,10 +166,15 @@ node_modules/.bin/wrangler secret put FCM_BEARER_TOKEN --env production
 | `APNS_BEARER_TOKEN`  | Optional | APNs token-auth JWT (set via `wrangler secret put`). Short-lived; rotate hourly.                                                                                                                                                  |
 | `FCM_ENDPOINT`       | Optional | FCM HTTP v1 send URL (plain var in `wrangler.jsonc`).                                                                                                                                                                             |
 | `FCM_BEARER_TOKEN`   | Optional | FCM OAuth 2.0 access token for a service account (set via `wrangler secret put`).                                                                                                                                                 |
+| `VAPID_PUBLIC_KEY`   | Optional | Web Push VAPID public key, base64url uncompressed P-256 point (plain var in `wrangler.jsonc`). Served at `GET /.well-known/allw/vapid-public-key`.                                                                                |
+| `VAPID_PRIVATE_KEY`  | Optional | Web Push VAPID private key, base64url 32-byte scalar (set via `wrangler secret put`). Long-lived; rotating it invalidates subscriptions.                                                                                          |
+| `VAPID_SUBJECT`      | Optional | Web Push operator contact, `mailto:` or `https:` URI (plain var in `wrangler.jsonc`).                                                                                                                                             |
 | `MAX_REQUEST_TTL_MS` | Optional | Request horizon in ms (plain var). Default `900000` (15 min). A submit whose `expires_at` is further out gets 400. Must stay above the hooks' 420 s timeout, or hook requests fail closed. Invalid values are logged and ignored. |
 
 No other secrets are required. The relay derives all per-account auth tokens internally and stores
-only SHA-256 hashes in the Durable Object SQLite database — it holds no static signing key.
+only SHA-256 hashes in the Durable Object SQLite database. Its only static signing key is the
+optional VAPID key, a push-provider transport credential (like the APNs bearer) that never signs
+anything in the approval contract.
 
 ---
 
@@ -150,7 +193,9 @@ Three bindings are declared under `"ratelimits"` in `packages/relay/wrangler.jso
 | `RATE_LIMIT_REQUESTS` | `POST /{acct}/requests`                                          | account + client IP | 60 per 60 s  |
 
 The per-client binding is checked first, so minting fresh account ids does not buy a client new
-budget. Tune `simple.limit` (and `period`, which must be `10` or `60`) per environment; keep the
+budget. That per-IP budget is shared by every client behind one address (a corporate NAT, a CGNAT
+pool, an IPv6 /64), so a busy office can exhaust it; raise `RATE_LIMIT_CLIENT`'s `limit` for such
+deployments. Tune `simple.limit` (and `period`, which must be `10` or `60`) per environment; keep the
 binding names. Each `namespace_id` must be unique within your Cloudflare account. **If a binding is
 missing the routes it covers fail closed with 503**, so a deploy that drops the block takes pairing
 and submission offline rather than running unlimited.
@@ -163,7 +208,7 @@ damping. What the other limits bound (`docs/relay-api.md` §3 Integrator endpoin
 - **Stored bytes** are bounded by submit rate × the 7-day retention × a small per-row residue: the
   request horizon (`MAX_REQUEST_TTL_MS`, above) ends every request within 15 minutes, and every
   terminal transition (expired, retracted, resolved) blanks the stored envelope, so a retained row
-  keeps only its id, timestamps, status, token hash and (if resolved) the signed verdict.
+  keeps only its id (a UUID), timestamps, status, token hash and (if resolved) the signed verdict.
 
 ---
 
@@ -253,7 +298,7 @@ KEYFILE="/tmp/allw-smoke-$(date +%s).json"
 
 # Use a throwaway keyfile so the smoke test gets a fresh account root (and so a fresh account id,
 # which is derived from the root).
-npx allw-approver pair \
+npx --no-install allw-approver pair \
   --relay "$RELAY_URL" \
   --keyfile "$KEYFILE" \
   --label "smoke-test-device"
@@ -262,7 +307,7 @@ npx allw-approver pair \
 Copy the printed account id and account-root public key, then start watching:
 
 ```sh
-npx allw-approver watch --keyfile "$KEYFILE"
+npx --no-install allw-approver watch --keyfile "$KEYFILE"
 ```
 
 In a third terminal, wire the hook and run a test request. Set the env vars printed during pairing:
@@ -273,7 +318,7 @@ export ALLW_ACCOUNT_ID="<ACCOUNT_ID_FROM_PAIR_OUTPUT>"
 export ALLW_APPROVER_ROOT_KEY="<ROOT_KEY_FROM_PAIR_OUTPUT>"
 
 # Trigger a request (simulating the Claude Code hook):
-npx allw-hook <<'EOF'
+npx --no-install allw-hook <<'EOF'
 {"tool_name":"Bash","tool_input":{"command":"echo smoke-test"}}
 EOF
 ```

@@ -40,8 +40,8 @@ deliberate moat over web / Electron / push-only competitors.
         └───────────────┘
 
    Relay (Cloudflare Workers + Durable Objects): zero-knowledge routing + pairing + push fan-out.
-   Push transport: APNs (token-based HTTP/2) + FCM, with Web Push stubbed behind the same interface —
-   wakeup + request id only; never context.
+   Push transport: APNs (token-based HTTP/2) + FCM + Web Push (VAPID, payload-less) behind one interface —
+   wakeup + request id at most (Web Push: no payload at all); never context.
    Device key storage: Secure Enclave / Android StrongBox (mobile, biometric-gated signing); Keychain /
    DPAPI / libsecret (desktop — reuse vaultkeeper's backend abstraction). Signing keys never leave hardware.
 ```

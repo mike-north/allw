@@ -40,7 +40,7 @@
   // Deploy with:  wrangler deploy --env production
   //
   // Replace every REPLACE_ME value before deploying. Secrets (APNS_BEARER_TOKEN,
-  // FCM_BEARER_TOKEN) must be set via `wrangler secret put` — never committed here.
+  // FCM_BEARER_TOKEN, VAPID_PRIVATE_KEY) must be set via `wrangler secret put` — never committed here.
   // See docs/relay-deploy.md for the complete runbook.
   // ---------------------------------------------------------------------------
   "env": {
@@ -106,11 +106,15 @@
       //                    Set here as a var because it changes per environment, not per secret.
       //   APNS_TOPIC     — your app's bundle id, e.g. "com.example.myapp".
       //                    Safe to commit; it is public in your provisioning profile.
+      //   VAPID_PUBLIC_KEY — Web Push VAPID public key (base64url P-256 point). Public by design;
+      //                    served at GET /.well-known/allw/vapid-public-key.
+      //   VAPID_SUBJECT  — Web Push operator contact, e.g. "mailto:ops@example.com".
       //
       // Secrets (set via `wrangler secret put --env production`; never committed):
       //   APNS_BEARER_TOKEN  — APNs token-auth JWT signed with your .p8 key.
       //   FCM_BEARER_TOKEN   — FCM HTTP v1 OAuth 2.0 access token (or a long-lived service-account key).
       //   FCM_ENDPOINT       — FCM HTTP v1 send endpoint (includes your project id).
+      //   VAPID_PRIVATE_KEY  — Web Push VAPID private key (base64url 32-byte P-256 scalar).
       //
       // See docs/relay-deploy.md §Secrets for the full inventory and setup commands.
     },

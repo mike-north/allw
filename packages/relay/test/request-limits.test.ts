@@ -44,7 +44,7 @@ import {
   readBodyCapped,
   type RateLimiter,
 } from "../src/limits.js";
-import { pairingStartBody, testAccount } from "./support/accounts.js";
+import { pairingStartBody, testAccount, testRequestId as rid } from "./support/accounts.js";
 import { bindAccountRoot, pinRelayClock } from "./support/relay-state.js";
 
 // ---------------------------------------------------------------------------
@@ -194,7 +194,7 @@ describe("POST /requests body size", () => {
 
   it("accepts a body of exactly MAX_REQUEST_BODY_BYTES", async () => {
     const acct = await freshAccount("body-at");
-    const body = paddedBody("req-body-at", MAX_REQUEST_BODY_BYTES);
+    const body = paddedBody(rid("req-body-at"), MAX_REQUEST_BODY_BYTES);
     expect(new TextEncoder().encode(body).byteLength).toBe(MAX_REQUEST_BODY_BYTES);
     const resp = await submitRaw(acct, body);
     expect(resp.status).toBe(202);
@@ -202,7 +202,10 @@ describe("POST /requests body size", () => {
 
   it("413 for a body one byte over MAX_REQUEST_BODY_BYTES, and stores nothing", async () => {
     const acct = await freshAccount("body-over");
-    const resp = await submitRaw(acct, paddedBody("req-body-over", MAX_REQUEST_BODY_BYTES + 1));
+    const resp = await submitRaw(
+      acct,
+      paddedBody(rid("req-body-over"), MAX_REQUEST_BODY_BYTES + 1),
+    );
     expect(resp.status).toBe(413);
     expect(await requestStatuses(acct)).toEqual({});
   });
@@ -304,7 +307,7 @@ describe("POST /requests context_ciphertext size", () => {
     const acct = await freshAccount("ct-at");
     const result = await submit(
       acct,
-      envelope("req-ct-at", { context_ciphertext: "A".repeat(MAX_CONTEXT_CIPHERTEXT_BYTES) }),
+      envelope(rid("req-ct-at"), { context_ciphertext: "A".repeat(MAX_CONTEXT_CIPHERTEXT_BYTES) }),
     );
     expect(result.status).toBe(202);
   });
@@ -313,7 +316,9 @@ describe("POST /requests context_ciphertext size", () => {
     const acct = await freshAccount("ct-over");
     const result = await submit(
       acct,
-      envelope("req-ct-over", { context_ciphertext: "A".repeat(MAX_CONTEXT_CIPHERTEXT_BYTES + 1) }),
+      envelope(rid("req-ct-over"), {
+        context_ciphertext: "A".repeat(MAX_CONTEXT_CIPHERTEXT_BYTES + 1),
+      }),
     );
     expect(result.status).toBe(413);
     expect(result.error).toMatch(/context_ciphertext/);
@@ -325,7 +330,10 @@ describe("POST /requests context_ciphertext size", () => {
     // MAX - 1 ASCII chars + one 2-byte char: MAX characters, MAX + 1 bytes.
     const ciphertext = "A".repeat(MAX_CONTEXT_CIPHERTEXT_BYTES - 1) + "é";
     expect(ciphertext.length).toBe(MAX_CONTEXT_CIPHERTEXT_BYTES);
-    const result = await submit(acct, envelope("req-ct-utf8", { context_ciphertext: ciphertext }));
+    const result = await submit(
+      acct,
+      envelope(rid("req-ct-utf8"), { context_ciphertext: ciphertext }),
+    );
     expect(result.status).toBe(413);
   });
 });
@@ -344,7 +352,7 @@ describe("POST /requests expires_at horizon", () => {
     const acct = await freshAccount("ttl-at");
     const result = await submit(
       acct,
-      envelope("req-ttl-at", { expires_at: NOW + DEFAULT_MAX_REQUEST_TTL_MS }),
+      envelope(rid("req-ttl-at"), { expires_at: NOW + DEFAULT_MAX_REQUEST_TTL_MS }),
     );
     expect(result.status).toBe(202);
   });
@@ -353,7 +361,7 @@ describe("POST /requests expires_at horizon", () => {
     const acct = await freshAccount("ttl-over");
     const result = await submit(
       acct,
-      envelope("req-ttl-over", { expires_at: NOW + DEFAULT_MAX_REQUEST_TTL_MS + 1 }),
+      envelope(rid("req-ttl-over"), { expires_at: NOW + DEFAULT_MAX_REQUEST_TTL_MS + 1 }),
     );
     expect(result.status).toBe(400);
     expect(result.error).toMatch(/expires_at/);
@@ -364,17 +372,19 @@ describe("POST /requests expires_at horizon", () => {
     const acct = await freshAccount("ttl-hook");
     const result = await submit(
       acct,
-      envelope("req-ttl-hook", { expires_at: NOW + HOOK_MAX_TIMEOUT_MS }),
+      envelope(rid("req-ttl-hook"), { expires_at: NOW + HOOK_MAX_TIMEOUT_MS }),
     );
     expect(result.status).toBe(202);
   });
 
   it("still refuses expires_at equal to now (already expired) and accepts now + 1", async () => {
     const acct = await freshAccount("ttl-now");
-    expect((await submit(acct, envelope("req-ttl-now", { expires_at: NOW }))).status).toBe(400);
-    expect((await submit(acct, envelope("req-ttl-now1", { expires_at: NOW + 1 }))).status).toBe(
-      202,
+    expect((await submit(acct, envelope(rid("req-ttl-now"), { expires_at: NOW }))).status).toBe(
+      400,
     );
+    expect(
+      (await submit(acct, envelope(rid("req-ttl-now1"), { expires_at: NOW + 1 }))).status,
+    ).toBe(202);
   });
 
   it("honors a configured horizon at its boundary and one past it", async () => {
@@ -384,10 +394,11 @@ describe("POST /requests expires_at horizon", () => {
       (instance as unknown as { maxRequestTtlMs: number }).maxRequestTtlMs = configured;
     });
     expect(
-      (await submit(acct, envelope("req-cfg-at", { expires_at: NOW + configured }))).status,
+      (await submit(acct, envelope(rid("req-cfg-at"), { expires_at: NOW + configured }))).status,
     ).toBe(202);
     expect(
-      (await submit(acct, envelope("req-cfg-over", { expires_at: NOW + configured + 1 }))).status,
+      (await submit(acct, envelope(rid("req-cfg-over"), { expires_at: NOW + configured + 1 })))
+        .status,
     ).toBe(400);
   });
 
@@ -433,11 +444,11 @@ describe("POST /requests per-account pending cap", () => {
     const acct = await freshAccount("cap");
     await seedRequests(acct, livePending("seed", MAX_PENDING_REQUESTS_PER_ACCOUNT - 1));
 
-    expect((await submit(acct, envelope("req-cap-last"))).status).toBe(202);
-    const over = await submit(acct, envelope("req-cap-over"));
+    expect((await submit(acct, envelope(rid("req-cap-last")))).status).toBe(202);
+    const over = await submit(acct, envelope(rid("req-cap-over")));
     expect(over.status).toBe(429);
     expect(over.error).toMatch(/pending/);
-    expect((await requestStatuses(acct))["req-cap-over"]).toBeUndefined();
+    expect((await requestStatuses(acct))[rid("req-cap-over")]).toBeUndefined();
   });
 
   it("does not count expired, resolved, retracted, past-deadline or over-horizon rows", async () => {
@@ -474,8 +485,8 @@ describe("POST /requests per-account pending cap", () => {
       ...livePending("live", cap - 1),
     ]);
 
-    expect((await submit(acct, envelope("req-cap-excluded-ok"))).status).toBe(202);
-    expect((await submit(acct, envelope("req-cap-excluded-over"))).status).toBe(429);
+    expect((await submit(acct, envelope(rid("req-cap-excluded-ok")))).status).toBe(202);
+    expect((await submit(acct, envelope(rid("req-cap-excluded-over")))).status).toBe(429);
   });
 
   it("a pre-horizon row one millisecond younger than the horizon still counts", async () => {
@@ -490,7 +501,7 @@ describe("POST /requests per-account pending cap", () => {
         terminal_at: null,
       },
     ]);
-    expect((await submit(acct, envelope("req-cap-legacy-young"))).status).toBe(429);
+    expect((await submit(acct, envelope(rid("req-cap-legacy-young")))).status).toBe(429);
   });
 });
 
@@ -552,9 +563,9 @@ describe("alarm expires over-horizon pending rows so the sweep removes them", ()
 
   it("schedules a fresh submit's alarm at its expires_at", async () => {
     const acct = await freshAccount("horizon-arm");
-    expect((await submit(acct, envelope("req-arm", { expires_at: NOW + 60_000 }))).status).toBe(
-      202,
-    );
+    expect(
+      (await submit(acct, envelope(rid("req-arm"), { expires_at: NOW + 60_000 }))).status,
+    ).toBe(202);
     const alarm = await runInDurableObject(stubFor(acct), (instance: AccountRelay) =>
       (instance as unknown as { ctx: DurableObjectState }).ctx.storage.getAlarm(),
     );
@@ -689,7 +700,7 @@ describe("rate limiting on unauthenticated routes", () => {
       acct,
       "/requests",
       { RATE_LIMIT_REQUESTS: deny },
-      { method: "POST", body: JSON.stringify(envelope("req-rl")) },
+      { method: "POST", body: JSON.stringify(envelope(rid("req-rl"))) },
     );
     expect(resp.status).toBe(429);
     expect(await requestStatuses(acct)).toEqual({});
@@ -822,37 +833,39 @@ describe("terminal transitions blank the stored envelope", () => {
       (
         await submit(
           acct,
-          envelope("req-blank-exp", { expires_at: NOW + 1, context_ciphertext: BIG }),
+          envelope(rid("req-blank-exp"), { expires_at: NOW + 1, context_ciphertext: BIG }),
         )
       ).status,
     ).toBe(202);
-    expect(JSON.parse((await storedEnvelopes(acct))["req-blank-exp"] ?? "{}")).toMatchObject({
+    expect(JSON.parse((await storedEnvelopes(acct))[rid("req-blank-exp")] ?? "{}")).toMatchObject({
       context_ciphertext: BIG,
     });
 
     await runAlarmAt(acct, NOW + 1);
-    expect(await requestStatuses(acct)).toEqual({ "req-blank-exp": "expired" });
-    expect(await storedEnvelopes(acct)).toEqual({ "req-blank-exp": "" });
+    expect(await requestStatuses(acct)).toEqual({ [rid("req-blank-exp")]: "expired" });
+    expect(await storedEnvelopes(acct)).toEqual({ [rid("req-blank-exp")]: "" });
   });
 
   it("after a retract, its row holds an empty envelope and status reads still work", async () => {
     const acct = await freshAccount("blank-retract");
     const resp = await submitRaw(
       acct,
-      JSON.stringify(envelope("req-blank-ret", { context_ciphertext: BIG })),
+      JSON.stringify(envelope(rid("req-blank-ret"), { context_ciphertext: BIG })),
     );
     expect(resp.status).toBe(202);
     const { request_auth_token: token } = (await resp.json()) as { request_auth_token: string };
     const auth = { Authorization: `Bearer ${token}` };
 
-    const retract = await SELF.fetch(relayUrl(acct, "/requests/req-blank-ret/retract"), {
+    const retract = await SELF.fetch(relayUrl(acct, `/requests/${rid("req-blank-ret")}/retract`), {
       method: "POST",
       headers: auth,
     });
     expect(retract.status).toBe(200);
-    expect(await storedEnvelopes(acct)).toEqual({ "req-blank-ret": "" });
+    expect(await storedEnvelopes(acct)).toEqual({ [rid("req-blank-ret")]: "" });
 
-    const poll = await SELF.fetch(relayUrl(acct, "/requests/req-blank-ret"), { headers: auth });
+    const poll = await SELF.fetch(relayUrl(acct, `/requests/${rid("req-blank-ret")}`), {
+      headers: auth,
+    });
     expect(poll.status).toBe(200);
     expect(((await poll.json()) as { status: string }).status).toBe("retracted");
   });
@@ -890,7 +903,7 @@ describe("POST /requests on an account with no bound root", () => {
   it("404 unknown account, and stores nothing", async () => {
     const acct = testAccount("limits-unbound");
     await pinRelayClock(acct, NOW);
-    const result = await submit(acct, envelope("req-unbound"));
+    const result = await submit(acct, envelope(rid("req-unbound")));
     expect(result.status).toBe(404);
     expect(result.error).toBe("unknown account");
     expect(await requestStatuses(acct)).toEqual({});
@@ -899,9 +912,9 @@ describe("POST /requests on an account with no bound root", () => {
   it("accepts the same submit once the root is bound", async () => {
     const acct = testAccount("limits-unbound-then-bound");
     await pinRelayClock(acct, NOW);
-    expect((await submit(acct, envelope("req-unbound-1"))).status).toBe(404);
+    expect((await submit(acct, envelope(rid("req-unbound-1")))).status).toBe(404);
     await bindAccountRoot(acct);
-    expect((await submit(acct, envelope("req-unbound-2"))).status).toBe(202);
+    expect((await submit(acct, envelope(rid("req-unbound-2")))).status).toBe(202);
   });
 });
 
@@ -974,5 +987,44 @@ describe("pairing body size caps", () => {
       auth,
     );
     expect(ok.status).toBe(201);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Request id syntax
+// ---------------------------------------------------------------------------
+
+describe("POST /requests id must be a canonical UUID", () => {
+  it("accepts a canonical UUID in lower or upper case", async () => {
+    const acct = await freshAccount("id-valid");
+    expect((await submit(acct, envelope("3f2b8c1e-9a4d-4e7b-8c2f-1a2b3c4d5e6f"))).status).toBe(202);
+    expect((await submit(acct, envelope("3F2B8C1E-9A4D-4E7B-8C2F-1A2B3C4D5E70"))).status).toBe(202);
+  });
+
+  it("400 for an over-long id, and stores nothing", async () => {
+    const acct = await freshAccount("id-long");
+    const result = await submit(
+      acct,
+      envelope(`3f2b8c1e-9a4d-4e7b-8c2f-1a2b3c4d5e6f${"0".repeat(4096)}`),
+    );
+    expect(result.status).toBe(400);
+    expect(result.error).toMatch(/UUID/);
+    expect(await requestStatuses(acct)).toEqual({});
+  });
+
+  it("400 for ids that are not canonical UUID syntax", async () => {
+    const acct = await freshAccount("id-bad");
+    for (const bad of [
+      "req-not-a-uuid",
+      "3f2b8c1e9a4d4e7b8c2f1a2b3c4d5e6f", // no hyphens
+      "{3f2b8c1e-9a4d-4e7b-8c2f-1a2b3c4d5e6f}", // braces
+      "urn:uuid:3f2b8c1e-9a4d-4e7b-8c2f-1a2b3c4d5e6f",
+      "3f2b8c1e-9a4d-4e7b-8c2f-1a2b3c4d5e6", // one hex digit short
+      "3f2b8c1e-9a4d-4e7b-8c2f-1a2b3c4d5e6g", // non-hex
+      " 3f2b8c1e-9a4d-4e7b-8c2f-1a2b3c4d5e6f",
+    ]) {
+      expect((await submit(acct, envelope(bad))).status, bad).toBe(400);
+    }
+    expect(await requestStatuses(acct)).toEqual({});
   });
 });
