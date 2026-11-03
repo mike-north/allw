@@ -1253,42 +1253,59 @@ pub struct VerdictProvenance {
     pub decided_at: i64,
 }
 
-/// Checks a verdict's **provenance** without the plaintext: that it was signed for `request_id` by
-/// a device of `account_id` certified by `account_root`, and that the device is not revoked.
+/// Checks a verdict's **provenance** without the plaintext: that it was signed for `request_id`,
+/// within the request's window, by a device of `account_id` certified by `account_root`, and that
+/// the device is not revoked.
 ///
 /// This is the relay's gate before it records a verdict as final (`docs/relay-api.md` §4). The
 /// relay never holds the plaintext, so it cannot run [`verify_verdict`]; what it can check, it
 /// checks here, through the same code [`verify_verdict`] uses:
 ///
-/// 1. the outer `note` is within [`MAX_NOTE_BYTES`] ([`VerifyError::NoteTooLong`]);
-/// 2. `verdict.approver.account_id == account_id` ([`VerifyError::ExpectedAccountMismatch`]);
-/// 3. the device certificate chains to `account_root` and is unexpired at the verdict's
+/// 1. `created_at <= decided_at <= expires_at`, the request's own window, exactly as
+///    [`verify_verdict`] step 5 requires ([`VerifyError::DecidedAtOutOfWindow`]). This runs first:
+///    `decided_at` is signed by the device, so without the bound a device whose certificate has
+///    expired could backdate it to a time the certificate was still valid;
+/// 2. the outer `note` is within [`MAX_NOTE_BYTES`] ([`VerifyError::NoteTooLong`]);
+/// 3. `verdict.approver.account_id == account_id` ([`VerifyError::ExpectedAccountMismatch`]);
+/// 4. the device certificate chains to `account_root` and is unexpired at the verdict's
 ///    `decided_at` ([`VerifyError::MissingDeviceCert`], [`VerifyError::CertSignatureInvalid`],
 ///    [`VerifyError::CertAccountMismatch`], [`VerifyError::CertDeviceMismatch`],
 ///    [`VerifyError::CertExpired`]);
-/// 4. the device is not revoked in the highest-sequence state of `account_states`, when any are
+/// 5. the device is not revoked in the highest-sequence state of `account_states`, when any are
 ///    given ([`VerifyError::DeviceRevoked`], [`VerifyError::AccountStateInvalid`]);
-/// 5. the verdict JWS verifies under the certified device key and its `kid` is that device
+/// 6. the verdict JWS verifies under the certified device key and its `kid` is that device
 ///    ([`VerifyError::VerdictSignatureInvalid`], [`VerifyError::MalformedJws`]);
-/// 6. every outer field equals its signed claim ([`VerifyError::ClaimsMismatch`]);
-/// 7. the signed `request_id` is `request_id` ([`VerifyError::RequestIdMismatch`]).
+/// 7. every outer field equals its signed claim ([`VerifyError::ClaimsMismatch`]), so the signed
+///    `decided_at` is the one checked in step 1;
+/// 8. the signed `request_id` is `request_id` ([`VerifyError::RequestIdMismatch`]).
 ///
-/// It does **not** recompute `request_hash`, check the decision window or the nonce, or look at
-/// the decision. The integrator's [`verify_verdict`] remains the only check that yields a verified
+/// `created_at` and `expires_at` are the request envelope's (relay-visible) values. Because the
+/// certificate is judged at a `decided_at` inside that window, a certificate that expires while the
+/// request is open can be backdated by at most the window, the same latitude [`verify_verdict`]
+/// grants. It does **not** recompute `request_hash`, check the nonce, or look at the decision. The integrator's [`verify_verdict`] remains the only check that yields a verified
 /// human decision; a verdict that passes here can still fail there (and is then a deny).
 ///
 /// # Errors
 ///
 /// Returns the [`VerifyError`] of the first failing check above.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the request's identity and window, the account's trust anchor and its revocation state are all independent inputs"
+)]
 pub fn verify_verdict_provenance(
     verdict: &Verdict,
     request_id: &str,
+    created_at: i64,
+    expires_at: i64,
     account_id: &str,
     account_root: &PublicKey,
     account_states: &[&str],
 ) -> Result<VerdictProvenance, VerifyError> {
-    // The certificate's expiry is judged at the decision time the device signed: the relay has no
-    // decision window of its own to judge it against (step 3 above).
+    // Bound the device-signed decision time by the request's window before the certificate is
+    // judged at it (step 1). Step 7 then ties this outer value to the signed claim.
+    if verdict.decided_at < created_at || verdict.decided_at > expires_at {
+        return Err(VerifyError::DecidedAtOutOfWindow);
+    }
     let claims = authenticate_verdict(
         verdict,
         account_root,
@@ -2864,6 +2881,8 @@ mod tests {
         verify_verdict_provenance(
             verdict,
             REQUEST_ID,
+            TS_CREATED,
+            TS_EXPIRES,
             ACCOUNT_ID,
             &root_key().public_key(),
             states,
@@ -2939,6 +2958,8 @@ mod tests {
         let err = verify_verdict_provenance(
             &make_signed_approved(),
             REQUEST_ID,
+            TS_CREATED,
+            TS_EXPIRES,
             "acc_other",
             &root_key().public_key(),
             &[],
@@ -3022,6 +3043,78 @@ mod tests {
         );
         let at_decision = signed_for(REQUEST_ID, Some(cert_expiring(TS_DECIDED)));
         provenance(&at_decision, &[]).expect("a cert valid at decided_at must pass");
+    }
+
+    /// Signs the standard approved verdict at `decided_at`, with a cert expiring at `cert_expires_at`.
+    fn signed_at(decided_at: i64, cert_expires_at: Option<i64>) -> Verdict {
+        let cert = issue_device_cert(
+            &root_key(),
+            ACCOUNT_ID,
+            DEVICE_ID,
+            &device_key().public_key(),
+            TS_CREATED,
+            cert_expires_at,
+        );
+        let mut unsigned = make_unsigned(Decision::Approved, canonical_hash(false), None);
+        unsigned.decided_at = decided_at;
+        sign_verdict(&unsigned, &device_key(), NONCE, Some(cert)).expect("note within cap")
+    }
+
+    /// The decision window is inclusive at both edges: `decided_at` equal to `created_at` or to
+    /// `expires_at` passes.
+    #[test]
+    fn provenance_accepts_decided_at_on_the_window_edges() {
+        for decided_at in [TS_CREATED, TS_EXPIRES] {
+            let got = provenance(&signed_at(decided_at, None), &[])
+                .unwrap_or_else(|e| panic!("decided_at {decided_at} must pass, got {e:?}"));
+            assert_eq!(got.decided_at, decided_at);
+        }
+    }
+
+    /// `decided_at` one millisecond before `created_at`, or after `expires_at` →
+    /// DecidedAtOutOfWindow.
+    #[test]
+    fn provenance_rejects_decided_at_outside_the_window() {
+        for decided_at in [TS_CREATED - 1, TS_EXPIRES + 1] {
+            assert_eq!(
+                provenance(&signed_at(decided_at, None), &[])
+                    .expect_err("a decision outside the request window must fail"),
+                VerifyError::DecidedAtOutOfWindow,
+                "decided_at {decided_at}"
+            );
+        }
+    }
+
+    /// The #352 review probe: a device whose certificate expired before the request was created
+    /// backdates `decided_at` to when the certificate was still valid. The window check refuses it
+    /// before the certificate is judged, so it can't pre-empt the request.
+    #[test]
+    fn provenance_rejects_an_expired_cert_backdated_before_the_request() {
+        let backdated = signed_at(TS_CREATED - 1_000, Some(TS_CREATED - 500));
+        assert_eq!(
+            provenance(&backdated, &[]).expect_err("a backdated verdict must fail"),
+            VerifyError::DecidedAtOutOfWindow
+        );
+        // And inside the window that certificate is expired.
+        assert_eq!(
+            provenance(&signed_at(TS_DECIDED, Some(TS_CREATED - 500)), &[])
+                .expect_err("an expired cert inside the window must fail"),
+            VerifyError::CertExpired
+        );
+    }
+
+    /// The window is checked on the outer `decided_at`; rewriting it into the window without
+    /// re-signing fails as a claims mismatch, so the bound applies to the signed value.
+    #[test]
+    fn provenance_window_applies_to_the_signed_decided_at() {
+        let mut verdict = signed_at(TS_CREATED - 1_000, None);
+        verdict.decided_at = TS_DECIDED;
+        assert_eq!(
+            provenance(&verdict, &[]).expect_err("a rewritten outer decided_at must fail"),
+            VerifyError::ClaimsMismatch {
+                field: "decided_at"
+            }
+        );
     }
 
     /// A verdict signed by a key the certificate does not certify → VerdictSignatureInvalid.

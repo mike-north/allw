@@ -230,6 +230,10 @@ struct WasmVector {
 
     /// The account id the provenance cases are checked for (the fixture verdicts' account).
     provenance_account_id: String,
+    /// The request window (`created_at`, `expires_at`, Unix ms) the provenance cases are checked
+    /// in: the relay passes the request row's values.
+    provenance_created_at: i64,
+    provenance_expires_at: i64,
     /// Verdict-provenance cases (#245), each checked with `approver_root_pubkey_b64`.
     provenance_cases: Vec<ProvenanceCase>,
 }
@@ -247,6 +251,9 @@ struct ProvenanceCase {
     /// The signing device the check reports when it passes; `None` when it must be rejected.
     /// Written from the rules, not captured from the function.
     expected_device_id: Option<String>,
+    /// For a rejected case, the `Display` of the `VerifyError` the rules call for, so the WASM side
+    /// can match the specific reason. `None` when the case passes.
+    expected_error: Option<String>,
 }
 
 /// A signed verdict whose human decision is not `approved`.
@@ -651,6 +658,8 @@ fn build_vector() -> WasmVector {
         not_approved_verdicts,
         forged_not_approved_verdicts,
         provenance_account_id: ACCOUNT_ID.to_string(),
+        provenance_created_at: TS_CREATED,
+        provenance_expires_at: TS_EXPIRES,
         provenance_cases,
     }
 }
@@ -658,7 +667,9 @@ fn build_vector() -> WasmVector {
 /// The provenance cases (#245), one per relay-table row: a genuine verdict and a genuine denial
 /// pass; a verdict from a second certified device passes naming that device (telling it apart
 /// from the socket's device is the relay's own check); a junk signature, a key no certificate
-/// vouches for, a verdict replayed for another request and a revoked device are rejected.
+/// vouches for, a verdict replayed for another request, a revoked device, a decision outside the
+/// request window on either side, and an expired certificate backdated to before the request are
+/// rejected. Each rejection's error is written from the rules ([`provenance_expected_error`]).
 fn provenance_cases(
     root: &SigningKeyPair,
     unsigned: &UnsignedVerdict,
@@ -674,8 +685,33 @@ fn provenance_cases(
                 request_id: request_id.to_string(),
                 account_states_json: serde_json::to_string(states).expect("states serialize"),
                 expected_device_id: ok.map(str::to_string),
+                expected_error: match ok {
+                    Some(_) => None,
+                    None => Some(provenance_expected_error(name).to_string()),
+                },
             }
         };
+    // The genuine device signing at `decided_at` under a certificate expiring at `cert_expires_at`.
+    let signed_at = |decided_at: i64, cert_expires_at: Option<i64>| {
+        let cert = issue_device_cert(
+            root,
+            ACCOUNT_ID,
+            DEVICE_ID,
+            &device.public_key(),
+            TS_CREATED - 10_000,
+            cert_expires_at,
+        );
+        sign_verdict(
+            &UnsignedVerdict {
+                decided_at,
+                ..clone_unsigned(unsigned)
+            },
+            &device,
+            NONCE,
+            Some(cert),
+        )
+        .expect("note within cap")
+    };
     let genuine =
         sign_verdict(unsigned, &device, NONCE, Some(cert.to_string())).expect("note within cap");
 
@@ -752,7 +788,44 @@ fn provenance_cases(
             None,
         ),
         case("revoked device", &genuine, REQUEST_ID, &[revoking], None),
+        case(
+            "decided before the request was created",
+            &signed_at(TS_CREATED - 1, None),
+            REQUEST_ID,
+            &[],
+            None,
+        ),
+        case(
+            "decided after the request expires",
+            &signed_at(TS_EXPIRES + 1, None),
+            REQUEST_ID,
+            &[],
+            None,
+        ),
+        // A device whose certificate has expired backdates its decision to while the certificate
+        // was valid; the window (not the certificate) is what rejects it.
+        case(
+            "expired cert backdated before the request",
+            &signed_at(TS_CREATED - 1_000, Some(TS_CREATED - 500)),
+            REQUEST_ID,
+            &[],
+            None,
+        ),
     ]
+}
+
+/// The error the rules call for, per rejected provenance case (written by hand, not captured).
+fn provenance_expected_error(name: &str) -> VerifyError {
+    match name {
+        "junk signature" => VerifyError::MalformedJws,
+        "uncertified key" => VerifyError::VerdictSignatureInvalid,
+        "replayed for another request" => VerifyError::RequestIdMismatch,
+        "revoked device" => VerifyError::DeviceRevoked,
+        "decided before the request was created"
+        | "decided after the request expires"
+        | "expired cert backdated before the request" => VerifyError::DecidedAtOutOfWindow,
+        other => panic!("no expected error written for provenance case {other:?}"),
+    }
 }
 
 fn not_approved_case(name: &str, verdict: &Verdict, signed_decision: &str) -> NotApprovedCase {
@@ -1181,17 +1254,7 @@ fn fixture_provenance_cases_follow_the_rules() {
     let v: WasmVector =
         serde_json::from_str(&raw).expect("committed fixture is valid WasmVector JSON");
     let root = SigningKeyPair::from_seed(&ROOT_SEED).public_key();
-    let expected_errors = [
-        ("junk signature", VerifyError::MalformedJws),
-        ("uncertified key", VerifyError::VerdictSignatureInvalid),
-        (
-            "replayed for another request",
-            VerifyError::RequestIdMismatch,
-        ),
-        ("revoked device", VerifyError::DeviceRevoked),
-    ];
-
-    assert_eq!(v.provenance_cases.len(), 7);
+    assert_eq!(v.provenance_cases.len(), 10);
     for case in &v.provenance_cases {
         let verdict: Verdict = serde_json::from_str(&case.verdict_json).unwrap();
         let states: Vec<String> = serde_json::from_str(&case.account_states_json).unwrap();
@@ -1199,6 +1262,8 @@ fn fixture_provenance_cases_follow_the_rules() {
         let result = verify_verdict_provenance(
             &verdict,
             &case.request_id,
+            v.provenance_created_at,
+            v.provenance_expires_at,
             &v.provenance_account_id,
             &root,
             &state_refs,
@@ -1210,11 +1275,14 @@ fn fixture_provenance_cases_follow_the_rules() {
                 assert_eq!(got.decided_at, TS_DECIDED, "{}", case.name);
             }
             None => {
-                let (_, expected) = expected_errors
-                    .iter()
-                    .find(|(name, _)| *name == case.name)
-                    .unwrap_or_else(|| panic!("{}: no expected error written", case.name));
-                assert_eq!(result.as_ref().err(), Some(expected), "{}", case.name);
+                let expected = provenance_expected_error(&case.name);
+                assert_eq!(result.as_ref().err(), Some(&expected), "{}", case.name);
+                assert_eq!(
+                    case.expected_error.as_deref(),
+                    Some(expected.to_string().as_str()),
+                    "{}: the fixture carries the expected error",
+                    case.name
+                );
             }
         }
     }
