@@ -289,6 +289,14 @@ interface WsMessage {
 interface WsClient {
   /** Resolve the next inbound JSON message (or reject after `timeoutMs`). */
   next(timeoutMs?: number): Promise<WsMessage>;
+  /**
+   * Assert that no message is waiting on this socket, without waiting out a timeout. Sends a frame
+   * the relay always answers (a non-JSON message gets an `error`) and requires that answer to be the
+   * next message. A Durable Object handles one event at a time, and every send this test caused
+   * (a connect's queue flush, a submit's fan-out, a verdict's retract) completed inside an earlier
+   * event, so any such message is already ahead of the answer on the socket.
+   */
+  expectNothingPending(): Promise<void>;
   send(obj: unknown): void;
   raw: WebSocket;
 }
@@ -336,20 +344,26 @@ async function connectWs(accountId: string, subPath: string): Promise<WsClient> 
 
   ws.accept();
 
-  return {
-    next(timeoutMs = 2000): Promise<WsMessage> {
-      const queued = queue.shift();
-      if (queued) return Promise.resolve(queued);
-      return new Promise<WsMessage>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("WebSocket message timeout")), timeoutMs);
-        waiters.push((m) => {
-          clearTimeout(timer);
-          resolve(m);
-        });
+  function next(timeoutMs = 2000): Promise<WsMessage> {
+    const queued = queue.shift();
+    if (queued) return Promise.resolve(queued);
+    return new Promise<WsMessage>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("WebSocket message timeout")), timeoutMs);
+      waiters.push((m) => {
+        clearTimeout(timer);
+        resolve(m);
       });
-    },
+    });
+  }
+
+  return {
+    next,
     send(obj: unknown): void {
       ws.send(JSON.stringify(obj));
+    },
+    async expectNothingPending(): Promise<void> {
+      ws.send("barrier: not a JSON message");
+      expect(await next()).toEqual({ type: "error", error: "invalid JSON message" });
     },
     raw: ws,
   };
@@ -590,8 +604,8 @@ describe("AccountRelay — routing (device offline)", () => {
     const d2 = await connectWs(acct, `/devices/${deviceId}/connect`);
     const flushed = await d2.next();
     expect(flushed.request_id).toBe("req-mixed-2");
-    // No further pending request should arrive.
-    await expect(d2.next(500)).rejects.toThrow(/timeout/);
+    // No further pending request arrives.
+    await d2.expectNothingPending();
   });
 });
 
@@ -678,7 +692,7 @@ describe("AccountRelay — cross-device coordination", () => {
 
     expect((await nativeMac.next()).request_id).toBe("req-surface-1");
     expect((await phone.next()).request_id).toBe("req-surface-1");
-    await expect(mirroredPhone.next(500)).rejects.toThrow(/timeout/);
+    await mirroredPhone.expectNothingPending();
   });
 
   it("continues same-surface fan-out when the first tagged socket cannot be sent to", async () => {
@@ -745,7 +759,7 @@ describe("AccountRelay — cross-device coordination", () => {
 
     expect((await nativeMac.next()).request_id).toBe("req-surface-queued");
     expect((await phone.next()).request_id).toBe("req-surface-queued");
-    await expect(mirroredPhone.next(500)).rejects.toThrow(/timeout/);
+    await mirroredPhone.expectNothingPending();
   });
 
   it("flushes queued requests when only stale sockets exist for the reconnecting surface", async () => {
@@ -1466,7 +1480,7 @@ describe("AccountRelay — fail-closed expiry", () => {
 
     // Connecting must NOT deliver the expired queued request.
     const device = await connectWs(acct, `/devices/${deviceId}/connect`);
-    await expect(device.next(500)).rejects.toThrow(/timeout/);
+    await device.expectNothingPending();
   });
 
   it("lazy-expires on poll: a past-deadline pending request reports terminal 'expired'", async () => {
