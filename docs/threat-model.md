@@ -181,6 +181,14 @@ Validation:
   §Device Revocation, issue #204 fix 1). Tests assert a revoked device receives no recipient entry, that a
   stale lower-sequence account state cannot resurrect a revocation, and that an all-revoked account fails
   closed rather than submitting to nobody.
+- Recipient keys come from the relay's device registry, so a small-order X25519 key (whose ECDH shared
+  secret is non-contributory and so predictable) is a runtime input, not a bug. `encrypt_context` returns
+  `EncryptError::LowOrderRecipientKey` naming the device instead of panicking, and refuses the whole
+  encryption rather than dropping that recipient. The SDK rethrows it, so the hook denies. The core also
+  exports its denylist (`X25519_SMALL_ORDER_POINTS`, libsodium's `has_small_order` list, matched with bit 255
+  masked) through WASM, so device-key registration can reject the same keys up front. A shared vector
+  (`crates/allw-core/tests/fixtures/x25519_small_order.json`) asserts the denylist and encryption agree in
+  Rust and through WASM (#248).
 
 ### R2. Verdict authenticity and binding
 
