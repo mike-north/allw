@@ -174,8 +174,9 @@ verifying once).
 **Rotating the keypair invalidates every existing browser subscription**: browsers must re-subscribe
 with the new public key. The relay does **not** prune the old endpoints: a push service rejects them
 with an auth error (401/403), which the relay deliberately treats as transient, so a misconfigured
-relay can never unregister every device. Stale endpoints stay registered until the device
-re-registers its push tokens (#236).
+relay can never unregister every device. Stale endpoints stay registered until each device
+replaces its push tokens with its new subscription (`PUT /{acct}/devices/{device_id}/push-tokens`,
+`docs/relay-api.md` §3), which a web approver should do when it re-subscribes (client flow: #237).
 
 ### Secrets inventory summary
 
@@ -316,7 +317,8 @@ EOF
 
 The watch terminal should display the pending approval. Press `a` to approve.
 
-The hook should emit `allow` and exit 0. This confirms:
+The hook should exit 0 with **empty stdout**: after a verified approval allw makes no decision (it
+never emits `allow`), so Claude Code's own permission rules apply. This confirms:
 
 1. The relay is reachable at the deployed URL.
 2. Pairing, device presence (WebSocket), and request submission all work.

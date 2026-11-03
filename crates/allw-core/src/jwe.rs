@@ -393,7 +393,10 @@ const DEVICE_ID_DISPLAY_MAX_CHARS: usize = 64;
 /// newlines, quotes, control and bidi characters, so a hostile id cannot pose as further
 /// diagnostic text. Capping it at [`DEVICE_ID_DISPLAY_MAX_CHARS`] characters (plus `…`) bounds the
 /// message. The full id stays in the error variant for structured callers.
-fn write_untrusted_device_id(f: &mut std::fmt::Formatter<'_>, device_id: &str) -> std::fmt::Result {
+pub(crate) fn write_untrusted_device_id(
+    f: &mut std::fmt::Formatter<'_>,
+    device_id: &str,
+) -> std::fmt::Result {
     match device_id.char_indices().nth(DEVICE_ID_DISPLAY_MAX_CHARS) {
         Some((cut, _)) => write!(f, "{:?}…", &device_id[..cut]),
         None => write!(f, "{device_id:?}"),

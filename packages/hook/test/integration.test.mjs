@@ -10,8 +10,8 @@
  * SDK then verifies against the account-root key. The poll path is forced (no WebSocket) and the
  * clock is fixed, so the run is fully deterministic — no `Date.now()`, no real network.
  *
- * Two cases pin the fail-closed contract end-to-end:
- *   - a signed **approved** verdict → the hook emits `allow`;
+ * Two cases pin the fail-closed, deny-only contract end-to-end (#247):
+ *   - a signed **approved** verdict → no decision (`null` ⇒ empty stdout), never `allow`;
  *   - a signed **denied** verdict   → the hook emits `deny` (a verified human "no").
  *
  * @see ../../../docs/contract.md §Transport, §Lifecycle, §Invariants #6 (fail-closed)
@@ -209,7 +209,7 @@ function overrides(fetchImpl) {
   };
 }
 
-test("end-to-end: a WASM-signed approved verdict makes the hook emit allow", async () => {
+test("end-to-end: a WASM-signed approved verdict yields no decision (never allow; #247)", async () => {
   const wasm = await loadWasm();
   const approver = await pairedApprover(wasm);
   const { fetchImpl } = relayDouble(wasm, approver, "approved");
@@ -220,11 +220,10 @@ test("end-to-end: a WASM-signed approved verdict makes the hook emit allow", asy
     overrides(fetchImpl),
   );
 
-  assert.equal(output.hookSpecificOutput.hookEventName, "PreToolUse");
   assert.equal(
-    output.hookSpecificOutput.permissionDecision,
-    "allow",
-    "a verified approved verdict gates the tool call open",
+    output,
+    null,
+    "a verified approval removes allw's objection; Claude Code's own rules still apply",
   );
 });
 
@@ -289,7 +288,7 @@ function withConfigHome(t, file) {
   return home;
 }
 
-test("end-to-end (#230): config file only, no ALLW_* env → the hook gates and emits allow", async (t) => {
+test("end-to-end (#230): config file only, no ALLW_* env → the hook gates; approval = no decision", async (t) => {
   const wasm = await loadWasm();
   const approver = await pairedApprover(wasm);
   const { fetchImpl } = relayDouble(wasm, approver, "approved");
@@ -307,9 +306,9 @@ test("end-to-end (#230): config file only, no ALLW_* env → the hook gates and 
   );
 
   assert.equal(
-    output.hookSpecificOutput.permissionDecision,
-    "allow",
-    "a verified approval, with the coordinates read from the config file",
+    output,
+    null,
+    "a verified approval, with the coordinates read from the config file, makes no decision (#247)",
   );
 });
 
@@ -347,7 +346,7 @@ test("end-to-end (#230, fail-closed): neither config file nor env → deny namin
   assert.equal(dialed, false, "missing config fails closed before any relay dial");
 });
 
-test("end-to-end: a non-gated tool (Read) emits allow without dialing the relay", async () => {
+test("end-to-end: a non-gated tool (Read) yields no decision without dialing the relay", async () => {
   let dialed = false;
   const fetchImpl = () => {
     dialed = true;
@@ -364,7 +363,7 @@ test("end-to-end: a non-gated tool (Read) emits allow without dialing the relay"
   });
 
   const output = await runHook(stdin, env(approver, TIMEOUT_MS), { fetchImpl });
-  assert.equal(output.hookSpecificOutput.permissionDecision, "allow");
+  assert.equal(output, null);
   assert.equal(dialed, false, "a non-gated tool never contacts the relay");
 });
 

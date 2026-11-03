@@ -25,7 +25,7 @@ supported, evaluated install path this doc documents:
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|Edit|MultiEdit|Write|mcp__.*",
+        "matcher": "^(Bash|Edit|MultiEdit|Write)$|^mcp__",
         "hooks": [
           {
             "type": "command",
@@ -36,14 +36,27 @@ supported, evaluated install path this doc documents:
         ]
       }
     ]
+  },
+  "permissions": {
+    "deny": ["Monitor", "PowerShell", "NotebookEdit"]
   }
 }
 ```
 
-- `matcher` is evaluated against `tool_name`. `Bash|Edit|MultiEdit|Write|mcp__.*` is the
-  recommended install matcher (`packages/hook/README.md`); `mcp__.*` is required (not
-  `mcp__<server>`) because a bare server prefix without `.*` is treated as an exact-string match
-  and matches nothing.
+- `matcher` is evaluated against `tool_name`. `^(Bash|Edit|MultiEdit|Write)$|^mcp__` contains
+  regex characters, so Claude Code reads it as a JavaScript regular expression, and the anchors make
+  it match whole names: exactly `Bash`, `Edit`, `MultiEdit` and `Write`, plus every tool whose name
+  starts with `mcp__` (every MCP tool). Unanchored, `Edit` would also match `NotebookEdit`, which
+  the hook doesn't gate. (Claude Code now calls `MultiEdit` legacy; it stays in the matcher for
+  versions that still have it.)
+- **The `deny` rules turn off the tools that can run commands or change files but that allw doesn't
+  gate yet** ([#298](https://github.com/mike-north/allw/issues/298)): `Monitor` and `PowerShell` run
+  shell commands, and `NotebookEdit` edits notebook files. A deny rule that names a bare tool removes
+  it from Claude's context ([Permissions](https://code.claude.com/docs/en/permissions#manage-permissions)).
+  Without them, those tools reach your files and shell under Claude Code's own rules alone, with no
+  approver in the loop. **`Monitor` uses your `Bash` permission rules**
+  ([Monitor tool](https://code.claude.com/docs/en/tools-reference#monitor-tool)), so a `Bash` allow
+  rule also lets it run any command with no prompt at all.
 - **Always pin `"timeout": 480`** (seconds). Without it the hook inherits Claude Code's 600s
   command-hook default, and the timeout-ordering invariant below depends on a known pinned value.
 - Use an absolute path to `dist/cli.js`, or `npx --no-install allw-hook` — `command` runs under
@@ -62,6 +75,75 @@ supported, evaluated install path this doc documents:
   [blocks the call](https://code.claude.com/docs/en/hooks#block-the-action-when-a-hook-fails).
   `@allw/hook` exits 0 on every decision, deny included, so the setting never turns one of its own
   decisions into a failure.
+
+### Install the hook where the agent can't write it
+
+**The gate is only as strong as the agent's inability to change it.** An agent that can edit the
+hook's code (`node_modules/@allw/hook/dist/cli.js`) or the settings file that registers it can turn
+the gate off without asking anyone. A project-local install sits inside the working directory, where
+`acceptEdits` mode auto-approves file edits, and a matcher without `Edit`, `MultiEdit` and `Write`
+doesn't gate edits at all. So install the hook **outside any tree the agent works in** and register it in your
+**user-level** `~/.claude/settings.json` by absolute path:
+
+```sh
+# A user-owned install, outside every project:
+npm install --prefix "$HOME/.allw/hook" @allw/hook
+
+# The absolute path to put in "command":
+echo "$HOME/.allw/hook/node_modules/@allw/hook/dist/cli.js"
+```
+
+(Until `@allw/hook` is published, pass the packed `@allw/sdk` and `@allw/hook` tarballs to the same
+`npm install --prefix` command instead of the package name.)
+
+Then register it in `~/.claude/settings.json` with the full matcher, `onFailure` and the `deny`
+rules. The hook reads its coordinates from `~/.allw/config.json` (see
+[`docs/quickstart.md`](./quickstart.md) §4), which is also under `~/.allw/`, so the points below
+cover it too:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^(Bash|Edit|MultiEdit|Write)$|^mcp__",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /Users/you/.allw/hook/node_modules/@allw/hook/dist/cli.js",
+            "timeout": 480,
+            "onFailure": "block"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "deny": ["Monitor", "PowerShell", "NotebookEdit"]
+  }
+}
+```
+
+`"onFailure": "block"` needs Claude Code v2.1.295 or later; older versions ignore the key without
+warning, so check `claude --version`. Why this holds:
+
+- `~/.claude/` is one of Claude Code's
+  [protected paths](https://code.claude.com/docs/en/permission-modes#protected-paths): writes there
+  are never auto-approved (except in `bypassPermissions`), and allow rules don't pre-approve them.
+- `~/.allw/hook` and `~/.allw/config.json` (the trust anchor the hook verifies verdicts against) are
+  outside the working directory, so `acceptEdits` doesn't auto-approve edits to them.
+- **allw gates exactly these tools:** `Bash`, `Edit`, `MultiEdit`, `Write` and every MCP tool. A
+  change to either location through one of them reaches your approver first. **Deny any request that
+  writes under `~/.allw/` or `~/.claude/`.**
+- **allw doesn't gate `Monitor`, `PowerShell` or `NotebookEdit`**
+  ([#298](https://github.com/mike-north/allw/issues/298)), and `Monitor` and `PowerShell` can run
+  any shell command, including one that edits or deletes the hook. That is why the config above
+  denies all three. If you remove those deny rules, these tools reach the hook's files under Claude
+  Code's own rules alone, and a `Bash` allow rule lets `Monitor` do it with no prompt.
+
+This is guidance, not a tamper-proof boundary: in `bypassPermissions` mode allw is the only gate, and
+the agent still runs as your OS user. Moving the account root off the agent's machine is tracked in
+[#244](https://github.com/mike-north/allw/issues/244).
 
 **stdin** (the pending tool call — Claude Code sends more fields than the hook reads; see
 [Hook input and output](https://code.claude.com/docs/en/hooks#hook-input-and-output)):
@@ -84,13 +166,13 @@ supported, evaluated install path this doc documents:
 ignored. `permission_mode` is not consulted — the hook's decision is uniform regardless of the
 session's Claude Code permission mode. See [Permission-Mode Interactions](#permission-mode-interactions).
 
-**stdout** (the permission decision; the hook always exits `0`):
+**stdout** (the hook always exits `0`): **empty** when allw has no objection, or one `deny`:
 
 ```jsonc
 {
   "hookSpecificOutput": {
     "hookEventName": "PreToolUse",
-    "permissionDecision": "allow", // or "deny" — allw never emits "ask" or "defer"
+    "permissionDecision": "deny", // the only decision allw ever emits
     "permissionDecisionReason": "allw: …",
   },
 }
@@ -99,12 +181,20 @@ session's Claude Code permission mode. See [Permission-Mode Interactions](#permi
 `permissionDecision` is one of four values Claude Code understands on `PreToolUse`: `allow`,
 `deny`, `ask`, or `defer` (`hookSpecificOutput.permissionDecision`,
 [PreToolUse decision control](https://code.claude.com/docs/en/hooks#pretooluse-decision-control)).
-`allw` only ever emits `allow` (a verified human approval, or a non-gated pass-through) or `deny`
-(everything else); it never emits `ask` (there is no "escalate to Claude Code's own prompt" tier —
-a gated action either reaches a verified human decision on the paired approver device or fails
-closed) or `defer` (which only applies to non-interactive `-p` / Agent-SDK integrations pausing a
-tool call for external resumption — not this hook's use case). `permissionDecisionReason` is shown
-to the user for `allow` (not to Claude); for `deny`, it is shown to Claude.
+**allw only ever emits `deny`.** A verified human approval, a non-gated tool and a pass-through all
+get **no decision**: exit `0` with empty stdout, which Claude Code treats as a plain success with no
+fields to apply ([Exit code output](https://code.claude.com/docs/en/hooks#exit-code-output)), so it
+goes on to its own permission rules exactly as if allw weren't installed.
+
+allw never emits `allow` because in Claude Code an `allow` **skips the permission prompt** (deny and
+ask rules are still evaluated). That would let an allw approval, or a matcher widened to tools allw
+never asks about, grant access the user's own permission setup would have prompted for. A verdict
+may only tighten access (`docs/contract.md` §Invariants). It never emits `ask` (there is no
+"escalate to Claude Code's own prompt" tier) or `defer` (only for non-interactive `-p` / Agent-SDK
+integrations pausing a call for external resumption). `@allw/codex-hook` uses the same deny-only
+encoding ([#191](https://github.com/mike-north/allw/issues/191)); both CLIs share one writer
+(`packages/hook/src/lib/decision-output.ts`). For `deny`, `permissionDecisionReason` is shown to
+Claude.
 
 ## What Is Gated
 
@@ -118,7 +208,8 @@ approval:
 | `Edit`, `Write`, `MultiEdit`                            | Yes    | `file_edit` — built from the operation kind, target path(s), a compact summary, and a hash of the full edit bytes.                                                                                                                                                                       |
 | any `mcp__<server>__<tool>` name                        | Yes    | `mcp_tool_call` — built from the parsed server/tool name and the raw `tool_input` params object.                                                                                                                                                                                         |
 | `apply_patch`                                           | Yes    | `file_edit`, via the same Codex apply-patch-grammar parser. Claude Code has no `apply_patch` tool, so this branch is never reached in a Claude Code session; it exists because `gateToolCall` is the same shared function `@allw/codex-hook` imports (`packages/codex-hook/src/cli.ts`). |
-| everything else (`Read`, `Glob`, `Grep`, `WebFetch`, …) | No     | Passes through as `allow` without contacting the relay, and **without requiring `allw` config** — a missing/misconfigured install never blocks reads.                                                                                                                                    |
+| `Monitor`, `PowerShell`, `NotebookEdit`                 | No     | **Not gated yet** ([#298](https://github.com/mike-north/allw/issues/298)), though they run shell commands (`Monitor`, `PowerShell`) or edit files (`NotebookEdit`). The recommended config denies them outright; see [Integration Shape](#integration-shape).                            |
+| everything else (`Read`, `Glob`, `Grep`, `WebFetch`, …) | No     | **No decision** (empty stdout) without contacting the relay, and **without requiring `allw` config** — a missing/misconfigured install never blocks reads; Claude Code's own permission rules apply.                                                                                     |
 
 Two fail-closed subtleties worth calling out precisely, because they are easy to get wrong when
 widening the matcher:
@@ -127,12 +218,15 @@ widening the matcher:
   `mcp__` prefix alone; a name that carries the prefix but doesn't parse as
   `mcp__<server>__<tool>` (e.g. `mcp__server__` or `mcp__onlytwo`) is still routed to `gateToolCall`,
   which then returns a `build-error` (→ `deny`). Treating an unparseable MCP name as non-gated would
-  pass it through as `allow`, which would break fail-closed for MCP calls — so the hook denies
+  let it through without a human, which would break fail-closed for MCP calls — so the hook denies
   instead.
-- Widening the matcher to a new tool name is additive and safe by construction: an unrecognized
-  tool name that isn't `Bash`, a file-edit tool, or `mcp__`-prefixed falls through to the
-  `pass-through` branch (`allow`) regardless of matcher — the matcher only ever narrows which calls
-  reach the hook process at all, never what the hook decides once it does.
+- **Widening the matcher only adds gating; it never grants.** A tool name that isn't `Bash`, a
+  file-edit tool, or `mcp__`-prefixed falls through to the `pass-through` branch, which makes **no
+  decision**: Claude Code applies its own permission rules to that call exactly as it would without
+  the hook. (Before [#247](https://github.com/mike-north/allw/issues/247) the pass-through emitted
+  `allow`, which skipped Claude Code's prompt, so a matcher such as `.*` made allw grant tools it never
+  asked a human about.) The matcher decides which calls reach the hook at all; the hook can only ever
+  add a `deny`.
 
 ## Configuration
 
@@ -160,7 +254,8 @@ its bound, is a fail-closed `deny` at config-read time — see
 
 ## Decision Mapping
 
-`decide` (`packages/hook/src/lib/decide.ts`) reduces every path to exactly one of `allow`/`deny`.
+`decide` (`packages/hook/src/lib/decide.ts`) reduces every path to exactly one of "no decision"
+(empty stdout) or `deny`.
 The Claude Code hook's `hookSpecificOutput` carries no machine-readable category field — only the
 human-readable `permissionDecisionReason` string shown below. The Codex hook briefly added a
 `denyReason` field in [#166](https://github.com/mike-north/allw/pull/166), but Codex's `PreToolUse`
@@ -172,8 +267,8 @@ equivalent field, nor should there be:
 
 | allw result                                                                                                                                                                                                 | `permissionDecision` | `permissionDecisionReason` (pattern)                                                                     |
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- | -------------------------------------------------------------------------------------------------------- |
-| non-gated tool (`Read`, `Grep`, `Glob`, `WebFetch`, …)                                                                                                                                                      | `allow`              | `allw: tool '<name>' is not gated by allw; passing through`                                              |
-| gated, verified verdict `decision === "approved"`                                                                                                                                                           | `allow`              | `allw: <summary> — approved by the human`                                                                |
+| non-gated tool (`Read`, `Grep`, `Glob`, `WebFetch`, …)                                                                                                                                                      | none (empty stdout)  | —                                                                                                        |
+| gated, verified verdict `decision === "approved"`                                                                                                                                                           | none (empty stdout)  | —                                                                                                        |
 | gated, verified verdict `denied` / `expired` / `aborted`                                                                                                                                                    | `deny`               | `allw: <summary> — not approved (verdict: <decision>)`                                                   |
 | gated, `ActionRecord` could not be built (malformed `tool_input`, invalid shell syntax, unparseable MCP name/params, malformed file-edit payload)                                                           | `deny`               | `allw: <reason> (fail-closed deny)` — reason names the specific field/shape problem                      |
 | gated, the built `ActionRecord` JSON was not in the expected shape (defense in depth; the core always emits a well-formed record)                                                                           | `deny`               | `allw: built ActionRecord was not in the expected shape (fail-closed deny)`                              |
@@ -181,81 +276,125 @@ equivalent field, nor should there be:
 | malformed hook stdin (not JSON, not an object, wrong `hook_event_name`, missing/non-string `tool_name`)                                                                                                     | `deny`               | `allw: hook input was not valid JSON (fail-closed deny)` (or the sibling reason for the specific defect) |
 | missing or invalid config (no `~/.allw/config.json` and no `ALLW_*` overrides, an invalid file, a malformed root key, a non-derived account id, or `ALLW_TIMEOUT_MS`/`ALLW_FETCH_TIMEOUT_MS` out of bounds) | `deny`               | `allw: no allw config found — … does not exist and ALLW_RELAY_URL is not set …` (or the sibling reason)  |
 | any unexpected internal error (defense in depth; the process-level catch-all in `cli.ts`'s `main()`)                                                                                                        | `deny`               | `allw: hook failed unexpectedly (fail-closed deny): <error message>`                                     |
+| the process reaches `beforeExit`/`exit`, or gets `SIGTERM`/`SIGINT`/`SIGHUP`, before `main()` decided (exit backstop, [#265](https://github.com/mike-north/allw/issues/265))                                | `deny`               | `allw: hook exited before reaching a decision (fail-closed deny)`                                        |
 
-A verdict becomes `allow` **only** when it is delivered, cryptographically verified against the
-approver's account-root key, bound to this exact request (WYSIWYS), fresh, and a human "yes" — the
-verification lives in the audited Rust core; the hook only maps the verified result onto the
-decision (`docs/contract.md` §Invariants #6).
+A gated call loses allw's `deny` **only** when its verdict is delivered, cryptographically
+verified against the approver's account-root key, bound to this exact request (WYSIWYS), fresh,
+and a human "yes" — the verification lives in the audited Rust core; the hook only maps the
+verified result onto the decision (`docs/contract.md` §Invariants #6). Even then the hook grants
+nothing: Claude Code's own permission rules still decide the call (see
+[After an approval](#after-an-approval-claude-codes-own-permissions-still-apply)).
+
+**Exit backstop.** Because empty stdout means "no objection", a process that exits _before_
+deciding must not read as one. The hook installs a backstop
+(`packages/hook/src/lib/decision-output.ts`, shared with `@allw/codex-hook`): if the process reaches
+Node's `beforeExit` or `exit` without `main()` having written its decision (the event loop drained
+while an approval was pending, the shape of [#254](https://github.com/mike-north/allw/issues/254); an
+uncaught exception; a stray `process.exit(n)`), or receives `SIGTERM`, `SIGINT` or `SIGHUP` while
+waiting, it prints the backstop `deny` above once and exits `0`. If the deny itself can't be
+written (stdout is gone), it exits `1` instead, never `0` with empty stdout, so `"onFailure":
+"block"` still blocks the call. The same holds when the hook's own decision fails part-way: it
+exits `1` and never appends a second decision after the partial one. What the process can't answer is covered in
+[Fail-Closed Analysis](#fail-closed-analysis).
+
+### After an approval: Claude Code's own permissions still apply
+
+With no hook decision, Claude Code evaluates the call exactly as it would without allw: deny rules
+block, ask rules prompt, allow rules and the permission mode decide the rest
+([Permissions](https://code.claude.com/docs/en/permissions#manage-permissions)). **allw only adds a
+gate; it never grants.** So in the default mode an approved `Bash` command can still show Claude
+Code's own prompt at the desk after you approved it on your phone.
+
+If you want the phone approval to be the only prompt for the gated tools, add allow rules for them
+in the same settings file as the hook:
+
+```json
+{
+  "permissions": {
+    "allow": ["Bash", "Edit", "MultiEdit", "Write", "mcp__<server>__*"],
+    "deny": ["Monitor", "PowerShell", "NotebookEdit"]
+  }
+}
+```
+
+> **Keep the `deny` rules whenever you add these allow rules.** A `Bash` allow rule also covers the
+> `Monitor` tool, which runs shell commands under your `Bash` rules
+> ([Monitor tool](https://code.claude.com/docs/en/tools-reference#monitor-tool)) and which allw
+> doesn't gate. An `Edit` allow rule also covers `NotebookEdit`
+> ([tool-specific rules](https://code.claude.com/docs/en/tools-reference#configure-tools-with-permission-rules-and-hooks)).
+> Without the deny rules, the agent could run any command through `Monitor`, or edit notebooks,
+> with no phone approval and no prompt at the desk.
+
+- An allow rule never overrides allw: a hook `deny` blocks the call even when an allow rule matches
+  ([Extend permissions with hooks](https://code.claude.com/docs/en/permissions#extend-permissions-with-hooks)).
+- MCP allow rules must name the server (`mcp__github__*`); an unanchored `mcp__*` allow rule is
+  skipped and approves nothing
+  ([MCP rules](https://code.claude.com/docs/en/permissions#mcp)). Add one per MCP
+  server you use.
+- The trade-off: these allow rules also apply when allw doesn't run. If the hook can't start, crashes
+  or times out, Claude Code treats that as a non-blocking error and the call proceeds without any
+  prompt, unless the hook sets `"onFailure": "block"` (Claude Code v2.1.295 or later; older versions
+  ignore the key without warning). Don't add these allow rules without it.
+- Your own deny and ask rules keep working on top of allw. An ask rule still prompts after a phone
+  approval.
 
 ## Fail-Closed Analysis
 
-`allw`'s fail-closed guarantee has two layers: what **the hook itself** always does, and what
-**Claude Code** does at the process boundary around it. The hook's own half is airtight by
-construction — every code path in the table above resolves to an explicit `allow`/`deny`, and
-`cli.ts`'s `main()` wraps the whole run in a catch-all that turns even an unanticipated internal
-throw into a parseable `deny`, still exiting `0` so Claude Code can read it as a decision rather
-than a hook error. The open question — the one this section answers precisely — is what happens
-when the hook process itself never gets that far: killed before it can write to stdout, or too slow
-to finish.
+`allw`'s fail-closed guarantee has two layers: what **the hook process** does, and what **Claude
+Code** does when the hook process doesn't finish normally.
 
-**Claude Code's own documented behavior at that boundary, per its exit-code and timeout contract**
-(verified against the [Claude Code hooks reference](https://code.claude.com/docs/en/hooks#exit-code-output),
-checked 2026-08-23; the `onFailure` rows re-checked 2026-11-02):
+**Inside the hook process.** Every path in the table above ends in either no decision or one
+`deny`, with exit `0`. `cli.ts`'s `main()` turns an unanticipated internal throw into a `deny`. The
+exit backstop covers the remaining early ends the process can still see: reaching `beforeExit` or
+`exit` without a decision (a drained event loop, an uncaught async exception, a stray
+`process.exit(n)`), and `SIGTERM`, `SIGINT` or `SIGHUP` while waiting. Each prints one `deny` and
+exits `0`.
 
-- **The hook can't start** (a wrong path, `node` missing from `PATH`, `npx --no-install` finding no
-  installed bin) → **a non-blocking error: the action goes ahead**, with a
-  `PreToolUse:<tool> hook error` notice in the transcript. The reference says so directly: "a hook
-  that can't start is a non-blocking error too." **Unless `"onFailure": "block"` is set**, in which
-  case Claude Code blocks the call ("failed; blocking because onFailure is \"block\"").
+**What the process can't answer:** `SIGKILL`, a native crash or `process.abort()`, running out of
+memory, a crash while loading modules before the backstop is installed, the hook never starting (a
+wrong path, `node` missing from `PATH`, `npx --no-install` finding no installed bin), and Claude
+Code's own `timeout`, after which Claude Code discards the hook's output. Each of these ends with
+no decision from allw. What happens next depends on `onFailure`.
 
-- **Exit `0` with valid decision JSON on stdout** → the JSON decides; this is the hook's own normal
-  path and is closed by construction.
-- **Exit `2`** → always blocks the tool call regardless of any JSON, "the one outcome JSON can't
-  override." `allw` deliberately does not rely on this path (see `packages/hook/README.md` and
-  `cli.ts`'s header comment) — it always emits a `deny` decision JSON on exit `0` instead, so its
-  fail-closed behavior never depends on this Claude-Code-specific mechanism.
-- **Any other exit code (including `0`) with invalid/absent JSON on stdout** (a crash, `SIGKILL`, a
-  script that can't start, or a bug that writes non-JSON) → **a non-blocking error: "the action
-  proceeds."** This is an unconditional fail-open — the tool call runs exactly as if the hook had
-  returned `allow`. With `"onFailure": "block"`, a crash, an exit code other than 0 or 2, or
-  unparseable / schema-invalid JSON blocks the call instead; plain-text or empty stdout on exit `0`
-  still proceeds (that is a success with no decision, not a failure).
-- **A `command` hook that exceeds its pinned `timeout`** → canceled; Claude Code discards its
-  output and the hook "renders no decision." Distinctly from the bullet above, a _timed-out_
-  `PreToolUse` hook "doesn't block the tool call. The call continues through **the normal
-  permission flow**" — i.e. it falls through to Claude Code's own permission system (mode/rules),
-  not to an unconditional proceed. In an interactive session with no matching allow rule, that
-  still surfaces Claude Code's own confirmation prompt to the person at the terminal; under
-  `bypassPermissions`, an existing allow rule, or a non-interactive/headless run, it silently
-  proceeds — full fail-open. With `"onFailure": "block"`, a timed-out hook blocks the call instead.
+**At the boundary** (the [Claude Code hooks reference](https://code.claude.com/docs/en/hooks#block-the-action-when-a-hook-fails),
+checked 2026-11-02):
 
-**Contrast with Codex** (`docs/codex-integration.md` §"Codex Hook Constraints"): Codex's documented
-contract is flatter — "a failed, malformed, or timed-out hook invocation is a non-blocking error;
-Codex reports the hook problem and continues the tool call," uniformly, for every failure mode
-including timeout. Claude Code's contract is **materially different on the timeout path
-specifically**: a crashed/malformed-output hook fails open exactly like Codex (an unconditional
-proceed), but a _timed-out_ hook falls through to Claude Code's own permission flow rather than a
-flat proceed — which can still put a human in front of the action in an interactive session (a
-different, weaker gate than allw's — no second device, no cryptographic binding, and skippable by
-`bypassPermissions` — but not a silent bypass). Both hosts share the same underlying residual this
-design cannot close from inside the hook process: if the process is killed, hangs before producing
-output, or is never started (a bad path in `settings.json`/`hooks.json`), the _governing_ host's
-gate is skipped and allw contributes nothing to that call. On Claude Code (v2.1.295 or later; older
-versions silently ignore the key),
-`"onFailure": "block"` closes this residual from the host side: a hook that can't start, crashes
-or times out blocks the call. Codex has no equivalent setting
-([`docs/codex-integration.md`](./codex-integration.md#if-the-hook-cant-start)), so on Codex the
-residual stands.
+- **With `"onFailure": "block"`** (Claude Code v2.1.295 or later; older versions silently ignore the
+  key, so check `claude --version`): Claude Code blocks the tool call, as exit `2` would, when the
+  hook can't start, exits with a code other than `0` or `2`, times out, or prints JSON it can't parse
+  or validate. A hook killed by a signal or a crash doesn't exit `0` or `2`, so it falls under that
+  rule (the reference doesn't name signals separately). Every failure above therefore blocks the
+  call. Empty or plain-text stdout on exit `0` is a success, not a failure, and still proceeds: that
+  is allw's "no decision".
+- **Without it**, each of those failures is a _non-blocking error_ and the action goes ahead: "a
+  hook that can't start is a non-blocking error too", and a timed-out `PreToolUse` hook "doesn't
+  block the tool call. The call continues through the normal permission flow." A crashed hook is
+  then **indistinguishable from a hook that made no decision**: the call goes on to Claude Code's
+  own permission rules and mode, exactly as an approved call does. Whether a human sees it depends
+  on those alone. Default mode with no matching allow rule still shows Claude Code's prompt at the
+  desk. An allow rule for the tool (see
+  [After an approval](#after-an-approval-claude-codes-own-permissions-still-apply)), `auto`,
+  `bypassPermissions` or a non-interactive run lets it run with no human prompt at all.
 
-This residual is exactly why the [timeout-ordering invariant (issue #52)](https://github.com/mike-north/allw/issues/52)
-exists and is enforced twice over, identically for both hooks: the install block pins the hook
+So the recommended config always sets `"onFailure": "block"`, and you shouldn't add allow rules for
+the gated tools without it. allw never relies on exit `2` itself: it always reports a `deny` as JSON
+on exit `0`, so its own decisions never depend on that mechanism.
+
+**Contrast with Codex** (`docs/codex-integration.md` §"Codex Hook Constraints"): "a failed,
+malformed, or timed-out hook invocation is a non-blocking error; Codex reports the hook problem and
+continues the tool call," uniformly, and Codex has no `onFailure` equivalent
+([`docs/codex-integration.md`](./codex-integration.md#if-the-hook-cant-start)). On Codex the
+residual stands: a hook that is killed, hangs past its timeout or never starts contributes nothing
+to that call.
+
+The timeout residual, on Codex and on Claude Code without `onFailure`, is why the
+[timeout-ordering invariant (issue #52)](https://github.com/mike-north/allw/issues/52) exists and is enforced twice over, identically for both hooks: the install block pins the hook
 `timeout` to `480` seconds (`PINNED_HOOK_TIMEOUT_MS`), and `readConfig` rejects any
 `ALLW_TIMEOUT_MS` at or above `420000` ms (`MAX_TIMEOUT_MS`) as a fail-closed `deny` at
 config-read time — never a silent clamp. So long as the hook process starts at all, the SDK's own
 deadline (plus its bounded per-relay-fetch timeouts, capped by `ALLW_FETCH_TIMEOUT_MS` ≤ `30000` ms)
 resolves to an explicit `deny` with 60 seconds of margin before Claude Code's pinned timeout could
-ever fire — keeping the "hook times out" bullet above a designed-against edge case, not the common
-path.
+ever fire, so a hook timeout is an edge case the design guards against, not the common path.
 
 ## Permission-Mode Interactions
 
@@ -282,41 +421,43 @@ composes with these modes:
    critical-path `rm`/`rmdir` circuit-breaker is stated to override a hook `"allow"` "even in modes
    that skip other prompts" — implying the hook is consulted in those modes too, not bypassed.
 2. **A hook `deny` — or an exit-`2` block — is decisive and is not overridable by an allow rule or
-   a permissive mode**; conversely, **an explicit `ask`/`deny` permission _rule_ the user configured
-   separately from allw still applies even after allw's hook returns `allow`** ("[h]ook decisions
-   don't bypass permission rules. Claude Code evaluates deny and ask rules regardless of what a
-   PreToolUse hook returns"). So a hook `allow` can be layered under an additional Claude-Code-level
-   prompt the human configured — it is a floor, not a ceiling, on what still requires confirmation.
+   a permissive mode.** allw's only decision is `deny`, so this is the whole of its effect.
 
-Two consequences for `allw` specifically:
+Because allw makes **no decision** on an approval or a pass-through, every mode then behaves exactly
+as it would without allw for that call. Consequences for `allw` specifically:
 
-- Because `allw` only ever emits `allow`/`deny` (never `ask`), it never itself triggers "a hook's
-  `ask` forces a permission prompt even in auto mode" — that's a capability the Claude Code contract
-  offers hook authors, but `allw`'s v1 design doesn't use it: an approval is either a verified human
-  "yes" on the paired device, or the call is denied.
-- `allw`'s own `allow` is **not absolute**: a fixed, mode-independent list of actions —
-  ["actions no mode auto-approves"](https://code.claude.com/docs/en/permission-modes#actions-no-mode-auto-approves) —
-  is never auto-approved by _any_ `PreToolUse` hook `"allow"`, including allw's. This covers an
-  explicit user-configured `ask` rule match, the built-in `AskUserQuestion` tool, MCP tools marked
-  `requiresUserInteraction`, and `rm`/`rmdir` targeting a critical path. None of these overlap with
-  what `allw` v1 gates today (`Bash`, `Edit`/`Write`/`MultiEdit`, `mcp__*`) in a way that changes the
-  decision itself, but a human may still see Claude Code's own confirmation on top of an allw
-  approval for a critical-path deletion — this is Claude Code's own circuit breaker, not something
-  `allw`'s hook can (or should) suppress.
+- **allw never loosens a mode.** In `default` mode an approved `Bash` call can still get Claude
+  Code's own prompt; in `acceptEdits` an approved edit inside the working directory runs without one;
+  in `bypassPermissions` everything allw doesn't deny runs. See
+  [After an approval](#after-an-approval-claude-codes-own-permissions-still-apply) for allow rules
+  that make the phone the only prompt.
+- **`dontAsk` mode denies an approved call unless an allow rule covers it.** `dontAsk` runs only
+  pre-approved tools (allow rules, read-only Bash, or a hook `allow`), and allw never emits `allow`.
+  Add `permissions.allow` rules for the gated tools if you use `dontAsk`.
+- Because `allw` only ever emits `deny` (never `ask`), it never itself triggers "a hook's `ask`
+  forces a permission prompt even in auto mode" — an approval is either a verified human "yes" on
+  the paired device, or the call is denied.
+- Claude Code's own circuit breakers stay in place:
+  ["actions no mode auto-approves"](https://code.claude.com/docs/en/permission-modes#actions-no-mode-auto-approves)
+  (an explicit `ask` rule match, `AskUserQuestion`, MCP tools marked `requiresUserInteraction`,
+  `rm`/`rmdir` on a critical path) still prompt after an allw approval.
 
 ## Claude Code Hook Constraints
 
-This design depends on the current Claude Code hooks contract, checked on 2026-08-23:
+This design depends on the current Claude Code hooks contract, checked on 2026-08-23 (`onFailure`,
+timeouts and matcher rules re-checked 2026-11-02):
 
 - Hook commands receive one JSON object on stdin (event-specific fields plus common fields like
   `cwd`, `permission_mode`, `hook_event_name`) and communicate results through exit codes, stdout,
   and stderr.
 - `PreToolUse` fires before a tool call executes and can `allow`/`deny`/`ask`/`defer` it via
   `hookSpecificOutput.permissionDecision`; `deny`/`defer`/`ask` outrank `allow` when multiple
-  `PreToolUse` hooks disagree (precedence: `deny` > `defer` > `ask` > `allow`).
+  `PreToolUse` hooks disagree (precedence: `deny` > `defer` > `ask` > `allow`). allw uses only
+  `deny`, so it outranks every other hook's decision and never overrides one.
 - Matcher patterns for `PreToolUse` are evaluated against `tool_name`: a name made only of letters,
   digits, `_`/`-`/spaces/`,`/`|` is an exact-match list; anything else (including a trailing `.*`)
-  is an unanchored JavaScript regular expression.
+  is an unanchored JavaScript regular expression, so `Edit.*` also matches `NotebookEdit`. allw's
+  recommended matcher anchors each name with `^…$` for that reason.
 - All matching hooks (from every settings source — user, project, local, managed, plugin) run in
   parallel.
 - **As of 2026, Claude Code hook handlers also support `type: "http"` (POST the event JSON to a

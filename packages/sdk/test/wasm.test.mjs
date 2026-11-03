@@ -2429,6 +2429,114 @@ test("select_recipients throws — never returns [] — when no recipient set is
   }
 });
 
+// ── Sealing to root-vouched recipients (#243) ───────────────────────────────────────
+// @see crates/allw-core/src/sealing.rs (one core call: select, then encrypt)
+// @see https://www.rfc-editor.org/rfc/rfc7516 §7.2 (General JWE JSON Serialization)
+
+/** The JWE recipient `kid`s, in order (RFC 7516 §7.2.1 `recipients[].header.kid`). */
+function recipientKids(ciphertext) {
+  return JSON.parse(ciphertext).recipients.map((r) => r.header.kid);
+}
+
+test("seal_context_for_account_state encrypts only to the vouched devices in the Rust vector", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  const sealed = JSON.parse(
+    wasm.seal_context_for_account_state(
+      v.context_json,
+      v.seal_account_states_json,
+      v.expected_account_id_for_root,
+      v.approver_root_pubkey_b64,
+      v.recipient_now_ms,
+      v.seal_sequence,
+    ),
+  );
+  // Spec: the seal reports the sequence it selected from, and its recipients are the selection.
+  assert.equal(sealed.sequence, v.seal_sequence);
+  const expected = JSON.parse(v.seal_expected_recipient_ids_json);
+  assert.deepEqual(recipientKids(sealed.ciphertext), expected);
+  assert.deepEqual(expected, ["laptop", "phone"]);
+
+  const seeds = JSON.parse(v.seal_x25519_seeds_json);
+  for (const id of expected) {
+    assert.deepEqual(
+      JSON.parse(wasm.decrypt_context(sealed.ciphertext, id, seeds[id])),
+      JSON.parse(v.context_json),
+      `${id} opens the sealed context`,
+    );
+  }
+  // The revoked device, the expired one, and a key the root never vouched for (listed only in a
+  // stale sequence) get no recipient entry.
+  for (const id of ["old", "injected", "expired"]) {
+    assert.throws(
+      () => wasm.decrypt_context(sealed.ciphertext, id, seeds[id]),
+      /no recipient header kid matches/,
+      id,
+    );
+  }
+});
+
+test("seal_context_for_account_state reports the selected sequence, not the caller's floor", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  // Spec (sealing.rs): `sequence` is the highest verified sequence the recipients came from; the
+  // caller persists it as its floor, so returning the floor itself would let a rollback through.
+  for (const floor of [1, undefined]) {
+    const sealed = JSON.parse(
+      wasm.seal_context_for_account_state(
+        v.context_json,
+        v.seal_account_states_json,
+        v.expected_account_id_for_root,
+        v.approver_root_pubkey_b64,
+        v.recipient_now_ms,
+        floor,
+      ),
+    );
+    assert.equal(sealed.sequence, 3, `floor ${String(floor)}`);
+  }
+});
+
+test("seal_context_for_account_state throws, encrypting nothing, when no recipient set is allowed", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  const seal = (states, floor = undefined, nowMs = v.recipient_now_ms, ctx = v.context_json) =>
+    wasm.seal_context_for_account_state(
+      ctx,
+      states,
+      v.expected_account_id_for_root,
+      v.approver_root_pubkey_b64,
+      nowMs,
+      floor,
+    );
+  assert.throws(() => seal("[]"), /no account-state document/);
+  assert.throws(
+    () => seal(v.seal_account_states_json, v.seal_sequence + 1),
+    /highest account-state sequence 3 is below the required floor 4/,
+  );
+  assert.throws(
+    () => seal(v.seal_account_states_json, undefined, -1),
+    /now_ms must be a non-negative/,
+  );
+  assert.throws(() => seal(v.seal_account_states_json, -1), /min_sequence must be a non-negative/);
+  assert.throws(
+    () => seal(v.seal_account_states_json, undefined, v.recipient_now_ms, "{}"),
+    /ApprovalContext/,
+  );
+  const otherRoot = wasm.ed25519_public_key(Buffer.alloc(32, 0x33).toString("base64url"));
+  assert.throws(
+    () =>
+      wasm.seal_context_for_account_state(
+        v.context_json,
+        v.seal_account_states_json,
+        v.expected_account_id_for_root,
+        otherRoot,
+        v.recipient_now_ms,
+        undefined,
+      ),
+    /did not verify/,
+  );
+});
+
 /**
  * A verified non-approval is reported structurally, never through the message (#311). For each
  * genuinely signed non-approval in the shared vector, both verify functions throw an `Error` whose
