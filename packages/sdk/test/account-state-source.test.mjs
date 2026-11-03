@@ -323,13 +323,14 @@ test("floor: read() with no state directory yet is first use, not an error", asy
 test("floor: racing writer processes never lose the highest value", async () => {
   // One writer records TOP once while six others spam lower values (review F4). Without the lock,
   // a spammer that read the floor before TOP landed renames its lower value over it; spreading the
-  // spam across the TOP write makes that clobber window wide, so a missing lock is caught every
-  // round rather than now and then.
+  // spam across the TOP write makes that clobber window wide. A single round can still miss a
+  // missing lock (about one in five), so five rounds bring a miss well under 1%; with the lock in
+  // place every round is deterministic.
   const writer = join(here, "fixtures", "floor-writer.mjs");
   const SPAMMERS = 6;
   const PER_SPAMMER = 150;
   const TOP = 100_000;
-  for (let round = 0; round < 3; round++) {
+  for (let round = 0; round < 5; round++) {
     const dir = tempDir();
     const spam = Array.from({ length: SPAMMERS }, (_, w) =>
       run(process.execPath, [
@@ -435,6 +436,54 @@ test("floor: a writer whose lock was taken over fails closed and leaves the newe
     "other writer\n",
     "the other writer's lock survives release",
   );
+});
+
+// Filesystems reuse inode numbers: on Linux (ext4, tmpfs) a lock unlinked and re-created by
+// another writer often gets the very inode the old one had, so inode identity alone cannot tell
+// the two locks apart. These rewrite the lock in place, which keeps its inode on every platform,
+// to stand in for that reuse.
+test("floor: a writer whose lock was re-taken under a reused inode fails closed (inode reuse)", async () => {
+  const dir = tempDir();
+  writeFloorFile(dir, { v: 1, account_id: ACCOUNT_ID, sequence: 3 });
+  const lock = `${floorPath(dir)}.lock`;
+  let inoBefore;
+  const store = fileSequenceFloorStoreWith(
+    { accountId: ACCOUNT_ID, dir },
+    {
+      afterLockAcquired: () => {
+        inoBefore = statSync(lock).ino;
+        writeFileSync(lock, "other writer\n", { mode: 0o600 }); // same inode, another holder
+      },
+    },
+  );
+  await assert.rejects(
+    () => store.raise(9),
+    (err) => err instanceof SequenceFloorError && /taken over by another writer/.test(err.message),
+  );
+  assert.equal(statSync(lock).ino, inoBefore, "the takeover really reused the inode");
+  assert.equal(
+    await fileSequenceFloorStore({ accountId: ACCOUNT_ID, dir }).read(),
+    3,
+    "not written",
+  );
+  assert.equal(readFileSync(lock, "utf8"), "other writer\n", "the other writer's lock survives");
+});
+
+test("floor: a breaker tells a fresh lock from the stale one under a reused inode (inode reuse)", () => {
+  const dir = tempDir();
+  const lock = `${floorPath(dir)}.lock`;
+  writeFileSync(lock, "L0 crashed\n", { mode: 0o600 });
+  const old = new Date(NOW_MS - 120_000);
+  utimesSync(lock, old, old);
+  breakLockIfStale(lock, () => NOW_MS, {
+    afterJudgedStale: () => {
+      // C's fresh lock lands on L0's inode, and even its mtime matches; only the content differs.
+      writeFileSync(lock, "L1 C\n", { mode: 0o600 });
+      utimesSync(lock, old, old);
+    },
+  });
+  assert.equal(readFileSync(lock, "utf8"), "L1 C\n", "C's lock is given back, not deleted");
+  assert.deepEqual(readdirSync(dir), [`${ACCOUNT_ID}.floor.json.lock`], "no .stale file left");
 });
 
 test("floor: a stale lock from a crashed writer is broken", async () => {

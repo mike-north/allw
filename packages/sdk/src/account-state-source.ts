@@ -41,6 +41,7 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  readFileSync,
   renameSync,
   statSync,
   unlinkSync,
@@ -301,6 +302,9 @@ function writeFloorAtomically(
       closeSync(fd);
     }
     beforeCommit();
+    // Residual (bounded): a breaker can still take the lock in the microseconds between this check
+    // and the rename. That needs this writer stalled 30 s while holding the lock, and the worst case
+    // is the floor falling back to a sequence this machine already accepted, never to one it did not.
     renameSync(tmp, path);
   } catch (cause) {
     try {
@@ -313,7 +317,12 @@ function writeFloorAtomically(
   }
 }
 
-/** A floor lock this writer holds, identified by the lock file's device and inode. */
+/**
+ * A floor lock this writer holds. It is identified by the lock file's device and inode **and** a
+ * random token written into it: filesystems reuse inode numbers (ext4 and tmpfs routinely hand a
+ * just-freed inode to the next file created), so a lock broken and re-taken by another writer can
+ * have the same inode as ours. The token is what tells them apart.
+ */
 interface HeldLock {
   /** Whether the file at the lock path is still this writer's lock (not broken and replaced). */
   stillHeld(): boolean;
@@ -337,10 +346,11 @@ async function acquireLock(
   for (;;) {
     try {
       const fd = openSync(lockPath, "wx", 0o600);
+      const token = `${String(process.pid)} ${randomUUID()}\n`;
       let ino: number;
       let dev: number;
       try {
-        writeSync(fd, `${String(process.pid)}\n`);
+        writeSync(fd, token);
         ({ ino, dev } = fstatSync(fd));
       } finally {
         closeSync(fd);
@@ -348,7 +358,8 @@ async function acquireLock(
       const stillHeld = (): boolean => {
         try {
           const current = lstatSync(lockPath);
-          return current.ino === ino && current.dev === dev;
+          if (current.ino !== ino || current.dev !== dev) return false;
+          return readFileSync(lockPath, "utf8") === token;
         } catch {
           return false;
         }
@@ -398,8 +409,10 @@ export function breakLockIfStale(
   hooks: LockBreakHooks = {},
 ): void {
   let stale;
+  let staleContent: string;
   try {
     stale = statSync(lockPath);
+    staleContent = readFileSync(lockPath, "utf8");
   } catch {
     return; // Released meanwhile.
   }
@@ -414,13 +427,23 @@ export function breakLockIfStale(
   hooks.afterMovedAside?.();
   try {
     const moved = statSync(aside);
-    if (moved.ino !== stale.ino || moved.dev !== stale.dev || moved.mtimeMs !== stale.mtimeMs) {
+    // Inode numbers are reused, so a fresh lock can match the stale one's inode; its content (each
+    // holder's random token) and mtime still differ.
+    if (
+      moved.ino !== stale.ino ||
+      moved.dev !== stale.dev ||
+      moved.mtimeMs !== stale.mtimeMs ||
+      readFileSync(aside, "utf8") !== staleContent
+    ) {
       // We moved a fresh lock that replaced the stale one: give it back to its owner, but never
       // over a newer lock (EEXIST leaves the newer one in place).
       try {
         linkSync(aside, lockPath);
       } catch {
         // A newer lock exists; the moved lock's owner will find it lost and fail closed.
+        // Residual: if that newer lock is then released, the account has no holder for a moment,
+        // and a lock left ownerless by a mis-judged move denies writes (fail-closed) until it
+        // turns stale, at most 30 s.
       }
     }
     unlinkSync(aside);
