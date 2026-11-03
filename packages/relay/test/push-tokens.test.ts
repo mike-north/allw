@@ -123,7 +123,7 @@ async function readRows(accountId: string, deviceId?: string): Promise<StoredRow
 
 async function seedRows(
   accountId: string,
-  rows: ReadonlyArray<{ device_id: string; transport: string; token: string }>,
+  rows: ReadonlyArray<{ device_id: string; transport: string; token: string; created_at?: number }>,
 ): Promise<void> {
   await runInDurableObject(accountStub(accountId), (instance: AccountRelay) => {
     const { sql } = instance as unknown as { sql: SqlStorage };
@@ -133,7 +133,7 @@ async function seedRows(
         row.device_id,
         row.transport,
         row.token,
-        SEEDED_AT,
+        row.created_at ?? SEEDED_AT,
       );
     }
   });
@@ -439,6 +439,31 @@ describe("APNs tokens are stored in one canonical, lowercase spelling (#304)", (
     ]);
     // Idempotent: running again changes nothing.
     expect(await readRows(acct)).toEqual(once);
+  });
+
+  it("keeps the earliest registration when the migration collapses spellings (review-335)", async () => {
+    const acct = testAccount("acct-apns-case-migrate-earliest");
+    const lowerFirst = "dev-apns-case-lower-earlier";
+    const upperFirst = "dev-apns-case-upper-earlier";
+    await seedRows(acct, [
+      // Inserted first (lower rowid) but registered later: rowid alone would keep created_at 100.
+      { device_id: lowerFirst, transport: "apns", token: UPPER, created_at: 100 },
+      { device_id: lowerFirst, transport: "apns", token: APNS_TOKEN, created_at: 50 },
+      // The reverse: the earlier registration is the non-canonical spelling.
+      { device_id: upperFirst, transport: "apns", token: APNS_TOKEN, created_at: 100 },
+      { device_id: upperFirst, transport: "apns", token: UPPER, created_at: 50 },
+    ]);
+
+    await runInDurableObject(accountStub(acct), (_instance: AccountRelay, state) => {
+      new AccountRelay(state, env as unknown as Env);
+    });
+
+    expect(await readRows(acct, lowerFirst)).toEqual([
+      { device_id: lowerFirst, transport: "apns", token: APNS_TOKEN, created_at: 50 },
+    ]);
+    expect(await readRows(acct, upperFirst)).toEqual([
+      { device_id: upperFirst, transport: "apns", token: APNS_TOKEN, created_at: 50 },
+    ]);
   });
 });
 

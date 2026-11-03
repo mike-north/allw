@@ -731,15 +731,24 @@ export class AccountRelay implements DurableObject {
     `);
     // APNs tokens are stored lowercase (#304). Rows stored before that may be in any case: keep one
     // row per device and token ignoring case (two spellings would collide once lowercased), then
-    // lowercase what is left. Idempotent; on an already-canonical table both statements change
-    // nothing.
+    // lowercase what is left. The survivor is the earliest registration (lowest created_at, rowid
+    // breaking ties), so the token keeps the created_at of when the device first registered it.
+    // Idempotent; on an already-canonical table both statements change nothing.
     this.sql.exec(`
       DELETE FROM device_push_token
       WHERE transport = 'apns'
-        AND rowid NOT IN (
-          SELECT MIN(rowid) FROM device_push_token
-          WHERE transport = 'apns'
-          GROUP BY device_id, lower(token)
+        AND EXISTS (
+          SELECT 1 FROM device_push_token AS earlier
+          WHERE earlier.transport = 'apns'
+            AND earlier.device_id = device_push_token.device_id
+            AND lower(earlier.token) = lower(device_push_token.token)
+            AND (
+              earlier.created_at < device_push_token.created_at
+              OR (
+                earlier.created_at = device_push_token.created_at
+                AND earlier.rowid < device_push_token.rowid
+              )
+            )
         );
 
       UPDATE device_push_token SET token = lower(token)
