@@ -60,6 +60,7 @@ import {
   createLocalPairingStore,
   mountPairingGate,
   mountRelayRepairGate,
+  type DisplayEscape,
   type PairedIdentity,
   type PairingStore,
   type RejectedRelayPin,
@@ -74,7 +75,7 @@ import {
 import { createBrowserRuntime } from "./runtime.js";
 import { createLocalAccountStateFloorStore } from "./sequence-floor.js";
 import { createLocalSurfaceIdStore, resolveSurfaceId } from "./surface-id.js";
-import type { WasmModuleSource } from "./wasm.js";
+import { initWasm, type WasmModuleSource } from "./wasm.js";
 
 /** The default poll interval for the live inbox once mounted (matches `relay-poll.ts`'s default). */
 const POLL_INTERVAL_MS = 2_000;
@@ -119,6 +120,13 @@ export interface BootEnvironment {
   readonly search: string;
   /** Load WASM and mount the live inbox for a paired identity, against its pinned relay. */
   readonly startInbox: (root: HTMLElement, identity: PinnedIdentity) => Promise<unknown>;
+  /**
+   * Load the core's display escape (#246) for the re-pair screen (#286), which shows a stored relay
+   * string before the inbox (and so before the runtime) loads. Production initializes the vendored
+   * WASM core, which is memoized and reused by the inbox. When omitted, or when it rejects, the
+   * re-pair screen withholds the pin text rather than print it unescaped.
+   */
+  readonly loadDisplayEscape?: () => Promise<DisplayEscape>;
 }
 
 /**
@@ -194,10 +202,27 @@ function confirmRelayRepair(
   root: HTMLElement,
   pairingStore: PairingStore,
   rejected: RejectedRelayPin,
+  escapeForDisplay: DisplayEscape | null,
 ): Promise<void> {
   return new Promise((resolve) => {
-    mountRelayRepairGate({ root, pairingStore, rejected, onResolved: resolve });
+    mountRelayRepairGate({ root, pairingStore, rejected, escapeForDisplay, onResolved: resolve });
   });
+}
+
+/** The core display escape from `env`, or `null` when it is not provided or fails to load. */
+async function loadDisplayEscape(env: BootEnvironment): Promise<DisplayEscape | null> {
+  if (env.loadDisplayEscape === undefined) return null;
+  try {
+    return await env.loadDisplayEscape();
+  } catch {
+    return null;
+  }
+}
+
+/** The core's `escape_for_display`, from the vendored WASM (memoized; the inbox reuses it). */
+async function loadVendoredDisplayEscape(): Promise<DisplayEscape> {
+  const wasm = await initWasm(await VENDORED_WASM.loadGlue(), VENDORED_WASM.moduleSource);
+  return (text) => wasm.escape_for_display(text);
 }
 
 /**
@@ -256,8 +281,10 @@ export async function boot(env: BootEnvironment): Promise<void> {
   const pairingStore = createLocalPairingStore(storage);
   let loaded = pairingStore.load();
   let repairing = false;
+  let escapeForDisplay: DisplayEscape | null = null;
   if (loaded.status === "relay-pin-rejected") {
-    await confirmRelayRepair(root, pairingStore, loaded);
+    escapeForDisplay = await loadDisplayEscape(env);
+    await confirmRelayRepair(root, pairingStore, loaded, escapeForDisplay);
     repairing = true;
     loaded = pairingStore.load();
   }
@@ -273,7 +300,12 @@ export async function boot(env: BootEnvironment): Promise<void> {
         : await resolveRepairRelayUrl(env);
     const ignored = describeIgnoredRelayOverride(env.search, relayUrl);
     if (ignored !== null) {
-      mountIgnoredRelayNotice({ host: env.noticeHost, ignored, pinnedRelayUrl: relayUrl });
+      mountIgnoredRelayNotice({
+        host: env.noticeHost,
+        ignored,
+        pinnedRelayUrl: relayUrl,
+        repairing: stored === null,
+      });
     }
   } else {
     relayUrl = await resolveCandidateRelayUrl(env);
@@ -286,6 +318,7 @@ export async function boot(env: BootEnvironment): Promise<void> {
       // A new pairing (including "Use another device") pins this relay; a returning device keeps
       // the relay already pinned in its stored identity.
       relayUrl,
+      ...(escapeForDisplay === null ? {} : { escapeForDisplay }),
       onPaired: (identity) => {
         // Fail-closed: the gate always pins `relayUrl` above and a stored identity was bound
         // before the gate mounted, so an unpinned identity here is a programming error — never
@@ -316,6 +349,7 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
     storage: window.localStorage,
     search: window.location.search,
     startInbox: bootInbox,
+    loadDisplayEscape: loadVendoredDisplayEscape,
   });
 }
 

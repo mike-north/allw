@@ -33,7 +33,13 @@ import test, { afterEach, beforeEach, describe } from "node:test";
 import { JSDOM } from "jsdom";
 
 import { boot, bootInbox } from "../dist/app.js";
-import { INSECURE_RELAY_URL_REASON, RELAY_URL_STORAGE_KEY } from "../dist/index.js";
+import {
+  INSECURE_RELAY_URL_REASON,
+  RELAY_URL_STORAGE_KEY,
+  WITHHELD_PIN_TEXT,
+} from "../dist/index.js";
+
+import { loadTestWasm } from "./wasm-helper.mjs";
 
 const PAIRING_KEY = "allw:pairing:v1";
 const ONBOARDING_KEY = "allw:onboarding:v1";
@@ -105,8 +111,17 @@ afterEach(() => {
   globalThis.WebSocket = saved.WebSocket;
 });
 
-/** Boot with `search` + `storage`, recording every identity handed to the inbox. */
-async function bootWith({ search, storage }) {
+/** Load the real core's `escape_for_display` (#246) from the vendored WASM, as production does. */
+async function loadCoreDisplayEscape() {
+  const wasm = await loadTestWasm();
+  return (text) => wasm.escape_for_display(text);
+}
+
+/**
+ * Boot with `search` + `storage`, recording every identity handed to the inbox. The re-pair
+ * screen's display escape comes from the real core unless `loadDisplayEscape` overrides it.
+ */
+async function bootWith({ search, storage, loadDisplayEscape = loadCoreDisplayEscape }) {
   const document = dom.window.document;
   const root = document.getElementById("app");
   const noticeHost = document.getElementById("notices");
@@ -119,6 +134,7 @@ async function bootWith({ search, storage }) {
     startInbox: async (_root, identity) => {
       inboxStarts.push(identity);
     },
+    loadDisplayEscape,
   });
   return { root, noticeHost, inboxStarts };
 }
@@ -290,6 +306,7 @@ describe("boot — stored identity pinned to a relay this build rejects (#286)",
 
     const bootPromise = bootWith({ search: relayQuery(EVIL_RELAY), storage });
     const root = dom.window.document.getElementById("app");
+    await waitFor(() => root.querySelector(".pairing-kicker"));
 
     assert.equal(root.querySelector(".pairing-kicker").textContent, "Re-pair required");
     assert.equal(root.querySelector(".pairing-relay-url").textContent, "http://[::1]:8787");
@@ -307,7 +324,10 @@ describe("boot — stored identity pinned to a relay this build rejects (#286)",
     // reported, and never persisted; the already-persisted candidate is the relay shown.
     assert.equal(root.querySelector(".pairing-relay-url").textContent, LOOPBACK_CANDIDATE);
     assert.equal(storage.getItem(RELAY_URL_STORAGE_KEY), LOOPBACK_CANDIDATE);
-    assert.ok(noticeHost.querySelector(".relay-pin-notice"), "the ignored link is reported");
+    const notice = noticeHost.querySelector(".relay-pin-notice");
+    assert.ok(notice, "the ignored link is reported");
+    assert.match(notice.textContent, /is re-pairing with http:\/\/127\.0\.0\.1:8787/);
+    assert.doesNotMatch(notice.textContent, /is paired with/, "not paired yet on this visit");
     assert.equal(inboxStarts.length, 0, "the rejected identity never reaches the inbox");
     assert.deepEqual(networkAttempts, []);
   });
@@ -320,6 +340,7 @@ describe("boot — stored identity pinned to a relay this build rejects (#286)",
 
     const bootPromise = bootWith({ search: "", storage });
     const root = dom.window.document.getElementById("app");
+    await waitFor(() => root.querySelector(".pairing-kicker"));
     assert.equal(root.querySelector(".pairing-kicker").textContent, "Re-pair required");
 
     // Another tab re-pairs meanwhile and saves a new, valid identity.
@@ -346,6 +367,7 @@ describe("boot — stored identity pinned to a relay this build rejects (#286)",
 
     void bootWith({ search: "", storage });
     const root = dom.window.document.getElementById("app");
+    await waitFor(() => root.querySelector(".pairing-kicker"));
 
     assert.equal(root.querySelector(".pairing-kicker").textContent, "Re-pair required");
     assert.equal(root.querySelector("form.relay-config-form"), null, "no relay prompt yet");
@@ -356,6 +378,59 @@ describe("boot — stored identity pinned to a relay this build rejects (#286)",
 
     assert.equal(storage.getItem(PAIRING_KEY), null);
     assert.ok(root.querySelector("form.relay-config-form"), "now the relay prompt is shown");
+    assert.deepEqual(networkAttempts, []);
+  });
+
+  test("a hostile pin is rendered through the core escape, never raw", async () => {
+    const storage = memoryStorage();
+    storage.setItem(ONBOARDING_KEY, "1");
+    storage.setItem(
+      PAIRING_KEY,
+      JSON.stringify({ ...PINNED_IDENTITY, relayUrl: "http://evil\u202Eexample.com\u001B" }),
+    );
+
+    void bootWith({ search: "", storage });
+    const root = dom.window.document.getElementById("app");
+    await waitFor(() => root.querySelector(".pairing-relay-url"));
+
+    // crates/allw-core/src/display.rs: bidi controls → ⟨U+XXXX⟩, C0 controls → backslash escapes.
+    assert.equal(
+      root.querySelector(".pairing-relay-url").textContent,
+      "http://evil⟨U+202E⟩example.com\\x1b",
+    );
+    assert.ok(!root.textContent.includes("\u202E"), "no raw bidi override on screen");
+    assert.ok(!root.textContent.includes("\u001B"), "no raw ESC on screen");
+    assert.deepEqual(networkAttempts, []);
+  });
+
+  test("if the core fails to load, the pin is withheld and the confirm still re-pairs", async () => {
+    const storage = memoryStorage();
+    storage.setItem(ONBOARDING_KEY, "1");
+    storage.setItem(
+      PAIRING_KEY,
+      JSON.stringify({ ...PINNED_IDENTITY, relayUrl: "http://evil\u202Eexample.com" }),
+    );
+    storage.setItem(RELAY_URL_STORAGE_KEY, LOOPBACK_CANDIDATE);
+
+    const bootPromise = bootWith({
+      search: "",
+      storage,
+      loadDisplayEscape: () => Promise.reject(new Error("the WASM core did not load")),
+    });
+    const root = dom.window.document.getElementById("app");
+    await waitFor(() => root.querySelector(".pairing-kicker"));
+
+    assert.equal(root.querySelector(".pairing-kicker").textContent, "Re-pair required");
+    assert.equal(root.querySelector(".pairing-relay-url").textContent, WITHHELD_PIN_TEXT);
+    assert.ok(!root.textContent.includes("evil"), "no part of the pin is printed");
+
+    click(root, confirmLabel);
+    const { inboxStarts } = await bootPromise;
+
+    assert.equal(storage.getItem(PAIRING_KEY), null, "cleared on confirmation");
+    assert.ok(root.querySelector("form.pairing-form"), "then the browser pairs again");
+    assert.equal(root.querySelector(".pairing-relay-url").textContent, LOOPBACK_CANDIDATE);
+    assert.equal(inboxStarts.length, 0);
     assert.deepEqual(networkAttempts, []);
   });
 

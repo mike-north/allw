@@ -25,18 +25,19 @@
  */
 
 import assert from "node:assert/strict";
-import test, { describe } from "node:test";
+import test, { before, describe } from "node:test";
 
 import { JSDOM } from "jsdom";
 
 import {
   INSECURE_RELAY_URL_REASON,
+  WITHHELD_PIN_TEXT,
   createLocalPairingStore,
   mountPairingGate,
 } from "../dist/index.js";
-// Internal to the package (a stopgap until the core display model lands, #246/#259).
-import { visiblyEscape } from "../dist/pairing.js";
 import { mountWebApprover } from "../dist/browser.js";
+
+import { loadTestWasm } from "./wasm-helper.mjs";
 
 // ── Fixed clock (never Date.now() in test data) ───────────────────────────
 
@@ -653,7 +654,11 @@ describe("createLocalPairingStore — pinned relay (#249)", () => {
     );
     const loaded = createLocalPairingStore(storage).load();
     assert.equal(loaded.status, "relay-pin-rejected");
-    assert.match(loaded.reason, /canonical form \(https:\/\/relay\.example\.com\)/);
+    // The reason is fixed text: it is shown unescaped, so it never embeds the (untrusted) pin.
+    assert.equal(
+      loaded.reason,
+      "This version stores relay URLs in canonical form, and this pin is not in that form.",
+    );
   });
 
   for (const [label, pin] of [
@@ -766,29 +771,24 @@ describe("mountPairingGate — relay shown and pinned at pairing (#249)", () => 
 
 // ── Re-pair required: a stored pin this build rejects (#286) ─────────────
 
-describe("visiblyEscape (#286)", () => {
-  test("keeps printable ASCII unchanged", () => {
-    assert.equal(visiblyEscape("http://[::1]:8787/a?b#c"), "http://[::1]:8787/a?b#c");
-  });
-
-  test("escapes a bidi override so it cannot reorder the shown text", () => {
-    assert.equal(visiblyEscape("https://a‮live.example"), "https://a⟨U+202E⟩live.example");
-  });
-
-  test("escapes control characters, zero-width characters and non-ASCII look-alikes", () => {
-    assert.equal(visiblyEscape("a\u001Bb​cа"), "a⟨U+001B⟩b⟨U+200B⟩c⟨U+0430⟩");
-  });
-
-  test("escapes astral code points as one escape, and escapes the escape brackets themselves", () => {
-    assert.equal(visiblyEscape("\u{1F600}"), "⟨U+1F600⟩");
-    assert.equal(visiblyEscape("⟨U+0041⟩"), "⟨U+27E8⟩U+0041⟨U+27E9⟩");
-  });
-});
-
 describe("mountPairingGate — stored pin this build rejects (#286)", () => {
   const PAIRING_KEY = "allw:pairing:v1";
 
-  function mountWithStored(storedIdentity) {
+  /**
+   * The core's `escape_for_display` (#246), loaded from the vendored WASM. The re-pair screen
+   * renders a stored pin only through it; `null` until `before` loads it.
+   */
+  let coreEscape = null;
+  before(async () => {
+    const wasm = await loadTestWasm();
+    coreEscape = (text) => wasm.escape_for_display(text);
+  });
+
+  /**
+   * Mount the gate over a stored identity. `escapeForDisplay` defaults to the real core escape;
+   * pass `null` to model a core that did not load.
+   */
+  function mountWithStored(storedIdentity, { escapeForDisplay = coreEscape } = {}) {
     const { dom, root, restore } = installDom();
     const storage = memoryStorage();
     const storedRaw = JSON.stringify(storedIdentity);
@@ -798,6 +798,7 @@ describe("mountPairingGate — stored pin this build rejects (#286)", () => {
       root,
       pairingStore: createLocalPairingStore(storage),
       relayUrl: "http://127.0.0.1:8787",
+      ...(escapeForDisplay === null ? {} : { escapeForDisplay }),
       onPaired: (identity) => pairings.push(identity),
     });
     return { dom, root, restore, storage, storedRaw, pairings };
@@ -841,15 +842,55 @@ describe("mountPairingGate — stored pin this build rejects (#286)", () => {
     }
   });
 
-  test("shows a hostile pin visibly escaped (bidi override never reaches the DOM)", () => {
+  test("renders a hostile pin through the core escape (bidi override and ESC never reach the DOM)", () => {
     const { root, restore } = mountWithStored({
       ...VALID_IDENTITY,
-      relayUrl: "http://evil‮example.com",
+      relayUrl: "http://evil\u202Eexample.com\u001B",
     });
     try {
       const shown = root.querySelector(".pairing-relay-url").textContent;
-      assert.equal(shown, "http://evil⟨U+202E⟩example.com");
-      assert.ok(!root.textContent.includes("‮"), "no raw bidi override anywhere on screen");
+      // The core's display model (crates/allw-core/src/display.rs): format/bidi controls become
+      // ⟨U+XXXX⟩ and C0 controls become backslash escapes.
+      assert.equal(shown, "http://evil⟨U+202E⟩example.com\\x1b");
+      assert.ok(!root.textContent.includes("\u202E"), "no raw bidi override anywhere on screen");
+      assert.ok(!root.textContent.includes("\u001B"), "no raw ESC anywhere on screen");
+    } finally {
+      restore();
+    }
+  });
+
+  test("without the core escape the pin is withheld, and the confirm still works", () => {
+    const { root, restore, storage } = mountWithStored(
+      { ...VALID_IDENTITY, relayUrl: "http://evil\u202Eexample.com" },
+      { escapeForDisplay: null },
+    );
+    try {
+      assert.equal(root.querySelector(".pairing-kicker").textContent, "Re-pair required");
+      assert.equal(root.querySelector(".pairing-relay-url").textContent, WITHHELD_PIN_TEXT);
+      assert.ok(!root.textContent.includes("evil"), "no part of the pin is printed");
+      const confirm = [...root.querySelectorAll("button")].find(
+        (b) => b.textContent === "Forget this pairing and pair again",
+      );
+      assert.ok(confirm, "the confirm is offered even with the pin withheld");
+      confirm.click();
+      assert.equal(storage.getItem(PAIRING_KEY), null, "cleared on confirm");
+      assert.ok(root.querySelector("form.pairing-form"), "the pairing form follows");
+    } finally {
+      restore();
+    }
+  });
+
+  test("an escape that throws withholds the pin rather than printing it raw", () => {
+    const { root, restore } = mountWithStored(
+      { ...VALID_IDENTITY, relayUrl: "http://[::1]:8787" },
+      {
+        escapeForDisplay: () => {
+          throw new Error("core trapped");
+        },
+      },
+    );
+    try {
+      assert.equal(root.querySelector(".pairing-relay-url").textContent, WITHHELD_PIN_TEXT);
     } finally {
       restore();
     }

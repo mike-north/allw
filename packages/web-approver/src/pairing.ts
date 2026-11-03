@@ -96,8 +96,8 @@ const REQUIRED_IDENTITY_FIELDS: readonly (keyof ApproverIdentity)[] = [
  * - `relay-pin-rejected` — every identity field is valid, but the pinned relay is one this build
  *   does not accept as stored (#286). The identity is unusable (fail-closed: nothing is sent to
  *   that relay), but it is a distinct state from `corrupt` so the gate can tell the human why and
- *   ask before clearing it. `pinnedRelayUrl` is the stored text, unvalidated: render it only with
- *   {@link visiblyEscape}. `snapshot` identifies exactly what was stored, so the clear the human
+ *   ask before clearing it. `pinnedRelayUrl` is the stored text, unvalidated: render it only
+ *   through the core escape ({@link DisplayEscape}), or withhold it. `snapshot` identifies exactly what was stored, so the clear the human
  *   confirms can be limited to that value ({@link PairingStore.clearIfUnchanged}).
  * - `corrupt` — anything else: unparseable JSON, a missing or empty field, a non-string pin.
  */
@@ -175,7 +175,8 @@ function classifyIdentity(value: unknown): ClassifiedIdentity {
       return {
         status: "relay-pin-rejected",
         pinnedRelayUrl: relayUrl,
-        reason: `This version stores relay URLs in canonical form (${checked.relayUrl}), and this pin is not in that form.`,
+        reason:
+          "This version stores relay URLs in canonical form, and this pin is not in that form.",
       };
     }
   }
@@ -183,31 +184,16 @@ function classifyIdentity(value: unknown): ClassifiedIdentity {
 }
 
 /**
- * Render arbitrary stored text so every character is visible: printable ASCII (U+0020–U+007E) is
- * kept, and every other code point (control characters, bidi overrides, zero-width and non-ASCII
- * look-alikes, and the `⟨` / `⟩` brackets themselves) becomes `⟨U+XXXX⟩`. Used for a rejected
- * relay pin, which is unvalidated stored text that could otherwise reorder or disguise itself on
- * screen.
- *
- * The notation matches the core's display model (#246), but the escaped set is stricter: the core
- * escapes a defined set (C0/C1 controls, bidi, default-ignorables, separators, U+2800) and keeps
- * printable non-ASCII, while this escapes every non-ASCII code point. Internal to this module; not
- * part of the package's API.
- *
- * TODO(#246/#259): replace with the core display model once it lands and is available before
- * pairing.
+ * Escapes one untrusted string for display: the core's `escape_for_display` (#246), reached through
+ * WASM. Every surface prints untrusted text only through the core (`docs/threat-model.md` R3).
  */
-export function visiblyEscape(value: string): string {
-  let out = "";
-  for (const char of value) {
-    const codePoint = char.codePointAt(0) ?? 0;
-    out +=
-      codePoint >= 0x20 && codePoint <= 0x7e
-        ? char
-        : `⟨U+${codePoint.toString(16).toUpperCase().padStart(4, "0")}⟩`;
-  }
-  return out;
-}
+export type DisplayEscape = (text: string) => string;
+
+/**
+ * Shown in place of a rejected pin when the core escape is unavailable (the WASM core did not
+ * load): untrusted text is withheld rather than printed unescaped or escaped by this surface.
+ */
+export const WITHHELD_PIN_TEXT = "(hidden: the approver core did not load)";
 
 /**
  * Injectable storage seam for the paired-device identity.
@@ -567,13 +553,29 @@ function renderPairingScreen(
 export type RejectedRelayPin = Extract<StoredPairing, { status: "relay-pin-rejected" }>;
 
 /**
+ * The rejected pin as shown on screen: `(empty)` for an empty pin, otherwise the core's escape of
+ * it, or {@link WITHHELD_PIN_TEXT} when there is no core escape (or it throws).
+ */
+function displayedPin(pin: string, escapeForDisplay: DisplayEscape | null): string {
+  if (pin === "") return "(empty)";
+  if (escapeForDisplay === null) return WITHHELD_PIN_TEXT;
+  try {
+    return escapeForDisplay(pin);
+  } catch {
+    return WITHHELD_PIN_TEXT;
+  }
+}
+
+/**
  * Render the re-pair-required screen (#286): the stored identity is intact but pinned to a relay
- * this build rejects. It names the pinned relay (visibly escaped) and why it is rejected, and says
- * that nothing is removed until the human continues. The only action is `onConfirm`.
+ * this build rejects. It names the pinned relay (escaped by the core, or withheld) and why it is
+ * rejected, and says that nothing is removed until the human continues. The only action is
+ * `onConfirm`, offered whether or not the pin could be shown.
  */
 function renderRelayRepairScreen(
   root: HTMLElement,
   rejected: RejectedRelayPin,
+  escapeForDisplay: DisplayEscape | null,
   onConfirm: () => void,
 ): void {
   root.replaceChildren();
@@ -604,9 +606,9 @@ function renderRelayRepairScreen(
 
   const relayBox = el("div", "pairing-relay");
   relayBox.append(text("span", "Pinned relay (no longer supported)", "pairing-relay-label"));
-  const shownPin =
-    rejected.pinnedRelayUrl === "" ? "(empty)" : visiblyEscape(rejected.pinnedRelayUrl);
-  relayBox.append(text("code", shownPin, "pairing-relay-url"));
+  relayBox.append(
+    text("code", displayedPin(rejected.pinnedRelayUrl, escapeForDisplay), "pairing-relay-url"),
+  );
   relayBox.append(text("p", rejected.reason, "pairing-relay-note"));
   screen.append(relayBox);
 
@@ -639,6 +641,11 @@ export interface RelayRepairGateOptions {
   /** The rejected pin, as {@link PairingStore.load} reported it. */
   readonly rejected: RejectedRelayPin;
   /**
+   * The core's display escape for the pin, or `null` when the core is unavailable, in which case
+   * the pin text is withheld ({@link WITHHELD_PIN_TEXT}). The confirm is offered either way.
+   */
+  readonly escapeForDisplay: DisplayEscape | null;
+  /**
    * Called once, after the human confirmed. The rejected identity has been cleared if it was still
    * the stored one; anything saved since (e.g. by another tab) is untouched. The caller must route
    * on what is stored **now** (`pairingStore.load()`), never assume it is empty.
@@ -654,8 +661,8 @@ export interface RelayRepairGateOptions {
  * asking for a relay, and {@link mountPairingGate} routes to it for the same stored state.
  */
 export function mountRelayRepairGate(options: RelayRepairGateOptions): void {
-  const { root, pairingStore, rejected, onResolved } = options;
-  renderRelayRepairScreen(root, rejected, () => {
+  const { root, pairingStore, rejected, escapeForDisplay, onResolved } = options;
+  renderRelayRepairScreen(root, rejected, escapeForDisplay, () => {
     // Clear only the identity this screen described. A stale tab must never forget a newer
     // identity another tab saved after this screen was rendered.
     pairingStore.clearIfUnchanged(rejected.snapshot);
@@ -682,6 +689,11 @@ export interface PairingGateOptions {
    * stored identity; this value never overrides it. Omit only in a relay-less harness.
    */
   readonly relayUrl?: string;
+  /**
+   * The core's display escape (#246), used if the stored identity turns out to be pinned to a
+   * rejected relay (#286). Without it that pin's text is withheld on the re-pair screen.
+   */
+  readonly escapeForDisplay?: DisplayEscape;
   /**
    * Called once when the user has a confirmed, valid `PairedIdentity`. The caller should
    * immediately mount the inbox (`mountWebApprover`) with the returned identity, sending every
@@ -714,6 +726,7 @@ export interface PairingGateOptions {
  */
 export function mountPairingGate(options: PairingGateOptions): void {
   const { root, onPaired, relayUrl } = options;
+  const escapeForDisplay = options.escapeForDisplay ?? null;
   const store: PairingStore = options.pairingStore ?? createLocalPairingStore();
 
   function goToPairing(): void {
@@ -746,6 +759,7 @@ export function mountPairingGate(options: PairingGateOptions): void {
           root,
           pairingStore: store,
           rejected: stored,
+          escapeForDisplay,
           // Route on what is stored now: normally nothing (→ pairing form), but a newer identity
           // another tab saved meanwhile goes to the returning-device screen, never cleared.
           onResolved: () => {

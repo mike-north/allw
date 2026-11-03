@@ -111,14 +111,16 @@ WebSocket, account-state resolution — goes to that pinned relay.
 - **A pin that a later build no longer accepts** (a rejected or non-canonical relay URL in an
   otherwise valid identity) puts the browser in a **re-pair-required** state. The identity is
   unusable (fail-closed: nothing is sent to that relay), but it is not discarded silently. Before
-  any relay is resolved or asked for, a screen shows the pinned relay, with every non-printable or
-  non-ASCII character shown as `⟨U+XXXX⟩` (an empty pin as `(empty)`), and says why it is
-  rejected. The stored identity is cleared only when the human chooses **Forget this pairing and
+  any relay is resolved or asked for, a screen shows the pinned relay and says why it is rejected.
+  The pin is untrusted stored text, so the screen loads the approver core first (the same WASM the
+  inbox reuses) and shows the pin only as the core's `escape_for_display` renders it (an empty pin
+  as `(empty)`). If the core does not load, the pin is withheld as
+  `(hidden: the approver core did not load)`, and the screen still offers the choice below. The stored identity is cleared only when the human chooses **Forget this pairing and
   pair again**, and only if it is still the identity the screen showed: a newer identity saved
   since, for example by another tab, is kept, and the browser routes to it instead. Closing the
-  page leaves it in storage. After the confirmation the browser pairs again, but as a previously
-  paired browser, like the legacy binding above: a `?relay=` link is ignored (the notice names it)
-  and never persisted, and the relay is the one this browser already persisted, or one the human
+  page leaves it in storage. After the confirmation the browser pairs again, but on that re-pair
+  visit it is treated as a previously paired browser, like the legacy binding above: a `?relay=`
+  link is ignored (the notice names it) and never persisted, and the relay is the one this browser already persisted, or one the human
   enters. For example, browsers pinned to
   `http://[::1]:…` before `[::1]` was dropped land here and re-pair against `http://127.0.0.1:…`.
   Builds that narrow the relay rule or change its canonical form should ship a migration for stored

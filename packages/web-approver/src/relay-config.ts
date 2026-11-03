@@ -238,8 +238,13 @@ export interface IgnoredRelayNoticeOptions {
   readonly host: HTMLElement;
   /** What {@link describeIgnoredRelayOverride} returned for the ignored `?relay=` value. */
   readonly ignored: string;
-  /** The relay URL pinned in the stored identity. */
+  /** The relay URL pinned in the stored identity, or the relay a re-pair visit pairs against. */
   readonly pinnedRelayUrl: string;
+  /**
+   * Whether this browser is re-pairing (#286): it has no usable identity yet, but is treated as
+   * previously paired, so the notice says it is re-pairing with the relay rather than paired.
+   */
+  readonly repairing?: boolean;
 }
 
 /**
@@ -248,13 +253,14 @@ export interface IgnoredRelayNoticeOptions {
  * gate hands off to the inbox. All attacker-influenced text goes through `textContent`.
  */
 export function mountIgnoredRelayNotice(options: IgnoredRelayNoticeOptions): void {
-  const { host, ignored, pinnedRelayUrl } = options;
+  const { host, ignored, pinnedRelayUrl, repairing = false } = options;
+  const relation = repairing ? "is re-pairing with" : "is paired with";
   const notice = el("div", "relay-pin-notice");
   notice.setAttribute("role", "status");
   notice.append(text("strong", "Relay link ignored. ", "relay-pin-notice-title"));
   notice.append(
     document.createTextNode(
-      `This browser is paired with ${relayOrigin(pinnedRelayUrl)} and only talks to that relay. ` +
+      `This browser ${relation} ${relayOrigin(pinnedRelayUrl)} and only talks to that relay. ` +
         "The link asked to use ",
     ),
   );

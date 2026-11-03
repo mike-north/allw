@@ -6,11 +6,17 @@ export type {
   PairingStore,
   PairingGateOptions,
   RejectedRelayPin,
+  DisplayEscape,
   RelayRepairGateOptions,
   StoredPairing,
   StoredSnapshot,
 } from "./pairing.js";
-export { createLocalPairingStore, mountPairingGate, mountRelayRepairGate } from "./pairing.js";
+export {
+  WITHHELD_PIN_TEXT,
+  createLocalPairingStore,
+  mountPairingGate,
+  mountRelayRepairGate,
+} from "./pairing.js";
 
 export type { OnboardingWalkthroughOptions, OnboardingGateOptions } from "./onboarding.js";
 export {
