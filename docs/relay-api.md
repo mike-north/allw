@@ -74,6 +74,10 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   send no `Origin` and are unaffected.
 - **Errors** are plain bodies with the status code; `400` covers malformed JSON / bad fields /
   unexpected envelope keys (zero-knowledge guard).
+- **Abuse limits (#248).** `413` = body or `context_ciphertext` too large. Treat it as "not
+  submitted": an integrator fails closed (deny), never retries into an approval.
+- **Pairing body cap.** `POST /pairing/start` and `POST /pairing/complete` bodies above
+  `MAX_PAIRING_BODY_BYTES` (16 KiB) are refused with **413** before parsing.
 - **Exact paths.** An account route answers only on its exact path, compared segment by segment as the URL
   parser yields them (percent-encoding preserved, `.` and `..` segments resolved): the same number of segments, every literal equal, and every `{param}` non-empty
   (#302). Anything else is **404** `{ "error": "not found" }`, whatever the method: an extra segment
@@ -377,6 +381,50 @@ highest-verified sequence floor. Rows from the pre-verification cache are droppe
 `created_at`, `expires_at`, `approver`, `context_ciphertext`; any other key ⇒ 400, including the
 specified-but-unimplemented `action_structure` / `privacy_preference` (#216); `expires_at ≤ now` ⇒ 400). → **202**
 `{ request_id, status:"pending", delivered_to, push_wakeups, request_auth_token }`. 409 on dup `id`.
+
+**Unknown account.** `POST /{acct}/requests` on an account with no bound root (no root-signed
+`pairing/start` has ever succeeded, so no device can have paired since #264) ⇒ **404**
+`{ "error": "unknown account" }`, checked before the body is read. This includes accounts that
+enrolled devices before root binding existed (#264's pre-binding state): they now get 404 on
+submit and must move to a new account root, as #264 already requires (their first bind is refused
+with 409, see §3 Pairing).
+
+**Request id.** The envelope `id` must be a UUID in lowercase canonical form — 8-4-4-4-12
+lowercase hex digits (contract §Transport requires UUIDv4 or later) — otherwise **400**. The relay
+never normalizes an id: an upper- or mixed-case id is refused, not lowered. This bounds the id,
+which is part of every retained row.
+
+**`expires_at`.** Must be an integer (i64 ms) — a fractional value ⇒ **400** — and is then held to
+the horizon below.
+
+**`created_at` sanity bound.** The envelope's `created_at` must be an integer (i64 ms), no later
+than `expires_at`, no further back than the request horizon (`now − MAX_REQUEST_TTL_MS`), and no
+further ahead than `MAX_CREATED_AT_SKEW_MS` (**60 s**, for clock skew) — otherwise **400**. Each
+bound is inclusive. This closes no attack, since the window is the submitter's own: it turns a
+request the device could never verify into a 400 at submit, instead of a provenance error on the
+device after the human taps.
+
+Limits on `POST /{acct}/requests` (#248; constants in `packages/relay/src/constants.ts`):
+
+| Limit                        | Value                                                               | Over the limit |
+| ---------------------------- | ------------------------------------------------------------------- | -------------- |
+| Request body                 | `MAX_REQUEST_BODY_BYTES` = 128 KiB, checked **before** JSON parsing | **413**        |
+| `context_ciphertext`         | `MAX_CONTEXT_CIPHERTEXT_BYTES` = 64 KiB (UTF-8 bytes of the string) | **413**        |
+| Horizon (`expires_at − now`) | `MAX_REQUEST_TTL_MS`, default **15 min** (Worker var override)      | **400**        |
+
+Each value is inclusive (exactly the limit is accepted). The `context_ciphertext` ceiling is the
+one integrators can hit with honest input: it caps the encrypted context, which is larger than the
+plaintext context the SDK encrypts. Over-size fails closed — the relay stores nothing, and the SDK's
+`requestApproval` rejects with a `RelayError` (`name` `"RelayError"`, `status` 413), which a caller must treat as deny. The
+SDK does no pre-check of its own. The 15-minute horizon covers the hooks'
+420 s maximum timeout; an operator who lowers it below that makes hook requests fail closed. A
+pending request older than the horizon (only possible for one stored before the horizon existed) is
+expired by the alarm; like every terminal request it is deleted 7 days after it ends. When a request
+ends (expired, retracted or resolved) the relay blanks its stored envelope: status and verdict reads
+keep working, but the ciphertext is gone. Stored bytes are therefore bounded by submit rate ×
+retention × that small per-row residue. Submission is not yet rate-limited, nor is the number of
+pending requests per account bounded — see `docs/threat-model.md` "Relay denial of service".
+
 **`GET /{acct}/requests/{id}`** and **`GET /{acct}/requests/{id}/wait`** (WS) — Bearer
 `request_auth_token`; poll/await `{ status, verdict? }`. `status` is `pending`, terminal `expired`,
 terminal `retracted` (see below), or `resolved` (+ `verdict`).
