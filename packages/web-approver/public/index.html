@@ -12,10 +12,19 @@
     <script src="./theme.js"></script>
     <link rel="stylesheet" href="./tokens.css" />
     <link rel="stylesheet" href="./styles.css" />
+    <!--
+      Installable web app (issue #237): the manifest makes the approver installable, which iOS and
+      iPadOS require before they deliver Web Push; iOS uses apple-touch-icon for the Home Screen.
+    -->
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png" />
+    <meta name="theme-color" content="#F1EDE4" />
   </head>
   <body>
     <!-- Notices that must outlive screen changes in #app, e.g. an ignored ?relay= link (#249). -->
     <div id="notices"></div>
+    <!-- Notification controls (#237), shown after pairing, outside the inbox so they never gate it. -->
+    <div id="notifications"></div>
     <div id="app"></div>
     <!--
       `scripts/build-site.mjs` copies this file into `dist-site/`, bundles `src/app.ts` (the

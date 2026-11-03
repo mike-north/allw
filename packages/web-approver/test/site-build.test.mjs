@@ -23,6 +23,8 @@
  * @see ../../../docs/web-approver-deploy.md
  * @see https://developers.cloudflare.com/pages/configuration/headers/
  * @see https://www.w3.org/TR/CSP3/
+ * @see https://www.w3.org/TR/appmanifest/
+ * @see https://www.w3.org/TR/service-workers/#service-worker-script-response (max scope)
  * @see ../../sdk/test/fixtures/relay-url-vectors.json (shared with the SDK and the runtime rule)
  */
 
@@ -98,9 +100,66 @@ describe("site bundle (build-site.mjs)", { skip: !wasmAvailable }, () => {
       "app.js",
       "vendor/allw-wasm/allw_wasm.js",
       "vendor/allw-wasm/allw_wasm_bg.wasm",
+      "sw.js",
+      "manifest.webmanifest",
+      "icons/icon-192.png",
+      "icons/icon-512.png",
+      "icons/apple-touch-icon.png",
     ]) {
       assert.ok(existsSync(join(outDir, relativePath)), `${relativePath} must exist in the bundle`);
     }
+  });
+
+  test("the service worker is a root-level classic script, so it can control the app's root scope (#237)", () => {
+    // A worker's maximum scope is the directory it is served from: it must sit next to index.html.
+    const sw = readFileSync(join(outDir, "sw.js"), "utf8");
+    assert.doesNotMatch(sw, /^\s*(import|export)\s/m, "a classic script has no ESM syntax");
+    assert.match(sw, /pushsubscriptionchange/);
+    assert.match(sw, /notificationclick/);
+  });
+
+  test("the manifest makes the app installable: name, start_url, standalone display, icons (#237)", () => {
+    const manifest = JSON.parse(readFileSync(join(outDir, "manifest.webmanifest"), "utf8"));
+    // W3C Web App Manifest members required by #237's acceptance criteria.
+    assert.equal(manifest.name, "allw approvals");
+    assert.equal(manifest.start_url, "./");
+    assert.equal(manifest.display, "standalone");
+    const sizes = manifest.icons.map((icon) => icon.sizes);
+    assert.ok(sizes.includes("192x192") && sizes.includes("512x512"), "192 and 512 icons");
+    for (const icon of manifest.icons) {
+      assert.ok(existsSync(join(outDir, icon.src)), `${icon.src} must be bundled`);
+      assert.equal(icon.type, "image/png");
+    }
+  });
+
+  test("every bundled icon is a PNG of the size it is declared as (#237)", () => {
+    // PNG: 8-byte signature, then the IHDR chunk with big-endian width and height at bytes 16–23.
+    for (const [file, size] of [
+      ["icons/icon-192.png", 192],
+      ["icons/icon-512.png", 512],
+      ["icons/apple-touch-icon.png", 180],
+    ]) {
+      const bytes = readFileSync(join(outDir, file));
+      assert.deepEqual([...bytes.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+      assert.equal(bytes.readUInt32BE(16), size, `${file} width`);
+      assert.equal(bytes.readUInt32BE(20), size, `${file} height`);
+    }
+  });
+
+  test("index.html links the manifest and the iOS Home Screen icon, and hosts the notification controls (#237)", () => {
+    const html = readFileSync(join(outDir, "index.html"), "utf8");
+    assert.match(html, /<link rel="manifest" href="\.\/manifest\.webmanifest" \/>/);
+    assert.match(html, /<link rel="apple-touch-icon" href="\.\/icons\/apple-touch-icon\.png" \/>/);
+    assert.match(html, /<div id="notifications"><\/div>/);
+  });
+
+  test("_headers serves the manifest with its media type and keeps the worker revalidated (#237)", () => {
+    const headers = readFileSync(join(outDir, "_headers"), "utf8");
+    assert.match(
+      headers,
+      /^\/manifest\.webmanifest\n {2}Content-Type: application\/manifest\+json$/m,
+    );
+    assert.match(headers, /^\/sw\.js\n {2}Cache-Control: no-cache$/m);
   });
 
   test("index.html references the bundled app.js as a same-directory sibling", () => {

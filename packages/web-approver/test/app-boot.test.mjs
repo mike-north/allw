@@ -118,14 +118,26 @@ async function loadCoreDisplayEscape() {
 }
 
 /**
- * Boot with `search` + `storage`, recording every identity handed to the inbox. The re-pair
- * screen's display escape comes from the real core unless `loadDisplayEscape` overrides it.
+ * Boot with `search` + `storage`, recording every identity handed to the inbox or to the
+ * notification controls, and counting requests to forget notifications (`onForget` sees each). The
+ * re-pair screen's display escape comes from the real core unless `loadDisplayEscape` overrides it.
  */
-async function bootWith({ search, storage, loadDisplayEscape = loadCoreDisplayEscape }) {
+async function bootWith({
+  search,
+  storage,
+  loadDisplayEscape = loadCoreDisplayEscape,
+  onForget = () => undefined,
+}) {
   const document = dom.window.document;
   const root = document.getElementById("app");
   const noticeHost = document.getElementById("notices");
   const inboxStarts = [];
+  const notificationStarts = [];
+  /**
+   * How many times boot asked to forget notifications (clear the credential mirror), and the
+   * forgotten relay credentials each request carried.
+   */
+  const forgets = { count: 0, forgotten: [] };
   await boot({
     root,
     noticeHost,
@@ -134,9 +146,17 @@ async function bootWith({ search, storage, loadDisplayEscape = loadCoreDisplayEs
     startInbox: async (_root, identity) => {
       inboxStarts.push(identity);
     },
+    startNotifications: (identity) => {
+      notificationStarts.push(identity);
+    },
+    forgetNotifications: async (forgotten) => {
+      forgets.count += 1;
+      forgets.forgotten.push(forgotten);
+      onForget(forgets.count);
+    },
     loadDisplayEscape,
   });
-  return { root, noticeHost, inboxStarts };
+  return { root, noticeHost, inboxStarts, notificationStarts, forgets };
 }
 
 function click(root, label) {
@@ -168,6 +188,134 @@ async function waitFor(probe, ticks = 100) {
   }
   assert.fail("condition not met within the tick budget");
 }
+
+describe("boot — notification controls (#237)", () => {
+  test("mount only once the human unlocks, with the pinned identity, after the inbox starts", async () => {
+    const storage = memoryStorage();
+    storage.setItem(PAIRING_KEY, JSON.stringify(PINNED_IDENTITY));
+
+    const { root, inboxStarts, notificationStarts } = await bootWith({ search: "", storage });
+    assert.equal(notificationStarts.length, 0, "nothing before the returning-device unlock");
+
+    click(root, "Unlock inbox");
+    assert.equal(inboxStarts.length, 1);
+    assert.equal(notificationStarts.length, 1);
+    assert.equal(notificationStarts[0].relayUrl, PINNED_RELAY);
+    assert.equal(notificationStarts[0].deviceId, PINNED_IDENTITY.deviceId);
+    assert.deepEqual(networkAttempts, []);
+  });
+
+  test("an unpaired browser gets no notification controls until it pairs", async () => {
+    const storage = memoryStorage();
+    storage.setItem(ONBOARDING_KEY, "1");
+    const { root, notificationStarts } = await bootWith({
+      search: relayQuery("https://relay.selfhost.example"),
+      storage,
+    });
+    assert.equal(notificationStarts.length, 0);
+    submitPairingForm(root, LEGACY_IDENTITY);
+    assert.equal(notificationStarts.length, 1);
+    assert.equal(notificationStarts[0].relayUrl, "https://relay.selfhost.example");
+  });
+
+  test("a paired browser keeps its notification credentials", async () => {
+    const storage = memoryStorage();
+    storage.setItem(PAIRING_KEY, JSON.stringify(PINNED_IDENTITY));
+    const { root, forgets } = await bootWith({ search: "", storage });
+    click(root, "Unlock inbox");
+    assert.equal(forgets.count, 0);
+  });
+
+  test("a browser with no usable identity forgets any mirrored credentials at boot", async () => {
+    const storage = memoryStorage();
+    storage.setItem(ONBOARDING_KEY, "1");
+    storage.setItem(PAIRING_KEY, "{not json");
+    storage.setItem(RELAY_URL_STORAGE_KEY, PINNED_RELAY);
+    const { forgets } = await bootWith({ search: "", storage });
+    assert.ok(forgets.count >= 1, "a corrupt identity's notification credentials are forgotten");
+  });
+
+  test("a browser with no stored identity forgets at boot, before onboarding or any action", async () => {
+    // No identity and onboarding not done: the walkthrough comes first, so boot's own forget is
+    // the only one that runs before the human does anything (review of #315, finding 4). A relay
+    // is already persisted, so boot runs through to the walkthrough without prompting.
+    const storage = memoryStorage();
+    storage.setItem(RELAY_URL_STORAGE_KEY, PINNED_RELAY);
+    const { root, forgets } = await bootWith({ search: "", storage });
+    assert.equal(root.querySelector("form.pairing-form"), null, "the walkthrough is showing");
+    assert.equal(forgets.count, 1);
+    assert.deepEqual(forgets.forgotten, [null], "there is no identity to take a token from");
+  });
+
+  test("'Use another device' forgets the notification credentials with the pairing", async () => {
+    const storage = memoryStorage();
+    storage.setItem(PAIRING_KEY, JSON.stringify(PINNED_IDENTITY));
+    const { root, forgets } = await bootWith({ search: "", storage });
+    assert.equal(forgets.count, 0);
+    click(root, "Use another device");
+    assert.equal(storage.getItem(PAIRING_KEY), null);
+    // The confirm forgets; the pairing gate's own clear before its form may forget again, which is
+    // harmless (forgetting is idempotent).
+    assert.ok(forgets.count >= 1, "the confirmed re-pair forgets the notification credentials");
+    // The forgotten identity's four relay fields travel with the forget, so its registration can be
+    // withdrawn even when the mirror is already empty (review of #315, round 2). Never the seeds.
+    assert.deepEqual(forgets.forgotten[0], {
+      relayUrl: PINNED_RELAY,
+      accountId: PINNED_IDENTITY.accountId,
+      deviceId: PINNED_IDENTITY.deviceId,
+      deviceAuthToken: PINNED_IDENTITY.deviceAuthToken,
+    });
+  });
+
+  test("confirming a re-pair forgets the notification credentials; showing the screen does not", async () => {
+    const storage = memoryStorage();
+    storage.setItem(ONBOARDING_KEY, "1");
+    storage.setItem(
+      PAIRING_KEY,
+      JSON.stringify({ ...PINNED_IDENTITY, relayUrl: "http://[::1]:8787" }),
+    );
+    storage.setItem(RELAY_URL_STORAGE_KEY, "http://127.0.0.1:8787");
+    const forgetsSeen = [];
+    const bootPromise = bootWith({ search: "", storage, onForget: (n) => forgetsSeen.push(n) });
+    const root = dom.window.document.getElementById("app");
+    await waitFor(() => root.querySelector(".pairing-kicker"));
+    assert.deepEqual(forgetsSeen, [], "nothing is forgotten before the human confirms");
+
+    click(root, "Forget this pairing and pair again");
+    const { forgets } = await bootPromise;
+    assert.equal(storage.getItem(PAIRING_KEY), null);
+    // The confirm forgets; the pairing gate's own clear before its form may forget again, which is
+    // harmless (forgetting is idempotent).
+    assert.ok(forgets.count >= 1, "the confirmed re-pair forgets the notification credentials");
+  });
+
+  test("a stale tab's re-pair confirm that keeps a newer identity forgets nothing (B1)", async () => {
+    const storage = memoryStorage();
+    storage.setItem(ONBOARDING_KEY, "1");
+    storage.setItem(
+      PAIRING_KEY,
+      JSON.stringify({ ...PINNED_IDENTITY, relayUrl: "http://[::1]:8787" }),
+    );
+    storage.setItem(RELAY_URL_STORAGE_KEY, "http://127.0.0.1:8787");
+    const bootPromise = bootWith({ search: "", storage });
+    const root = dom.window.document.getElementById("app");
+    await waitFor(() => root.querySelector(".pairing-kicker"));
+
+    // Another tab re-pairs (and may have enabled notifications for the new identity) meanwhile.
+    storage.setItem(
+      PAIRING_KEY,
+      JSON.stringify({
+        ...PINNED_IDENTITY,
+        deviceId: "dev-newer",
+        relayUrl: "http://127.0.0.1:8787",
+      }),
+    );
+    click(root, "Forget this pairing and pair again");
+    const { forgets } = await bootPromise;
+    assert.equal(JSON.parse(storage.getItem(PAIRING_KEY)).deviceId, "dev-newer");
+    assert.equal(forgets.count, 0, "the newer identity's notification credentials are kept");
+  });
+});
 
 describe("boot — paired device with a ?relay= link to another origin (#249)", () => {
   test("nothing reaches the other origin, the stored identity is unchanged, and a notice names it", async () => {
