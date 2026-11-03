@@ -66,12 +66,15 @@ const DEFAULT_ACCOUNT_STATES = {
  * the core's `verify_account_state` (403), and the highest sequence must rise (409); `GET` needs no
  * token. Unpublished accounts serve `unpublished` (default `DEFAULT_ACCOUNT_STATES`; pairing tests
  * use the real relay's empty set). `/pairing/complete` assigns `deviceIds` in order (the last one
- * repeats). Returns { url, requests, boundRoots, publishedStates, close }.
+ * repeats). `accountStatesGetStatus` makes `GET account-states` answer that status instead, as a relay
+ * deployed before the endpoint was unauthenticated does (401). Returns { url, requests, boundRoots,
+ * publishedStates, close }.
  */
 async function startFakeRelay({
   now = FIXED_NOW,
   unpublished = DEFAULT_ACCOUNT_STATES,
   deviceIds = [ASSIGNED_DEVICE_ID],
+  accountStatesGetStatus,
 } = {}) {
   let completes = 0;
   const wasm = await loadWasm();
@@ -189,6 +192,11 @@ async function startFakeRelay({
       }
       // GET /:acct/account-states → { account_states, max_sequence } (unauthenticated)
       if (req.method === "GET" && req.url.endsWith("/account-states")) {
+        if (accountStatesGetStatus !== undefined) {
+          res.writeHead(accountStatesGetStatus, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "authorization required" }));
+          return;
+        }
         const accountId = decodeURIComponent(req.url.split("/")[1] ?? "");
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(publishedStates.get(accountId) ?? unpublished));
@@ -804,6 +812,79 @@ test("runPair for a second device carries the first device forward at the next s
           ],
         );
       });
+    });
+  } finally {
+    await relay.close();
+  }
+});
+
+// The documented upgrade (docs/quickstart.md §Upgrading an existing pairing): an account paired before
+// pair published account state has none on the relay. Re-running pair with the same keyfile keeps the
+// seeds and account, gets a new device id, and publishes a state naming only that new id.
+test("re-running runPair on an already-paired keyfile with no published state publishes one for the new device id (#243 upgrade)", async () => {
+  const wasm = await loadWasm();
+  const relay = await startFakeRelay({
+    unpublished: NO_ACCOUNT_STATES,
+    deviceIds: ["dev-old", "dev-new"],
+  });
+  try {
+    await withTempKeyfile(async (keyfilePath) => {
+      const before = await runPair(
+        wasm,
+        { relayUrl: relay.url, keyfilePath, now: FIXED_NOW },
+        () => {},
+      );
+      // Simulate the pre-#243 world: the old pairing left nothing published on the relay, and the
+      // keyfile has no recorded account-state floor.
+      relay.publishedStates.delete(before.account_id);
+      const { account_state_highest_sequence: _floor, ...legacy } = readKeyfile(keyfilePath);
+      const { writeKeyfile } = await import("../dist/lib/keyfile.js");
+      writeKeyfile(keyfilePath, legacy);
+
+      const after = await runPair(
+        wasm,
+        { relayUrl: relay.url, keyfilePath, now: FIXED_NOW },
+        () => {},
+      );
+      assert.equal(after.account_id, before.account_id, "same account");
+      assert.equal(after.account_root_pubkey, before.account_root_pubkey);
+      assert.equal(after.device_encryption_seed, before.device_encryption_seed, "seeds kept");
+      assert.equal(after.device_signing_seed, before.device_signing_seed);
+      assert.equal(after.device_id, "dev-new", "a new device id");
+      assert.notEqual(after.device_cert, before.device_cert, "a new cert for the new id");
+      const [state] = publishedStatesFor(wasm, relay, after);
+      assert.equal(state.sequence, 1);
+      assert.deepEqual(
+        state.devices.map((d) => [d.device_id, d.encryption_pubkey]),
+        [["dev-new", before.device_encryption_pubkey]],
+        "the state names only the new device id, so a client on the old id must re-paste",
+      );
+    });
+  } finally {
+    await relay.close();
+  }
+});
+
+// Regression: a relay deployed before account-state GET became unauthenticated answers it with 401.
+// pair must still fail closed (nothing published, keyfile unpaired) and say to redeploy the relay.
+test("runPair against a relay too old for account-state GET (401) fails closed and says redeploy the relay", async () => {
+  const wasm = await loadWasm();
+  const relay = await startFakeRelay({
+    unpublished: NO_ACCOUNT_STATES,
+    accountStatesGetStatus: 401,
+  });
+  try {
+    await withTempKeyfile(async (keyfilePath) => {
+      await assert.rejects(
+        () => runPair(wasm, { relayUrl: relay.url, keyfilePath, now: FIXED_NOW }, () => {}),
+        /HTTP 401.*relay is too old to publish account state; redeploy it from current allw main/,
+      );
+      assert.equal(readKeyfile(keyfilePath).device_id, undefined, "not paired on disk");
+      assert.equal(
+        relay.requests.some((r) => r.method === "POST" && r.url.endsWith("/account-states")),
+        false,
+        "nothing published",
+      );
     });
   } finally {
     await relay.close();

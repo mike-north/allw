@@ -64,6 +64,32 @@ can add devices to it. `--account <id>` is optional; when given it must equal th
 The keyfile defaults to `~/.allw/approver-keyfile.json` (override with `--keyfile <path>`) and is
 written `0600` (owner read/write only).
 
+#### Upgrading an existing pairing
+
+If you paired before root-vouched recipients shipped (#243), the relay holds no account state for
+your account, so integrators deny every gated call with "the relay has no account state … run
+allw-approver pair". Upgrade the pairing once:
+
+1. Make sure your relay runs current `main`. A relay that answers `GET /<account>/account-states`
+   with 401 is too old: integrators deny with "this relay is too old … redeploy it", and `pair` fails
+   the same way. Redeploy it ([`relay-deploy.md`](../../docs/relay-deploy.md)).
+2. Re-run `pair` with the **same keyfile** (and the same `--relay`):
+
+   ```sh
+   npx --no-install allw-approver pair --relay <RELAY_URL> --keyfile <your keyfile>
+   ```
+
+   It keeps your seeds and account, registers a new device id, mints a new device certificate and
+   token, and publishes an account state naming that device ("Published account state —
+   sequence 1"). The account id and account-root public key are unchanged, so integrator config
+   needs no edit.
+
+3. **Web approver:** open it, press **Use another device**, and paste the keyfile's values again.
+   `device_id`, `device_cert` and `device_auth_token` changed. The seeds did not. This step is
+   required: requests are encrypted to the device id the account state names, so a browser still
+   holding the old device id cannot read them. A running `allw-approver watch` picks the new values
+   up from the keyfile on restart.
+
 ### 2. Watch for requests and approve/deny
 
 ```sh

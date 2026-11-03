@@ -7,6 +7,20 @@
 /** Pairing HTTP requests are short; bound them so a hung relay can't stall the CLI indefinitely. */
 export const PAIRING_TIMEOUT_MS = 15_000;
 
+/**
+ * A non-2xx relay response. The message is the human-facing error; `status` lets a caller name a
+ * specific fix for a specific status without parsing the message.
+ */
+export class RelayHttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = "RelayHttpError";
+  }
+}
+
 /** Trim a trailing slash so `${base}/path` never doubles up. */
 function normalizeBase(url: string): string {
   return url.replace(/\/+$/, "");
@@ -42,7 +56,7 @@ async function postJson(
   if (!resp.ok) {
     const detail =
       parsed && typeof parsed === "object" && "error" in parsed ? String(parsed.error) : text;
-    throw new Error(`relay ${url} → HTTP ${String(resp.status)}: ${detail}`);
+    throw new RelayHttpError(`relay ${url} → HTTP ${String(resp.status)}: ${detail}`, resp.status);
   }
   return parsed;
 }
@@ -71,7 +85,7 @@ async function getJson(
   if (!resp.ok) {
     const detail =
       parsed && typeof parsed === "object" && "error" in parsed ? String(parsed.error) : text;
-    throw new Error(`relay ${url} → HTTP ${String(resp.status)}: ${detail}`);
+    throw new RelayHttpError(`relay ${url} → HTTP ${String(resp.status)}: ${detail}`, resp.status);
   }
   return parsed;
 }
@@ -220,7 +234,22 @@ export async function fetchAccountStatesWithMetadata(
   accountId: string,
   timeoutMs: number = PAIRING_TIMEOUT_MS,
 ): Promise<AccountStateFetchResult> {
-  return parseAccountStateSet(await getJson(accountStatesUrl(relayUrl, accountId), timeoutMs));
+  let body: unknown;
+  try {
+    body = await getJson(accountStatesUrl(relayUrl, accountId), timeoutMs);
+  } catch (err) {
+    // The endpoint is unauthenticated on current relays, so a 401 means the relay predates it.
+    if (err instanceof RelayHttpError && err.status === 401) {
+      throw new RelayHttpError(
+        `${err.message} — this relay requires authorization for GET /account-states, which ` +
+          `current relays serve without it, so the relay is too old to publish account state; ` +
+          `redeploy it from current allw main (docs/relay-deploy.md)`,
+        err.status,
+      );
+    }
+    throw err;
+  }
+  return parseAccountStateSet(body);
 }
 
 /** {@link fetchAccountStatesWithMetadata} without the relay's sequence bookkeeping. */
