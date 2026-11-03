@@ -14,7 +14,7 @@
  * - **No credentials mode.** `Access-Control-Allow-Credentials` is never sent. Relay auth is a bearer
  *   capability the page holds explicitly, never an ambient cookie, so allowing an origin grants it
  *   nothing the bearer token does not.
- * - **Preflight** admits only the methods the relay routes (`GET`, `POST`) and the request headers it
+ * - **Preflight** admits only the methods the relay routes (`GET`, `POST`, `PUT`) and the request headers it
  *   reads (`Authorization`, `Content-Type`). Anything else is refused. Preflight is route-independent
  *   by design: it is answered per origin, method and header without consulting the router, and the
  *   actual request is still routed (and 404/405'd) normally, with CORS headers.
@@ -34,7 +34,7 @@
 export const DEFAULT_CORS_ALLOWED_ORIGINS = "https://allw-web-approver.pages.dev";
 
 /** HTTP methods the relay routes; the only ones a preflight may request. */
-const ALLOWED_METHODS: readonly string[] = ["GET", "POST"];
+const ALLOWED_METHODS: readonly string[] = ["GET", "POST", "PUT"];
 
 /** Request headers the relay reads (lowercase); the only ones a preflight may request. */
 const ALLOWED_REQUEST_HEADERS: ReadonlySet<string> = new Set(["authorization", "content-type"]);

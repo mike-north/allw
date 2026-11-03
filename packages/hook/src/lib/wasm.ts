@@ -76,6 +76,11 @@ export interface HookWasm {
     diffSummary: string,
     diffBytes: string,
   ): string;
+  /**
+   * Escape one untrusted string for display with the core notation (`\n`, `\x1b`, `⟨U+202E⟩`, …),
+   * so it stays one visible line. The hooks run error text through it before the agent reads it.
+   */
+  escape_for_display(text: string): string;
 }
 
 /** The `--target web` glue module shape we depend on (subset of the generated bindings). */

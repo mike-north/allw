@@ -36,6 +36,7 @@ export const HOOK_EVENT_NAME = "PreToolUse" as const;
  * - `no-approval` — the human explicitly denied the request (`decision === "denied"`).
  * - `timeout` — the approval request expired before the human responded (`decision === "expired"`).
  * - `aborted` — the approval request was aborted (`decision === "aborted"`).
+ * - `premature-exit` — the process reached exit before deciding (the exit backstop, #265).
  */
 export type DenyReason =
   | "input-parse-error"
@@ -44,7 +45,8 @@ export type DenyReason =
   | "transport-error"
   | "no-approval"
   | "timeout"
-  | "aborted";
+  | "aborted"
+  | "premature-exit";
 
 /**
  * The validated subset of Codex PreToolUse input. Unknown fields are ignored; `toolInput` stays

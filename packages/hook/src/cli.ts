@@ -5,9 +5,10 @@
  * Reads the pending tool call as JSON on stdin, and — for a gated action (`Bash`, a direct
  * file-edit tool, or an `mcp__server__tool` call) — turns it into a phone approval: it builds the
  * `ActionRecord` via the WASM core, requests a human decision over the zero-knowledge relay
- * (`@allw/sdk`), and emits an `allow` only for a **verified** approval. Everything else
- * (non-approval, timeout, missing config, any error) emits `deny`. Non-gated tools pass through as
- * `allow` without bothering the human.
+ * (`@allw/sdk`), and makes **no decision** (empty stdout) only for a **verified** approval, so Claude
+ * Code's own permission rules still apply. Everything else (non-approval, timeout, missing config,
+ * any error) emits `deny`. Non-gated tools also get no decision, without bothering the human. allw
+ * never emits `allow` (see `./lib/hook-io.ts`).
  *
  * # Runs as Node + WASM (a hard constraint)
  * This is a `node` entrypoint over the same vendored `.wasm` the SDK uses — never a standalone
@@ -15,11 +16,14 @@
  * (`docs/architecture.md`). The `bin` is `node ./dist/cli.js`.
  *
  * # Fail-closed at the process boundary
- * The happy path prints a `hookSpecificOutput` decision JSON and exits 0 (Claude Code reads the
- * decision from stdout). If anything prevents producing that JSON — even an unexpected internal
- * throw — we print a `deny` decision and still exit 0 so Claude Code blocks the tool on a decision
- * it can parse. (Exit code 2 is Claude Code's blocking-error fallback; we prefer an explicit,
- * reasoned `deny` over relying on it, but the catch-all keeps us closed regardless.)
+ * The hook always exits 0, with either empty stdout (no decision) or a `deny` JSON. If anything
+ * prevents deciding — even an unexpected internal throw — we print a `deny` decision and still exit 0
+ * so Claude Code blocks the tool on a decision it can parse. (Exit code 2 is Claude Code's
+ * blocking-error fallback; we prefer an explicit, reasoned `deny` over relying on it.)
+ *
+ * Because empty stdout now means "no objection", the process also installs an exit backstop
+ * (`./lib/decision-output.ts`, #265): reaching `beforeExit`/`exit` without a finalized decision
+ * prints a `deny`, so a premature exit can never read as an approval.
  *
  * @see ./lib/hook-io.ts (the verified PreToolUse wire contract)
  * @see https://code.claude.com/docs/en/hooks
@@ -34,7 +38,14 @@ import { createClient, type ClientConfig } from "@allw/sdk";
 import { readConfig } from "./lib/config.js";
 import { decide, type RequestApprovalFn } from "./lib/decide.js";
 import { isGatedTool } from "./lib/gating.js";
-import { allowOutput, denyOutput, parseHookInput, type PreToolUseOutput } from "./lib/hook-io.js";
+import { installDecisionBackstop } from "./lib/decision-output.js";
+import {
+  denyOutput,
+  noDecisionOutput,
+  parseHookInput,
+  type ClaudeHookResult,
+  type PreToolUseOutput,
+} from "./lib/hook-io.js";
 import { loadWasm } from "./lib/wasm.js";
 import { getVersion } from "./version.js";
 
@@ -67,14 +78,17 @@ async function readStdin(): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-/** Write the decision JSON to stdout. Claude Code reads the permission decision from this. */
-function emit(output: PreToolUseOutput): void {
-  process.stdout.write(`${JSON.stringify(output)}\n`);
-}
+/**
+ * The deny the exit backstop prints when the process reaches exit without a finalized decision
+ * (#265) — e.g. the event loop drained while an approval was still pending.
+ */
+export const BACKSTOP_DENY_REASON =
+  "allw: hook exited before reaching a decision (fail-closed deny)";
 
 /**
  * Run the hook end-to-end against a raw stdin string and an environment map, returning the decision
- * output. Pure with respect to stdout (the caller emits) so it is exercised whole in tests.
+ * (`null` = no decision). Pure with respect to stdout (the caller emits) so it is exercised whole in
+ * tests.
  *
  * @param overrides test-only SDK transport seams (a relay double + fixed clock); omitted in prod.
  */
@@ -82,19 +96,18 @@ export async function runHook(
   raw: string,
   env: NodeJS.ProcessEnv,
   overrides: RunHookOverrides = {},
-): Promise<PreToolUseOutput> {
+): Promise<ClaudeHookResult> {
   const parsed = parseHookInput(raw);
   if (!parsed.ok) {
     return denyOutput(parsed.reason);
   }
 
-  // Fast path: a non-gated tool passes through as `allow` regardless of config — the hook never
-  // contacts the relay for it, so a missing/misconfigured `allw` setup must not block reads, edits,
-  // greps, etc. Only a *gated* call (Bash / MCP) requires config and the WASM core below.
+  // Fast path: a non-gated tool gets no decision regardless of config — the hook never contacts the
+  // relay for it, so a missing/misconfigured `allw` setup must not block reads, greps, etc. Widening
+  // the matcher therefore only ever adds gating; it never grants. Only a *gated* call (Bash, a file
+  // edit, MCP) requires config and the WASM core below.
   if (!isGatedTool(parsed.input.toolName)) {
-    return allowOutput(
-      `allw: tool '${parsed.input.toolName}' is not gated by allw; passing through`,
-    );
+    return noDecisionOutput();
   }
 
   const configResult = readConfig(env);
@@ -146,7 +159,12 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  let output: PreToolUseOutput;
+  // From here on, any exit without a finalized decision prints a deny (#265).
+  const decision = installDecisionBackstop<PreToolUseOutput>(() =>
+    denyOutput(BACKSTOP_DENY_REASON),
+  );
+
+  let output: ClaudeHookResult;
   try {
     const raw = await readStdin();
     output = await runHook(raw, process.env);
@@ -158,9 +176,9 @@ async function main(): Promise<void> {
       }`,
     );
   }
-  emit(output);
-  // Exit 0 with a decision JSON: Claude Code acts on the decision (allow or deny). A non-zero exit
-  // would be a hook *error* rather than a *decision*; we always speak in explicit decisions.
+  decision.finalize(output);
+  // Exit 0: empty stdout is "no decision", a deny JSON is a deny. A non-zero exit would be a hook
+  // *error* rather than a *decision*.
   process.exit(0);
 }
 

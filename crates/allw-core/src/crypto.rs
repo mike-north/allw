@@ -205,8 +205,9 @@ pub(crate) struct JwsHeader {
 /// [`verify_verdict`] cross-checks every outer field against the matching claim.
 ///
 /// Binary fields (`request_hash`, `nonce`) serialize as base64url-unpadded strings, consistent
-/// with the rest of the wire format. `challenge_response` is included (and therefore signed)
-/// only when present.
+/// with the rest of the wire format. `note` and `challenge_response` are included (and therefore
+/// signed) only when present; an absent field is signed *as absent*, so adding, removing or
+/// rewriting either one after signing is a claims mismatch.
 ///
 /// See `docs/contract.md` §Lifecycle step 5 and §Wire encoding → verdict signature.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,6 +232,12 @@ pub struct VerdictClaims {
     /// Number-match challenge response. Signed (and present) only when a challenge was required.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub challenge_response: Option<String>,
+
+    /// The approver's free-form note, signed verbatim (S15, #251). Carried as the note itself
+    /// rather than a hash: the outer [`Verdict::note`] is already plaintext on the wire, so a hash
+    /// would add a second canonicalization rule without hiding anything. Omitted when absent.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub note: Option<String>,
 }
 
 /// The signed claims inside a **device-cert** JWS — binds a device key to an account.
@@ -508,6 +515,34 @@ pub(crate) fn decode_and_verify_jws<T: for<'de> Deserialize<'de>>(
 
 // ── Signing API ──────────────────────────────────────────────────────────────────
 
+/// Maximum length of [`Verdict::note`], in bytes of UTF-8 (`docs/contract.md` §Wire encoding →
+/// verdict signature). Enforced at sign ([`SignVerdictError::NoteTooLong`]) and verify
+/// ([`VerifyError::NoteTooLong`]); a note of exactly this many bytes is allowed.
+pub const MAX_NOTE_BYTES: usize = 2048;
+
+/// Why [`sign_verdict`] refused to sign. Every variant means **no verdict was produced**.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignVerdictError {
+    /// The note is longer than [`MAX_NOTE_BYTES`] bytes of UTF-8.
+    NoteTooLong {
+        /// The note's length in bytes of UTF-8.
+        len: usize,
+    },
+}
+
+impl std::fmt::Display for SignVerdictError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoteTooLong { len } => write!(
+                f,
+                "verdict note is {len} bytes of UTF-8; the maximum is {MAX_NOTE_BYTES}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SignVerdictError {}
+
 /// An unsigned verdict: every [`Verdict`] field except the crypto-derived `sig`/`device_cert`.
 ///
 /// Making the signing input an explicit type (rather than a partially-built `Verdict`) keeps it
@@ -543,13 +578,21 @@ pub struct UnsignedVerdict {
 /// so the signed `kid` and the outer verdict's device id cannot diverge — [`verify_verdict`]
 /// requires `kid == approver.device_id`, and deriving both from one source removes the chance to
 /// build a self-inconsistent verdict.
-#[must_use]
+///
+/// # Errors
+///
+/// [`SignVerdictError::NoteTooLong`] if `unsigned.note` is longer than [`MAX_NOTE_BYTES`] bytes of
+/// UTF-8. Nothing is signed in that case.
 pub fn sign_verdict(
     unsigned: &UnsignedVerdict,
     device_key: &SigningKeyPair,
     nonce: &[u8],
     device_cert: Option<String>,
-) -> Verdict {
+) -> Result<Verdict, SignVerdictError> {
+    if let Some(len) = note_len_over_cap(unsigned.note.as_deref()) {
+        return Err(SignVerdictError::NoteTooLong { len });
+    }
+
     let claims = VerdictClaims {
         request_id: unsigned.request_id.clone(),
         request_hash: unsigned.request_hash,
@@ -557,6 +600,7 @@ pub fn sign_verdict(
         decided_at: unsigned.decided_at,
         nonce: nonce.to_vec(),
         challenge_response: unsigned.challenge_response.clone(),
+        note: unsigned.note.clone(),
     };
 
     let header = JwsHeader {
@@ -567,7 +611,7 @@ pub fn sign_verdict(
 
     let sig = encode_compact_jws(&header, &claims, device_key);
 
-    Verdict {
+    Ok(Verdict {
         v: unsigned.v,
         request_id: unsigned.request_id.clone(),
         request_hash: unsigned.request_hash,
@@ -578,7 +622,12 @@ pub fn sign_verdict(
         challenge_response: unsigned.challenge_response.clone(),
         sig,
         device_cert,
-    }
+    })
+}
+
+/// `Some(len)` when `note` is longer than [`MAX_NOTE_BYTES`] bytes of UTF-8, else `None`.
+fn note_len_over_cap(note: Option<&str>) -> Option<usize> {
+    note.map(str::len).filter(|&len| len > MAX_NOTE_BYTES)
 }
 
 /// Issues a device certificate: an EdDSA compact JWS, signed by the **account root** key,
@@ -801,6 +850,9 @@ pub struct VerifiedVerdict {
     /// The signed anti-replay nonce, returned so bindings can thread freshness into their own
     /// long-lived stores after the core has authenticated the verdict.
     pub nonce: Vec<u8>,
+    /// The approver's note, taken from the **signed claims**. This is the value an audit record
+    /// must carry (`docs/contract.md` §AuditRecord), never the unverified outer field.
+    pub note: Option<String>,
 }
 
 /// Why a verdict failed verification. Every variant is a **deny** (fail-closed).
@@ -828,6 +880,12 @@ pub enum VerifyError {
     VerdictSignatureInvalid,
     /// Step 2 — the verdict JWS was structurally malformed, or its `kid`/`typ`/`alg` was wrong.
     MalformedJws,
+    /// Step 0 — the outer note is longer than [`MAX_NOTE_BYTES`] bytes of UTF-8. Checked before any
+    /// crypto; since step 3 requires the signed note to equal the outer one, it bounds both.
+    NoteTooLong {
+        /// The note's length in bytes of UTF-8.
+        len: usize,
+    },
     /// Step 3 — an outer [`Verdict`] field disagreed with the signed claim of the same name.
     ClaimsMismatch {
         /// The field whose outer value diverged from the signed claim.
@@ -902,6 +960,10 @@ impl std::fmt::Display for VerifyError {
             Self::MalformedJws => {
                 write!(f, "verdict JWS is malformed or has the wrong typ/kid/alg")
             }
+            Self::NoteTooLong { len } => write!(
+                f,
+                "verdict note is {len} bytes of UTF-8; the maximum is {MAX_NOTE_BYTES}"
+            ),
             Self::ClaimsMismatch { field } => {
                 write!(
                     f,
@@ -1029,6 +1091,8 @@ pub fn derive_number_match_challenge(request_hash: &[u8; 32]) -> String {
 /// Fail-closed: **any** failure returns `Err` (`docs/contract.md` §Invariants #6). The steps
 /// map one-to-one onto the `docs/contract.md` §Verification checklist:
 ///
+/// 0. **Note bound** (input hygiene, before any crypto). An outer `note` longer than
+///    [`MAX_NOTE_BYTES`] bytes of UTF-8 is rejected ([`VerifyError::NoteTooLong`]).
 /// 1. **Device cert → root** (checklist #1). Requires `verdict.device_cert`
 ///    ([`VerifyError::MissingDeviceCert`]); verifies its JWS against `approver_root`
 ///    ([`VerifyError::CertSignatureInvalid`]); checks `typ`, the signed header `kid` and
@@ -1039,8 +1103,9 @@ pub fn derive_number_match_challenge(request_hash: &[u8; 32]) -> String {
 ///    `typ`/`kid == approver.device_id`, and verifies it with the device key from step 1
 ///    ([`VerifyError::VerdictSignatureInvalid`] / [`VerifyError::MalformedJws`]).
 /// 3. **Claims ↔ outer consistency** (checklist #2). Each outer field
-///    (`request_id`, `decision`, `decided_at`, `request_hash`, `challenge_response`) must equal
-///    its signed claim ([`VerifyError::ClaimsMismatch`]).
+///    (`request_id`, `decision`, `decided_at`, `request_hash`, `challenge_response`, `note`) must
+///    equal its signed claim ([`VerifyError::ClaimsMismatch`]); an optional field present on one
+///    side and absent on the other is a mismatch.
 /// 4. **Binds the EXACT request — id AND hash** (checklist #2). `claims.request_id == request.id`
 ///    ([`VerifyError::RequestIdMismatch`]) AND `claims.request_hash` equals the hash recomputed
 ///    locally from the [`ApprovalContext`] + the envelope's `expires_at` (via
@@ -1187,6 +1252,11 @@ fn verify_verdict_with_account_states_impl(
     account_states: &[&str],
     expected_account_id: Option<&str>,
 ) -> Result<VerifiedVerdict, VerifyError> {
+    // ── Step 0: bound the untrusted note before any crypto ───────────────────────
+    if let Some(len) = note_len_over_cap(verdict.note.as_deref()) {
+        return Err(VerifyError::NoteTooLong { len });
+    }
+
     // ── Step 1: device cert chains to the account root ───────────────────────────
     if expected_account_id.is_some_and(|expected| expected != verdict.approver.account_id) {
         return Err(VerifyError::ExpectedAccountMismatch);
@@ -1265,6 +1335,11 @@ fn verify_verdict_with_account_states_impl(
             field: "challenge_response",
         });
     }
+    // The outer note must equal the signed one (S15, #251): otherwise the relay could rewrite,
+    // inject, or strip the human's note before it reaches the audit trail.
+    if claims.note != verdict.note {
+        return Err(VerifyError::ClaimsMismatch { field: "note" });
+    }
 
     // ── Step 4: bind to the EXACT request — id AND hash (no swap) ─────────────────
     // `request_hash` deliberately excludes `id` (it covers only the human-shown content), so two
@@ -1327,6 +1402,7 @@ fn verify_verdict_with_account_states_impl(
         approver: verdict.approver.clone(),
         decided_at: claims.decided_at,
         nonce: claims.nonce.clone(),
+        note: claims.note.clone(),
     })
 }
 
@@ -1516,6 +1592,7 @@ mod tests {
             NONCE,
             Some(cert),
         )
+        .expect("note within cap")
     }
 
     // ── Round-trip happy path ─────────────────────────────────────────────────────
@@ -1594,7 +1671,8 @@ mod tests {
             &device_key(),
             NONCE,
             Some(cert),
-        );
+        )
+        .expect("note within cap");
         let request = make_request();
         let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
@@ -1663,7 +1741,8 @@ mod tests {
             &device_key(),
             NONCE,
             Some(cert),
-        );
+        )
+        .expect("note within cap");
         let request = make_request();
         let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
@@ -1688,7 +1767,8 @@ mod tests {
             &device_key(),
             NONCE,
             None, // no cert
-        );
+        )
+        .expect("note within cap");
         let request = make_request();
         let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
@@ -1805,7 +1885,8 @@ mod tests {
             &device_key(),
             NONCE,
             Some(cert),
-        );
+        )
+        .expect("note within cap");
         // Request is bound to REQUEST_HASH, not OTHER_REQUEST_HASH.
         let request = make_request();
         let context = make_context(false);
@@ -1877,7 +1958,8 @@ mod tests {
             note: None,
             challenge_response: None,
         };
-        let verdict = sign_verdict(&unsigned, &device_key(), NONCE, Some(cert));
+        let verdict =
+            sign_verdict(&unsigned, &device_key(), NONCE, Some(cert)).expect("note within cap");
 
         // Request B: different id, SAME request_hash (renders identically).
         let request = make_request();
@@ -1910,7 +1992,8 @@ mod tests {
             &device_key(),
             NONCE,
             Some(cert),
-        );
+        )
+        .expect("note within cap");
         verdict.challenge_response = Some("99".to_string()); // tamper the OUTER field only
 
         let request = make_request();
@@ -1930,6 +2013,228 @@ mod tests {
             err,
             VerifyError::ClaimsMismatch {
                 field: "challenge_response"
+            }
+        );
+    }
+
+    // ── Signed note (S15, #251) ─────────────────────────────────────────────────
+
+    /// Signs an approved, canonical-hash verdict carrying `note` (challenge not required).
+    fn make_signed_with_note(note: Option<&str>) -> Verdict {
+        let cert = make_cert(&root_key());
+        let mut unsigned = make_unsigned(Decision::Approved, canonical_hash(false), None);
+        unsigned.note = note.map(str::to_string);
+        sign_verdict(&unsigned, &device_key(), NONCE, Some(cert)).expect("note within cap")
+    }
+
+    /// Verifies `verdict` against the standard request/context with a fresh nonce store.
+    fn verify_standard(verdict: &Verdict) -> Result<VerifiedVerdict, VerifyError> {
+        let mut store = InMemoryNonceStore::new();
+        verify_verdict(
+            verdict,
+            &make_request(),
+            &make_context(false),
+            &root_key().public_key(),
+            &mut store,
+            NOW_OK,
+        )
+    }
+
+    /// Decodes the (unverified) payload segment of a compact JWS into verdict claims.
+    fn decode_verdict_claims(sig: &str) -> VerdictClaims {
+        let payload = sig.split('.').nth(1).expect("compact JWS has a payload");
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).expect("b64url payload"))
+            .expect("verdict claims JSON")
+    }
+
+    /// The note is inside the signed claims, verbatim, and a noted verdict verifies
+    /// (docs/contract.md §Wire encoding → verdict signature).
+    #[test]
+    fn note_is_signed_and_noted_verdict_verifies() {
+        let verdict = make_signed_with_note(Some("ok, but only this once"));
+        let claims = decode_verdict_claims(&verdict.sig);
+        assert_eq!(claims.note.as_deref(), Some("ok, but only this once"));
+        verify_standard(&verdict).expect("an untampered noted verdict must verify");
+    }
+
+    /// An absent note is omitted from the signed claims (not `"note": null`), so a note-less
+    /// verdict's signed payload is unchanged by this field.
+    #[test]
+    fn absent_note_is_omitted_from_signed_claims() {
+        let verdict = make_signed_with_note(None);
+        let payload = verdict.sig.split('.').nth(1).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
+        assert!(json.get("note").is_none(), "absent note must be omitted");
+        verify_standard(&verdict).expect("a note-less verdict must verify");
+    }
+
+    /// Rewriting the outer note (relay tamper) → ClaimsMismatch{field:"note"}.
+    #[test]
+    fn tampered_outer_note_detected() {
+        let mut verdict = make_signed_with_note(Some("deny if this touches prod"));
+        verdict.note = Some("looks fine".to_string());
+        assert_eq!(
+            verify_standard(&verdict).expect_err("tampered note must fail"),
+            VerifyError::ClaimsMismatch { field: "note" }
+        );
+    }
+
+    /// Adding a note to a verdict that was signed without one → ClaimsMismatch{field:"note"}.
+    #[test]
+    fn note_added_after_signing_detected() {
+        let mut verdict = make_signed_with_note(None);
+        verdict.note = Some("injected by relay".to_string());
+        assert_eq!(
+            verify_standard(&verdict).expect_err("injected note must fail"),
+            VerifyError::ClaimsMismatch { field: "note" }
+        );
+    }
+
+    /// Stripping a signed note from the outer verdict → ClaimsMismatch{field:"note"}.
+    #[test]
+    fn note_removed_after_signing_detected() {
+        let mut verdict = make_signed_with_note(Some("approved with reservations"));
+        verdict.note = None;
+        assert_eq!(
+            verify_standard(&verdict).expect_err("stripped note must fail"),
+            VerifyError::ClaimsMismatch { field: "note" }
+        );
+    }
+
+    /// An empty-string note is a distinct value from an absent note: blanking the outer note
+    /// (`Some("")`) is still a mismatch, not a normalization to "no note".
+    #[test]
+    fn note_blanked_after_signing_detected() {
+        let mut verdict = make_signed_with_note(Some("approved with reservations"));
+        verdict.note = Some(String::new());
+        assert_eq!(
+            verify_standard(&verdict).expect_err("blanked note must fail"),
+            VerifyError::ClaimsMismatch { field: "note" }
+        );
+    }
+
+    /// Rewriting the note INSIDE the signed payload (and the outer field to match) without
+    /// re-signing → VerdictSignatureInvalid: the relay cannot forge a consistent pair.
+    #[test]
+    fn note_rewritten_in_signed_payload_detected() {
+        let mut verdict = make_signed_with_note(Some("deny if this touches prod"));
+        let mut claims = decode_verdict_claims(&verdict.sig);
+        claims.note = Some("looks fine".to_string());
+        let mut parts: Vec<String> = verdict.sig.split('.').map(str::to_string).collect();
+        parts[1] = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        verdict.sig = parts.join(".");
+        verdict.note = Some("looks fine".to_string());
+        assert_eq!(
+            verify_standard(&verdict).expect_err("re-encoded note without re-signing must fail"),
+            VerifyError::VerdictSignatureInvalid
+        );
+    }
+
+    /// The note check runs BEFORE the decision gate: a signed *denial* whose note was rewritten is
+    /// unverifiable (`ClaimsMismatch{field:"note"}`), never a verified human "no" (`NotApproved`).
+    /// Otherwise a relay could forge the note on any denial and it would be audited as authentic.
+    #[test]
+    fn tampered_note_on_denial_is_claims_mismatch_not_not_approved() {
+        let cert = make_cert(&root_key());
+        let mut unsigned = make_unsigned(Decision::Denied, canonical_hash(false), None);
+        unsigned.note = Some("never on prod".to_string());
+        let mut verdict =
+            sign_verdict(&unsigned, &device_key(), NONCE, Some(cert)).expect("note within cap");
+        // Control: the untampered denial is a verified "no".
+        assert_eq!(
+            verify_standard(&verdict).unwrap_err(),
+            VerifyError::NotApproved {
+                decision: Decision::Denied
+            }
+        );
+        verdict.note = Some("fine on prod".to_string());
+        assert_eq!(
+            verify_standard(&verdict).unwrap_err(),
+            VerifyError::ClaimsMismatch { field: "note" }
+        );
+    }
+
+    /// `VerifiedVerdict.note` comes from the signed claims (the value audit records must carry).
+    #[test]
+    fn verified_verdict_returns_the_signed_note() {
+        let verified = verify_standard(&make_signed_with_note(Some("only this once")))
+            .expect("noted verdict verifies");
+        assert_eq!(verified.note.as_deref(), Some("only this once"));
+        let verified = verify_standard(&make_signed_with_note(None)).expect("verifies");
+        assert_eq!(verified.note, None);
+    }
+
+    /// Signs `note` without the sign-side cap, so verify-side cap tests can build an over-cap
+    /// verdict the way a non-core signer could.
+    fn sign_uncapped_with_note(note: &str) -> Verdict {
+        let mut verdict = make_signed_with_note(None);
+        let mut claims = decode_verdict_claims(&verdict.sig);
+        claims.note = Some(note.to_string());
+        let header = JwsHeader {
+            alg: ALG_EDDSA.to_string(),
+            typ: TYP_VERDICT.to_string(),
+            kid: DEVICE_ID.to_string(),
+        };
+        verdict.sig = encode_compact_jws(&header, &claims, &device_key());
+        verdict.note = Some(note.to_string());
+        verdict
+    }
+
+    /// A note of exactly `MAX_NOTE_BYTES` bytes of UTF-8 signs and verifies.
+    #[test]
+    fn note_at_cap_signs_and_verifies() {
+        let note = "a".repeat(MAX_NOTE_BYTES);
+        let verified = verify_standard(&make_signed_with_note(Some(&note))).expect("at cap");
+        assert_eq!(verified.note.as_deref(), Some(note.as_str()));
+    }
+
+    /// One byte over the cap: sign refuses with a typed error and produces no verdict.
+    #[test]
+    fn note_one_byte_over_cap_is_refused_at_sign() {
+        let mut unsigned = make_unsigned(Decision::Approved, canonical_hash(false), None);
+        unsigned.note = Some("a".repeat(MAX_NOTE_BYTES + 1));
+        let err = sign_verdict(
+            &unsigned,
+            &device_key(),
+            NONCE,
+            Some(make_cert(&root_key())),
+        )
+        .expect_err("over-cap note must not sign");
+        assert_eq!(
+            err,
+            SignVerdictError::NoteTooLong {
+                len: MAX_NOTE_BYTES + 1
+            }
+        );
+    }
+
+    /// The cap counts UTF-8 bytes, not characters: 683 three-byte chars (2049 bytes) is over.
+    #[test]
+    fn note_cap_counts_utf8_bytes_not_chars() {
+        let note = "—".repeat(683); // U+2014 is 3 bytes; 683 * 3 = 2049
+        assert_eq!(note.len(), MAX_NOTE_BYTES + 1);
+        let mut unsigned = make_unsigned(Decision::Approved, canonical_hash(false), None);
+        unsigned.note = Some(note);
+        assert_eq!(
+            sign_verdict(&unsigned, &device_key(), NONCE, None).unwrap_err(),
+            SignVerdictError::NoteTooLong {
+                len: MAX_NOTE_BYTES + 1
+            }
+        );
+    }
+
+    /// One byte over the cap at verify: an otherwise validly signed verdict (from a signer that
+    /// skipped the cap) is rejected with `NoteTooLong`; at the cap the same path verifies.
+    #[test]
+    fn note_one_byte_over_cap_is_rejected_at_verify() {
+        let at_cap = sign_uncapped_with_note(&"a".repeat(MAX_NOTE_BYTES));
+        verify_standard(&at_cap).expect("a signed at-cap note verifies");
+        let over = sign_uncapped_with_note(&"a".repeat(MAX_NOTE_BYTES + 1));
+        assert_eq!(
+            verify_standard(&over).unwrap_err(),
+            VerifyError::NoteTooLong {
+                len: MAX_NOTE_BYTES + 1
             }
         );
     }
@@ -1956,7 +2261,8 @@ mod tests {
             &device_key(),
             NONCE,
             Some(cert),
-        );
+        )
+        .expect("note within cap");
         let request = make_request();
         let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
@@ -1985,7 +2291,8 @@ mod tests {
             &device_key(),
             NONCE,
             Some(cert),
-        );
+        )
+        .expect("note within cap");
         let request = make_request();
         let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
@@ -2017,7 +2324,8 @@ mod tests {
             &device_key(),
             NONCE,
             Some(cert),
-        );
+        )
+        .expect("note within cap");
         let request = make_request();
         let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
@@ -2048,7 +2356,8 @@ mod tests {
             &device_key(),
             NONCE,
             Some(cert),
-        );
+        )
+        .expect("note within cap");
         let request = make_request();
         let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
@@ -2098,7 +2407,8 @@ mod tests {
         let cert = make_cert(&root_key());
         let mut unsigned = make_unsigned(Decision::Approved, canonical_hash(false), None);
         unsigned.decided_at = TS_CREATED - 1; // before the window opens
-        let verdict = sign_verdict(&unsigned, &device_key(), NONCE, Some(cert));
+        let verdict =
+            sign_verdict(&unsigned, &device_key(), NONCE, Some(cert)).expect("note within cap");
         let request = make_request();
         let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
@@ -2121,7 +2431,8 @@ mod tests {
         let cert = make_cert(&root_key());
         let mut unsigned = make_unsigned(Decision::Approved, canonical_hash(false), None);
         unsigned.decided_at = TS_EXPIRES + 1; // after the window closes
-        let verdict = sign_verdict(&unsigned, &device_key(), NONCE, Some(cert));
+        let verdict =
+            sign_verdict(&unsigned, &device_key(), NONCE, Some(cert)).expect("note within cap");
         let request = make_request();
         let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
@@ -2175,7 +2486,8 @@ mod tests {
             &device_key(),
             NONCE,
             Some(cert),
-        );
+        )
+        .expect("note within cap");
         let request = make_request();
         let context = make_context(true);
         let mut store = InMemoryNonceStore::new();
@@ -2201,7 +2513,8 @@ mod tests {
             &device_key(),
             NONCE,
             Some(cert),
-        );
+        )
+        .expect("note within cap");
         let request = make_request();
         let context = make_context(true);
         let mut store = InMemoryNonceStore::new();
@@ -2242,7 +2555,8 @@ mod tests {
             &device_key(),
             NONCE,
             Some(cert),
-        );
+        )
+        .expect("note within cap");
         let request = make_request();
         let context = make_context(true);
         let mut store = InMemoryNonceStore::new();
@@ -2279,7 +2593,8 @@ mod tests {
             &device_key(),
             NONCE,
             Some(cert),
-        );
+        )
+        .expect("note within cap");
         let request = make_request();
         let context = make_context(true);
         let mut store = InMemoryNonceStore::new();
@@ -2399,7 +2714,8 @@ mod tests {
             &device_key(),
             NONCE,
             Some(cert),
-        );
+        )
+        .expect("note within cap");
         let request = make_request();
         let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
@@ -2426,7 +2742,8 @@ mod tests {
             &device_key(),
             NONCE,
             Some(cert),
-        );
+        )
+        .expect("note within cap");
         let request = make_request();
         let context = make_context(false);
         let mut store = InMemoryNonceStore::new();
@@ -2540,7 +2857,8 @@ mod tests {
             &device_key(),
             NONCE,
             Some(cert),
-        );
+        )
+        .expect("note within cap");
         let request = make_request();
         let context = make_context(true);
         let mut store = InMemoryNonceStore::new();
@@ -2614,7 +2932,8 @@ mod tests {
             &imposter,
             NONCE,
             Some(cert),
-        );
+        )
+        .expect("note within cap");
         let request = make_request();
         let context = make_context(false);
         let mut store = InMemoryNonceStore::new();

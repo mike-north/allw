@@ -90,6 +90,30 @@ export function isPushTransportKind(value: string): value is PushTransportKind {
   return value === "apns" || value === "fcm" || value === "webpush";
 }
 
+/** A push token as a device registers it: routing metadata only, never request content. */
+export interface PushTokenEntry {
+  readonly transport: PushTransportKind;
+  readonly token: string;
+}
+
+/**
+ * The row changes that turn a device's current push-token set into `desired`: rows to delete and
+ * entries to insert. Tokens present in both are left untouched (keeping their `created_at`), so
+ * replacing a set with itself changes nothing.
+ */
+export function diffPushTokenSet(
+  current: readonly PushTokenEntry[],
+  desired: readonly PushTokenEntry[],
+): { readonly remove: PushTokenEntry[]; readonly add: PushTokenEntry[] } {
+  const key = (entry: PushTokenEntry): string => `${entry.transport}\0${entry.token}`;
+  const currentKeys = new Set(current.map(key));
+  const desiredKeys = new Set(desired.map(key));
+  return {
+    remove: current.filter((entry) => !desiredKeys.has(key(entry))),
+    add: desired.filter((entry) => !currentKeys.has(key(entry))),
+  };
+}
+
 /** The tokens a fan-out will actually attempt: those whose transport is registered. */
 export function schedulablePushTokens(
   tokens: readonly StoredPushToken[],
