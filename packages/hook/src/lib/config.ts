@@ -28,7 +28,8 @@
  * Per the Claude Code hooks docs, a command hook's default `timeout` is **600s**, and a hook
  * **timeout** is a *non-blocking error* → Claude Code **proceeds** (fail-OPEN); its behavior on
  * timeout is otherwise undocumented and version-dependent. So the contract we control is: the hook
- * always exits 0 with an explicit `allow`/`deny`, **well before** any external timeout.
+ * always exits 0 with its decision (no output for an approval, a `deny` otherwise) **well before**
+ * any external timeout.
  *
  * To guarantee that, the documented `.claude/settings.json` install block pins the hook `timeout`
  * to {@link PINNED_HOOK_TIMEOUT_MS}, and `ALLW_TIMEOUT_MS` is **capped** at
@@ -65,7 +66,8 @@ export const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
  * The Claude Code hook `timeout` (in ms) the README's install block pins. Chosen comfortably below
  * Claude Code's 600s command-hook default so the relationship is explicit and version-independent,
  * and comfortably above {@link DEFAULT_TIMEOUT_MS} so the common case has ample headroom. The hook
- * always emits an explicit `allow`/`deny` before this fires (issue #52).
+ * always reaches its decision (no output for an approval, a `deny` otherwise) before this fires
+ * (issue #52).
  *
  * NOTE: Claude Code expresses `timeout` in **seconds** (`480`); this is the same value in **ms**
  * (`480000`) for comparison against `ALLW_TIMEOUT_MS`, which is in ms.

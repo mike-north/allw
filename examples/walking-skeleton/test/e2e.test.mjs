@@ -7,7 +7,7 @@
  *   real `@allw/hook` runHook  →  real `@allw/sdk` requestApproval  →  in-process relay  →
  *   real `@allw/approver` core (decrypt → recompute request_hash → sign_verdict)  →  back to the
  *   SDK, which verifies the signed verdict against the account-root key before returning it, and
- *   the hook maps the verified verdict to allow/deny.
+ *   the hook maps the verified verdict to "no decision" (approved) or deny.
  *
  * The only stand-in is the relay transport: the real relay runs under workerd while the SDK and
  * approver run under node, so a single-process `node --test` cannot host both runtimes and dial
@@ -22,7 +22,8 @@
  * 1. A gated destructive command is intercepted by the hook (it builds the ActionRecord + escalates).
  * 2. The exact command + actor + risk + expiry reach the approver inside the encrypted context
  *    (asserted via the approver's recomputed WYSIWYS request_hash matching the SDK's).
- * 3. Approve → the hook emits `allow`; deny → `deny`; timeout → `deny`. Fail-closed both ways.
+ * 3. Approve → the hook makes no decision (empty stdout; never `allow`, #247); deny → `deny`;
+ *    timeout → `deny`. Fail-closed both ways.
  * 4. The integrator independently re-verifies the signed verdict — request_id AND request_hash,
  *    no-swap — and the relay stored ONLY ciphertext + routing (zero-knowledge), never plaintext or
  *    a signing key.
@@ -118,9 +119,9 @@ function hookEnv(identity) {
   };
 }
 
-// ── Acceptance item 3: Approve → allow ──────────────────────────────────────────────────────────
+// ── Acceptance item 3: Approve → no decision (never allow, #247) ────────────────────────────────
 
-test("approve: a gated destructive command → human approves → hook emits allow", async () => {
+test("approve: a gated destructive command → human approves → hook makes no decision", async () => {
   const { identity, relay, log } = await harness("approved");
 
   const output = await runHook(
@@ -129,11 +130,10 @@ test("approve: a gated destructive command → human approves → hook emits all
     sdkOverrides(relay),
   );
 
-  assert.equal(output.hookSpecificOutput.hookEventName, "PreToolUse");
   assert.equal(
-    output.hookSpecificOutput.permissionDecision,
-    "allow",
-    "a verified approved verdict gates the destructive command open",
+    output,
+    null,
+    "a verified approval removes allw's objection without granting; Claude Code's rules still apply",
   );
   // The approver saw and signed over exactly one request (WYSIWYS hash recorded).
   assert.equal(log.length, 1, "the approver handled exactly one escalated request");

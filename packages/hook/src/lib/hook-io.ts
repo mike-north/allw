@@ -19,22 +19,28 @@
  * }
  * ```
  *
- * # stdout (the permission decision)
- * The hook prints a JSON object and exits 0; Claude Code reads the decision from it:
+ * # stdout (the permission decision) — deny only
+ * Claude Code's vocabulary is `allow` | `deny` | `ask` | `defer`. allw uses exactly one of them. The
+ * hook always exits 0 and either:
+ *
+ * - prints **nothing** (no decision): a non-gated tool, a pass-through, or a verified human approval.
+ *   Claude Code then applies the user's own permission rules, exactly as without allw; or
+ * - prints a **deny**, the fail-closed result for everything else:
  *
  * ```jsonc
  * {
  *   "hookSpecificOutput": {
  *     "hookEventName": "PreToolUse",
- *     "permissionDecision": "allow" | "deny" | "ask",
+ *     "permissionDecision": "deny",
  *     "permissionDecisionReason": "…"
  *   }
  * }
  * ```
  *
- * `allw` only ever emits `allow` (a verified human approval) or `deny` (everything else — the
- * fail-closed default). It never emits `ask`/`defer`: a gated action that reaches the human is
- * decided by the human, and a non-gated action is passed through as `allow`.
+ * allw never emits `allow`: in Claude Code an `allow` skips the permission prompt, so it would let an
+ * allw approval, or a matcher widened to tools allw never asks about, grant access the user's own
+ * rules would have prompted for. A verdict may only tighten access (`docs/contract.md` §Invariants).
+ * This mirrors `@allw/codex-hook` (#191); the shared writer is `./decision-output.ts`.
  *
  * @see https://code.claude.com/docs/en/hooks (PreToolUse JSON schema, decision values, exit codes)
  */
@@ -43,11 +49,10 @@
 export const HOOK_EVENT_NAME = "PreToolUse" as const;
 
 /**
- * The decision values Claude Code understands on `permissionDecision`. `allw` only emits
- * `allow`/`deny`; `ask` is part of the contract vocabulary but never produced here (a gated action
- * is decided by the human, a non-gated one passes through).
+ * The only `permissionDecision` allw writes. Claude Code also understands `allow`, `ask` and `defer`;
+ * allw deliberately emits none of them (see the module doc comment).
  */
-export type PermissionDecision = "allow" | "deny" | "ask";
+export type PermissionDecision = "deny";
 
 /**
  * The validated PreToolUse hook input. Only the fields the hook reads are typed; Claude Code may
@@ -69,30 +74,34 @@ export interface HookSpecificOutput {
   readonly permissionDecisionReason: string;
 }
 
-/** The full stdout payload: a single `hookSpecificOutput` envelope. */
+/** The full stdout payload for a deny: a single `hookSpecificOutput` envelope. */
 export interface PreToolUseOutput {
   readonly hookSpecificOutput: HookSpecificOutput;
 }
 
-/** Build the stdout payload for a decision. */
-export function makeOutput(decision: PermissionDecision, reason: string): PreToolUseOutput {
+/**
+ * The hook's full result. `null` is "no decision" — written as empty stdout + exit 0, so Claude Code
+ * applies the user's own permission rules. A non-null value is always a `deny`.
+ */
+export type ClaudeHookResult = PreToolUseOutput | null;
+
+/**
+ * "allw has no objection": a non-gated tool, a pass-through, or a verified human approval. Named
+ * rather than a bare `null` so the intent (no decision, never an `allow`) reads at the call site.
+ */
+export function noDecisionOutput(): ClaudeHookResult {
+  return null;
+}
+
+/** A `deny` output — the fail-closed default for every error/ambiguity path, and the only output. */
+export function denyOutput(reason: string): PreToolUseOutput {
   return {
     hookSpecificOutput: {
       hookEventName: HOOK_EVENT_NAME,
-      permissionDecision: decision,
+      permissionDecision: "deny",
       permissionDecisionReason: reason,
     },
   };
-}
-
-/** A `deny` output — the fail-closed default for every error/ambiguity path. */
-export function denyOutput(reason: string): PreToolUseOutput {
-  return makeOutput("deny", reason);
-}
-
-/** An `allow` output — only ever produced for a verified approval or a non-gated pass-through. */
-export function allowOutput(reason: string): PreToolUseOutput {
-  return makeOutput("allow", reason);
 }
 
 /** The result of parsing stdin: either a validated input or a fail-closed reason to deny. */

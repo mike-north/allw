@@ -31,13 +31,13 @@ pnpm -r build              # build every surface (sdk → approver/hook → this
 
 # Live end-to-end demo (boots a real `wrangler dev` relay, pairs a real approver, drives the real
 # hook bin, auto-approves, and asserts the decision). Pick a mode:
-pnpm --filter @allw/example-walking-skeleton demo:approve   # → hook emits allow
+pnpm --filter @allw/example-walking-skeleton demo:approve   # → hook makes no decision (empty stdout)
 pnpm --filter @allw/example-walking-skeleton demo:deny      # → hook emits deny
 pnpm --filter @allw/example-walking-skeleton demo:timeout   # → hook emits deny (fail-closed)
 ```
 
 Each mode prints the WYSIWYS approval block (the exact command, actor, risk, expiry, and
-`request_hash`) and then `✔ PASS — the live stack produced '<allow|deny>' as expected.` (exit 0).
+`request_hash`) and then `✔ PASS — the live stack produced '<no decision|deny>' as expected.` (exit 0).
 
 What runs live, in order:
 
@@ -65,13 +65,16 @@ The primitive **never returns a bare "allow"** — the integrator composes it
 
 | Approver action             | Verdict the SDK resolves       | Hook decision |
 | --------------------------- | ------------------------------ | ------------- |
-| Approve                     | `approved` (verified)          | `allow`       |
+| Approve                     | `approved` (verified)          | none          |
 | Deny                        | `denied` (verified human "no") | `deny`        |
 | No response by the deadline | `expired` (timeout)            | `deny`        |
 | Unverifiable / forged       | synthesized `denied`           | `deny`        |
 
-Approve is the **only** path to `allow`, and only for a verdict that verifies against the approver's
-account-root key. Deny and timeout both block.
+"None" means empty stdout: allw has no objection and Claude Code's own permission rules decide the
+call. The hook never emits `allow`, because in Claude Code an `allow` skips the user's permission
+prompt and a verdict may only tighten access. Approve is the **only** way past allw's `deny`, and
+only for a verdict that verifies against the approver's account-root key. Deny and timeout both
+block.
 
 > The **unverifiable / forged** row is exercised here at the `Verdict.verify()` boolean (the no-swap
 > test asserts a verdict does **not** verify against a different root key). The forged-verdict path
@@ -108,7 +111,7 @@ A deterministic, all-real-crypto round-trip in one Node process (fixed clock, no
 
 It proves, with **no verdict stubbing**:
 
-- **approve → allow**, **deny → deny**, **timeout → deny** (fail-closed both ways);
+- **approve → no decision**, **deny → deny**, **timeout → deny** (fail-closed both ways);
 - the integrator **independently re-verifies** the verdict (`request_id` + `request_hash`), and that
   it does **not** verify against a different (attacker) root key (no-swap);
 - the relay stores **only** the opaque ciphertext envelope + signed verdict — never a plaintext
@@ -166,13 +169,42 @@ surface and presses Approve / Deny, and the recording itself is the artifact. To
      node packages/hook/dist/cli.js
    ```
    The hook **blocks**. Switch to Terminal B: the WYSIWYS block shows the exact command — press `a`
-   to approve or `d` to deny. The hook then prints `{"permissionDecision":"allow"}` (approve) or
-   `"deny"` (deny). Let the prompt sit to demonstrate the **timeout** (set `ALLW_TIMEOUT_MS=4000` to
+   to approve or `d` to deny. The hook then prints nothing (approve: no decision) or a
+   `{"permissionDecision":"deny"}` JSON (deny). Let the prompt sit to demonstrate the **timeout** (set `ALLW_TIMEOUT_MS=4000` to
    keep it short).
 
-> In a real Claude Code session the hook is wired via `.claude/settings.json` (matcher `Bash|mcp__.*`)
-> and Claude Code itself supplies the stdin — see [`packages/hook/README.md`](../../packages/hook/README.md).
-> Terminal C reproduces that stdin by hand so the recording does not depend on a live agent session.
+In a real Claude Code session the hook is wired via `.claude/settings.json` and Claude Code itself
+supplies the stdin; Terminal C reproduces that stdin by hand so the recording does not depend on a
+live agent session. For this checkout:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^(Bash|Edit|MultiEdit|Write)$|^mcp__",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /absolute/path/to/packages/hook/dist/cli.js",
+            "timeout": 480,
+            "onFailure": "block"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "deny": ["Monitor", "PowerShell", "NotebookEdit"]
+  }
+}
+```
+
+> `"onFailure": "block"` makes Claude Code block the call when the hook can't start, crashes or times
+> out. It needs Claude Code v2.1.295 or later; older versions ignore the key without warning, so
+> check `claude --version`. The `deny` rules turn off tools allw doesn't gate yet
+> ([#298](https://github.com/mike-north/allw/issues/298)). See
+> [`packages/hook/README.md`](../../packages/hook/README.md) for what each field does.
 
 ## Decisions
 
