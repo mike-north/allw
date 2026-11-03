@@ -571,8 +571,9 @@ test("renderRequest surfaces MCP server/tool even when a benign raw masks them, 
   const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
   const rendered = renderRequest(prepared);
 
-  // The benign raw may be the headline, but the dangerous hash-bound server/tool must be surfaced.
-  assert.match(rendered, /Action:\s+echo hello/, "the raw headline is shown");
+  // The hash-bound server/tool is the headline (#321); the benign raw is only its description.
+  assert.match(rendered, /Action:\s+fs :: delete_all_files/, "the tool identity is the headline");
+  assert.match(rendered, /Description: echo hello/, "the raw is labelled as the description");
   assert.match(
     rendered,
     /MCP:\s+fs :: delete_all_files/,

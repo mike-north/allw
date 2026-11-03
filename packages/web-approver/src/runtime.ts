@@ -18,7 +18,7 @@
  * re-checks the number-match challenge and refuses to sign without a paired device cert.
  */
 
-import { rawDivergesFromArgv, reconstructCommand } from "./command-line.js";
+import { rawDivergesFromArgv, reconstructCommand, toolIdentity } from "./command-line.js";
 import type {
   ApprovalActor,
   ApprovalContext,
@@ -353,10 +353,13 @@ function toApprovalContext(
     allowed_decisions: toAllowedDecisions(wire.constraints.allowed_decisions),
     hasHiddenOrControlChars: display.has_hidden_or_control_chars,
   };
-  // Decided on the unescaped bytes; the line shown is rebuilt from the escaped substrate.
-  const divergentArgv = rawDivergesFromArgv(wire.action.syntactic)
-    ? reconstructCommand(display.syntactic)
-    : undefined;
+  // Decided on the unescaped bytes; the line shown is rebuilt from the escaped substrate. A tool
+  // call that heads with its identity has no raw/argv divergence: its `raw` is a description, and a
+  // command form it carries is flagged separately (`toolCommandForm`).
+  const divergentArgv =
+    toolIdentity(context) === undefined && rawDivergesFromArgv(wire.action.syntactic)
+      ? reconstructCommand(display.syntactic)
+      : undefined;
   // Spread optional keys only when present so `exactOptionalPropertyTypes` keeps them absent.
   return {
     ...context,

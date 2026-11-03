@@ -1,4 +1,11 @@
-import { quoteToken, reconstructCommand, renderArgv, renderList } from "./command-line.js";
+import {
+  quoteToken,
+  reconstructCommand,
+  renderArgv,
+  renderList,
+  toolIdentity,
+} from "./command-line.js";
+export { toolIdentity } from "./command-line.js";
 
 export type { AllwWasm, WasmModuleSource } from "./wasm.js";
 export { initWasm, initWasmSync, resetWasmForTests } from "./wasm.js";
@@ -252,6 +259,13 @@ export interface WebApproverRuntime {
 export const RAW_ARGV_DIVERGENCE_WARNING =
   "⚠ raw and argv differ — the heading shows the hash-bound argv; the raw line below is what the agent wrote. Review both.";
 
+/**
+ * Shown with a tool-surface request that also carries a hash-bound command form (`bin`/`argv`). The
+ * heading is the tool identity, so the command is flagged; the plaintext shows it as `bin:`/`argv:` (#321).
+ */
+export const TOOL_COMMAND_FORM_WARNING =
+  "⚠ this tool call also carries a command (the bin/argv lines below) — it is hash-bound too. Review both.";
+
 /** Label for the context summary: the integrator's own description, not the action itself (#262). */
 export const CONTEXT_SUMMARY_LABEL = "Agent's description";
 
@@ -291,6 +305,8 @@ export interface ApprovalDetail extends ApprovalListItem {
   readonly contextSummary?: string;
   /** True when raw and the hash-bound argv describe different commands; see `divergentArgv`. */
   readonly rawArgvDiverges: boolean;
+  /** True when a tool-surface request also carries a command form; see {@link toolIdentity}. */
+  readonly toolCommandForm: boolean;
 }
 
 /**
@@ -545,6 +561,10 @@ export class WebApproverController {
       exactPlaintext: context ? exactPlaintext(context) : "Context could not be verified.",
       hasHiddenOrControlChars: context?.hasHiddenOrControlChars === true,
       rawArgvDiverges: context?.divergentArgv !== undefined,
+      toolCommandForm:
+        context !== undefined &&
+        toolIdentity(context) !== undefined &&
+        reconstructCommand(context.substrate) !== undefined,
     };
 
     if (!prepared) {
@@ -616,21 +636,22 @@ export class WebApproverController {
 export const NO_ACTION_FIELDS_HEADLINE = "(no command, tool, or file-edit fields)";
 
 /**
- * One-line headline for a list row and a card heading. Uses the CLI's precedence
- * (`renderActionHeadline` in `packages/approver/src/lib/render.ts`), whatever the surface, so a
- * record that mixes substrates (an `mcp_tool_call` also carrying `argv`) heads with the command,
- * not the benign-looking tool name. The shared fixture `test/fixtures/action-headline.json` keeps
- * the two approvers in step.
+ * One-line headline for a list row and a card heading. The CLI uses the same rule
+ * (`renderActionHeadline` in `packages/approver/src/lib/render.ts`), and both are checked against
+ * the shared fixture `test/fixtures/action-headline.json`.
  *
- * 1. When raw and argv diverge: the hash-bound argv form, never the possibly benign `raw` (the card
+ * 1. A tool surface with a `tool`: its {@link toolIdentity}. Its `raw` is shown as the caller's
+ *    description, and any command form it also carries is shown with a warning.
+ * 2. When raw and argv diverge: the hash-bound argv form, never the possibly benign `raw` (the card
  *    then shows a warning and both forms).
- * 2. A file edit: its diff summary, else `operation paths`.
- * 3. `raw`; else the command `bin`/`argv` reconstruct to.
- * 4. A tool call: `server :: tool` (a `.` join would make server `fs.delete` + tool `x` look like
- *    server `fs` + tool `delete.x`), or the tool alone.
- * 5. `operation paths`; else the compact params; else {@link NO_ACTION_FIELDS_HEADLINE}.
+ * 3. A file edit: its diff summary, else `operation paths`.
+ * 4. `raw`; else the command `bin`/`argv` reconstruct to.
+ * 5. `server :: tool`, or the tool alone.
+ * 6. `operation paths`; else the compact params; else {@link NO_ACTION_FIELDS_HEADLINE}.
  */
 export function actionSummary(context: ApprovalContext): string {
+  const identity = toolIdentity(context);
+  if (identity !== undefined) return identity;
   if (context.divergentArgv !== undefined) return context.divergentArgv;
   const s = context.substrate;
   const fileEdit =
@@ -692,9 +713,14 @@ export function exactPlaintext(context: ApprovalContext): string {
   if (s.diffHash !== undefined) lines.push(`diff_hash: ${s.diffHash}`);
   const content = s.rawLines ?? (s.raw !== undefined ? [s.raw] : undefined);
   if (content !== undefined) {
-    lines.push(
-      `${context.kind === "file_edit" ? "content" : "raw"}: ${content.join(CONTINUATION)}`,
-    );
+    // On a tool surface that heads with its identity, `raw` is the caller's description.
+    const label =
+      context.kind === "file_edit"
+        ? "content"
+        : toolIdentity(context) !== undefined
+          ? "description"
+          : "raw";
+    lines.push(`${label}: ${content.join(CONTINUATION)}`);
   }
   if (context.chain !== undefined) lines.push(`chain: ${renderList(context.chain)}`);
   return lines.length > 0 ? lines.join("\n") : "Unknown action";

@@ -104,3 +104,23 @@ export function rawDivergesFromArgv(syntactic: unknown): boolean {
   });
   return reconstructed !== undefined && reconstructed !== raw;
 }
+
+/** What {@link toolIdentity} reads: the request's surface kind and its tool-call fields. */
+export interface ToolIdentityParts {
+  readonly kind: string;
+  readonly substrate: { readonly server?: string | undefined; readonly tool?: string | undefined };
+}
+
+/**
+ * The tool identity a tool-surface request heads with: `server :: tool`, or the tool alone (a `.`
+ * join would make server `fs.delete` + tool `x` look like server `fs` + tool `delete.x`). It is
+ * `undefined` on any other surface, or when the request has no `tool`. On a tool surface `raw` is
+ * the caller's description of the call (e.g. OpenClaw's plugin text), not the action (#321).
+ * Mirrors the CLI's `toolIdentity` in `packages/approver/src/lib/render.ts`.
+ */
+export function toolIdentity(parts: ToolIdentityParts): string | undefined {
+  const { server, tool } = parts.substrate;
+  const isToolSurface = parts.kind === "mcp" || parts.kind === "agent_tool_call";
+  if (!isToolSurface || tool === undefined) return undefined;
+  return server !== undefined ? `${server} :: ${tool}` : tool;
+}

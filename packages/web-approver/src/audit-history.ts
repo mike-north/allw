@@ -25,6 +25,7 @@
 import {
   CONTEXT_SUMMARY_LABEL,
   RAW_ARGV_DIVERGENCE_WARNING,
+  TOOL_COMMAND_FORM_WARNING,
   type AuditHistoryItem,
   type WebApproverController,
 } from "./index.js";
@@ -211,6 +212,13 @@ function detailPane(
     divergence.className = "audit-raw-argv-divergence";
     divergence.setAttribute("role", "alert");
     pane.append(divergence);
+  }
+  if (detail.toolCommandForm) {
+    // The heading is the tool identity, so a hash-bound command the call also carries is flagged.
+    const commandForm = textElement("p", TOOL_COMMAND_FORM_WARNING);
+    commandForm.className = "audit-tool-command-form";
+    commandForm.setAttribute("role", "alert");
+    pane.append(commandForm);
   }
 
   // WYSIWYS receipt — plain text, no innerHTML

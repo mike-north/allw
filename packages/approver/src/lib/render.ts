@@ -159,6 +159,19 @@ export function rawDivergesFromArgv(action: ActionRecord): boolean {
 }
 
 /**
+ * The tool identity a tool-surface record heads with: `server :: tool`, or the tool alone. It is
+ * `undefined` on any other surface, or when the record has no `tool`. A `.` join would make server
+ * `fs.delete` + tool `x` look like server `fs` + tool `delete.x`, hence `::`.
+ */
+export function toolIdentity(display: DisplayModel): string | undefined {
+  const isToolSurface =
+    display.surface === "mcp_tool_call" || display.surface === "agent_tool_call";
+  const { server, tool } = display.syntactic;
+  if (!isToolSurface || tool === undefined) return undefined;
+  return server !== undefined ? `${server} :: ${tool}` : tool;
+}
+
+/**
  * Render the action into the literal command / tool call the agent attempted, as one display line,
  * from the core's escaped model. NOTE: this is the *headline* line only — meaning-changing fields
  * (`cwd`, `host`, `env_refs`, MCP `params`) are rendered as their own labeled lines by
@@ -171,9 +184,13 @@ export function rawDivergesFromArgv(action: ActionRecord): boolean {
  *   `argv` does not already lead with it — the human must never see args without the program they
  *   belong to (per `docs/policy-seam.md`, `bin` and `argv` are distinct substrate fields).
  *
- * `raw` (the agent's original string form) is preferred when present; otherwise we reconstruct from
- * `bin`/`argv`; otherwise an MCP `server :: tool` headline; otherwise the compact params JSON so
- * nothing is ever silently dropped.
+ * On a tool surface (`mcp_tool_call`, `agent_tool_call`) with a `tool`, the headline is the tool
+ * identity ({@link toolIdentity}): there `raw` is the caller's description of the call (OpenClaw's
+ * plugin text), not the action, so it is shown on its own labelled `Description:` line instead.
+ * Otherwise `raw` (the agent's original string form) is preferred when present; then we
+ * reconstruct from `bin`/`argv`; then a `server :: tool` headline; then the compact params JSON so
+ * nothing is ever silently dropped. The web approver uses the same rule, and both are checked
+ * against one shared fixture (`packages/web-approver/test/fixtures/action-headline.json`).
  *
  * SECURITY (`docs/contract.md` §Invariant #3): the **full** `bin`/`argv` substrate is bound into
  * `request_hash` (`crates/allw-core/src/hash.rs`), but `raw` is just one substrate field. A buggy
@@ -184,8 +201,10 @@ export function rawDivergesFromArgv(action: ActionRecord): boolean {
  * surfaces the reconstructed form as a labeled `Argv:` line. Display-only — it never changes the
  * hash.
  */
-function renderActionHeadline(display: DisplayModel): string {
+export function renderActionHeadline(display: DisplayModel): string {
   const s = display.syntactic;
+  const identity = toolIdentity(display);
+  if (identity !== undefined) return identity;
   if (display.surface === "file_edit") {
     if (s.diff_summary !== undefined) return s.diff_summary;
     if (s.operation !== undefined && s.paths !== undefined && s.paths.length > 0) {
@@ -232,9 +251,12 @@ function substrateDetailLines(action: ActionRecord, display: DisplayModel): stri
   // reconstructs to a DIFFERENT command, surface that reconstructed form so a benign `raw` can
   // never hide a dangerous argv. (When there is no `raw`, the headline already IS the reconstructed
   // command, so the line would be redundant and is omitted.)
-  if (rawDivergesFromArgv(action)) {
-    const reconstructed = reconstructCommand(s);
-    if (reconstructed !== undefined) lines.push(`  Argv:       ${reconstructed}`);
+  // A tool-surface record heads with its tool identity, so any command form it also carries is
+  // always shown, with a warning at the decision point (TOOL_COMMAND_FORM_WARNING).
+  const reconstructed = reconstructCommand(s);
+  const toolHeadline = toolIdentity(display) !== undefined;
+  if (reconstructed !== undefined && (toolHeadline || rawDivergesFromArgv(action))) {
+    lines.push(`  Argv:       ${reconstructed}`);
   }
 
   // `flags` / `positionals` are bound into the hash but were never rendered on any path before;
@@ -298,6 +320,17 @@ function substrateDetailLines(action: ActionRecord, display: DisplayModel): stri
  */
 function actionLines(display: DisplayModel): string[] {
   const lines = display.syntactic.raw_lines;
+  const identity = toolIdentity(display);
+  if (identity !== undefined) {
+    // A tool call heads with its identity; its `raw` is the caller's description, labelled so.
+    if (display.syntactic.raw === undefined || !lines) return [`  Action:     ${identity}`];
+    const [first = "", ...rest] = lines;
+    return [
+      `  Action:     ${identity}`,
+      `  Description: ${first}`,
+      ...rest.map((line) => `             │ ${line}`),
+    ];
+  }
   if (display.surface === "file_edit" || display.syntactic.raw === undefined || !lines) {
     return [`  Action:     ${renderActionHeadline(display)}`];
   }
@@ -312,6 +345,13 @@ function actionLines(display: DisplayModel): string[] {
  */
 export const RAW_ARGV_DIVERGENCE_WARNING =
   "  ⚠ WARNING: raw and argv differ — the line above is the hash-bound argv; the Action line shows raw. Review both.";
+
+/**
+ * Printed directly above the prompt when a tool-surface record, which heads with its tool identity,
+ * also carries a hash-bound command form (`bin`/`argv`). The `Argv:` line in the block shows it.
+ */
+export const TOOL_COMMAND_FORM_WARNING =
+  "  ⚠ WARNING: this tool call also carries a command (see Argv above) — it is hash-bound too. Review both.";
 
 /** Shown under the header whenever the core escaped at least one character (#246). */
 export const HIDDEN_CHARS_WARNING =
@@ -433,8 +473,12 @@ export function renderRequest(
   // with the action (one escaped line) and any warning on screen however long the block was. When
   // raw and argv diverge, the decision line shows the hash-bound argv (never only the `raw` half,
   // which may be the benign one) and says so on the last line before the prompt.
-  const diverges = rawDivergesFromArgv(context.action);
+  // On a tool surface `raw` is a description, not a command, so it is never compared with argv;
+  // a command form there is flagged by its own warning instead.
+  const toolHeadline = toolIdentity(display) !== undefined;
+  const diverges = !toolHeadline && rawDivergesFromArgv(context.action);
   const decidingOn = diverges ? reconstructCommand(display.syntactic) : undefined;
+  const toolCommandForm = toolHeadline && reconstructCommand(display.syntactic) !== undefined;
   lines.push(`  Deciding on: ${decidingOn ?? renderActionHeadline(display)}`);
   if (display.has_hidden_or_control_chars) {
     lines.push(HIDDEN_CHARS_WARNING);
@@ -442,9 +486,18 @@ export function renderRequest(
   if (decidingOn !== undefined) {
     lines.push(RAW_ARGV_DIVERGENCE_WARNING);
   }
+  if (toolCommandForm) {
+    lines.push(TOOL_COMMAND_FORM_WARNING);
+  }
 
   // Every row that can carry untrusted text is hard-wrapped with a continuation marker. The fixed
   // chrome (rules, header, warnings) contains no untrusted text and is left whole.
-  const fixed = new Set([rule, HEADER, HIDDEN_CHARS_WARNING, RAW_ARGV_DIVERGENCE_WARNING]);
+  const fixed = new Set([
+    rule,
+    HEADER,
+    HIDDEN_CHARS_WARNING,
+    RAW_ARGV_DIVERGENCE_WARNING,
+    TOOL_COMMAND_FORM_WARNING,
+  ]);
   return lines.flatMap((line) => (fixed.has(line) ? [line] : wrapRow(line, columns))).join("\n");
 }

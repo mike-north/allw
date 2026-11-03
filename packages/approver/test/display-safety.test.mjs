@@ -36,6 +36,7 @@ import { prepareRequest } from "../dist/lib/approver-core.js";
 import {
   HIDDEN_CHARS_WARNING,
   RAW_ARGV_DIVERGENCE_WARNING,
+  TOOL_COMMAND_FORM_WARNING,
   WRAP_MARKER,
   rawDivergesFromArgv,
   reconstructCommand,
@@ -451,6 +452,62 @@ test("UAT: `watch` stdout/stderr bytes carry no raw ESC/CR for the #246 spoof", 
   }
 });
 
+test("UAT: `watch` heads an OpenClaw tool call with its tool and flags its command form (#321)", async () => {
+  // An OpenClaw plugin permission request: `raw` is the plugin's own description, and the record
+  // also carries a hash-bound argv. The human must see the tool as the action, the description
+  // labelled as such, and a warning about the command, right above the prompt.
+  const dir = mkdtempSync(join(tmpdir(), "allw-tool-headline-uat-"));
+  try {
+    const contextFile = join(dir, "context.json");
+    writeFileSync(
+      contextFile,
+      JSON.stringify(
+        context({
+          action: {
+            record_schema_version: 1,
+            surface: "agent_tool_call",
+            syntactic: {
+              server: "deploy-plugin",
+              tool: "deploy_service",
+              raw: "This plugin wants to deploy to production.",
+              argv: ["rm", "-rf", "/srv"],
+            },
+            risk: "critical",
+          },
+          actor: { id: "openclaw:home-mini", kind: "openclaw" },
+        }),
+      ),
+    );
+    const driver = join(here, "fixtures", "watch-spoof-driver.mjs");
+    const child = spawnSync(process.execPath, [driver, dir, contextFile], {
+      input: "d\n",
+      timeout: 60_000,
+    });
+    assert.equal(child.status, 0, `driver failed: ${child.stderr.toString("utf8")}`);
+    const text = child.stdout.toString("utf8");
+    const promptAt = text.indexOf("Approve / Deny / Skip?");
+    assert.ok(promptAt >= 0, "the prompt is printed");
+    const beforePrompt = text.slice(0, promptAt).split("\n");
+    assert.ok(beforePrompt.includes("  Action:     deploy-plugin :: deploy_service"));
+    assert.ok(beforePrompt.includes("  Description: This plugin wants to deploy to production."));
+    assert.ok(beforePrompt.includes("  Argv:       rm -rf /srv"), "the command form is shown");
+    assert.ok(!beforePrompt.some((l) => l.startsWith("  Action:     This plugin")));
+    assert.equal(
+      beforePrompt.at(-2),
+      TOOL_COMMAND_FORM_WARNING,
+      "warning is the line above the prompt",
+    );
+    assert.equal(beforePrompt.at(-3), "  Deciding on: deploy-plugin :: deploy_service");
+    assert.ok(
+      !text.includes(RAW_ARGV_DIVERGENCE_WARNING),
+      "a description is never a divergent raw",
+    );
+    assert.match(text, /Sent denied verdict for req-display-uat\./);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 /**
  * A hostile relay for the pairing UAT: `pairing/start` returns a code carrying a clear-screen
  * sequence, and `pairing/complete` fails with an error body that does the same.
@@ -661,7 +718,7 @@ test("the Action and Deciding on lines match the shared CLI/web headline fixture
       "utf8",
     ),
   );
-  assert.equal(fixture.cases.length, 12);
+  assert.equal(fixture.cases.length, 15);
   for (const [i, c] of fixture.cases.entries()) {
     const ctx = context({
       action: {
@@ -675,5 +732,19 @@ test("the Action and Deciding on lines match the shared CLI/web headline fixture
     const lines = unwrap(rendered).split("\n");
     assert.ok(lines.includes(`  Action:     ${c.headline}`), `${c.name}: Action line`);
     assert.ok(lines.includes(`  Deciding on: ${c.heading}`), `${c.name}: Deciding on line`);
+    // On a tool surface the caller's raw is a labelled description, never the headline (#321).
+    if (c.description === undefined) {
+      assert.ok(!lines.some((l) => l.startsWith("  Description: ")), `${c.name}: no Description`);
+    } else {
+      assert.ok(lines.includes(`  Description: ${c.description}`), `${c.name}: Description line`);
+    }
+    assert.equal(
+      lines.includes(TOOL_COMMAND_FORM_WARNING),
+      c.tool_command_form === true,
+      `${c.name}: command-form warning`,
+    );
+    if (c.tool_command_form === true) {
+      assert.ok(!lines.includes(RAW_ARGV_DIVERGENCE_WARNING), `${c.name}: no divergence warning`);
+    }
   }
 });
