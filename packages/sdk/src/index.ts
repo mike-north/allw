@@ -437,31 +437,36 @@ function newRequestId(): string {
   return crypto.randomUUID();
 }
 
-/** Validate that a parsed verdict is an object carrying a string `decision`; returns it or `null`. */
-function readDecision(value: unknown): Decision | null {
-  if (typeof value !== "object" || value === null) return null;
-  const decision = (value as { decision?: unknown }).decision;
-  if (
-    decision === "approved" ||
-    decision === "denied" ||
-    decision === "expired" ||
-    decision === "aborted"
-  ) {
-    return decision;
-  }
+/** A decision a verified human "no" can carry: anything but `approved`. */
+type NonApprovingDecision = Exclude<Decision, "approved">;
+
+/**
+ * The **signed** decision of a verified non-approval, read from the structured error WASM
+ * `verify_verdict*` throws for one (`kind: "not_approved"`, `decision` from the signed claims), or
+ * `null` for any other failure.
+ *
+ * Never classify by the error message: untrusted input (the relay-delivered verdict) is echoed
+ * into parse errors, so any message substring can be forged (#311). Only the Rust boundary sets
+ * these properties, and only for the core's `NotApproved`. This never returns `approved`.
+ */
+function signedNonApproval(err: unknown): NonApprovingDecision | null {
+  if (!(err instanceof Error)) return null;
+  // Own properties only, as WASM sets them: an inherited `kind`/`decision` (a polluted
+  // `Error.prototype`) would otherwise turn every unverifiable error into a "verified" decision.
+  if (!Object.hasOwn(err, "kind") || !Object.hasOwn(err, "decision")) return null;
+  const { kind, decision } = err as { kind?: unknown; decision?: unknown };
+  if (kind !== "not_approved") return null;
+  if (decision === "denied" || decision === "expired" || decision === "aborted") return decision;
   return null;
 }
 
-/** True when a thrown WASM verify error is an *authenticated* non-approval (a verified human "no"). */
-function isAuthenticatedNonApproval(message: string): boolean {
-  // The core's `VerifyError::NotApproved` Display: "verified human decision was not 'approved': …".
-  return message.includes("verified human decision was not");
-}
-
-interface VerifiedDecision {
-  readonly decision: Decision;
-  readonly nonceB64?: string;
-}
+/**
+ * A verdict reduced to a verified decision. `approved` only ever comes from a successful WASM
+ * verification (with its signed nonce); a verified non-approval can never be `approved`.
+ */
+type VerifiedDecision =
+  | { readonly decision: "approved"; readonly nonceB64: string }
+  | { readonly decision: NonApprovingDecision; readonly nonceB64?: undefined };
 
 interface VerifiedWasmResult {
   readonly approved: true;
@@ -574,10 +579,10 @@ function expectedAccountIdConstraint(expectedAccountId: string | undefined): str
  * Verify a (possibly null) verdict value through the WASM core and reduce it to a {@link Decision}.
  *
  * - WASM `verify_verdict` returns ⇒ authenticated, bound, fresh, **approved** ⇒ `"approved"`.
- * - It throws `NotApproved` ⇒ a *verified* human "no" ⇒ the verdict's real `decision`
- *   (`denied`/`expired`/`aborted`), defaulting to `denied` if unreadable.
- * - It throws anything else (forgery, tamper, bad sig, replay, window) ⇒ unverifiable ⇒ `null`
- *   (the caller fails closed to a synthesized `denied`).
+ * - It throws the structured `kind: "not_approved"` error ⇒ a *verified* human "no" ⇒ the
+ *   **signed** decision it carries (`denied`/`expired`/`aborted`), never the outer verdict's.
+ * - It throws anything else (forgery, tamper, bad sig, replay, window, unparseable JSON) ⇒
+ *   unverifiable ⇒ `null` (the caller fails closed to a synthesized `denied`).
  */
 async function verifyToDecision(
   wasm: AllwWasm,
@@ -616,12 +621,12 @@ async function verifyToDecision(
             accountConstraint,
           );
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (isAuthenticatedNonApproval(message)) {
-      // Authenticated, bound, fresh — but the human did not approve. Report the verified decision.
-      return { decision: readDecision(verdictValue) ?? "denied" };
+    const decision = signedNonApproval(err);
+    if (decision !== null) {
+      // Authenticated, bound, fresh — but the human did not approve. Report the signed decision.
+      return { decision };
     }
-    // Forgery / tamper / expiry-window / replay — unverifiable. Fail closed.
+    // Forgery / tamper / expiry-window / replay / unparseable — unverifiable. Fail closed.
     return null;
   }
 
@@ -664,6 +669,11 @@ export async function verifyAccountState(
  * Verify a verdict while enforcing account-state device revocations. The optional nonce store is
  * checked after the core authenticates the signed nonce, so replay protection composes with the
  * revocation-aware verification path.
+ *
+ * Throws on every verification failure (fail-closed). A *verified* non-approval throws an `Error`
+ * with own properties `kind: "not_approved"` and `decision` (`denied`/`expired`/`aborted`, from the
+ * signed claims); any other throw is unverifiable. Never classify by the error message: the relay
+ * controls text echoed into it.
  */
 export async function verifyVerdictWithAccountStates(
   input: VerifyVerdictWithAccountStatesInput,

@@ -254,6 +254,29 @@ describe("WakeupCoalescer — at most one wakeup per subscription per window", (
     expect(coalescer.tryClaim(KEY, pastWindow)).toBe(true);
   });
 
+  it("reports the first instant a claim can succeed again: just past the window", () => {
+    const coalescer = new WakeupCoalescer(WEB_PUSH_COALESCE_MS);
+    // Never claimed: claimable now.
+    expect(coalescer.nextClaimableAt(KEY, T0)).toBe(T0);
+
+    expect(coalescer.tryClaim(KEY, T0)).toBe(true);
+    coalescer.release(KEY);
+    const reopensAt = T0 + WEB_PUSH_COALESCE_MS + 1;
+    expect(coalescer.nextClaimableAt(KEY, T0 + 1)).toBe(reopensAt);
+    // The reported instant agrees with tryClaim at the boundary and just past it.
+    expect(coalescer.tryClaim(KEY, reopensAt - 1)).toBe(false);
+    expect(coalescer.tryClaim(KEY, reopensAt)).toBe(true);
+  });
+
+  it("never reports a time before now, even while a claim is still in flight past its window", () => {
+    const coalescer = new WakeupCoalescer(WEB_PUSH_COALESCE_MS);
+    expect(coalescer.tryClaim(KEY, T0)).toBe(true);
+    const late = T0 + 10 * WEB_PUSH_COALESCE_MS;
+    expect(coalescer.nextClaimableAt(KEY, late)).toBe(late);
+    // It is a lower bound: the in-flight claim still blocks until released.
+    expect(coalescer.tryClaim(KEY, late)).toBe(false);
+  });
+
   it("keeps subscriptions independent", () => {
     const coalescer = new WakeupCoalescer(WEB_PUSH_COALESCE_MS);
     expect(coalescer.tryClaim(KEY, T0)).toBe(true);
