@@ -1,0 +1,123 @@
+# Stages the @allw/* npm packages via npm trusted publishing (GitHub Actions OIDC).
+#
+# This workflow can only STAGE a release, never make it public. The npm trusted-publisher config
+# for each package is stage-only (`npm trust github … --allow-stage-publish`), so the OIDC token
+# this workflow gets permits `npm stage publish` and nothing else. A staged version stays private
+# until a maintainer approves it with npm 2FA (`npm stage approve <stage-id>`). That approval is the
+# release gate. The checks below (tag on main, environment) are defense in depth, not the gate:
+# anyone with write access to the repo could change them in the commit they tag.
+#
+# There is deliberately no NPM_TOKEN. The identity values live in scripts/release-packages.mjs,
+# which the bootstrap that configures npm also reads. If you rename this file or the environment,
+# re-run the bootstrap.
+#
+# Triggers:
+#   - push of a `v<x.y.z>` tag on main's history → build, pack, smoke the packed tarballs, stage.
+#   - workflow_dispatch from a branch → rehearsal: everything up to `npm stage publish --dry-run`.
+#     (Dispatching on a `v*` tag ref behaves like the tag push — use it to retry a failed release.)
+#
+# Agents never push `v*` tags or dispatch this workflow (ENG_TEAM_INSTRUCTIONS.md). See
+# docs/releasing.md.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build, pack, smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Releases are cut only from commits already on main (reviewed + CI-gated there).
+      - name: Require the release commit to be on main
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
+            || { echo "::error::$GITHUB_REF_NAME ($GITHUB_SHA) is not on main"; exit 1; }
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      # No caches anywhere in this workflow: release builds run cold. A cache entry is keyed by
+      # name, not by who wrote it, so a run on a hostile `v*` tag could save poisoned build state
+      # that a later, legitimate release would restore. The pre-approval byte match can't catch
+      # that, because the poisoned bytes would come from the real run.
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: pnpm install --frozen-lockfile
+      # Lockstep versioning: the tag must equal every released package's version. A rehearsal
+      # (branch dispatch) checks the version currently in the manifests instead.
+      - name: Verify the release set
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="v$(node -p 'require("./packages/sdk/package.json").version')"
+          fi
+          node scripts/release-packages.mjs verify "$tag"
+      # The .wasm is a build artifact (not committed); it must be bundled into the @allw/sdk tarball.
+      - run: pnpm run build:wasm
+      - run: pnpm -r build
+      - run: pnpm run test:release
+      # Pack once, then smoke-test exactly those tarballs (all five): clean `npm install`, then
+      # headless checks, with no Rust toolchain on the consumer side. The same files are staged below.
+      - run: node scripts/release-packages.mjs pack dist-release
+      - run: node scripts/smoke-packaged-install.mjs --tarballs dist-release
+      - name: Rehearse staging (dry run)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: node scripts/release-packages.mjs publish dist-release --dry-run
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarballs
+          path: dist-release/
+          if-no-files-found: error
+          retention-days: 30
+
+  stage:
+    name: Stage on npm (awaits maintainer approval)
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # Must match RELEASE_ENVIRONMENT in scripts/release-packages.mjs and the npm trusted-publisher
+    # config. Protect it (required reviewer, `v*` tags only) as defense in depth.
+    environment: npm-publish
+    # The only job that can mint an OIDC token. It installs no dependencies and runs no package
+    # scripts. It stages the exact tarballs the build job smoke-tested.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      # `npm stage` (and trusted publishing with it) needs npm >= 11.15.0. Pinned exactly: this job
+      # holds the OIDC token, so a new npm release must not reach it without a reviewed bump.
+      - run: npm install -g npm@11.21.1
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-tarballs
+          path: dist-release
+      # In dependency order. Each tarball must still match the sha512 that `pack` recorded in
+      # release-manifest.json. A version already on the registry is skipped only if its registry
+      # integrity equals the local tarball's; any mismatch fails the job. The stage ids and
+      # integrities go to the job summary. The summary is not evidence: the maintainer runs
+      # scripts/verify-staged-release.mjs before approving.
+      - run: node scripts/release-packages.mjs publish dist-release

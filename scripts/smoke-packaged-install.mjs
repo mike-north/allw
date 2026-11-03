@@ -1,23 +1,31 @@
 /**
  * Packaged-install smoke test (issue #96).
  *
- * Proves the published artifacts actually work from a clean `npm install` with **no Rust toolchain
- * and no repo checkout** — the property the rest of the build can't prove, because in-repo tests run
- * against the workspace's vendored wasm and workspace symlinks rather than the real tarballs.
+ * Proves the released artifacts actually work from a clean `npm install` with **no Rust toolchain
+ * and no repo checkout**. The rest of the build can't prove this, because in-repo tests run against
+ * the workspace's vendored wasm and workspace symlinks rather than the real tarballs.
+ *
+ * Usage:
+ *
+ *   node scripts/smoke-packaged-install.mjs                       # pack the release set, then smoke it
+ *   node scripts/smoke-packaged-install.mjs --tarballs <dir>      # smoke the tarballs in <dir>
+ *
+ * `--tarballs` takes a directory written by `scripts/release-packages.mjs pack`, and tests exactly the
+ * tarballs its `release-manifest.json` lists. The release workflow uses it, so the bytes it stages are
+ * the bytes this test installed. Without it, the script packs the same release set itself with the
+ * same code. Either way it covers every released package (scripts/release-packages.mjs).
  *
  * What it does:
- *   1. `pnpm pack` @allw/sdk, @allw/hook, @allw/approver into a temp dir (the exact tarballs that
- *      would be published).
- *   2. `npm install` all three tarballs into a fresh temp project (npm, not pnpm, so the dependency
- *      graph is resolved from the tarballs the way a real consumer's npm would do it — `@allw/sdk`
- *      is satisfied by the local sdk tarball).
+ *   1. Collects the tarballs and asserts the @allw/sdk tarball bundles the wasm.
+ *   2. `npm install`s all of them into a fresh temp project (npm, not pnpm, so the dependency graph is
+ *      resolved from the tarballs the way a real consumer's npm would; `@allw/*` deps resolve to the
+ *      local tarballs).
  *   3. Headless checks that need no live relay or paired device:
- *        - `allw-hook --version` and `allw-approver --version` print their package.json version.
- *        - The hook runs end-to-end on a NON-gated tool call (stdin → `allow`) — this loads the
- *          bundled WASM from the installed @allw/sdk (the real "no toolchain at install" proof) and
- *          builds an ActionRecord path without ever contacting a relay.
- *        - The SDK imports and exposes `createClient` (module + bundled wasm resolve from the
- *          installed package).
+ *        - every bin of every package prints its package.json version for `--version`;
+ *        - every package's main entry imports cleanly from the installed copy;
+ *        - the hook runs end to end on a NON-gated tool call (stdin → `allow`), which loads the
+ *          bundled WASM from the installed @allw/sdk without contacting a relay;
+ *        - the SDK exposes `createClient`.
  *
  * What it deliberately does NOT do (needs a live relay + a paired device — see docs/quickstart.md):
  *   - pairing, a real approval round-trip, or a gated command reaching a phone/web surface.
@@ -26,25 +34,18 @@
  *
  * @see ../docs/quickstart.md (the end-to-end flow this smoke-tests the install half of)
  * @see ../docs/architecture.md (WASM-local: the wasm glue ships in the package; no toolchain)
+ * @see ../docs/releasing.md
  */
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, readdirSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join, resolve } from "node:path";
 
-const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+import { PUBLISHED_PACKAGES, packAll, readReleaseManifest } from "./release-packages.mjs";
 
-/** Packages to pack + install, in dependency order (sdk first so the others can resolve it). */
-const PACKAGES = [
-  { name: "@allw/sdk", dir: join(repoRoot, "packages", "sdk") },
-  { name: "@allw/hook", dir: join(repoRoot, "packages", "hook") },
-  { name: "@allw/approver", dir: join(repoRoot, "packages", "approver") },
-];
-
-/** Run a command (stderr is piped and embedded in the thrown error on failure), fail loudly (non-zero exit) on error. */
+/** Run a command (stderr is piped and embedded in the thrown error on failure), fail loudly on error. */
 function run(cmd, args, opts = {}) {
   const res = spawnSync(cmd, args, { encoding: "utf8", ...opts });
   if (res.status !== 0) {
@@ -62,42 +63,39 @@ function ok(msg) {
   console.log(`  ✓ ${msg}`);
 }
 
+const argv = process.argv.slice(2);
+const tarballsFlag = argv.indexOf("--tarballs");
+const givenDir = tarballsFlag >= 0 ? argv[tarballsFlag + 1] : null;
+if (tarballsFlag >= 0 && !givenDir) {
+  console.error("usage: node scripts/smoke-packaged-install.mjs [--tarballs <dir>]");
+  process.exit(2);
+}
+
 const workDir = mkdtempSync(join(tmpdir(), "allw-smoke-"));
-const packDir = join(workDir, "tarballs");
 const projectDir = join(workDir, "consumer");
-mkdirSync(packDir, { recursive: true });
 mkdirSync(projectDir, { recursive: true });
 
 let failed = false;
 try {
   console.log(`allw packaged-install smoke test\n  workdir: ${workDir}`);
 
-  // 1. Pack each package into packDir. `pnpm pack --pack-destination` writes the tarball there.
-  console.log("\n[1/3] packing tarballs");
-  /** @type {Array<{name: string, file: string}>} */
-  const packedPkgs = [];
-  for (const pkg of PACKAGES) {
-    const seenBefore = new Set(readdirSync(packDir).filter((f) => f.endsWith(".tgz")));
-    run("pnpm", ["pack", "--pack-destination", packDir], { cwd: pkg.dir });
-    // Identify the tarball pnpm just wrote by diffing the directory listing — keyed to this
-    // package by name so adding more packages later can't misroute the identity check.
-    const file = readdirSync(packDir)
-      .filter((f) => f.endsWith(".tgz") && !seenBefore.has(f))
-      .map((f) => join(packDir, f))[0];
-    assert.ok(file, `no tarball produced for ${pkg.name}`);
-    packedPkgs.push({ name: pkg.name, file });
-    ok(`packed ${pkg.name}`);
-  }
+  // 1. The tarballs under test: the ones given, or a fresh pack of the release set.
+  console.log("\n[1/3] collecting tarballs");
+  const packDir = givenDir ? resolve(givenDir) : join(workDir, "tarballs");
+  const entries = givenDir ? readReleaseManifest(packDir) : packAll(packDir);
+  assert.deepEqual(
+    entries.map((e) => e.name),
+    PUBLISHED_PACKAGES.map((p) => p.name),
+    "the tarball set must be exactly the release set, in release order",
+  );
+  const tarballs = entries.map((e) => join(packDir, e.file));
+  ok(`${entries.length} tarballs: ${entries.map((e) => `${e.name}@${e.version}`).join(", ")}`);
 
-  // Collect just the paths for the bulk npm install later.
-  const tarballs = packedPkgs.map((p) => p.file);
-
-  // Assert the SDK tarball actually contains the bundled wasm (the whole point). If this regresses,
-  // an install would silently need a Rust toolchain.
-  const sdkEntry = packedPkgs.find((p) => p.name === "@allw/sdk");
-  assert.ok(sdkEntry, "could not identify the @allw/sdk tarball by package name");
-  const sdkTarball = sdkEntry.file;
-  const listing = run("tar", ["-tzf", sdkTarball]).stdout;
+  // The SDK tarball must contain the bundled wasm (the whole point). If this regresses, an install
+  // would silently need a Rust toolchain.
+  const sdkEntry = entries.find((e) => e.name === "@allw/sdk");
+  assert.ok(sdkEntry, "no @allw/sdk tarball");
+  const listing = run("tar", ["-tzf", join(packDir, sdkEntry.file)]).stdout;
   assert.match(
     listing,
     /package\/vendor\/allw-wasm\/allw_wasm_bg\.wasm/,
@@ -110,38 +108,52 @@ try {
   );
   ok("the @allw/sdk tarball bundles the wasm glue + .wasm");
 
-  // 2. Install all three tarballs into a clean npm project (no pnpm workspace, no Rust toolchain).
+  // 2. Install every tarball into a clean npm project (no pnpm workspace, no Rust toolchain).
   console.log("\n[2/3] installing into a clean project");
   writeFileSync(
     join(projectDir, "package.json"),
     `${JSON.stringify({ name: "allw-smoke-consumer", version: "0.0.0", private: true, type: "module" }, null, 2)}\n`,
   );
-  // Install the SDK first so the hook/approver's @allw/sdk dependency resolves to the local tarball.
   run("npm", ["install", "--no-audit", "--no-fund", "--save", ...tarballs], { cwd: projectDir });
-  ok("npm install of all three tarballs succeeded");
+  ok(`npm install of all ${tarballs.length} tarballs succeeded`);
 
-  const binDir = join(projectDir, "node_modules", ".bin");
-  const hookBin = join(binDir, "allw-hook");
-  const approverBin = join(binDir, "allw-approver");
-
-  // 3a. Versions, read from the installed packages.
   console.log("\n[3/3] headless checks");
-  const installedHookVersion = JSON.parse(
-    readFileSync(join(projectDir, "node_modules", "@allw", "hook", "package.json"), "utf8"),
-  ).version;
-  const installedApproverVersion = JSON.parse(
-    readFileSync(join(projectDir, "node_modules", "@allw", "approver", "package.json"), "utf8"),
-  ).version;
+  const binDir = join(projectDir, "node_modules", ".bin");
 
-  const hookVer = run(hookBin, ["--version"], { cwd: projectDir }).stdout.trim();
-  assert.equal(hookVer, installedHookVersion, "allw-hook --version mismatch");
-  ok(`allw-hook --version → ${hookVer}`);
+  // 3a. Every bin reports its own installed package.json version.
+  for (const { name } of entries) {
+    const installed = JSON.parse(
+      readFileSync(join(projectDir, "node_modules", ...name.split("/"), "package.json"), "utf8"),
+    );
+    const bins =
+      typeof installed.bin === "string" ? [name.split("/")[1]] : Object.keys(installed.bin ?? {});
+    for (const bin of bins) {
+      const out = run(join(binDir, bin), ["--version"], { cwd: projectDir }).stdout.trim();
+      assert.equal(out, installed.version, `${bin} --version mismatch`);
+      ok(`${bin} --version → ${out}`);
+    }
+  }
 
-  const approverVer = run(approverBin, ["--version"], { cwd: projectDir }).stdout.trim();
-  assert.equal(approverVer, installedApproverVersion, "allw-approver --version mismatch");
-  ok(`allw-approver --version → ${approverVer}`);
+  // 3b. Every package's main entry imports from the installed copy.
+  const importProbe = join(projectDir, "probe-imports.mjs");
+  writeFileSync(
+    importProbe,
+    [
+      `const names = ${JSON.stringify(entries.map((e) => e.name))};`,
+      "for (const name of names) {",
+      "  const mod = await import(name);",
+      "  if (Object.keys(mod).length === 0) { console.error(`${name} exports nothing`); process.exit(1); }",
+      "}",
+      'const { createClient } = await import("@allw/sdk");',
+      'if (typeof createClient !== "function") { console.error("createClient missing"); process.exit(1); }',
+      'console.log("imports-ok");',
+      "",
+    ].join("\n"),
+  );
+  assert.equal(run("node", [importProbe], { cwd: projectDir }).stdout.trim(), "imports-ok");
+  ok("every package imports from the installed copy; @allw/sdk exposes createClient");
 
-  // 3b. The hook loads the BUNDLED wasm and decides a non-gated tool call as `allow`, with no relay
+  // 3c. The hook loads the BUNDLED wasm and decides a non-gated tool call as `allow`, with no relay
   // and no config. A `Read` tool passes through without dialing the relay, so this exercises the
   // installed wasm-resolution path (`@allw/sdk/vendor/...`) end-to-end against the real tarballs.
   const nonGatedStdin = JSON.stringify({
@@ -150,29 +162,13 @@ try {
     tool_name: "Read",
     tool_input: { file_path: "/etc/hostname" },
   });
-  const hookOut = run(hookBin, [], { cwd: projectDir, input: nonGatedStdin }).stdout;
+  const hookOut = run(join(binDir, "allw-hook"), [], {
+    cwd: projectDir,
+    input: nonGatedStdin,
+  }).stdout;
   const decision = JSON.parse(hookOut).hookSpecificOutput.permissionDecision;
   assert.equal(decision, "allow", "the hook should pass through a non-gated Read as allow");
   ok("allw-hook decides a non-gated tool call as allow (bundled wasm loaded, no relay)");
-
-  // 3c. The SDK imports from the installed package and exposes its public entrypoint.
-  const importProbe = join(projectDir, "probe.mjs");
-  writeFileSync(
-    importProbe,
-    [
-      'import { createClient } from "@allw/sdk";',
-      'if (typeof createClient !== "function") { console.error("createClient missing"); process.exit(1); }',
-      'console.log("sdk-import-ok");',
-      "",
-    ].join("\n"),
-  );
-  const probeOut = run("node", [importProbe], { cwd: projectDir }).stdout.trim();
-  assert.equal(
-    probeOut,
-    "sdk-import-ok",
-    "the SDK did not import cleanly from the installed package",
-  );
-  ok("@allw/sdk imports and exposes createClient from the installed package");
 
   console.log("\nPASS: packaged install works with no Rust toolchain.");
 } catch (err) {
