@@ -76,10 +76,25 @@ export interface ApprovalRequestEnvelope {
   readonly context_ciphertext: string;
 }
 
-/** A relay error carrying the HTTP status and the relay's error body (when present). */
+/**
+ * The relay answered, but not with a usable success: a non-2xx reply (for example 413 when
+ * `context_ciphertext` is over the 64 KiB ceiling, `docs/relay-api.md` §3), or a 2xx whose body is not
+ * JSON or not the expected shape. Every relay call throws it for such a reply.
+ *
+ * Through `requestApproval`, it is a rejection only from the steps before waiting: the device fetch
+ * and the submit. Once the request is submitted, a non-2xx or malformed poll reply (for example 401
+ * or 403) resolves to an `expired` verdict instead, and a failed retract is ignored. Treat a
+ * rejection as deny, like every failure (fail-closed), and never retry it into an approval.
+ *
+ * Narrow with `err instanceof RelayError`. The message names the call and status only: it never
+ * quotes the relay's body, which is untrusted. A hung or unreachable relay is not a `RelayError`,
+ * because no reply arrived: a direct relay call rejects with a timeout or the fetch's own network
+ * error, and `requestApproval` resolves to an `expired` verdict.
+ */
 export class RelayError extends Error {
   constructor(
     message: string,
+    /** The relay reply's HTTP status (the 2xx status itself when the body was malformed). */
     readonly status: number,
   ) {
     super(message);
@@ -363,7 +378,8 @@ export class RelayClient {
    * Poll a request's status once (`GET /:acct/requests/:id`).
    *
    * @returns the terminal outcome if the request is `resolved`/`expired`, or `null` while pending.
-   * @throws {RelayError} on a non-2xx response (e.g. 404 unknown request).
+   * @throws {RelayError} on a non-2xx response (e.g. 401/403: a missing or wrong token, which is
+   *   also how the relay answers an unknown request id).
    */
   async poll(requestId: string): Promise<VerdictOutcome | null> {
     const token = this.requestAuthTokens.get(requestId);
@@ -409,7 +425,8 @@ export class RelayClient {
    * so a failure here can only make cancellation a no-op, never fabricate an approval or discard an
    * already-recorded verdict (the relay itself refuses to retract a `resolved` request).
    *
-   * @throws {RelayError} on a non-2xx response (e.g. 404 unknown request, 409 already resolved/expired).
+   * @throws {RelayError} on a non-2xx response (e.g. 401/403: a missing or wrong token, which is
+   *   also how the relay answers an unknown request id; 409 already resolved/expired).
    */
   async retract(requestId: string): Promise<void> {
     const token = this.requestAuthTokens.get(requestId);

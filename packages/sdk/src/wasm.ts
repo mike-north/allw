@@ -17,10 +17,12 @@
  * @see ../vendor/allw-wasm/allw_wasm.d.ts (the generated FFI surface)
  */
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+
+import { MAX_ESCAPED_DIAGNOSTIC_CHARS, escapeToPrintableAscii } from "./printable-ascii.js";
 
 /**
  * The subset of the `allw-wasm` FFI the SDK calls. Every function takes and returns JSON strings
@@ -110,6 +112,12 @@ export interface AllwWasm {
   ed25519_public_key(seedB64: string): string;
   /** Build an ActionRecord JSON for a shell command using the core T1 command parser. */
   action_from_command(commandLine: string, cwd?: string | null): string;
+  /**
+   * Build an ActionRecord JSON for a **PowerShell** command line (the `command` surface). `raw` is
+   * the exact line and argv is always its whitespace split; risk is at least Medium, or at least High
+   * for a compound, escaped or dynamic-execution line. Never throws for PowerShell syntax.
+   */
+  action_from_powershell_command(commandLine: string, cwd?: string | null): string;
   /**
    * Build an ActionRecord JSON from a **canonical, pre-tokenized** argv (JSON array of strings).
    * For callers that hold the exact token vector that will execute and must bind it verbatim —
@@ -211,11 +219,65 @@ function initGlue(glue: WasmGlue, dir: string): AllwWasm {
   return glue;
 }
 
-/** The actionable error for a missing/broken vendor directory. */
-function loadError(dir: string, cause: unknown): Error {
+/** The vendored files the loader reads; if any is missing, the core was never built here. */
+const VENDOR_FILES = ["allw_wasm.js", "allw_wasm_bg.wasm"] as const;
+
+/**
+ * The most characters of a load failure's escaped cause that {@link wasmLoadError} quotes, before the
+ * `...` that marks a clip.
+ */
+export const MAX_WASM_LOAD_CAUSE_CHARS = 200;
+
+/**
+ * A load failure's cause as one bounded line of printable ASCII ({@link escapeToPrintableAscii},
+ * clipped to {@link MAX_WASM_LOAD_CAUSE_CHARS}). The display-escaping core is the thing that failed
+ * to load, so it can't be used here. A cause can't move the cursor or spoof lines in a terminal or
+ * a hook's deny reason.
+ */
+function describeLoadCause(cause: unknown): string {
+  let text: string;
+  try {
+    text =
+      cause instanceof Error
+        ? `${cause.name}: ${cause.message}`
+        : `non-error thrown: ${String(cause)}`;
+  } catch {
+    text = "a cause that could not be described";
+  }
+  return escapeToPrintableAscii(text, MAX_WASM_LOAD_CAUSE_CHARS);
+}
+
+/**
+ * The actionable error for a vendored core that failed to load (#301). When a vendored file is
+ * missing, the fix is to build it, and the message says so. Otherwise the files are there and
+ * something else broke (a glue module that fails to evaluate, a corrupt `.wasm`), so the message
+ * quotes the underlying cause, escaped and bounded, instead of sending the reader to rebuild.
+ *
+ * Exported for tests; not re-exported from the package entry point.
+ *
+ * @internal
+ */
+export function wasmLoadError(
+  dir: string,
+  cause: unknown,
+  fileExists: (path: string) => boolean = existsSync,
+): Error {
+  const missing = VENDOR_FILES.filter((file) => !fileExists(join(dir, file)));
+  // The vendor dir comes from the install location, which can hold any characters; it is quoted
+  // escaped and bounded like the cause (#358).
+  const shownDir = escapeToPrintableAscii(dir, MAX_ESCAPED_DIAGNOSTIC_CHARS);
+  if (missing.length > 0) {
+    return new Error(
+      `allw: failed to load the vendored WASM core from ${shownDir}: ${missing.join(" and ")} ` +
+        `${missing.length === 1 ? "is" : "are"} missing. Run \`pnpm run build:wasm\` from the ` +
+        `repo root first (or reinstall @allw/sdk if it came from npm).`,
+      { cause },
+    );
+  }
   return new Error(
-    `allw: failed to load the vendored WASM core from ${dir}. ` +
-      `Run \`pnpm run build:wasm\` from the repo root first.`,
+    `allw: failed to load the vendored WASM core from ${shownDir} (${describeLoadCause(cause)}). ` +
+      `The vendored files are present, so rebuilding may not help; reinstall @allw/sdk or ` +
+      `rebuild the core (\`pnpm run build:wasm\`) if the files are damaged.`,
     { cause },
   );
 }
@@ -223,7 +285,8 @@ function loadError(dir: string, cause: unknown): Error {
 /**
  * Load (and memoize) the vendored WASM core.
  *
- * @throws if the vendor directory is missing — run `pnpm run build:wasm` from the repo root first.
+ * @throws if the vendored core is missing (the message says to run `pnpm run build:wasm`) or
+ *   fails to load (the message quotes the cause, escaped and bounded; see {@link wasmLoadError}).
  */
 export async function loadWasm(): Promise<AllwWasm> {
   if (cached) return cached;
@@ -233,7 +296,7 @@ export async function loadWasm(): Promise<AllwWasm> {
     const glue = (await import(pathToFileURL(join(dir, "allw_wasm.js")).href)) as WasmGlue;
     return initGlue(glue, dir);
   } catch (cause) {
-    throw loadError(dir, cause);
+    throw wasmLoadError(dir, cause);
   }
 }
 
@@ -243,7 +306,8 @@ export async function loadWasm(): Promise<AllwWasm> {
  * top-level await, so Node's `require(esm)` loads it synchronously; it shares Node's module cache
  * (and this memo) with {@link loadWasm}, so the core is instantiated once either way.
  *
- * @throws if the vendor directory is missing — run `pnpm run build:wasm` from the repo root first.
+ * @throws if the vendored core is missing (the message says to run `pnpm run build:wasm`) or
+ *   fails to load (the message quotes the cause, escaped and bounded; see {@link wasmLoadError}).
  */
 export function loadWasmSync(): AllwWasm {
   if (cached) return cached;
@@ -253,6 +317,6 @@ export function loadWasmSync(): AllwWasm {
     const glue = require(join(dir, "allw_wasm.js")) as WasmGlue;
     return initGlue(glue, dir);
   } catch (cause) {
-    throw loadError(dir, cause);
+    throw wasmLoadError(dir, cause);
   }
 }

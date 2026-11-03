@@ -18,16 +18,15 @@
  * re-checks the number-match challenge and refuses to sign without a paired device cert.
  */
 
+import { rawDivergesFromArgv, reconstructCommand } from "./command-line.js";
 import type {
-  AgentToolCallAction,
   ApprovalActor,
   ApprovalContext,
   ApprovalDecision,
   ApprovalEnvelope,
   ApprovalRisk,
-  CommandAction,
-  McpCallAction,
   NumberMatchChallenge,
+  SubstrateView,
   PreparedApproval,
   SignDecisionInput,
   SignedVerdict,
@@ -240,73 +239,95 @@ function toAllowedDecisions(values: readonly string[]): readonly ApprovalDecisio
 }
 
 /**
+ * The core's escaped display substrate (Rust `allw_core::DisplaySubstrate`): every hash-bound
+ * action field, each already escaped. All fields are declared, so the view model can carry the
+ * whole substrate (#295).
+ */
+interface CoreDisplaySubstrate {
+  readonly bin?: string;
+  readonly argv?: readonly string[];
+  readonly flags?: readonly string[];
+  readonly positionals?: readonly string[];
+  readonly cwd?: string;
+  readonly host?: string;
+  readonly env_refs?: readonly string[];
+  readonly server?: string;
+  readonly tool?: string;
+  readonly params_json?: string;
+  readonly params_json_lines?: readonly string[];
+  readonly operation?: string;
+  readonly paths?: readonly string[];
+  readonly diff_summary?: string;
+  readonly diff_hash?: string;
+  readonly raw?: string;
+  readonly raw_lines?: readonly string[];
+}
+
+/**
  * The core's escaped display model of a decrypted context (Rust `allw_core::DisplayModel`, from the
- * WASM `display_model`, #246). Only the fields this runtime maps are declared. Every string is
- * already escaped by the core — this is the only source of context text the view model may carry.
+ * WASM `display_model`, #246). Every string is already escaped by the core — this is the only
+ * source of context text the view model may carry.
  */
 interface CoreDisplayModel {
   readonly summary: string;
   readonly actor_id: string;
   readonly actor_label: string;
-  readonly syntactic: {
-    readonly argv?: readonly string[];
-    readonly cwd?: string;
-    readonly raw?: string;
-    readonly raw_lines?: readonly string[];
-    readonly server?: string;
-    readonly tool?: string;
-    readonly params_json_lines?: readonly string[];
-  };
+  readonly syntactic: CoreDisplaySubstrate;
+  readonly chain?: readonly string[];
   readonly has_hidden_or_control_chars: boolean;
 }
 
+/** A writable {@link SubstrateView}, filled one present field at a time. */
+type SubstrateDraft = { -readonly [K in keyof SubstrateView]: SubstrateView[K] };
+
 /**
- * Map the core display model's substrate onto the controller's {@link CommandAction}. Reads only
- * the display-relevant fields the renderer surfaces, all already escaped by the core.
+ * Carry the core's display substrate into the view model whole: every field the core returned is
+ * copied (renamed to camelCase), none dropped.
  */
-function toCommandAction(syntactic: CoreDisplayModel["syntactic"]): CommandAction {
-  const command: CommandAction = { argv: syntactic.argv ?? [] };
-  const withCwd = syntactic.cwd !== undefined ? { ...command, cwd: syntactic.cwd } : command;
-  const withRaw = syntactic.raw !== undefined ? { ...withCwd, raw: syntactic.raw } : withCwd;
-  return syntactic.raw_lines !== undefined
-    ? { ...withRaw, rawLines: syntactic.raw_lines }
-    : withRaw;
+function toSubstrateView(s: CoreDisplaySubstrate): SubstrateView {
+  const view: SubstrateDraft = {};
+  if (s.bin !== undefined) view.bin = s.bin;
+  if (s.argv !== undefined) view.argv = s.argv;
+  if (s.flags !== undefined) view.flags = s.flags;
+  if (s.positionals !== undefined) view.positionals = s.positionals;
+  if (s.cwd !== undefined) view.cwd = s.cwd;
+  if (s.host !== undefined) view.host = s.host;
+  if (s.env_refs !== undefined) view.envRefs = s.env_refs;
+  if (s.server !== undefined) view.server = s.server;
+  if (s.tool !== undefined) view.tool = s.tool;
+  if (s.params_json !== undefined) view.paramsJson = s.params_json;
+  if (s.params_json_lines !== undefined) view.paramsLines = s.params_json_lines;
+  if (s.operation !== undefined) view.operation = s.operation;
+  if (s.paths !== undefined) view.paths = s.paths;
+  if (s.diff_summary !== undefined) view.diffSummary = s.diff_summary;
+  if (s.diff_hash !== undefined) view.diffHash = s.diff_hash;
+  if (s.raw !== undefined) view.raw = s.raw;
+  if (s.raw_lines !== undefined) view.rawLines = s.raw_lines;
+  return view;
 }
 
-/** Map the core display model's substrate onto a `(server, tool, params)` action — shared by
- * `mcp_tool_call` ({@link McpCallAction}) and `agent_tool_call` ({@link AgentToolCallAction}),
- * which reduce to the identical wire shape (spec §5.2). */
-function toToolCallAction(
-  syntactic: CoreDisplayModel["syntactic"],
-): McpCallAction | AgentToolCallAction | undefined {
-  if (syntactic.server === undefined || syntactic.tool === undefined) return undefined;
-  const action = { server: syntactic.server, tool: syntactic.tool };
-  return syntactic.params_json_lines !== undefined
-    ? { ...action, paramsDisplay: syntactic.params_json_lines.join("\n") }
-    : action;
+/** The view-model kind for a wire surface. An unknown surface is shown as a command. */
+function toKind(surface: string): ApprovalContext["kind"] {
+  switch (surface) {
+    case "mcp_tool_call":
+      return "mcp";
+    case "agent_tool_call":
+    case "file_edit":
+      return surface;
+    default:
+      return "command";
+  }
 }
 
 /**
  * Map the decrypted wire context + the core's escaped display model + verified attestation +
  * (optional) derived challenge onto the controller's {@link ApprovalContext} view model. Every
  * string in the result comes from `display` (escaped by the core, #246); `wire` supplies only the
- * non-text fields (surface, risk level, reversibility, allowed decisions).
+ * non-text fields (surface, risk level, reversibility, allowed decisions) and the unescaped
+ * substrate that raw/argv divergence is decided on.
  *
- * Every surface other than `mcp_tool_call`/`agent_tool_call` — including `file_edit` — is mapped to
- * a `command` action carrying only `argv`, `cwd` and `raw`/`raw_lines` (so a file edit shows its
- * content under `raw:` with an empty `argv:`). This view is **narrower than the CLI approver's**:
- * the web card does not yet show `bin`, `flags`, `positionals`, `host`, `env_refs`, `chain`, a file
- * edit's `operation`/`paths`/`diff_summary`/`diff_hash`, or a raw/argv divergence warning, although
- * all of them are bound into `request_hash`. Closing that gap is tracked as a follow-up; until then
- * the CLI is the complete view.
- *
- * `agent_tool_call` (an agent-runtime/plugin-owned tool call, e.g. an OpenClaw plugin permission
- * request — `docs/openclaw-integration.md` §5.2) is its own `kind`, distinct from `mcp`: it shares
- * the `(server, tool)` wire shape with `mcp_tool_call`, but `server` holds a plugin id, not an MCP
- * server name. Folding it into `mcp` would show the human a false MCP label and drop the
- * hash-bound function identity into the generic "command" fallback (which only reads
- * `argv`/`cwd`/`raw` — `agent_tool_call` records carry no `argv`, so the identity would be lost
- * from the rendered plaintext even though it is inside `request_hash`).
+ * The view carries the core's whole substrate, the context summary and the chain, so the web card
+ * shows every hash-bound field the CLI approver shows (#262, #295).
  */
 function toApprovalContext(
   wire: WireApprovalContext,
@@ -324,34 +345,25 @@ function toApprovalContext(
     reversible: wire.reversible,
     summary: display.summary,
   };
-  const allowed = toAllowedDecisions(wire.constraints.allowed_decisions);
-  const kind: ApprovalContext["kind"] =
-    wire.action.surface === "mcp_tool_call"
-      ? "mcp"
-      : wire.action.surface === "agent_tool_call"
-        ? "agent_tool_call"
-        : "command";
-
-  // Spread the surface-specific action only when present so `exactOptionalPropertyTypes` keeps the
-  // optional `command`/`mcp`/`agentToolCall`/`challenge` keys absent (not explicitly `undefined`).
-  const base = {
-    kind,
+  const context: ApprovalContext = {
+    kind: toKind(wire.action.surface),
+    substrate: toSubstrateView(display.syntactic),
     actor,
     risk,
-    allowed_decisions: allowed,
+    allowed_decisions: toAllowedDecisions(wire.constraints.allowed_decisions),
     hasHiddenOrControlChars: display.has_hidden_or_control_chars,
-  } as const;
-  let withAction: ApprovalContext;
-  if (kind === "mcp") {
-    const mcp = toToolCallAction(display.syntactic);
-    withAction = mcp ? { ...base, mcp } : base;
-  } else if (kind === "agent_tool_call") {
-    const agentToolCall = toToolCallAction(display.syntactic);
-    withAction = agentToolCall ? { ...base, agentToolCall } : base;
-  } else {
-    withAction = { ...base, command: toCommandAction(display.syntactic) };
-  }
-  return challenge ? { ...withAction, challenge } : withAction;
+  };
+  // Decided on the unescaped bytes; the line shown is rebuilt from the escaped substrate.
+  const divergentArgv = rawDivergesFromArgv(wire.action.syntactic)
+    ? reconstructCommand(display.syntactic)
+    : undefined;
+  // Spread optional keys only when present so `exactOptionalPropertyTypes` keeps them absent.
+  return {
+    ...context,
+    ...(divergentArgv !== undefined ? { divergentArgv } : {}),
+    ...(display.chain !== undefined ? { chain: display.chain } : {}),
+    ...(challenge ? { challenge } : {}),
+  };
 }
 
 /**
@@ -470,7 +482,8 @@ export function createWasmRuntime(options: WasmRuntimeOptions): WebApproverRunti
       );
     }
 
-    // Decrypt via the core. A wrong key / tampered ciphertext / malformed JWE throws here.
+    // Decrypt via the core. A wrong key / tampered ciphertext / malformed JWE throws here, and so does
+    // a context that breaks a v1 device-side check (docs/contract.md §Device-side context checks).
     const contextJson = wasm.decrypt_context(
       envelope.context_ciphertext,
       identity.deviceId,

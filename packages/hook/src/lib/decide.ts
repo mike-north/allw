@@ -3,10 +3,18 @@
  * gated tool call through a human approval and mapping the **verified** verdict to "no decision" or
  * deny.
  *
- * This module is deliberately I/O-free and dependency-injected — the WASM core, the approval
- * function, and a clock are all passed in — so the full decision matrix is unit-testable without
- * touching stdin/stdout, the network, or the real SDK. `runHook` in `../cli.ts` wires the real
- * `@allw/sdk` client into it.
+ * This module is deliberately free of stdin/stdout and network I/O and is dependency-injected — the
+ * WASM core, the command-request builder and the approval function are passed in — so the full
+ * decision matrix is unit-testable without the relay. `runHook` in `../cli.ts` wires the real
+ * `@allw/sdk` functions into it.
+ *
+ * # Building the request
+ * A POSIX shell command (`Bash`, or `Monitor` with a `command`) is built through `@allw/sdk`'s
+ * `commandRequest` (#269), the same core-built path a plain script uses, with the hook's own actor,
+ * risk-derived `reversible` and timeout as explicit overrides. (`commandRequest` loads the SDK's copy
+ * of the WASM core, the same vendored artifact the hook's `wasm` is.) Every other gated surface (MCP,
+ * file edits, PowerShell) has no SDK builder yet, so its record comes from {@link gateToolCall} and
+ * is translated here.
  *
  * # Fail-closed, deny-only mapping (contract §Invariants)
  * A verdict may only tighten access, so the hook never emits `allow` (see `./hook-io.ts`):
@@ -28,8 +36,11 @@
  * @see ../../../sdk/src/index.ts (requestApproval is itself fail-closed: approved ⇒ verified)
  */
 
+import type { commandRequest } from "@allw/sdk";
+
 import type { HookWasm } from "./wasm.js";
-import { gateToolCall } from "./gating.js";
+import { agentSafeErrorText, agentSafeText } from "./agent-text.js";
+import { commandBuildFailureReason, gateToolCall, posixCommandCall } from "./gating.js";
 import {
   denyOutput,
   noDecisionOutput,
@@ -49,8 +60,9 @@ export interface ApprovalVerdict {
 
 /**
  * The minimal `ApprovalRequest` shape the hook builds. Mirrors `@allw/sdk`'s `ApprovalRequest`
- * (camelCase). `action` is typed `unknown` here because the hook produces it by translating the
- * core's snake_case `ActionRecord` JSON — the SDK validates/serializes it on the way to the core.
+ * (camelCase). `action` is typed `unknown` here because, outside the command surface, the hook
+ * produces it by translating the core's snake_case `ActionRecord` JSON — the SDK validates and
+ * serializes it on the way to the core.
  */
 export interface HookApprovalRequest {
   readonly action: unknown;
@@ -64,42 +76,20 @@ export interface HookApprovalRequest {
 /** The injectable approval function — the real one is `client.requestApproval` from `@allw/sdk`. */
 export type RequestApprovalFn = (req: HookApprovalRequest) => Promise<ApprovalVerdict>;
 
-/** Everything `decide` needs that isn't the parsed input — all injectable for tests. */
-/** The most characters of error text a deny reason carries (after escaping), plus `…`. */
-export const MAX_ERROR_TEXT_CHARS = 256;
-
-/** Shown instead of error text the core escape could not process. */
-const WITHHELD_ERROR_TEXT = "details withheld (the display-escaping core is unavailable)";
-
 /**
- * The text of an error from the approval round-trip, made safe to put in a deny reason the agent
- * reads.
- *
- * Errors from `requestApproval` can carry relay-supplied text (a status body, a device id, a JSON
- * parse snippet), and the relay is untrusted. A newline-laden message could pose as an allw
- * diagnostic and instruct the agent (prompt injection). This is the single choke point both hooks
- * use: the text goes through the core's `escape_for_display`, so control, bidi and zero-width
- * characters (newlines included) become visible escapes, and it is capped at
- * {@link MAX_ERROR_TEXT_CHARS} characters. If the core escape fails, the text is withheld.
+ * The injectable command-request builder — the real one is `@allw/sdk`'s `commandRequest`. It
+ * rejects with a `CommandActionError` for a command it refuses; any rejection denies.
  */
-export function agentSafeErrorText(wasm: HookWasm, err: unknown): string {
-  const message = err instanceof Error ? err.message : String(err);
-  let escaped: string;
-  try {
-    escaped = wasm.escape_for_display(message);
-  } catch {
-    return WITHHELD_ERROR_TEXT;
-  }
-  // Cap by code point, so a surrogate pair is never split.
-  const chars = Array.from(escaped);
-  return chars.length > MAX_ERROR_TEXT_CHARS
-    ? `${chars.slice(0, MAX_ERROR_TEXT_CHARS).join("")}…`
-    : escaped;
-}
+export type CommandRequestFn = typeof commandRequest;
 
+export { MAX_ERROR_TEXT_CHARS, agentSafeErrorText, agentSafeText } from "./agent-text.js";
+
+/** Everything `decide` needs that isn't the parsed input — all injectable for tests. */
 export interface DecideDeps {
   readonly wasm: HookWasm;
   readonly config: HookConfig;
+  /** Builds the request for a POSIX shell command (`Bash`, `Monitor`'s `command`). */
+  readonly commandRequest: CommandRequestFn;
   readonly requestApproval: RequestApprovalFn;
 }
 
@@ -135,6 +125,43 @@ function reversibleForRisk(risk: Risk): boolean {
   return risk === "low" || risk === "medium";
 }
 
+/** The machine actor the hook submits as: this host, acting as Claude Code. */
+function hookActor(hostname: string): HookApprovalRequest["actor"] {
+  return { id: `machine:${hostname}`, kind: "claude-code" };
+}
+
+/**
+ * Build the `ApprovalRequest` for a POSIX shell command through `@allw/sdk`'s `commandRequest`,
+ * which builds the record with the core's `action_from_command` and takes `risk` from it.
+ *
+ * The hook's own values are explicit overrides: its actor, the configured timeout, and `cwd`
+ * (`null` when Claude Code sent none, so the record is unbound rather than bound to the hook's own
+ * working directory). `reversible` is derived from the core's risk, which is known only once the
+ * record is built, so it replaces `commandRequest`'s conservative `false` afterwards; the key order
+ * is unchanged, so the request is the one the hook built by hand before #269.
+ *
+ * @throws `CommandActionError` (as a rejection) when the SDK refuses the command: invalid
+ * shell syntax, or a blank command or program. (It also refuses a blank `cwd`, which the stdin
+ * parser has already turned into an absent one.) The caller denies.
+ */
+async function commandApprovalRequest(
+  build: CommandRequestFn,
+  command: string,
+  summary: string,
+  cwd: string | undefined,
+  config: HookConfig,
+  hostname: string,
+): Promise<HookApprovalRequest> {
+  const req = await build({
+    commandLine: command,
+    summary,
+    cwd: cwd ?? null,
+    actor: hookActor(hostname),
+    ...(config.timeoutMs !== undefined ? { timeoutMs: config.timeoutMs } : {}),
+  });
+  return { ...req, reversible: reversibleForRisk(req.risk) };
+}
+
 /**
  * Translate the core's snake_case `ActionRecord` JSON into the SDK's camelCase `action` and build
  * the full `ApprovalRequest`. Returns `null` if the core JSON is unparseable/unexpected (caller
@@ -164,11 +191,63 @@ function buildApprovalRequest(
   return {
     action,
     summary,
-    actor: { id: `machine:${hostname}`, kind: "claude-code" },
+    actor: hookActor(hostname),
     risk: parsed.risk,
     reversible: reversibleForRisk(parsed.risk),
     ...(config.timeoutMs !== undefined ? { timeoutMs: config.timeoutMs } : {}),
   };
+}
+
+/**
+ * A gated call reduced to what `decide` acts on: a request to submit (with the raw `summary` a deny
+ * reason quotes), no decision (`pass-through`), or a fail-closed deny (`build-error`).
+ */
+type PreparedCall =
+  | { readonly kind: "request"; readonly req: HookApprovalRequest; readonly summary: string }
+  | { readonly kind: "pass-through"; readonly reason: string }
+  | { readonly kind: "build-error"; readonly reason: string };
+
+/**
+ * Reduce a call to the request to submit. A POSIX shell command goes through the SDK
+ * ({@link commandApprovalRequest}); every other gated surface through {@link gateToolCall}. A
+ * record that cannot be built is a `build-error`, so the caller denies.
+ */
+async function prepareCall(
+  input: PreToolUseInput,
+  deps: DecideDeps,
+  hostname: string,
+): Promise<PreparedCall> {
+  const { config, wasm } = deps;
+  const command = posixCommandCall(input.toolName, input.toolInput);
+  if (command !== null) {
+    if (command.kind !== "command") return command;
+    try {
+      const req = await commandApprovalRequest(
+        deps.commandRequest,
+        command.command,
+        command.summary,
+        input.cwd,
+        config,
+        hostname,
+      );
+      return { kind: "request", req, summary: command.summary };
+    } catch (err) {
+      // A command the SDK refuses, or any other failure to build the request (the SDK's WASM
+      // loader, say), is never submitted; the human is not asked (fail-closed).
+      return { kind: "build-error", reason: commandBuildFailureReason(wasm, err) };
+    }
+  }
+
+  const gate = gateToolCall(wasm, input.toolName, input.toolInput, input.cwd);
+  if (gate.kind !== "gated") return gate;
+  const req = buildApprovalRequest(gate.actionRecord, gate.summary, config, hostname);
+  if (req === null) {
+    return {
+      kind: "build-error",
+      reason: "allw: built ActionRecord was not in the expected shape (fail-closed deny)",
+    };
+  }
+  return { kind: "request", req, summary: gate.summary };
 }
 
 /**
@@ -186,19 +265,15 @@ export async function decide(
   deps: DecideDeps,
   hostname: string,
 ): Promise<ClaudeHookResult> {
-  const gate = gateToolCall(deps.wasm, input.toolName, input.toolInput, input.cwd);
+  const prepared = await prepareCall(input, deps, hostname);
 
-  if (gate.kind === "pass-through") {
+  if (prepared.kind === "pass-through") {
     return noDecisionOutput();
   }
-  if (gate.kind === "build-error") {
-    return denyOutput(gate.reason);
+  if (prepared.kind === "build-error") {
+    return denyOutput(prepared.reason);
   }
-
-  const req = buildApprovalRequest(gate.actionRecord, gate.summary, deps.config, hostname);
-  if (req === null) {
-    return denyOutput("allw: built ActionRecord was not in the expected shape (fail-closed deny)");
-  }
+  const { req, summary } = prepared;
 
   let verdict: ApprovalVerdict;
   try {
@@ -218,5 +293,10 @@ export async function decide(
     return noDecisionOutput();
   }
   // denied / expired / aborted ⇒ deny (a verified human "no", a timeout, or a device abort).
-  return denyOutput(`allw: ${gate.summary} — not approved (verdict: ${verdict.decision})`);
+  // The summary quotes the tool call (a command, tool and server names, MCP params), which can come
+  // from a third party, so it goes through the core escape before the agent reads it (#364). The
+  // approver still gets the raw summary and applies its own display escape.
+  return denyOutput(
+    `allw: ${agentSafeText(deps.wasm, summary)} — not approved (verdict: ${verdict.decision})`,
+  );
 }

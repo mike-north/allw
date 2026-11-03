@@ -155,7 +155,8 @@ npx --no-install allw-approver pair \
 ```
 
 - `<RELAY_URL>` is from step 0 — `https://allw-relay.mnorth.workers.dev` by default, or your own
-  URL if you chose to self-host.
+  URL if you chose to self-host. It must be `https://`; `pair` and `watch` refuse plain `http://`
+  except for a local relay on `localhost` or `127.0.0.1`.
 - The **account id is derived from the account-root key** in your keyfile (a 43-character
   base64url string) — you don't choose it. Only the holder of that key can add devices to the
   account. `--account <id>` is optional and only checks that you got the id you expected.
@@ -233,11 +234,13 @@ You don't need any of these if the file is in place:
 | `ALLW_ACCOUNT_ID`        | `account_id`                                                                                                                                                                                              |
 | `ALLW_APPROVER_ROOT_KEY` | `approver_root_key`                                                                                                                                                                                       |
 
+The default location must be absolute too: if `HOME` is a relative path, the loader refuses to
+guess (it would resolve against the agent's working directory); set `ALLW_CONFIG` instead.
+
 Then register the hook in your project's (or user's) `.claude/settings.json` as a **PreToolUse**
-hook. The matcher `^(Bash|Edit|MultiEdit|Write)$|^mcp__` sends exactly the `Bash`, `Edit`,
-`MultiEdit` and `Write` tools, plus every MCP tool (`mcp__…`), to allw. The `deny` rules turn off
-`Monitor`, `PowerShell` and `NotebookEdit`: they run shell commands or edit files, and allw doesn't
-gate them yet ([#298](https://github.com/mike-north/allw/issues/298)). (Beyond a demo, install the hook outside the project and register it in
+hook. The matcher sends exactly the shell tools (`Bash`, `PowerShell`, `Monitor`), the file-edit
+tools (`Edit`, `MultiEdit`, `Write`, `NotebookEdit`) and every MCP tool (`mcp__…`) to allw: every
+tool that runs a command or changes a file. (Beyond a demo, install the hook outside the project and register it in
 `~/.claude/settings.json`, so the agent can't edit the gate:
 [Install the hook where the agent can't write it](./claude-code-integration.md#install-the-hook-where-the-agent-cant-write-it).)
 
@@ -246,7 +249,7 @@ gate them yet ([#298](https://github.com/mike-north/allw/issues/298)). (Beyond a
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "^(Bash|Edit|MultiEdit|Write)$|^mcp__",
+        "matcher": "^(Bash|PowerShell|Monitor|Edit|MultiEdit|Write|NotebookEdit)$|^mcp__",
         "hooks": [
           {
             "type": "command",
@@ -257,9 +260,6 @@ gate them yet ([#298](https://github.com/mike-north/allw/issues/298)). (Beyond a
         ]
       }
     ]
-  },
-  "permissions": {
-    "deny": ["Monitor", "PowerShell", "NotebookEdit"]
   }
 }
 ```

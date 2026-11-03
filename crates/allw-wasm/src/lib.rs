@@ -50,6 +50,7 @@ use allw_core::{
     action_from_argv as core_action_from_argv, action_from_command as core_action_from_command,
     action_from_file_edit as core_action_from_file_edit,
     action_from_mcp_tool_call as core_action_from_mcp_tool_call,
+    action_from_powershell_command as core_action_from_powershell_command,
     check_account_id_for_root as core_check_account_id_for_root,
     compute_request_hash as core_compute_request_hash, decrypt_context as core_decrypt_context,
     derive_number_match_challenge as core_derive_number_match_challenge,
@@ -73,6 +74,7 @@ use allw_core::{
     verify_policy_rule_with_account_states_for_account as core_verify_policy_rule_with_account_states_for_account,
     verify_verdict as core_verify_verdict,
     verify_verdict_for_account as core_verify_verdict_for_account,
+    verify_verdict_provenance as core_verify_verdict_provenance,
     verify_verdict_with_account_states as core_verify_verdict_with_account_states,
     verify_verdict_with_account_states_for_account as core_verify_verdict_with_account_states_for_account,
     AccountState, ActionRecord, Actor, ApprovalContext, ApprovalRequest, Approver, CommandContext,
@@ -512,6 +514,83 @@ pub fn verify_verdict_with_account_states(
             note: verified.note,
         },
         "VerifyResult",
+    )
+    .map_err(JsValue::from)
+}
+
+// ── verify_verdict_provenance ─────────────────────────────────────────────────────────
+
+/// The successful result of [`verify_verdict_provenance`]: who signed the verdict. **Not** a
+/// verified human decision — see the core
+/// [`VerdictProvenance`](allw_core::VerdictProvenance).
+#[derive(Serialize)]
+struct ProvenanceResult {
+    /// The certified device that signed the verdict.
+    device_id: String,
+    /// The signed decision time, Unix ms. The device certificate was unexpired at it.
+    decided_at: i64,
+}
+
+/// Checks a verdict's provenance without the plaintext: signed for `request_id`, with a
+/// `decided_at` inside `[created_at, expires_at]` (the request envelope's window), by a device of
+/// `account_id` certified by the account root, and not revoked in `account_states_json`. The
+/// relay's gate before it records a verdict (see the core
+/// [`verify_verdict_provenance`](allw_core::verify_verdict_provenance) for the exact checks).
+///
+/// - `account_states_json` — a JSON array of compact `allw-account-state+jws` strings; `[]` skips
+///   the revocation check. Every document must verify against the root, or the check fails closed.
+///
+/// Returns `{ device_id, decided_at }` JSON. This is **not** approval: the request hash, replay
+/// and decision are unchecked; only [`verify_verdict`] yields a verified decision.
+///
+/// # Errors
+///
+/// Throws on any failed check (the message is the core [`VerifyError`] `Display`, for diagnostics
+/// only), on invalid `verdict_json` / `account_states_json`, on a root key that is not a 32-byte
+/// base64url Ed25519 key, or on a `created_at` / `expires_at` that is not an integer in range.
+#[wasm_bindgen]
+pub fn verify_verdict_provenance(
+    verdict_json: &str,
+    request_id: &str,
+    created_at: f64,
+    expires_at: f64,
+    account_id: &str,
+    account_root_pubkey_b64: &str,
+    account_states_json: &str,
+) -> Result<String, JsValue> {
+    let verdict: Verdict = parse_json(verdict_json, "Verdict")?;
+    let root_bytes = decode_b64_32(account_root_pubkey_b64, "account_root_pubkey_b64")?;
+    let root = PublicKey::from_bytes(&root_bytes).map_err(|e| {
+        JsError::new(&format!(
+            "account_root_pubkey_b64 is not a valid Ed25519 key: {e}"
+        ))
+    })?;
+    let created_at = ms_to_i64(created_at, "created_at")?;
+    let expires_at = ms_to_i64(expires_at, "expires_at")?;
+    let account_states = parse_account_states_json(account_states_json)?;
+    let account_state_refs: Vec<&str> = account_states.iter().map(String::as_str).collect();
+
+    let provenance = core_verify_verdict_provenance(
+        &verdict,
+        request_id,
+        created_at,
+        expires_at,
+        account_id,
+        &root,
+        &account_state_refs,
+    )
+    .map_err(|e| {
+        JsValue::from(JsError::new(&format!(
+            "verify_verdict_provenance failed: {e}"
+        )))
+    })?;
+
+    to_json(
+        &ProvenanceResult {
+            device_id: provenance.device_id,
+            decided_at: provenance.decided_at,
+        },
+        "ProvenanceResult",
     )
     .map_err(JsValue::from)
 }
@@ -1400,6 +1479,26 @@ pub fn action_from_command(command_line: &str, cwd: Option<String>) -> Result<St
     let record = core_action_from_command(command_line, &ctx)
         .map_err(|e| JsError::new(&format!("action_from_command failed: {e}")))?;
     to_json(&record, "ActionRecord")
+}
+
+/// Builds an [`ActionRecord`](allw_core::ActionRecord) from a raw **PowerShell** command line,
+/// returning it as JSON (the `command` surface, for a host's PowerShell tool). `raw` is the exact
+/// line; argv is always a plain whitespace split of it; risk is at least `Medium`, or at least
+/// `High` for a compound, escaped or dynamic-execution line. See
+/// [`allw_core::powershell`](allw_core::powershell) for the rules.
+///
+/// Infallible by design: no PowerShell line is refused for its syntax, so a valid PowerShell
+/// command is never denied for its quoting.
+#[wasm_bindgen]
+pub fn action_from_powershell_command(
+    command_line: &str,
+    cwd: Option<String>,
+) -> Result<String, JsError> {
+    let ctx = CommandContext { cwd };
+    to_json(
+        &core_action_from_powershell_command(command_line, &ctx),
+        "ActionRecord",
+    )
 }
 
 /// Builds an [`ActionRecord`](allw_core::ActionRecord) from a **pre-tokenized** argv, returning it

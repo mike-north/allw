@@ -24,56 +24,20 @@ import { JSDOM } from "jsdom";
 import { mountWebApprover } from "../dist/browser.js";
 import { createWasmRuntime } from "../dist/index.js";
 import { loadTestWasm } from "./wasm-helper.mjs";
+import {
+  ACCOUNT_ID,
+  DEVICE_ID,
+  NOW_MS,
+  envelope,
+  mountWith,
+  pairedIdentity,
+} from "./support/real-runtime.mjs";
 
-const ACCOUNT_ID = "acct-web-display-test";
-const DEVICE_ID = "dev-web-display-test";
-const ISSUED_AT = 1700000000000;
-const EXPIRES_AT = 1700003600000;
-const NOW_MS = 1700001500000;
-
-const RLO = "‮";
-const ZWSP = "​";
+const RLO = "\u202e";
+const ZWSP = "\u200b";
 // eslint-disable-next-line no-control-regex
-const RAW_HIDDEN = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f؜​-‏‪-‮⁠⁦-⁩﻿]/;
-
-function pairedIdentity(wasm) {
-  const accountRootSeed = Buffer.alloc(32, 0x11).toString("base64url");
-  const deviceSigningSeed = Buffer.alloc(32, 0x22).toString("base64url");
-  const deviceEncryptionSeed = Buffer.alloc(32, 0x33).toString("base64url");
-  const deviceEncryptionPubkey = wasm.x25519_public_key(deviceEncryptionSeed);
-  const identity = {
-    accountId: ACCOUNT_ID,
-    deviceId: DEVICE_ID,
-    deviceEncryptionSeed,
-    deviceSigningSeed,
-    deviceCert: wasm.issue_device_cert(
-      accountRootSeed,
-      ACCOUNT_ID,
-      DEVICE_ID,
-      wasm.ed25519_public_key(deviceSigningSeed),
-      ISSUED_AT,
-    ),
-    accountRootPubkey: wasm.ed25519_public_key(accountRootSeed),
-    deviceAuthToken: "relay-bearer-test-token",
-  };
-  const encryptTo = (context) =>
-    wasm.encrypt_context(
-      JSON.stringify(context),
-      JSON.stringify([{ device_id: DEVICE_ID, public_key_b64: deviceEncryptionPubkey }]),
-    );
-  return { identity, encryptTo };
-}
-
-function envelope(id, ciphertext) {
-  return {
-    v: 1,
-    id,
-    created_at: ISSUED_AT,
-    expires_at: EXPIRES_AT,
-    approver: ACCOUNT_ID,
-    context_ciphertext: ciphertext,
-  };
-}
+const RAW_HIDDEN =
+  /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/;
 
 function context(syntactic, overrides = {}) {
   return {
@@ -87,38 +51,8 @@ function context(syntactic, overrides = {}) {
   };
 }
 
-/** Mount the real web approver over the real WASM runtime and return the rendered root. */
-async function mountWith(contexts) {
-  const wasm = await loadTestWasm();
-  const { identity, encryptTo } = pairedIdentity(wasm);
-  const envelopes = contexts.map((ctx, i) => envelope(`req-display-${String(i)}`, encryptTo(ctx)));
-  const dom = new JSDOM('<div id="app"></div>', { url: "https://approver.local/" });
-  const root = dom.window.document.getElementById("app");
-  const saved = {
-    document: globalThis.document,
-    window: globalThis.window,
-    HTMLButtonElement: globalThis.HTMLButtonElement,
-  };
-  globalThis.document = dom.window.document;
-  globalThis.window = dom.window;
-  globalThis.HTMLButtonElement = dom.window.HTMLButtonElement;
-  try {
-    await mountWebApprover({
-      root,
-      nowMs: () => NOW_MS,
-      fetchInbox: async () => envelopes,
-      runtime: createWasmRuntime({ wasm, identity, nowMs: () => NOW_MS }),
-    });
-    return root;
-  } finally {
-    globalThis.document = saved.document;
-    globalThis.window = saved.window;
-    globalThis.HTMLButtonElement = saved.HTMLButtonElement;
-  }
-}
-
 test("a U+202E bidi override renders escaped in the DOM with the warning badge (#246)", async () => {
-  // Trojan-Source-style filename: displayed raw, `invoice‮fdp.exe` reads as `invoiceexe.pdf`.
+  // Trojan-Source-style filename: displayed raw, `invoice\u202efdp.exe` reads as `invoiceexe.pdf`.
   const root = await mountWith([
     context({ argv: ["open", `invoice${RLO}fdp.exe`], raw: `open invoice${RLO}fdp.exe` }),
   ]);

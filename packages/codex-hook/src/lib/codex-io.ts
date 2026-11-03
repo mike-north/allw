@@ -20,6 +20,8 @@
  * @see https://learn.chatgpt.com/docs/hooks
  */
 
+import { MAX_ESCAPED_DIAGNOSTIC_CHARS, escapeToPrintableAscii } from "@allw/sdk";
+
 /** The Codex hook event this package implements. */
 export const HOOK_EVENT_NAME = "PreToolUse" as const;
 
@@ -56,6 +58,11 @@ export interface CodexPreToolUseInput {
   readonly hookEventName: typeof HOOK_EVENT_NAME;
   readonly toolName: string;
   readonly toolInput: unknown;
+  /**
+   * The session's working directory, threaded into the command `ActionRecord`. Never blank: a blank
+   * or whitespace-only `cwd` is treated as unknown, so the record is left unbound (#372, as in the
+   * Claude Code hook since #371).
+   */
   readonly cwd?: string;
   readonly toolUseId?: string;
 }
@@ -158,8 +165,10 @@ export function parseCodexHookInput(raw: string): ParseResult {
   if (eventName !== HOOK_EVENT_NAME) {
     return {
       ok: false,
-      reason: `allw: unexpected Codex hook_event_name '${String(
-        eventName,
+      // Stdin is untrusted and this runs before the WASM core loads: quote it escaped and bounded.
+      reason: `allw: unexpected Codex hook_event_name '${escapeToPrintableAscii(
+        String(eventName),
+        MAX_ESCAPED_DIAGNOSTIC_CHARS,
       )}' (expected '${HOOK_EVENT_NAME}'; fail-closed deny)`,
       denyReason: "input-parse-error",
     };
@@ -174,6 +183,8 @@ export function parseCodexHookInput(raw: string): ParseResult {
     };
   }
 
+  // A blank or whitespace-only cwd names no directory: treat it as absent, so the record is unbound
+  // and the human is still asked, rather than bound to a meaningless "" directory (#372).
   const cwd = parsed.cwd;
   const toolUseId = parsed.tool_use_id;
   return {
@@ -182,7 +193,7 @@ export function parseCodexHookInput(raw: string): ParseResult {
       hookEventName: HOOK_EVENT_NAME,
       toolName,
       toolInput: parsed.tool_input,
-      ...(typeof cwd === "string" ? { cwd } : {}),
+      ...(typeof cwd === "string" && cwd.trim() !== "" ? { cwd } : {}),
       ...(typeof toolUseId === "string" ? { toolUseId } : {}),
     },
   };

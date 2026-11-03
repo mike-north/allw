@@ -1,0 +1,158 @@
+{
+  "description": "Shared Rust/WASM vector for the v1 device-side context checks (#296). Each case patches base_context (keys are dotted JSON paths; a null value writes an explicit null), seals it to the fixed device, and decrypts it as the device. A device refuses a context whose action.capabilities or action.scope is non-null (any JSON value, including [], {}, \"\", 0 and false), checked first, or whose shown risk is lower than action.risk (a hidden downgrade). A raised or equal context risk passes. Expected values are written by hand from docs/contract.md §Device-side context checks; never regenerate them from program output. expected_error is the exact refusal text, which the decrypt error contains.",
+  "device_id": "device-conformance",
+  "device_x25519_seed_b64": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc",
+  "base_context": {
+    "action": {
+      "record_schema_version": 1,
+      "surface": "command",
+      "syntactic": {
+        "bin": "git",
+        "argv": ["git", "push"],
+        "raw": "git push"
+      },
+      "risk": "high"
+    },
+    "summary": "git push",
+    "actor": { "id": "machine:conformance", "kind": "script" },
+    "risk": "high",
+    "reversible": false,
+    "constraints": {
+      "allowed_decisions": ["approved", "denied"],
+      "challenge_required": false
+    }
+  },
+  "cases": [
+    {
+      "class": "reserved fields absent",
+      "set": {},
+      "expected": "accepted"
+    },
+    {
+      "class": "explicit null capabilities and scope (on the wire null reads as absent, so the opened context omits both)",
+      "set": { "action.capabilities": null, "action.scope": null },
+      "expected": "accepted"
+    },
+    {
+      "class": "non-null capabilities",
+      "set": { "action.capabilities": [{ "grant": "WRITE_EVERYTHING" }] },
+      "expected": "refused",
+      "expected_error": "action.capabilities is reserved and must be null in v1"
+    },
+    {
+      "class": "empty capabilities array is non-null",
+      "set": { "action.capabilities": [] },
+      "expected": "refused",
+      "expected_error": "action.capabilities is reserved and must be null in v1"
+    },
+    {
+      "class": "non-null scope",
+      "set": { "action.scope": { "paths": ["/etc"] } },
+      "expected": "refused",
+      "expected_error": "action.scope is reserved and must be null in v1"
+    },
+    {
+      "class": "empty scope object is non-null",
+      "set": { "action.scope": {} },
+      "expected": "refused",
+      "expected_error": "action.scope is reserved and must be null in v1"
+    },
+    {
+      "class": "empty scope array is non-null",
+      "set": { "action.scope": [] },
+      "expected": "refused",
+      "expected_error": "action.scope is reserved and must be null in v1"
+    },
+    {
+      "class": "falsy scope scalars are non-null",
+      "set": { "action.scope": false },
+      "expected": "refused",
+      "expected_error": "action.scope is reserved and must be null in v1"
+    },
+    {
+      "class": "empty-string scope is non-null",
+      "set": { "action.scope": "" },
+      "expected": "refused",
+      "expected_error": "action.scope is reserved and must be null in v1"
+    },
+    {
+      "class": "both reserved fields set: both are named",
+      "set": {
+        "action.capabilities": [{ "grant": "WRITE_EVERYTHING" }],
+        "action.scope": { "paths": ["/etc"] }
+      },
+      "expected": "refused",
+      "expected_error": "action.capabilities and action.scope are reserved and must be null in v1"
+    },
+    {
+      "class": "reserved fields are checked before the risk",
+      "set": { "action.scope": {}, "risk": "low", "action.risk": "critical" },
+      "expected": "refused",
+      "expected_error": "action.scope is reserved and must be null in v1"
+    },
+    {
+      "class": "equal risk: low",
+      "set": { "risk": "low", "action.risk": "low" },
+      "expected": "accepted"
+    },
+    {
+      "class": "equal risk: medium",
+      "set": { "risk": "medium", "action.risk": "medium" },
+      "expected": "accepted"
+    },
+    {
+      "class": "equal risk: high",
+      "set": { "risk": "high", "action.risk": "high" },
+      "expected": "accepted"
+    },
+    {
+      "class": "equal risk: critical",
+      "set": { "risk": "critical", "action.risk": "critical" },
+      "expected": "accepted"
+    },
+    {
+      "class": "raised risk: low record shown as medium",
+      "set": { "risk": "medium", "action.risk": "low" },
+      "expected": "accepted"
+    },
+    {
+      "class": "raised risk: medium record shown as high",
+      "set": { "risk": "high", "action.risk": "medium" },
+      "expected": "accepted"
+    },
+    {
+      "class": "raised risk: high record shown as critical",
+      "set": { "risk": "critical", "action.risk": "high" },
+      "expected": "accepted"
+    },
+    {
+      "class": "raised risk: low record shown as critical",
+      "set": { "risk": "critical", "action.risk": "low" },
+      "expected": "accepted"
+    },
+    {
+      "class": "lowered risk: medium record shown as low",
+      "set": { "risk": "low", "action.risk": "medium" },
+      "expected": "refused",
+      "expected_error": "context risk low is lower than action.risk medium"
+    },
+    {
+      "class": "lowered risk: high record shown as medium",
+      "set": { "risk": "medium", "action.risk": "high" },
+      "expected": "refused",
+      "expected_error": "context risk medium is lower than action.risk high"
+    },
+    {
+      "class": "lowered risk: critical record shown as high",
+      "set": { "risk": "high", "action.risk": "critical" },
+      "expected": "refused",
+      "expected_error": "context risk high is lower than action.risk critical"
+    },
+    {
+      "class": "lowered risk: critical record shown as low",
+      "set": { "risk": "low", "action.risk": "critical" },
+      "expected": "refused",
+      "expected_error": "context risk low is lower than action.risk critical"
+    }
+  ]
+}

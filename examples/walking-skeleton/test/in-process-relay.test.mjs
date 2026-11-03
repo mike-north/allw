@@ -179,3 +179,23 @@ test("poll auth: requires the request-scoped bearer token returned by submit", a
   assert.equal(pollBody.status, "pending");
   assert.equal(pollBody.request_id, "req-auth");
 });
+
+test("poll auth: an unknown id answers exactly as a wrong token, never 'not found' (#357)", async () => {
+  const relay = new InProcessRelay({ now });
+  await submit(relay, envelope({ id: "req-known" }));
+
+  for (const token of [undefined, "wrong"]) {
+    const known = await poll(relay, "req-known", token);
+    const unknown = await poll(relay, "req-unknown", token);
+    assert.deepEqual(unknown, known, `token ${String(token)}: indistinguishable`);
+  }
+  // The relay's auth answers (`docs/relay-api.md` §1).
+  assert.deepEqual(await poll(relay, "req-unknown"), {
+    status: 401,
+    body: { error: "authorization required" },
+  });
+  assert.deepEqual(await poll(relay, "req-unknown", "wrong"), {
+    status: 403,
+    body: { error: "authorization denied" },
+  });
+});

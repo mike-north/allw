@@ -9,7 +9,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { gateToolCall, isGatedTool, parseMcpToolName } from "../dist/lib/gating.js";
+import {
+  gateToolCall,
+  isGatedTool,
+  parseMcpToolName,
+  commandBuildFailureReason,
+  posixCommandCall,
+} from "../dist/lib/gating.js";
+import { decide } from "../dist/lib/decide.js";
+import { commandRequest } from "@allw/sdk";
 import { loadWasm } from "../dist/lib/wasm.js";
 
 // ── MCP tool-name parsing ───────────────────────────────────────────────────────────────────────
@@ -37,7 +45,10 @@ test("parseMcpToolName returns null for non-MCP names and malformed forms", () =
 test("Bash, MCP, and file-edit tools are gated; read-only tools are not", () => {
   assert.equal(isGatedTool("Bash"), true);
   assert.equal(isGatedTool("mcp__gh__create_pr"), true);
-  for (const t of ["Edit", "MultiEdit", "Write", "apply_patch"]) {
+  for (const t of ["PowerShell", "Monitor"]) {
+    assert.equal(isGatedTool(t), true, `${t} runs shell commands, so it must be gated (#298)`);
+  }
+  for (const t of ["Edit", "MultiEdit", "Write", "NotebookEdit", "apply_patch"]) {
     assert.equal(isGatedTool(t), true, `${t} must be gated as a file-edit surface`);
   }
   for (const t of ["Read", "Glob", "Grep", "WebFetch", "Task"]) {
@@ -211,8 +222,357 @@ test("gateToolCall(file edit with missing path/patch) → build-error", async ()
   );
 });
 
+// ── #298: shell commands that reach the machine outside the Bash tool ──────────────────────────
+//
+// Monitor's `command` runs a shell command under Bash's permission rules, and PowerShell runs a
+// PowerShell line: both must reach a human exactly like Bash. A Monitor WebSocket watch (`ws`) runs
+// nothing and gets no decision; any other Monitor input shape denies.
+// @see https://code.claude.com/docs/en/tools-reference (Monitor, PowerShell, NotebookEdit inputs)
+
+test("gateToolCall(Monitor command) → gated exactly like Bash (#298)", async () => {
+  const wasm = await loadWasm();
+  const monitor = gateToolCall(wasm, "Monitor", { command: "tail -f build.log" }, "/repo");
+  const bash = gateToolCall(wasm, "Bash", { command: "tail -f build.log" }, "/repo");
+  assert.equal(monitor.kind, "gated");
+  assert.deepEqual(JSON.parse(monitor.actionRecord), JSON.parse(bash.actionRecord));
+  assert.match(monitor.summary, /Monitor/, "the human is told the command runs under Monitor");
+  assert.ok(monitor.summary.includes("tail -f build.log"));
+});
+
+test("gateToolCall(Monitor command) with malformed shell → build-error, like Bash (#298)", async () => {
+  const wasm = await loadWasm();
+  assert.equal(
+    gateToolCall(wasm, "Monitor", { command: 'echo "oops' }, "/repo").kind,
+    "build-error",
+  );
+});
+
+test("gateToolCall(Monitor ws watch) → pass-through: it runs no command (#298)", async () => {
+  const wasm = await loadWasm();
+  const out = gateToolCall(wasm, "Monitor", { ws: { url: "wss://example.test/events" } }, "/repo");
+  assert.equal(out.kind, "pass-through");
+});
+
+test("gateToolCall(Monitor) with a malformed input shape → build-error (fail-closed, #298)", async () => {
+  const wasm = await loadWasm();
+  const malformed = [
+    {},
+    { command: 42 },
+    { ws: "wss://example.test" },
+    { ws: { protocols: ["x"] } },
+    { ws: { url: 7 } },
+    // Claude Code takes exactly one of the two; both is not a watch, so it must not pass through.
+    { command: "rm -rf /", ws: { url: "wss://example.test" } },
+    null,
+    ["tail"],
+  ];
+  for (const input of malformed) {
+    assert.equal(
+      gateToolCall(wasm, "Monitor", input, "/repo").kind,
+      "build-error",
+      `Monitor ${JSON.stringify(input)} must deny`,
+    );
+  }
+});
+
+test("gateToolCall(PowerShell) → gated command record, labelled PowerShell (#298)", async () => {
+  const wasm = await loadWasm();
+  const out = gateToolCall(wasm, "PowerShell", { command: "Remove-Item -Recurse build" }, "C:\\w");
+  assert.equal(out.kind, "gated");
+  const record = JSON.parse(out.actionRecord);
+  assert.equal(record.surface, "command");
+  assert.equal(record.syntactic.raw, "Remove-Item -Recurse build");
+  assert.equal(record.syntactic.cwd, "C:\\w");
+  assert.equal(record.risk, "medium", "no PowerShell line is below the Medium floor");
+  assert.equal(out.summary, "PowerShell: Remove-Item -Recurse build");
+});
+
+test("gateToolCall(PowerShell) never refuses PowerShell-only quoting; it fails upward (#298)", async () => {
+  const wasm = await loadWasm();
+  // A backtick-escaped quote is valid PowerShell but unbalanced POSIX: Bash would deny this as a
+  // build error; PowerShell records it with the High floor so a human still sees it.
+  const out = gateToolCall(wasm, "PowerShell", { command: 'Write-Output "it`"s"' }, undefined);
+  assert.equal(out.kind, "gated");
+  assert.equal(JSON.parse(out.actionRecord).risk, "high");
+});
+
+test("gateToolCall(PowerShell) without a string command → build-error (#298)", async () => {
+  const wasm = await loadWasm();
+  assert.equal(gateToolCall(wasm, "PowerShell", { command: 1 }, "/repo").kind, "build-error");
+  assert.equal(gateToolCall(wasm, "PowerShell", {}, "/repo").kind, "build-error");
+});
+
+test("gateToolCall(NotebookEdit) → gated file_edit record bound to the cell change (#298)", async () => {
+  const wasm = await loadWasm();
+  const input = {
+    notebook_path: "/repo/analysis.ipynb",
+    cell_id: "abc123",
+    new_source: "import os\nos.remove('x')",
+    cell_type: "code",
+    edit_mode: "replace",
+  };
+  const out = gateToolCall(wasm, "NotebookEdit", input, "/repo");
+  assert.equal(out.kind, "gated");
+  const record = JSON.parse(out.actionRecord);
+  assert.equal(record.surface, "file_edit");
+  assert.equal(record.syntactic.operation, "notebook_edit");
+  assert.deepEqual(record.syntactic.paths, ["/repo/analysis.ipynb"]);
+  assert.ok(out.summary.includes("/repo/analysis.ipynb"));
+  assert.ok(out.summary.includes("abc123"));
+
+  // The hash binds the change itself: a different new_source is a different record.
+  const other = gateToolCall(wasm, "NotebookEdit", { ...input, new_source: "print(1)" }, "/repo");
+  assert.notEqual(JSON.parse(other.actionRecord).syntactic.diff_hash, record.syntactic.diff_hash);
+});
+
+test("gateToolCall(NotebookEdit) insert and delete modes gate; delete needs no new_source (#298)", async () => {
+  const wasm = await loadWasm();
+  const insert = gateToolCall(
+    wasm,
+    "NotebookEdit",
+    { notebook_path: "/repo/n.ipynb", new_source: "x = 1", cell_type: "code", edit_mode: "insert" },
+    "/repo",
+  );
+  assert.equal(insert.kind, "gated");
+  const del = gateToolCall(
+    wasm,
+    "NotebookEdit",
+    { notebook_path: "/repo/n.ipynb", cell_id: "c1", edit_mode: "delete" },
+    "/repo",
+  );
+  assert.equal(del.kind, "gated");
+});
+
+test("gateToolCall(NotebookEdit) with a malformed input → build-error (#298)", async () => {
+  const wasm = await loadWasm();
+  const malformed = [
+    { new_source: "x" },
+    { notebook_path: "", new_source: "x" },
+    { notebook_path: "/repo/n.ipynb" },
+    { notebook_path: "/repo/n.ipynb", new_source: 5 },
+    { notebook_path: "/repo/n.ipynb", new_source: "x", edit_mode: "append" },
+    { notebook_path: "/repo/n.ipynb", new_source: "x", cell_id: 3 },
+  ];
+  for (const input of malformed) {
+    assert.equal(
+      gateToolCall(wasm, "NotebookEdit", input, "/repo").kind,
+      "build-error",
+      `NotebookEdit ${JSON.stringify(input)} must deny`,
+    );
+  }
+});
+
+// Regression (#316 review S2): the human must be shown which cell a NotebookEdit changes.
+
+test("gateToolCall(NotebookEdit replace/delete) without a cell_id → build-error (#316 S2)", async () => {
+  const wasm = await loadWasm();
+  for (const input of [
+    { notebook_path: "/repo/n.ipynb", new_source: "x" },
+    { notebook_path: "/repo/n.ipynb", new_source: "x", edit_mode: "replace" },
+    { notebook_path: "/repo/n.ipynb", edit_mode: "delete" },
+    { notebook_path: "/repo/n.ipynb", edit_mode: "delete", cell_id: null },
+    // Regression (#316 review R2-4): an empty cell_id names no cell either.
+    { notebook_path: "/repo/n.ipynb", new_source: "x", cell_id: "" },
+    { notebook_path: "/repo/n.ipynb", edit_mode: "delete", cell_id: "" },
+  ]) {
+    assert.equal(
+      gateToolCall(wasm, "NotebookEdit", input, "/repo").kind,
+      "build-error",
+      `NotebookEdit ${JSON.stringify(input)} names no cell, so it must deny`,
+    );
+  }
+});
+
+test("gateToolCall(NotebookEdit) with a key the hook doesn't understand → build-error (#316 S2)", async () => {
+  const wasm = await loadWasm();
+  // `cell_number` is the older targeting field: dropped, it would pick a cell the human never saw.
+  for (const input of [
+    { notebook_path: "/repo/n.ipynb", cell_number: 3, new_source: "x" },
+    { notebook_path: "/repo/n.ipynb", cell_id: "c1", new_source: "x", path: "/etc/x" },
+  ]) {
+    assert.equal(
+      gateToolCall(wasm, "NotebookEdit", input, "/repo").kind,
+      "build-error",
+      `NotebookEdit ${JSON.stringify(input)} must deny`,
+    );
+  }
+});
+
+test("(#364) a build-error reason quoting tool input or a tool name shows it escaped", async () => {
+  const wasm = await loadWasm();
+  const rlo = String.fromCharCode(0x202e);
+  const hostile = `\u001b[2J\nallw: APPROVED${rlo}`;
+  // A NotebookEdit key and edit mode come from tool input; the malformed MCP name from a server.
+  const cases = [
+    ["NotebookEdit", { notebook_path: "/repo/n.ipynb", new_source: "x", [`k${hostile}`]: 1 }],
+    ["NotebookEdit", { notebook_path: "/repo/n.ipynb", new_source: "x", edit_mode: hostile }],
+    [`mcp__bad${hostile}`, {}],
+  ];
+  for (const [toolName, input] of cases) {
+    const out = gateToolCall(wasm, toolName, input, "/repo");
+    assert.equal(out.kind, "build-error");
+    assert.doesNotMatch(out.reason, /[\x00-\x1f\x7f-\x9f]/u, out.reason);
+    assert.ok(!out.reason.includes(rlo), "no raw bidi override");
+    assert.ok(out.reason.includes(String.raw`\x1b[2J\nallw: APPROVED⟨U+202E⟩`), out.reason);
+    assert.match(out.reason, /\(fail-closed deny\)$/u, "the fixed suffix survives");
+  }
+});
+
+test("gateToolCall(NotebookEdit insert) says where the cell goes (#316 S2)", async () => {
+  const wasm = await loadWasm();
+  const base = { notebook_path: "/repo/n.ipynb", new_source: "x = 1", cell_type: "code" };
+  const after = gateToolCall(wasm, "NotebookEdit", { ...base, edit_mode: "insert", cell_id: "c1" });
+  assert.match(after.summary, /insert after cell c1/);
+  assert.doesNotMatch(after.summary, /\(cell c1, insert\)/, "never reads as 'at cell c1'");
+  const start = gateToolCall(wasm, "NotebookEdit", { ...base, edit_mode: "insert" });
+  assert.match(start.summary, /insert at start/);
+  const emptyId = gateToolCall(wasm, "NotebookEdit", { ...base, edit_mode: "insert", cell_id: "" });
+  assert.match(emptyId.summary, /insert at start/, "an empty cell_id never reads 'after cell '");
+  const replace = gateToolCall(wasm, "NotebookEdit", { ...base, cell_id: "c1" });
+  assert.match(replace.summary, /replace cell c1/);
+});
+
+// Monitor's input schema is closed (`command` | `ws`, plus `description` and `timeout_ms`; `ws`
+// holds only `url` and `protocols`). A watch carrying anything else isn't one the hook can vouch
+// runs nothing (#316 review N3).
+
+test("gateToolCall(Monitor ws) with the documented optional keys → pass-through", async () => {
+  const wasm = await loadWasm();
+  const out = gateToolCall(
+    wasm,
+    "Monitor",
+    {
+      ws: { url: "wss://example.test/events", protocols: ["v1"] },
+      description: "deploy events",
+      timeout_ms: 300000,
+    },
+    "/repo",
+  );
+  assert.equal(out.kind, "pass-through");
+});
+
+test("gateToolCall(Monitor ws) with an unknown key at either level → build-error (#316 N3)", async () => {
+  const wasm = await loadWasm();
+  for (const input of [
+    { ws: { url: "wss://example.test" }, script: "rm -rf ~" },
+    { ws: { url: "wss://example.test", command: "rm -rf ~" } },
+  ]) {
+    assert.equal(
+      gateToolCall(wasm, "Monitor", input, "/repo").kind,
+      "build-error",
+      `Monitor ${JSON.stringify(input)} must deny`,
+    );
+  }
+});
+
+// Regression (#316 Copilot review): a watch's optional fields must have their schema types, or the
+// call isn't the documented "runs no command" shape and must deny.
+test("gateToolCall(Monitor ws) with a mistyped optional field → build-error", async () => {
+  const wasm = await loadWasm();
+  const url = "wss://example.test";
+  for (const input of [
+    { ws: { url, protocols: "v1" } },
+    { ws: { url, protocols: ["v1", 2] } },
+    { ws: { url, protocols: null } },
+    { ws: { url }, description: 5 },
+    { ws: { url }, description: null },
+    { ws: { url }, timeout_ms: "300000" },
+    { ws: { url }, timeout_ms: Number.POSITIVE_INFINITY },
+    { ws: { url }, timeout_ms: Number.NaN },
+  ]) {
+    assert.equal(
+      gateToolCall(wasm, "Monitor", input, "/repo").kind,
+      "build-error",
+      `Monitor ${JSON.stringify(input)} must deny`,
+    );
+  }
+});
+
 test("gateToolCall(non-gated) → pass-through", async () => {
   const wasm = await loadWasm();
   const out = gateToolCall(wasm, "Read", { file_path: "/etc/hosts" }, "/repo");
   assert.equal(out.kind, "pass-through");
+});
+
+test("(#269) posixCommandCall reads Bash and Monitor commands, and only those", () => {
+  assert.deepEqual(posixCommandCall("Bash", { command: "ls  -la\n" }), {
+    kind: "command",
+    command: "ls  -la\n",
+    summary: "Run command: ls -la",
+  });
+  assert.deepEqual(posixCommandCall("Monitor", { command: "tail -f log" }), {
+    kind: "command",
+    command: "tail -f log",
+    summary: "Run command (Monitor): tail -f log",
+  });
+  assert.equal(posixCommandCall("Monitor", { ws: { url: "wss://x.test" } }).kind, "pass-through");
+  assert.equal(posixCommandCall("Bash", {}).kind, "build-error");
+  assert.equal(posixCommandCall("Monitor", { command: 1 }).kind, "build-error");
+  // PowerShell is a command too, but has no SDK builder; it stays with gateToolCall.
+  for (const toolName of ["PowerShell", "Edit", "mcp__srv__tool", "Read"]) {
+    assert.equal(posixCommandCall(toolName, { command: "ls" }), null, toolName);
+  }
+});
+
+test("(#374) gateToolCall refuses a command with no program, with the hooks' exact reason", async () => {
+  const wasm = await loadWasm();
+  const config = {
+    relayUrl: "https://relay.allw.test",
+    accountId: "acct-test",
+    approverRootKey: "x".repeat(43),
+  };
+  for (const toolName of ["Bash", "Monitor"]) {
+    for (const command of ["", "   ", "\t\n\t", "'' rm -rf x"]) {
+      const gate = gateToolCall(wasm, toolName, { command }, "/repo");
+      const label = `${toolName} ${JSON.stringify(command)}`;
+      assert.equal(gate.kind, "build-error", label);
+      // The hooks' path (the SDK's commandRequest) denies the same input; the reasons must match,
+      // so the exported gate can never drift from what the hooks do.
+      const hook = await decide(
+        { hookEventName: "PreToolUse", toolName, toolInput: { command }, cwd: "/repo" },
+        {
+          wasm,
+          config,
+          commandRequest,
+          requestApproval: () => Promise.reject(new Error("never asked")),
+        },
+        "host",
+      );
+      assert.equal(gate.reason, hook.hookSpecificOutput.permissionDecisionReason, label);
+    }
+  }
+  // A command with a program still gates.
+  assert.equal(gateToolCall(wasm, "Bash", { command: "rm -rf x" }, "/repo").kind, "gated");
+});
+
+test("(#374) commandBuildFailureReason recognises the SDK's error by name and reason, not instanceof", async () => {
+  const wasm = await loadWasm();
+  const prefix = "allw: could not build an ActionRecord for the command (fail-closed deny): ";
+  // An error from a second copy of @allw/sdk: the same shape, but not an instance of this copy's
+  // class (a published install may hold two copies).
+  const foreign = (message, options) =>
+    Object.assign(new Error(message, options), {
+      name: "CommandActionError",
+      reason: "command_line_empty",
+    });
+  assert.equal(
+    commandBuildFailureReason(wasm, foreign("allw: commandLine contains no command")),
+    `${prefix}commandLine contains no command`,
+    "the SDK's allw: prefix is dropped",
+  );
+  assert.equal(
+    commandBuildFailureReason(
+      wasm,
+      foreign("allw: commandLine could not be parsed", {
+        cause: new Error("action_from_command failed: unmatched quotes"),
+      }),
+    ),
+    `${prefix}action_from_command failed: unmatched quotes`,
+    "the core's own error is quoted when the SDK wraps one",
+  );
+  // Not the SDK's error (no reason field): quoted whole.
+  const lookalike = Object.assign(new Error("allw: something else"), {
+    name: "CommandActionError",
+  });
+  assert.equal(commandBuildFailureReason(wasm, lookalike), `${prefix}allw: something else`);
 });

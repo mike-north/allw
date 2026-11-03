@@ -143,12 +143,33 @@ raw line as bash would; §v1 command risk below lists the rules and their limits
 
 `action_from_argv` records an argv run without a shell, so its words are never read as shell syntax.
 
+**PowerShell lines** (Claude Code's `PowerShell` tool, #298) are also `command` records, built by the core's
+`action_from_powershell_command` (decided 2026-11-03). `raw` is the exact line and argv is **always** a plain
+whitespace split of it: PowerShell quoting is never interpreted with POSIX rules (inside `"…"` its escape is the
+backtick and `\` is literal, so a POSIX split could hide a `; Remove-Item …` inside one harmless token, and it strips
+Windows paths' backslashes). Every non-whitespace byte of `raw` stays visible in some token. Because the v1 risk table
+knows no PowerShell commands, risk is at least `medium`, and at least `high` when `raw` contains a construct that runs more
+than one command, runs one T1 can't read, or builds one at run time (uncertain ⇒ upward): `;`, `|`, `&`, a line break,
+a backtick, `(` or `{`, `[scriptblock]` or `.Invoke`, a command word that runs other code (`iex`, `Invoke-Expression`,
+`Invoke-Command` / `icm`, `Start-Process` / `start` / `saps`, `Start-Job` / `sajb`, `powershell`, `pwsh`, `cmd`;
+quotes inside the word are ignored, so `i''ex` and `I"nvoke-Expression` count (#341)), a
+program named like PowerShell itself (a name starting `pwsh` or `powershell` after any path, with its quotes removed,
+such as `pwsh-preview`, `powershell_ise` or `p''wsh`), an `-EncodedCommand` parameter or any prefix of it (or `-ec`) led
+by one or two of `-`, `/` and the Unicode dashes U+2013, U+2014, U+2015, with every quote character in the token
+ignored (`'-enc'`, `-"enc"`, `-e''nc`, #328), or dot-sourcing (a leading `.`
+word, or `.` directly followed by a quoted or variable path such as `.'x.ps1'`). There is no PowerShell field on the
+record and no schema change: surfaces label the line for the human in the summary (`PowerShell: <command>`). The
+other substrate fields come from the command builder's T1 scans of the tokens and `raw`, so they can disagree with
+PowerShell: for example `$env:PATH` records `env` in `env_refs`. `raw` is authoritative.
+
 ### Forward-compat requirements on `allw-core` v1 (cheap now, painful later)
 
 1. **Capture the syntactic substrate** (tokenized command / MCP call) for every action — the durable base all
    three tiers match against.
 2. **Stamp `record_schema_version`.**
 3. **Reserve the optional `capabilities` / `scope` fields** so the semantic tier layers on with no wire break.
+   They **MUST be null in v1**: a device refuses a context that sets either one to any non-null value, because the
+   hash binds them but no approver shows them ([contract.md](./contract.md) §Device-side context checks, #296).
 4. **Reserve a `policy` block in `AuditRecord`:** `{ decision: allow|deny|escalate, rule_id?, tier, schema_version }`.
    v1 always writes `escalate`; the field exists so history is policy-analyzable later.
 5. **Enforce the structure/data split** when constructing `ApprovalRequest` envelopes: surface + tool/bin name

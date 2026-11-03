@@ -37,15 +37,16 @@
 //! only directly after a base its range actually defines variants for:
 //!
 //! - **U+FE0E / U+FE0F** after a non-ASCII base listed in Unicode `emoji-variation-sequences.txt`
-//!   (Emoji 16.0; `EMOJI_VARIATION_BASES`), as in `⚠️` or `❤️`; or U+FE0F inside an emoji keycap
+//!   (Emoji 17.0; `EMOJI_VARIATION_BASES`), as in `⚠️` or `❤️`; or U+FE0F inside an emoji keycap
 //!   (ASCII `0`–`9`, `#` or `*`, then U+FE0F, then U+20E3, as in `1️⃣`);
 //! - **U+E0100–U+E01EF** (ideographic variation selectors) after a `Unified_Ideograph`, as in a
 //!   CJK ideographic variation sequence;
 //! - **U+180B–U+180D, U+180F** after a Mongolian-block character (U+1800–U+18AF).
 //!
 //! U+FE00–U+FE0D are always escaped, and so is every selector anywhere else — after ASCII, after
-//! punctuation or a letter outside those tables, after a combining mark, or after another selector.
-//! An escaped selector sets the flag.
+//! punctuation or a letter outside those tables, after any combining mark (General_Category `Mn` or
+//! `Me`, including the Mongolian-block marks), or after another selector. An escaped selector sets
+//! the flag.
 //!
 //! **Accepted residual.** A shown selector still carries a little information, because a base may
 //! take more than one selector: about 1 bit per listed emoji (U+FE0E or U+FE0F), and up to about one
@@ -53,6 +54,53 @@
 //! of emoji or CJK text in the request; plain prose with bullets, dashes, quotes or non-CJK letters
 //! can no longer carry one. This residual is a deliberate trade-off against warning on every emoji
 //! and every CJK variant form (`docs/threat-model.md` R3).
+//!
+//! ## Stacked combining marks
+//!
+//! A combining mark (General_Category `Mn` or `Me`, [`is_combining_mark`]) draws on the character
+//! before it. A few are ordinary (`é` decomposed is `e` + U+0301), but dozens stacked on one base
+//! ("zalgo" text) overflow the line box and can paint over the line above or below, such as the
+//! `cwd:` or origin line of an approval card. So at most [`MAX_STACKED_COMBINING_MARKS`] (2)
+//! consecutive combining marks are shown; the third and every later mark of the same run render as
+//! `⟨U+XXXX⟩` and set the flag. A run is counted over the input: any character that is not a
+//! combining mark ends it, and a variation selector (also `Mn`) counts toward it.
+//!
+//! **Unicode-version skew fails closed.** The tables come from one Unicode version,
+//! [`UNICODE_VERSION`], but a renderer may know a newer one, with marks the tables don't list. So
+//! for run counting only, a code point that is unassigned (`Cn`) in [`UNICODE_VERSION`] counts as a
+//! combining mark: a future mark cannot extend a run unflagged. Outside a run it is shown as-is, so a
+//! new character on its own (a new emoji, say) is unaffected unless it follows two marks; three or
+//! more unassigned code points in a row show from the third escaped.
+//!
+//! **Accepted false positives.** Some scripts put three marks on one base in ordinary spelling, and
+//! those words warn and show the third mark escaped:
+//!
+//! - Tibetan: a subjoined consonant stack with a vowel sign is ordinary spelling, so most Tibetan
+//!   prose warns (`སྐྱེས` "born" shows as `སྐྱ⟨U+0F7A⟩ས`);
+//! - Burmese: vowel and tone marks after a medial (`မြို့` "city" shows as `မြို⟨U+1037⟩`);
+//! - pointed Hebrew, from the points alone (dagesh, shin dot and a vowel point on one letter, as in
+//!   `הַשָּׁמַיִם`), and more with cantillation;
+//! - Quranic Arabic (shadda, a vowel and a superscript alef, as in `ٱللَّٰهِ`);
+//! - polytonic Greek in NFD (`ᾧ` decomposed has three marks on `ω`; NFC `ᾧ` is one character);
+//! - rarely, Hindi (nukta, a vowel sign and candrabindu, as in `फ़ूँ`).
+//!
+//! That fails safe: the human is warned and still sees every code point. Vietnamese (NFC or NFD),
+//! accented Latin, Thai, Lao, Khmer, ordinary Hindi and vocalized Arabic stay within two marks and do
+//! not warn.
+//!
+//! ## Regenerating the Unicode tables
+//!
+//! The tables in `display/unicode_tables.rs` are generated, never edited by hand:
+//!
+//! ```text
+//! node scripts/gen-unicode-tables.mjs 17.0.0
+//! ```
+//!
+//! fetches `extracted/DerivedGeneralCategory.txt`, `PropList.txt` and
+//! `emoji/emoji-variation-sequences.txt` from <https://www.unicode.org/Public/17.0.0/ucd/> (or reads
+//! them from `--ucd-dir <dir>`) and rewrites the file; the same version reproduces the same bytes.
+//! The SDK's display-vector test checks every mark its runtime's Unicode knows against the cap,
+//! and fails with this command when the runtime's Unicode is newer than [`UNICODE_VERSION`].
 //!
 //! # Structure inside multi-line content
 //!
@@ -115,6 +163,13 @@ use std::fmt::Write as _;
 use serde::Serialize;
 
 use crate::contract::{ApprovalContext, Risk, Surface, SyntacticSubstrate};
+
+mod unicode_tables;
+
+pub use unicode_tables::UNICODE_VERSION;
+use unicode_tables::{
+    COMBINING_MARK_RANGES, EMOJI_VARIATION_BASES, UNASSIGNED_RANGES, UNIFIED_IDEOGRAPH_RANGES,
+};
 
 /// Whether `c` must be rendered as a visible escape rather than shown as itself.
 ///
@@ -181,40 +236,54 @@ pub fn is_variation_selector(c: char) -> bool {
     )
 }
 
-/// Whether `c` is a `Unified_Ideograph` (Unicode 16.0.0 `PropList.txt`): the only bases after
-/// which an ideographic variation selector (U+E0100–U+E01EF) is shown.
-///
-/// @see https://www.unicode.org/Public/16.0.0/ucd/PropList.txt
+/// How many combining marks in a row one base may carry before the rest are escaped. Two covers
+/// ordinary accented text, including Vietnamese letters with two diacritics (`ệ` decomposed is `e`
+/// U+0323 U+0302); more lets a stack of marks overflow its line (see the module docs, "Stacked
+/// combining marks").
+pub const MAX_STACKED_COMBINING_MARKS: usize = 2;
+
+/// Whether `c` is a combining mark: General_Category `Mn` or `Me` in [`UNICODE_VERSION`], which
+/// draws on the character before it instead of taking its own cell.
+pub fn is_combining_mark(c: char) -> bool {
+    in_ranges(&COMBINING_MARK_RANGES, c)
+}
+
+/// Whether `c` is a `Unified_Ideograph`: the only bases after which an ideographic variation
+/// selector (U+E0100–U+E01EF) is shown.
 fn is_unified_ideograph(c: char) -> bool {
-    matches!(
-        c,
-        '\u{3400}'..='\u{4DBF}'
-            | '\u{4E00}'..='\u{9FFF}'
-            | '\u{FA0E}'..='\u{FA0F}'
-            | '\u{FA11}'
-            | '\u{FA13}'..='\u{FA14}'
-            | '\u{FA1F}'
-            | '\u{FA21}'
-            | '\u{FA23}'..='\u{FA24}'
-            | '\u{FA27}'..='\u{FA29}'
-            | '\u{20000}'..='\u{2A6DF}'
-            | '\u{2A700}'..='\u{2B739}'
-            | '\u{2B740}'..='\u{2B81D}'
-            | '\u{2B820}'..='\u{2CEA1}'
-            | '\u{2CEB0}'..='\u{2EBE0}'
-            | '\u{2EBF0}'..='\u{2EE5D}'
-            | '\u{30000}'..='\u{3134A}'
-            | '\u{31350}'..='\u{323AF}'
-    )
+    in_ranges(&UNIFIED_IDEOGRAPH_RANGES, c)
+}
+
+/// Whether `c` is unassigned (General_Category `Cn`) in [`UNICODE_VERSION`], the core's Unicode
+/// version. A later version may assign it, possibly as a combining mark the tables here don't know,
+/// so it counts toward a run of combining marks (see the module docs, "Stacked combining marks").
+fn is_unassigned(c: char) -> bool {
+    in_ranges(&UNASSIGNED_RANGES, c)
+}
+
+/// Whether `c` falls in one of `ranges` (inclusive, sorted and disjoint).
+fn in_ranges(ranges: &[(char, char)], c: char) -> bool {
+    ranges
+        .binary_search_by(|&(lo, hi)| {
+            if hi < c {
+                std::cmp::Ordering::Less
+            } else if lo > c {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
 }
 
 /// Whether the variation selector `c`, between `prev` and `next`, is shown as-is rather than
 /// escaped. Each selector range has its own allowed bases (see the module docs, "Variation
-/// selectors"); a base is never itself a selector or a hidden character, so a selector directly
-/// after another selector is always escaped.
+/// selectors"); a base is never itself a selector, a combining mark or a hidden character, so a
+/// selector directly after another selector or after any combining mark is always escaped.
 fn selector_is_shown(c: char, prev: Option<char>, next: Option<char>) -> bool {
-    let Some(base) = prev.filter(|&p| !is_variation_selector(p) && !is_hidden_or_control_char(p))
-    else {
+    let Some(base) = prev.filter(|&p| {
+        !is_variation_selector(p) && !is_combining_mark(p) && !is_hidden_or_control_char(p)
+    }) else {
         return false;
     };
     match c {
@@ -256,12 +325,24 @@ pub const CRLF_MARKER: &str = "␍";
 fn escape_into(out: &mut String, text: &str, context: Context) -> bool {
     let mut flagged = false;
     let mut prev: Option<char> = None;
+    // Consecutive combining marks in the input so far, this one included (0 for any other char).
+    // An unassigned code point counts as a mark here, so a mark from a later Unicode version
+    // cannot extend a run unflagged; it is otherwise shown as-is.
+    let mut marks_in_run = 0usize;
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
+        marks_in_run = if is_combining_mark(c) || is_unassigned(c) {
+            marks_in_run + 1
+        } else {
+            0
+        };
         if c == '\t' && context == Context::ContentLine {
             out.push_str(TAB_MARKER);
         } else if is_hidden_or_control_char(c) {
             push_escaped(out, c);
+            flagged = true;
+        } else if marks_in_run > MAX_STACKED_COMBINING_MARKS {
+            push_codepoint(out, c);
             flagged = true;
         } else if is_variation_selector(c) {
             if selector_is_shown(c, prev, chars.peek().copied()) {
@@ -584,71 +665,6 @@ pub fn display_model(context: &ApprovalContext) -> DisplayModel {
     }
 }
 
-/// The non-ASCII bases of the emoji variation sequences: every code point listed with U+FE0E/U+FE0F
-/// in Unicode `emoji-variation-sequences.txt`, **Emoji Version 16.0** (Unicode 16.0.0, file dated
-/// 2024-05-01; each listed base has both the text and the emoji style). Sorted for binary search.
-///
-/// The file's ASCII bases (`#`, `*`, `0`–`9`) are deliberately left out: a selector after ASCII is
-/// shown only in the full keycap form (`1` U+FE0F U+20E3), handled separately.
-///
-/// @see https://www.unicode.org/Public/16.0.0/ucd/emoji/emoji-variation-sequences.txt
-/// @see https://www.unicode.org/reports/tr51/#def_emoji_presentation_sequence
-#[rustfmt::skip]
-const EMOJI_VARIATION_BASES: [char; 359] = [
-    '\u{00A9}', '\u{00AE}', '\u{203C}', '\u{2049}', '\u{2122}', '\u{2139}', '\u{2194}',
-    '\u{2195}', '\u{2196}', '\u{2197}', '\u{2198}', '\u{2199}', '\u{21A9}', '\u{21AA}',
-    '\u{231A}', '\u{231B}', '\u{2328}', '\u{23CF}', '\u{23E9}', '\u{23EA}', '\u{23EB}',
-    '\u{23EC}', '\u{23ED}', '\u{23EE}', '\u{23EF}', '\u{23F0}', '\u{23F1}', '\u{23F2}',
-    '\u{23F3}', '\u{23F8}', '\u{23F9}', '\u{23FA}', '\u{24C2}', '\u{25AA}', '\u{25AB}',
-    '\u{25B6}', '\u{25C0}', '\u{25FB}', '\u{25FC}', '\u{25FD}', '\u{25FE}', '\u{2600}',
-    '\u{2601}', '\u{2602}', '\u{2603}', '\u{2604}', '\u{260E}', '\u{2611}', '\u{2614}',
-    '\u{2615}', '\u{2618}', '\u{261D}', '\u{2620}', '\u{2622}', '\u{2623}', '\u{2626}',
-    '\u{262A}', '\u{262E}', '\u{262F}', '\u{2638}', '\u{2639}', '\u{263A}', '\u{2640}',
-    '\u{2642}', '\u{2648}', '\u{2649}', '\u{264A}', '\u{264B}', '\u{264C}', '\u{264D}',
-    '\u{264E}', '\u{264F}', '\u{2650}', '\u{2651}', '\u{2652}', '\u{2653}', '\u{265F}',
-    '\u{2660}', '\u{2663}', '\u{2665}', '\u{2666}', '\u{2668}', '\u{267B}', '\u{267E}',
-    '\u{267F}', '\u{2692}', '\u{2693}', '\u{2694}', '\u{2695}', '\u{2696}', '\u{2697}',
-    '\u{2699}', '\u{269B}', '\u{269C}', '\u{26A0}', '\u{26A1}', '\u{26A7}', '\u{26AA}',
-    '\u{26AB}', '\u{26B0}', '\u{26B1}', '\u{26BD}', '\u{26BE}', '\u{26C4}', '\u{26C5}',
-    '\u{26C8}', '\u{26CE}', '\u{26CF}', '\u{26D1}', '\u{26D3}', '\u{26D4}', '\u{26E9}',
-    '\u{26EA}', '\u{26F0}', '\u{26F1}', '\u{26F2}', '\u{26F3}', '\u{26F4}', '\u{26F5}',
-    '\u{26F7}', '\u{26F8}', '\u{26F9}', '\u{26FA}', '\u{26FD}', '\u{2702}', '\u{2705}',
-    '\u{2708}', '\u{2709}', '\u{270A}', '\u{270B}', '\u{270C}', '\u{270D}', '\u{270F}',
-    '\u{2712}', '\u{2714}', '\u{2716}', '\u{271D}', '\u{2721}', '\u{2728}', '\u{2733}',
-    '\u{2734}', '\u{2744}', '\u{2747}', '\u{274C}', '\u{274E}', '\u{2753}', '\u{2754}',
-    '\u{2755}', '\u{2757}', '\u{2763}', '\u{2764}', '\u{2795}', '\u{2796}', '\u{2797}',
-    '\u{27A1}', '\u{27B0}', '\u{27BF}', '\u{2934}', '\u{2935}', '\u{2B05}', '\u{2B06}',
-    '\u{2B07}', '\u{2B1B}', '\u{2B1C}', '\u{2B50}', '\u{2B55}', '\u{3030}', '\u{303D}',
-    '\u{3297}', '\u{3299}', '\u{1F004}', '\u{1F170}', '\u{1F171}', '\u{1F17E}', '\u{1F17F}',
-    '\u{1F202}', '\u{1F21A}', '\u{1F22F}', '\u{1F237}', '\u{1F30D}', '\u{1F30E}', '\u{1F30F}',
-    '\u{1F315}', '\u{1F31C}', '\u{1F321}', '\u{1F324}', '\u{1F325}', '\u{1F326}', '\u{1F327}',
-    '\u{1F328}', '\u{1F329}', '\u{1F32A}', '\u{1F32B}', '\u{1F32C}', '\u{1F336}', '\u{1F378}',
-    '\u{1F37D}', '\u{1F393}', '\u{1F396}', '\u{1F397}', '\u{1F399}', '\u{1F39A}', '\u{1F39B}',
-    '\u{1F39E}', '\u{1F39F}', '\u{1F3A7}', '\u{1F3AC}', '\u{1F3AD}', '\u{1F3AE}', '\u{1F3C2}',
-    '\u{1F3C4}', '\u{1F3C6}', '\u{1F3CA}', '\u{1F3CB}', '\u{1F3CC}', '\u{1F3CD}', '\u{1F3CE}',
-    '\u{1F3D4}', '\u{1F3D5}', '\u{1F3D6}', '\u{1F3D7}', '\u{1F3D8}', '\u{1F3D9}', '\u{1F3DA}',
-    '\u{1F3DB}', '\u{1F3DC}', '\u{1F3DD}', '\u{1F3DE}', '\u{1F3DF}', '\u{1F3E0}', '\u{1F3ED}',
-    '\u{1F3F3}', '\u{1F3F5}', '\u{1F3F7}', '\u{1F408}', '\u{1F415}', '\u{1F41F}', '\u{1F426}',
-    '\u{1F43F}', '\u{1F441}', '\u{1F442}', '\u{1F446}', '\u{1F447}', '\u{1F448}', '\u{1F449}',
-    '\u{1F44D}', '\u{1F44E}', '\u{1F453}', '\u{1F46A}', '\u{1F47D}', '\u{1F4A3}', '\u{1F4B0}',
-    '\u{1F4B3}', '\u{1F4BB}', '\u{1F4BF}', '\u{1F4CB}', '\u{1F4DA}', '\u{1F4DF}', '\u{1F4E4}',
-    '\u{1F4E5}', '\u{1F4E6}', '\u{1F4EA}', '\u{1F4EB}', '\u{1F4EC}', '\u{1F4ED}', '\u{1F4F7}',
-    '\u{1F4F9}', '\u{1F4FA}', '\u{1F4FB}', '\u{1F4FD}', '\u{1F508}', '\u{1F50D}', '\u{1F512}',
-    '\u{1F513}', '\u{1F549}', '\u{1F54A}', '\u{1F550}', '\u{1F551}', '\u{1F552}', '\u{1F553}',
-    '\u{1F554}', '\u{1F555}', '\u{1F556}', '\u{1F557}', '\u{1F558}', '\u{1F559}', '\u{1F55A}',
-    '\u{1F55B}', '\u{1F55C}', '\u{1F55D}', '\u{1F55E}', '\u{1F55F}', '\u{1F560}', '\u{1F561}',
-    '\u{1F562}', '\u{1F563}', '\u{1F564}', '\u{1F565}', '\u{1F566}', '\u{1F567}', '\u{1F56F}',
-    '\u{1F570}', '\u{1F573}', '\u{1F574}', '\u{1F575}', '\u{1F576}', '\u{1F577}', '\u{1F578}',
-    '\u{1F579}', '\u{1F587}', '\u{1F58A}', '\u{1F58B}', '\u{1F58C}', '\u{1F58D}', '\u{1F590}',
-    '\u{1F5A5}', '\u{1F5A8}', '\u{1F5B1}', '\u{1F5B2}', '\u{1F5BC}', '\u{1F5C2}', '\u{1F5C3}',
-    '\u{1F5C4}', '\u{1F5D1}', '\u{1F5D2}', '\u{1F5D3}', '\u{1F5DC}', '\u{1F5DD}', '\u{1F5DE}',
-    '\u{1F5E1}', '\u{1F5E3}', '\u{1F5E8}', '\u{1F5EF}', '\u{1F5F3}', '\u{1F5FA}', '\u{1F610}',
-    '\u{1F687}', '\u{1F68D}', '\u{1F691}', '\u{1F694}', '\u{1F698}', '\u{1F6AD}', '\u{1F6B2}',
-    '\u{1F6B9}', '\u{1F6BA}', '\u{1F6BC}', '\u{1F6CB}', '\u{1F6CD}', '\u{1F6CE}', '\u{1F6CF}',
-    '\u{1F6E0}', '\u{1F6E1}', '\u{1F6E2}', '\u{1F6E3}', '\u{1F6E4}', '\u{1F6E5}', '\u{1F6E9}',
-    '\u{1F6F0}', '\u{1F6F3}',
-];
-
 #[cfg(test)]
 mod tests {
     //! Unit tests for display escaping. Expected strings are written by hand from the notation in
@@ -880,6 +896,174 @@ mod tests {
         assert!(has_hidden_or_control_chars(&text));
         assert!(!escaped.chars().any(is_variation_selector), "{escaped}");
         assert_eq!(escaped.matches("⟨U+E01").count(), secret.len());
+    }
+
+    /// Regression (#271): dozens of combining marks stacked on one base overflow the line and can
+    /// paint over neighbouring lines. Only the first two are shown; the rest are escaped and warn.
+    #[test]
+    fn stacked_combining_marks_beyond_two_are_escaped_and_warn() {
+        let text = format!("ok{}{}", "\u{0336}".repeat(5), "\u{0301}".repeat(50));
+        let expected = format!(
+            "ok\u{0336}\u{0336}{}{}",
+            "⟨U+0336⟩".repeat(3),
+            "⟨U+0301⟩".repeat(50)
+        );
+        assert_eq!(escape_for_display(&text), expected);
+        assert!(has_hidden_or_control_chars(&text));
+        // Escaping is idempotent: the output's runs are already within the limit.
+        assert_eq!(escape_for_display(&expected), expected);
+        assert!(!has_hidden_or_control_chars(&expected));
+    }
+
+    #[test]
+    fn ordinary_accented_text_does_not_warn() {
+        // Decomposed é (one mark) and Vietnamese ệ (two marks), each on its own base.
+        for text in [
+            "cafe\u{0301}",
+            "Vi\u{0323}\u{0302}t Nam",
+            "a\u{0301}\u{0301}b\u{0301}\u{0301}",
+        ] {
+            assert_eq!(escape_for_display(text), text);
+            assert!(!has_hidden_or_control_chars(text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_selector_after_any_combining_mark_is_escaped() {
+        // U+18A9 is a Mongolian-block combining mark: inside U+1800–U+18AF, but not a base.
+        assert_eq!(
+            escape_for_display("\u{1820}\u{18A9}\u{180B}"),
+            "\u{1820}\u{18A9}⟨U+180B⟩"
+        );
+        // Regression guard, not a test of the mark rule: U+FE0F is shown only after an emoji
+        // variation base, and none of these marks (Thai, Hebrew, Devanagari) is one, so they were
+        // escaped before that rule too. Since the Mongolian block is the only base range that
+        // contains marks, the assertion above is the one that tests the rule.
+        for mark in ['\u{0E48}', '\u{05B4}', '\u{093C}'] {
+            let text = format!("x{mark}\u{FE0F}");
+            assert_eq!(escape_for_display(&text), format!("x{mark}⟨U+FE0F⟩"));
+        }
+    }
+
+    /// Every range table is sorted, non-overlapping and merged, so the binary search is exact, and
+    /// the emoji bases are sorted and distinct.
+    #[test]
+    fn unicode_tables_are_sorted_and_disjoint() {
+        for (name, table) in [
+            ("COMBINING_MARK_RANGES", &COMBINING_MARK_RANGES[..]),
+            ("UNASSIGNED_RANGES", &UNASSIGNED_RANGES[..]),
+            ("UNIFIED_IDEOGRAPH_RANGES", &UNIFIED_IDEOGRAPH_RANGES[..]),
+        ] {
+            for (lo, hi) in table {
+                assert!(lo <= hi, "{name}: {lo:?}..={hi:?}");
+            }
+            for pair in table.windows(2) {
+                let (_, prev_hi) = pair[0];
+                let (next_lo, _) = pair[1];
+                assert!(
+                    u32::from(prev_hi) + 1 < u32::from(next_lo),
+                    "{name}: {pair:?} overlap or touch"
+                );
+            }
+        }
+        for pair in EMOJI_VARIATION_BASES.windows(2) {
+            assert!(pair[0] < pair[1], "EMOJI_VARIATION_BASES: {pair:?}");
+        }
+        // General categories are exclusive: no mark is unassigned.
+        for (lo, hi) in UNASSIGNED_RANGES {
+            assert!(
+                !is_combining_mark(lo) && !is_combining_mark(hi),
+                "{lo:?}..={hi:?}"
+            );
+        }
+    }
+
+    /// Regression (review of #271): U+1ACF is a combining mark new in Unicode 17.0, which a table
+    /// from 16.0 didn't know, so 60 of them stacked on `k` unescaped and without a warning.
+    #[test]
+    fn unicode_17_combining_marks_are_capped() {
+        let text = format!("ok{}", "\u{1ACF}".repeat(60));
+        let expected = format!("ok\u{1ACF}\u{1ACF}{}", "⟨U+1ACF⟩".repeat(58));
+        assert_eq!(escape_for_display(&text), expected);
+        assert!(has_hidden_or_control_chars(&text));
+    }
+
+    /// Unicode-version skew fails closed: a code point unassigned in the core's version (U+0378
+    /// and U+50000 are `Cn` in 17.0.0) counts toward a run of marks, so a mark from a later
+    /// version cannot extend a run unflagged. Outside a run it is shown as-is.
+    #[test]
+    fn an_unassigned_code_point_counts_toward_a_mark_run() {
+        for unassigned in ['\u{0378}', '\u{50000}'] {
+            // Standalone, or after fewer than two marks: unaffected.
+            for text in [
+                format!("o{unassigned}"),
+                format!("e\u{0301}{unassigned}"),
+                format!("{unassigned}x"),
+            ] {
+                assert_eq!(escape_for_display(&text), text);
+                assert!(!has_hidden_or_control_chars(&text), "{text:?}");
+            }
+            // After two marks it is the third of the run: escaped, and it warns.
+            let text = format!("e\u{0301}\u{0301}{unassigned}");
+            let expected = format!("e\u{0301}\u{0301}⟨U+{:04X}⟩", u32::from(unassigned));
+            assert_eq!(escape_for_display(&text), expected);
+            assert!(has_hidden_or_control_chars(&text));
+            // Stacked on its own, a would-be mark is capped like a known one.
+            let text = format!("o{}", unassigned.to_string().repeat(3));
+            let expected = format!("o{unassigned}{unassigned}⟨U+{:04X}⟩", u32::from(unassigned));
+            assert_eq!(escape_for_display(&text), expected);
+        }
+        // A new base resets the run, as for known marks.
+        assert_eq!(
+            escape_for_display("e\u{0301}\u{0301}x\u{0378}"),
+            "e\u{0301}\u{0301}x\u{0378}"
+        );
+    }
+
+    /// Spot checks against General_Category in Unicode 17.0.0 `UnicodeData.txt`.
+    #[test]
+    fn is_combining_mark_matches_the_general_category() {
+        // Mn or Me.
+        for c in [
+            '\u{0300}',
+            '\u{036F}',
+            '\u{0483}',
+            '\u{0489}',
+            '\u{05B4}',
+            '\u{093C}',
+            '\u{0E48}',
+            '\u{1885}',
+            '\u{18A9}',
+            // New in 17.0.
+            '\u{1ACF}',
+            '\u{1AEB}',
+            '\u{11B60}',
+            '\u{1E6E3}',
+            '\u{20DD}',
+            '\u{20E3}',
+            '\u{3099}',
+            '\u{FE0F}',
+            '\u{FE20}',
+            '\u{1E944}',
+            '\u{E0100}',
+            '\u{E01EF}',
+        ] {
+            assert!(is_combining_mark(c), "{c:?} is Mn/Me");
+        }
+        // Not marks: letters, a spacing mark (Mc), an emoji modifier (Sk), a format control (Cf),
+        // an unassigned code point (Cn).
+        for c in [
+            '\u{0378}',
+            'e',
+            '\u{0903}',
+            '\u{0E33}',
+            '\u{1F3FB}',
+            '\u{200D}',
+            '\u{2022}',
+            '\u{FFFD}',
+        ] {
+            assert!(!is_combining_mark(c), "{c:?} is not Mn/Me");
+        }
     }
 
     #[test]

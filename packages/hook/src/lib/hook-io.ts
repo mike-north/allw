@@ -45,6 +45,8 @@
  * @see https://code.claude.com/docs/en/hooks (PreToolUse JSON schema, decision values, exit codes)
  */
 
+import { MAX_ESCAPED_DIAGNOSTIC_CHARS, escapeToPrintableAscii } from "@allw/sdk";
+
 /** The hook event we implement. Claude Code stamps this on both the input and our output. */
 export const HOOK_EVENT_NAME = "PreToolUse" as const;
 
@@ -63,7 +65,11 @@ export interface PreToolUseInput {
   readonly hookEventName: typeof HOOK_EVENT_NAME;
   readonly toolName: string;
   readonly toolInput: unknown;
-  /** The working directory of the session, threaded into the command `ActionRecord`. */
+  /**
+   * The working directory of the session, threaded into the command `ActionRecord`. Never blank:
+   * Claude Code sends `""` when it does not know the directory, and the parser treats that as
+   * absent, so the record is left unbound (#371).
+   */
   readonly cwd?: string;
 }
 
@@ -136,8 +142,10 @@ export function parseHookInput(raw: string): ParseResult {
   if (eventName !== HOOK_EVENT_NAME) {
     return {
       ok: false,
-      reason: `allw: unexpected hook_event_name '${String(
-        eventName,
+      // Stdin is untrusted and this runs before the WASM core loads: quote it escaped and bounded.
+      reason: `allw: unexpected hook_event_name '${escapeToPrintableAscii(
+        String(eventName),
+        MAX_ESCAPED_DIAGNOSTIC_CHARS,
       )}' (expected '${HOOK_EVENT_NAME}'; fail-closed deny)`,
     };
   }
@@ -150,12 +158,15 @@ export function parseHookInput(raw: string): ParseResult {
     };
   }
 
+  // Claude Code builds `cwd` as `<directory> ?? ""`, so an unknown directory arrives as a blank
+  // string. Treat blank (or whitespace-only) as absent: the record is then unbound and the human is
+  // still asked, on every surface, rather than bound to a meaningless "" directory (#371).
   const cwd = parsed.cwd;
   const input: PreToolUseInput = {
     hookEventName: HOOK_EVENT_NAME,
     toolName,
     toolInput: parsed.tool_input,
-    ...(typeof cwd === "string" ? { cwd } : {}),
+    ...(typeof cwd === "string" && cwd.trim() !== "" ? { cwd } : {}),
   };
   return { ok: true, input };
 }

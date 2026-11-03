@@ -182,7 +182,7 @@ live agent session. For this checkout:
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "^(Bash|Edit|MultiEdit|Write)$|^mcp__",
+        "matcher": "^(Bash|PowerShell|Monitor|Edit|MultiEdit|Write|NotebookEdit)$|^mcp__",
         "hooks": [
           {
             "type": "command",
@@ -193,17 +193,13 @@ live agent session. For this checkout:
         ]
       }
     ]
-  },
-  "permissions": {
-    "deny": ["Monitor", "PowerShell", "NotebookEdit"]
   }
 }
 ```
 
 > `"onFailure": "block"` makes Claude Code block the call when the hook can't start, crashes or times
 > out. It needs Claude Code v2.1.295 or later; older versions ignore the key without warning, so
-> check `claude --version`. The `deny` rules turn off tools allw doesn't gate yet
-> ([#298](https://github.com/mike-north/allw/issues/298)). See
+> check `claude --version`. See
 > [`packages/hook/README.md`](../../packages/hook/README.md) for what each field does.
 
 ## Decisions

@@ -29,6 +29,7 @@
  * @see https://code.claude.com/docs/en/hooks (tool_name / tool_input; mcp__server__tool naming)
  */
 
+import { agentSafeErrorText, agentSafeText } from "./agent-text.js";
 import type { HookWasm } from "./wasm.js";
 
 /** The `mcp__<server>__<tool>` prefix Claude Code uses for every MCP tool name. */
@@ -37,17 +38,36 @@ const MCP_TOOL_PREFIX = "mcp__";
 /** The Bash tool name (the v0 command surface). */
 const BASH_TOOL_NAME = "Bash";
 
+/**
+ * Claude Code's PowerShell tool: a shell command in `tool_input.command`, like Bash, but in
+ * PowerShell syntax, so the core's PowerShell builder records it (#298).
+ */
+const POWERSHELL_TOOL_NAME = "PowerShell";
+
+/**
+ * Claude Code's Monitor tool. With `tool_input.command` it runs a shell command in the background,
+ * exactly as Bash would (and under Bash's permission rules), so it is gated like Bash. With
+ * `tool_input.ws` it opens a WebSocket watch instead and runs nothing (#298).
+ */
+const MONITOR_TOOL_NAME = "Monitor";
+
 /** Codex's patch application tool name. */
 const APPLY_PATCH_TOOL_NAME = "apply_patch";
 
 /** Claude Code file-editing tool names that can mutate files without going through Bash. */
-const CLAUDE_FILE_EDIT_TOOLS = new Set(["Edit", "MultiEdit", "Write"]);
+const CLAUDE_FILE_EDIT_TOOLS = new Set(["Edit", "MultiEdit", "Write", "NotebookEdit"]);
 
 /**
  * The outcome of classifying + reducing a tool call:
  * - `gated`: build succeeded; `actionRecord` (JSON) + a one-line `summary` are ready to submit.
- * - `pass-through`: not a gated tool; allw makes no decision (`reason` explains why).
+ * - `pass-through`: not a gated tool, or a call that runs nothing (a `Monitor` WebSocket watch);
+ *   allw makes no decision (`reason` explains why).
  * - `build-error`: gated, but the `ActionRecord` could not be built; deny (`reason` explains why).
+ *
+ * A `reason` is safe to hand the agent as is: every third-party segment it quotes (a tool or server
+ * name, tool input, a core error) has been through the core escape (#364). The `summary` is raw: it
+ * goes to the approver, which applies its own display escape, and a deny reason that quotes it must
+ * escape it first.
  */
 export type GateOutcome =
   | {
@@ -58,7 +78,7 @@ export type GateOutcome =
   | { readonly kind: "pass-through"; readonly reason: string }
   | { readonly kind: "build-error"; readonly reason: string };
 
-/** Narrow `tool_input` to a `Bash` shape: a `{ command: string }`. */
+/** Narrow `tool_input` to a `Bash`-shaped `{ command: string }` (also PowerShell and Monitor). */
 function readBashCommand(toolInput: unknown): string | null {
   if (typeof toolInput !== "object" || toolInput === null) return null;
   const command = (toolInput as { command?: unknown }).command;
@@ -101,8 +121,10 @@ function isFileEditTool(toolName: string): boolean {
 }
 
 /**
- * True if a tool name is one this hook gates: `Bash`, file edit tools, or **any**
- * `mcp__`-prefixed name.
+ * True if a tool name is one this hook gates: the shell tools (`Bash`, `PowerShell`, `Monitor`),
+ * the file edit tools (including `NotebookEdit`), or **any** `mcp__`-prefixed name. A `Monitor`
+ * call is routed here even when it turns out to be a WebSocket watch; `gateToolCall` then makes no
+ * decision for it.
  *
  * Crucially, gating an MCP name does NOT require it to fully parse as `mcp__<server>__<tool>`. The
  * recommended `.claude/settings.json` matcher includes `^mcp__`, so Claude Code routes every
@@ -112,7 +134,82 @@ function isFileEditTool(toolName: string): boolean {
  * cannot be reduced to an `ActionRecord`.
  */
 export function isGatedTool(toolName: string): boolean {
-  return toolName === BASH_TOOL_NAME || isFileEditTool(toolName) || hasMcpPrefix(toolName);
+  return (
+    toolName === BASH_TOOL_NAME ||
+    toolName === POWERSHELL_TOOL_NAME ||
+    toolName === MONITOR_TOOL_NAME ||
+    isFileEditTool(toolName) ||
+    hasMcpPrefix(toolName)
+  );
+}
+
+/**
+ * What a `Monitor` call asks for: a shell `command`, a WebSocket `ws` watch, or neither (malformed).
+ * Claude Code accepts exactly one of the two, so a call carrying both is malformed too.
+ */
+type MonitorRequest =
+  | { readonly kind: "command"; readonly command: string }
+  | { readonly kind: "ws" }
+  | { readonly kind: "malformed" };
+
+/**
+ * The `Monitor` input keys a WebSocket watch may carry, top level and inside `ws`, from Claude
+ * Code's closed Monitor input schema. A watch with any other key is not one the hook can vouch runs
+ * nothing, so it is malformed (denied) rather than passed through.
+ */
+const MONITOR_WS_KEYS = new Set(["ws", "description", "timeout_ms"]);
+const MONITOR_WS_FIELDS = new Set(["url", "protocols"]);
+
+/**
+ * True if the optional fields of a WebSocket watch have the types Claude Code's schema gives them,
+ * when present: `ws.protocols` an array of strings, `description` a string, `timeout_ms` a finite
+ * number. A watch with a field of any other type is malformed (denied).
+ */
+function monitorWsFieldTypesValid(
+  record: Record<string, unknown>,
+  ws: Record<string, unknown>,
+): boolean {
+  const { protocols } = ws;
+  const { description, timeout_ms: timeoutMs } = record;
+  return (
+    (protocols === undefined ||
+      (Array.isArray(protocols) && protocols.every((p) => typeof p === "string"))) &&
+    (description === undefined || typeof description === "string") &&
+    (timeoutMs === undefined || (typeof timeoutMs === "number" && Number.isFinite(timeoutMs)))
+  );
+}
+
+/** True if every key of `value` is in `allowed`. */
+function onlyKeys(value: Record<string, unknown>, allowed: ReadonlySet<string>): boolean {
+  return Object.keys(value).every((key) => allowed.has(key));
+}
+
+/**
+ * Classify a `Monitor` `tool_input`. A `ws` watch needs an object with a string `url`, no key
+ * outside the watch schema at either level, and correctly typed optional fields.
+ */
+function readMonitorRequest(toolInput: unknown): MonitorRequest {
+  if (typeof toolInput !== "object" || toolInput === null || Array.isArray(toolInput)) {
+    return { kind: "malformed" };
+  }
+  const record = toolInput as Record<string, unknown>;
+  const hasCommand = "command" in record;
+  const hasWs = "ws" in record;
+  if (hasCommand && !hasWs) {
+    return typeof record.command === "string"
+      ? { kind: "command", command: record.command }
+      : { kind: "malformed" };
+  }
+  if (hasWs && !hasCommand) {
+    const ws = record.ws;
+    const wellFormed =
+      readStringField(ws, "url") !== null &&
+      onlyKeys(record, MONITOR_WS_KEYS) &&
+      onlyKeys(ws as Record<string, unknown>, MONITOR_WS_FIELDS) &&
+      monitorWsFieldTypesValid(record, ws as Record<string, unknown>);
+    return wellFormed ? { kind: "ws" } : { kind: "malformed" };
+  }
+  return { kind: "malformed" };
 }
 
 /** Truncate a summary so a long command/params blob stays a one-liner in the notification. */
@@ -182,6 +279,85 @@ type FileEditReduction =
     }
   | { readonly error: string };
 
+/** The edit modes Claude Code's `NotebookEdit` accepts; `replace` is its default. */
+const NOTEBOOK_EDIT_MODES = new Set(["replace", "insert", "delete"]);
+
+/**
+ * Every `NotebookEdit` input key the hook understands. A call carrying any other key (for example
+ * the older `cell_number` targeting field) is denied: a key the hook drops would be neither bound
+ * nor shown, so it could change which cell is edited without the human seeing it.
+ */
+const NOTEBOOK_EDIT_KEYS = new Set([
+  "notebook_path",
+  "cell_id",
+  "cell_type",
+  "edit_mode",
+  "new_source",
+]);
+
+/**
+ * Reduce a `NotebookEdit` call (one cell of a Jupyter notebook) into the core's file_edit builder
+ * inputs. The hash-bound bytes are the cell-level change itself: which cell, how, and the new source.
+ * The summary names the cell: `replace` and `delete` must target one by `cell_id`, and `insert`
+ * adds a cell after the given one, or at the start of the notebook without one.
+ */
+function reduceNotebookEdit(toolInput: unknown): FileEditReduction {
+  const notebookPath = readStringField(toolInput, "notebook_path");
+  if (notebookPath === null || notebookPath.trim().length === 0) {
+    return { error: "NotebookEdit tool_input missing a string 'notebook_path'" };
+  }
+  const record = toolInput as Record<string, unknown>;
+  const unknownKey = Object.keys(record).find((key) => !NOTEBOOK_EDIT_KEYS.has(key));
+  if (unknownKey !== undefined) {
+    return { error: `NotebookEdit tool_input has an unsupported key '${unknownKey}'` };
+  }
+  const optionalString = (key: string): string | null | undefined => {
+    const value = record[key];
+    if (value === undefined || value === null) return null;
+    return typeof value === "string" ? value : undefined;
+  };
+  const cellId = optionalString("cell_id");
+  const cellType = optionalString("cell_type");
+  const editMode = optionalString("edit_mode");
+  const newSource = optionalString("new_source");
+  if (cellId === undefined || cellType === undefined || editMode === undefined) {
+    return {
+      error: "NotebookEdit tool_input has a non-string 'cell_id', 'cell_type' or 'edit_mode'",
+    };
+  }
+  const mode = editMode ?? "replace";
+  if (!NOTEBOOK_EDIT_MODES.has(mode)) {
+    return { error: `NotebookEdit tool_input has an unknown 'edit_mode' '${mode}'` };
+  }
+  if (newSource === undefined || (newSource === null && mode !== "delete")) {
+    return { error: "NotebookEdit tool_input missing a string 'new_source'" };
+  }
+  // An empty `cell_id` names no cell, so it counts as absent; the hash still binds the value sent.
+  const namedCell = cellId === null || cellId === "" ? null : cellId;
+  if (namedCell === null && mode !== "insert") {
+    return { error: `NotebookEdit '${mode}' needs a string 'cell_id' naming the cell` };
+  }
+  const paths = [notebookPath];
+  const target =
+    mode === "insert"
+      ? namedCell === null
+        ? "insert at start"
+        : `insert after cell ${namedCell}`
+      : `${mode} cell ${namedCell ?? ""}`;
+  return {
+    operation: "notebook_edit",
+    paths,
+    diffSummary: summarizeFileEdit("notebook_edit", paths, `(${target})`),
+    diffBytes: JSON.stringify({
+      notebook_path: notebookPath,
+      cell_id: cellId,
+      cell_type: cellType,
+      edit_mode: mode,
+      new_source: newSource,
+    }),
+  };
+}
+
 /** Reduce a direct file-edit tool call into the core's file_edit builder inputs. */
 function reduceFileEdit(toolName: string, toolInput: unknown): FileEditReduction {
   if (toolName === APPLY_PATCH_TOOL_NAME) {
@@ -196,6 +372,8 @@ function reduceFileEdit(toolName: string, toolInput: unknown): FileEditReduction
       diffBytes: patch.patch,
     };
   }
+
+  if (toolName === "NotebookEdit") return reduceNotebookEdit(toolInput);
 
   const filePath = readStringField(toolInput, "file_path");
   if (filePath === null || filePath.trim().length === 0) {
@@ -251,6 +429,146 @@ function reduceFileEdit(toolName: string, toolInput: unknown): FileEditReduction
 }
 
 /**
+ * A POSIX shell command call (`Bash`, or `Monitor` with a `command`), read from its `tool_input`
+ * but not yet built into a record:
+ * - `command`: the command line to record, and the one-line `summary` the human is shown.
+ * - `pass-through`: a `Monitor` WebSocket watch, which runs no command.
+ * - `build-error`: the `tool_input` has the wrong shape; deny (`reason` is a constant).
+ *
+ * Both hooks build the request for a `command` through `@allw/sdk`'s `commandRequest` (#269,
+ * #372), which also refuses a blank command or program. {@link gateToolCall} still builds a core
+ * record for one directly, for a caller that uses it on its own, and refuses the same commands with
+ * the same reason.
+ */
+export type PosixCommandCall =
+  | { readonly kind: "command"; readonly command: string; readonly summary: string }
+  | { readonly kind: "pass-through"; readonly reason: string }
+  | { readonly kind: "build-error"; readonly reason: string };
+
+/**
+ * Read a POSIX shell command call (`Bash`, or `Monitor`'s `command`) from its `tool_input`.
+ * Returns `null` for any other tool. This only reads the input; the record is built by the caller.
+ */
+export function posixCommandCall(toolName: string, toolInput: unknown): PosixCommandCall | null {
+  if (toolName === BASH_TOOL_NAME) {
+    const command = readBashCommand(toolInput);
+    if (command === null) {
+      return {
+        kind: "build-error",
+        reason: "allw: Bash tool_input missing a string 'command' (fail-closed deny)",
+      };
+    }
+    return { kind: "command", command, summary: oneLine(`Run command: ${command}`) };
+  }
+
+  if (toolName === MONITOR_TOOL_NAME) {
+    const request = readMonitorRequest(toolInput);
+    if (request.kind === "ws") {
+      // A WebSocket watch runs no command: it is a read-only network subscription, and allw does
+      // not gate raw egress (docs/policy-seam.md). Claude Code's own WebSocket prompt still applies.
+      return { kind: "pass-through", reason: "allw: Monitor WebSocket watch runs no command" };
+    }
+    if (request.kind === "malformed") {
+      return {
+        kind: "build-error",
+        reason:
+          "allw: Monitor tool_input must have either a string 'command' or a 'ws' object with a " +
+          "string 'url' (fail-closed deny)",
+      };
+    }
+    return {
+      kind: "command",
+      command: request.command,
+      summary: oneLine(`Run command (Monitor): ${request.command}`),
+    };
+  }
+
+  return null;
+}
+
+/**
+ * True if `err` is `@allw/sdk`'s `CommandActionError`. Checked by its name and `reason` field, not
+ * `instanceof`: a published install can hold two copies of the SDK (the codex-hook's and this
+ * package's), and an error from one copy is not an instance of the other's class.
+ */
+function isCommandActionError(err: unknown): err is Error & { readonly reason: string } {
+  return (
+    err instanceof Error &&
+    err.name === "CommandActionError" &&
+    typeof (err as { reason?: unknown }).reason === "string"
+  );
+}
+
+/**
+ * The deny reason for a command whose request could not be built: the SDK refused it (a
+ * `CommandActionError`), the core refused it, or anything else failed while building it. Both hooks
+ * and {@link gateToolCall} use this, so the same command is denied with the same reason everywhere
+ * (#372).
+ *
+ * For invalid shell syntax the SDK wraps the core's own error, which names the problem; quoting that
+ * keeps the reason the same as before #269. Otherwise the SDK's message is used, without its
+ * `allw: ` prefix (the reason already carries one). Either way the text goes through the core escape
+ * and cap before the agent reads it.
+ */
+export function commandBuildFailureReason(wasm: HookWasm, err: unknown): string {
+  const quoted = isCommandActionError(err)
+    ? err.cause instanceof Error
+      ? err.cause
+      : err.message.replace(/^allw: /u, "")
+    : err;
+  return `allw: could not build an ActionRecord for the command (fail-closed deny): ${agentSafeErrorText(
+    wasm,
+    quoted,
+  )}`;
+}
+
+/**
+ * Why a core `command` record has no program to show the human, worded exactly as `@allw/sdk`'s
+ * `commandActionFromLine` words its refusal, or `null` when it has one. A blank or whitespace-only
+ * line has no `argv` at all; `'' rm …` has an empty first word. This reads the core's record; it does
+ * not re-tokenize. A record that cannot be read is refused too (fail-closed).
+ */
+function noProgramRefusal(actionRecord: string): string | null {
+  let argv: unknown;
+  try {
+    argv = (JSON.parse(actionRecord) as { syntactic?: { argv?: unknown } }).syntactic?.argv;
+  } catch {
+    return "the core returned an unreadable command record";
+  }
+  if (!Array.isArray(argv) || argv.length === 0) return "commandLine contains no command";
+  if (argv[0] === "") return "commandLine's first word (the program) must be non-empty";
+  return null;
+}
+
+/**
+ * Build a `command` record for a POSIX shell command (Bash, or Monitor's `command`) through the core.
+ * A core error (invalid shell syntax), or a record with no program (a blank command, or an empty
+ * first word), is a `build-error`, so the caller denies, exactly as the hooks' `commandRequest` path
+ * does.
+ */
+function gatePosixCommand(
+  wasm: HookWasm,
+  command: string,
+  cwd: string | undefined,
+  summary: string,
+): GateOutcome {
+  try {
+    // Pass cwd through to the core only when present; the FFI maps `undefined` → `None`.
+    const actionRecord =
+      cwd === undefined
+        ? wasm.action_from_command(command)
+        : wasm.action_from_command(command, cwd);
+    const refusal = noProgramRefusal(actionRecord);
+    if (refusal !== null) {
+      return { kind: "build-error", reason: commandBuildFailureReason(wasm, refusal) };
+    }
+    return { kind: "gated", actionRecord, summary };
+  } catch (err) {
+    return { kind: "build-error", reason: commandBuildFailureReason(wasm, err) };
+  }
+}
+
+/**
  * Classify a tool call and, when gated, build its `ActionRecord` through the WASM core.
  *
  * All `ActionRecord` construction is delegated to the core — the hook never reimplements the
@@ -263,27 +581,34 @@ export function gateToolCall(
   toolInput: unknown,
   cwd: string | undefined,
 ): GateOutcome {
-  if (toolName === BASH_TOOL_NAME) {
+  const posix = posixCommandCall(toolName, toolInput);
+  if (posix !== null) {
+    return posix.kind === "command"
+      ? gatePosixCommand(wasm, posix.command, cwd, posix.summary)
+      : posix;
+  }
+
+  if (toolName === POWERSHELL_TOOL_NAME) {
     const command = readBashCommand(toolInput);
     if (command === null) {
       return {
         kind: "build-error",
-        reason: "allw: Bash tool_input missing a string 'command' (fail-closed deny)",
+        reason: "allw: PowerShell tool_input missing a string 'command' (fail-closed deny)",
       };
     }
     try {
-      // Pass cwd through to the core only when present; the FFI maps `undefined` → `None`.
       const actionRecord =
         cwd === undefined
-          ? wasm.action_from_command(command)
-          : wasm.action_from_command(command, cwd);
-      return { kind: "gated", actionRecord, summary: oneLine(`Run command: ${command}`) };
+          ? wasm.action_from_powershell_command(command)
+          : wasm.action_from_powershell_command(command, cwd);
+      return { kind: "gated", actionRecord, summary: oneLine(`PowerShell: ${command}`) };
     } catch (err) {
       return {
         kind: "build-error",
-        reason: `allw: could not build an ActionRecord for the command (fail-closed deny): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
+        reason: `allw: could not build an ActionRecord for the PowerShell command (fail-closed deny): ${agentSafeErrorText(
+          wasm,
+          err,
+        )}`,
       };
     }
   }
@@ -293,7 +618,8 @@ export function gateToolCall(
     if ("error" in fileEdit) {
       return {
         kind: "build-error",
-        reason: `allw: ${fileEdit.error} (fail-closed deny)`,
+        // The error can quote tool input (a key or an edit mode), so it is escaped (#364).
+        reason: `allw: ${agentSafeText(wasm, fileEdit.error)} (fail-closed deny)`,
       };
     }
 
@@ -312,9 +638,10 @@ export function gateToolCall(
     } catch (err) {
       return {
         kind: "build-error",
-        reason: `allw: could not build an ActionRecord for the file edit (fail-closed deny): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
+        reason: `allw: could not build an ActionRecord for the file edit (fail-closed deny): ${agentSafeErrorText(
+          wasm,
+          err,
+        )}`,
       };
     }
   }
@@ -327,7 +654,8 @@ export function gateToolCall(
       // we cannot build a record for it, so we DENY rather than pass through (fail-closed).
       return {
         kind: "build-error",
-        reason: `allw: MCP tool name '${toolName}' is not a well-formed 'mcp__<server>__<tool>' (fail-closed deny)`,
+        // The name comes from a third-party MCP server, so it is escaped (#364).
+        reason: `allw: MCP tool name '${agentSafeText(wasm, toolName)}' is not a well-formed 'mcp__<server>__<tool>' (fail-closed deny)`,
       };
     }
     // The MCP tool params are the raw `tool_input` object; serialize verbatim for the core.
@@ -342,9 +670,10 @@ export function gateToolCall(
     } catch (err) {
       return {
         kind: "build-error",
-        reason: `allw: could not build an ActionRecord for the MCP tool call (fail-closed deny): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
+        reason: `allw: could not build an ActionRecord for the MCP tool call (fail-closed deny): ${agentSafeErrorText(
+          wasm,
+          err,
+        )}`,
       };
     }
   }
@@ -352,6 +681,6 @@ export function gateToolCall(
   // A genuinely non-Bash, non-MCP, non-file-edit tool (Read/Grep/…) is not gated.
   return {
     kind: "pass-through",
-    reason: `allw: tool '${toolName}' is not gated by allw; passing through`,
+    reason: `allw: tool '${agentSafeText(wasm, toolName)}' is not gated by allw; passing through`,
   };
 }

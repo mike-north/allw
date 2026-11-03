@@ -40,6 +40,10 @@
 //! never classify as a verified non-approval. The WASM side checks the structured
 //! `kind: "not_approved"` error for each.
 //!
+//! And the verdict-provenance cases (#245): verdicts the relay's plaintext-free
+//! `verify_verdict_provenance` must accept (naming the signing device) or reject, so the relay's
+//! WASM gate is checked against the same hand-written answers as the core.
+//!
 //! @see docs/contract.md §Wire encoding, §Verification checklist
 //! @see docs/enrollment.md §Model (account id derivation, pairing-start authorization)
 //! @see crates/allw-core/src/hash.rs (FROZEN_HASH_HEX — the same value)
@@ -48,6 +52,7 @@
 
 use std::path::PathBuf;
 
+use allw_core::verify_verdict_provenance;
 use allw_core::{
     account_id_for_root, action_from_agent_tool_call, compute_request_hash, decrypt_context,
     issue_device_cert, seal_context_for_account_state, select_recipients, sign_account_state,
@@ -127,6 +132,14 @@ const NOTE: &str = "ok for staging only — not prod";
 const DENIED_NONCE: &[u8] = &[0x31, 0x32, 0x33, 0x34];
 const EXPIRED_NONCE: &[u8] = &[0x41, 0x42, 0x43, 0x44];
 const ABORTED_NONCE: &[u8] = &[0x51, 0x52, 0x53, 0x54];
+
+// Verdict-provenance cases (#245): a second certified device, a key no certificate vouches for,
+// another request id, and the sequence of the account state that revokes the fixture device.
+const SECOND_DEVICE_SEED: [u8; 32] = [0x23u8; 32];
+const SECOND_DEVICE_ID: &str = "dev_wasm_vector_02";
+const UNCERTIFIED_SEED: [u8; 32] = [0x2Fu8; 32];
+const OTHER_REQUEST_ID: &str = "req_wasm_vector_02";
+const PROVENANCE_REVOKING_SEQUENCE: u64 = 7;
 
 /// The text the SDK once matched in a verify error's message to decide a failure was a verified
 /// non-approval (the core's `NotApproved` `Display` prefix). Forged cases echo it through fields
@@ -214,6 +227,33 @@ struct WasmVector {
     /// non-approval: each fails to parse or fails verification with some other error, and WASM
     /// throws an error with no `kind`.
     forged_not_approved_verdicts: Vec<ForgedNotApprovedCase>,
+
+    /// The account id the provenance cases are checked for (the fixture verdicts' account).
+    provenance_account_id: String,
+    /// The request window (`created_at`, `expires_at`, Unix ms) the provenance cases are checked
+    /// in: the relay passes the request row's values.
+    provenance_created_at: i64,
+    provenance_expires_at: i64,
+    /// Verdict-provenance cases (#245), each checked with `approver_root_pubkey_b64`.
+    provenance_cases: Vec<ProvenanceCase>,
+}
+
+/// One `verify_verdict_provenance` case.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct ProvenanceCase {
+    name: String,
+    /// JSON `Verdict` as the device sent it.
+    verdict_json: String,
+    /// The request id the relay checks it for (the frame's `request_id`).
+    request_id: String,
+    /// JSON array of account-state JWS the relay holds (`[]` for none).
+    account_states_json: String,
+    /// The signing device the check reports when it passes; `None` when it must be rejected.
+    /// Written from the rules, not captured from the function.
+    expected_device_id: Option<String>,
+    /// For a rejected case, the `Display` of the `VerifyError` the rules call for, so the WASM side
+    /// can match the specific reason. `None` when the case passes.
+    expected_error: Option<String>,
 }
 
 /// A signed verdict whose human decision is not `approved`.
@@ -569,6 +609,7 @@ fn build_vector() -> WasmVector {
         ),
     ];
     let forged_not_approved_verdicts = forged_not_approved_cases(&denied);
+    let provenance_cases = provenance_cases(&root, &unsigned, &cert, &denied);
     let verdict = sign_verdict(&unsigned, &device, NONCE, Some(cert)).expect("note within cap");
 
     let agent_tool_call_context = make_agent_tool_call_context();
@@ -616,6 +657,174 @@ fn build_vector() -> WasmVector {
         seal_sequence: SEAL_SEQUENCE,
         not_approved_verdicts,
         forged_not_approved_verdicts,
+        provenance_account_id: ACCOUNT_ID.to_string(),
+        provenance_created_at: TS_CREATED,
+        provenance_expires_at: TS_EXPIRES,
+        provenance_cases,
+    }
+}
+
+/// The provenance cases (#245), one per relay-table row: a genuine verdict and a genuine denial
+/// pass; a verdict from a second certified device passes naming that device (telling it apart
+/// from the socket's device is the relay's own check); a junk signature, a key no certificate
+/// vouches for, a verdict replayed for another request, a revoked device, a decision outside the
+/// request window on either side, and an expired certificate backdated to before the request are
+/// rejected. Each rejection's error is written from the rules ([`provenance_expected_error`]).
+fn provenance_cases(
+    root: &SigningKeyPair,
+    unsigned: &UnsignedVerdict,
+    cert: &str,
+    denied: &Verdict,
+) -> Vec<ProvenanceCase> {
+    let device = SigningKeyPair::from_seed(&DEVICE_SEED);
+    let case =
+        |name: &str, verdict: &Verdict, request_id: &str, states: &[String], ok: Option<&str>| {
+            ProvenanceCase {
+                name: name.to_string(),
+                verdict_json: serde_json::to_string(verdict).expect("verdict serializes"),
+                request_id: request_id.to_string(),
+                account_states_json: serde_json::to_string(states).expect("states serialize"),
+                expected_device_id: ok.map(str::to_string),
+                expected_error: match ok {
+                    Some(_) => None,
+                    None => Some(provenance_expected_error(name).to_string()),
+                },
+            }
+        };
+    // The genuine device signing at `decided_at` under a certificate expiring at `cert_expires_at`.
+    let signed_at = |decided_at: i64, cert_expires_at: Option<i64>| {
+        let cert = issue_device_cert(
+            root,
+            ACCOUNT_ID,
+            DEVICE_ID,
+            &device.public_key(),
+            TS_CREATED - 10_000,
+            cert_expires_at,
+        );
+        sign_verdict(
+            &UnsignedVerdict {
+                decided_at,
+                ..clone_unsigned(unsigned)
+            },
+            &device,
+            NONCE,
+            Some(cert),
+        )
+        .expect("note within cap")
+    };
+    let genuine =
+        sign_verdict(unsigned, &device, NONCE, Some(cert.to_string())).expect("note within cap");
+
+    let mut junk = genuine.clone();
+    junk.sig = "not-a-jws".to_string();
+
+    let uncertified = sign_verdict(
+        unsigned,
+        &SigningKeyPair::from_seed(&UNCERTIFIED_SEED),
+        NONCE,
+        Some(cert.to_string()),
+    )
+    .expect("note within cap");
+
+    let second_key = SigningKeyPair::from_seed(&SECOND_DEVICE_SEED);
+    let second_cert = issue_device_cert(
+        root,
+        ACCOUNT_ID,
+        SECOND_DEVICE_ID,
+        &second_key.public_key(),
+        TS_CREATED,
+        None,
+    );
+    let second = sign_verdict(
+        &UnsignedVerdict {
+            approver: Approver {
+                account_id: ACCOUNT_ID.to_string(),
+                device_id: SECOND_DEVICE_ID.to_string(),
+            },
+            ..clone_unsigned(unsigned)
+        },
+        &second_key,
+        NONCE,
+        Some(second_cert),
+    )
+    .expect("note within cap");
+
+    let revoking = sign_account_state(
+        &AccountState {
+            v: 1,
+            account_id: ACCOUNT_ID.to_string(),
+            sequence: PROVENANCE_REVOKING_SEQUENCE,
+            current_root: root.public_key().to_bytes(),
+            previous_roots: vec![],
+            devices: vec![],
+            actors: vec![],
+            revocations: vec![AccountStateRevocation {
+                kind: AccountStateRevocationKind::Device,
+                id: DEVICE_ID.to_string(),
+                revoked_at: TS_CREATED,
+                reason: None,
+            }],
+        },
+        root,
+    );
+
+    vec![
+        case("genuine", &genuine, REQUEST_ID, &[], Some(DEVICE_ID)),
+        case("genuine denial", denied, REQUEST_ID, &[], Some(DEVICE_ID)),
+        case(
+            "second certified device",
+            &second,
+            REQUEST_ID,
+            &[],
+            Some(SECOND_DEVICE_ID),
+        ),
+        case("junk signature", &junk, REQUEST_ID, &[], None),
+        case("uncertified key", &uncertified, REQUEST_ID, &[], None),
+        case(
+            "replayed for another request",
+            &genuine,
+            OTHER_REQUEST_ID,
+            &[],
+            None,
+        ),
+        case("revoked device", &genuine, REQUEST_ID, &[revoking], None),
+        case(
+            "decided before the request was created",
+            &signed_at(TS_CREATED - 1, None),
+            REQUEST_ID,
+            &[],
+            None,
+        ),
+        case(
+            "decided after the request expires",
+            &signed_at(TS_EXPIRES + 1, None),
+            REQUEST_ID,
+            &[],
+            None,
+        ),
+        // A device whose certificate has expired backdates its decision to while the certificate
+        // was valid; the window (not the certificate) is what rejects it.
+        case(
+            "expired cert backdated before the request",
+            &signed_at(TS_CREATED - 1_000, Some(TS_CREATED - 500)),
+            REQUEST_ID,
+            &[],
+            None,
+        ),
+    ]
+}
+
+/// The error the rules call for, per rejected provenance case (written by hand, not captured).
+fn provenance_expected_error(name: &str) -> VerifyError {
+    match name {
+        "junk signature" => VerifyError::MalformedJws,
+        "uncertified key" => VerifyError::VerdictSignatureInvalid,
+        "replayed for another request" => VerifyError::RequestIdMismatch,
+        "revoked device" => VerifyError::DeviceRevoked,
+        "decided before the request was created"
+        | "decided after the request expires"
+        | "expired cert backdated before the request" => VerifyError::DecidedAtOutOfWindow,
+        other => panic!("no expected error written for provenance case {other:?}"),
     }
 }
 
@@ -1032,6 +1241,48 @@ fn fixture_not_approved_cases_follow_the_signed_claims() {
                     case.name
                 );
                 assert!(!error.to_string().contains(NOT_APPROVED_MESSAGE_MARKER));
+            }
+        }
+    }
+}
+
+/// Each provenance case gives the hand-written answer: the named device, or the specific error the
+/// rules say (`docs/relay-api.md` §4, the relay's table in #245).
+#[test]
+fn fixture_provenance_cases_follow_the_rules() {
+    let raw = std::fs::read_to_string(fixture_path()).expect("fixture must exist for this test");
+    let v: WasmVector =
+        serde_json::from_str(&raw).expect("committed fixture is valid WasmVector JSON");
+    let root = SigningKeyPair::from_seed(&ROOT_SEED).public_key();
+    assert_eq!(v.provenance_cases.len(), 10);
+    for case in &v.provenance_cases {
+        let verdict: Verdict = serde_json::from_str(&case.verdict_json).unwrap();
+        let states: Vec<String> = serde_json::from_str(&case.account_states_json).unwrap();
+        let state_refs: Vec<&str> = states.iter().map(String::as_str).collect();
+        let result = verify_verdict_provenance(
+            &verdict,
+            &case.request_id,
+            v.provenance_created_at,
+            v.provenance_expires_at,
+            &v.provenance_account_id,
+            &root,
+            &state_refs,
+        );
+        match &case.expected_device_id {
+            Some(device_id) => {
+                let got = result.unwrap_or_else(|e| panic!("{}: must pass, got {e:?}", case.name));
+                assert_eq!(&got.device_id, device_id, "{}", case.name);
+                assert_eq!(got.decided_at, TS_DECIDED, "{}", case.name);
+            }
+            None => {
+                let expected = provenance_expected_error(&case.name);
+                assert_eq!(result.as_ref().err(), Some(&expected), "{}", case.name);
+                assert_eq!(
+                    case.expected_error.as_deref(),
+                    Some(expected.to_string().as_str()),
+                    "{}: the fixture carries the expected error",
+                    case.name
+                );
             }
         }
     }

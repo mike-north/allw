@@ -11,12 +11,16 @@ import { describe, expect, it, vi } from "vitest";
 import {
   ApnsPushTransport,
   FcmPushTransport,
+  InMemoryWakeupClaimStore,
   UndeliverablePushTokenError,
-  WEB_PUSH_COALESCE_MS,
+  PUSH_COALESCE_MS,
   WakeupCoalescer,
   buildPushWakeupPayload,
   diffPushTokenSet,
   dispatchPushWakeups,
+  isClientErrorStatus,
+  parsePushCoalesceKey,
+  pushCoalesceKey,
   type Fetcher,
   type PushTransport,
   type StoredPushToken,
@@ -62,7 +66,8 @@ describe("push fan-out", () => {
       transports: { apns, fcm },
     });
 
-    expect(result).toEqual({ delivered: 2, undeliverableTokens: [] });
+    // Both providers accepted their wakeup, so both tokens are reported delivered.
+    expect(result).toEqual({ deliveredTokens: tokens, undeliverableTokens: [] });
     expect(sent).toEqual([
       {
         kind: "apns",
@@ -152,7 +157,11 @@ describe("push fan-out", () => {
           transports: { apns, fcm },
         },
       ),
-    ).resolves.toEqual({ delivered: 1, undeliverableTokens: [] });
+    ).resolves.toEqual({
+      // Only FCM accepted; the rejected APNs wakeup is neither delivered nor prunable.
+      deliveredTokens: [{ device_id: "dev-b", transport: "fcm", token: "fcm-token" }],
+      undeliverableTokens: [],
+    });
   });
 
   it("keeps at most `concurrency` wakeups in flight, and a slow one does not block the rest", async () => {
@@ -194,7 +203,17 @@ describe("push fan-out", () => {
       release();
     });
 
-    await expect(dispatched).resolves.toEqual({ delivered: 6, undeliverableTokens: [] });
+    // Every send succeeded, the slow one last.
+    const result = await dispatched;
+    expect(result.deliveredTokens.map((token) => token.token)).toEqual([
+      "a",
+      "b",
+      "c",
+      "d",
+      "e",
+      "slow",
+    ]);
+    expect(result.undeliverableTokens).toEqual([]);
   });
 
   it("reports only tokens whose transport signalled UndeliverablePushTokenError for pruning", async () => {
@@ -215,8 +234,307 @@ describe("push fan-out", () => {
         expiresAt: EXPIRES_AT,
         transports: { webpush },
       }),
-    ).resolves.toEqual({ delivered: 0, undeliverableTokens: [gone] });
+    ).resolves.toEqual({ deliveredTokens: [], undeliverableTokens: [gone] });
   });
+});
+
+describe("push-service rejections are logged for operators (#326)", () => {
+  const APNS_DEVICE_TOKEN = "f".repeat(64);
+  const FCM_REGISTRATION = "fcm-registration-secret";
+
+  function apnsAnswering(status: number): ApnsPushTransport {
+    return new ApnsPushTransport({
+      endpoint: "https://api.push.apple.test",
+      topic: "com.example.allw",
+      bearerToken: "apns-bearer-secret",
+      fetcher: async () => new Response(JSON.stringify({ reason: "BadDeviceToken" }), { status }),
+    });
+  }
+
+  function fcmAnswering(status: number): FcmPushTransport {
+    return new FcmPushTransport({
+      endpoint: "https://fcm.googleapis.test/v1/projects/allw-secret-project/messages:send",
+      bearerToken: "fcm-bearer-secret",
+      fetcher: async () => new Response(null, { status }),
+    });
+  }
+
+  function wakeupFor(token: string) {
+    return {
+      accountId: "acct",
+      deviceId: "dev",
+      requestId: "req-rejected",
+      expiresAt: EXPIRES_AT,
+      token,
+    };
+  }
+
+  /** The relay's push-rejection warnings during `body`, ignoring any other console output. */
+  async function rejectionWarnings(body: () => Promise<unknown>): Promise<string[]> {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await body().catch(() => undefined);
+      return warn.mock.calls
+        .map((call) => String(call[0]))
+        .filter((message) => message.startsWith("push:"));
+    } finally {
+      warn.mockRestore();
+    }
+  }
+
+  it("logs an APNs 4xx with transport, host and status only, never the device token", async () => {
+    const warnings = await rejectionWarnings(() =>
+      apnsAnswering(400).sendWakeup(wakeupFor(APNS_DEVICE_TOKEN)),
+    );
+
+    expect(warnings).toEqual([
+      "push: apns push service api.push.apple.test rejected a wakeup with HTTP 400; token kept",
+    ]);
+    for (const secret of [APNS_DEVICE_TOKEN, "apns-bearer-secret", "req-rejected", "/3/device"]) {
+      expect(warnings[0]).not.toContain(secret);
+    }
+  });
+
+  it("logs an FCM 4xx with the host only, never the token or the project path", async () => {
+    const warnings = await rejectionWarnings(() =>
+      fcmAnswering(403).sendWakeup(wakeupFor(FCM_REGISTRATION)),
+    );
+
+    expect(warnings).toEqual([
+      "push: fcm push service fcm.googleapis.test rejected a wakeup with HTTP 403; token kept",
+    ]);
+    for (const secret of [FCM_REGISTRATION, "fcm-bearer-secret", "allw-secret-project"]) {
+      expect(warnings[0]).not.toContain(secret);
+    }
+  });
+
+  it.each([200, 202, 500, 503, 301])(
+    "does not log an APNs or FCM response with HTTP %i as a rejection",
+    async (status) => {
+      expect(
+        await rejectionWarnings(() =>
+          apnsAnswering(status).sendWakeup(wakeupFor(APNS_DEVICE_TOKEN)),
+        ),
+      ).toEqual([]);
+      expect(
+        await rejectionWarnings(() => fcmAnswering(status).sendWakeup(wakeupFor(FCM_REGISTRATION))),
+      ).toEqual([]);
+    },
+  );
+
+  it("classifies exactly the 4xx statuses as client errors", () => {
+    expect([400, 401, 403, 404, 410, 429, 499].every((s) => isClientErrorStatus(s))).toBe(true);
+    expect([200, 201, 301, 399, 500, 503].some((s) => isClientErrorStatus(s))).toBe(false);
+  });
+});
+
+/**
+ * @see https://developer.apple.com/documentation/usernotifications/handling-notification-responses-from-apns
+ * @see https://firebase.google.com/docs/reference/fcm/rest/v1/ErrorCode
+ */
+describe("APNs and FCM prune only on an unregistered answer (#260)", () => {
+  const APNS_TOKEN = "e".repeat(64);
+  /** FCM HTTP v1's error body for a registration token that is no longer valid. */
+  const FCM_UNREGISTERED = {
+    error: {
+      code: 404,
+      message: "Requested entity was not found.",
+      status: "NOT_FOUND",
+      details: [
+        {
+          "@type": "type.googleapis.com/google.firebase.fcm.v1.FcmError",
+          errorCode: "UNREGISTERED",
+        },
+      ],
+    },
+  };
+
+  function apns(response: () => Response): ApnsPushTransport {
+    return new ApnsPushTransport({
+      endpoint: "https://api.push.apple.test",
+      topic: "com.example.allw",
+      bearerToken: "apns-bearer",
+      fetcher: async () => response(),
+    });
+  }
+
+  function fcm(response: () => Response): FcmPushTransport {
+    return new FcmPushTransport({
+      endpoint: "https://fcm.googleapis.test/v1/projects/allw/messages:send",
+      bearerToken: "fcm-bearer",
+      fetcher: async () => response(),
+    });
+  }
+
+  /** Send one wakeup; the error it failed with (or null) and the push-rejection warnings logged. */
+  async function outcome(
+    transport: PushTransport,
+    token: string,
+  ): Promise<{ failure: unknown; warnings: string[] }> {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const failure = await transport
+        .sendWakeup({
+          accountId: "acct",
+          deviceId: "dev",
+          requestId: "req",
+          expiresAt: EXPIRES_AT,
+          token,
+        })
+        .then(
+          () => null,
+          (error: unknown) => error,
+        );
+      return {
+        failure,
+        warnings: warn.mock.calls
+          .map((call) => String(call[0]))
+          .filter((message) => message.startsWith("push:")),
+      };
+    } finally {
+      warn.mockRestore();
+    }
+  }
+
+  it("prunes an APNs token answered 410 (Unregistered), without logging a rejection", async () => {
+    const { failure, warnings } = await outcome(
+      apns(() => new Response(JSON.stringify({ reason: "Unregistered" }), { status: 410 })),
+      APNS_TOKEN,
+    );
+
+    expect(failure).toBeInstanceOf(UndeliverablePushTokenError);
+    expect(warnings).toEqual([]);
+  });
+
+  it("keeps an APNs token answered 400 BadDeviceToken, which a wrong APNs environment also causes", async () => {
+    const { failure, warnings } = await outcome(
+      apns(() => new Response(JSON.stringify({ reason: "BadDeviceToken" }), { status: 400 })),
+      APNS_TOKEN,
+    );
+
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(UndeliverablePushTokenError);
+    expect(warnings).toEqual([
+      "push: apns push service api.push.apple.test rejected a wakeup with HTTP 400; token kept",
+    ]);
+  });
+
+  it.each([403, 404, 429, 500, 503])("keeps an APNs token answered %i", async (status) => {
+    const { failure } = await outcome(
+      apns(() => new Response(null, { status })),
+      APNS_TOKEN,
+    );
+
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(UndeliverablePushTokenError);
+  });
+
+  it("logs an APNs 404 (a wrong request path) as a rejection, since it does not prune", async () => {
+    const { warnings } = await outcome(
+      apns(() => new Response(null, { status: 404 })),
+      APNS_TOKEN,
+    );
+
+    expect(warnings).toEqual([
+      "push: apns push service api.push.apple.test rejected a wakeup with HTTP 404; token kept",
+    ]);
+  });
+
+  it("releases every APNs response body unread", async () => {
+    for (const status of [200, 400, 410, 500]) {
+      const cancelled = vi.fn();
+      await outcome(
+        apns(() => new Response(new ReadableStream({ cancel: cancelled }), { status })),
+        APNS_TOKEN,
+      );
+      expect(cancelled).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it.each([
+    ["APNs", 200, null],
+    ["APNs", 410, UndeliverablePushTokenError],
+    ["FCM", 200, null],
+    ["FCM", 404, UndeliverablePushTokenError],
+    ["FCM", 403, Error],
+  ] as const)(
+    "does not wait for a body cancel that never settles (%s HTTP %i)",
+    async (transport, status, expected) => {
+      const cancelled = vi.fn(() => new Promise<void>(() => undefined));
+      // FCM's 404 body is read for UNREGISTERED; the stream stays open so the read ends at its
+      // deadline and the cancel is still needed.
+      const response = () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              if (transport === "FCM" && status === 404) {
+                controller.enqueue(new TextEncoder().encode(JSON.stringify(FCM_UNREGISTERED)));
+              }
+            },
+            cancel: cancelled,
+          }),
+          { status },
+        );
+      const sender = transport === "APNs" ? apns(response) : fcm(response);
+      const result = await Promise.race([
+        outcome(sender, transport === "APNs" ? APNS_TOKEN : "fcm-token").then((r) => r.failure),
+        new Promise((resolve) => setTimeout(() => resolve("hung"), 3_000)),
+      ]);
+
+      if (expected === null) expect(result).toBeNull();
+      else expect(result).toBeInstanceOf(expected);
+      expect(cancelled).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("prunes an FCM token answered 404 with UNREGISTERED, without logging a rejection", async () => {
+    const { failure, warnings } = await outcome(
+      fcm(() => new Response(JSON.stringify(FCM_UNREGISTERED), { status: 404 })),
+      "fcm-token",
+    );
+
+    expect(failure).toBeInstanceOf(UndeliverablePushTokenError);
+    expect(warnings).toEqual([]);
+  });
+
+  it.each([
+    ["no body", null],
+    ["a non-JSON body", "Not Found"],
+    [
+      "another error code",
+      JSON.stringify({ error: { details: [{ errorCode: "SENDER_ID_MISMATCH" }] } }),
+    ],
+    ["UNREGISTERED outside error.details", JSON.stringify({ errorCode: "UNREGISTERED" })],
+    // Cut off at the read limit, the prefix does not parse: no information, so no prune.
+    [
+      "UNREGISTERED past the read limit",
+      JSON.stringify({ padding: " ".repeat(8192), ...FCM_UNREGISTERED }),
+    ],
+  ])("keeps an FCM token answered 404 with %s, and logs it", async (_name, body) => {
+    const { failure, warnings } = await outcome(
+      fcm(() => new Response(body, { status: 404 })),
+      "fcm-token",
+    );
+
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(UndeliverablePushTokenError);
+    expect(warnings).toEqual([
+      "push: fcm push service fcm.googleapis.test rejected a wakeup with HTTP 404; token kept",
+    ]);
+  });
+
+  it.each([400, 403, 429, 500, 503])(
+    "keeps an FCM token answered %i, even with an UNREGISTERED body",
+    async (status) => {
+      const { failure } = await outcome(
+        fcm(() => new Response(JSON.stringify(FCM_UNREGISTERED), { status })),
+        "fcm-token",
+      );
+
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure).not.toBeInstanceOf(UndeliverablePushTokenError);
+    },
+  );
 });
 
 describe("WakeupCoalescer — at most one wakeup per subscription per window", () => {
@@ -226,36 +544,114 @@ describe("WakeupCoalescer — at most one wakeup per subscription per window", (
   const OTHER = "dev-b\0https://fcm.googleapis.com/fcm/send/b";
 
   it("uses a 30-second window", () => {
-    expect(WEB_PUSH_COALESCE_MS).toBe(30_000);
+    expect(PUSH_COALESCE_MS).toBe(30_000);
   });
 
   it("coalesces a second claim inside the window, through the boundary, and allows one just past it", () => {
-    const coalescer = new WakeupCoalescer(WEB_PUSH_COALESCE_MS);
+    const coalescer = new WakeupCoalescer(PUSH_COALESCE_MS);
     expect(coalescer.tryClaim(KEY, T0)).toBe(true);
     coalescer.release(KEY);
 
     expect(coalescer.tryClaim(KEY, T0 + 1)).toBe(false);
-    expect(coalescer.tryClaim(KEY, T0 + WEB_PUSH_COALESCE_MS - 1)).toBe(false);
+    expect(coalescer.tryClaim(KEY, T0 + PUSH_COALESCE_MS - 1)).toBe(false);
     // The boundary itself is still inside the window.
-    expect(coalescer.tryClaim(KEY, T0 + WEB_PUSH_COALESCE_MS)).toBe(false);
+    expect(coalescer.tryClaim(KEY, T0 + PUSH_COALESCE_MS)).toBe(false);
     // Just past it, the subscription may be woken again, and that claim opens a new window.
-    expect(coalescer.tryClaim(KEY, T0 + WEB_PUSH_COALESCE_MS + 1)).toBe(true);
+    expect(coalescer.tryClaim(KEY, T0 + PUSH_COALESCE_MS + 1)).toBe(true);
     coalescer.release(KEY);
-    expect(coalescer.tryClaim(KEY, T0 + WEB_PUSH_COALESCE_MS + 2)).toBe(false);
+    expect(coalescer.tryClaim(KEY, T0 + PUSH_COALESCE_MS + 2)).toBe(false);
   });
 
   it("coalesces while a wakeup is still in flight, even past the window", () => {
-    const coalescer = new WakeupCoalescer(WEB_PUSH_COALESCE_MS);
+    const coalescer = new WakeupCoalescer(PUSH_COALESCE_MS);
     expect(coalescer.tryClaim(KEY, T0)).toBe(true);
 
-    const pastWindow = T0 + WEB_PUSH_COALESCE_MS + 1;
+    const pastWindow = T0 + PUSH_COALESCE_MS + 1;
     expect(coalescer.tryClaim(KEY, pastWindow)).toBe(false);
     coalescer.release(KEY);
     expect(coalescer.tryClaim(KEY, pastWindow)).toBe(true);
   });
 
+  it("reports the first instant a claim can succeed again: just past the window", () => {
+    const coalescer = new WakeupCoalescer(PUSH_COALESCE_MS);
+    // Never claimed: claimable now.
+    expect(coalescer.nextClaimableAt(KEY, T0)).toBe(T0);
+
+    expect(coalescer.tryClaim(KEY, T0)).toBe(true);
+    coalescer.release(KEY);
+    const reopensAt = T0 + PUSH_COALESCE_MS + 1;
+    expect(coalescer.nextClaimableAt(KEY, T0 + 1)).toBe(reopensAt);
+    // The reported instant agrees with tryClaim at the boundary and just past it.
+    expect(coalescer.tryClaim(KEY, reopensAt - 1)).toBe(false);
+    expect(coalescer.tryClaim(KEY, reopensAt)).toBe(true);
+  });
+
+  it("never reports a time before now, even while a claim is still in flight past its window", () => {
+    const coalescer = new WakeupCoalescer(PUSH_COALESCE_MS);
+    expect(coalescer.tryClaim(KEY, T0)).toBe(true);
+    const late = T0 + 10 * PUSH_COALESCE_MS;
+    expect(coalescer.nextClaimableAt(KEY, late)).toBe(late);
+    // It is a lower bound: the in-flight claim still blocks until released.
+    expect(coalescer.tryClaim(KEY, late)).toBe(false);
+  });
+
+  it("remembers claims through its store, so a second coalescer on the same store still coalesces (#319)", () => {
+    // Models a Durable Object evicted and recreated over the same SQLite: in-flight state is new,
+    // but the last claim is read back from the store.
+    const store = new InMemoryWakeupClaimStore(PUSH_COALESCE_MS);
+    const before = new WakeupCoalescer(PUSH_COALESCE_MS, store);
+    expect(before.tryClaim(KEY, T0)).toBe(true);
+    before.release(KEY);
+
+    const after = new WakeupCoalescer(PUSH_COALESCE_MS, store);
+    expect(after.tryClaim(KEY, T0 + 1)).toBe(false);
+    expect(after.nextClaimableAt(KEY, T0 + 1)).toBe(T0 + PUSH_COALESCE_MS + 1);
+    expect(after.tryClaim(KEY, T0 + PUSH_COALESCE_MS + 1)).toBe(true);
+  });
+
+  it("counts a stored claim from the future as now, so it blocks for one window at most (review-330 S1)", () => {
+    const store = new InMemoryWakeupClaimStore(PUSH_COALESCE_MS);
+    store.recordClaim(KEY, T0 + 24 * 60 * 60 * 1000);
+    const coalescer = new WakeupCoalescer(PUSH_COALESCE_MS, store);
+
+    expect(coalescer.nextClaimableAt(KEY, T0)).toBe(T0 + PUSH_COALESCE_MS + 1);
+    expect(coalescer.tryClaim(KEY, T0)).toBe(false);
+    expect(coalescer.tryClaim(KEY, T0 + PUSH_COALESCE_MS + 1)).toBe(true);
+  });
+
+  it("round-trips a push token of each transport through its coalescing key", () => {
+    for (const token of [
+      {
+        device_id: "dev-a",
+        transport: "webpush",
+        token: "https://fcm.googleapis.com/fcm/send/a?x=1",
+      },
+      { device_id: "dev-a", transport: "apns", token: "a".repeat(64) },
+      { device_id: "dev-a", transport: "fcm", token: "fcm:token_A-1" },
+    ] as const) {
+      expect(parsePushCoalesceKey(pushCoalesceKey(token))).toEqual(token);
+    }
+  });
+
+  it("keys one token string separately per transport", () => {
+    const token = "a".repeat(64);
+    expect(pushCoalesceKey({ device_id: "dev-a", transport: "apns", token })).not.toBe(
+      pushCoalesceKey({ device_id: "dev-a", transport: "fcm", token }),
+    );
+  });
+
+  it("refuses to parse a key without both separators or with an unknown transport", () => {
+    for (const bad of [
+      "dev-a-https://fcm.googleapis.com/fcm/send/a",
+      "webpush\0dev-a-https://fcm.googleapis.com/fcm/send/a",
+      "smtp\0dev-a\0token",
+    ]) {
+      expect(() => parsePushCoalesceKey(bad)).toThrow("not a push coalescing key");
+    }
+  });
+
   it("keeps subscriptions independent", () => {
-    const coalescer = new WakeupCoalescer(WEB_PUSH_COALESCE_MS);
+    const coalescer = new WakeupCoalescer(PUSH_COALESCE_MS);
     expect(coalescer.tryClaim(KEY, T0)).toBe(true);
     expect(coalescer.tryClaim(OTHER, T0)).toBe(true);
     expect(coalescer.tryClaim(KEY, T0 + 1)).toBe(false);

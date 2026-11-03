@@ -11,16 +11,18 @@
 
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import type { SqlStorage } from "@cloudflare/workers-types";
-import type { AccountRelay } from "../src/index.js";
-import type { PushTransportRegistry } from "../src/push.js";
+import { AccountRelay, type Env } from "../src/index.js";
 import { WebPushTransport, type VapidConfig } from "../src/web-push.js";
-import { pairingStartBody, testAccount } from "./support/accounts.js";
+import { pairingStartBody, testAccount, testRequestId } from "./support/accounts.js";
+import { pinRelayClock } from "./support/relay-state.js";
+import { DEVICE_X25519_PUBKEY } from "./support/keys.js";
 
-/** A 32-byte base64url-unpadded device key (32 × 0x00). */
-const DEVICE_PUBKEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+/** A full-order X25519 device key (pairing rejects small-order keys, #248). */
+const DEVICE_PUBKEY = DEVICE_X25519_PUBKEY;
 /** Far-future expiry (2100-01-01Z, ms) — deterministic and always after the relay's clock. */
 const FUTURE_EXPIRES_AT = 4102444800000;
+/** The relay's injected clock for the submit test: two minutes before {@link FUTURE_EXPIRES_AT}. */
+const RELAY_NOW = FUTURE_EXPIRES_AT - 2 * 60 * 1000;
 /** A fixed creation timestamp (2023-11-14Z, ms) for seeded rows. */
 const SEEDED_AT = 1700000000000;
 
@@ -105,7 +107,7 @@ function accountStub(accountId: string) {
 
 async function readRows(accountId: string, deviceId?: string): Promise<StoredRow[]> {
   return runInDurableObject(accountStub(accountId), (instance: AccountRelay) => {
-    const { sql } = instance as unknown as { sql: SqlStorage };
+    const sql = instance["sql"];
     const rows =
       deviceId === undefined
         ? sql.exec<StoredRow>(
@@ -123,17 +125,17 @@ async function readRows(accountId: string, deviceId?: string): Promise<StoredRow
 
 async function seedRows(
   accountId: string,
-  rows: ReadonlyArray<{ device_id: string; transport: string; token: string }>,
+  rows: ReadonlyArray<{ device_id: string; transport: string; token: string; created_at?: number }>,
 ): Promise<void> {
   await runInDurableObject(accountStub(accountId), (instance: AccountRelay) => {
-    const { sql } = instance as unknown as { sql: SqlStorage };
+    const sql = instance["sql"];
     for (const row of rows) {
       sql.exec(
         `INSERT INTO device_push_token (device_id, transport, token, created_at) VALUES (?, ?, ?, ?)`,
         row.device_id,
         row.transport,
         row.token,
-        SEEDED_AT,
+        row.created_at ?? SEEDED_AT,
       );
     }
   });
@@ -301,23 +303,22 @@ describe("PUT /devices/{id}/push-tokens — replace the device's own set", () =>
     );
     const fetcher = vi.fn<typeof fetch>(async () => new Response(null, { status: 201 }));
     await runInDurableObject(accountStub(acct), async (instance: AccountRelay) => {
-      (instance as unknown as { pushTransports: PushTransportRegistry }).pushTransports = {
+      instance["pushTransports"] = {
         webpush: new WebPushTransport({ vapid: await makeVapid(), fetcher }),
       };
     });
 
+    // Pin the clock so the fixed expiry sits inside the request horizon (#248).
+    await pinRelayClock(acct, RELAY_NOW);
     const submit = await post<{ push_wakeups: number }>(acct, "/requests", {
       v: 1,
-      id: "req-push-tokens-rotated",
-      created_at: SEEDED_AT,
+      id: testRequestId("req-push-tokens-rotated"),
+      created_at: RELAY_NOW - 60_000,
       expires_at: FUTURE_EXPIRES_AT,
       approver: "acct-approver-routing-id",
       context_ciphertext: "eyJhbGciOiJFQ0RILUVTK0EyNTZLVyJ9.FAKE.JWE",
     });
-    await runInDurableObject(
-      accountStub(acct),
-      (instance: AccountRelay) => (instance as unknown as { pushFanOut: Promise<void> }).pushFanOut,
-    );
+    await runInDurableObject(accountStub(acct), (instance: AccountRelay) => instance["pushFanOut"]);
 
     expect(submit.data.push_wakeups).toBe(1);
     expect(fetcher.mock.calls.map(([input]) => String(input))).toEqual([ROTATED_FCM_ENDPOINT]);
@@ -339,6 +340,131 @@ describe("PUT /devices/{id}/push-tokens — replace the device's own set", () =>
     expect(list.status).toBe(200);
     expect(text).not.toContain("push_tokens");
     expect(text).not.toContain("fcm.googleapis.com");
+  });
+});
+
+describe("APNs tokens are stored in one canonical, lowercase spelling (#304)", () => {
+  // An APNs device token is hex, which is case-insensitive: two spellings are one device token.
+  const UPPER = APNS_TOKEN.toUpperCase();
+  const MIXED = "aA".repeat(32);
+  /** FCM registration tokens are case-sensitive opaque strings, so their case is kept. */
+  const FCM_TOKEN = "AbC:dEf_123-XyZ";
+
+  it("pairing stores both spellings of one APNs token as one lowercase row", async () => {
+    const acct = testAccount("acct-apns-case-pairing");
+    const device = await pairDevice(acct, [
+      { transport: "apns", token: APNS_TOKEN },
+      { transport: "apns", token: UPPER },
+      { transport: "fcm", token: FCM_TOKEN },
+    ]);
+
+    expect((await readRows(acct, device.deviceId)).map((r) => [r.transport, r.token])).toEqual([
+      ["apns", APNS_TOKEN],
+      ["fcm", FCM_TOKEN],
+    ]);
+  });
+
+  it("PUT collapses mixed spellings in one body to one lowercase entry", async () => {
+    const acct = testAccount("acct-apns-case-put");
+    const device = await pairDevice(acct);
+
+    const put = await putPushTokens(
+      acct,
+      device.deviceId,
+      {
+        push_tokens: [
+          { transport: "apns", token: UPPER },
+          { transport: "apns", token: MIXED },
+        ],
+      },
+      bearer(device.authToken),
+    );
+
+    // Both spellings are the token APNS_TOKEN ("a" × 64).
+    expect(put.status).toBe(200);
+    expect(put.data).toEqual({ push_tokens: [{ transport: "apns", token: APNS_TOKEN }] });
+    expect(await readRows(acct, device.deviceId)).toHaveLength(1);
+  });
+
+  it("PUT re-sending a stored APNs token in uppercase is a no-op (created_at unchanged)", async () => {
+    const acct = testAccount("acct-apns-case-noop");
+    const device = await pairDevice(acct);
+    // Seeded with a fixed timestamp: a delete + re-insert would replace it with the relay's clock.
+    await seedRows(acct, [{ device_id: device.deviceId, transport: "apns", token: APNS_TOKEN }]);
+
+    const put = await putPushTokens(
+      acct,
+      device.deviceId,
+      { push_tokens: [{ transport: "apns", token: UPPER }] },
+      bearer(device.authToken),
+    );
+
+    expect(put.status).toBe(200);
+    expect(put.data).toEqual({ push_tokens: [{ transport: "apns", token: APNS_TOKEN }] });
+    expect(await readRows(acct, device.deviceId)).toEqual([
+      { device_id: device.deviceId, transport: "apns", token: APNS_TOKEN, created_at: SEEDED_AT },
+    ]);
+  });
+
+  it("migrates rows stored before #304: one lowercase row per device token, FCM untouched", async () => {
+    const acct = testAccount("acct-apns-case-migrate");
+    const device = await pairDevice(acct);
+    const otherDevice = "dev-apns-case-other";
+    await seedRows(acct, [
+      // Two non-canonical spellings of one token, and no lowercase row: they would collide on the
+      // primary key if both were lowercased.
+      { device_id: device.deviceId, transport: "apns", token: UPPER },
+      { device_id: device.deviceId, transport: "apns", token: "Aa".repeat(32) },
+      { device_id: device.deviceId, transport: "fcm", token: FCM_TOKEN },
+      // The same token on another device is that device's own row.
+      { device_id: otherDevice, transport: "apns", token: UPPER },
+      { device_id: otherDevice, transport: "apns", token: "B".repeat(64) },
+    ]);
+
+    // A fresh instance on the same storage runs the schema migrations, as after a deploy.
+    const migrate = () =>
+      runInDurableObject(accountStub(acct), (_instance: AccountRelay, state) => {
+        new AccountRelay(state, env as unknown as Env);
+      });
+    await migrate();
+    const once = await readRows(acct);
+    await migrate();
+
+    expect(await readRows(acct, device.deviceId)).toEqual([
+      { device_id: device.deviceId, transport: "apns", token: APNS_TOKEN, created_at: SEEDED_AT },
+      { device_id: device.deviceId, transport: "fcm", token: FCM_TOKEN, created_at: SEEDED_AT },
+    ]);
+    expect(await readRows(acct, otherDevice)).toEqual([
+      { device_id: otherDevice, transport: "apns", token: APNS_TOKEN, created_at: SEEDED_AT },
+      { device_id: otherDevice, transport: "apns", token: "b".repeat(64), created_at: SEEDED_AT },
+    ]);
+    // Idempotent: running again changes nothing.
+    expect(await readRows(acct)).toEqual(once);
+  });
+
+  it("keeps the earliest registration when the migration collapses spellings (review-335)", async () => {
+    const acct = testAccount("acct-apns-case-migrate-earliest");
+    const lowerFirst = "dev-apns-case-lower-earlier";
+    const upperFirst = "dev-apns-case-upper-earlier";
+    await seedRows(acct, [
+      // Inserted first (lower rowid) but registered later: rowid alone would keep created_at 100.
+      { device_id: lowerFirst, transport: "apns", token: UPPER, created_at: 100 },
+      { device_id: lowerFirst, transport: "apns", token: APNS_TOKEN, created_at: 50 },
+      // The reverse: the earlier registration is the non-canonical spelling.
+      { device_id: upperFirst, transport: "apns", token: APNS_TOKEN, created_at: 100 },
+      { device_id: upperFirst, transport: "apns", token: UPPER, created_at: 50 },
+    ]);
+
+    await runInDurableObject(accountStub(acct), (_instance: AccountRelay, state) => {
+      new AccountRelay(state, env as unknown as Env);
+    });
+
+    expect(await readRows(acct, lowerFirst)).toEqual([
+      { device_id: lowerFirst, transport: "apns", token: APNS_TOKEN, created_at: 50 },
+    ]);
+    expect(await readRows(acct, upperFirst)).toEqual([
+      { device_id: upperFirst, transport: "apns", token: APNS_TOKEN, created_at: 50 },
+    ]);
   });
 });
 
