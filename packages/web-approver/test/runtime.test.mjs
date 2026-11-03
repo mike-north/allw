@@ -150,7 +150,7 @@ test("valid envelope: prepare decrypts + recomputes the WYSIWYS hash; the signed
   );
   assert.equal(prepared.context.kind, "command", "the command surface maps to a command context");
   assert.deepEqual(
-    prepared.context.command?.argv,
+    prepared.context.substrate.argv,
     ["git", "push", "--force", "origin", "main"],
     "the decrypted argv round-trips into the view model",
   );
@@ -218,14 +218,13 @@ test("agent_tool_call surface: maps to its own kind, distinct from mcp, with (se
     "agent_tool_call",
     "the agent_tool_call surface must map to its own kind, not 'mcp'",
   );
-  assert.equal(prepared.context.mcp, undefined, "must not also populate the mcp action");
-  // No `params` on the wire ⇒ no `paramsDisplay` on the (core-escaped) view.
-  assert.deepEqual(prepared.context.agentToolCall, {
-    server: "deploy-plugin",
-    tool: "deploy_service",
-  });
+  assert.equal(prepared.context.substrate.server, "deploy-plugin");
+  assert.equal(prepared.context.substrate.tool, "deploy_service");
+  // No `params` on the wire ⇒ no `paramsLines` on the (core-escaped) view.
+  assert.equal(prepared.context.substrate.paramsLines, undefined);
 
-  assert.equal(actionSummary(prepared.context), "deploy-plugin :: deploy_service");
+  // The CLI's headline precedence puts `raw` first; the (server, tool) identity leads the plaintext.
+  assert.equal(actionSummary(prepared.context), "This plugin wants to deploy to production.");
   assert.match(
     exactPlaintext(prepared.context),
     /^agent_tool_call: deploy-plugin :: deploy_service/,
