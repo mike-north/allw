@@ -697,7 +697,7 @@ fn sequence_floor_from_f64(min_sequence: Option<f64>) -> Result<Option<u64>, JsE
 ///   highest-sequence documents count; recipients are their `active`, unrevoked devices whose
 ///   signed `cert_expires_at` is after `now_ms`, narrowed to the devices every same-sequence
 ///   sibling agrees on.
-/// - `now_ms`: the current Unix time in integer milliseconds.
+/// - `now_ms`: the current Unix time in integer milliseconds (never negative).
 /// - `min_sequence`: the caller's persisted sequence floor, or `undefined`/`null` for none.
 ///
 /// # Errors
@@ -717,6 +717,12 @@ pub fn select_recipients(
 ) -> Result<String, JsError> {
     let root = parse_account_root_pubkey(account_root_pubkey_b64)?;
     let now_ms = ms_to_i64(now_ms, "now_ms")?;
+    // A Unix-ms clock is never negative; a negative one would read every expiry as in the future.
+    if now_ms < 0 {
+        return Err(JsError::new(&format!(
+            "now_ms must be a non-negative Unix millisecond timestamp, got {now_ms}"
+        )));
+    }
     let min_sequence = sequence_floor_from_f64(min_sequence)?;
     let account_states = parse_account_states_json(account_states_json)?;
     let account_state_refs: Vec<&str> = account_states.iter().map(String::as_str).collect();

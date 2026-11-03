@@ -2312,6 +2312,17 @@ test("select_recipients throws — never returns [] — when no recipient set is
       ),
     /now_ms must be a finite integer/,
   );
+  // Regression: a negative clock was accepted, reading every cert expiry as in the future.
+  assert.throws(
+    () =>
+      select(
+        v.recipient_account_states_json,
+        v.expected_account_id_for_root,
+        v.approver_root_pubkey_b64,
+        -1,
+      ),
+    /now_ms must be a non-negative Unix millisecond timestamp/,
+  );
   for (const floor of [-1, 1.5, Number.NaN, 2 ** 53]) {
     assert.throws(
       () =>

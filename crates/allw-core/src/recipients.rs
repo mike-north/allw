@@ -39,8 +39,9 @@
 //!   share the highest sequence, a device is a recipient only if *every* one of them lists it as an
 //!   active, unrevoked, unexpired device with the *same* encryption key. This is the
 //!   confidentiality counterpart of `revoked_device_ids` taking the union of revocations: a
-//!   conflict can only remove readers. A device id listed twice in one document with different
-//!   keys is likewise excluded.
+//!   conflict can only remove readers. Within one document the same holds: a device id listed more
+//!   than once is a recipient only if *every* entry for it is active and unexpired with the same
+//!   key, so a duplicate entry that is not active, has expired, or carries another key excludes it.
 //! - **Malformed device entries fail the call.** An empty `device_id` anywhere in a
 //!   highest-sequence document ([`RecipientSelectionError::EmptyDeviceId`]), or an all-zero
 //!   encryption key on a selected recipient ([`RecipientSelectionError::InvalidEncryptionKey`]),
@@ -152,8 +153,10 @@ impl From<AccountStateError> for RecipientSelectionError {
     }
 }
 
-/// The active, unrevoked, unexpired devices of one document at `now_ms`, keyed by device id. A
-/// device id listed with two different keys maps to `None` (ambiguous, so never a recipient).
+/// Every device id in one document at `now_ms`, mapped to the key it may be encrypted to, or to
+/// `None` when it is not a recipient. An id is `Some(key)` only if it is not revoked and *every*
+/// entry for it is active and unexpired with that same key; any other entry for the id (not active,
+/// expired, or another key) makes it `None` — ambiguity never widens the set.
 fn active_devices(
     state: &AccountState,
     now_ms: i64,
@@ -173,20 +176,18 @@ fn active_devices(
         let expired = device
             .cert_expires_at
             .is_some_and(|expires_at| expires_at <= now_ms);
-        if device.status != DEVICE_STATUS_ACTIVE
-            || expired
-            || revoked.contains(device.device_id.as_str())
-        {
-            continue;
-        }
+        let eligible = device.status == DEVICE_STATUS_ACTIVE
+            && !expired
+            && !revoked.contains(device.device_id.as_str());
+        let this_entry = eligible.then_some(device.encryption_pubkey);
         devices
             .entry(device.device_id.as_str())
             .and_modify(|key| {
-                if *key != Some(device.encryption_pubkey) {
+                if *key != this_entry {
                     *key = None;
                 }
             })
-            .or_insert(Some(device.encryption_pubkey));
+            .or_insert(this_entry);
     }
     Ok(devices)
 }
@@ -529,6 +530,47 @@ mod tests {
                 device("dev-a", KEY_A, "active"),
                 device("dev-b", KEY_B, "active"),
                 device("dev-b", KEY_C, "active"),
+            ],
+            vec![],
+        ));
+        assert_eq!(select(&[doc]), Ok(vec![recipient("dev-a", KEY_A)]));
+    }
+
+    #[test]
+    fn a_duplicate_entry_that_is_not_active_excludes_the_device() {
+        // Regression: an ineligible duplicate entry used to be skipped, leaving the active entry
+        // (possibly with another key) selected. Either order, different or same key.
+        for (first, second) in [
+            (
+                device("dev-b", KEY_B, "active"),
+                device("dev-b", KEY_C, "revoked"),
+            ),
+            (
+                device("dev-b", KEY_C, "revoked"),
+                device("dev-b", KEY_B, "active"),
+            ),
+            (
+                device("dev-b", KEY_B, "active"),
+                device("dev-b", KEY_B, "revoked"),
+            ),
+        ] {
+            let doc = signed(&state(
+                1,
+                vec![device("dev-a", KEY_A, "active"), first, second],
+                vec![],
+            ));
+            assert_eq!(select(&[doc]), Ok(vec![recipient("dev-a", KEY_A)]));
+        }
+    }
+
+    #[test]
+    fn a_duplicate_entry_that_has_expired_excludes_the_device() {
+        let doc = signed(&state(
+            1,
+            vec![
+                device("dev-a", KEY_A, "active"),
+                device("dev-b", KEY_B, "active"),
+                expiring("dev-b", KEY_B, NOW_MS),
             ],
             vec![],
         ));

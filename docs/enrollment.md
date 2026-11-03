@@ -64,7 +64,9 @@ It is fail-closed throughout:
   sequence below that floor is an error, never a fallback to the older state;
 - a device whose `cert_expires_at` is at or before `now_ms` is not a recipient;
 - when several verified documents share the highest sequence, a device counts only if all of them list it active,
-  unrevoked, unexpired, and with the same encryption key (a conflict can only remove readers);
+  unrevoked, unexpired, and with the same encryption key (a conflict can only remove readers); likewise, within
+  one document, a device id listed more than once counts only if every entry is active and unexpired with the
+  same key;
 - an empty `device_id` in a highest-sequence document, or an all-zero encryption key on a selected device, is an
   error;
 - no document, no remaining device, or more than `MAX_RECIPIENTS` (16) is an error, never an empty list.
