@@ -149,10 +149,19 @@ async function startFakeRelay({ now = FIXED_NOW } = {}) {
           res.writeHead(status, { "Content-Type": "application/json" });
           res.end(JSON.stringify(payload));
         };
+        const docs = parsed.account_states;
+        if (
+          !Array.isArray(docs) ||
+          docs.length === 0 ||
+          docs.length > 16 ||
+          !docs.every((doc) => typeof doc === "string")
+        ) {
+          return reply(400, { error: "'account_states' must be an array of 1 to 16 strings" });
+        }
         const root = boundRoots.get(accountId);
         if (root === undefined) return reply(409, { error: "account root not bound" });
         let highest = -1;
-        for (const jws of parsed.account_states ?? []) {
+        for (const jws of docs) {
           let sequence;
           try {
             sequence = JSON.parse(wasm.verify_account_state(jws, accountId, root)).sequence;
@@ -345,6 +354,33 @@ test("fetchAccountStatesWithMetadata returns relay max_sequence metadata", async
   }
 });
 
+test("fetchAccountStatesWithMetadata rejects a response without max_sequence (fail-closed, no default)", async () => {
+  // Regression: a missing max_sequence used to be coerced to 0, silently disabling the approver's
+  // relay-metadata rollback check instead of failing closed.
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const body of [
+      { account_states: [] },
+      { account_states: [], max_sequence: null },
+      { account_states: [], max_sequence: -1 },
+      { account_states: [], max_sequence: 2 ** 53 },
+    ]) {
+      globalThis.fetch = async () =>
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      await assert.rejects(
+        fetchAccountStatesWithMetadata("https://relay.allw.test", "acct-2"),
+        /unexpected shape/,
+        JSON.stringify(body),
+      );
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 /** A root-signed account-state document for `root`'s own account at `sequence`. */
 function signedAccountState(wasm, root, sequence) {
   return wasm.sign_account_state(
@@ -403,6 +439,9 @@ test("publishAccountStates fails closed on a relay rejection", async () => {
     // Signed by another root → 403.
     const forged = signedAccountState(wasm, { ...other, accountId: root.accountId }, 4);
     await assert.rejects(publishAccountStates(relay.url, root.accountId, [forged]), /HTTP 403/);
+
+    // An empty document set is malformed → 400 (the fake relay enforces the real 1–16 bound).
+    await assert.rejects(publishAccountStates(relay.url, root.accountId, []), /HTTP 400/);
 
     // Republishing the current document (not a higher sequence) → 409.
     await publishAccountStates(relay.url, root.accountId, [doc]);

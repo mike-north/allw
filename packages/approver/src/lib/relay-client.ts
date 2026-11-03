@@ -184,7 +184,11 @@ function accountStatesUrl(relayUrl: string, accountId: string): string {
   return `${normalizeBase(relayUrl)}/${encodeURIComponent(accountId)}/account-states`;
 }
 
-/** Validate an `{ account_states, max_sequence? }` relay response body (fail-closed on any drift). */
+/**
+ * Validate an `{ account_states, max_sequence }` relay response body, fail-closed on any drift. The
+ * relay always reports `max_sequence` (`docs/relay-api.md` §3 Account state) and the approver's
+ * rollback defense compares against it, so a missing value is rejected, never defaulted.
+ */
 function parseAccountStateSet(result: unknown): AccountStateFetchResult {
   if (
     typeof result !== "object" ||
@@ -197,15 +201,12 @@ function parseAccountStateSet(result: unknown): AccountStateFetchResult {
     throw new Error(`relay account-states returned an unexpected shape: ${JSON.stringify(result)}`);
   }
   const maxSequence = (result as { max_sequence?: unknown }).max_sequence;
-  if (
-    maxSequence !== undefined &&
-    (typeof maxSequence !== "number" || !Number.isSafeInteger(maxSequence) || maxSequence < 0)
-  ) {
+  if (typeof maxSequence !== "number" || !Number.isSafeInteger(maxSequence) || maxSequence < 0) {
     throw new Error(`relay account-states returned an unexpected shape: ${JSON.stringify(result)}`);
   }
   return {
     accountStates: (result as { account_states: string[] }).account_states,
-    maxSequence: maxSequence ?? 0,
+    maxSequence,
   };
 }
 
