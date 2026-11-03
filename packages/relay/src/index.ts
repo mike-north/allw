@@ -28,6 +28,7 @@
  * `pairing/complete` likewise refuses (403) on an unbound account.
  */
 
+import { AlarmMultiplexer } from "./alarms.js";
 import { PAIRING_TTL_MS } from "./constants.js";
 import { withCors, type CorsEnv } from "./cors.js";
 import {
@@ -44,6 +45,7 @@ import {
   MAX_PUSH_TOKENS_PER_REGISTRATION,
   MAX_PUSH_TOKENS_PER_TRANSPORT,
   WEB_PUSH_COALESCE_MS,
+  WEB_PUSH_TRAILING_RETRY_MS,
   diffPushTokenSet,
   WakeupCoalescer,
   dispatchPushWakeups,
@@ -108,6 +110,20 @@ interface DevicePushTokenRow extends Record<string, string | number | null | Arr
   token: string;
   created_at: number;
 }
+
+/** A row of `webpush_trailing_wakeup`: a subscription owed one wakeup once its window ends. */
+interface TrailingWakeupRow extends Record<string, string | number | null | ArrayBuffer> {
+  account_id: string;
+  device_id: string;
+  token: string;
+  due_at: number;
+}
+
+/**
+ * The jobs that share this Durable Object's single alarm (see `alarms.ts`), in the order they run
+ * when due together: expiry first, so a trailing wakeup never counts a request that just expired.
+ */
+type RelayAlarmPurpose = "request-expiry" | "webpush-trailing-wakeup";
 
 interface IncomingPushToken {
   transport: PushTransportKind;
@@ -471,6 +487,11 @@ function parseSurfaceId(request: Request): string | null | undefined {
   return value;
 }
 
+/** The coalescing key of one Web Push subscription: its device plus endpoint. */
+function webPushCoalesceKey(deviceId: string, token: string): string {
+  return `${deviceId}\0${token}`;
+}
+
 // ---------------------------------------------------------------------------
 // AccountRelay Durable Object
 // ---------------------------------------------------------------------------
@@ -500,12 +521,15 @@ export class AccountRelay implements DurableObject {
    * Only tests read it (to assert on the outcome of background delivery without sleeping).
    */
   private pushFanOut: Promise<void> = Promise.resolve();
+  /** The single DO alarm, shared by every {@link RelayAlarmPurpose}. Never call `setAlarm` directly. */
+  private readonly alarms: AlarmMultiplexer<RelayAlarmPurpose>;
 
   constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
     this.sql = ctx.storage.sql;
     this.pushTransports = buildPushTransports(env);
     this.initSchema();
+    this.alarms = new AlarmMultiplexer(ctx.storage);
     // On reactivation, restore the alarm from persisted pending rows in case the previous
     // isolate exited after a write but before the scheduled alarm was durably restored.
     this.ctx.waitUntil(this.armExpiryAlarm());
@@ -533,6 +557,18 @@ export class AccountRelay implements DurableObject {
         token      TEXT    NOT NULL,
         created_at INTEGER NOT NULL,
         PRIMARY KEY (device_id, transport, token)
+      );
+
+      -- Web Push subscriptions owed one trailing wakeup: a submit was coalesced (skipped) while
+      -- the subscription's window was open, so it may have landed after the service worker's
+      -- inbox fetch. One row per subscription, sent when its window ends (due_at) via the alarm.
+      -- Routing metadata only. account_id is this DO's own account, kept for the wakeup payload.
+      CREATE TABLE IF NOT EXISTS webpush_trailing_wakeup (
+        account_id TEXT    NOT NULL,
+        device_id  TEXT    NOT NULL,
+        token      TEXT    NOT NULL,
+        due_at     INTEGER NOT NULL,
+        PRIMARY KEY (device_id, token)
       );
 
       CREATE TABLE IF NOT EXISTS actor (
@@ -1587,7 +1623,12 @@ export class AccountRelay implements DurableObject {
     await this.armExpiryAlarm();
 
     const delivered = this.sendRequestToOneSocketPerSurface(id, envelope);
-    const pushWakeups = this.schedulePushWakeups(accountId, id, expiresAt);
+    const { scheduled: pushWakeups, coalesced } = this.schedulePushWakeups(
+      accountId,
+      id,
+      expiresAt,
+    );
+    if (coalesced > 0) await this.armTrailingWakeupAlarm();
 
     return this.requestSubmitResponse(id, delivered, pushWakeups, requestAuthToken);
   }
@@ -1631,19 +1672,34 @@ export class AccountRelay implements DurableObject {
   }
 
   /**
-   * Schedule request-id-at-most push wakeups (Web Push sends no payload at all) to registered device
-   * push tokens, and return how many were scheduled. Only tokens whose transport is configured are
-   * scheduled, newest registrations first, up to the account budget. A Web Push wakeup to a
-   * subscription that has one in flight or was woken within `WEB_PUSH_COALESCE_MS` is skipped: submit
-   * needs no caller auth, so this is what bounds push volume per subscription. The check-and-claim
-   * runs synchronously here, before any `await`, so concurrent submits cannot both claim.
+   * Schedule push wakeups to registered device push tokens: at most a request id (Web Push sends no
+   * payload at all). Only tokens whose transport is configured are scheduled, newest registrations
+   * first, up to the account budget.
+   *
+   * Web Push coalescing: if a subscription has a wakeup in flight, or was woken within
+   * `WEB_PUSH_COALESCE_MS`, it is skipped. Submit needs no caller auth, so this is what bounds push
+   * volume per subscription. The check-and-claim runs synchronously here, before any `await`, so
+   * concurrent submits cannot both claim.
+   *
+   * A skipped subscription is recorded in `webpush_trailing_wakeup` and woken once more when its
+   * window ends (see {@link sendTrailingWakeups}). The earlier wakeup may already have been fetched
+   * before this request was stored, so without that the request could get no push at all. A
+   * subscription that is claimed here has its trailing row cleared: this wakeup is dispatched after
+   * every request stored so far, so it covers them.
    *
    * The fan-out runs **off the response path** under `waitUntil`, so a slow or hung push service can
-   * never delay or fail the submit.
+   * never delay or fail the submit. Returns how many wakeups were scheduled and how many Web Push
+   * subscriptions were coalesced. When the second is non-zero the caller arms the alarm with
+   * {@link armTrailingWakeupAlarm}.
    */
-  private schedulePushWakeups(accountId: string, requestId: string, expiresAt: number): number {
+  private schedulePushWakeups(
+    accountId: string,
+    requestId: string,
+    expiresAt: number,
+  ): { scheduled: number; coalesced: number } {
     const now = Date.now();
     const claimedWebPushKeys: string[] = [];
+    let coalesced = 0;
     const tokens = schedulablePushTokens(
       [
         ...this.sql.exec<DevicePushTokenRow>(
@@ -1655,21 +1711,135 @@ export class AccountRelay implements DurableObject {
       this.pushTransports,
     ).filter((token) => {
       if (token.transport !== "webpush") return true;
-      const key = `${token.device_id}\0${token.token}`;
-      if (!this.webPushCoalescer.tryClaim(key, now)) return false;
+      const key = webPushCoalesceKey(token.device_id, token.token);
+      if (!this.webPushCoalescer.tryClaim(key, now)) {
+        coalesced++;
+        // The first skip in a window fixes the due time; later skips find the row already there.
+        this.sql.exec(
+          `INSERT INTO webpush_trailing_wakeup (account_id, device_id, token, due_at)
+           VALUES (?, ?, ?, ?) ON CONFLICT (device_id, token) DO NOTHING`,
+          accountId,
+          token.device_id,
+          token.token,
+          this.webPushCoalescer.nextClaimableAt(key, now),
+        );
+        return false;
+      }
+      this.sql.exec(
+        `DELETE FROM webpush_trailing_wakeup WHERE device_id = ? AND token = ?`,
+        token.device_id,
+        token.token,
+      );
       claimedWebPushKeys.push(key);
       return true;
     });
-    if (tokens.length > 0) {
-      const fanOut = this.deliverPushWakeups(tokens, accountId, requestId, expiresAt).finally(
-        () => {
-          for (const key of claimedWebPushKeys) this.webPushCoalescer.release(key);
-        },
-      );
-      this.pushFanOut = Promise.all([this.pushFanOut, fanOut]).then(() => undefined);
-      this.ctx.waitUntil(fanOut);
+    this.startPushFanOut(tokens, claimedWebPushKeys, accountId, requestId, expiresAt);
+    return { scheduled: tokens.length, coalesced };
+  }
+
+  /**
+   * Start one background fan-out under `waitUntil`, then release the coalescing claims it holds,
+   * whatever the outcome. Does nothing for an empty token list.
+   */
+  private startPushFanOut(
+    tokens: readonly StoredPushToken[],
+    claimedWebPushKeys: readonly string[],
+    accountId: string,
+    requestId: string,
+    expiresAt: number,
+  ): void {
+    if (tokens.length === 0) return;
+    const fanOut = this.deliverPushWakeups(tokens, accountId, requestId, expiresAt).finally(() => {
+      for (const key of claimedWebPushKeys) this.webPushCoalescer.release(key);
+    });
+    this.pushFanOut = Promise.all([this.pushFanOut, fanOut]).then(() => undefined);
+    this.ctx.waitUntil(fanOut);
+  }
+
+  /** Point the `webpush-trailing-wakeup` alarm purpose at the earliest owed trailing wakeup, if any. */
+  private async armTrailingWakeupAlarm(): Promise<void> {
+    const next = [
+      ...this.sql.exec<{ next: number | null }>(
+        `SELECT MIN(due_at) AS next FROM webpush_trailing_wakeup`,
+      ),
+    ][0]?.next;
+    await this.alarms.schedule("webpush-trailing-wakeup", next ?? null);
+  }
+
+  /**
+   * Alarm purpose `webpush-trailing-wakeup`: send each subscription whose trailing wakeup is due its
+   * one owed wakeup.
+   *
+   * - The send goes through the coalescer like any other, so the per-window bound holds. This
+   *   includes a coalescer emptied by eviction.
+   * - A subscription still blocked (a wakeup in flight, or claimed again since) is retried at its
+   *   next claimable time, at least {@link WEB_PUSH_TRAILING_RETRY_MS} away.
+   * - Rows are dropped without sending when there is nothing left to fetch (no pending, unexpired
+   *   request), when the subscription is no longer registered, or when Web Push is not configured.
+   * - The wakeup's deadline is that of the longest-lived pending request, so it lasts as long as
+   *   anything it covers.
+   */
+  private async sendTrailingWakeups(now: number): Promise<void> {
+    if (this.pushTransports.webpush === undefined) {
+      this.sql.exec(`DELETE FROM webpush_trailing_wakeup`);
+      await this.armTrailingWakeupAlarm();
+      return;
     }
-    return tokens.length;
+    this.sql.exec(
+      `DELETE FROM webpush_trailing_wakeup
+       WHERE NOT EXISTS (
+         SELECT 1 FROM device_push_token p
+         WHERE p.device_id = webpush_trailing_wakeup.device_id
+           AND p.transport = 'webpush'
+           AND p.token = webpush_trailing_wakeup.token
+       )`,
+    );
+    const latest = [
+      ...this.sql.exec<{ request_id: string; expires_at: number }>(
+        `SELECT request_id, expires_at FROM request
+         WHERE status = 'pending' AND expires_at > ?
+         ORDER BY expires_at DESC LIMIT 1`,
+        now,
+      ),
+    ][0];
+    if (latest === undefined) {
+      this.sql.exec(`DELETE FROM webpush_trailing_wakeup WHERE due_at <= ?`, now);
+      await this.armTrailingWakeupAlarm();
+      return;
+    }
+    const due = [
+      ...this.sql.exec<TrailingWakeupRow>(
+        `SELECT account_id, device_id, token, due_at FROM webpush_trailing_wakeup
+         WHERE due_at <= ? ORDER BY due_at ASC`,
+        now,
+      ),
+    ];
+    const tokens: StoredPushToken[] = [];
+    const claimedKeys: string[] = [];
+    let accountId = "";
+    for (const row of due) {
+      const key = webPushCoalesceKey(row.device_id, row.token);
+      if (this.webPushCoalescer.tryClaim(key, now)) {
+        this.sql.exec(
+          `DELETE FROM webpush_trailing_wakeup WHERE device_id = ? AND token = ?`,
+          row.device_id,
+          row.token,
+        );
+        tokens.push({ device_id: row.device_id, transport: "webpush", token: row.token });
+        claimedKeys.push(key);
+        accountId = row.account_id;
+      } else {
+        const claimableAt = this.webPushCoalescer.nextClaimableAt(key, now);
+        this.sql.exec(
+          `UPDATE webpush_trailing_wakeup SET due_at = ? WHERE device_id = ? AND token = ?`,
+          Math.max(claimableAt, now + WEB_PUSH_TRAILING_RETRY_MS),
+          row.device_id,
+          row.token,
+        );
+      }
+    }
+    this.startPushFanOut(tokens, claimedKeys, accountId, latest.request_id, latest.expires_at);
+    await this.armTrailingWakeupAlarm();
   }
 
   /**
@@ -2080,11 +2250,28 @@ export class AccountRelay implements DurableObject {
   }
 
   /**
-   * Durable Object alarm: proactively fail-closes expired pending requests, retracts them from
-   * connected devices, wakes live integrator waiters, and then schedules the next pending expiry.
+   * Durable Object alarm: runs whichever purposes are due (see {@link RelayAlarmPurpose} and
+   * `alarms.ts`). Expiry runs first, and on every firing: it recomputes everything from the request
+   * table, so running it early is harmless, and an alarm left by an older deploy still expires and
+   * sweeps.
    */
   async alarm(): Promise<void> {
-    const now = Date.now();
+    await this.alarms.run(
+      Date.now(),
+      {
+        "request-expiry": (now) => this.expireDueRequests(now),
+        "webpush-trailing-wakeup": (now) => this.sendTrailingWakeups(now),
+      },
+      { everyFiring: ["request-expiry"] },
+    );
+  }
+
+  /**
+   * Alarm purpose `request-expiry`: fail-close expired pending requests, retract them from
+   * connected devices, wake live integrator waiters, sweep old terminal rows, and then schedule the
+   * next pending expiry.
+   */
+  private async expireDueRequests(now: number): Promise<void> {
     const expired = this.expirePendingDue(now);
     for (const request of expired) {
       this.notifyExpiredRequest(request.request_id);
@@ -2093,18 +2280,14 @@ export class AccountRelay implements DurableObject {
     await this.armExpiryAlarm();
   }
 
-  /** Schedule the alarm to the nearest pending expiry, or clear it when no pending request remains. */
+  /** Point the `request-expiry` alarm purpose at the nearest pending expiry, or clear it when none remains. */
   private async armExpiryAlarm(): Promise<void> {
     const next = [
       ...this.sql.exec<{ expires_at: number }>(
         `SELECT expires_at FROM request WHERE status = 'pending' ORDER BY expires_at ASC LIMIT 1`,
       ),
     ][0];
-    if (!next) {
-      await this.ctx.storage.deleteAlarm();
-      return;
-    }
-    await this.ctx.storage.setAlarm(Math.max(next.expires_at, Date.now()));
+    await this.alarms.schedule("request-expiry", next?.expires_at ?? null);
   }
 
   /** Mark every overdue pending request expired and return the rows that changed state. */

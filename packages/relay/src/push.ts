@@ -55,11 +55,22 @@ export const MAX_PUSH_TOKENS_PER_ACCOUNT = 32;
  * Minimum spacing between Web Push wakeups to one subscription. Submitting a request needs no caller
  * auth, so without this every submit would fan out real, VAPID-signed pushes: notification spam on
  * the user's browser (service workers must show a notification per push) and, because one VAPID key
- * serves every account, push-service throttling of the whole relay. A Web Push wakeup is payload-less
- * ("check your inbox"), so one wakeup covers every request submitted while it is pending; coalescing
- * loses nothing the inbox fetch does not recover.
+ * serves every account, push-service throttling of the whole relay.
+ *
+ * A Web Push wakeup is payload-less ("check your inbox"), but it covers only requests stored
+ * before the service worker's inbox fetch. A submit skipped by coalescing may land after that
+ * fetch, so the relay sends one **trailing** wakeup when the window ends (see `AccountRelay`'s
+ * `webpush_trailing_wakeup`). Every request then gets a wakeup sent after it was stored, still at
+ * most one push per subscription per window.
  */
 export const WEB_PUSH_COALESCE_MS = 30_000;
+
+/**
+ * How long a due trailing wakeup waits before trying again when its subscription is still blocked
+ * by a wakeup in flight. A fan-out can outlast the coalescing window: each send has a 5 s timeout,
+ * and at most 4 run at once.
+ */
+export const WEB_PUSH_TRAILING_RETRY_MS = 1_000;
 
 /** Most wakeups in flight at once; Workers allow about six open outbound connections. */
 const DEFAULT_PUSH_CONCURRENCY = 4;
@@ -292,6 +303,17 @@ export class WakeupCoalescer {
     this.lastClaimedAt.set(key, nowMs);
     this.inFlight.add(key);
     return true;
+  }
+
+  /**
+   * The earliest epoch ms at which {@link tryClaim} for `key` could next succeed: just past the
+   * window of its last claim, or `nowMs` if it has none. While a wakeup is in flight the answer
+   * also depends on when it finishes, which is unknown here, so callers treat the result as a lower
+   * bound.
+   */
+  nextClaimableAt(key: string, nowMs: number): number {
+    const last = this.lastClaimedAt.get(key);
+    return last === undefined ? nowMs : Math.max(nowMs, last + this.windowMs + 1);
   }
 
   /** Mark a claimed wakeup finished. The window from its claim still applies. */
