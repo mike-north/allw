@@ -482,7 +482,8 @@ export function createWasmRuntime(options: WasmRuntimeOptions): WebApproverRunti
       );
     }
 
-    // Decrypt via the core. A wrong key / tampered ciphertext / malformed JWE throws here.
+    // Decrypt via the core. A wrong key / tampered ciphertext / malformed JWE throws here, and so does
+    // a context that breaks a v1 device-side check (docs/contract.md §Device-side context checks).
     const contextJson = wasm.decrypt_context(
       envelope.context_ciphertext,
       identity.deviceId,

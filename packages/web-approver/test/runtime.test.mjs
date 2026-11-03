@@ -347,6 +347,29 @@ test("undecryptable context: a JWE the device key cannot open fails closed in pr
   );
 });
 
+test("v1 context checks (#296): a non-null reserved field or a hidden risk downgrade fails closed in prepare", async () => {
+  const wasm = await loadTestWasm();
+  const { identity, encryptTo } = pairedIdentity(wasm);
+  const runtime = runtimeAt(wasm, identity);
+  // docs/contract.md §Device-side context checks: the core's decrypt_context refuses these, so the
+  // card renders unverified (deny-only) with the core's error naming the field or both tiers.
+  const cases = [
+    [{ ...CONTEXT, action: { ...CONTEXT.action, capabilities: [] } }, "action.capabilities"],
+    [{ ...CONTEXT, action: { ...CONTEXT.action, scope: {} } }, "action.scope"],
+    [
+      { ...CONTEXT, risk: "low" },
+      `context risk low is lower than action.risk ${CONTEXT.action.risk}`,
+    ],
+  ];
+  for (const [context, named] of cases) {
+    await assert.rejects(
+      () => runtime.prepare(makeEnvelope(encryptTo(JSON.stringify(context)))),
+      (err) => err instanceof Error && err.message.includes(named),
+      `the refusal must name ${named}`,
+    );
+  }
+});
+
 test("missing ciphertext: a malformed envelope is rejected before any crypto", async () => {
   const wasm = await loadTestWasm();
   const { identity } = pairedIdentity(wasm);
