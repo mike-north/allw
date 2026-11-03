@@ -60,29 +60,46 @@
 //!   command lines.
 //! - Heredocs (`<<`, `<<-`) are recognized:
 //!   - the delimiter is read as bash reads it: an empty quoted delimiter (`<<''`) ends the body at
-//!     the first empty line, and a backslash-newline inside it is removed;
+//!     the first empty line, a backslash-newline is removed, and inside double quotes `\"`, `\\`,
+//!     `\$` and `` \` `` are unescaped;
 //!   - a delimiter T1 can't read for sure (`$'…'`, a backtick, none at all) makes the line `High`;
-//!   - a quoted delimiter makes the body literal, and an unquoted one makes only its substitutions
-//!     run.
-//! - A heredoc or here-string (`<<<`) fed to a shell is classified as a script. The shell may be
-//!   the command word or a later word after a curated wrapper (`env bash <<'EOF'`).
+//!   - an unquoted delimiter's body has its substitutions classified.
+//! - **Every heredoc and here-string (`<<<`) body is also read as a script**, whatever consumes it
+//!   (a shell, a wrapper, a compound command, `eval`, or `cat`), and the higher tier wins. This is a
+//!   deliberate fail-upward rule: deciding which consumers run their input is a moving target
+//!   (`{ bash; } <<'EOF'`, `eval bash <<'EOF'`, …), and over-reading a body only raises the tier.
+//! - `((…))` at a command position (including `for ((…))`) is arithmetic: a `<<` inside it is a
+//!   shift, not a heredoc.
 //! - Any operator, substitution or redirection makes the line at least `Medium`. A line that ends
 //!   inside an open quote or substitution is `High`: the shell runs what comes before the syntax
 //!   error.
 //!
-//! Quoting follows bash. Two ambiguities are read both ways, and the higher tier wins: whether `#`
-//! starts a comment, and whether `$'…'` is an ANSI-C string (bash) or not (dash, `shlex`). These
-//! alternate readings run only when the line holds an unquoted `#` or a `$'`. zsh-only syntax gets
-//! fail-upward handling only: its precommand words, and `&!` / `&|` as operators.
+//! Quoting follows bash ≥ 4. Where shells, versions or tokenizers disagree, the line is read
+//! both ways and the higher tier wins:
+//!
+//! - whether `#` starts a comment;
+//! - whether `$'…'` is an ANSI-C string (bash) or not (dash, `shlex`);
+//! - whether `((` opens an arithmetic command or two subshells;
+//! - whether a heredoc inside `$(…)` is read before the closing `)` (bash ≥ 4, zsh) or the first
+//!   `)` closes the substitution (bash 3.2, dash).
+//!
+//! Each alternate reading runs only when the line holds the syntax it is about, and only at the
+//! top level: nested `-c` strings, `eval` arguments and substitutions are read the bash way, so
+//! the readings don't multiply with depth. zsh-only syntax gets fail-upward handling only: its
+//! precommand words, and `&!` / `&|` as operators.
 //!
 //! # Bounds (all fail upward)
 //!
 //! - Nesting of `-c`, `eval` and substitutions past [`MAX_SHELL_NESTING`] levels: `High`.
 //! - Argv positions past [`MAX_PROGRAM_CANDIDATES`] are not analyzed. They count as a `High`
 //!   candidate for any wrapper, shell or assignment in front of them.
-//! - All analysis of one record shares one budget of [`MAX_RISK_WORK`] units (bytes scanned or
-//!   split, plus argv positions classified). Exhausting it makes the record at least `High`, and
-//!   never lowers a tier already found (a `dd` seen before the budget ran out stays `Critical`).
+//! - Before any budgeted work, an unbudgeted linear pre-pass records the tier of every visible
+//!   program word: each argv word, and the command word of every top-level segment.
+//! - All analysis of one record shares one budget of [`MAX_RISK_WORK`] units (bytes scanned,
+//!   split or copied, plus argv positions classified). Exhausting it makes the record at least
+//!   `High`, and never lowers a tier already found: any program word visible at the top level
+//!   keeps its tier on exhaustion (a `dd` padded with megabytes after it stays `Critical`). Only
+//!   text the analysis never reached falls back to `High`.
 //!   Every candidate string is analyzed once per level, and every look-ahead scan is linear, so
 //!   work grows linearly with input size.
 //!
@@ -175,6 +192,7 @@ const ZSH_PRECOMMANDS: &[&str] = &["noglob", "nocorrect", "-"];
 /// Risk of an argv that runs without a shell (the argv of `action_from_argv`).
 pub(super) fn argv_risk(argv: &[String]) -> Risk {
     let mut budget = Budget::new(MAX_RISK_WORK);
+    note_visible_programs(None, argv, &mut budget);
     let risk = classify_argv(argv, 0, &mut budget);
     budget.finish(risk)
 }
@@ -188,6 +206,7 @@ pub(super) fn command_line_risk(line: &str, words: &[String]) -> Risk {
 }
 
 fn line_and_words_risk(line: &str, words: &[String], budget: &mut Budget) -> Risk {
+    note_visible_programs(Some(line), words, budget);
     let risk = classify_argv(words, 0, budget);
     match shell_line_risk(line, 0, budget) {
         Some(line_risk) => max_risk(risk, line_risk),
@@ -419,14 +438,16 @@ fn command_string_risk(text: &str, depth: usize, budget: &mut Budget) -> Option<
 }
 
 /// The table's tier for the command starting at `argv[j]`. Only `rm` / `git` / `chmod` read their
-/// own flags, so only they pay for the split.
-fn direct_risk(argv: &[String], j: usize, budget: &mut Budget) -> Risk {
+/// own flags, so only they pay for the split, charged by the bytes it copies (`suffix_bytes`, the
+/// size of `argv[j..]`).
+fn direct_risk(argv: &[String], j: usize, suffix_bytes: usize, budget: &mut Budget) -> Risk {
     let program = argv[j].as_str();
     let tier = match basename(program) {
         "rm" | "git" | "chmod" => {
-            if !budget.spend(argv.len() - j) {
+            if !budget.spend(suffix_bytes) {
                 return Risk::High;
             }
+            note_scanned(suffix_bytes);
             let (flags, positionals) = split_flags_and_positionals(&argv[j..]);
             classify_program(program, &flags, &positionals)
         }
@@ -484,6 +505,13 @@ fn classify_argv(argv: &[String], depth: usize, budget: &mut Budget) -> Risk {
             .map(|p| w + 1 + p)
     });
 
+    // Bytes in `argv[j..]` for each analyzed `j`, for charging `direct_risk`'s split.
+    let mut suffix_bytes = vec![0usize; analyzed + 1];
+    suffix_bytes[analyzed] = argv[analyzed..].iter().map(|w| w.len() + 1).sum();
+    for j in (0..analyzed).rev() {
+        suffix_bytes[j] = suffix_bytes[j + 1] + argv[j].len() + 1;
+    }
+
     let mut risk = vec![Risk::Low; analyzed];
     // Suffix state over positions k > j.
     let mut later_max: Option<Risk> = unseen; // tier of a later non-flag word as a program start
@@ -500,7 +528,7 @@ fn classify_argv(argv: &[String], depth: usize, budget: &mut Budget) -> Risk {
         }
         let token = argv[j].as_str();
         let base = basename(token);
-        let direct = direct_risk(argv, j, budget);
+        let direct = direct_risk(argv, j, suffix_bytes[j], budget);
         let tier = if is_assignment_like(token) {
             let after = if j + 1 < analyzed {
                 risk[j + 1]
@@ -581,9 +609,9 @@ fn classify_argv(argv: &[String], depth: usize, budget: &mut Budget) -> Risk {
 
 // ── Shell-line scanning ───────────────────────────────────────────────────────
 
-/// How the scanner reads the two places where shells (or tokenizers) disagree. The bash reading
-/// ([`Reading::BASH`]) is authoritative; the others are analyzed only when the line holds the
-/// ambiguous syntax, and can only raise the tier.
+/// How the scanner reads the places where shells (or tokenizers, or bash versions) disagree. The
+/// bash ≥ 4 reading ([`Reading::BASH`]) is authoritative; the others are analyzed only for the
+/// top-level line, only when it holds the ambiguous syntax, and can only raise the tier.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Reading {
     /// An unquoted `#` at the start of a word starts a comment that runs to the end of the line.
@@ -591,22 +619,28 @@ struct Reading {
     /// `$'…'` is an ANSI-C string in which `\'` does not end the string (bash, zsh, ksh; not
     /// dash, and not the `shlex` tokenizer).
     ansi_c_quotes: bool,
+    /// `((…))` at a command position is an arithmetic command: no heredocs or operators inside it
+    /// (bash, zsh, ksh). Otherwise it is two subshells.
+    arithmetic_commands: bool,
+    /// A heredoc inside `$(…)` is read as a heredoc, so a `)` in its body doesn't close the
+    /// substitution (bash ≥ 4, zsh). Otherwise the first unquoted `)` closes it (bash 3.2, dash).
+    heredocs_in_substitutions: bool,
 }
 
 impl Reading {
     const BASH: Reading = Reading {
         honor_comments: true,
         ansi_c_quotes: true,
+        arithmetic_commands: true,
+        heredocs_in_substitutions: true,
     };
 }
 
 /// A heredoc whose body begins at the next unquoted newline.
 struct PendingHeredoc {
-    delimiter: String,
+    delimiter: Vec<u8>,
     strip_tabs: bool,
     quoted: bool,
-    /// Index of the segment holding the `<<` (the segment that receives the body as stdin).
-    segment: usize,
 }
 
 /// What a shell does with a command line, as far as risk needs to know.
@@ -616,8 +650,8 @@ struct ShellLine<'a> {
     segments: Vec<&'a str>,
     /// Bodies of command and process substitutions, each a command line of its own.
     substitutions: Vec<&'a str>,
-    /// Heredoc bodies with the index of the segment that reads them.
-    heredocs: Vec<(usize, &'a str)>,
+    /// Heredoc bodies. Each is always also classified as a script, whatever reads it.
+    heredocs: Vec<&'a str>,
     /// Any operator, substitution or redirection: shell syntax beyond plain words.
     has_shell_syntax: bool,
     /// The line ends inside an open quote, substitution or backtick, or holds syntax T1 can't
@@ -627,6 +661,8 @@ struct ShellLine<'a> {
     saw_comment: bool,
     /// The line holds an unquoted `$'` (the ANSI-C reading is ambiguous).
     saw_ansi_c: bool,
+    /// The line holds an arithmetic command `((…))` (the arithmetic reading is ambiguous).
+    saw_arithmetic: bool,
 }
 
 #[cfg(test)]
@@ -674,10 +710,12 @@ fn skip_ansi_c_string(b: &[u8], start: usize) -> Option<usize> {
 }
 
 /// Index of the `)` closing a `(` whose body starts at `start`, honoring quotes and backslashes,
-/// or `None` if it is never closed.
+/// or `None` if it is never closed. With [`Reading::heredocs_in_substitutions`], a heredoc
+/// inside is read as one, so a `)` in its body doesn't close the substitution.
 fn find_closing_paren(b: &[u8], start: usize, reading: Reading) -> Option<usize> {
     let mut depth = 1usize;
     let mut in_double = false;
+    let mut pending: Vec<PendingHeredoc> = Vec::new();
     let mut i = start;
     while i < b.len() {
         match b[i] {
@@ -691,6 +729,24 @@ fn find_closing_paren(b: &[u8], start: usize, reading: Reading) -> Option<usize>
             }
             b'$' if reading.ansi_c_quotes && !in_double && b.get(i + 1) == Some(&b'\'') => {
                 i = skip_ansi_c_string(b, i + 2).unwrap_or(b.len());
+                continue;
+            }
+            b'<' if reading.heredocs_in_substitutions
+                && !in_double
+                && b.get(i + 1) == Some(&b'<')
+                && b.get(i + 2) != Some(&b'<') =>
+            {
+                let (heredoc, end) = heredoc_operator(b, i);
+                pending.push(heredoc);
+                i = end;
+                continue;
+            }
+            b'\n' if !in_double && !pending.is_empty() => {
+                let mut pos = i + 1;
+                for heredoc in pending.drain(..) {
+                    pos = consume_heredoc(b, pos, &heredoc).1;
+                }
+                i = pos;
                 continue;
             }
             b'"' => in_double = !in_double,
@@ -738,7 +794,7 @@ fn is_word_break(c: u8) -> bool {
 /// A heredoc delimiter word as bash reads it.
 struct HeredocDelimiter {
     /// The delimiter text after quote removal; may be empty (`<<''`).
-    text: String,
+    text: Vec<u8>,
     /// Any part was quoted or escaped, so the body is literal.
     quoted: bool,
     /// The word holds syntax whose delimiter meaning T1 doesn't model (`$'…'`, `$"…"`, a
@@ -748,8 +804,12 @@ struct HeredocDelimiter {
     end: usize,
 }
 
-/// Read a heredoc delimiter word starting at `i`. A backslash-newline inside it is a line
-/// continuation and is removed, as bash does before reading the word.
+/// Read a heredoc delimiter word starting at `i`, removing quotes as bash does:
+/// - unquoted, a backslash-newline is a line continuation and is removed; another backslash
+///   quotes the next byte;
+/// - in single quotes every byte is literal;
+/// - in double quotes, a backslash-newline is removed and `\"`, `\\`, `\$`, `` \` `` lose their
+///   backslash; any other backslash is literal.
 fn read_heredoc_delimiter(b: &[u8], mut i: usize) -> HeredocDelimiter {
     let start = i;
     let mut word = Vec::new();
@@ -774,17 +834,38 @@ fn read_heredoc_delimiter(b: &[u8], mut i: usize) -> HeredocDelimiter {
                 word.push(b'`');
                 i += 1;
             }
-            q @ (b'\'' | b'"') => {
+            b'\'' => {
                 quoted = true;
-                let end = match find_byte(b, i + 1, q) {
-                    Some(end) => end,
-                    None => {
-                        uncertain = true;
-                        b.len()
-                    }
-                };
+                let end = find_byte(b, i + 1, b'\'').unwrap_or_else(|| {
+                    uncertain = true;
+                    b.len()
+                });
                 word.extend_from_slice(&b[i + 1..end]);
                 i = end + 1;
+            }
+            b'"' => {
+                quoted = true;
+                let mut j = i + 1;
+                loop {
+                    match b.get(j) {
+                        None => {
+                            uncertain = true;
+                            break;
+                        }
+                        Some(b'"') => break,
+                        Some(b'\\') if b.get(j + 1) == Some(&b'\n') => j += 2,
+                        Some(b'\\') if matches!(b.get(j + 1), Some(b'"' | b'\\' | b'$' | b'`')) => {
+                            word.push(b[j + 1]);
+                            j += 2;
+                        }
+                        Some(&c) => {
+                            word.push(c);
+                            j += 1;
+                        }
+                    }
+                }
+                note_scanned(j.min(b.len()) - i);
+                i = j + 1;
             }
             c => {
                 word.push(c);
@@ -795,33 +876,57 @@ fn read_heredoc_delimiter(b: &[u8], mut i: usize) -> HeredocDelimiter {
     // `<<` with no word at all is a syntax error.
     uncertain |= i == start;
     HeredocDelimiter {
-        text: String::from_utf8_lossy(&word).into_owned(),
+        text: word,
         quoted,
         uncertain,
         end: i.min(b.len()),
     }
 }
 
-/// Consume a heredoc body starting at `pos`: the body's byte range and the index just past its
-/// delimiter line (or the end of the text when there is none).
-fn consume_heredoc(text: &str, pos: usize, heredoc: &PendingHeredoc) -> (usize, usize, usize) {
-    let b = text.as_bytes();
-    let start = pos;
+/// Read the heredoc operator `<<` or `<<-` at `b[i]` and its delimiter: the pending heredoc,
+/// whether its delimiter is uncertain, and the index just past the delimiter word.
+fn heredoc_operator(b: &[u8], i: usize) -> (PendingHeredoc, usize) {
+    let (heredoc, end, _) = heredoc_operator_checked(b, i);
+    (heredoc, end)
+}
+
+/// [`heredoc_operator`], also reporting whether the delimiter is uncertain.
+fn heredoc_operator_checked(b: &[u8], i: usize) -> (PendingHeredoc, usize, bool) {
+    let strip_tabs = b.get(i + 2) == Some(&b'-');
+    let mut p = i + 2 + usize::from(strip_tabs);
+    while p < b.len() && (b[p] == b' ' || b[p] == b'\t') {
+        p += 1;
+    }
+    let delimiter = read_heredoc_delimiter(b, p);
+    (
+        PendingHeredoc {
+            delimiter: delimiter.text,
+            strip_tabs,
+            quoted: delimiter.quoted,
+        },
+        delimiter.end,
+        delimiter.uncertain,
+    )
+}
+
+/// Consume a heredoc body starting at `pos`: the index where the body ends, and the index just
+/// past its delimiter line (both the end of the text when there is no delimiter line).
+fn consume_heredoc(b: &[u8], pos: usize, heredoc: &PendingHeredoc) -> (usize, usize) {
     let mut line_start = pos;
     while line_start < b.len() {
         let line_end = find_byte(b, line_start, b'\n').unwrap_or(b.len());
-        let line = &text[line_start..line_end];
-        let line = if heredoc.strip_tabs {
-            line.trim_start_matches('\t')
-        } else {
-            line
-        };
-        if line == heredoc.delimiter {
-            return (start, line_start, (line_end + 1).min(b.len()));
+        let mut line = &b[line_start..line_end];
+        if heredoc.strip_tabs {
+            while let Some((b'\t', rest)) = line.split_first() {
+                line = rest;
+            }
+        }
+        if line == heredoc.delimiter.as_slice() {
+            return (line_start, (line_end + 1).min(b.len()));
         }
         line_start = line_end + 1;
     }
-    (start, b.len(), b.len())
+    (b.len(), b.len())
 }
 
 /// The command substitutions in an unquoted heredoc body. Quotes are literal there; only `$(…)`,
@@ -861,8 +966,16 @@ fn heredoc_substitutions<'a>(body: &'a str, reading: Reading, out: &mut Vec<&'a 
     unterminated
 }
 
+/// Is `prefix` (the text of a segment before some position) only shell keywords, so the next
+/// word is at a command position?
+fn at_command_position(prefix: &str) -> bool {
+    prefix
+        .split_ascii_whitespace()
+        .all(|w| SHELL_KEYWORDS.contains(&w))
+}
+
 /// Split a command line the way bash does for risk: segments between unquoted control operators,
-/// substitution bodies, and heredoc bodies. See [`Reading`] for the two ambiguous rules.
+/// substitution bodies, and heredoc bodies. See [`Reading`] for the ambiguous rules.
 ///
 /// Only ASCII bytes are ever matched, so every slice boundary falls on a UTF-8 char boundary.
 fn scan_shell_line(text: &str, reading: Reading) -> ShellLine<'_> {
@@ -871,6 +984,9 @@ fn scan_shell_line(text: &str, reading: Reading) -> ShellLine<'_> {
     let mut pending: Vec<PendingHeredoc> = Vec::new();
     let mut seg_start = 0;
     let mut in_double = false;
+    // After a `((` that isn't an arithmetic command, don't retry inside the text already scanned
+    // for its closing `))`: each byte is scanned for arithmetic at most once.
+    let mut no_arithmetic_before = 0;
     let mut i = 0;
     while i < b.len() {
         let at_word_start = i == 0 || is_word_break(b[i - 1]);
@@ -942,28 +1058,40 @@ fn scan_shell_line(text: &str, reading: Reading) -> ShellLine<'_> {
                 }
                 continue;
             }
+            b'(' if !in_double
+                && b.get(i + 1) == Some(&b'(')
+                && i >= no_arithmetic_before
+                && at_command_position(&text[seg_start..i]) =>
+            {
+                // `((…))` at a command position: an arithmetic command, with no heredocs or
+                // operators inside. Where the reading is off, it is two subshells (below).
+                line.has_shell_syntax = true;
+                match find_closing_paren(b, i + 2, reading) {
+                    Some(inner) if b.get(inner + 1) == Some(&b')') => {
+                        line.saw_arithmetic = true;
+                        if reading.arithmetic_commands {
+                            i = inner + 2;
+                            continue;
+                        }
+                    }
+                    Some(inner) => no_arithmetic_before = inner,
+                    None => no_arithmetic_before = b.len(),
+                }
+                line.segments.push(&text[seg_start..i]);
+                seg_start = i + 1;
+            }
             b'<' if !in_double && b.get(i + 1) == Some(&b'<') => {
                 line.has_shell_syntax = true;
                 if b.get(i + 2) == Some(&b'<') {
-                    i += 3; // `<<<` is a here-string, not a heredoc
+                    i += 3; // `<<<` is a here-string, read with its segment's words
                     continue;
                 }
-                let strip_tabs = b.get(i + 2) == Some(&b'-');
-                let mut p = i + 2 + usize::from(strip_tabs);
-                while p < b.len() && (b[p] == b' ' || b[p] == b'\t') {
-                    p += 1;
-                }
-                let delimiter = read_heredoc_delimiter(b, p);
+                let (heredoc, end, uncertain) = heredoc_operator_checked(b, i);
                 // A delimiter T1 can't read for sure fails upward: the body and what follows it
                 // are still scanned as well as T1 can, and the line is at least High.
-                line.unterminated |= delimiter.uncertain;
-                pending.push(PendingHeredoc {
-                    delimiter: delimiter.text,
-                    strip_tabs,
-                    quoted: delimiter.quoted,
-                    segment: line.segments.len(),
-                });
-                i = delimiter.end;
+                line.unterminated |= uncertain;
+                pending.push(heredoc);
+                i = end;
                 continue;
             }
             b'<' | b'>' if !in_double => line.has_shell_syntax = true,
@@ -994,14 +1122,14 @@ fn scan_shell_line(text: &str, reading: Reading) -> ShellLine<'_> {
                 line.segments.push(&text[seg_start..i]);
                 let mut pos = i + 1;
                 for heredoc in pending.drain(..) {
-                    let (start, end, next) = consume_heredoc(text, pos, &heredoc);
-                    let body = &text[start..end];
+                    let (end, next) = consume_heredoc(b, pos, &heredoc);
+                    let body = &text[pos..end];
                     if !heredoc.quoted
                         && heredoc_substitutions(body, reading, &mut line.substitutions)
                     {
                         line.unterminated = true;
                     }
-                    line.heredocs.push((heredoc.segment, body));
+                    line.heredocs.push(body);
                     pos = next;
                 }
                 i = pos;
@@ -1331,12 +1459,6 @@ fn redirection(word: &str) -> Option<bool> {
     Some(rest.is_empty())
 }
 
-/// Is `word` (after quote removal) a shell that reads a script from stdin?
-fn is_shell(word: &str) -> bool {
-    let base = basename(word);
-    SHELLS.contains(&base) || POWERSHELLS.contains(&base)
-}
-
 /// If `word` is a here-string redirection (`<<<`, optionally after an fd number), its attached
 /// text (`Some("")` when the text is the next word).
 fn here_string(word: &str) -> Option<&str> {
@@ -1344,34 +1466,12 @@ fn here_string(word: &str) -> Option<&str> {
     word[digits..].strip_prefix("<<<")
 }
 
-/// What one segment runs.
-struct Segment {
-    /// Its tier, or `None` when it runs nothing.
-    risk: Option<Risk>,
-    /// It runs a shell that reads a script from stdin: the shell is the command word, or a later
-    /// word after a curated wrapper (`env bash`, `sudo -u x sh`). A heredoc or here-string fed to
-    /// it is a script.
-    runs_shell: bool,
-}
-
-/// Classify one segment: skip the words in front of the command word, then classify the argv.
-/// A here-string fed to a shell is classified as a script.
-fn segment_risk(segment: &str, depth: usize, reading: Reading, budget: &mut Budget) -> Segment {
-    if !budget.spend(segment.len()) {
-        return Segment {
-            risk: Some(Risk::High),
-            runs_shell: false,
-        };
-    }
-    let raw = raw_words(segment, reading);
-    let unquoted: Vec<Word> = raw
-        .iter()
-        .map(|w| unquote_word(w, reading, budget))
-        .collect();
-    let mut words: Vec<String> = Vec::new();
-    let mut has_assignment = false;
+/// The command word of a segment's unquoted words: the first word that isn't a keyword, a zsh
+/// precommand, a redirection (with its target) or an assignment. Also returns the assignments
+/// in front of it.
+fn command_word(unquoted: &[Word]) -> (Option<usize>, Vec<String>) {
+    let mut assignments = Vec::new();
     let mut i = 0;
-    let mut command: Option<usize> = None;
     while i < unquoted.len() {
         let word = &unquoted[i];
         let text = word.text.as_str();
@@ -1394,59 +1494,70 @@ fn segment_risk(segment: &str, depth: usize, reading: Reading, budget: &mut Budg
                 continue;
             }
             if is_assignment_like(text) {
-                has_assignment = true;
-                words.push(word.text.clone());
+                assignments.push(word.text.clone());
                 i += 1;
                 continue;
             }
         }
-        command = Some(i);
-        break;
+        return (Some(i), assignments);
     }
-    let Some(c) = command else {
-        return Segment {
-            risk: has_assignment.then_some(Risk::Medium),
-            runs_shell: false,
-        };
-    };
-    let word = &unquoted[c];
-    if word.expansion {
-        // The command word is computed at run time (decision: unknowable ⇒ High).
-        return Segment {
-            risk: Some(Risk::High),
-            runs_shell: false,
-        };
-    }
-    // zsh `=cmd` expands to the path of `cmd`.
-    let command_word = match word.text.strip_prefix('=') {
+    (None, assignments)
+}
+
+/// The program name a command word runs: zsh `=cmd` expands to the path of `cmd`.
+fn program_name(word: &str) -> &str {
+    match word.strip_prefix('=') {
         Some(name) if !name.is_empty() => name,
-        _ => word.text.as_str(),
-    };
-    words.push(command_word.to_string());
-    words.extend(unquoted[c + 1..].iter().map(|w| w.text.clone()));
-    let mut tier = classify_argv(&words, depth, budget);
-    if word.uncertain {
-        // bash may run a different name than the one decoded: at least High.
-        tier = max_risk(tier, Risk::High);
+        _ => word,
     }
-    let runs_shell = is_shell(command_word)
-        || (WRAPPERS.contains(&basename(command_word))
-            && unquoted[c + 1..].iter().any(|w| is_shell(&w.text)));
-    let mut risk = Some(tier);
-    if runs_shell {
-        // A here-string fed to a shell is a script (`bash <<< 'cmd'`).
-        for (k, w) in unquoted.iter().enumerate() {
-            let script = match here_string(&w.text) {
-                Some("") => unquoted.get(k + 1).map(|t| t.text.as_str()),
-                Some(attached) => Some(attached),
-                None => None,
-            };
-            if let Some(script) = script {
-                risk = raise_opt(risk, command_string_risk(script, depth, budget));
+}
+
+/// Classify one segment: skip the words in front of the command word, then classify the argv.
+/// Every here-string in it is also classified as a script, whatever reads it (see
+/// [`reading_risk`] for heredocs). `None` when the segment runs nothing.
+fn segment_risk(
+    segment: &str,
+    depth: usize,
+    reading: Reading,
+    budget: &mut Budget,
+) -> Option<Risk> {
+    if !budget.spend(segment.len()) {
+        return Some(Risk::High);
+    }
+    let raw = raw_words(segment, reading);
+    let unquoted: Vec<Word> = raw
+        .iter()
+        .map(|w| unquote_word(w, reading, budget))
+        .collect();
+    let (command, mut words) = command_word(&unquoted);
+    let mut risk = match command {
+        None => (!words.is_empty()).then_some(Risk::Medium),
+        // The command word is computed at run time (decision: unknowable ⇒ High).
+        Some(c) if unquoted[c].expansion => Some(Risk::High),
+        Some(c) => {
+            words.push(program_name(&unquoted[c].text).to_string());
+            words.extend(unquoted[c + 1..].iter().map(|w| w.text.clone()));
+            let mut tier = classify_argv(&words, depth, budget);
+            if unquoted[c].uncertain {
+                // bash may run a different name than the one decoded: at least High.
+                tier = max_risk(tier, Risk::High);
             }
+            Some(tier)
+        }
+    };
+    // A here-string is always also read as a script (deliberate fail-upward rule): whatever
+    // consumes it may be a shell, directly or through a compound command, `eval` or a wrapper.
+    for (k, w) in unquoted.iter().enumerate() {
+        let script = match here_string(&w.text) {
+            Some("") => unquoted.get(k + 1).map(|t| t.text.as_str()),
+            Some(attached) => Some(attached),
+            None => None,
+        };
+        if let Some(script) = script {
+            risk = raise_opt(risk, command_string_risk(script, depth, budget));
         }
     }
-    Segment { risk, runs_shell }
+    risk
 }
 
 /// The tier of one reading of a line: its segments, substitutions and heredoc bodies.
@@ -1457,20 +1568,17 @@ fn reading_risk(
     budget: &mut Budget,
 ) -> Option<Risk> {
     let mut tier = None;
-    let mut runs_shell: Vec<bool> = Vec::with_capacity(line.segments.len());
     for segment in &line.segments {
-        let classified = segment_risk(segment, depth, reading, budget);
-        tier = raise_opt(tier, classified.risk);
-        runs_shell.push(classified.runs_shell);
+        tier = raise_opt(tier, segment_risk(segment, depth, reading, budget));
     }
     for body in &line.substitutions {
         tier = raise_opt(tier, command_string_risk(body, depth, budget));
     }
-    for (segment, body) in &line.heredocs {
-        // A heredoc fed to a shell (directly or through a curated wrapper) is a script.
-        if runs_shell.get(*segment).copied().unwrap_or(false) {
-            tier = raise_opt(tier, command_string_risk(body, depth, budget));
-        }
+    // A heredoc body is always also read as a script (deliberate fail-upward rule): whatever
+    // consumes it may be a shell, directly or through a compound command, `eval` or a wrapper.
+    // Over-counting a body that is only data (`cat <<EOF`) can only raise the tier.
+    for body in &line.heredocs {
+        tier = raise_opt(tier, command_string_risk(body, depth, budget));
     }
     if line.has_shell_syntax {
         tier = raise(tier, Risk::Medium);
@@ -1478,8 +1586,48 @@ fn reading_risk(
     tier
 }
 
+/// The alternate readings worth analyzing for a line whose bash reading is `primary`: one per
+/// ambiguity the line actually holds.
+fn alternate_readings(text: &str, primary: &ShellLine<'_>) -> Vec<Reading> {
+    let bash = Reading::BASH;
+    let mut alternates = Vec::new();
+    if primary.saw_comment {
+        alternates.push(Reading {
+            honor_comments: false,
+            ..bash
+        });
+    }
+    if primary.saw_ansi_c {
+        alternates.push(Reading {
+            ansi_c_quotes: false,
+            ..bash
+        });
+    }
+    if primary.saw_comment && primary.saw_ansi_c {
+        alternates.push(Reading {
+            honor_comments: false,
+            ansi_c_quotes: false,
+            ..bash
+        });
+    }
+    if primary.saw_arithmetic {
+        alternates.push(Reading {
+            arithmetic_commands: false,
+            ..bash
+        });
+    }
+    if text.contains("<<") && (text.contains('(') || text.contains('`')) {
+        alternates.push(Reading {
+            heredocs_in_substitutions: false,
+            ..bash
+        });
+    }
+    alternates
+}
+
 /// Risk of every command a shell would run for `text`, or `None` when it runs nothing. See the
-/// module doc § Command lines.
+/// module doc § Command lines. Alternate readings are analyzed for the top-level line only
+/// (`depth == 0`), so they can't multiply at every nesting level.
 fn shell_line_risk(text: &str, depth: usize, budget: &mut Budget) -> Option<Risk> {
     if !budget.spend(text.len()) {
         return Some(Risk::High);
@@ -1490,37 +1638,55 @@ fn shell_line_risk(text: &str, depth: usize, budget: &mut Budget) -> Option<Risk
         // The shell runs what precedes the syntax error, and what follows can't be read.
         tier = raise(tier, Risk::High);
     }
-    let mut alternates = Vec::new();
-    if primary.saw_comment {
-        alternates.push(Reading {
-            honor_comments: false,
-            ansi_c_quotes: true,
-        });
-    }
-    if primary.saw_ansi_c {
-        alternates.push(Reading {
-            honor_comments: true,
-            ansi_c_quotes: false,
-        });
-    }
-    if primary.saw_comment && primary.saw_ansi_c {
-        alternates.push(Reading {
-            honor_comments: false,
-            ansi_c_quotes: false,
-        });
-    }
-    for reading in alternates {
-        if !budget.spend(text.len()) {
-            break;
+    if depth == 0 {
+        for reading in alternate_readings(text, &primary) {
+            if !budget.spend(text.len()) {
+                break;
+            }
+            let line = scan_shell_line(text, reading);
+            tier = raise_opt(tier, reading_risk(&line, depth, reading, budget));
         }
-        let line = scan_shell_line(text, reading);
-        tier = raise_opt(tier, reading_risk(&line, depth, reading, budget));
     }
     if budget.exhausted {
         // Keep what was found; what wasn't read counts as High.
         return raise(tier, Risk::High);
     }
     tier
+}
+
+// ── Lexical pre-pass ──────────────────────────────────────────────────────────
+
+/// Record, before any budgeted work, the program-table tier of every program word visible at
+/// the top level: every word of `words` (the line's `shlex` split, or the argv), and the command
+/// word of every segment of `line` in the bash reading. The pass is linear and isn't charged.
+/// Its tiers are only read if the budget runs out, so a `dd` the line plainly runs keeps its
+/// tier however much padding follows it. Counting a word that turns out not to run (`echo dd`)
+/// can only raise the tier.
+fn note_visible_programs(line: Option<&str>, words: &[String], budget: &mut Budget) {
+    for word in words {
+        budget.note(classify_program(word, &[], &[]));
+    }
+    let Some(line) = line else {
+        return;
+    };
+    let mut unlimited = Budget::new(usize::MAX);
+    for segment in scan_shell_line(line, Reading::BASH).segments {
+        let unquoted: Vec<Word> = raw_words(segment, Reading::BASH)
+            .iter()
+            .map(|w| unquote_word(w, Reading::BASH, &mut unlimited))
+            .collect();
+        if let (Some(c), _) = command_word(&unquoted) {
+            if !unquoted[c].expansion {
+                let argv: Vec<String> = unquoted[c..].iter().map(|w| w.text.clone()).collect();
+                let (flags, positionals) = split_flags_and_positionals(&argv);
+                budget.note(classify_program(
+                    program_name(&unquoted[c].text),
+                    &flags,
+                    &positionals,
+                ));
+            }
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
