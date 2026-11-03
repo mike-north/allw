@@ -80,6 +80,8 @@ function fakeRuntime(fixtures) {
       assert.ok(value, `missing fixture for ${envelopeInput.id}`);
       return { expiresAt: envelopeInput.expires_at, ...value };
     },
+    // Test double: identity escape. The real core escape is covered by display-safety.test.mjs.
+    escapeForDisplay: (text) => text,
     async signDecision(input) {
       return {
         requestId: input.envelope.id,

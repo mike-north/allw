@@ -48,15 +48,34 @@ node_modules/.bin/wrangler whoami
 
 Open `packages/relay/wrangler.jsonc` and replace every `REPLACE_ME` value under `env.production`:
 
-| Field                 | What to put                                                |
-| --------------------- | ---------------------------------------------------------- |
-| `account_id`          | Your Cloudflare account id (from `wrangler whoami`).       |
-| `routes[0].pattern`   | The hostname + path pattern, e.g. `relay.example.com/*`.   |
-| `routes[0].zone_name` | The root domain managed by Cloudflare, e.g. `example.com`. |
+| Field                       | What to put                                                  |
+| --------------------------- | ------------------------------------------------------------ |
+| `account_id`                | Your Cloudflare account id (from `wrangler whoami`).         |
+| `routes[0].pattern`         | The hostname + path pattern, e.g. `relay.example.com/*`.     |
+| `routes[0].zone_name`       | The root domain managed by Cloudflare, e.g. `example.com`.   |
+| `vars.CORS_ALLOWED_ORIGINS` | Browser origins allowed to read relay responses (see below). |
 
 **If you want to use the default `workers.dev` subdomain instead of a custom domain**, delete the
 `"routes"` array from the `env.production` block. The worker will be reachable at
 `https://allw-relay.<your-subdomain>.workers.dev` after deploy.
+
+**Browser origins (CORS).** `env.production.vars.CORS_ALLOWED_ORIGINS` is a comma-separated list of
+the origins a browser approver may call the relay from. It ships as the hosted web approver,
+`https://allw-web-approver.pages.dev`. If you serve your own web approver (`docs/web-approver-deploy.md`),
+put its origin here: scheme, host and port only, with no path or trailing slash, e.g.
+`https://approver.example.com`. Each entry is normalized to the origin a browser sends (lowercase
+host, punycode for an internationalized host, default port dropped), so `https://Approver.example.com:443`
+works too. An entry that is not an origin (a path or trailing slash, a query or fragment,
+credentials, a non-http(s) scheme, a wildcard host, `null`) is ignored and logged once
+(`wrangler tail`); it never widens the list. Matching is exact: Cloudflare Pages preview and branch
+origins (`<hash>.allw-web-approver.pages.dev`) are not admitted by the hosted origin and there is no
+suffix wildcard. A port of `*` matches any port and is meant for loopback dev only
+(the top-level dev config allows `http://localhost:*` and `http://127.0.0.1:*`). Setting the var
+replaces the default, and an empty value allows no browser origin. This is not a secret and not an
+access control: non-browser clients are unaffected, and every request is still authorized by its
+bearer token. Other plain vars (`APNS_*`, `FCM_ENDPOINT`, `VAPID_PUBLIC_KEY`, `VAPID_SUBJECT`) go in
+the same `vars` block, because Wrangler does not inherit top-level vars into an environment, and a
+second `"vars"` key in `env.production` silently replaces the first (dropping `CORS_ALLOWED_ORIGINS`).
 
 **[OPERATOR]** Commit the filled-in placeholders (no secrets — they go in the next step):
 
@@ -90,8 +109,8 @@ file from the Apple Developer portal).
 
 ```sh
 # The APNs topic is your app bundle id — not a secret; safe to set as a plain env var.
-# Add it to wrangler.jsonc under env.production as:
-#   "vars": { "APNS_TOPIC": "com.yourcompany.allw", "APNS_ENDPOINT": "https://api.push.apple.com" }
+# Add it to the existing "vars" block under env.production in wrangler.jsonc:
+#   "APNS_TOPIC": "com.yourcompany.allw", "APNS_ENDPOINT": "https://api.push.apple.com"
 # Use "https://api.development.push.apple.com" for the APNs sandbox.
 
 # The bearer token is a short-lived JWT you generate from your .p8 private key.
@@ -110,7 +129,8 @@ Required only if you want push wakeups to Android devices.
 ```sh
 # FCM_ENDPOINT is the FCM HTTP v1 send URL for your Firebase project:
 #   https://fcm.googleapis.com/v1/projects/<YOUR_PROJECT_ID>/messages:send
-# Add it to wrangler.jsonc under env.production as a plain var (it contains your project id, not a secret).
+# Add it to the existing "vars" block under env.production in wrangler.jsonc (it contains your
+# project id, not a secret).
 
 # FCM_BEARER_TOKEN is an OAuth 2.0 access token for a service account with Firebase Cloud Messaging
 # API enabled. Generate one with: gcloud auth print-access-token --scopes=https://www.googleapis.com/auth/firebase.messaging
@@ -137,9 +157,9 @@ subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign"]).then(
   console.log("VAPID_PRIVATE_KEY=" + (await subtle.exportKey("jwk", k.privateKey)).d);
 });'
 
-# The public key and subject are plain vars. Add them to wrangler.jsonc under env.production:
-#   "vars": { "VAPID_PUBLIC_KEY": "<the printed public key>",
-#             "VAPID_SUBJECT": "mailto:ops@yourcompany.example" }
+# The public key and subject are plain vars. Add them to the existing "vars" block under
+# env.production in wrangler.jsonc (a second "vars" key would silently drop CORS_ALLOWED_ORIGINS):
+#   "VAPID_PUBLIC_KEY": "<the printed public key>", "VAPID_SUBJECT": "mailto:ops@yourcompany.example"
 # VAPID_SUBJECT is the operator contact push services may use; it must be mailto: or https:.
 
 node_modules/.bin/wrangler secret put VAPID_PRIVATE_KEY --env production
@@ -160,16 +180,17 @@ replaces its push tokens with its new subscription (`PUT /{acct}/devices/{device
 
 ### Secrets inventory summary
 
-| Secret / var        | Required | Description                                                                                                                                        |
-| ------------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `APNS_ENDPOINT`     | Optional | APNs base URL (plain var in `wrangler.jsonc`). Production: `https://api.push.apple.com`; sandbox: `https://api.development.push.apple.com`.        |
-| `APNS_TOPIC`        | Optional | App bundle id, e.g. `com.example.allw` (plain var in `wrangler.jsonc`).                                                                            |
-| `APNS_BEARER_TOKEN` | Optional | APNs token-auth JWT (set via `wrangler secret put`). Short-lived; rotate hourly.                                                                   |
-| `FCM_ENDPOINT`      | Optional | FCM HTTP v1 send URL (plain var in `wrangler.jsonc`).                                                                                              |
-| `FCM_BEARER_TOKEN`  | Optional | FCM OAuth 2.0 access token for a service account (set via `wrangler secret put`).                                                                  |
-| `VAPID_PUBLIC_KEY`  | Optional | Web Push VAPID public key, base64url uncompressed P-256 point (plain var in `wrangler.jsonc`). Served at `GET /.well-known/allw/vapid-public-key`. |
-| `VAPID_PRIVATE_KEY` | Optional | Web Push VAPID private key, base64url 32-byte scalar (set via `wrangler secret put`). Long-lived; rotating it invalidates subscriptions.           |
-| `VAPID_SUBJECT`     | Optional | Web Push operator contact, `mailto:` or `https:` URI (plain var in `wrangler.jsonc`).                                                              |
+| Secret / var           | Required  | Description                                                                                                                                        |
+| ---------------------- | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CORS_ALLOWED_ORIGINS` | Defaulted | Comma-separated browser origins allowed to read relay responses (plain var in `wrangler.jsonc`, §2). Default: the hosted web approver.             |
+| `APNS_ENDPOINT`        | Optional  | APNs base URL (plain var in `wrangler.jsonc`). Production: `https://api.push.apple.com`; sandbox: `https://api.development.push.apple.com`.        |
+| `APNS_TOPIC`           | Optional  | App bundle id, e.g. `com.example.allw` (plain var in `wrangler.jsonc`).                                                                            |
+| `APNS_BEARER_TOKEN`    | Optional  | APNs token-auth JWT (set via `wrangler secret put`). Short-lived; rotate hourly.                                                                   |
+| `FCM_ENDPOINT`         | Optional  | FCM HTTP v1 send URL (plain var in `wrangler.jsonc`).                                                                                              |
+| `FCM_BEARER_TOKEN`     | Optional  | FCM OAuth 2.0 access token for a service account (set via `wrangler secret put`).                                                                  |
+| `VAPID_PUBLIC_KEY`     | Optional  | Web Push VAPID public key, base64url uncompressed P-256 point (plain var in `wrangler.jsonc`). Served at `GET /.well-known/allw/vapid-public-key`. |
+| `VAPID_PRIVATE_KEY`    | Optional  | Web Push VAPID private key, base64url 32-byte scalar (set via `wrangler secret put`). Long-lived; rotating it invalidates subscriptions.           |
+| `VAPID_SUBJECT`        | Optional  | Web Push operator contact, `mailto:` or `https:` URI (plain var in `wrangler.jsonc`).                                                              |
 
 No other secrets are required. The relay derives all per-account auth tokens internally and stores
 only SHA-256 hashes in the Durable Object SQLite database. Its only static signing key is the
@@ -218,7 +239,12 @@ All tests must pass. If any fail, do not deploy until they are fixed.
 ```sh
 cd packages/relay
 node_modules/.bin/wrangler deploy --env production
+# equivalently, from the repo root: pnpm --filter @allw/relay run deploy
 ```
+
+The package's `deploy` script always passes `--env production`. A bare `wrangler deploy` would
+publish the top-level dev config under the same worker name, replacing production's vars (with
+loopback CORS origins) and routes, so the script never does that. Use `wrangler dev` for local work.
 
 Wrangler will print the deployed URL, e.g.:
 

@@ -1,0 +1,42 @@
+# Checks that the workspace still builds on its declared minimum supported Rust version: the
+# `rust-version` in the workspace Cargo.toml. Everything else in CI uses the newer pin in
+# rust-toolchain.toml, so without this job the `rust-version` claim would go untested.
+#
+# To raise the MSRV, change `rust-version` in Cargo.toml; this job reads it from there.
+name: MSRV
+
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  msrv:
+    name: MSRV (Cargo.toml rust-version)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: msrv
+        name: Read rust-version from Cargo.toml
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^rust-version = "\([0-9.]*\)".*/\1/p' Cargo.toml)
+          if [ -z "$version" ]; then
+            echo "::error file=Cargo.toml::no workspace rust-version found"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - run: cargo +${{ steps.msrv.outputs.version }} check --workspace --all-targets --locked

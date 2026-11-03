@@ -28,6 +28,7 @@
  */
 
 import { PAIRING_TTL_MS } from "./constants.js";
+import { withCors, type CorsEnv } from "./cors.js";
 import {
   CoreUnavailableError,
   checkAccountIdForRoot,
@@ -58,7 +59,7 @@ import {
 } from "./web-push.js";
 import { handleWellKnown, isWellKnownPath } from "./well-known.js";
 
-export interface Env extends VapidEnv {
+export interface Env extends VapidEnv, CorsEnv {
   readonly ACCOUNT: DurableObjectNamespace;
   readonly APNS_ENDPOINT?: string;
   readonly APNS_TOPIC?: string;
@@ -69,14 +70,18 @@ export interface Env extends VapidEnv {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
-    // Relay-level routes live under `/.well-known/` and are dispatched before account routing.
-    if (isWellKnownPath(url.pathname)) return handleWellKnown(request, env);
-    // Route by account id → its Durable Object.
-    const accountId = url.pathname.split("/")[1] ?? "";
-    if (!accountId) return new Response("missing account", { status: 400 });
-    const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
-    return stub.fetch(request);
+    // CORS for browser clients is applied once here, around all routing (see `cors.ts`), so it
+    // covers relay-level routes (e.g. the VAPID public key) as well as account routes.
+    return withCors(request, env, async (req) => {
+      const url = new URL(req.url);
+      // Relay-level routes live under `/.well-known/` and are dispatched before account routing.
+      if (isWellKnownPath(url.pathname)) return handleWellKnown(req, env);
+      // Route by account id → its Durable Object.
+      const accountId = url.pathname.split("/")[1] ?? "";
+      if (!accountId) return new Response("missing account", { status: 400 });
+      const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
+      return stub.fetch(req);
+    });
   },
 } satisfies ExportedHandler<Env>;
 
