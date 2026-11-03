@@ -99,7 +99,8 @@
 //! fetches `extracted/DerivedGeneralCategory.txt`, `PropList.txt` and
 //! `emoji/emoji-variation-sequences.txt` from <https://www.unicode.org/Public/17.0.0/ucd/> (or reads
 //! them from `--ucd-dir <dir>`) and rewrites the file; the same version reproduces the same bytes.
-//! The SDK's display-vector test checks every mark its runtime's Unicode knows against the cap.
+//! The SDK's display-vector test checks every mark its runtime's Unicode knows against the cap,
+//! and fails with this command when the runtime's Unicode is newer than [`UNICODE_VERSION`].
 //!
 //! # Structure inside multi-line content
 //!
