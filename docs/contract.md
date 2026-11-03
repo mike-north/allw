@@ -251,17 +251,18 @@ and the signed verdict — never plaintext, never a key it could sign with.
 | `GET  /requests/{id}/wait` (WS)                | integrator | Block for the verdict; it is pushed the instant a device decides.                                                                                                         |
 | `POST /requests/{id}/retract`                  | integrator | Cancel its own still-`pending` request (#195, NOT a verdict) — 409 once `resolved`/`expired`.                                                                             |
 | `GET  /devices/{id}/connect?surface_id=…` (WS) | device     | Presence socket (hibernatable); flushes the offline queue on open. `surface_id` is optional visible-screen topology for deduping mirrored/native notification transports. |
-| `POST /account-states`                         | device     | Replace the relay-distributed set of root-signed account-state JWS documents for the account.                                                                             |
-| `GET  /account-states`                         | device     | Fetch root-signed account-state JWS documents before local actor-origin verification.                                                                                     |
+| `POST /account-states`                         | root       | Publish root-signed account-state JWS documents; the relay verifies each against the bound root and keeps the highest.                                                    |
+| `GET  /account-states`                         | anyone     | Fetch the relay-verified root-signed account-state documents (integrators and devices), then verify locally.                                                              |
 
 `POST /pairing/start` returns `{ code, expires_at, pairing_auth_token }`; `POST /pairing/complete`
 must present that token as `Authorization: Bearer …` and returns `{ device_id, device_auth_token }`.
 Device-scoped endpoints such as `GET /devices/{id}/connect` and
 `POST /devices/{id}/revoke` require that device token (header or `auth` query for WebSocket
 upgrades). `POST /requests` returns `request_auth_token`; `GET /requests/{id}` and
-`GET /requests/{id}/wait` require it. `POST /account-states` and `GET /account-states`
-also require an enrolled device token: the relay distributes only opaque compact JWS account-state
-documents and cannot make a substituted actor key trusted. The relay stores only SHA-256 hashes of
+`GET /requests/{id}/wait` require it. `POST /account-states` takes no token — the relay verifies
+every document against the account's bound root (#242) — and `GET /account-states` is
+unauthenticated; the relay still cannot make a substituted actor key trusted, because consumers
+verify the root signature themselves. The relay stores only SHA-256 hashes of
 these bearer tokens. `POST /requests/{id}/retract` requires that SAME `request_auth_token` — scoped
 to exactly the request it was issued for, so an integrator can never retract a request it did not
 submit (#195).
