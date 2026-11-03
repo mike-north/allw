@@ -26,6 +26,8 @@ export type {
   Constraints,
   Decision,
   DeviceInboundMessage,
+  DisplayModel,
+  DisplaySubstrate,
   Risk,
   Surface,
   SyntacticSubstrate,
@@ -47,7 +49,7 @@ export { defaultKeyfilePath } from "./lib/paths.js";
 
 export type { RenderableRequest } from "./lib/approver-core.js";
 export { generateNonce, prepareRequest, signDecision } from "./lib/approver-core.js";
-export { renderRequest } from "./lib/render.js";
+export { HIDDEN_CHARS_WARNING, renderRequest } from "./lib/render.js";
 
 export {
   deviceConnectWsUrl,
@@ -61,6 +63,7 @@ export { runPair, type PairOptions, type Logger } from "./commands/pair.js";
 export { runKeygen, type KeygenOptions } from "./commands/keygen.js";
 export {
   createReadlinePrompter,
+  displaySafeLogger,
   handleRequest,
   runWatch,
   type Prompter,
