@@ -76,13 +76,15 @@ priority order (`src/relay-config.ts`):
 That order applies **only before pairing**. Once a browser is paired, its relay is pinned (below).
 
 **HTTPS only.** A relay URL is accepted only if it is `https:`, or `http:` on a loopback host
-(`localhost`, `127.0.0.1`, `[::1]`) for local development against `wrangler dev`, and it carries no
+(`localhost` or `127.0.0.1`) for local development against `wrangler dev`, and it carries no
 username, password, query (`?`) or fragment (`#`) — userinfo lets a link look like one host while
 pointing at another (`https://relay.example.com@evil.example` is `evil.example`). Anything else —
-including `http://relay.example.com` — is rejected at configuration time and the config prompt
-shows why, so bearer tokens and ciphertext never travel unencrypted. A path is allowed. The
-accepted URL is stored in canonical form: the origin (lowercased, punycode host, default port
-dropped) plus the path without trailing slashes. The SDK's `createClient` enforces the same rule;
+including `http://relay.example.com` — is rejected at configuration time and the config prompt shows
+why, so bearer tokens and ciphertext never travel unencrypted. For a local relay use `127.0.0.1`,
+not `[::1]`: a CSP cannot list an IPv6 address (§3.1), so the IPv6 loopback is rejected by the web
+approver, the SDK, and the site build alike. A path is allowed. The accepted URL is stored in
+canonical form: the origin (lowercased, punycode host, default port dropped) plus the path without
+trailing slashes. The SDK's `createClient` enforces the same rule;
 `packages/sdk/test/fixtures/relay-url-vectors.json` holds the shared accept/reject vectors (issue
 #249).
 
@@ -106,6 +108,11 @@ WebSocket, account-state resolution — goes to that pinned relay.
 - **Browsers paired before pinning existed** are bound once, on their next visit, to the relay URL
   they had already persisted (`allw:relay-url:v1`) — never to a `?relay=` link on that visit. If
   none is persisted, the config prompt asks for it.
+- **A pin that a later build no longer accepts** makes the stored identity load as corrupt
+  (fail-closed). The browser boots as unpaired and must re-pair, which replaces the stored identity.
+  For example, browsers pinned to `http://[::1]:…` before `[::1]` was dropped must re-pair against
+  `http://127.0.0.1:…`. Builds that narrow the relay rule or change its canonical form must ship a
+  migration for stored pins.
 
 **[OPERATOR]** To hand a user a working link, share the deployed bundle's URL with `?relay=`
 appended, e.g.:
@@ -220,7 +227,7 @@ a real network and a live relay), so it is a manual post-deploy check:
 
 1. Deploy the relay (`docs/relay-deploy.md`) and note its URL.
 2. Deploy the web approver bundle (§3 above) and note its URL.
-3. Pair a device against the relay (e.g. `npx allw-approver pair --relay <RELAY_URL> --label
+3. Pair a device against the relay (e.g. `npx --no-install allw-approver pair --relay <RELAY_URL> --label
 web-phone`; the account id is derived from the keyfile's account root), noting the printed account id, `device_id`, `device_auth_token`, seeds,
    and device cert — the pairing form on the phone (§5 below) collects these same 7 fields.
 4. On a phone, open `<WEB_APPROVER_URL>/?relay=<RELAY_URL>` in the browser.
