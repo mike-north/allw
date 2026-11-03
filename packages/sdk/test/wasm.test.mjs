@@ -154,6 +154,53 @@ test("verify_verdict rejects a verdict whose request_hash was mutated", async ()
   );
 });
 
+// ── signed note (S15, #251) ─────────────────────────────────────────────────────────
+
+/**
+ * The note is signed into the verdict claims, so the relay cannot rewrite, strip, or inject it.
+ *
+ * @see docs/contract.md §Wire encoding → verdict signature
+ */
+test("sign_verdict reproduces the Rust noted verdict byte-for-byte", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  const noted = JSON.parse(v.noted_verdict_json);
+  const { sig: _sig, device_cert: deviceCert, ...unsigned } = noted;
+  const deviceSeed = Buffer.alloc(32, 0x22).toString("base64url"); // DEVICE_SEED in wasm_vector.rs
+  assert.equal(
+    wasm.sign_verdict(JSON.stringify(unsigned), deviceSeed, v.noted_verdict_nonce_b64, deviceCert),
+    v.noted_verdict_json,
+    "the WASM signer must sign the note into the same claim bytes as the Rust core",
+  );
+  const claims = JSON.parse(Buffer.from(noted.sig.split(".")[1], "base64url").toString("utf8"));
+  assert.equal(claims.note, v.noted_verdict_note, "the note is carried verbatim in the claims");
+});
+
+test("verify_verdict accepts the noted vector and rejects a tampered, removed, or added note", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  const verify = (verdict) =>
+    wasm.verify_verdict(
+      JSON.stringify(verdict),
+      v.request_json,
+      v.context_json,
+      v.approver_root_pubkey_b64,
+      v.now_ms,
+    );
+
+  const noted = JSON.parse(v.noted_verdict_json);
+  assert.equal(JSON.parse(verify(noted)).approved, true, "the untampered noted verdict verifies");
+
+  const tampered = { ...noted, note: "ok for prod" };
+  assert.throws(() => verify(tampered), /note/, "a rewritten note must fail verification");
+
+  const { note: _note, ...removed } = noted;
+  assert.throws(() => verify(removed), /note/, "a stripped note must fail verification");
+
+  const added = { ...JSON.parse(v.verdict_json), note: "injected" };
+  assert.throws(() => verify(added), /note/, "an injected note must fail verification");
+});
+
 test("compute_request_hash throws on invalid context JSON", async () => {
   const wasm = await loadWasm();
   assert.throws(

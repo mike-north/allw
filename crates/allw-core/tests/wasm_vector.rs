@@ -39,9 +39,9 @@ use std::path::PathBuf;
 
 use allw_core::{
     account_id_for_root, action_from_agent_tool_call, compute_request_hash, issue_device_cert,
-    sign_pairing_start_authorization, sign_verdict, ActionRecord, Actor, ApprovalContext,
-    ApprovalRequest, Approver, Constraints, Decision, Risk, SigningKeyPair, Surface,
-    SyntacticSubstrate, UnsignedVerdict,
+    sign_pairing_start_authorization, sign_verdict, verify_verdict, ActionRecord, Actor,
+    ApprovalContext, ApprovalRequest, Approver, Constraints, Decision, InMemoryNonceStore, Risk,
+    SigningKeyPair, Surface, SyntacticSubstrate, UnsignedVerdict, Verdict, VerifyError,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
@@ -75,6 +75,11 @@ const FROZEN_ACCOUNT_ID: &str = "hUes5Gso3s5hHMmZjDI-P0tyaD905KSl1B97nsp2VIo";
 
 // Fixed anti-replay nonce (deterministic fixture).
 const NONCE: &[u8] = &[0xA1, 0xB2, 0xC3, 0xD4];
+
+// Signed-note verdict (S15, #251): its own nonce and a note with non-ASCII text, so the vector
+// proves the note is signed as exact UTF-8 on both surfaces.
+const NOTED_NONCE: &[u8] = &[0xE5, 0xF6, 0x07, 0x18];
+const NOTE: &str = "ok for staging only — not prod";
 
 // ── The committed fixture shape ───────────────────────────────────────────────────
 
@@ -119,6 +124,15 @@ struct WasmVector {
     pairing_start_jti: String,
     /// A verifier time inside the authorization's validity window.
     pairing_start_now_ms: i64,
+
+    /// JSON `Verdict` identical in shape to `verdict_json` but carrying an approver `note`, signed
+    /// into the claims (S15, #251) with nonce `noted_verdict_nonce_b64`. The WASM `sign_verdict`
+    /// must reproduce it byte-for-byte from the same seed, and rewriting the note must fail verify.
+    noted_verdict_json: String,
+    /// The `note` signed into `noted_verdict_json`.
+    noted_verdict_note: String,
+    /// The anti-replay nonce signed into `noted_verdict_json`, base64url-unpadded.
+    noted_verdict_nonce_b64: String,
 }
 
 // ── Builders (mirror hash::tests::make_minimal_context exactly) ───────────────────
@@ -236,6 +250,11 @@ fn build_vector() -> WasmVector {
         note: None,
         challenge_response: None,
     };
+    let noted_unsigned = UnsignedVerdict {
+        note: Some(NOTE.to_string()),
+        ..clone_unsigned(&unsigned)
+    };
+    let noted_verdict = sign_verdict(&noted_unsigned, &device, NOTED_NONCE, Some(cert.clone()));
     let verdict = sign_verdict(&unsigned, &device, NONCE, Some(cert));
 
     let agent_tool_call_context = make_agent_tool_call_context();
@@ -266,6 +285,23 @@ fn build_vector() -> WasmVector {
         pairing_start_expires_at: TS_PAIRING_EXPIRES,
         pairing_start_jti: PAIRING_JTI.to_string(),
         pairing_start_now_ms: PAIRING_NOW_MS,
+        noted_verdict_json: serde_json::to_string(&noted_verdict).expect("verdict serializes"),
+        noted_verdict_note: NOTE.to_string(),
+        noted_verdict_nonce_b64: URL_SAFE_NO_PAD.encode(NOTED_NONCE),
+    }
+}
+
+/// `UnsignedVerdict` is not `Clone`; copy it field-by-field for the noted variant.
+fn clone_unsigned(u: &UnsignedVerdict) -> UnsignedVerdict {
+    UnsignedVerdict {
+        v: u.v,
+        request_id: u.request_id.clone(),
+        request_hash: u.request_hash,
+        decision: u.decision,
+        decided_at: u.decided_at,
+        approver: u.approver.clone(),
+        note: u.note.clone(),
+        challenge_response: u.challenge_response.clone(),
     }
 }
 
@@ -374,4 +410,46 @@ fn fixture_account_id_equals_frozen_vector() {
     let committed: WasmVector =
         serde_json::from_str(&raw).expect("committed fixture is valid WasmVector JSON");
     assert_eq!(committed.expected_account_id_for_root, FROZEN_ACCOUNT_ID);
+}
+
+/// The committed noted verdict verifies under the fixture's root, and rewriting, stripping, or
+/// adding a note on the shared vector is rejected as a claims mismatch (S15, #251). The WASM side
+/// replays the same checks in `packages/sdk/test/wasm.test.mjs`.
+///
+/// @see docs/contract.md §Wire encoding → verdict signature
+#[test]
+fn fixture_noted_verdict_binds_its_note() {
+    let raw = std::fs::read_to_string(fixture_path()).expect("fixture must exist for this test");
+    let v: WasmVector =
+        serde_json::from_str(&raw).expect("committed fixture is valid WasmVector JSON");
+    let request: ApprovalRequest = serde_json::from_str(&v.request_json).unwrap();
+    let context: ApprovalContext = serde_json::from_str(&v.context_json).unwrap();
+    let root = SigningKeyPair::from_seed(&ROOT_SEED).public_key();
+    let verify = |verdict: &Verdict| {
+        verify_verdict(
+            verdict,
+            &request,
+            &context,
+            &root,
+            &mut InMemoryNonceStore::new(),
+            v.now_ms,
+        )
+    };
+
+    let noted: Verdict = serde_json::from_str(&v.noted_verdict_json).unwrap();
+    assert_eq!(noted.note.as_deref(), Some(v.noted_verdict_note.as_str()));
+    verify(&noted).expect("the committed noted verdict must verify");
+
+    let note_mismatch = VerifyError::ClaimsMismatch { field: "note" };
+    let mut tampered = noted.clone();
+    tampered.note = Some("ok for prod".to_string());
+    assert_eq!(verify(&tampered).unwrap_err(), note_mismatch);
+
+    let mut removed = noted;
+    removed.note = None;
+    assert_eq!(verify(&removed).unwrap_err(), note_mismatch);
+
+    let mut added: Verdict = serde_json::from_str(&v.verdict_json).unwrap();
+    added.note = Some("injected".to_string());
+    assert_eq!(verify(&added).unwrap_err(), note_mismatch);
 }

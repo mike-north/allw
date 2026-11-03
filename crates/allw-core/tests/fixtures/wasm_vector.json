@@ -14,5 +14,8 @@
   "pairing_start_issued_at": 1700000000000,
   "pairing_start_expires_at": 1700000120000,
   "pairing_start_jti": "jti_wasm_vector_01",
-  "pairing_start_now_ms": 1700000001000
+  "pairing_start_now_ms": 1700000001000,
+  "noted_verdict_json": "{\"v\":1,\"request_id\":\"req_wasm_vector_01\",\"request_hash\":\"gJ_kdjNT6LEEF_EYWBtRDr_lKwcl01hC85Hz0MPUe-c\",\"decision\":\"approved\",\"decided_at\":1700001000000,\"approver\":{\"account_id\":\"acc_wasm_vector_01\",\"device_id\":\"dev_wasm_vector_01\"},\"note\":\"ok for staging only — not prod\",\"sig\":\"eyJhbGciOiJFZERTQSIsInR5cCI6ImFsbHctdmVyZGljdCtqd3MiLCJraWQiOiJkZXZfd2FzbV92ZWN0b3JfMDEifQ.eyJyZXF1ZXN0X2lkIjoicmVxX3dhc21fdmVjdG9yXzAxIiwicmVxdWVzdF9oYXNoIjoiZ0pfa2RqTlQ2TEVFRl9FWVdCdFJEcl9sS3djbDAxaEM4NUh6ME1QVWUtYyIsImRlY2lzaW9uIjoiYXBwcm92ZWQiLCJkZWNpZGVkX2F0IjoxNzAwMDAxMDAwMDAwLCJub25jZSI6IjVmWUhHQSIsIm5vdGUiOiJvayBmb3Igc3RhZ2luZyBvbmx5IOKAlCBub3QgcHJvZCJ9.603ih0Cb0v2Vi4u_JYyyngPvH8ul7d4uAzkJ30zjfGHgmGDgZCWN6jCC9XNuhjKje50W5IA1PkFtErZH9Qp0Cg\",\"device_cert\":\"eyJhbGciOiJFZERTQSIsInR5cCI6ImFsbHctZGV2aWNlLWNlcnQrandzIiwia2lkIjoiYWNjX3dhc21fdmVjdG9yXzAxIn0.eyJhY2NvdW50X2lkIjoiYWNjX3dhc21fdmVjdG9yXzAxIiwiZGV2aWNlX2lkIjoiZGV2X3dhc21fdmVjdG9yXzAxIiwiZGV2aWNlX3B1YmtleSI6Im9KcWw5SHBuV1lBdi1WWDQzQzBxRktYSm5TTy1sX2hrRW5fNU9EUlZwUEEiLCJpc3N1ZWRfYXQiOjE3MDAwMDAwMDAwMDB9.7W-sbmeCIe72fvPJ3XAiwLS4IZTnQjRqvwQyyNU130YCgVwaKIZRMyD_ETNxlELLEnms59ZX1zcQZbA0bQvRAA\"}",
+  "noted_verdict_note": "ok for staging only — not prod",
+  "noted_verdict_nonce_b64": "5fYHGA"
 }
