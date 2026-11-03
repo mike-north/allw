@@ -3,12 +3,11 @@
  * one account, served under `/.well-known/allw/` (RFC 8615 site metadata).
  *
  * # Why a separate namespace
- * Every other path is `/{account_id}/…`, and account ids are caller-chosen. A relay-level route under
- * an ordinary first segment (e.g. `/push/…`) would shadow, or be shadowed by, the account with that
- * id. A leading `.` is outside the base64url alphabet that real account ids use, so `/.well-known/`
- * does not collide with one. The top-level router claims the whole `/.well-known` segment before
- * account routing, so no such path ever reaches a Durable Object (a would-be account literally named
- * `.well-known` is simply unreachable, never shadowed). **Any relay-level route added later belongs
+ * Every other path is `/{account_id}/…`. A relay-level route under an ordinary first segment (e.g.
+ * `/push/…`) would share that namespace with accounts. Account ids are self-certifying base64url
+ * strings (derived from the account-root key), and a leading `.` is outside that alphabet, so
+ * `/.well-known/` can never collide with a real account. The top-level router claims the whole
+ * `/.well-known` segment before account routing, so no such path ever reaches a Durable Object. **Any relay-level route added later belongs
  * under `/.well-known/allw/`.**
  *
  * @see https://www.rfc-editor.org/rfc/rfc8615 (Well-Known URIs)

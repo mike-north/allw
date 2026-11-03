@@ -41,8 +41,9 @@ export interface PushDispatchResult {
   readonly undeliverableTokens: readonly StoredPushToken[];
 }
 
-// Registration budgets. Pairing is unauthenticated, and every stored token costs an outbound request
-// on every submit, so registration is bounded. Over-budget input is rejected, never truncated.
+// Registration budgets. Every stored token costs an outbound request on every submit, so registration
+// is bounded even for the root holder, the only party able to pair devices (root-signed
+// pairing/start). Over-budget input is rejected, never truncated.
 
 /** Most `push_tokens` entries one registration may carry. */
 export const MAX_PUSH_TOKENS_PER_REGISTRATION = 4;

@@ -19,6 +19,7 @@ import type { SqlStorage } from "@cloudflare/workers-types";
 import type { AccountRelay } from "../src/index.js";
 import type { PushTransportRegistry } from "../src/push.js";
 import { WebPushTransport, type VapidConfig } from "../src/web-push.js";
+import { pairingStartBody, testAccount } from "./support/accounts.js";
 
 /** A 32-byte base64url-unpadded device key (32 × 0x00). */
 const DEVICE_PUBKEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -56,7 +57,7 @@ async function pairWithPushTokens(
   const start = await post<{ code: string; pairing_auth_token: string }>(
     accountId,
     "/pairing/start",
-    {},
+    pairingStartBody(accountId),
   );
   const complete = await post<{ device_id?: string; error?: string }>(
     accountId,
@@ -136,7 +137,7 @@ function envelope(id: string): Record<string, unknown> {
 
 describe("pairing — webpush token is a validated subscription endpoint", () => {
   it("stores an allowlisted https subscription endpoint as the webpush token", async () => {
-    const acct = "acct-webpush-pair-valid";
+    const acct = testAccount("acct-webpush-pair-valid");
     const paired = await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
 
     expect(paired.status).toBe(201);
@@ -148,7 +149,7 @@ describe("pairing — webpush token is a validated subscription endpoint", () =>
     ["a non-allowlisted host", "host", "https://push.attacker.example/abc"],
     ["non-URL input", "non-url", "web-token"],
   ])("rejects %s with 400 and stores nothing", async (_name, slug, token) => {
-    const acct = `acct-webpush-pair-bad-${slug}`;
+    const acct = testAccount(`acct-webpush-pair-bad-${slug}`);
     const paired = await pairWithPushTokens(acct, [{ transport: "webpush", token }]);
 
     expect(paired.status).toBe(400);
@@ -183,7 +184,7 @@ async function seedPushTokenRows(
 
 describe("pairing — push-token budgets (reject, never truncate)", () => {
   it("rejects more than four push_tokens in one registration with 400, storing nothing", async () => {
-    const acct = "acct-webpush-budget-total";
+    const acct = testAccount("acct-webpush-budget-total");
     const paired = await pairWithPushTokens(acct, [
       { transport: "webpush", token: FCM_ENDPOINT },
       { transport: "webpush", token: MOZILLA_ENDPOINT },
@@ -197,7 +198,7 @@ describe("pairing — push-token budgets (reject, never truncate)", () => {
   });
 
   it("rejects more than two distinct tokens for one transport with 400, storing nothing", async () => {
-    const acct = "acct-webpush-budget-transport";
+    const acct = testAccount("acct-webpush-budget-transport");
     const paired = await pairWithPushTokens(acct, [
       { transport: "webpush", token: `${FCM_ENDPOINT}1` },
       { transport: "webpush", token: `${FCM_ENDPOINT}2` },
@@ -209,7 +210,9 @@ describe("pairing — push-token budgets (reject, never truncate)", () => {
   });
 
   it("rejects a registration that would exceed the account's 32-token budget (409), storing nothing", async () => {
-    const acct = "acct-webpush-budget-account";
+    const acct = testAccount("acct-webpush-budget-account");
+    // Bind the account root first (pairing/start requires an otherwise empty account), then fill it.
+    expect((await pairWithPushTokens(acct, [])).status).toBe(201);
     await seedPushTokenRows(
       acct,
       Array.from({ length: 31 }, (_, n) => ({
@@ -232,7 +235,7 @@ describe("pairing — push-token budgets (reject, never truncate)", () => {
   });
 
   it("stores the normalized endpoint, so two spellings of one subscription are one row", async () => {
-    const acct = "acct-webpush-normalized";
+    const acct = testAccount("acct-webpush-normalized");
     const paired = await pairWithPushTokens(acct, [
       { transport: "webpush", token: "https://FCM.googleapis.com/fcm/send/c3Vic2NyaXB0aW9uLWE" },
       {
@@ -250,7 +253,7 @@ describe("submit — Web Push wakeups off the response path, with pruning", () =
   it.each([404, 410])(
     "prunes only the token the push service answered %i for; submit still succeeds",
     async (goneStatus) => {
-      const acct = `acct-webpush-prune-${String(goneStatus)}`;
+      const acct = testAccount(`acct-webpush-prune-${String(goneStatus)}`);
       const paired = await pairWithPushTokens(acct, [
         { transport: "webpush", token: FCM_ENDPOINT },
         { transport: "webpush", token: MOZILLA_ENDPOINT },
@@ -280,7 +283,7 @@ describe("submit — Web Push wakeups off the response path, with pruning", () =
   it.each([401, 403, 429, 500, 503])(
     "keeps the token when the push service fails with %i; submit still succeeds",
     async (status) => {
-      const acct = `acct-webpush-keep-${String(status)}`;
+      const acct = testAccount(`acct-webpush-keep-${String(status)}`);
       const paired = await pairWithPushTokens(acct, [
         { transport: "webpush", token: FCM_ENDPOINT },
       ]);
@@ -304,7 +307,7 @@ describe("submit — Web Push wakeups off the response path, with pruning", () =
   );
 
   it("keeps the token when the push service is unreachable (fetch rejects)", async () => {
-    const acct = "acct-webpush-keep-network-error";
+    const acct = testAccount("acct-webpush-keep-network-error");
     await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
     const fetcher = vi.fn<typeof fetch>(() => Promise.reject(new TypeError("network down")));
     await installPushTransports(acct, {
@@ -326,7 +329,7 @@ describe("submit — Web Push wakeups off the response path, with pruning", () =
   });
 
   it("returns 202 while a push service hangs, then times the push out and keeps the token", async () => {
-    const acct = "acct-webpush-hanging";
+    const acct = testAccount("acct-webpush-hanging");
     await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
     let fetchSettled = false;
     const hanging = vi.fn<typeof fetch>(
@@ -364,7 +367,7 @@ describe("submit — Web Push wakeups off the response path, with pruning", () =
   });
 
   it("prunes a stored row that fails the allowlist without ever requesting it", async () => {
-    const acct = "acct-webpush-legacy-row";
+    const acct = testAccount("acct-webpush-legacy-row");
     // A row the earlier no-op stub accepted (any string) before endpoints were validated.
     await seedPushTokenRows(acct, [
       { device_id: "dev-legacy", transport: "webpush", token: "web-token" },
@@ -385,7 +388,7 @@ describe("submit — Web Push wakeups off the response path, with pruning", () =
   });
 
   it("sends a payload-less wakeup whose TTL is bounded by the request deadline", async () => {
-    const acct = "acct-webpush-payloadless";
+    const acct = testAccount("acct-webpush-payloadless");
     await pairWithPushTokens(acct, [{ transport: "webpush", token: FCM_ENDPOINT }]);
     const fetcher = await installWebPush(acct, () => 201);
 
