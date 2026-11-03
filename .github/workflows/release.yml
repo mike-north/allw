@@ -1,17 +1,23 @@
-# Publishes the @allw/* npm packages via npm trusted publishing (GitHub Actions OIDC).
+# Stages the @allw/* npm packages via npm trusted publishing (GitHub Actions OIDC).
 #
-# There is deliberately no NPM_TOKEN: npm exchanges this workflow's short-lived OIDC token for a
-# one-shot publish credential, and only for packages whose trusted-publisher config names this repo,
-# this workflow file (release.yml) and the `npm-publish` environment. Provenance is attested
-# automatically. The identity values live in scripts/release-packages.mjs, which the bootstrap that
-# configures npm also reads — rename this file or the environment and you must re-run the bootstrap.
+# This workflow can only STAGE a release, never make it public. The npm trusted-publisher config
+# for each package is stage-only (`npm trust github … --allow-stage-publish`), so the OIDC token
+# this workflow gets permits `npm stage publish` and nothing else. A staged version stays private
+# until a maintainer approves it with npm 2FA (`npm stage approve <stage-id>`). That approval is the
+# release gate. The checks below (tag on main, environment) are defense in depth, not the gate:
+# anyone with write access to the repo could change them in the commit they tag.
+#
+# There is deliberately no NPM_TOKEN. The identity values live in scripts/release-packages.mjs,
+# which the bootstrap that configures npm also reads. If you rename this file or the environment,
+# re-run the bootstrap.
 #
 # Triggers:
-#   - push of a `v<version>` tag on main's history → build, smoke, pack, publish.
-#   - workflow_dispatch from a branch → rehearsal: everything up to `npm publish --dry-run`.
+#   - push of a `v<x.y.z>` tag on main's history → build, pack, smoke the packed tarballs, stage.
+#   - workflow_dispatch from a branch → rehearsal: everything up to `npm stage publish --dry-run`.
 #     (Dispatching on a `v*` tag ref behaves like the tag push — use it to retry a failed release.)
 #
-# See docs/releasing.md.
+# Agents never push `v*` tags or dispatch this workflow (ENG_TEAM_INSTRUCTIONS.md). See
+# docs/releasing.md.
 name: Release
 
 on:
@@ -28,7 +34,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build, smoke, pack
+    name: Build, pack, smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -54,7 +60,7 @@ jobs:
           node-version: "24"
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      # Lockstep versioning: the tag must equal every published package's version. A rehearsal
+      # Lockstep versioning: the tag must equal every released package's version. A rehearsal
       # (branch dispatch) checks the version currently in the manifests instead.
       - name: Verify the release set
         run: |
@@ -68,10 +74,11 @@ jobs:
       - run: pnpm run build:wasm
       - run: pnpm -r build
       - run: pnpm run test:release
-      # pack → clean `npm install` → headless checks, with no Rust toolchain on the consumer side.
-      - run: pnpm run smoke:packaged-install
+      # Pack once, then smoke-test exactly those tarballs (all five): clean `npm install`, then
+      # headless checks, with no Rust toolchain on the consumer side. The same files are staged below.
       - run: node scripts/release-packages.mjs pack dist-release
-      - name: Rehearse the publish (dry run)
+      - run: node scripts/smoke-packaged-install.mjs --tarballs dist-release
+      - name: Rehearse staging (dry run)
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         run: node scripts/release-packages.mjs publish dist-release --dry-run
       - uses: actions/upload-artifact@v4
@@ -81,16 +88,16 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  publish:
-    name: Publish to npm
+  stage:
+    name: Stage on npm (awaits maintainer approval)
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     # Must match RELEASE_ENVIRONMENT in scripts/release-packages.mjs and the npm trusted-publisher
-    # config. Add protection rules (required reviewers, `v*` tags only) to it in the repo settings.
+    # config. Protect it (required reviewer, `v*` tags only) as defense in depth.
     environment: npm-publish
     # The only job that can mint an OIDC token. It installs no dependencies and runs no package
-    # scripts — it publishes the exact tarballs the build job smoke-tested.
+    # scripts. It stages the exact tarballs the build job smoke-tested.
     permissions:
       contents: read
       id-token: write
@@ -99,12 +106,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
-      # Trusted publishing needs npm >= 11.5.1.
-      - run: npm install -g npm@^11.5.1
+      # `npm stage` (and trusted publishing with it) needs npm >= 11.15.0.
+      - run: npm install -g npm@^11.15.0
       - uses: actions/download-artifact@v4
         with:
           name: npm-tarballs
           path: dist-release
-      # In dependency order; versions already on the registry are skipped, so re-running a partially
-      # failed release completes it.
+      # In dependency order. A version already on the registry is skipped only if its registry
+      # integrity equals the local tarball's; any mismatch fails the job. The stage ids and the
+      # approval commands are written to the job summary.
       - run: node scripts/release-packages.mjs publish dist-release

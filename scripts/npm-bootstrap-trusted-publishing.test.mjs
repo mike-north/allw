@@ -6,7 +6,9 @@
  * @see ../docs/releasing.md
  * @see https://docs.npmjs.com/trusted-publishers
  * @see https://docs.npmjs.com/cli/v11/commands/npm-trust (`--file`, `--repo`, `--env`,
- *      `--allow-publish`, `--yes`, `--dry-run`; one trust config per package; package must exist)
+ *      `--allow-stage-publish`, `--yes`, `--dry-run`; one trust config per package; package must
+ *      exist)
+ * @see https://docs.npmjs.com/staged-publishing (stage-only trust: CI stages, a maintainer approves)
  */
 
 import assert from "node:assert/strict";
@@ -44,7 +46,8 @@ const EXPECTED_TRUST = {
   file: RELEASE_WORKFLOW_FILE,
   repository: TRUSTED_REPOSITORY,
   environment: RELEASE_ENVIRONMENT,
-  permissions: ["createPackage"],
+  // Stage-only: the workflow may `npm stage publish`, never `npm publish` (npm's "createPackage").
+  permissions: ["createStagedPackage"],
 };
 
 /**
@@ -259,7 +262,7 @@ test("fresh registry: placeholders then trusted publishers, in release order, af
     "mike-north/allw",
     "--env",
     "npm-publish",
-    "--allow-publish",
+    "--allow-stage-publish",
     "--yes",
   ]);
   assert.equal(sleeps.length, NAMES.length - 1, "trust calls are paced");
@@ -287,6 +290,30 @@ test("a mismatched trust config is revoked and replaced, only after confirmation
       ["trust", "github", "@allw/hook", "--file"],
     ],
   );
+});
+
+// Regression: the first bootstrap created direct-publish (`--allow-publish`) configs, which let the
+// tag workflow make a version public with no human approval. A re-run must replace them.
+test("a direct-publish trust config is revoked and replaced with a stage-only one", async () => {
+  const registry = configuredRegistry();
+  for (const name of NAMES) {
+    registry[name].trust = [
+      { ...EXPECTED_TRUST, id: `direct-${name}`, permissions: ["createPackage"] },
+    ];
+  }
+  const fake = fakeNpm({ registry });
+  const { exitCode } = await run(fake);
+  assert.equal(exitCode, 0);
+  const writes = fake.writes().map(({ args }) => args);
+  for (const name of NAMES) {
+    assert.ok(
+      writes.some((a) => a.join(" ") === `trust revoke ${name} --id=direct-${name}`),
+      `revokes the direct-publish config on ${name}`,
+    );
+    const create = writes.find((a) => a[0] === "trust" && a[1] === "github" && a[2] === name);
+    assert.ok(create?.includes("--allow-stage-publish"), `recreates ${name} stage-only`);
+    assert.ok(!create.includes("--allow-publish"));
+  }
 });
 
 test("declining the confirmations writes nothing", async () => {
@@ -323,7 +350,10 @@ test("isExpectedTrust rejects any identity or permission that differs from the r
     { file: "ci.yml" },
     { environment: undefined },
     { environment: "production" },
-    { permissions: ["createStagedPackage"] },
+    // Anything that can publish directly is wrong, even alongside staging.
+    { permissions: ["createPackage"] },
+    { permissions: ["createPackage", "createStagedPackage"] },
+    { permissions: [] },
     { permissions: undefined },
   ]) {
     assert.equal(isExpectedTrust({ ...EXPECTED_TRUST, ...change }), false, JSON.stringify(change));

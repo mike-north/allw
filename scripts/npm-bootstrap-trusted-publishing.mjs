@@ -18,12 +18,15 @@
  *      (`0.0.0-bootstrap.0`, dist-tag `bootstrap`, no code — importing it throws a pointer to the real
  *      releases). Real code is never published from a laptop: the first real version comes from the
  *      release workflow, with provenance. Announced, and gated on a y/N confirmation.
- *   2. Configures the trusted publisher with `npm trust github` (npm >= 11.15.0): repo
- *      mike-north/allw, workflow `release.yml`, environment `npm-publish`, permission `publish`. If a
- *      different trust config is already attached, it offers to revoke and replace it. If the CLI path
- *      fails, it prints the exact npmjs.com page and field values to enter by hand.
- *   3. Claims the unscoped names in CLAIM_ONLY_NAMES (`allw`, and every bin name `npx` could
- *      resolve to a registry package) with the same kind of inert placeholder. Each is gated on its
+ *   2. Configures a **stage-only** trusted publisher with `npm trust github` (npm >= 11.15.0): repo
+ *      mike-north/allw, workflow `release.yml`, environment `npm-publish`, permission
+ *      `--allow-stage-publish` and nothing else. CI can then only *stage* a release, and each staged
+ *      version goes public only when a maintainer approves it with npm 2FA. Any other config,
+ *      including a direct-publish (`--allow-publish`) one, counts as wrong: the script offers to
+ *      revoke and replace it. If the CLI path fails, it prints the exact npmjs.com page and field
+ *      values to enter by hand.
+ *   3. Claims the unscoped names in CLAIM_ONLY_NAMES (every bin name `npx` could resolve to a
+ *      registry package) with the same kind of inert placeholder. Each is gated on its
  *      own confirmation. They are name claims only and get no trusted publisher.
  *   4. Prints a checklist of what is done and what the human must still do.
  *
@@ -103,7 +106,15 @@ export function parseTrustList(stdout) {
   return parsed.flat();
 }
 
-/** Whether a trust config is exactly the one the release workflow needs. */
+/** The only permission the release workflow's trust config may carry: `npm stage publish`. */
+export const STAGE_ONLY_PERMISSIONS = Object.freeze(["createStagedPackage"]);
+
+/**
+ * Whether a trust config is exactly the one the release workflow needs: our repo, workflow and
+ * environment, and **stage-only**. A config that also (or instead) allows direct `npm publish`
+ * (`createPackage`) is wrong, because it would let a workflow run publish without a maintainer's 2FA
+ * approval.
+ */
 export function isExpectedTrust(config) {
   return (
     config?.type === "github" &&
@@ -111,7 +122,8 @@ export function isExpectedTrust(config) {
     config.file === RELEASE_WORKFLOW_FILE &&
     config.environment === RELEASE_ENVIRONMENT &&
     Array.isArray(config.permissions) &&
-    config.permissions.includes("createPackage")
+    config.permissions.length === STAGE_ONLY_PERMISSIONS.length &&
+    STAGE_ONLY_PERMISSIONS.every((p) => config.permissions.includes(p))
   );
 }
 
@@ -127,7 +139,7 @@ export function trustGithubArgs(name, { dryRun = false } = {}) {
     TRUSTED_REPOSITORY,
     "--env",
     RELEASE_ENVIRONMENT,
-    "--allow-publish",
+    "--allow-stage-publish",
     dryRun ? "--dry-run" : "--yes",
   ];
 }
@@ -140,7 +152,7 @@ export function manualTrustInstructions(name) {
     `      Repository:           ${TRUSTED_REPOSITORY.split("/")[1]}`,
     `      Workflow filename:    ${RELEASE_WORKFLOW_FILE}`,
     `      Environment name:     ${RELEASE_ENVIRONMENT}`,
-    `      Allowed action:       npm publish`,
+    `      Allowed actions:      npm stage publish ONLY (leave "npm publish" and "npm dist-tag" unticked)`,
   ].join("\n");
 }
 
@@ -502,7 +514,7 @@ export async function bootstrap({
   if (toCreate.length > 0) {
     log(
       `Will attach the trusted publisher (repo ${TRUSTED_REPOSITORY}, workflow ${RELEASE_WORKFLOW_FILE}, ` +
-        `environment ${RELEASE_ENVIRONMENT}, allow: npm publish) to:\n` +
+        `environment ${RELEASE_ENVIRONMENT}, allow: npm stage publish only) to:\n` +
         toCreate
           .map(({ row, replace }) =>
             replace.length > 0
@@ -653,8 +665,12 @@ function printChecklist({ rows, claimRows, log, dryRun, refreshTrust }) {
   }
 
   todo.push(
-    `Recommended: protect the "${RELEASE_ENVIRONMENT}" GitHub environment (required reviewer, deployment\n` +
-      `     from \`v*\` tags only): https://github.com/${TRUSTED_REPOSITORY}/settings/environments`,
+    "Releases only STAGE on npm. Each staged version goes public only when you approve it with npm 2FA\n" +
+      "     (`npm stage approve <stage-id>`, in the order the release run's summary lists).",
+  );
+  todo.push(
+    `Defense in depth: protect the "${RELEASE_ENVIRONMENT}" GitHub environment (required reviewer, deployment\n` +
+      `     from \`v*\` tags only) and add a \`v*\` tag ruleset: https://github.com/${TRUSTED_REPOSITORY}/settings`,
   );
   const placeholders = rows.filter((row) => row.versions?.includes(PLACEHOLDER_VERSION));
   if (placeholders.length > 0) {
@@ -681,7 +697,7 @@ function usage() {
     "usage: node scripts/npm-bootstrap-trusted-publishing.mjs [--dry-run] [--refresh-trust]",
     "",
     "Reserves the @allw/* package names on npm (placeholder), attaches the GitHub Actions trusted",
-    "publisher for .github/workflows/release.yml, and claims the unscoped names (allw, allw-hook, …)",
+    "publisher for .github/workflows/release.yml, and claims the unscoped bin names (allw-hook, …)",
     "against squatting. Run after `npm login`. Safe to re-run.",
     "",
     "  --dry-run        report what would happen; change nothing",
