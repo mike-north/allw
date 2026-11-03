@@ -1137,6 +1137,18 @@ describe("AccountRelay — verdict finality (#245)", () => {
     await expectStillAnswerable(ctx, "req-final-approver");
   });
 
+  it("gives a malformed approver the provenance error, not 'another device'", async () => {
+    const ctx = await setUp("acct-final-approver-shape", "req-final-approver-shape");
+    const genuine = signTestVerdict(ctx.acct, ctx.first, "req-final-approver-shape", {
+      decision: "denied",
+    });
+    await expectRefused(ctx, "req-final-approver-shape", {
+      ...genuine,
+      approver: { account_id: ctx.acct, device_id: 42 },
+    });
+    await expectStillAnswerable(ctx, "req-final-approver-shape");
+  });
+
   it("refuses every verdict when the account has no bound root (fail-closed)", async () => {
     const ctx = await setUp("acct-final-unbound", "req-final-unbound");
     // A pre-binding leftover: the device rows exist but no root is bound to check against.

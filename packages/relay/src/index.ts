@@ -2365,8 +2365,14 @@ export class AccountRelay implements DurableObject {
     // another device's verdict, even a genuine one. The outer `approver.device_id` is checked here,
     // before any crypto, so a mismatched verdict costs no signature work; the provenance check
     // next ties it to the signature (`kid`) and the signed claims.
+    // Only a string `device_id` is compared: a malformed approver falls through to the provenance
+    // check and gets its error, not a claim about another device.
     const approver = msg.verdict.approver;
-    if (isPlainObject(approver) && approver.device_id !== deviceId) {
+    if (
+      isPlainObject(approver) &&
+      typeof approver.device_id === "string" &&
+      approver.device_id !== deviceId
+    ) {
       trySendJson(ws, {
         type: "error",
         request_id: requestId,
