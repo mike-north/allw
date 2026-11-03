@@ -152,6 +152,33 @@ test("approved round-trip: decrypt → recompute request_hash → sign → verif
   assert.equal(result.decided_at, DECIDED_AT, "verified decided_at echoes the signed claim");
 });
 
+/** @see docs/contract.md §Wire encoding → verdict signature (the note is a signed claim; #251 S15) */
+test("approver note is signed: a noted verdict verifies and a rewritten note is rejected", async () => {
+  const wasm = await loadWasm();
+  const { keyfile, jwe } = pairedApprover(wasm);
+  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
+
+  const verdict = signDecision(wasm, keyfile, prepared, "approved", DECIDED_AT, {
+    note: "only this one file",
+  });
+  const verify = (v) =>
+    wasm.verify_verdict(
+      JSON.stringify(v),
+      makeRequestJson(),
+      CONTEXT_JSON,
+      keyfile.account_root_pubkey,
+      NOW_MS,
+    );
+
+  assert.equal(verdict.note, "only this one file", "the note is on the signed verdict");
+  assert.equal(JSON.parse(verify(verdict)).approved, true, "an untampered noted verdict verifies");
+  assert.throws(
+    () => verify({ ...verdict, note: "anything goes" }),
+    /note/,
+    "a relay-rewritten note must fail verification",
+  );
+});
+
 test("denied round-trip: a signed denial verifies as a verified 'no' (verify_verdict throws)", async () => {
   const wasm = await loadWasm();
   const { keyfile, jwe } = pairedApprover(wasm);
