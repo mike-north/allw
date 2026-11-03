@@ -77,15 +77,24 @@ This is the Codex-parallel install path for developers who already have a paired
    npx --no-install allw-codex-hook --version
    ```
 
-2. Export the relay and account trust anchor (the hosted relay,
+2. Write the integrator config file `~/.allw/config.json` (`0600`, in a `0700` `~/.allw`) with the
+   relay and account trust anchor printed by `allw-approver pair` — the same file the Claude Code
+   hook and `@allw/sdk` read ([`docs/quickstart.md`](./quickstart.md) §4). The hosted relay,
    `https://allw-relay.mnorth.workers.dev`, needs no Cloudflare account; substitute your own URL if
-   you self-hosted per [`docs/relay-deploy.md`](./relay-deploy.md)):
+   you self-hosted per [`docs/relay-deploy.md`](./relay-deploy.md):
 
-   ```sh
-   export ALLW_RELAY_URL="https://allw-relay.mnorth.workers.dev"
-   export ALLW_ACCOUNT_ID="acct_..."
-   export ALLW_APPROVER_ROOT_KEY="..."
+   ```json
+   {
+     "version": 1,
+     "relay_url": "https://allw-relay.mnorth.workers.dev",
+     "account_id": "<account id from pair>",
+     "approver_root_key": "<account-root public key from pair>"
+   }
    ```
+
+   The `ALLW_RELAY_URL` / `ALLW_ACCOUNT_ID` / `ALLW_APPROVER_ROOT_KEY` env vars still work as
+   per-field overrides (env wins), and `ALLW_CONFIG` moves the file (it must be an absolute path;
+   a leading `~/` is expanded).
 
 3. Add the `PreToolUse` block above to `~/.codex/hooks.json` or a trusted project
    `.codex/hooks.json`.
@@ -179,15 +188,20 @@ The matcher intentionally matches the hook's v1 surfaces:
 
 ## Decision Mapping
 
-The hook reads the same allw environment as the Claude Code hook:
+The hook reads the same allw config as the Claude Code hook — `~/.allw/config.json` through
+`@allw/sdk`'s `loadClientConfig` — with these env vars as overrides:
 
-| Variable                 | Required | Meaning                                                       |
-| ------------------------ | -------- | ------------------------------------------------------------- |
-| `ALLW_RELAY_URL`         | yes      | Base URL of the zero-knowledge relay.                         |
-| `ALLW_ACCOUNT_ID`        | yes      | The approver's relay account id.                              |
-| `ALLW_APPROVER_ROOT_KEY` | yes      | The approver account-root Ed25519 public key.                 |
-| `ALLW_TIMEOUT_MS`        | no       | Fail-closed approval deadline in ms, capped below hook time.  |
-| `ALLW_FETCH_TIMEOUT_MS`  | no       | Per-relay-fetch timeout in ms, only allowed to lower the cap. |
+| Variable                 | Required | Meaning                                                                                                                                                                                                 |
+| ------------------------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ALLW_CONFIG`            | no       | Config-file path (default `~/.allw/config.json`); must be an **absolute** path (a leading `~/` is expanded; a relative path is rejected, since it would resolve against the agent's working directory). |
+| `ALLW_RELAY_URL`         | no       | Overrides `relay_url`: base URL of the zero-knowledge relay.                                                                                                                                            |
+| `ALLW_ACCOUNT_ID`        | no       | Overrides `account_id`: the approver's self-certifying relay account id.                                                                                                                                |
+| `ALLW_APPROVER_ROOT_KEY` | no       | Overrides `approver_root_key`: the approver account-root Ed25519 key.                                                                                                                                   |
+| `ALLW_TIMEOUT_MS`        | no       | Fail-closed approval deadline in ms, capped below hook time.                                                                                                                                            |
+| `ALLW_FETCH_TIMEOUT_MS`  | no       | Per-relay-fetch timeout in ms, only allowed to lower the cap.                                                                                                                                           |
+
+With neither the file nor the overrides, or with an invalid file, every gated call is denied with a
+reason naming both ways to configure.
 
 For gated calls, the hook builds the syntactic `ActionRecord`, requests approval through
 `@allw/sdk`, and maps the verdict to what it writes to stdout. Only `deny` is ever an explicit wire

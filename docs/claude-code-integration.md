@@ -97,8 +97,9 @@ echo "$HOME/.allw/hook/node_modules/@allw/hook/dist/cli.js"
 `npm install --prefix` command instead of the package name.)
 
 Then register it in `~/.claude/settings.json` with the full matcher, `onFailure` and the `deny`
-rules, and put the export lines for the `ALLW_*` variables in the shell profile Claude Code launches
-from:
+rules. The hook reads its coordinates from `~/.allw/config.json` (see
+[`docs/quickstart.md`](./quickstart.md) §4), which is also under `~/.allw/`, so the points below
+cover it too:
 
 ```json
 {
@@ -129,7 +130,8 @@ warning, so check `claude --version`. Why this holds:
 - `~/.claude/` is one of Claude Code's
   [protected paths](https://code.claude.com/docs/en/permission-modes#protected-paths): writes there
   are never auto-approved (except in `bypassPermissions`), and allow rules don't pre-approve them.
-- `~/.allw/hook` is outside the working directory, so `acceptEdits` doesn't auto-approve edits to it.
+- `~/.allw/hook` and `~/.allw/config.json` (the trust anchor the hook verifies verdicts against) are
+  outside the working directory, so `acceptEdits` doesn't auto-approve edits to them.
 - **allw gates exactly these tools:** `Bash`, `Edit`, `MultiEdit`, `Write` and every MCP tool. A
   change to either location through one of them reaches your approver first. **Deny any request that
   writes under `~/.allw/` or `~/.claude/`.**
@@ -228,21 +230,27 @@ widening the matcher:
 
 ## Configuration
 
-The hook has no config file; it reads its environment (`packages/hook/src/lib/config.ts`):
+The hook reads the relay coordinates and trust anchor from the shared integrator config file,
+`~/.allw/config.json`, through `@allw/sdk`'s `loadClientConfig` (one loader for every surface;
+`packages/hook/src/lib/config.ts` wraps it). The env vars below override the file per field (env
+wins); the timeouts are env-only:
 
-| Variable                 | Required | Meaning                                                                                                                                  |
-| ------------------------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `ALLW_RELAY_URL`         | yes      | Base URL of the zero-knowledge relay.                                                                                                    |
-| `ALLW_ACCOUNT_ID`        | yes      | The approver's relay account id (routes to their devices).                                                                               |
-| `ALLW_APPROVER_ROOT_KEY` | yes      | The approver account-root Ed25519 public key (base64url).                                                                                |
-| `ALLW_TIMEOUT_MS`        | no       | Fail-closed approval deadline in ms (default `300000` = 5 min; must be **strictly below `420000`**, rejected — fail-closed — otherwise). |
-| `ALLW_FETCH_TIMEOUT_MS`  | no       | Per-relay-fetch timeout in ms (default/max `30000`); may only lower the SDK's per-fetch timeout, never raise it.                         |
+| Variable                 | Required | Meaning                                                                                                                                                                                                                                            |
+| ------------------------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ALLW_CONFIG`            | no       | Config-file path (default `~/.allw/config.json`); when set, the file must exist and the path must be an **absolute** path (a leading `~/` is expanded; a relative path is rejected, since it would resolve against the agent's working directory). |
+| `ALLW_RELAY_URL`         | no       | Overrides `relay_url`: base URL of the zero-knowledge relay.                                                                                                                                                                                       |
+| `ALLW_ACCOUNT_ID`        | no       | Overrides `account_id`: the approver's self-certifying relay account id (must derive from the root key).                                                                                                                                           |
+| `ALLW_APPROVER_ROOT_KEY` | no       | Overrides `approver_root_key`: the approver account-root Ed25519 public key (base64url-unpadded).                                                                                                                                                  |
+| `ALLW_TIMEOUT_MS`        | no       | Fail-closed approval deadline in ms (default `300000` = 5 min; must be **strictly below `420000`**, rejected — fail-closed — otherwise).                                                                                                           |
+| `ALLW_FETCH_TIMEOUT_MS`  | no       | Per-relay-fetch timeout in ms (default/max `30000`); may only lower the SDK's per-fetch timeout, never raise it.                                                                                                                                   |
 
-Same shape as `docs/codex-integration.md`'s "Decision Mapping" env-var table — both hooks read the
-identical `ALLW_*` variables, because `readConfig` is one shared function
-(`packages/hook/src/lib/config.ts`, imported by `@allw/codex-hook`). A missing required variable, or
-an `ALLW_TIMEOUT_MS`/`ALLW_FETCH_TIMEOUT_MS` outside its bound, is a fail-closed `deny` at
-config-read time — see [Fail-Closed Analysis](#fail-closed-analysis).
+Same shape as `docs/codex-integration.md`'s "Decision Mapping" table — both hooks read the
+identical file and `ALLW_*` overrides, because `readConfig` is one shared function
+(`packages/hook/src/lib/config.ts`, imported by `@allw/codex-hook`). No file and no env, an invalid
+file (not a regular file, over 64 KiB, not owned by you or group/world-writable, malformed JSON, unknown `version`, missing or unknown key), a malformed root key, an account
+id that does not derive from the root key, or an `ALLW_TIMEOUT_MS`/`ALLW_FETCH_TIMEOUT_MS` outside
+its bound, is a fail-closed `deny` at config-read time — see
+[Fail-Closed Analysis](#fail-closed-analysis).
 
 ## Decision Mapping
 
@@ -257,18 +265,18 @@ carries the same category as an `allw[<category>]: ` prefix on `permissionDecisi
 [#191](https://github.com/mike-north/allw/issues/191)) — there still isn't a Claude Code
 equivalent field, nor should there be:
 
-| allw result                                                                                                                                                                  | `permissionDecision` | `permissionDecisionReason` (pattern)                                                                     |
-| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- | -------------------------------------------------------------------------------------------------------- |
-| non-gated tool (`Read`, `Grep`, `Glob`, `WebFetch`, …)                                                                                                                       | none (empty stdout)  | —                                                                                                        |
-| gated, verified verdict `decision === "approved"`                                                                                                                            | none (empty stdout)  | —                                                                                                        |
-| gated, verified verdict `denied` / `expired` / `aborted`                                                                                                                     | `deny`               | `allw: <summary> — not approved (verdict: <decision>)`                                                   |
-| gated, `ActionRecord` could not be built (malformed `tool_input`, invalid shell syntax, unparseable MCP name/params, malformed file-edit payload)                            | `deny`               | `allw: <reason> (fail-closed deny)` — reason names the specific field/shape problem                      |
-| gated, the built `ActionRecord` JSON was not in the expected shape (defense in depth; the core always emits a well-formed record)                                            | `deny`               | `allw: built ActionRecord was not in the expected shape (fail-closed deny)`                              |
-| gated, `requestApproval` threw (network/relay error, no enrolled devices, relay rejection)                                                                                   | `deny`               | `allw: approval request failed (fail-closed deny): <error message>`                                      |
-| malformed hook stdin (not JSON, not an object, wrong `hook_event_name`, missing/non-string `tool_name`)                                                                      | `deny`               | `allw: hook input was not valid JSON (fail-closed deny)` (or the sibling reason for the specific defect) |
-| missing or invalid config (`ALLW_RELAY_URL`/`ALLW_ACCOUNT_ID`/`ALLW_APPROVER_ROOT_KEY` unset, or `ALLW_TIMEOUT_MS`/`ALLW_FETCH_TIMEOUT_MS` out of bounds)                    | `deny`               | `allw: ALLW_RELAY_URL is not set (fail-closed deny)` (or the sibling reason)                             |
-| any unexpected internal error (defense in depth; the process-level catch-all in `cli.ts`'s `main()`)                                                                         | `deny`               | `allw: hook failed unexpectedly (fail-closed deny): <error message>`                                     |
-| the process reaches `beforeExit`/`exit`, or gets `SIGTERM`/`SIGINT`/`SIGHUP`, before `main()` decided (exit backstop, [#265](https://github.com/mike-north/allw/issues/265)) | `deny`               | `allw: hook exited before reaching a decision (fail-closed deny)`                                        |
+| allw result                                                                                                                                                                                                 | `permissionDecision` | `permissionDecisionReason` (pattern)                                                                     |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- | -------------------------------------------------------------------------------------------------------- |
+| non-gated tool (`Read`, `Grep`, `Glob`, `WebFetch`, …)                                                                                                                                                      | none (empty stdout)  | —                                                                                                        |
+| gated, verified verdict `decision === "approved"`                                                                                                                                                           | none (empty stdout)  | —                                                                                                        |
+| gated, verified verdict `denied` / `expired` / `aborted`                                                                                                                                                    | `deny`               | `allw: <summary> — not approved (verdict: <decision>)`                                                   |
+| gated, `ActionRecord` could not be built (malformed `tool_input`, invalid shell syntax, unparseable MCP name/params, malformed file-edit payload)                                                           | `deny`               | `allw: <reason> (fail-closed deny)` — reason names the specific field/shape problem                      |
+| gated, the built `ActionRecord` JSON was not in the expected shape (defense in depth; the core always emits a well-formed record)                                                                           | `deny`               | `allw: built ActionRecord was not in the expected shape (fail-closed deny)`                              |
+| gated, `requestApproval` threw (network/relay error, no enrolled devices, relay rejection)                                                                                                                  | `deny`               | `allw: approval request failed (fail-closed deny): <error message>`                                      |
+| malformed hook stdin (not JSON, not an object, wrong `hook_event_name`, missing/non-string `tool_name`)                                                                                                     | `deny`               | `allw: hook input was not valid JSON (fail-closed deny)` (or the sibling reason for the specific defect) |
+| missing or invalid config (no `~/.allw/config.json` and no `ALLW_*` overrides, an invalid file, a malformed root key, a non-derived account id, or `ALLW_TIMEOUT_MS`/`ALLW_FETCH_TIMEOUT_MS` out of bounds) | `deny`               | `allw: no allw config found — … does not exist and ALLW_RELAY_URL is not set …` (or the sibling reason)  |
+| any unexpected internal error (defense in depth; the process-level catch-all in `cli.ts`'s `main()`)                                                                                                        | `deny`               | `allw: hook failed unexpectedly (fail-closed deny): <error message>`                                     |
+| the process reaches `beforeExit`/`exit`, or gets `SIGTERM`/`SIGINT`/`SIGHUP`, before `main()` decided (exit backstop, [#265](https://github.com/mike-north/allw/issues/265))                                | `deny`               | `allw: hook exited before reaching a decision (fail-closed deny)`                                        |
 
 A gated call loses allw's `deny` **only** when its verdict is delivered, cryptographically
 verified against the approver's account-root key, bound to this exact request (WYSIWYS), fresh,
@@ -473,7 +481,7 @@ Source: [Claude Code hooks reference](https://code.claude.com/docs/en/hooks),
 
 There is no automated UAT-prep script for the Claude Code hook yet (the Codex-parallel
 `scripts/uat-codex.sh` has no Claude Code twin) — use [`docs/quickstart.md`](./quickstart.md) §§0–4
-to stand up a local relay, pair an approver, and export the `ALLW_*` env vars, then wire the hook
+to stand up a local relay, pair an approver, and write `~/.allw/config.json`, then wire the hook
 into a scratch project's `.claude/settings.json` and drive a real Claude Code session by hand.
 Record the result on the relevant tracking issue:
 

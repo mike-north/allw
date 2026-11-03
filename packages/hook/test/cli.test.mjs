@@ -21,6 +21,8 @@ import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
+import { loadWasm } from "../dist/lib/wasm.js";
+
 const here = dirname(fileURLToPath(import.meta.url));
 const CLI = join(here, "..", "dist", "cli.js");
 
@@ -80,12 +82,18 @@ function reasonOf(stdout) {
   return JSON.parse(stdout).hookSpecificOutput.permissionDecisionReason;
 }
 
+// A real root key and its self-certifying account id, both from the core (docs/enrollment.md §Model),
+// so the config loader's checks pass and the gated call reaches the SDK transport.
+const coreWasm = await loadWasm();
+const UAT_ROOT_KEY = coreWasm.ed25519_public_key(Buffer.alloc(32, 9).toString("base64url"));
+const UAT_ACCOUNT_ID = coreWasm.account_id_for_root(UAT_ROOT_KEY);
+
 /** Minimal config that gets a gated call to the real SDK transport path. */
 function hookEnv(relayUrl, extra = {}) {
   return {
     ALLW_RELAY_URL: relayUrl,
-    ALLW_ACCOUNT_ID: "acct-uat",
-    ALLW_APPROVER_ROOT_KEY: "k".repeat(43),
+    ALLW_ACCOUNT_ID: UAT_ACCOUNT_ID,
+    ALLW_APPROVER_ROOT_KEY: UAT_ROOT_KEY,
     ALLW_TIMEOUT_MS: "1000",
     // UATs need to prove bounded failure without burning the SDK's production 30s default.
     ALLW_FETCH_TIMEOUT_MS: "100",

@@ -18,6 +18,7 @@
  */
 
 import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -91,6 +92,17 @@ export interface AllwWasm {
     expectedAccountId: string,
     accountRootPubkeyB64: string,
   ): string;
+  /**
+   * Derive the self-certifying account id for an account-root public key (base64url-unpadded).
+   * **Throws** when the key is not base64url-unpadded, not exactly 32 bytes, or not a valid
+   * Ed25519 point.
+   */
+  account_id_for_root(accountRootPubkeyB64: string): string;
+  /**
+   * Check that `accountId` is exactly the id derived from `accountRootPubkeyB64`. **Throws** on a
+   * malformed key or a mismatch.
+   */
+  check_account_id_for_root(accountId: string, accountRootPubkeyB64: string): void;
   /** Derive the Ed25519 public key for a 32-byte signing seed (base64url). */
   ed25519_public_key(seedB64: string): string;
   /** Build an ActionRecord JSON for a shell command using the core T1 command parser. */
@@ -187,6 +199,24 @@ function vendorDir(): string {
 
 let cached: AllwWasm | null = null;
 
+/** Initialize already-imported glue from the vendored bytes and memoize it. */
+function initGlue(glue: WasmGlue, dir: string): AllwWasm {
+  const bytes = readFileSync(join(dir, "allw_wasm_bg.wasm"));
+  const module = new WebAssembly.Module(bytes);
+  glue.initSync({ module });
+  cached = glue;
+  return glue;
+}
+
+/** The actionable error for a missing/broken vendor directory. */
+function loadError(dir: string, cause: unknown): Error {
+  return new Error(
+    `allw: failed to load the vendored WASM core from ${dir}. ` +
+      `Run \`pnpm run build:wasm\` from the repo root first.`,
+    { cause },
+  );
+}
+
 /**
  * Load (and memoize) the vendored WASM core.
  *
@@ -195,20 +225,31 @@ let cached: AllwWasm | null = null;
 export async function loadWasm(): Promise<AllwWasm> {
   if (cached) return cached;
   const dir = vendorDir();
-  let glue: WasmGlue;
   try {
     // A bare path is not a valid ESM specifier on Windows (`C:\...`); use a file:// URL.
-    glue = (await import(pathToFileURL(join(dir, "allw_wasm.js")).href)) as WasmGlue;
-    const bytes = readFileSync(join(dir, "allw_wasm_bg.wasm"));
-    const module = new WebAssembly.Module(bytes);
-    glue.initSync({ module });
+    const glue = (await import(pathToFileURL(join(dir, "allw_wasm.js")).href)) as WasmGlue;
+    return initGlue(glue, dir);
   } catch (cause) {
-    throw new Error(
-      `allw: failed to load the vendored WASM core from ${dir}. ` +
-        `Run \`pnpm run build:wasm\` from the repo root first.`,
-      { cause },
-    );
+    throw loadError(dir, cause);
   }
-  cached = glue;
-  return cached;
+}
+
+/**
+ * Synchronous {@link loadWasm}, for callers with a synchronous config step (the integrator config
+ * loader, and through it the hooks' `readConfig`). The `--target web` glue is an ES module with no
+ * top-level await, so Node's `require(esm)` loads it synchronously; it shares Node's module cache
+ * (and this memo) with {@link loadWasm}, so the core is instantiated once either way.
+ *
+ * @throws if the vendor directory is missing — run `pnpm run build:wasm` from the repo root first.
+ */
+export function loadWasmSync(): AllwWasm {
+  if (cached) return cached;
+  const dir = vendorDir();
+  try {
+    const require = createRequire(import.meta.url);
+    const glue = require(join(dir, "allw_wasm.js")) as WasmGlue;
+    return initGlue(glue, dir);
+  } catch (cause) {
+    throw loadError(dir, cause);
+  }
 }

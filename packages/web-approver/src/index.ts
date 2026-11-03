@@ -110,16 +110,29 @@ export interface ApprovalRisk {
   readonly summary: string;
 }
 
+/**
+ * The view model's action and actor strings are **display text produced by the core**
+ * (`display_model`, #246): every control, bidi, and zero-width character is already a visible
+ * escape (`\x1b`, `⟨U+202E⟩`). The renderers below lay them out but never escape anything
+ * themselves, and must never be handed raw decrypted strings.
+ */
 export interface CommandAction {
   readonly cwd?: string;
   readonly argv: readonly string[];
+  /** `raw` as one core-escaped line (TAB, LF and CR show as `\t`, `\n`, `\r`) — for list rows. */
   readonly raw?: string;
+  /**
+   * `raw` as multi-line content, one core-escaped entry per line (a heredoc command spans several).
+   * TAB and CRLF endings are shown as structure markers and do not raise the warning.
+   */
+  readonly rawLines?: readonly string[];
 }
 
 export interface McpCallAction {
   readonly server: string;
   readonly tool: string;
-  readonly params: unknown;
+  /** The call's `params` as indented JSON (core-escaped); absent when the call has none. */
+  readonly paramsDisplay?: string;
 }
 
 /**
@@ -133,7 +146,8 @@ export interface McpCallAction {
 export interface AgentToolCallAction {
   readonly server: string;
   readonly tool: string;
-  readonly params: unknown;
+  /** The call's `params` as indented JSON (core-escaped); absent when the call has none. */
+  readonly paramsDisplay?: string;
 }
 
 export interface NumberMatchChallenge {
@@ -151,6 +165,11 @@ export interface ApprovalContext {
   readonly risk: ApprovalRisk;
   readonly allowed_decisions: readonly ApprovalDecision[];
   readonly challenge?: NumberMatchChallenge;
+  /**
+   * The core found (and escaped) hidden or control characters somewhere in the request (#246).
+   * Renderers must show a prominent warning when this is true.
+   */
+  readonly hasHiddenOrControlChars: boolean;
 }
 
 export interface PreparedApproval {
@@ -188,7 +207,17 @@ export interface WebApproverRuntime {
    * The controller validates UI state first, but signing remains delegated to core.
    */
   signDecision(input: SignDecisionInput): Promise<SignedVerdict>;
+
+  /**
+   * Renders untrusted text (an error message that can embed a relay-supplied id or HTTP body) for
+   * display through the core's escape (`escape_for_display`). Optional: when a runtime has no
+   * core, the controller withholds such text rather than showing it unescaped.
+   */
+  escapeForDisplay?(text: string): string;
 }
+
+/** Shown in place of untrusted error text when no core escape is available to render it safely. */
+export const WITHHELD_ERROR_TEXT = "details withheld (no display escaper available)";
 
 export interface WebApproverControllerOptions {
   readonly runtime: WebApproverRuntime;
@@ -214,6 +243,8 @@ export interface ApprovalDetail extends ApprovalListItem {
   readonly reversible?: boolean;
   readonly verificationError?: string;
   readonly challenge?: NumberMatchChallenge;
+  /** True when the core escaped hidden/control characters in this request (#246). */
+  readonly hasHiddenOrControlChars: boolean;
 }
 
 /**
@@ -255,6 +286,13 @@ export class WebApproverController {
   constructor(options: WebApproverControllerOptions) {
     this.#runtime = options.runtime;
     this.#nowMs = options.nowMs ?? Date.now;
+  }
+  /**
+   * Render untrusted text (an error message, which can embed a relay-supplied id or HTTP body) for
+   * the DOM through the runtime's core escape, or withhold it when the runtime has none (#246).
+   */
+  escapeForDisplay(text: string): string {
+    return this.#runtime.escapeForDisplay?.(text) ?? WITHHELD_ERROR_TEXT;
   }
 
   /**
@@ -419,7 +457,9 @@ export class WebApproverController {
         envelope,
         expiresAt: envelope.expires_at,
         status: "unverified",
-        verificationError: error instanceof Error ? error.message : String(error),
+        verificationError: this.escapeForDisplay(
+          error instanceof Error ? error.message : String(error),
+        ),
       };
     }
   }
@@ -457,6 +497,7 @@ export class WebApproverController {
     const base = {
       ...item,
       exactPlaintext: context ? exactPlaintext(context) : "Context could not be verified.",
+      hasHiddenOrControlChars: context?.hasHiddenOrControlChars === true,
     };
 
     if (!prepared) {
@@ -523,39 +564,44 @@ export class WebApproverController {
   }
 }
 
+/**
+ * One-line headline for a list row. A tool call is `server :: tool` (as in the CLI): a `.` join
+ * would make server `fs.delete` + tool `x` look like server `fs` + tool `delete.x`.
+ */
 export function actionSummary(context: ApprovalContext): string {
   if (context.kind === "command" && context.command) {
     return context.command.raw ?? shellQuote(context.command.argv);
   }
   if (context.kind === "mcp" && context.mcp) {
-    return `${context.mcp.server}.${context.mcp.tool}`;
+    return `${context.mcp.server} :: ${context.mcp.tool}`;
   }
   if (context.kind === "agent_tool_call" && context.agentToolCall) {
-    return `${context.agentToolCall.server}.${context.agentToolCall.tool}`;
+    return `${context.agentToolCall.server} :: ${context.agentToolCall.tool}`;
   }
   return "Unknown action";
 }
 
 export function exactPlaintext(context: ApprovalContext): string {
   if (context.kind === "command" && context.command) {
+    // argv is shown token-by-token with boundary quoting rather than as JSON: the tokens are
+    // already core-escaped, and JSON would double their backslashes (`\\x1b`), misstating them.
+    // A multi-line `raw` (e.g. a heredoc) prints its further lines behind a `│` marker, so no line
+    // of it can pass for a `cwd:`/`argv:` line of its own.
     const cwd = context.command.cwd ? `cwd: ${context.command.cwd}\n` : "";
-    return `${cwd}argv: ${JSON.stringify(context.command.argv)}\nraw: ${
-      context.command.raw ?? shellQuote(context.command.argv)
-    }`;
+    const raw = context.command.rawLines
+      ? context.command.rawLines.join("\n   │ ")
+      : (context.command.raw ?? shellQuote(context.command.argv));
+    return `${cwd}argv: ${shellQuote(context.command.argv)}\nraw: ${raw}`;
   }
   if (context.kind === "mcp" && context.mcp) {
-    return `mcp: ${context.mcp.server}.${context.mcp.tool}\nparams: ${JSON.stringify(
-      context.mcp.params,
-      null,
-      2,
-    )}`;
+    return `mcp: ${context.mcp.server} :: ${context.mcp.tool}\nparams: ${
+      context.mcp.paramsDisplay ?? "(none)"
+    }`;
   }
   if (context.kind === "agent_tool_call" && context.agentToolCall) {
-    return `agent_tool_call: ${context.agentToolCall.server}.${context.agentToolCall.tool}\nparams: ${JSON.stringify(
-      context.agentToolCall.params,
-      null,
-      2,
-    )}`;
+    return `agent_tool_call: ${context.agentToolCall.server} :: ${context.agentToolCall.tool}\nparams: ${
+      context.agentToolCall.paramsDisplay ?? "(none)"
+    }`;
   }
   return "Unknown action";
 }

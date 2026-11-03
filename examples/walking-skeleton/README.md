@@ -160,10 +160,11 @@ surface and presses Approve / Deny, and the recording itself is the artifact. To
    ```sh
    node packages/approver/dist/cli.js watch --keyfile /tmp/allw-demo-keyfile.json
    ```
-4. **Terminal C — drive a gated command through the hook** (using the pubkey from step 2):
+4. **Terminal C — drive a gated command through the hook** (using the account id and pubkey from
+   step 2; the account id must be the one derived from that root, or the hook denies):
    ```sh
    echo '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git push --force origin main"},"cwd":"/workspace/project"}' \
-   | ALLW_RELAY_URL=http://localhost:8787 ALLW_ACCOUNT_ID=demo \
+   | ALLW_RELAY_URL=http://localhost:8787 ALLW_ACCOUNT_ID=<account-id> \
      ALLW_APPROVER_ROOT_KEY=<account-root-pubkey> \
      node packages/hook/dist/cli.js
    ```

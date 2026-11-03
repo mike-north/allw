@@ -49,6 +49,7 @@ export { gateToolCall, isGatedTool, parseMcpToolName, type GateOutcome } from ".
 export {
   DEFAULT_TIMEOUT_MS,
   readConfig,
+  type ReadConfigOptions,
   type ConfigResult,
   type Env,
   type HookConfig,

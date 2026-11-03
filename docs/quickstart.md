@@ -19,15 +19,16 @@ stand-ins, called out inline. Where a step is **not yet wired**, it says so rath
 > - An **approver** (`@allw/approver`, a CLI stand-in for a second device; demo-only when run on the
 >   agent's machine, see §2) that renders the exact action (WYSIWYS), prompts Approve / Deny, and
 >   returns a signed verdict.
-> - A **zero-knowledge relay** (`@allw/relay`) — this quickstart defaults to the hosted relay at
->   `https://allw-relay.mnorth.workers.dev`; you can also run your own (Cloudflare or locally via
->   `wrangler dev`).
+> - A **relay** (`@allw/relay`) designed to be zero-knowledge — this quickstart defaults to the hosted
+>   relay at `https://allw-relay.mnorth.workers.dev`; you can also run your own (Cloudflare or locally
+>   via `wrangler dev`). **Not yet zero-knowledge against a malicious relay operator:** see the caveat
+>   in step 0.
 >
 > **v0 stand-ins (not production):**
 >
-> - The "second device" is a **CLI** (`allw-approver`), not yet a phone/web app. The hosted web
->   inbox is designed but not shipped (see `design/` and issue tracker). The wire protocol does not
->   change when the phone/web surface lands.
+> - The "second device" in this walkthrough is a **CLI** (`allw-approver`). A hosted **web approver**
+>   is also live (see the browser option in step 2); the native phone app is not shipped yet. The wire
+>   protocol does not change when the phone surface lands.
 > - The approver holds its keys in a **software keyfile**, not hardware (Secure Enclave / StrongBox).
 >   Tracked by [#23](https://github.com/mike-north/allw/issues/23). The protocol is unchanged.
 > - The requesting **actor identity is unverified** in v0 ([#16](https://github.com/mike-north/allw/issues/16));
@@ -49,7 +50,7 @@ package, and `@allw/hook` / `@allw/approver` load it from there.
 
 ## 0. The relay endpoint
 
-`allw` routes encrypted requests through a **zero-knowledge relay**. This quickstart uses the
+`allw` routes encrypted requests through a relay designed to be **zero-knowledge**. This quickstart uses the
 **hosted relay** so you can start without standing up any infrastructure:
 
 ```
@@ -58,9 +59,16 @@ https://allw-relay.mnorth.workers.dev
 
 That's the `<RELAY_URL>` referenced in the steps below — no Cloudflare account or setup needed.
 
-> The relay only ever sees **ciphertext + signed verdicts** — never plaintext or any signing key
-> (`docs/architecture.md`, `docs/contract.md`). That's true whether you use the hosted relay above
-> or run your own.
+> The relay is only ever sent **ciphertext + signed verdicts** — never plaintext or any signing key
+> (`docs/architecture.md`, `docs/contract.md`).
+>
+> **Caveat — not yet zero-knowledge against the relay itself.** The SDK encrypts each request to the
+> device list the relay returns (`GET /{account}/devices`), and the shipped hooks do not yet check that
+> list against root-signed account state. A malicious or compromised relay operator could therefore
+> list a key it holds as a device and decrypt the action context. Until the fixes land
+> ([#243](https://github.com/mike-north/allw/issues/243): encrypt only to root-vouched devices;
+> [#242](https://github.com/mike-north/allw/issues/242): verified account state), only use a relay
+> whose operator you trust — or run your own. See `docs/threat-model.md` §Residual Risks.
 
 **Prefer to self-host?** Either option below gives you a `<RELAY_URL>` to use in place of the
 hosted one — everything else in this quickstart is unchanged.
@@ -184,14 +192,47 @@ protection against the agent (see the warning in §2).
 > For the full integration contract (matcher set, decision mapping, fail-closed analysis,
 > permission-mode interactions) see [`docs/claude-code-integration.md`](./claude-code-integration.md).
 
-The hook reads its config from the environment. Export these in the shell where Claude Code runs
-(using the values from step 2):
+The hook (like `@allw/sdk`'s `loadClientConfig` and every other integrator surface) reads its
+coordinates from **one non-secret config file**, `~/.allw/config.json`. Create it with the values
+from step 2, user-only:
 
 ```sh
-export ALLW_RELAY_URL="<RELAY_URL>"
-export ALLW_ACCOUNT_ID="<ACCOUNT_ID_FROM_STEP_2>"
-export ALLW_APPROVER_ROOT_KEY="<ACCOUNT_ROOT_PUBLIC_KEY_FROM_STEP_2>"
+mkdir -p -m 700 ~/.allw
+cat > ~/.allw/config.json <<'JSON'
+{
+  "version": 1,
+  "relay_url": "<RELAY_URL>",
+  "account_id": "<ACCOUNT_ID_FROM_STEP_2>",
+  "approver_root_key": "<ACCOUNT_ROOT_PUBLIC_KEY_FROM_STEP_2>"
+}
+JSON
+chmod 600 ~/.allw/config.json
 ```
+
+> Automatic writing of this file by `allw-approver pair` is tracked in
+> [#230](https://github.com/mike-north/allw/issues/230); until it lands, write it by hand as above.
+> If the agent runs on a different machine from the one that ran `pair`, copy the file there.
+
+The file holds no secrets (never put the approver keyfile's seeds or tokens in it), but it is your
+**trust anchor**: `approver_root_key` decides whose signatures the hook accepts, so anyone who can
+rewrite it can redirect approvals. Keep it `0600` in a `0700` directory. On macOS/Linux the loader
+enforces this on read: a file that is not owned by you, or is group- or world-writable, is rejected
+(fix it with `chmod 600 ~/.allw/config.json`).
+
+The loader fails closed — the hook **denies** — if the file is missing and no env vars are set, is
+not a regular file (a FIFO, device or directory), is over 64 KiB, fails the ownership/permission
+check above, is not valid JSON, has an unknown `version`, is missing a key or has an unknown one, holds a malformed
+`approver_root_key`, or holds an `account_id` that does not derive from `approver_root_key`.
+
+**Overrides.** Each field can be overridden by an env var, field by field (env wins over the file).
+You don't need any of these if the file is in place:
+
+| Env var                  | Overrides                                                                                                                                                                                                 |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ALLW_CONFIG`            | the file's location (default `~/.allw/config.json`); must be an **absolute** path (a leading `~/` is expanded; a relative path is rejected, since it would resolve against the agent's working directory) |
+| `ALLW_RELAY_URL`         | `relay_url`                                                                                                                                                                                               |
+| `ALLW_ACCOUNT_ID`        | `account_id`                                                                                                                                                                                              |
+| `ALLW_APPROVER_ROOT_KEY` | `approver_root_key`                                                                                                                                                                                       |
 
 Then register the hook in your project's (or user's) `.claude/settings.json` as a **PreToolUse**
 hook. The matcher `^(Bash|Edit|MultiEdit|Write)$|^mcp__` sends exactly the `Bash`, `Edit`,
@@ -288,14 +329,15 @@ agent, that decision is only as trustworthy as the machine: the agent can read t
 
 ## Troubleshooting
 
-| Symptom                                      | Cause / fix                                                                                                                    |
-| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| Hook always denies with "ALLW\_… is not set" | The hook env vars (step 4) aren't visible to Claude Code's shell. Export them where Claude Code launches.                      |
-| Hook denies with "vendored wasm not found"   | You're running an unbuilt checkout, not the installed package. `npm install @allw/hook` (it bundles the WASM via `@allw/sdk`). |
-| No prompt appears in the watch terminal      | The account id / `--relay` printed by `pair` must match the hook's `ALLW_ACCOUNT_ID` / `ALLW_RELAY_URL`.                       |
-| Request times out immediately                | Check the relay is running (step 0) and reachable at `ALLW_RELAY_URL`.                                                         |
-| Transcript shows `PreToolUse:… hook error`   | The hook couldn't start (bad path, or not installed). See [If the hook can't start](#if-the-hook-cant-start).                  |
-| A read or search runs without your approver  | By design: only `Bash`, `Edit`/`MultiEdit`/`Write` and `mcp__*` are gated. allw makes no decision for the rest.                |
+| Symptom                                                                  | Cause / fix                                                                                                                                                          |
+| ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Hook denies with "group- or world-writable" or "not by the current user" | Run `chmod 600 ~/.allw/config.json` (and `chown` it to the user Claude Code runs as).                                                                                |
+| Hook always denies with "no allw config found"                           | `~/.allw/config.json` (step 4) doesn't exist for the user Claude Code runs as, and no `ALLW_*` overrides are set. Write the file (or set `ALLW_CONFIG` to its path). |
+| Hook denies with "vendored wasm not found"                               | You're running an unbuilt checkout, not the installed package. `npm install @allw/hook` (it bundles the WASM via `@allw/sdk`).                                       |
+| No prompt appears in the watch terminal                                  | The account id / `--relay` printed by `pair` must match `account_id` / `relay_url` in `~/.allw/config.json` (or their `ALLW_*` overrides).                           |
+| Request times out immediately                                            | Check the relay is running (step 0) and reachable at the configured `relay_url`.                                                                                     |
+| Transcript shows `PreToolUse:… hook error`                               | The hook couldn't start (bad path, or not installed). See [If the hook can't start](#if-the-hook-cant-start).                                                        |
+| A read or search runs without your approver                              | By design: only `Bash`, `Edit`/`MultiEdit`/`Write` and `mcp__*` are gated. allw makes no decision for the rest.                                                      |
 
 ---
 

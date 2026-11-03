@@ -14,7 +14,13 @@
 import { webcrypto } from "node:crypto";
 
 import type { AllwWasm } from "./wasm.js";
-import type { ApprovalContext, ApprovalRequest, Decision, UnsignedVerdict } from "./types.js";
+import type {
+  ApprovalContext,
+  ApprovalRequest,
+  Decision,
+  DisplayModel,
+  UnsignedVerdict,
+} from "./types.js";
 import type { Keyfile } from "./keyfile.js";
 
 /** Verdict protocol/schema version (`docs/contract.md` §Wire encoding). */
@@ -30,6 +36,9 @@ const NONCE_BYTES = 16;
  *
  * Fail-closed: a missing attestation, an unenrolled actor, a relay outage, or a failed verification
  * all yield `verified: false`. There is no "unknown → trusted" path.
+ *
+ * Both strings are **display-ready**: they embed untrusted text (actor ids, core error messages), so
+ * every producer escapes them with the core's `escape_for_display` before returning (#246).
  */
 export type OriginVerification =
   | {
@@ -47,8 +56,18 @@ export type OriginVerification =
 export interface RenderableRequest {
   /** The envelope's request id (also the verdict's `request_id`). */
   readonly requestId: string;
-  /** The decrypted human-shown context. */
+  /**
+   * The decrypted context. Use it for decisions (constraints, hashing inputs), never for printing:
+   * its strings are raw, untrusted bytes.
+   */
   readonly context: ApprovalContext;
+  /**
+   * The core's escaped display model of {@link context} (#246) — the only source of context text
+   * the renderer may print.
+   */
+  readonly display: DisplayModel;
+  /** {@link requestId} escaped for display (it is relay-supplied plaintext). */
+  readonly displayRequestId: string;
   /** Fail-closed deadline (ms) read from the envelope and bound into `request_hash`. */
   readonly expiresAt: number;
   /** The WYSIWYS `request_hash` (base64url) the core computed from `context` + `expiresAt`. */
@@ -162,6 +181,9 @@ export function prepareRequest(
   // The core canonicalizes (RFC 8785 JCS) and hashes; we never derive these bytes ourselves.
   const requestHash = wasm.compute_request_hash(contextJson, envelope.expires_at);
   const parsedContext = context as unknown as ApprovalContext;
+  // The display model is built by the core from the same plaintext it just hashed, so what is shown
+  // is exactly what is bound — with every hidden/control character made visible (#246).
+  const display = JSON.parse(wasm.display_model(contextJson)) as DisplayModel;
   const numberMatchChallenge = parsedContext.constraints.challenge_required
     ? wasm.derive_number_match_challenge(requestHash)
     : undefined;
@@ -169,6 +191,8 @@ export function prepareRequest(
   return {
     requestId: envelope.id,
     context: parsedContext,
+    display,
+    displayRequestId: wasm.escape_for_display(envelope.id),
     expiresAt: envelope.expires_at,
     requestHash,
     ...(numberMatchChallenge !== undefined ? { numberMatchChallenge } : {}),
@@ -216,7 +240,7 @@ export function verifyActorOrigin(
   if (accountStates.length === 0) {
     return {
       verified: false,
-      reason: `no root-signed account state to anchor actor '${actor.id}' (origin not root-anchored)`,
+      reason: `no root-signed account state to anchor actor '${prepared.display.actor_id}' (origin not root-anchored)`,
     };
   }
   try {
@@ -231,14 +255,14 @@ export function verifyActorOrigin(
     const result = JSON.parse(resultJson) as { origin?: unknown };
     const origin =
       typeof result.origin === "string" ? result.origin : `${actor.kind} · ${actor.id}`;
-    return { verified: true, origin };
+    return { verified: true, origin: wasm.escape_for_display(origin) };
   } catch (err) {
     // A failed verification (spoofed/altered origin, non-root-anchored key, revoked actor, wrong
     // request id/hash) is reported as unverified — the request is still rendered, but the origin is
     // explicitly NOT trusted (fail-closed display).
     return {
       verified: false,
-      reason: `attestation failed verification: ${(err as Error).message}`,
+      reason: wasm.escape_for_display(`attestation failed verification: ${(err as Error).message}`),
     };
   }
 }

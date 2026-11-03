@@ -1,19 +1,27 @@
 /**
- * Hook configuration, sourced from the environment so the hook needs no config file of its own.
+ * Hook configuration: the relay coordinates and approver trust anchor come from the shared
+ * integrator config loader (`@allw/sdk` `loadClientConfig`, issue #230); the hook-only timeouts come
+ * from the environment.
  *
- * The hook is wired into Claude Code's `.claude/settings.json`; the relay coordinates and the
- * approver trust anchor come from these env vars (documented in the package README):
+ * The coordinates are read from **one non-secret config file**, `~/.allw/config.json` (moved with
+ * `ALLW_CONFIG`), with per-field env-var overrides. Env wins over the file, field by field:
  *
- * | Variable                 | Required | Meaning                                                      |
- * | ------------------------ | -------- | ------------------------------------------------------------ |
- * | `ALLW_RELAY_URL`         | yes      | Base URL of the zero-knowledge relay.                        |
- * | `ALLW_ACCOUNT_ID`        | yes      | The approver's relay account id (routes to their devices).   |
- * | `ALLW_APPROVER_ROOT_KEY` | yes      | The approver account-root Ed25519 public key (base64url).    |
- * | `ALLW_TIMEOUT_MS`        | no       | Fail-closed deadline in ms (default 300000 = 5 min, capped). |
- * | `ALLW_FETCH_TIMEOUT_MS`  | no       | Per-relay-fetch timeout in ms (default/max 30000).           |
+ * | Variable                 | File key            | Meaning                                                      |
+ * | ------------------------ | ------------------- | ------------------------------------------------------------ |
+ * | `ALLW_CONFIG`            | —                   | Config-file path (absolute; default `~/.allw/config.json`).  |
+ * | `ALLW_RELAY_URL`         | `relay_url`         | Base URL of the zero-knowledge relay.                        |
+ * | `ALLW_ACCOUNT_ID`        | `account_id`        | The approver's self-certifying relay account id.             |
+ * | `ALLW_APPROVER_ROOT_KEY` | `approver_root_key` | The approver account-root Ed25519 public key (base64url).    |
+ * | `ALLW_TIMEOUT_MS`        | —                   | Fail-closed deadline in ms (default 300000 = 5 min, capped). |
+ * | `ALLW_FETCH_TIMEOUT_MS`  | —                   | Per-relay-fetch timeout in ms (default/max 30000).           |
  *
- * **Fail-closed:** any missing required var yields a parse error the caller turns into a `deny`
- * with an actionable reason (which var to set) — the hook never proceeds on partial config.
+ * **Fail-closed:** no file and no env, a relative `ALLW_CONFIG`, a file that is not a regular file,
+ * is oversize, is not owned by the user or is group/world-writable, a
+ * malformed/unknown-version/incomplete file, a malformed root
+ * key, an account id that does not derive from the root key, or a bad timeout all yield a parse
+ * error the caller turns into a `deny` with an actionable reason (naming the file path and the env
+ * var to fix) — the hook never proceeds on partial config. There is one loader for every surface;
+ * this module does not parse the file itself.
  *
  * # Timeout-ordering invariant (issue #52)
  * The hook's safety must NOT depend on what Claude Code does when a hook fails to emit a decision.
@@ -32,6 +40,8 @@
  * the SDK's production per-fetch timeout, which lets UATs prove the hung-relay path quickly without
  * weakening the production timeout-ordering margin.
  */
+
+import { ClientConfigError, loadClientConfig, type IntegratorConfig } from "@allw/sdk";
 
 /** The fully-resolved hook config. */
 export interface HookConfig {
@@ -82,12 +92,6 @@ export const MAX_FETCH_TIMEOUT_MS = 30_000;
 /** An environment map (injectable for tests; defaults to `process.env`). */
 export type Env = Record<string, string | undefined>;
 
-/** Read a required non-empty string env var, or `null` if absent/blank. */
-function required(env: Env, key: string): string | null {
-  const value = env[key];
-  return typeof value === "string" && value.trim().length > 0 ? value : null;
-}
-
 /** Read an optional positive-integer millisecond env var. */
 function optionalMs(
   env: Env,
@@ -107,25 +111,34 @@ function optionalMs(
   return { ok: true, value: parsed };
 }
 
+/** Options for {@link readConfig} (tests). */
+export interface ReadConfigOptions {
+  /** Config-file path override; see `LoadClientConfigOptions.path`. */
+  readonly path?: string;
+}
+
 /**
- * Read and validate the hook config from an environment map.
+ * Read and validate the hook config: coordinates via `loadClientConfig` (config file + env
+ * overrides), timeouts from the environment.
  *
- * Returns a fail-closed `{ ok: false, reason }` (naming the first missing var, or the bad timeout)
- * rather than throwing, so the caller maps it straight to a `deny`.
+ * Returns a fail-closed `{ ok: false, reason }` rather than throwing, so the caller maps it straight
+ * to a `deny`.
  */
-export function readConfig(env: Env): ConfigResult {
-  const relayUrl = required(env, "ALLW_RELAY_URL");
-  if (relayUrl === null) {
-    return { ok: false, reason: "allw: ALLW_RELAY_URL is not set (fail-closed deny)" };
+export function readConfig(env: Env, options: ReadConfigOptions = {}): ConfigResult {
+  let coordinates: IntegratorConfig;
+  try {
+    coordinates = loadClientConfig({
+      env,
+      ...(options.path !== undefined ? { path: options.path } : {}),
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      ok: false,
+      reason: err instanceof ClientConfigError ? message : `allw: ${message} (fail-closed deny)`,
+    };
   }
-  const accountId = required(env, "ALLW_ACCOUNT_ID");
-  if (accountId === null) {
-    return { ok: false, reason: "allw: ALLW_ACCOUNT_ID is not set (fail-closed deny)" };
-  }
-  const approverRootKey = required(env, "ALLW_APPROVER_ROOT_KEY");
-  if (approverRootKey === null) {
-    return { ok: false, reason: "allw: ALLW_APPROVER_ROOT_KEY is not set (fail-closed deny)" };
-  }
+  const { relayUrl, accountId, approverRootKey } = coordinates;
 
   const timeout = optionalMs(env, "ALLW_TIMEOUT_MS");
   if (!timeout.ok) return timeout;
