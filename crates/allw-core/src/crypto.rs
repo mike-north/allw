@@ -205,8 +205,9 @@ pub(crate) struct JwsHeader {
 /// [`verify_verdict`] cross-checks every outer field against the matching claim.
 ///
 /// Binary fields (`request_hash`, `nonce`) serialize as base64url-unpadded strings, consistent
-/// with the rest of the wire format. `challenge_response` is included (and therefore signed)
-/// only when present.
+/// with the rest of the wire format. `note` and `challenge_response` are included (and therefore
+/// signed) only when present; an absent field is signed *as absent*, so adding, removing or
+/// rewriting either one after signing is a claims mismatch.
 ///
 /// See `docs/contract.md` §Lifecycle step 5 and §Wire encoding → verdict signature.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,6 +232,12 @@ pub struct VerdictClaims {
     /// Number-match challenge response. Signed (and present) only when a challenge was required.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub challenge_response: Option<String>,
+
+    /// The approver's free-form note, signed verbatim (S15, #251). Carried as the note itself
+    /// rather than a hash: the outer [`Verdict::note`] is already plaintext on the wire, so a hash
+    /// would add a second canonicalization rule without hiding anything. Omitted when absent.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub note: Option<String>,
 }
 
 /// The signed claims inside a **device-cert** JWS — binds a device key to an account.
@@ -557,6 +564,7 @@ pub fn sign_verdict(
         decided_at: unsigned.decided_at,
         nonce: nonce.to_vec(),
         challenge_response: unsigned.challenge_response.clone(),
+        note: unsigned.note.clone(),
     };
 
     let header = JwsHeader {
@@ -1039,8 +1047,9 @@ pub fn derive_number_match_challenge(request_hash: &[u8; 32]) -> String {
 ///    `typ`/`kid == approver.device_id`, and verifies it with the device key from step 1
 ///    ([`VerifyError::VerdictSignatureInvalid`] / [`VerifyError::MalformedJws`]).
 /// 3. **Claims ↔ outer consistency** (checklist #2). Each outer field
-///    (`request_id`, `decision`, `decided_at`, `request_hash`, `challenge_response`) must equal
-///    its signed claim ([`VerifyError::ClaimsMismatch`]).
+///    (`request_id`, `decision`, `decided_at`, `request_hash`, `challenge_response`, `note`) must
+///    equal its signed claim ([`VerifyError::ClaimsMismatch`]); an optional field present on one
+///    side and absent on the other is a mismatch.
 /// 4. **Binds the EXACT request — id AND hash** (checklist #2). `claims.request_id == request.id`
 ///    ([`VerifyError::RequestIdMismatch`]) AND `claims.request_hash` equals the hash recomputed
 ///    locally from the [`ApprovalContext`] + the envelope's `expires_at` (via
@@ -1264,6 +1273,11 @@ fn verify_verdict_with_account_states_impl(
         return Err(VerifyError::ClaimsMismatch {
             field: "challenge_response",
         });
+    }
+    // The outer note must equal the signed one (S15, #251): otherwise the relay could rewrite,
+    // inject, or strip the human's note before it reaches the audit trail.
+    if claims.note != verdict.note {
+        return Err(VerifyError::ClaimsMismatch { field: "note" });
     }
 
     // ── Step 4: bind to the EXACT request — id AND hash (no swap) ─────────────────
@@ -1931,6 +1945,120 @@ mod tests {
             VerifyError::ClaimsMismatch {
                 field: "challenge_response"
             }
+        );
+    }
+
+    // ── Signed note (S15, #251) ─────────────────────────────────────────────────
+
+    /// Signs an approved, canonical-hash verdict carrying `note` (challenge not required).
+    fn make_signed_with_note(note: Option<&str>) -> Verdict {
+        let cert = make_cert(&root_key());
+        let mut unsigned = make_unsigned(Decision::Approved, canonical_hash(false), None);
+        unsigned.note = note.map(str::to_string);
+        sign_verdict(&unsigned, &device_key(), NONCE, Some(cert))
+    }
+
+    /// Verifies `verdict` against the standard request/context with a fresh nonce store.
+    fn verify_standard(verdict: &Verdict) -> Result<VerifiedVerdict, VerifyError> {
+        let mut store = InMemoryNonceStore::new();
+        verify_verdict(
+            verdict,
+            &make_request(),
+            &make_context(false),
+            &root_key().public_key(),
+            &mut store,
+            NOW_OK,
+        )
+    }
+
+    /// Decodes the (unverified) payload segment of a compact JWS into verdict claims.
+    fn decode_verdict_claims(sig: &str) -> VerdictClaims {
+        let payload = sig.split('.').nth(1).expect("compact JWS has a payload");
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).expect("b64url payload"))
+            .expect("verdict claims JSON")
+    }
+
+    /// The note is inside the signed claims, verbatim, and a noted verdict verifies
+    /// (docs/contract.md §Wire encoding → verdict signature).
+    #[test]
+    fn note_is_signed_and_noted_verdict_verifies() {
+        let verdict = make_signed_with_note(Some("ok, but only this once"));
+        let claims = decode_verdict_claims(&verdict.sig);
+        assert_eq!(claims.note.as_deref(), Some("ok, but only this once"));
+        verify_standard(&verdict).expect("an untampered noted verdict must verify");
+    }
+
+    /// An absent note is omitted from the signed claims (not `"note": null`), so a note-less
+    /// verdict's signed payload is unchanged by this field.
+    #[test]
+    fn absent_note_is_omitted_from_signed_claims() {
+        let verdict = make_signed_with_note(None);
+        let payload = verdict.sig.split('.').nth(1).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
+        assert!(json.get("note").is_none(), "absent note must be omitted");
+        verify_standard(&verdict).expect("a note-less verdict must verify");
+    }
+
+    /// Rewriting the outer note (relay tamper) → ClaimsMismatch{field:"note"}.
+    #[test]
+    fn tampered_outer_note_detected() {
+        let mut verdict = make_signed_with_note(Some("deny if this touches prod"));
+        verdict.note = Some("looks fine".to_string());
+        assert_eq!(
+            verify_standard(&verdict).expect_err("tampered note must fail"),
+            VerifyError::ClaimsMismatch { field: "note" }
+        );
+    }
+
+    /// Adding a note to a verdict that was signed without one → ClaimsMismatch{field:"note"}.
+    #[test]
+    fn note_added_after_signing_detected() {
+        let mut verdict = make_signed_with_note(None);
+        verdict.note = Some("injected by relay".to_string());
+        assert_eq!(
+            verify_standard(&verdict).expect_err("injected note must fail"),
+            VerifyError::ClaimsMismatch { field: "note" }
+        );
+    }
+
+    /// Stripping a signed note from the outer verdict → ClaimsMismatch{field:"note"}.
+    #[test]
+    fn note_removed_after_signing_detected() {
+        let mut verdict = make_signed_with_note(Some("approved with reservations"));
+        verdict.note = None;
+        assert_eq!(
+            verify_standard(&verdict).expect_err("stripped note must fail"),
+            VerifyError::ClaimsMismatch { field: "note" }
+        );
+    }
+
+    /// An empty-string note is a distinct value from an absent note: blanking the outer note
+    /// (`Some("")`) is still a mismatch, not a normalization to "no note".
+    #[test]
+    fn note_blanked_after_signing_detected() {
+        let mut verdict = make_signed_with_note(Some("approved with reservations"));
+        verdict.note = Some(String::new());
+        assert_eq!(
+            verify_standard(&verdict).expect_err("blanked note must fail"),
+            VerifyError::ClaimsMismatch { field: "note" }
+        );
+    }
+
+    /// Rewriting the note INSIDE the signed payload (and the outer field to match) without
+    /// re-signing → VerdictSignatureInvalid: the relay cannot forge a consistent pair.
+    #[test]
+    fn note_rewritten_in_signed_payload_detected() {
+        let mut verdict = make_signed_with_note(Some("deny if this touches prod"));
+        let mut claims = decode_verdict_claims(&verdict.sig);
+        claims.note = Some("looks fine".to_string());
+        let mut parts: Vec<String> = verdict.sig.split('.').map(str::to_string).collect();
+        parts[1] = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        verdict.sig = parts.join(".");
+        verdict.note = Some("looks fine".to_string());
+        assert_eq!(
+            verify_standard(&verdict).expect_err("re-encoded note without re-signing must fail"),
+            VerifyError::VerdictSignatureInvalid
         );
     }
 
