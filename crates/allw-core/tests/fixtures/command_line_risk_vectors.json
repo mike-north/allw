@@ -1,5 +1,5 @@
 {
-  "description": "Shared Rust <-> WASM vectors for action_from_command risk on command lines with shell operators, substitutions, redirections and newlines (issue #272). Expected values are derived by hand from the risk table and rule in crates/allw-core/src/command.rs (shell_line_risk) and docs/policy-seam.md; bin is always the first shlex word (unchanged by #272). Append-only.",
+  "description": "Shared Rust <-> WASM vectors for action_from_command risk on command lines with shell operators, substitutions, redirections and newlines (issue #272). Expected values are derived by hand from the risk table and rule in crates/allw-core/src/command/risk.rs and docs/policy-seam.md; bin is always the first shlex word (unchanged by #272). Append-only.",
   "cases": [
     {
       "command": "ls && rm -rf /",
@@ -198,6 +198,168 @@
       "risk": "low",
       "bin": "ls",
       "why": "a plain command is unchanged"
+    },
+    {
+      "command": "cat > notes.md <<EOF\nDon't panic\nEOF\nrm -rf / # '",
+      "risk": "high",
+      "bin": "cat",
+      "why": "a quote in a heredoc body is data; rm -rf / runs after the body"
+    },
+    {
+      "command": "cat <<'EOF'\nit's\nEOF\nrm -rf / #'",
+      "risk": "high",
+      "bin": "cat",
+      "why": "quoted-delimiter heredoc body is literal; rm -rf / runs after it"
+    },
+    {
+      "command": "cat <<EOF\nsay \"hi\nEOF\nrm -rf /\necho \"",
+      "risk": "high",
+      "bin": "cat",
+      "why": "a double quote in a heredoc body is data; rm -rf / runs"
+    },
+    {
+      "command": "cat <<-EOF\n\tDon't\n\tEOF\nrm -rf / #'",
+      "risk": "high",
+      "bin": "cat",
+      "why": "<<- strips leading tabs before matching the delimiter; rm -rf / runs"
+    },
+    {
+      "command": "cat <<<EOF\nrm -rf /",
+      "risk": "high",
+      "bin": "cat",
+      "why": "<<< is a here-string, not a heredoc: the next line is a command"
+    },
+    {
+      "command": "cat <<EOF\nrm -rf /\nEOF",
+      "risk": "medium",
+      "bin": "cat",
+      "why": "negative: a heredoc body is data, not commands"
+    },
+    {
+      "command": "cat <<EOF\n$(rm -rf ~)\nEOF",
+      "risk": "high",
+      "bin": "cat",
+      "why": "an unquoted heredoc body runs its substitutions"
+    },
+    {
+      "command": "cat <<'EOF'\n$(rm -rf ~)\nEOF",
+      "risk": "medium",
+      "bin": "cat",
+      "why": "negative: a quoted delimiter makes the body literal"
+    },
+    {
+      "command": "bash <<'EOF'\nrm -rf /\nEOF",
+      "risk": "high",
+      "bin": "bash",
+      "why": "a heredoc fed to a shell is a script"
+    },
+    {
+      "command": "2>/dev/null rm -rf ~",
+      "risk": "high",
+      "bin": "2>/dev/null",
+      "why": "a leading redirection is not the command word"
+    },
+    {
+      "command": "> out rm -rf ~",
+      "risk": "high",
+      "bin": ">",
+      "why": "a lone redirection operator and its target are skipped"
+    },
+    {
+      "command": "time -p rm -rf ~",
+      "risk": "high",
+      "bin": "time",
+      "why": "time -p is skipped"
+    },
+    {
+      "command": "coproc NAME { rm -rf ~; }",
+      "risk": "high",
+      "bin": "coproc",
+      "why": "a { word starts a segment: rm -rf ~"
+    },
+    {
+      "command": "function f { rm -rf ~; }",
+      "risk": "high",
+      "bin": "function",
+      "why": "a function body is classified"
+    },
+    {
+      "command": "if true { rm -rf ~ }",
+      "risk": "high",
+      "bin": "if",
+      "why": "zsh short-form if: { starts a segment"
+    },
+    {
+      "command": "noglob rm -rf ~",
+      "risk": "high",
+      "bin": "noglob",
+      "why": "zsh precommand noglob is skipped"
+    },
+    {
+      "command": "repeat 3 rm -rf ~",
+      "risk": "high",
+      "bin": "repeat",
+      "why": "zsh repeat N is skipped"
+    },
+    {
+      "command": "=rm -rf ~",
+      "risk": "high",
+      "bin": "=rm",
+      "why": "zsh =cmd expands to the path of cmd"
+    },
+    {
+      "command": "ls &! rm -rf /",
+      "risk": "high",
+      "bin": "ls",
+      "why": "zsh &! is a control operator"
+    },
+    {
+      "command": "$CMD -rf ~",
+      "risk": "high",
+      "bin": "$CMD",
+      "why": "a command word from a parameter expansion can't be known: High"
+    },
+    {
+      "command": "$(echo rm) -rf ~",
+      "risk": "high",
+      "bin": "$(echo",
+      "why": "a command word from a command substitution can't be known: High"
+    },
+    {
+      "command": "r* -rf ~",
+      "risk": "high",
+      "bin": "r*",
+      "why": "a globbed command word can't be known: High"
+    },
+    {
+      "command": "{rm,ls} -rf ~",
+      "risk": "high",
+      "bin": "{rm,ls}",
+      "why": "a brace-list command word can't be known: High"
+    },
+    {
+      "command": "$'\\x72m' -rf ~",
+      "risk": "high",
+      "bin": "$\\x72m",
+      "why": "bash decodes $'\\x72m' to rm before running it"
+    },
+    {
+      "command": "ls *.txt",
+      "risk": "low",
+      "bin": "ls",
+      "why": "negative: a glob in an argument doesn't raise a Low command"
+    },
+    {
+      "command": "[ -f x ]",
+      "risk": "medium",
+      "bin": "[",
+      "why": "negative: a bare [ is the test command, not a glob"
+    },
+    {
+      "command": "tee >(rm -rf ~)",
+      "risk": "high",
+      "bin": "tee",
+      "why": "an output process substitution runs rm -rf ~"
     }
   ]
 }

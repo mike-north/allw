@@ -11,7 +11,7 @@
  *   pnpm --filter @allw/sdk test
  *
  * @see ../../../docs/policy-seam.md §ActionRecord
- * @see ../../../crates/allw-core/src/command.rs (module doc § Risk heuristic)
+ * @see ../../../crates/allw-core/src/command/risk.rs (module doc)
  * @see https://pubs.opengroup.org/onlinepubs/9799919799/utilities/V3_chap02.html
  */
 

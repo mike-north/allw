@@ -2,7 +2,7 @@
 //!
 //! `tests/fixtures/command_risk_vectors.json` lists commands with a hand-derived expected `risk`
 //! and `bin`. Each expected value comes from the module-doc risk table in
-//! `crates/allw-core/src/command.rs` and the rule in `docs/policy-seam.md` §ActionRecord: risk is
+//! `crates/allw-core/src/command/risk.rs` and the rule in `docs/policy-seam.md` §ActionRecord: risk is
 //! classified on the program that actually runs (leading `NAME=value` assignments, wrappers and
 //! `sh -c` never lower it), while `bin` stays `argv[0]`. The same file is fed through the compiled
 //! WASM by `packages/sdk/test/command-risk-vectors.test.mjs`, so the two surfaces cannot drift.
@@ -10,7 +10,7 @@
 //! The fixture is append-only and hand-written. It is never regenerated from program output.
 //!
 //! @see docs/policy-seam.md §ActionRecord
-//! @see crates/allw-core/src/command.rs (module doc § Risk heuristic)
+//! @see crates/allw-core/src/command/risk.rs (module doc)
 
 use std::path::PathBuf;
 

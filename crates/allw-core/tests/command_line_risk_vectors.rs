@@ -2,7 +2,7 @@
 //!
 //! `tests/fixtures/command_line_risk_vectors.json` lists command lines with a hand-derived
 //! expected `risk` and `bin`. Each expected value comes from the module-doc risk table in
-//! `crates/allw-core/src/command.rs` and the rule in `docs/policy-seam.md`: unquoted operators
+//! `crates/allw-core/src/command/risk.rs` and the rule in `docs/policy-seam.md`: unquoted operators
 //! (`&&`, `||`, `;`, `|`, `&`, newline), substitutions (`$(…)`, backticks, `<(…)`) and redirections
 //! raise risk to that of every command the shell would run, and at least `medium`. They never
 //! lower it. `bin` stays the first word. The same file is fed through the compiled WASM by
