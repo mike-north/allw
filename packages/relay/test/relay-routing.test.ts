@@ -50,8 +50,11 @@ const FUTURE_EXPIRES_AT = 4102444800000;
 const RELAY_NOW = FUTURE_EXPIRES_AT - 5 * 60 * 1000;
 /** A past expiry (1970-01-01T00:00:01Z, ms) — always < the relay's real `Date.now()` (fail-closed tests). */
 const PAST_EXPIRES_AT = 1000;
-/** A fixed creation timestamp (2023-11-14Z, ms). */
-const CREATED_AT = 1700000000000;
+/**
+ * A fixed creation timestamp: one minute before {@link RELAY_NOW}, so a submitted `created_at` is
+ * within the relay's bounds (#248).
+ */
+const CREATED_AT = RELAY_NOW - 60_000;
 /** Retention cutoff fixture: far enough in the past to be swept deterministically. */
 const OLD_TERMINAL_AT = 2000;
 

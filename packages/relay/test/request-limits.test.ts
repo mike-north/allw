@@ -7,6 +7,8 @@
  * - Body size: checked before JSON parsing → 413.
  * - `context_ciphertext` size → 413.
  * - Horizon: `expires_at - now > MAX_REQUEST_TTL_MS` → 400 (Worker-var configurable).
+ * - `created_at` sanity: an integer, `<= expires_at`, `>= now - MAX_REQUEST_TTL_MS` and
+ *   `<= now + MAX_CREATED_AT_SKEW_MS`, else 400.
  * - Over-horizon pending rows are expired by the alarm and then swept after retention.
  * - Every terminal transition blanks the stored envelope, so retained rows hold no ciphertext.
  * - Submits to an account with no bound root → 404 "unknown account".
@@ -25,6 +27,7 @@ import { AccountRelay, type Env } from "../src/index.js";
 import {
   DEFAULT_MAX_REQUEST_TTL_MS,
   MAX_CONTEXT_CIPHERTEXT_BYTES,
+  MAX_CREATED_AT_SKEW_MS,
   MAX_PAIRING_BODY_BYTES,
   MAX_REQUEST_BODY_BYTES,
   REQUEST_RETENTION_MS,
@@ -42,20 +45,20 @@ import { bindAccountRoot, pinRelayClock } from "./support/relay-state.js";
  * from it (`setAlarm(max(deadline, real now))`) are the fixture values, not the real time.
  */
 const NOW = 4_000_000_000_000;
-/** A fixed `created_at` for envelopes (contract field; the relay does not interpret it). */
-const CREATED_AT = 1_700_000_000_000;
+/** A fixed envelope `created_at`: one second before {@link NOW}, inside every created_at bound. */
+const CREATED_AT = NOW - 1000;
 /** The hooks' `MAX_TIMEOUT_MS` (`packages/hook/src/lib/config.ts`): the horizon must cover it. */
 const HOOK_MAX_TIMEOUT_MS = 420_000;
 const SHORT_CIPHERTEXT = "eyJhbGciOiJFQ0RILUVTK0EyNTZLVyJ9.FAKE.JWE";
 
 function envelope(
   id: string,
-  overrides: Partial<{ expires_at: number; context_ciphertext: string }> = {},
+  overrides: Partial<{ created_at: number; expires_at: number; context_ciphertext: string }> = {},
 ): Record<string, unknown> {
   return {
     v: 1,
     id,
-    created_at: CREATED_AT,
+    created_at: overrides.created_at ?? CREATED_AT,
     expires_at: overrides.expires_at ?? NOW + 60_000,
     approver: "acct-approver-limits",
     context_ciphertext: overrides.context_ciphertext ?? SHORT_CIPHERTEXT,
@@ -410,6 +413,82 @@ describe("POST /requests expires_at horizon", () => {
     }
     expect(errors).toHaveBeenCalledTimes(7);
     errors.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// created_at sanity bound (relay-api §3)
+// ---------------------------------------------------------------------------
+
+describe("POST /requests created_at bound", () => {
+  /** Submit with `created_at` (and optionally `expires_at`) on a fresh account. */
+  async function submitCreatedAt(
+    name: string,
+    createdAt: number,
+    expiresAt = NOW + 60_000,
+  ): Promise<{ status: number; error: string | undefined; stored: Record<string, string> }> {
+    const acct = await freshAccount(`created-${name}`);
+    const result = await submit(
+      acct,
+      envelope(rid(`req-created-${name}`), { created_at: createdAt, expires_at: expiresAt }),
+    );
+    return { ...result, stored: await requestStatuses(acct) };
+  }
+
+  it("allows 60 s of clock skew ahead of the relay", () => {
+    expect(MAX_CREATED_AT_SKEW_MS).toBe(60_000);
+  });
+
+  it("accepts an integer created_at; 400 for a fractional one, and stores nothing", async () => {
+    expect((await submitCreatedAt("int", NOW - 1000)).status).toBe(202);
+    const fractional = await submitCreatedAt("frac", NOW - 999.5);
+    expect(fractional.status).toBe(400);
+    expect(fractional.error).toBe("'created_at' must be an integer (i64 ms)");
+    expect(fractional.stored).toEqual({});
+  });
+
+  it("accepts created_at equal to expires_at; 400 one millisecond after it", async () => {
+    const expiresAt = NOW + 30_000;
+    expect((await submitCreatedAt("eq-exp", expiresAt, expiresAt)).status).toBe(202);
+    const after = await submitCreatedAt("after-exp", expiresAt + 1, expiresAt);
+    expect(after.status).toBe(400);
+    expect(after.error).toBe("'created_at' is after 'expires_at'");
+    expect(after.stored).toEqual({});
+  });
+
+  it("accepts created_at exactly the horizon in the past; 400 one millisecond earlier", async () => {
+    expect((await submitCreatedAt("past-at", NOW - DEFAULT_MAX_REQUEST_TTL_MS)).status).toBe(202);
+    const older = await submitCreatedAt("past-over", NOW - DEFAULT_MAX_REQUEST_TTL_MS - 1);
+    expect(older.status).toBe(400);
+    expect(older.error).toBe(
+      `'created_at' is more than ${String(DEFAULT_MAX_REQUEST_TTL_MS)} ms in the past`,
+    );
+    expect(older.stored).toEqual({});
+  });
+
+  it("accepts created_at exactly the skew ahead of the relay; 400 one millisecond further", async () => {
+    const expiresAt = NOW + MAX_CREATED_AT_SKEW_MS + 1000;
+    expect((await submitCreatedAt("skew-at", NOW + MAX_CREATED_AT_SKEW_MS, expiresAt)).status).toBe(
+      202,
+    );
+    const ahead = await submitCreatedAt("skew-over", NOW + MAX_CREATED_AT_SKEW_MS + 1, expiresAt);
+    expect(ahead.status).toBe(400);
+    expect(ahead.error).toBe(
+      `'created_at' is more than ${String(MAX_CREATED_AT_SKEW_MS)} ms in the future`,
+    );
+    expect(ahead.stored).toEqual({});
+  });
+
+  it("the past bound follows a configured horizon: at it accepted, one past it 400", async () => {
+    const acct = await freshAccount("created-config");
+    const configured = parseMaxRequestTtlMs("600000");
+    await runInDurableObject(stubFor(acct), (instance: AccountRelay) => {
+      (instance as unknown as { maxRequestTtlMs: number }).maxRequestTtlMs = configured;
+    });
+    const at = envelope(rid("req-created-cfg-at"), { created_at: NOW - configured });
+    expect((await submit(acct, at)).status).toBe(202);
+    const over = envelope(rid("req-created-cfg-over"), { created_at: NOW - configured - 1 });
+    expect((await submit(acct, over)).status).toBe(400);
   });
 });
 

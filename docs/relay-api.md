@@ -393,6 +393,13 @@ with 409, see §3 Pairing).
 (contract §Transport requires UUIDv4 or later) — otherwise **400**. This bounds the id, which is
 part of every retained row.
 
+**`created_at` sanity bound.** The envelope's `created_at` must be an integer (i64 ms), no later
+than `expires_at`, no further back than the request horizon (`now − MAX_REQUEST_TTL_MS`), and no
+further ahead than `MAX_CREATED_AT_SKEW_MS` (**60 s**, for clock skew) — otherwise **400**. Each
+bound is inclusive. This closes no attack, since the window is the submitter's own: it turns a
+request the device could never verify into a 400 at submit, instead of a provenance error on the
+device after the human taps.
+
 Limits on `POST /{acct}/requests` (#248; constants in `packages/relay/src/constants.ts`):
 
 | Limit                        | Value                                                               | Over the limit |
@@ -409,6 +416,7 @@ ends (expired, retracted or resolved) the relay blanks its stored envelope: stat
 keep working, but the ciphertext is gone. Stored bytes are therefore bounded by submit rate ×
 retention × that small per-row residue. Submission is not yet rate-limited, nor is the number of
 pending requests per account bounded — see `docs/threat-model.md` "Relay denial of service".
+
 **`GET /{acct}/requests/{id}`** and **`GET /{acct}/requests/{id}/wait`** (WS) — Bearer
 `request_auth_token`; poll/await `{ status, verdict? }`. `status` is `pending`, terminal `expired`,
 terminal `retracted` (see below), or `resolved` (+ `verdict`).

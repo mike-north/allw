@@ -39,6 +39,13 @@ export const MAX_REQUEST_BODY_BYTES = 128 * 1024;
 export const MAX_CONTEXT_CIPHERTEXT_BYTES = 64 * 1024;
 
 /**
+ * How far ahead of the relay's clock a submitted `created_at` may be, absorbing clock skew between
+ * the integrator and the relay; further ahead gets 400. The bound closes no attack (the window is
+ * the submitter's own): it turns a request the device could never verify into a 400 at submit.
+ */
+export const MAX_CREATED_AT_SKEW_MS = 60 * 1000;
+
+/**
  * Default request horizon: `expires_at - now` above this gets 400. Fifteen minutes covers the
  * hooks' 420 s `MAX_TIMEOUT_MS` with margin. Self-hosters may override it with the
  * `MAX_REQUEST_TTL_MS` Worker var (see `parseMaxRequestTtlMs`).

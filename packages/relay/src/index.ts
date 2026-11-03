@@ -31,6 +31,7 @@
 import { AlarmMultiplexer } from "./alarms.js";
 import {
   MAX_CONTEXT_CIPHERTEXT_BYTES,
+  MAX_CREATED_AT_SKEW_MS,
   MAX_PAIRING_BODY_BYTES,
   MAX_REQUEST_BODY_BYTES,
   PAIRING_TTL_MS,
@@ -1676,8 +1677,9 @@ export class AccountRelay implements DurableObject {
    * connected it stays queued and is delivered on the next `…/connect` (see handleDeviceConnect).
    * - 404: the account has no bound root (`unknown account`): no device can have paired.
    * - 400: not exactly the contract's envelope fields, an `id` that is not a canonical UUID,
-   *        already expired, or `expires_at - now`
-   *        beyond the request horizon (`maxRequestTtlMs`, default 15 min).
+   *        already expired, `expires_at - now` beyond the request horizon (`maxRequestTtlMs`,
+   *        default 15 min), or a `created_at` that is not an integer, is after `expires_at`, is
+   *        more than the horizon in the past, or is more than `MAX_CREATED_AT_SKEW_MS` ahead.
    * - 409: a request with this `id` was already submitted.
    * - 413: the body exceeds `MAX_REQUEST_BODY_BYTES` (checked before parsing) or
    *        `context_ciphertext` exceeds `MAX_CONTEXT_CIPHERTEXT_BYTES`.
@@ -1715,9 +1717,8 @@ export class AccountRelay implements DurableObject {
     if (requiredNumber(envelope, "v") === null) {
       return json({ error: "'v' is required (number)" }, 400);
     }
-    if (requiredNumber(envelope, "created_at") === null) {
-      return json({ error: "'created_at' is required (i64 ms)" }, 400);
-    }
+    const createdAt = requiredNumber(envelope, "created_at");
+    if (createdAt === null) return json({ error: "'created_at' is required (i64 ms)" }, 400);
     if (!requiredString(envelope, "approver")) {
       return json({ error: "'approver' is required (string)" }, 400);
     }
@@ -1746,6 +1747,8 @@ export class AccountRelay implements DurableObject {
         400,
       );
     }
+    const createdAtFailure = this.createdAtFailure(createdAt, expiresAt, now);
+    if (createdAtFailure !== null) return json({ error: createdAtFailure }, 400);
     const requestAuthToken = generateAuthToken();
     const requestAuthTokenHash = await hashAuthToken(requestAuthToken);
 
@@ -1784,6 +1787,27 @@ export class AccountRelay implements DurableObject {
     if (coalesced > 0) await this.armTrailingWakeupAlarm();
 
     return this.requestSubmitResponse(id, delivered, pushWakeups, requestAuthToken);
+  }
+
+  /**
+   * Why a submitted `created_at` is not plausible, or `null` when it is. The window is the
+   * submitter's own, so this closes no attack: it turns a request the device would reject as
+   * unverifiable after the human taps into a 400 at submit. Each bound is inclusive:
+   * - an integer (contract §Transport: i64 ms);
+   * - no later than `expires_at`;
+   * - no further back than the request horizon (`now - maxRequestTtlMs`);
+   * - no further ahead than `MAX_CREATED_AT_SKEW_MS` (clock skew).
+   */
+  private createdAtFailure(createdAt: number, expiresAt: number, now: number): string | null {
+    if (!Number.isInteger(createdAt)) return "'created_at' must be an integer (i64 ms)";
+    if (createdAt > expiresAt) return "'created_at' is after 'expires_at'";
+    if (createdAt < now - this.maxRequestTtlMs) {
+      return `'created_at' is more than ${String(this.maxRequestTtlMs)} ms in the past`;
+    }
+    if (createdAt > now + MAX_CREATED_AT_SKEW_MS) {
+      return `'created_at' is more than ${String(MAX_CREATED_AT_SKEW_MS)} ms in the future`;
+    }
+    return null;
   }
 
   private async authorizeRequestRead(
