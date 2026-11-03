@@ -34,12 +34,13 @@ interface PairedDevice {
   readonly authToken: string;
 }
 
-interface StoredRow {
+/** A `device_push_token` row. A type alias (not an interface) so it satisfies `SqlStorage.exec`'s row constraint. */
+type StoredRow = {
   device_id: string;
   transport: string;
   token: string;
   created_at: number;
-}
+};
 
 function relayUrl(accountId: string, subPath: string): string {
   return `https://relay.allw.test/${accountId}${subPath}`;
