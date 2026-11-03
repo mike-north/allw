@@ -428,7 +428,8 @@ BadDeviceToken` never prunes: APNs also returns it for a token sent to the wrong
 (sandbox or production), so a misconfigured `APNS_ENDPOINT` would otherwise unregister every device.
 A bare FCM 404, one with another error code, or one whose body cannot be read is likewise kept. Any
 4xx that does not prune is logged once (`console.warn`) with the transport, the push-service host
-and the status, never the token (#326). 5xx, 429 and timeouts are transient and not logged.
+and the status, never the token (#326); that includes a 429, which keeps the token. 5xx answers
+and timeouts are transient and not logged.
 
 **Web Push** (RFC 8030, browser approvers):
 
