@@ -2635,6 +2635,7 @@ test("verify_verdict_provenance gives the Rust vector's answer for every case (#
 
   // Junk input never passes: a non-object verdict, a verdict for another account, a bad root.
   const genuine = v.provenance_cases.find((c) => c.name === "genuine");
+  assert.ok(genuine, "the vector carries the genuine provenance case");
   assert.throws(() =>
     wasm.verify_verdict_provenance(
       "42",

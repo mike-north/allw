@@ -35,6 +35,7 @@ import {
   rootFor,
   signAccountState,
   signTestVerdict,
+  TEST_DECIDED_AT,
   testAccount,
   testRoot,
 } from "./support/accounts.js";
@@ -1057,7 +1058,8 @@ describe("AccountRelay — verdict finality (#245)", () => {
       "req-final-cert-expired",
       signTestVerdict(ctx.acct, ctx.first, "req-final-cert-expired", {
         decision: "denied",
-        certExpiresAt: Date.now() - 60_000,
+        // Expired one millisecond before the signed decision time.
+        certExpiresAt: TEST_DECIDED_AT - 1,
       }),
     );
     await expectStillAnswerable(ctx, "req-final-cert-expired");

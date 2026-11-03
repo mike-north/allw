@@ -150,11 +150,19 @@ export function signAccountState(signer: TestAccount, options: AccountStateOptio
   return glue.sign_account_state(json, signer.rootSeed);
 }
 
+/** Test device certificates are issued at this fixed time (Unix ms), with no expiry by default. */
+export const TEST_CERT_ISSUED_AT = 1_700_000_000_000;
+/**
+ * The fixed `decided_at` of test verdicts (Unix ms, after {@link TEST_CERT_ISSUED_AT}). The relay
+ * judges the certificate's expiry at `decided_at`, not its own clock, so fixtures stay deterministic.
+ */
+export const TEST_DECIDED_AT = 1_700_000_500_000;
+
 /** Options for a device-signed verdict. */
 export interface VerdictOptions {
   /** The signed decision (default `approved`). */
   readonly decision?: "approved" | "denied" | "expired" | "aborted";
-  /** The signed `decided_at` (default: now). The device certificate must be valid at it. */
+  /** The signed `decided_at` (default {@link TEST_DECIDED_AT}). The certificate must be valid at it. */
   readonly decidedAt?: number;
   /**
    * The root that certifies the device key (default: the account's own root). Another account's
@@ -195,7 +203,7 @@ export function signTestVerdict(
     accountId,
     options.certifiedDeviceId ?? deviceId,
     glue.ed25519_public_key(seed),
-    1_700_000_000_000,
+    TEST_CERT_ISSUED_AT,
     options.certExpiresAt ?? null,
   );
   const unsigned = {
@@ -203,7 +211,7 @@ export function signTestVerdict(
     request_id: requestId,
     request_hash: "ZmFrZS1yZXF1ZXN0LWhhc2gtMzItYnl0ZXMtYjY0dXI",
     decision: options.decision ?? "approved",
-    decided_at: options.decidedAt ?? Date.now(),
+    decided_at: options.decidedAt ?? TEST_DECIDED_AT,
     approver: { account_id: accountId, device_id: deviceId },
   };
   const signingSeed = options.uncertifiedKey ? deviceSeed(accountId, deviceId, "rogue") : seed;
