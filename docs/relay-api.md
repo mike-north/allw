@@ -347,7 +347,8 @@ wakeup would shorten the ceremony but changes no trust property.
 ### Device (approver) endpoints — Bearer `device_auth_token`
 
 **`GET /{acct}/devices/{device_id}/inbox`** → **200** `{ envelopes: [ ApprovalEnvelope ] }` —
-pending only, `expires_at > now`, oldest first. (404 if device not enrolled.)
+pending requests before their deadline (§3, request deadline), oldest first. (404 if device not
+enrolled.)
 
 **`GET /{acct}/devices/{device_id}/connect?surface_id=…`** — WebSocket (101). See §4.
 `surface_id` (optional, 1–128 `[A-Za-z0-9._:-]`) dedupes delivery to **one socket per surface**
@@ -451,16 +452,28 @@ Limits on `POST /{acct}/requests` (#248; constants in `packages/relay/src/consta
 | Submits per account + IP      | `RATE_LIMIT_REQUESTS` binding (default 60 / 60 s)                   | **429**        |
 | Unauthenticated calls per IP  | `RATE_LIMIT_CLIENT` binding (default 120 / 60 s, all four routes)   | **429**        |
 
-Each value is inclusive (exactly the limit is accepted). The `context_ciphertext` ceiling is the
-one integrators can hit with honest input: it caps the encrypted context, which is larger than the
-plaintext context the SDK encrypts. Over-size fails closed — the relay stores nothing, and the SDK's
-`requestApproval` rejects with a `RelayError` (`name` `"RelayError"`, `status` 413), which a caller
-must treat as deny. The SDK does no pre-check of its own. The 15-minute horizon covers the hooks'
-420 s maximum timeout; an operator who lowers it below that makes hook requests fail closed. Only
-**live** pending requests count toward the pending cap: resolved, expired and retracted requests,
-and pending ones already past `expires_at`, do not. A pending request older than the horizon (only
-possible for one stored before the horizon existed) also stops counting and is expired by the alarm;
-like every terminal request it is deleted 7 days after it ends. When a request ends (expired,
+Each value is inclusive (exactly the limit is accepted). The `context_ciphertext` ceiling is the one
+integrators can hit with honest input: it caps the encrypted context, which is larger than the plaintext
+context the SDK encrypts. Over-size fails closed — the relay stores nothing, and the SDK's
+`requestApproval` rejects with a `RelayError` with `status` 413, which a caller must treat as deny.
+`RelayError` is exported from `@allw/sdk`, so a caller narrows with
+`err instanceof RelayError && err.status === 413` (#365). `requestApproval` rejects with a `RelayError`
+only for a non-2xx or malformed reply to the device fetch or the submit; once the request is submitted,
+a non-2xx poll reply (such as 401 or 403) resolves to an `expired` verdict, and a failed retract is
+ignored. The SDK does no pre-check of its own. The 15-minute horizon covers the hooks' 420 s maximum
+timeout; an operator who lowers it below that makes hook requests fail closed.
+
+**Request deadline.** A stored request's deadline is `min(expires_at, created_at + MAX_REQUEST_TTL_MS)`,
+where `created_at` is the relay's own receipt time, not the envelope's. A request is live strictly
+before its deadline and expired at it. Every lifecycle path reads this one deadline, on one relay
+clock: submit and its pending cap, the inbox and the reconnect flush, poll, wait, retract, verdict
+acceptance, the expiry alarm, and the deadline a push wakeup carries. Only **live** pending requests
+count toward the pending cap: resolved, expired and retracted requests, and pending ones already at
+or past their deadline, do not. The horizon term only bites for a request stored before the horizon
+existed or before an operator lowered `MAX_REQUEST_TTL_MS`. From its deadline on such a request is
+treated exactly like one past `expires_at`: it is not delivered, poll and wait report `expired`,
+retract is 409, a verdict is acked `expired`, it frees its pending slot, and the alarm expires it.
+Like every terminal request it is deleted 7 days after it ends. When a request ends (expired,
 retracted or resolved) the relay blanks its stored envelope: status and verdict reads keep working,
 but the ciphertext is gone. The pending cap therefore bounds **live** requests; stored bytes are
 bounded by submit rate × retention × that small per-row residue.
@@ -517,8 +530,8 @@ offline queue (still-pending, non-expired) as `request` messages. Hibernatable.
   decision (the `SignedVerdict.signedVerdictJson` the core produced; see `docs/contract.md` Verdict).
 - relay replies
   `{ "type": "ack", "request_id": string, "status": "resolved" | "already_resolved" | "expired" | "retracted" }`.
-  Idempotent: a second verdict is `already_resolved` (not overwritten); a verdict past `expires_at`
-  is `expired` (rejected, fail-closed); a verdict for a request the integrator already cancelled is
+  Idempotent: a second verdict is `already_resolved` (not overwritten); a verdict at or after the
+  request's deadline (§3, request deadline) is `expired` (rejected, fail-closed); a verdict for a request the integrator already cancelled is
   `retracted` (rejected — a retract is never overridable, #195).
 
 Only device sockets may submit verdicts, and only a verdict with valid **provenance** is recorded
