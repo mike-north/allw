@@ -50,7 +50,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      # No caches anywhere in this workflow: release builds run cold. A cache entry is keyed by
+      # name, not by who wrote it, so a run on a hostile `v*` tag could save poisoned build state
+      # that a later, legitimate release would restore. The pre-approval byte match can't catch
+      # that, because the poisoned bytes would come from the real run.
       - uses: jetli/wasm-pack-action@v0.4.0
         with:
           version: latest
@@ -58,7 +61,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
-          cache: pnpm
       - run: pnpm install --frozen-lockfile
       # Lockstep versioning: the tag must equal every released package's version. A rehearsal
       # (branch dispatch) checks the version currently in the manifests instead.

@@ -455,3 +455,21 @@ test("release.yml only stages, via OIDC from the trusted identity, with no token
   const smoke = buildJob.indexOf("smoke-packaged-install.mjs --tarballs dist-release");
   assert.ok(pack >= 0 && smoke > pack, "pack, then smoke the packed tarballs");
 });
+
+// Cache poisoning: a cache entry is keyed by name, not by who wrote it. A run on a hostile `v*` tag
+// could save poisoned build state that a later legitimate release restores, and the pre-approval
+// byte match would pass because the poisoned bytes come from the real run. So release builds run
+// cold.
+test("release.yml restores and saves no caches", () => {
+  const workflow = readFileSync(
+    join(REPO_ROOT, ".github", "workflows", RELEASE_WORKFLOW_FILE),
+    "utf8",
+  )
+    .split("\n")
+    .filter((line) => !/^\s*#/.test(line))
+    .join("\n");
+  assert.doesNotMatch(workflow, /actions\/cache/);
+  assert.doesNotMatch(workflow, /rust-cache/);
+  assert.doesNotMatch(workflow, /^\s*cache(-[a-z-]+)?:/m, "no `cache:` input on any step");
+  assert.doesNotMatch(workflow, /sccache|cache-on-failure|save-always/);
+});
