@@ -180,6 +180,18 @@ test("agentSafeErrorText leaves a short, clean message unchanged", async () => {
   assert.equal(agentSafeErrorText(wasm, new Error(atCap)), atCap, "exactly the cap is not cut");
 });
 
+test("agentSafeErrorText cuts by code point, never splitting a surrogate pair", async () => {
+  const wasm = await loadWasm();
+  // U+1F600 is one code point but two UTF-16 units; a UTF-16 cut at the cap would split one.
+  const text = "x" + "\u{1F600}".repeat(MAX_ERROR_TEXT_CHARS);
+  const capped = agentSafeErrorText(wasm, new Error(text));
+  const chars = Array.from(capped);
+  assert.equal(chars.length, MAX_ERROR_TEXT_CHARS + 1, "the cap, plus the … marker");
+  assert.equal(chars.at(-1), "…");
+  assert.equal(chars.at(-2), "\u{1F600}", "the last kept character is a whole emoji");
+  assert.equal(capped.isWellFormed(), true, "no lone surrogate");
+});
+
 test("non-gated tool (Read) → allow pass-through WITHOUT calling the approver", async () => {
   const wasm = await loadWasm();
   const approver = recording("denied"); // would deny if (wrongly) called

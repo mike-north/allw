@@ -56,7 +56,6 @@ export interface HookApprovalRequest {
 /** The injectable approval function — the real one is `client.requestApproval` from `@allw/sdk`. */
 export type RequestApprovalFn = (req: HookApprovalRequest) => Promise<ApprovalVerdict>;
 
-/** Everything `decide` needs that isn't the parsed input — all injectable for tests. */
 /** The most characters of error text a deny reason carries (after escaping), plus `…`. */
 export const MAX_ERROR_TEXT_CHARS = 256;
 
@@ -89,6 +88,7 @@ export function agentSafeErrorText(wasm: HookWasm, err: unknown): string {
     : escaped;
 }
 
+/** Everything `decide` needs that isn't the parsed input — all injectable for tests. */
 export interface DecideDeps {
   readonly wasm: HookWasm;
   readonly config: HookConfig;
