@@ -150,6 +150,9 @@ fn decode_b64_vec(value: &str, what: &str) -> Result<Vec<u8>, AllwFfiError> {
 /// (`docs/openclaw-integration.md` §5.1). `raw` carries the original command text (empty string
 /// when the caller has none) and is used only to record `syntactic.raw` and extract `env_refs`
 /// names; it is never re-tokenized. `cwd` is the bound working directory, empty when unbound.
+///
+/// Fails (fail-closed) for an argv with no program (#376): empty, an empty program word, or only
+/// variable assignments.
 #[uniffi::export]
 pub fn action_from_argv_json(
     argv: Vec<String>,
@@ -159,7 +162,8 @@ pub fn action_from_argv_json(
     let ctx = CommandContext {
         cwd: if cwd.is_empty() { None } else { Some(cwd) },
     };
-    let action = core_action_from_argv(&argv, if raw.is_empty() { None } else { Some(&raw) }, &ctx);
+    let action = core_action_from_argv(&argv, if raw.is_empty() { None } else { Some(&raw) }, &ctx)
+        .map_err(|e| AllwFfiError::failure(format!("failed to build command action: {e}")))?;
     to_json(&action, "ActionRecord")
 }
 
@@ -507,6 +511,26 @@ mod tests {
             assert!(err.to_string().contains(message), "{line:?}: {err}");
         }
         assert!(action_from_command_json("ls".to_string(), String::new()).is_ok());
+    }
+
+    /// The argv binding inherits the core's no-program refusal too (#376).
+    #[test]
+    fn action_from_argv_json_refuses_an_argv_with_no_program() {
+        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (argv, message) in [
+            (words(&[]), "contains no command"),
+            (words(&[""]), "first program word is empty"),
+            (
+                words(&["", "rm", "-rf", "x"]),
+                "first program word is empty",
+            ),
+            (words(&["FOO=1"]), "runs no program"),
+        ] {
+            let err = action_from_argv_json(argv.clone(), "rm -rf x".to_string(), String::new())
+                .expect_err("an argv with no program must be refused");
+            assert!(err.to_string().contains(message), "{argv:?}: {err}");
+        }
+        assert!(action_from_argv_json(words(&["ls"]), String::new(), String::new()).is_ok());
     }
 
     /// A valid 32-byte seed decodes into a `Zeroizing<[u8; 32]>` whose bytes match the input.

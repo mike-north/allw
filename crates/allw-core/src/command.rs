@@ -14,11 +14,11 @@
 //!
 //! // From a pre-tokenized argv (e.g. when the shell has already split arguments):
 //! let argv = vec!["git".to_string(), "push".to_string(), "--force".to_string()];
-//! let record = action_from_argv(&argv, None, &CommandContext::default());
+//! let record = action_from_argv(&argv, None, &CommandContext::default())?;
 //!
 //! // …or a pre-tokenized argv that also carries the original command text, so `raw` (and the
 //! // `env_refs` derived from it) are populated without re-tokenizing:
-//! let record = action_from_argv(&argv, Some("git push --force"), &CommandContext::default());
+//! let record = action_from_argv(&argv, Some("git push --force"), &CommandContext::default())?;
 //! ```
 //!
 //! # Tokenization
@@ -32,7 +32,8 @@
 //! - Whitespace as delimiter (any sequence of spaces/tabs)
 //!
 //! If the shell string is syntactically invalid (unmatched quotes), the tokenization
-//! returns an error.  [`action_from_argv`] does not tokenize and never fails.
+//! returns an error.  [`action_from_argv`] does not tokenize; it fails only for an argv with no
+//! program (empty, an empty program word, or only assignments; #376), as both builders do.
 //!
 //! # Command lines with shell syntax (risk only)
 //!
@@ -247,10 +248,10 @@ pub fn action_from_command(
 /// Build an [`ActionRecord`] from a pre-tokenized argument vector, optionally carrying the
 /// original command text.
 ///
-/// This is the infallible variant for callers that have already split the command into
-/// tokens (e.g. received from a shell hook, a process execution API, or an agent runtime that
-/// stores a canonical execution plan). Such callers **must not** re-tokenize their own command
-/// text: re-parsing risks binding a different token vector than the one that actually executes
+/// This is the variant for callers that have already split the command into tokens (e.g.
+/// received from a shell hook, a process execution API, or an agent runtime that stores a
+/// canonical execution plan). Such callers **must not** re-tokenize their own command text:
+/// re-parsing risks binding a different token vector than the one that actually executes
 /// (`docs/openclaw-integration.md` §5.1).
 ///
 /// `raw` is the original command string as the upstream gate renders it, when the caller has one.
@@ -258,17 +259,44 @@ pub fn action_from_command(
 /// extracts `env_refs` from — passing `None` therefore also yields `env_refs: None`, since a token
 /// vector has already had its `$VAR` references resolved by whatever produced it.
 ///
-/// An empty `argv` slice produces an [`ActionRecord`] whose `bin`, `argv`, `flags`, and
-/// `positionals` are all `None` (there is nothing to populate); `raw` still reflects the argument.
+/// # Errors
+///
+/// It refuses an argv with no program to show the human (#376), whatever `raw` says:
+///
+/// - [`CommandError::NoCommand`] for an empty `argv`;
+/// - [`CommandError::EmptyProgram`] when the first word that is not a pure assignment is `""`
+///   (`[""]`, `["", "rm", "-rf", "x"]`, `["FOO=1", ""]`);
+/// - [`CommandError::NoProgram`] when every word is a pure assignment (`["FOO=1"]`).
+///
+/// The words are never read as shell syntax: an operator word (`["&&"]`) is a program name, so it
+/// is built. Assignments are treated as the line builder treats them (and as the risk rules skip
+/// them) even though an argv runs without a shell, where `FOO=1` would be a program name: no real
+/// program is named like an assignment, so refusing it fails closed and keeps both builders
+/// consistent. See `docs/policy-seam.md` §Command lines that run no program.
 ///
 /// # Examples
 ///
 /// ```rust,ignore
 /// let argv = vec!["git".to_string(), "push".to_string()];
-/// let record = action_from_argv(&argv, None, &CommandContext::default());
-/// let bound = action_from_argv(&argv, Some("git push"), &CommandContext::default());
+/// let record = action_from_argv(&argv, None, &CommandContext::default())?;
+/// let bound = action_from_argv(&argv, Some("git push"), &CommandContext::default())?;
 /// ```
-pub fn action_from_argv(argv: &[String], raw: Option<&str>, ctx: &CommandContext) -> ActionRecord {
+pub fn action_from_argv(
+    argv: &[String],
+    raw: Option<&str>,
+    ctx: &CommandContext,
+) -> Result<ActionRecord, CommandError> {
+    check_argv_has_a_program(argv)?;
+    Ok(build_argv_record(argv, raw, ctx))
+}
+
+/// [`action_from_argv`] without the no-program check, for a builder that has already done its own
+/// (the PowerShell builder, whose whitespace tokens are not POSIX words).
+pub(crate) fn build_argv_record(
+    argv: &[String],
+    raw: Option<&str>,
+    ctx: &CommandContext,
+) -> ActionRecord {
     // The argv runs without a shell, so `raw` is display text and is not read for risk.
     let risk = risk::argv_risk(argv);
     build_record(argv.to_vec(), ctx, raw.map(str::to_string), risk)
@@ -306,11 +334,17 @@ fn is_pure_assignment(piece: &str) -> bool {
 /// [pure assignment](is_pure_assignment) is skipped, and any other piece is a program. This reads
 /// the tokens only; it does not change them or the record.
 ///
-/// It can only refuse a line that runs nothing. `shlex` removes quotes, so a quoted operator or
-/// assignment (`';'`, `'FOO=1'`) is read as unquoted; but bash runs such a word as a program name
-/// that does not exist, so refusing it denies nothing that would run. Anything that does run (a
-/// program word, a substitution, a redirection such as `> f`) leaves a piece that is not skipped,
-/// so the line is built and goes to a human as before.
+/// It never refuses a line whose first command word runs: a program word, a substitution or a
+/// redirection (such as `> f`) leaves a piece that is not skipped, so the line is built and goes to
+/// a human as before. It can refuse a line where the shell would still run something, and that is
+/// deliberate (a deny, so fail-closed):
+///
+/// - only the words up to the first program word are read, so a later segment after an empty
+///   program word is not examined (`'' || rm -rf x`, `'' ; rm -rf x` are refused);
+/// - `shlex` removes quotes, so a quoted operator or assignment (`';'`, `'FOO=1'`) is read as
+///   unquoted, though bash runs it as a program name;
+/// - an assignment is recognised by its first character only, so `FO-O=1` is read as one, though
+///   bash runs it as a program name.
 fn check_runs_a_program(argv: &[String]) -> Result<(), CommandError> {
     if argv.is_empty() {
         return Err(CommandError::NoCommand);
@@ -327,6 +361,21 @@ fn check_runs_a_program(argv: &[String]) -> Result<(), CommandError> {
         }
     }
     Err(CommandError::NoProgram)
+}
+
+/// Refuse an argv with no program (#376), the [`action_from_argv`] rules: empty →
+/// [`CommandError::NoCommand`]; leading [pure assignments](is_pure_assignment) skipped, then `""` →
+/// [`CommandError::EmptyProgram`]; only assignments → [`CommandError::NoProgram`]. Words are not
+/// split on operators: an argv runs without a shell.
+fn check_argv_has_a_program(argv: &[String]) -> Result<(), CommandError> {
+    if argv.is_empty() {
+        return Err(CommandError::NoCommand);
+    }
+    match argv.iter().find(|word| !is_pure_assignment(word)) {
+        Some(word) if word.is_empty() => Err(CommandError::EmptyProgram),
+        Some(_) => Ok(()),
+        None => Err(CommandError::NoProgram),
+    }
 }
 
 // ── Core builder ─────────────────────────────────────────────────────────────
@@ -922,11 +971,11 @@ mod tests {
 
     // ── action_from_argv ─────────────────────────────────────────────────────
 
-    /// action_from_argv accepts a pre-tokenized argv and never fails.
+    /// action_from_argv builds a record from a pre-tokenized argv.
     #[test]
     fn action_from_argv_basic() {
         let argv = vec!["git".to_string(), "push".to_string(), "--force".to_string()];
-        let r = action_from_argv(&argv, None, &ctx_with_cwd());
+        let r = action_from_argv(&argv, None, &ctx_with_cwd()).unwrap();
 
         assert_eq!(bin(&r), "git");
         assert_eq!(positionals(&r), vec!["push"]);
@@ -934,28 +983,47 @@ mod tests {
         assert_eq!(r.risk, Risk::High, "git push --force is High risk");
     }
 
-    /// action_from_argv with empty argv → all command fields None.
+    /// An argv with no program is refused (#376), whatever `raw` says: empty → NoCommand, an
+    /// empty program word → EmptyProgram, only assignments → NoProgram.
     #[test]
-    fn action_from_argv_empty() {
-        let r = action_from_argv(&[], None, &ctx_no_cwd());
-
-        assert!(r.syntactic.bin.is_none());
-        assert!(r.syntactic.argv.is_none());
-        assert!(r.syntactic.flags.is_none());
-        assert!(r.syntactic.positionals.is_none());
-        // raw is None for action_from_argv (no original string available)
-        assert!(r.syntactic.raw.is_none());
+    fn action_from_argv_refuses_an_argv_with_no_program() {
+        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (argv, raw, expected) in [
+            (words(&[]), None, CommandError::NoCommand),
+            (words(&[]), Some("rm -rf x"), CommandError::NoCommand),
+            (words(&[""]), None, CommandError::EmptyProgram),
+            (
+                words(&["", "rm", "-rf", "x"]),
+                Some("rm -rf x"),
+                CommandError::EmptyProgram,
+            ),
+            (words(&["FOO=1", ""]), None, CommandError::EmptyProgram),
+            (words(&["FOO=1"]), None, CommandError::NoProgram),
+            (
+                words(&["FOO=1", "BAR=2"]),
+                Some("FOO=1 BAR=2"),
+                CommandError::NoProgram,
+            ),
+        ] {
+            assert_eq!(
+                action_from_argv(&argv, raw, &ctx_no_cwd()),
+                Err(expected),
+                "{argv:?}"
+            );
+        }
     }
 
-    /// An empty argv still records the caller's `raw`, so a malformed upstream plan is visible in
-    /// the record rather than silently erased.
+    /// An argv runs without a shell, so its words are never read as operators: an argv with a
+    /// program word (even one named like an operator, or after an assignment) is built.
     #[test]
-    fn action_from_argv_empty_keeps_raw() {
-        let r = action_from_argv(&[], Some("  "), &ctx_no_cwd());
-
-        assert!(r.syntactic.bin.is_none());
-        assert!(r.syntactic.argv.is_none());
-        assert_eq!(r.syntactic.raw.as_deref(), Some("  "));
+    fn action_from_argv_builds_an_argv_with_a_program() {
+        for argv in [vec!["&&"], vec![";"], vec!["FOO=1", "ls"], vec!["ls", ""]] {
+            let argv: Vec<String> = argv.into_iter().map(str::to_string).collect();
+            assert!(
+                action_from_argv(&argv, None, &ctx_no_cwd()).is_ok(),
+                "{argv:?}"
+            );
+        }
     }
 
     /// `raw` is recorded verbatim and is **not** re-tokenized: the bound `argv` stays exactly the
@@ -969,7 +1037,7 @@ mod tests {
             "echo hello world".to_string(),
         ];
         let raw = "bash -lc echo hello world";
-        let r = action_from_argv(&argv, Some(raw), &ctx_no_cwd());
+        let r = action_from_argv(&argv, Some(raw), &ctx_no_cwd()).unwrap();
 
         assert_eq!(r.syntactic.raw.as_deref(), Some(raw));
         assert_eq!(
@@ -995,7 +1063,8 @@ mod tests {
             &argv,
             Some("curl -H \"Authorization: Bearer $API_TOKEN\" https://example.test/${TENANT}"),
             &ctx_no_cwd(),
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             r.syntactic.env_refs.as_deref(),
@@ -1009,7 +1078,7 @@ mod tests {
     #[test]
     fn action_from_argv_without_raw_has_no_env_refs() {
         let argv = vec!["echo".to_string(), "$HOME".to_string()];
-        let r = action_from_argv(&argv, None, &ctx_no_cwd());
+        let r = action_from_argv(&argv, None, &ctx_no_cwd()).unwrap();
 
         assert!(r.syntactic.env_refs.is_none());
     }
@@ -1103,7 +1172,7 @@ mod tests {
     #[test]
     fn raw_is_none_for_action_from_argv() {
         let argv = vec!["ls".to_string()];
-        let r = action_from_argv(&argv, None, &ctx_no_cwd());
+        let r = action_from_argv(&argv, None, &ctx_no_cwd()).unwrap();
         assert!(
             r.syntactic.raw.is_none(),
             "action_from_argv with raw=None sets raw to None"

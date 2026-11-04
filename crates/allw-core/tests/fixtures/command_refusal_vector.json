@@ -1,5 +1,5 @@
 {
-  "description": "Shared Rust/WASM vector for the command builders' no-program refusal (#376). Every case is a line the core must refuse instead of building a record: `code` is CommandError::code (the WASM error's `kind`) and `message` is the core's Display text. `builder` is `posix` (action_from_command) or `powershell` (action_from_powershell_command). Written by hand from docs/policy-seam.md §Command lines that run no program; never regenerate it from program output.",
+  "description": "Shared Rust/WASM vector for the command builders' no-program refusal (#376). Every case is a line the core must refuse instead of building a record: `code` is CommandError::code (the WASM error's `kind`) and `message` is the core's Display text. `builder` is `posix` (action_from_command), `powershell` (action_from_powershell_command) or `argv` (action_from_argv, whose `argv` is the token array and `raw` the optional display text; `command` is unused). Written by hand from docs/policy-seam.md §Command lines that run no program; never regenerate it from program output.",
   "cases": [
     {
       "class": "empty",
@@ -154,17 +154,132 @@
       "command": "& \"\" -Force",
       "code": "empty_program",
       "message": "command line's first program word is empty"
+    },
+    {
+      "class": "deliberate: a later segment after an empty program word is not examined (||)",
+      "builder": "posix",
+      "command": "'' || rm -rf x",
+      "code": "empty_program",
+      "message": "command line's first program word is empty"
+    },
+    {
+      "class": "deliberate: a later segment after an empty program word is not examined (;)",
+      "builder": "posix",
+      "command": "'' ; rm -rf x",
+      "code": "empty_program",
+      "message": "command line's first program word is empty"
+    },
+    {
+      "class": "deliberate: an assignment is recognised by its first character",
+      "builder": "posix",
+      "command": "FO-O=1",
+      "code": "no_program",
+      "message": "command line runs no program (only variable assignments or shell operators)"
+    },
+    {
+      "class": "comment only",
+      "builder": "powershell",
+      "command": "# rm -rf x",
+      "code": "no_command",
+      "message": "command line contains no command"
+    },
+    {
+      "class": "comment lines only",
+      "builder": "powershell",
+      "command": "  # a\n# Remove-Item x",
+      "code": "no_command",
+      "message": "command line contains no command"
+    },
+    {
+      "class": "a literal assignment and a comment",
+      "builder": "powershell",
+      "command": "$env:FOO=1 # set it",
+      "code": "no_program",
+      "message": "command line runs no program (only variable assignments or shell operators)"
+    },
+    {
+      "class": "deliberate: a later statement after an empty-string program is not examined",
+      "builder": "powershell",
+      "command": "'' ; Remove-Item x",
+      "code": "empty_program",
+      "message": "command line's first program word is empty"
+    },
+    {
+      "class": "empty argv",
+      "builder": "argv",
+      "command": "",
+      "argv": [],
+      "raw": "rm -rf x",
+      "code": "no_command",
+      "message": "command line contains no command"
+    },
+    {
+      "class": "an empty program word",
+      "builder": "argv",
+      "command": "",
+      "argv": [""],
+      "raw": null,
+      "code": "empty_program",
+      "message": "command line's first program word is empty"
+    },
+    {
+      "class": "an empty program word with arguments",
+      "builder": "argv",
+      "command": "",
+      "argv": ["", "rm", "-rf", "x"],
+      "raw": "rm -rf x",
+      "code": "empty_program",
+      "message": "command line's first program word is empty"
+    },
+    {
+      "class": "an empty program word after an assignment",
+      "builder": "argv",
+      "command": "",
+      "argv": ["FOO=1", ""],
+      "raw": null,
+      "code": "empty_program",
+      "message": "command line's first program word is empty"
+    },
+    {
+      "class": "only an env assignment",
+      "builder": "argv",
+      "command": "",
+      "argv": ["FOO=1"],
+      "raw": "FOO=1",
+      "code": "no_program",
+      "message": "command line runs no program (only variable assignments or shell operators)"
+    },
+    {
+      "class": "only env assignments",
+      "builder": "argv",
+      "command": "",
+      "argv": ["FOO=1", "BAR=2"],
+      "raw": null,
+      "code": "no_program",
+      "message": "command line runs no program (only variable assignments or shell operators)"
     }
   ],
   "accepted": [
-    { "class": "a program after an assignment", "builder": "posix", "command": "FOO=1 ls" },
-    { "class": "an assignment running a substitution", "builder": "posix", "command": "FOO=$(id)" },
+    {
+      "class": "a program after an assignment",
+      "builder": "posix",
+      "command": "FOO=1 ls"
+    },
+    {
+      "class": "an assignment running a substitution",
+      "builder": "posix",
+      "command": "FOO=$(id)"
+    },
     {
       "class": "a redirection with no program (creates a file)",
       "builder": "posix",
       "command": "> out.txt"
     },
-    { "class": "an empty argument, not program", "builder": "posix", "command": "ls ''" },
+    {
+      "class": "an empty argument, not program",
+      "builder": "posix",
+      "command": "ls ''"
+    },
     {
       "class": "an assignment whose value runs a command",
       "builder": "powershell",
@@ -174,6 +289,42 @@
       "class": "a command after an assignment",
       "builder": "powershell",
       "command": "$env:FOO=1; Remove-Item x"
+    },
+    {
+      "class": "a command after a comment line",
+      "builder": "powershell",
+      "command": "# note\nRemove-Item x"
+    },
+    {
+      "class": "a block comment before a command",
+      "builder": "powershell",
+      "command": "<# x #> Remove-Item x"
+    },
+    {
+      "class": "a bare block comment (not recognised; goes to a human)",
+      "builder": "powershell",
+      "command": "<# x #>"
+    },
+    {
+      "class": "an operator word is a program name in an argv",
+      "builder": "argv",
+      "command": "",
+      "argv": ["&&"],
+      "raw": null
+    },
+    {
+      "class": "a program after an assignment",
+      "builder": "argv",
+      "command": "",
+      "argv": ["FOO=1", "ls"],
+      "raw": "FOO=1 ls"
+    },
+    {
+      "class": "an empty argument, not program",
+      "builder": "argv",
+      "command": "",
+      "argv": ["ls", ""],
+      "raw": null
     }
   ]
 }

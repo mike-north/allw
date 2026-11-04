@@ -55,7 +55,7 @@
 //! @see docs/policy-seam.md §The three tiers (T1 syntactic substrate)
 //! @see https://learn.microsoft.com/powershell/module/microsoft.powershell.core/about/about_quoting_rules
 
-use crate::command::{action_from_argv, CommandContext, CommandError};
+use crate::command::{build_argv_record, CommandContext, CommandError};
 use crate::contract::{ActionRecord, Risk};
 
 /// The risk floor for every PowerShell line: no PowerShell command is known to be low-risk at T1.
@@ -138,47 +138,75 @@ pub fn action_from_powershell_command(
     } else {
         POWERSHELL_RISK_FLOOR
     };
-    let mut record = action_from_argv(&argv, Some(command_line), ctx);
+    let mut record = build_argv_record(&argv, Some(command_line), ctx);
     record.risk = at_least(record.risk, floor);
     Ok(record)
 }
 
-/// Characters that separate PowerShell statements, pipelines or groups: `;`, `|`, `&` (also the
-/// call operator, and `&&` / `||` in pwsh 7), parentheses and line breaks. The no-program check
-/// splits the raw line on these into pieces.
-const STATEMENT_BREAKS: [char; 7] = [';', '|', '&', '(', ')', '\n', '\r'];
+/// Characters that separate PowerShell statements, pipelines or groups on one line: `;`, `|`,
+/// `&` (also the call operator, and `&&` / `||` in pwsh 7) and parentheses. The no-program check
+/// splits each line on these into pieces.
+const STATEMENT_BREAKS: [char; 5] = [';', '|', '&', '(', ')'];
 
-/// Refuse a PowerShell line that runs no program (#376). `raw` is split on [`STATEMENT_BREAKS`]
-/// (quoting is not interpreted, as everywhere in this module) and the trimmed pieces are read in
-/// order:
+/// Refuse a PowerShell line that runs no program (#376). Quoting is not interpreted, as everywhere
+/// in this module. `raw` is read line by line (split on `\n` and `\r`):
 ///
-/// - an empty piece (only separators or operators) is skipped;
-/// - a piece that is a variable assigned a literal ([`is_literal_assignment`]) is skipped;
-/// - a piece whose first word is an empty string (`''` or `""`) is
-///   [`CommandError::EmptyProgram`];
-/// - any other piece may run something: the line is built.
+/// - a `#` that starts a token begins a comment ([`without_comment`]), which runs to the end of
+///   its line and is dropped. Only `#` itself: a `<#` block comment is not recognised, so
+///   `<# x #> Remove-Item x` is built, and a bare `<# x #>` line is built too (it then goes to a
+///   human; that fails toward asking, never toward allowing);
+/// - the rest is split on [`STATEMENT_BREAKS`] and the trimmed pieces are read in order:
+///   - an empty piece (only separators or operators) is skipped;
+///   - a piece that is a variable assigned a literal ([`is_literal_assignment`]) is skipped;
+///   - a piece whose first word is an empty string (`''` or `""`) is
+///     [`CommandError::EmptyProgram`];
+///   - any other piece may run something: the line is built.
 ///
-/// A blank line is [`CommandError::NoCommand`]; a line of only skipped pieces is
-/// [`CommandError::NoProgram`].
+/// A line that is blank once comments are dropped (`""`, `"  "`, `# rm -rf x`) is
+/// [`CommandError::NoCommand`]; a line of only skipped pieces is [`CommandError::NoProgram`].
 ///
-/// It can only refuse a line that runs nothing. A split inside a quoted string can only leave a
-/// piece with an unclosed quote, which is neither skipped nor an empty string, so the line is built
-/// and goes to a human as before.
+/// It never refuses a line whose first command word runs. A split inside a quoted string can only
+/// leave a piece with an unclosed quote, which is neither skipped nor an empty string, so the line
+/// is built. Pieces after the first one that is neither skipped nor built are not examined, so
+/// `'' ; Remove-Item x` is refused though PowerShell would run the `Remove-Item`; that refusal is
+/// deliberate (a deny, so fail-closed).
 fn check_runs_a_powershell_program(raw: &str) -> Result<(), CommandError> {
-    if raw.trim().is_empty() {
-        return Err(CommandError::NoCommand);
-    }
-    for piece in raw.split(STATEMENT_BREAKS).map(str::trim) {
-        if piece.is_empty() || is_literal_assignment(piece) {
-            continue;
+    let mut has_code = false;
+    for line in raw.split(['\n', '\r']) {
+        let code = without_comment(line);
+        has_code |= !code.trim().is_empty();
+        for piece in code.split(STATEMENT_BREAKS).map(str::trim) {
+            if piece.is_empty() || is_literal_assignment(piece) {
+                continue;
+            }
+            let first = piece.split_whitespace().next().unwrap_or_default();
+            if first == "''" || first == "\"\"" {
+                return Err(CommandError::EmptyProgram);
+            }
+            return Ok(());
         }
-        let first = piece.split_whitespace().next().unwrap_or_default();
-        if first == "''" || first == "\"\"" {
-            return Err(CommandError::EmptyProgram);
-        }
-        return Ok(());
     }
-    Err(CommandError::NoProgram)
+    if has_code {
+        Err(CommandError::NoProgram)
+    } else {
+        Err(CommandError::NoCommand)
+    }
+}
+
+/// `line` up to the first `#` that starts a token: at the line's start, or right after whitespace
+/// or a [`STATEMENT_BREAKS`] character. That `#` begins a comment running to the end of the line. A
+/// `#` inside a word (`a#b`) or after `<` (`<#`) is kept. A `#` inside a quoted string is cut too;
+/// that can only leave a piece with an unclosed quote, which the check never skips, so the line is
+/// built.
+fn without_comment(line: &str) -> &str {
+    let mut at_token_start = true;
+    for (i, c) in line.char_indices() {
+        if c == '#' && at_token_start {
+            return &line[..i];
+        }
+        at_token_start = c.is_whitespace() || STATEMENT_BREAKS.contains(&c);
+    }
+    line
 }
 
 /// Whether `piece` is exactly a PowerShell variable assigned a literal, which runs nothing:
@@ -380,6 +408,47 @@ mod tests {
         for line in ["", " ", "\t", "\r\n", " \t\r\n ", "\u{a0}"] {
             assert_eq!(refused(line), CommandError::NoCommand, "{line:?}");
         }
+    }
+
+    #[test]
+    fn a_comment_only_line_is_refused_as_no_command() {
+        for line in ["# rm -rf x", "  # Remove-Item x", "# a\n# b", "#"] {
+            assert_eq!(refused(line), CommandError::NoCommand, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_comment_after_no_program_is_still_no_program() {
+        for line in ["$env:FOO=1 # set it", "; # nothing", "$x=1\n# done"] {
+            assert_eq!(refused(line), CommandError::NoProgram, "{line:?}");
+        }
+    }
+
+    /// Only a `#` that starts a piece is a comment, and it ends at the line break: a command after
+    /// the break, a block comment, or a `#` inside a word keeps the line.
+    #[test]
+    fn a_command_beside_a_comment_is_not_refused() {
+        for line in [
+            "# note\nRemove-Item x",
+            "Remove-Item x # why",
+            "$x = 'a #b'",
+            "$x = 'a #b'; Remove-Item y",
+            "<# x #> Remove-Item x",
+            "<# x #>",
+            "a#b",
+        ] {
+            assert!(
+                action_from_powershell_command(line, &CommandContext::default()).is_ok(),
+                "{line:?} may run something"
+            );
+        }
+    }
+
+    /// A later statement after an empty-string program is not examined: the line is refused even
+    /// though PowerShell would run the later statement. A deny, so fail-closed (#376).
+    #[test]
+    fn a_statement_after_an_empty_string_program_is_not_examined() {
+        assert_eq!(refused("'' ; Remove-Item x"), CommandError::EmptyProgram);
     }
 
     #[test]

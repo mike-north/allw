@@ -26,7 +26,7 @@ fn line_risk(cmd: &str) -> Risk {
 /// Risk of an argv that runs without a shell, through the public builder.
 fn argv_of(argv: &[&str]) -> Risk {
     let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
-    action_from_argv(&argv, None, &ctx()).risk
+    action_from_argv(&argv, None, &ctx()).unwrap().risk
 }
 
 fn assert_all(cmds: &[&str], expected: Risk) {
@@ -126,9 +126,7 @@ fn append_and_array_assignments_do_not_hide_program() {
 #[test]
 fn assignment_before_low_program_is_medium() {
     assert_eq!(line_risk("X=1 ls"), Risk::Medium);
-    // A bare `FOO=bar` runs no program, so the builder refuses it (#376); its argv tier is still
-    // at least Medium.
-    assert_eq!(argv_of(&["FOO=bar"]), Risk::Medium);
+    // A bare `FOO=bar` runs no program, so both builders refuse it (#376).
 }
 
 /// Negative: a word whose name doesn't start like an identifier is the command, not skipped.
@@ -234,11 +232,17 @@ fn padding_past_candidate_limit_does_not_hide_program() {
         MAX_PROGRAM_CANDIDATES,
     ));
     argv.extend(["rm", "-rf", "~"].map(String::from));
-    assert_eq!(action_from_argv(&argv, None, &ctx()).risk, Risk::High);
+    assert_eq!(
+        action_from_argv(&argv, None, &ctx()).unwrap().risk,
+        Risk::High
+    );
 
     let mut argv = vec!["X=1".to_string(); MAX_PROGRAM_CANDIDATES];
     argv.extend(["rm", "-rf", "~"].map(String::from));
-    assert_eq!(action_from_argv(&argv, None, &ctx()).risk, Risk::High);
+    assert_eq!(
+        action_from_argv(&argv, None, &ctx()).unwrap().risk,
+        Risk::High
+    );
 }
 
 /// Negative: a long argv for a program that isn't a wrapper is not raised by truncation.
@@ -246,7 +250,10 @@ fn padding_past_candidate_limit_does_not_hide_program() {
 fn long_non_wrapper_argv_is_not_raised() {
     let mut argv = vec!["ls".to_string()];
     argv.extend((0..MAX_PROGRAM_CANDIDATES + 10).map(|i| format!("file{i}")));
-    assert_eq!(action_from_argv(&argv, None, &ctx()).risk, Risk::Low);
+    assert_eq!(
+        action_from_argv(&argv, None, &ctx()).unwrap().risk,
+        Risk::Low
+    );
 }
 
 // ── Shells and eval ───────────────────────────────────────────────────────────
@@ -330,11 +337,20 @@ fn nested_sh(levels: usize, innermost: &str) -> Vec<String> {
 #[test]
 fn nested_shells_up_to_limit_are_analyzed_and_past_it_are_high() {
     let argv = nested_sh(MAX_SHELL_NESTING, "dd if=/dev/zero of=/dev/sda");
-    assert_eq!(action_from_argv(&argv, None, &ctx()).risk, Risk::Critical);
+    assert_eq!(
+        action_from_argv(&argv, None, &ctx()).unwrap().risk,
+        Risk::Critical
+    );
     let argv = nested_sh(MAX_SHELL_NESTING, "echo hi");
-    assert_eq!(action_from_argv(&argv, None, &ctx()).risk, Risk::Medium);
+    assert_eq!(
+        action_from_argv(&argv, None, &ctx()).unwrap().risk,
+        Risk::Medium
+    );
     let argv = nested_sh(MAX_SHELL_NESTING + 1, "echo hi");
-    assert_eq!(action_from_argv(&argv, None, &ctx()).risk, Risk::High);
+    assert_eq!(
+        action_from_argv(&argv, None, &ctx()).unwrap().risk,
+        Risk::High
+    );
 }
 
 #[test]
@@ -613,7 +629,7 @@ fn nested_substitutions_up_to_limit_are_analyzed_and_past_it_are_high() {
 #[test]
 fn argv_records_are_not_read_as_shell_lines() {
     let argv: Vec<String> = ["ls", "&&", "rm", "-rf", "/"].map(String::from).to_vec();
-    let r = action_from_argv(&argv, Some("ls && rm -rf /"), &ctx());
+    let r = action_from_argv(&argv, Some("ls && rm -rf /"), &ctx()).unwrap();
     assert_eq!(r.risk, Risk::Low);
 }
 
@@ -1081,7 +1097,7 @@ fn rm_flag_split_is_charged_by_bytes() {
     argv.extend(std::iter::repeat_n("rm".to_string(), 255));
     argv.push("x".repeat(4 * 1024 * 1024));
     SCANNED.with(|c| c.set(0));
-    let risk = action_from_argv(&argv, None, &ctx()).risk;
+    let risk = action_from_argv(&argv, None, &ctx()).unwrap().risk;
     let scanned = SCANNED.with(std::cell::Cell::get);
     assert!(matches!(risk, Risk::High | Risk::Critical), "{risk:?}");
     assert!(scanned < 3 * MAX_RISK_WORK, "copied {scanned} bytes");

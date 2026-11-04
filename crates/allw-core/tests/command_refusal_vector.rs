@@ -7,7 +7,9 @@
 
 use std::path::PathBuf;
 
-use allw_core::{action_from_command, action_from_powershell_command, CommandContext};
+use allw_core::{
+    action_from_argv, action_from_command, action_from_powershell_command, CommandContext,
+};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -15,6 +17,10 @@ struct Refused {
     class: String,
     builder: String,
     command: String,
+    #[serde(default)]
+    argv: Vec<String>,
+    #[serde(default)]
+    raw: Option<String>,
     code: String,
     message: String,
 }
@@ -24,6 +30,10 @@ struct Accepted {
     class: String,
     builder: String,
     command: String,
+    #[serde(default)]
+    argv: Vec<String>,
+    #[serde(default)]
+    raw: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -39,11 +49,17 @@ fn load_vector() -> Vector {
     serde_json::from_str(&raw).expect("parse command_refusal_vector.json")
 }
 
-fn build(builder: &str, command: &str) -> Result<allw_core::ActionRecord, allw_core::CommandError> {
+fn build(
+    builder: &str,
+    command: &str,
+    argv: &[String],
+    raw: Option<&str>,
+) -> Result<allw_core::ActionRecord, allw_core::CommandError> {
     let ctx = CommandContext::default();
     match builder {
         "posix" => action_from_command(command, &ctx),
         "powershell" => action_from_powershell_command(command, &ctx),
+        "argv" => action_from_argv(argv, raw, &ctx),
         other => panic!("unknown builder {other:?}"),
     }
 }
@@ -53,9 +69,17 @@ fn every_refusal_case_is_refused_with_its_code_and_message() {
     let vector = load_vector();
     assert!(vector.cases.len() >= 10);
     for case in &vector.cases {
-        let label = format!("{} ({}: {:?})", case.class, case.builder, case.command);
-        let err =
-            build(&case.builder, &case.command).expect_err(&format!("{label} must be refused"));
+        let label = format!(
+            "{} ({}: {:?} {:?})",
+            case.class, case.builder, case.command, case.argv
+        );
+        let err = build(
+            &case.builder,
+            &case.command,
+            &case.argv,
+            case.raw.as_deref(),
+        )
+        .expect_err(&format!("{label} must be refused"));
         assert_eq!(err.code(), case.code, "{label}");
         assert_eq!(err.to_string(), case.message, "{label}");
     }
@@ -66,13 +90,19 @@ fn every_accepted_case_builds_a_record() {
     let vector = load_vector();
     assert!(!vector.accepted.is_empty());
     for case in &vector.accepted {
-        let result = build(&case.builder, &case.command);
+        let result = build(
+            &case.builder,
+            &case.command,
+            &case.argv,
+            case.raw.as_deref(),
+        );
         assert!(
             result.is_ok(),
-            "{} ({}: {:?}) must build: {result:?}",
+            "{} ({}: {:?} {:?}) must build: {result:?}",
             case.class,
             case.builder,
-            case.command
+            case.command,
+            case.argv
         );
     }
 }

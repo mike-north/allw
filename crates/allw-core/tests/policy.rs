@@ -93,7 +93,7 @@ fn signed(rule: UnsignedPolicyRule) -> allw_core::VerifiedPolicyRule {
 
 fn git_force_action() -> allw_core::ActionRecord {
     let argv = ["git", "push", "--force", "origin", "main"].map(String::from);
-    action_from_argv(&argv, None, &CommandContext::default())
+    action_from_argv(&argv, None, &CommandContext::default()).unwrap()
 }
 
 fn file_edit_action(path: &str, diff: &str) -> allw_core::ActionRecord {
@@ -598,7 +598,8 @@ fn args_any_glob_matches_structured_tokens_not_raw_or_substrings() {
     });
 
     let exact_token = ["rm", "-rf", "build"].map(String::from);
-    let exact_token_action = action_from_argv(&exact_token, None, &CommandContext::default());
+    let exact_token_action =
+        action_from_argv(&exact_token, None, &CommandContext::default()).unwrap();
     assert_eq!(
         evaluate(&exact_token_action, std::slice::from_ref(&rule)).decision,
         PolicyDecision::Allow,
@@ -606,7 +607,8 @@ fn args_any_glob_matches_structured_tokens_not_raw_or_substrings() {
     );
 
     let prefixed_token = ["rm", "-rf", "build-prod"].map(String::from);
-    let prefixed_token_action = action_from_argv(&prefixed_token, None, &CommandContext::default());
+    let prefixed_token_action =
+        action_from_argv(&prefixed_token, None, &CommandContext::default()).unwrap();
     assert_eq!(
         evaluate(&prefixed_token_action, std::slice::from_ref(&rule)).decision,
         PolicyDecision::Escalate,
@@ -653,7 +655,7 @@ fn args_any_glob_over_length_cap_fails_closed_to_escalate() {
         expires_at: None,
     });
     let argv = ["tool".to_string(), oversized];
-    let action = action_from_argv(&argv, None, &CommandContext::default());
+    let action = action_from_argv(&argv, None, &CommandContext::default()).unwrap();
 
     assert_eq!(
         evaluate(&action, &[rule]).decision,
@@ -690,7 +692,7 @@ fn oversized_action_token_cannot_bypass_deny_with_broad_allow() {
         expires_at: None,
     });
     let argv = ["tool".to_string(), oversized];
-    let action = action_from_argv(&argv, None, &CommandContext::default());
+    let action = action_from_argv(&argv, None, &CommandContext::default()).unwrap();
 
     assert_eq!(
         evaluate(&action, &[deny_secret, allow_tool]).decision,
@@ -843,7 +845,7 @@ fn from_approval_exact_call_round_trips_and_allows_only_the_same_command() {
     );
 
     let changed_argv = ["git", "push", "--force-with-lease", "origin", "main"].map(String::from);
-    let changed_action = action_from_argv(&changed_argv, None, &CommandContext::default());
+    let changed_action = action_from_argv(&changed_argv, None, &CommandContext::default()).unwrap();
     assert_eq!(
         evaluate_for_actor(&actor, &changed_action, &[verified]).decision,
         PolicyDecision::Escalate,

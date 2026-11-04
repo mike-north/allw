@@ -1537,18 +1537,21 @@ pub fn action_from_powershell_command(
 ///
 /// # Errors
 ///
-/// Throws if `argv_json` is not a JSON array of strings — fail-closed: the caller denies rather
-/// than submitting a record built from an unparseable plan.
+/// Throws if `argv_json` is not a JSON array of strings (a plain `Error`, no `kind`) — fail-closed:
+/// the caller denies rather than submitting a record built from an unparseable plan. Also throws,
+/// with a `kind` as [`action_from_command`], for an argv with no program (#376): empty
+/// (`no_command`), an empty program word (`empty_program`), or only assignments (`no_program`).
 #[wasm_bindgen]
 pub fn action_from_argv(
     argv_json: &str,
     raw: Option<String>,
     cwd: Option<String>,
-) -> Result<String, JsError> {
+) -> Result<String, JsValue> {
     let argv: Vec<String> = parse_json(argv_json, "command argv")?;
     let ctx = CommandContext { cwd };
-    let record = core_action_from_argv(&argv, raw.as_deref(), &ctx);
-    to_json(&record, "ActionRecord")
+    let record = core_action_from_argv(&argv, raw.as_deref(), &ctx)
+        .map_err(|e| command_failure("action_from_argv", &e))?;
+    Ok(to_json(&record, "ActionRecord")?)
 }
 
 /// Builds an [`ActionRecord`](allw_core::ActionRecord) for an MCP tool call, returning it as JSON.
