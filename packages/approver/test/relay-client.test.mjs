@@ -865,6 +865,65 @@ test("re-running runPair on an already-paired keyfile with no published state pu
   }
 });
 
+// #378: re-running pair registers a new relay id for the same keyfile keys. The core composition
+// replaces the entry for those keys, so ids never pile up; another device's entry is untouched.
+test("two consecutive re-pairs leave exactly one entry for the keyfile's keys, under the newest id (#378)", async () => {
+  const wasm = await loadWasm();
+  const relay = await startFakeRelay({
+    unpublished: NO_ACCOUNT_STATES,
+    deviceIds: ["dev-cli-1", "dev-other", "dev-cli-2", "dev-cli-3"],
+  });
+  try {
+    await withTempKeyfile(async (cliPath) => {
+      const first = await runPair(
+        wasm,
+        { relayUrl: relay.url, keyfilePath: cliPath, now: FIXED_NOW },
+        () => {},
+      );
+      let other;
+      await withTempKeyfile(async (otherPath) => {
+        // Another device under the same root, with its own keys.
+        const { generateKeyfile, writeKeyfile } = await import("../dist/lib/keyfile.js");
+        writeKeyfile(otherPath, {
+          ...generateKeyfile(wasm),
+          account_root_seed: first.account_root_seed,
+          account_root_pubkey: first.account_root_pubkey,
+        });
+        other = await runPair(
+          wasm,
+          { relayUrl: relay.url, keyfilePath: otherPath, now: FIXED_NOW },
+          () => {},
+        );
+      });
+      // The other device's pair advanced the published state to 2; the CLI keyfile's floor is 1.
+      for (const [expectedId, expectedSequence] of [
+        ["dev-cli-2", 3],
+        ["dev-cli-3", 4],
+      ]) {
+        const repaired = await runPair(
+          wasm,
+          { relayUrl: relay.url, keyfilePath: cliPath, now: FIXED_NOW },
+          () => {},
+        );
+        assert.equal(repaired.device_id, expectedId);
+        const [state] = publishedStatesFor(wasm, relay, repaired);
+        assert.equal(state.sequence, expectedSequence);
+        assert.deepEqual(
+          state.devices.map((d) => [d.device_id, d.encryption_pubkey]),
+          [
+            ["dev-other", other.device_encryption_pubkey],
+            [expectedId, first.device_encryption_pubkey],
+          ],
+          "the previous id for these keys is gone; the other device stays",
+        );
+        assert.equal(repaired.account_state_highest_sequence, expectedSequence);
+      }
+    });
+  } finally {
+    await relay.close();
+  }
+});
+
 // Regression: a relay deployed before account-state GET became unauthenticated answers it with 401.
 // pair must still fail closed (nothing published, keyfile unpaired) and say to redeploy the relay.
 test("runPair against a relay too old for account-state GET (401) fails closed and says redeploy the relay", async () => {

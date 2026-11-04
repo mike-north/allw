@@ -50,8 +50,10 @@ account-root key), publishes a root-signed **account state** that names this dev
 **account id** and **account-root public key** — what an integrator is configured with
 ([#12](https://github.com/mike-north/allw/issues/12)). Integrators encrypt requests only to devices
 that account state lists (#243), so a device is unreachable until a state naming it is published.
-Pairing a second device carries the existing devices forward at the next sequence; `pair` refuses to
-publish when the relay's account states don't verify or are older than the keyfile has seen.
+The core composes that state (`next_account_state`, #379): it carries the existing devices forward at
+the next sequence, keeps one entry per key pair (a re-pair replaces this keyfile's entry under its
+old device id, #378), and refuses to publish when the relay's account states don't verify, disagree,
+or are older than the keyfile has seen.
 
 The account id is self-certifying (`docs/enrollment.md` §Self-Certifying Account Id): it is
 `base64url(SHA-256("allw/account-id/v1" || 0x00 || account_root_pubkey))`, so only the root holder
@@ -92,14 +94,61 @@ allw-approver pair". Upgrade the pairing once:
 
    It keeps your seeds and account, registers a new device id, mints a new device certificate and
    token, and publishes an account state naming that device ("Published account state —
-   sequence 1"). The account id and account-root public key are unchanged, so integrator config
-   needs no edit.
+   sequence N"). The account id and account-root public key are unchanged, so integrator config
+   needs no edit. The state lists your keys once, under the new id: an entry with the same keys
+   under an older id is dropped (#378), so the old device id can no longer read requests.
 
 3. **Web approver:** open it, press **Use another device**, and paste the keyfile's values again.
    `device_id`, `device_cert` and `device_auth_token` changed. The seeds did not. This step is
    required: requests are encrypted to the device id the account state names, so a browser still
-   holding the old device id cannot read them. A running `allw-approver watch` picks the new values
-   up from the keyfile on restart.
+   holding the old device id cannot read them. Repeat it after every later re-pair. A running
+   `allw-approver watch` picks the new values up from the keyfile on restart.
+
+4. **iPhone approver, or a web approver with keys of its own** (not set up from this keyfile):
+   re-pairing does not list it. Vouch for it once with the values it shows
+   (`allw-approver vouch`, interim until #199; see [§Vouch for a device with its own keys](#vouch-for-a-device-with-its-own-keys)).
+
+#### Vouch for a device with its own keys
+
+> **Interim until [#199](https://github.com/mike-north/allw/issues/199)**, the cross-device
+> enrollment ceremony, which replaces this command.
+
+Integrators encrypt each request only to devices the root-signed account state lists. `pair` lists
+this keyfile's own device. A device with **keys of its own** (the iPhone approver, or a web
+approver whose seeds did not come from this keyfile) has to be vouched for by the account-root
+holder, from the paired keyfile:
+
+```sh
+allw-approver vouch --device-id <id> --encryption-pubkey <b64url> --signing-pubkey <b64url>
+```
+
+Copy the three values from the device's own screen (the web approver's "This device's keys"
+panel). A web approver set up by pasting this keyfile's values is this keyfile's device and needs
+no vouch.
+
+`vouch` refuses, with a non-zero exit and nothing signed, when:
+
+- stdin and stdout are not both a terminal (there is no `--yes`: a device is never vouched for
+  unseen);
+- the id or a key is malformed: not canonical base64url of 32 bytes, a small-order X25519 key, or an
+  Ed25519 key that is not a valid point;
+- the relay has no device with that id for this account, or registered it with a different
+  encryption key;
+- the relay's account states don't verify, disagree, or are older than the keyfile has seen, or the
+  id is revoked or already listed with other keys (a key change is a rotation, #199's job);
+- you don't answer `y`.
+
+Before asking, it prints the device id, the relay's label for it, and a fingerprint of each key:
+eight groups of four hex digits, the same ones the device shows. **Compare the device id and all
+eight groups of both fingerprints.** That comparison is the only check on the signing key (the
+relay stores only the encryption key). A wrong signing key fails closed: the device's verdicts don't
+verify, so they deny. On `y`, it root-signs and publishes the next account state, and records its
+sequence in the keyfile.
+
+`vouch` does not issue a device certificate. The device can read requests once vouched; its
+verdicts verify only with a certificate from this account root.
+
+See `docs/enrollment.md` §Interim vouching and `docs/threat-model.md` R9.
 
 ### 2. Watch for requests and approve/deny
 

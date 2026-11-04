@@ -287,6 +287,54 @@ export async function publishAccountStates(
   return parseAccountStateSet(result);
 }
 
+/** One entry of the relay's device registry (`GET /:acct/devices`). */
+export interface RegisteredDevice {
+  readonly device_id: string;
+  /** The X25519 encryption key the device registered at `/pairing/complete` (base64url). */
+  readonly pubkey: string;
+  /** The device's label as the relay holds it: untrusted text, shown only escaped. */
+  readonly label: string | null;
+}
+
+/**
+ * Fetch the account's relay device registry (`GET /:acct/devices`, unauthenticated).
+ *
+ * The registry is routing data the relay controls: it never decides who reads a request. `vouch`
+ * reads it only to **refuse**: a pasted device id the relay never registered, or registered with a
+ * different encryption key, is not vouched for. Fails closed on any shape drift.
+ */
+export async function fetchDeviceRegistry(
+  relayUrl: string,
+  accountId: string,
+  timeoutMs: number = PAIRING_TIMEOUT_MS,
+): Promise<readonly RegisteredDevice[]> {
+  const body = await getJson(
+    `${normalizeBase(relayUrl)}/${encodeURIComponent(accountId)}/devices`,
+    timeoutMs,
+  );
+  const devices = (body as { devices?: unknown } | null)?.devices;
+  if (
+    !Array.isArray(devices) ||
+    !devices.every(
+      (d: unknown) =>
+        typeof d === "object" &&
+        d !== null &&
+        typeof (d as { device_id?: unknown }).device_id === "string" &&
+        typeof (d as { pubkey?: unknown }).pubkey === "string" &&
+        ((d as { label?: unknown }).label === null ||
+          (d as { label?: unknown }).label === undefined ||
+          typeof (d as { label?: unknown }).label === "string"),
+    )
+  ) {
+    throw new Error("relay device registry returned an unexpected shape");
+  }
+  return (devices as { device_id: string; pubkey: string; label?: string | null }[]).map((d) => ({
+    device_id: d.device_id,
+    pubkey: d.pubkey,
+    label: d.label ?? null,
+  }));
+}
+
 /**
  * Build the device presence WebSocket URL (`GET /:acct/devices/:deviceId/connect`). `http(s)` is
  * upgraded to `ws(s)` so the same relay base works for both HTTP pairing and the WS presence link.

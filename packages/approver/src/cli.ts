@@ -6,15 +6,18 @@
  *   pair    Pair this approver with an account on the relay (mints a device cert).
  *   watch   Open the device presence socket and approve/deny incoming requests (alias: serve).
  *   keygen  Generate a fresh local keyfile without pairing.
+ *   vouch   Interim (#199): vouch for a separately keyed device after comparing its fingerprints.
  *
  * All cryptography is delegated to the WASM core (`docs/architecture.md` — WASM-local hard
  * constraint). ⚠ v0 stand-in: device keys are software-held (see README / issue #23).
  */
 
+import { createInterface } from "node:readline/promises";
 import { parseArgs } from "node:util";
 
 import { runKeygen } from "./commands/keygen.js";
 import { runPair } from "./commands/pair.js";
+import { runVouch, type Confirmer } from "./commands/vouch.js";
 import { createReadlinePrompter, runWatch, type WebSocketLike } from "./commands/watch.js";
 import { printSameMachineDemoWarning } from "./lib/demo-warning.js";
 import { defaultKeyfilePath } from "./lib/paths.js";
@@ -33,6 +36,10 @@ COMMANDS:
   watch     Open the device presence WebSocket and approve/deny requests as they arrive.
             Alias: serve.
   keygen    Generate a fresh local keyfile (three software-held seeds) without pairing.
+  vouch     Interim, until the enrollment ceremony (#199): as the account-root holder, vouch for
+            a device that has its own keys (an iPhone approver, or a separately keyed web
+            approver), so requests are encrypted to it. Shows the device's key fingerprints and
+            asks you to confirm they match what the device shows. Needs an interactive terminal.
   help      Show this help.
 
 COMMON OPTIONS:
@@ -59,6 +66,12 @@ watch OPTIONS:
 keygen OPTIONS:
   --force            Overwrite an existing keyfile (orphans the current device's seeds).
 
+vouch OPTIONS:
+  --device-id <id>             The device's id, as the device shows it (required).
+  --encryption-pubkey <b64url> The device's encryption public key, as the device shows it (required).
+  --signing-pubkey <b64url>    The device's signing public key, as the device shows it (required).
+  --relay <url>                Override the paired relay URL (same rule as pair --relay).
+
 ⚠ v0 stand-in: device keys are held in software in the keyfile. Production custody is hardware-
   backed (Secure Enclave / StrongBox) — see issue #23. The wire protocol is unchanged either way.
 
@@ -83,7 +96,13 @@ function requireOption(value: string | undefined, flag: string): string {
 }
 
 /** Commands that create or use the keyfile's account-root and signing seeds (`serve` = `watch`). */
-const DEMO_WARNING_COMMANDS: ReadonlySet<string> = new Set(["pair", "watch", "serve", "keygen"]);
+const DEMO_WARNING_COMMANDS: ReadonlySet<string> = new Set([
+  "pair",
+  "watch",
+  "serve",
+  "keygen",
+  "vouch",
+]);
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
@@ -117,6 +136,9 @@ async function main(): Promise<void> {
       label: { type: "string" },
       code: { type: "string" },
       "pairing-token": { type: "string" },
+      "device-id": { type: "string" },
+      "encryption-pubkey": { type: "string" },
+      "signing-pubkey": { type: "string" },
       force: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
       version: { type: "boolean", short: "v", default: false },
@@ -152,6 +174,25 @@ async function main(): Promise<void> {
       });
       return;
     }
+    case "vouch": {
+      const confirmer = createTerminalConfirmer();
+      try {
+        await runVouch(
+          wasm,
+          {
+            keyfilePath,
+            deviceId: requireOption(values["device-id"], "--device-id"),
+            encryptionPubkey: requireOption(values["encryption-pubkey"], "--encryption-pubkey"),
+            signingPubkey: requireOption(values["signing-pubkey"], "--signing-pubkey"),
+            ...(values.relay !== undefined ? { relayUrl: values.relay } : {}),
+          },
+          confirmer,
+        );
+      } finally {
+        confirmer.close();
+      }
+      return;
+    }
     case "watch":
     case "serve": {
       await runWatch(
@@ -173,6 +214,26 @@ async function main(): Promise<void> {
       printUsageAndExit(1);
     }
   }
+}
+
+/**
+ * The terminal confirmer for `vouch`: interactive only when both stdin and stdout are a TTY, and
+ * only an explicit `y` / `yes` confirms. The readline interface is opened lazily, so a refused
+ * non-interactive run never touches stdin.
+ */
+function createTerminalConfirmer(): Confirmer & { close(): void } {
+  let rl: ReturnType<typeof createInterface> | undefined;
+  return {
+    interactive: process.stdin.isTTY && process.stdout.isTTY,
+    async confirm(question: string): Promise<boolean> {
+      rl ??= createInterface({ input: process.stdin, output: process.stdout });
+      const answer = (await rl.question(question)).trim().toLowerCase();
+      return answer === "y" || answer === "yes";
+    },
+    close(): void {
+      rl?.close();
+    },
+  };
 }
 
 /**

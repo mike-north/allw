@@ -17,8 +17,9 @@
  *    verifying key → cert, so verifiers need only the account-root key.
  * 5. **Publish the next root-signed account state** listing this device (#243): integrators encrypt
  *    only to devices a verified account state vouches for, so a device is not reachable until this
- *    succeeds. The new state carries the previous verified state's devices, actors and revocations
- *    forward — never keys from the relay's device list.
+ *    succeeds. The core composes it (#379): the previous verified state's devices, actors and
+ *    revocations carry forward — never keys from the relay's device list — and an entry for these
+ *    keys under an earlier relay id is replaced (#378).
  * 6. Persist relay/account/device + cert into the keyfile, and print the **account id** and the
  *    **account-root pubkey** (the integrator's routing id and trust anchor, #12).
  */
@@ -26,12 +27,8 @@
 import { randomBytes } from "node:crypto";
 
 import { generateKeyfile, loadKeyfile, writeKeyfile, type Keyfile } from "../lib/keyfile.js";
-import {
-  fetchAccountStatesWithMetadata,
-  pairingComplete,
-  pairingStart,
-  publishAccountStates,
-} from "../lib/relay-client.js";
+import { composeAddDevice, signAndPublish } from "../lib/account-state-authoring.js";
+import { pairingComplete, pairingStart } from "../lib/relay-client.js";
 import { assertCliRelayUrl } from "../lib/relay-url.js";
 import type { AllwWasm } from "../lib/wasm.js";
 
@@ -60,26 +57,12 @@ export interface PairOptions {
 /** Lifetime of the root-signed pairing-start authorization `pair` sends (the core allows ≤ 5 min). */
 export const PAIRING_START_AUTH_LIFETIME_MS = 2 * 60 * 1000;
 
-/** The fields of a verified `AccountState` that `pair` reads or rewrites; the rest pass through. */
-interface AccountStateDoc {
-  readonly v: number;
-  readonly account_id: string;
-  readonly sequence: number;
-  readonly current_root: string;
-  readonly devices: readonly { readonly device_id: string }[];
-  readonly revocations: readonly { readonly kind: string; readonly id: string }[];
-  readonly [field: string]: unknown;
-}
-
 /**
- * Root-sign and publish the account state that adds `deviceId` (`docs/enrollment.md` §Model).
- *
- * The relay's current documents are verified against the account root first; the next state is
- * the single highest verified one with this device added (or replacing an entry with the same id),
- * at sequence `max(highest, floor) + 1`. Fails closed — and so fails the pairing — when a document
- * does not verify, the relay claims a `max_sequence` no verified document backs, the relay's
- * highest is below this keyfile's floor (a rollback), siblings at the highest sequence disagree,
- * or the id is already revoked.
+ * Root-sign and publish the account state that adds this keyfile's device as `deviceId`
+ * (`docs/enrollment.md` §Model). The core composes it (`next_account_state`, #379): it verifies
+ * the relay's documents and refuses an unbacked `max_sequence`, a rollback below this keyfile's
+ * floor, disagreeing siblings, or a revoked id. Entries for the same keys under an earlier relay id
+ * are replaced (#378), so re-running `pair` leaves one entry for this keyfile's device.
  *
  * @returns the published sequence.
  */
@@ -90,65 +73,13 @@ async function publishDeviceAccountState(
   accountId: string,
   deviceId: string,
 ): Promise<number> {
-  const fetched = await fetchAccountStatesWithMetadata(relayUrl, accountId);
-  const verified = fetched.accountStates.map(
-    (jws) =>
-      JSON.parse(
-        wasm.verify_account_state(jws, accountId, keyfile.account_root_pubkey),
-      ) as AccountStateDoc,
-  );
-  const highest = verified.reduce((max, state) => Math.max(max, state.sequence), 0);
-  if (fetched.maxSequence > highest) {
-    throw new Error(
-      `relay reports account-state sequence ${String(fetched.maxSequence)} but serves no verified ` +
-        `document at it (highest verified: ${String(highest)})`,
-    );
-  }
-  const floor = keyfile.account_state_highest_sequence ?? 0;
-  if (highest < floor) {
-    throw new Error(
-      `relay serves account-state sequence ${String(highest)}, below the ${String(floor)} this ` +
-        `device already accepted (rollback)`,
-    );
-  }
-  const top = verified.filter((state) => state.sequence === highest);
-  const [base] = top;
-  if (top.some((state) => JSON.stringify(state) !== JSON.stringify(base))) {
-    throw new Error(
-      `relay serves differing account-state documents at sequence ${String(highest)}; ` +
-        `resolve them before pairing`,
-    );
-  }
-  if (base?.revocations.some((r) => r.kind === "device" && r.id === deviceId) === true) {
-    throw new Error(`device ${deviceId} is revoked in the current account state`);
-  }
-  const device = {
-    device_id: deviceId,
-    encryption_pubkey: keyfile.device_encryption_pubkey,
-    signing_pubkey: keyfile.device_signing_pubkey,
-    status: "active",
-  };
-  const sequence = Math.max(highest, floor) + 1;
-  const next =
-    base === undefined
-      ? {
-          v: 1,
-          account_id: accountId,
-          sequence,
-          current_root: keyfile.account_root_pubkey,
-          previous_roots: [],
-          devices: [device],
-          actors: [],
-          revocations: [],
-        }
-      : {
-          ...base,
-          sequence,
-          devices: [...base.devices.filter((d) => d.device_id !== deviceId), device],
-        };
-  const jws = wasm.sign_account_state(JSON.stringify(next), keyfile.account_root_seed);
-  await publishAccountStates(relayUrl, accountId, [jws]);
-  return sequence;
+  const draft = await composeAddDevice(wasm, keyfile, relayUrl, accountId, {
+    deviceId,
+    encryptionPubkey: keyfile.device_encryption_pubkey,
+    signingPubkey: keyfile.device_signing_pubkey,
+  });
+  await signAndPublish(wasm, keyfile, relayUrl, accountId, draft);
+  return draft.sequence;
 }
 
 /** A sink for human-facing output (stdout by default; captured in tests). */

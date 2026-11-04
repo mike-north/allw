@@ -68,6 +68,7 @@ export {
 } from "./lib/relay-url.js";
 
 export { runPair, type PairOptions, type Logger } from "./commands/pair.js";
+export { runVouch, type VouchOptions, type Confirmer } from "./commands/vouch.js";
 export { runKeygen, type KeygenOptions } from "./commands/keygen.js";
 export {
   createReadlinePrompter,
