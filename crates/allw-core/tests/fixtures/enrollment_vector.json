@@ -1,0 +1,424 @@
+{
+  "description": "Shared Rust/WASM vector for root-holder enrollment authoring (#379, #381): device material validation, key fingerprints, and next_account_state refusals. Keys were generated with Node's own X25519/Ed25519, fingerprints computed with Node's SHA-256 over 'allw/device-key-fingerprint/v1' || 0x00 || kind || 0x00 || key (first 16 bytes, hex, groups of 4). Expected outcomes are written from docs/enrollment.md and the core module docs. States are signed at test time with the root seed [0x11; 32] (or [0x33; 32] for signed_by 'other'); device keys refer to the 'keys' table.",
+  "keys": {
+    "a": {
+      "encryption_pubkey": "656QImt3_WS8nNS_xQmNsxA_ZgDqwNmNAFBGspvz2EE",
+      "signing_pubkey": "hMzEJea30r8m_JdAEqBE94rnoDU2usJQlx15GO2zqOo"
+    },
+    "b": {
+      "encryption_pubkey": "mtoK7bNBrm4HsbhkcUmrew_TwkDFCzNhIGtaFZRduzA",
+      "signing_pubkey": "w-gmw7DkQcy5qew8lzlEJrXNczY2A7cHAmDas559RFY"
+    },
+    "c": {
+      "encryption_pubkey": "dZxqv7jJL092bV79kZh6C5uiv99r_Xybd_041IKaVx0",
+      "signing_pubkey": "o8w-_uJ77YyUeSpEWAP-Gkn3_t_OehzaXa_0a-d1l6A"
+    },
+    "d": {
+      "encryption_pubkey": "Eo7gev5WIq4Kel1AQZ7l9Eu2gc9ienda3NPMrqeL-lI",
+      "signing_pubkey": "ACCYQTz_BGwTtNg2V2OSxG1yx5mYcxWzROT5SNGKM2M"
+    }
+  },
+  "material": [
+    {
+      "name": "valid relay uuid id",
+      "device_id": "0f8c1e2a-3b4d-4e5f-8a9b-0c1d2e3f4a5b",
+      "encryption_pubkey": "656QImt3_WS8nNS_xQmNsxA_ZgDqwNmNAFBGspvz2EE",
+      "signing_pubkey": "hMzEJea30r8m_JdAEqBE94rnoDU2usJQlx15GO2zqOo",
+      "error": null
+    },
+    {
+      "name": "empty id",
+      "device_id": "",
+      "encryption_pubkey": "656QImt3_WS8nNS_xQmNsxA_ZgDqwNmNAFBGspvz2EE",
+      "signing_pubkey": "hMzEJea30r8m_JdAEqBE94rnoDU2usJQlx15GO2zqOo",
+      "error": "InvalidDeviceId",
+      "message_contains": "device id must be"
+    },
+    {
+      "name": "id with a space",
+      "device_id": "dev 1",
+      "encryption_pubkey": "656QImt3_WS8nNS_xQmNsxA_ZgDqwNmNAFBGspvz2EE",
+      "signing_pubkey": "hMzEJea30r8m_JdAEqBE94rnoDU2usJQlx15GO2zqOo",
+      "error": "InvalidDeviceId",
+      "message_contains": "device id must be"
+    },
+    {
+      "name": "id with an escape",
+      "device_id": "dev\u001b[2J",
+      "encryption_pubkey": "656QImt3_WS8nNS_xQmNsxA_ZgDqwNmNAFBGspvz2EE",
+      "signing_pubkey": "hMzEJea30r8m_JdAEqBE94rnoDU2usJQlx15GO2zqOo",
+      "error": "InvalidDeviceId",
+      "message_contains": "device id must be"
+    },
+    {
+      "name": "65-char id",
+      "device_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "encryption_pubkey": "656QImt3_WS8nNS_xQmNsxA_ZgDqwNmNAFBGspvz2EE",
+      "signing_pubkey": "hMzEJea30r8m_JdAEqBE94rnoDU2usJQlx15GO2zqOo",
+      "error": "InvalidDeviceId",
+      "message_contains": "device id must be"
+    },
+    {
+      "name": "padded encryption key",
+      "device_id": "dev-1",
+      "encryption_pubkey": "656QImt3_WS8nNS_xQmNsxA_ZgDqwNmNAFBGspvz2EE=",
+      "signing_pubkey": "hMzEJea30r8m_JdAEqBE94rnoDU2usJQlx15GO2zqOo",
+      "error": "KeyEncoding(Encryption)",
+      "message_contains": "encryption key must be the canonical"
+    },
+    {
+      "name": "31-byte signing key",
+      "device_id": "dev-1",
+      "encryption_pubkey": "656QImt3_WS8nNS_xQmNsxA_ZgDqwNmNAFBGspvz2EE",
+      "signing_pubkey": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ",
+      "error": "KeyEncoding(Signing)",
+      "message_contains": "signing key must be the canonical"
+    },
+    {
+      "name": "standard-alphabet key",
+      "device_id": "dev-1",
+      "encryption_pubkey": "+++++++++++++++++++++++++++++++++++++++++++",
+      "signing_pubkey": "hMzEJea30r8m_JdAEqBE94rnoDU2usJQlx15GO2zqOo",
+      "error": "KeyEncoding(Encryption)",
+      "message_contains": "encryption key must be the canonical"
+    },
+    {
+      "name": "small-order encryption key (0)",
+      "device_id": "dev-1",
+      "encryption_pubkey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "signing_pubkey": "hMzEJea30r8m_JdAEqBE94rnoDU2usJQlx15GO2zqOo",
+      "error": "SmallOrderEncryptionKey",
+      "message_contains": "small-order X25519"
+    },
+    {
+      "name": "encryption key with bit 255 set",
+      "device_id": "dev-1",
+      "encryption_pubkey": "656QImt3_WS8nNS_xQmNsxA_ZgDqwNmNAFBGspvz2ME",
+      "signing_pubkey": "hMzEJea30r8m_JdAEqBE94rnoDU2usJQlx15GO2zqOo",
+      "error": "NonCanonicalEncryptionKey",
+      "message_contains": "not a canonical X25519"
+    },
+    {
+      "name": "signing key not on the curve (y=2)",
+      "device_id": "dev-1",
+      "encryption_pubkey": "656QImt3_WS8nNS_xQmNsxA_ZgDqwNmNAFBGspvz2EE",
+      "signing_pubkey": "AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "error": "InvalidSigningKey",
+      "message_contains": "not a valid Ed25519"
+    },
+    {
+      "name": "small-order signing key (identity)",
+      "device_id": "dev-1",
+      "encryption_pubkey": "656QImt3_WS8nNS_xQmNsxA_ZgDqwNmNAFBGspvz2EE",
+      "signing_pubkey": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "error": "WeakSigningKey",
+      "message_contains": "small-order Ed25519"
+    }
+  ],
+  "fingerprints": [
+    {
+      "kind": "encryption",
+      "key": "656QImt3_WS8nNS_xQmNsxA_ZgDqwNmNAFBGspvz2EE",
+      "fingerprint": "507b 5eeb fbb1 2a72 344f 65f6 7749 5fb2"
+    },
+    {
+      "kind": "signing",
+      "key": "hMzEJea30r8m_JdAEqBE94rnoDU2usJQlx15GO2zqOo",
+      "fingerprint": "2625 5a05 f11c 1b34 fee9 f653 316a 570c"
+    },
+    {
+      "kind": "encryption",
+      "key": "mtoK7bNBrm4HsbhkcUmrew_TwkDFCzNhIGtaFZRduzA",
+      "fingerprint": "3173 713f 2f3f 1e23 13b1 71e0 1f71 54c8"
+    },
+    {
+      "kind": "signing",
+      "key": "w-gmw7DkQcy5qew8lzlEJrXNczY2A7cHAmDas559RFY",
+      "fingerprint": "0991 348a 9d77 9b6a 3138 8089 5cc6 01eb"
+    }
+  ],
+  "next_state": [
+    {
+      "name": "first state of a new account",
+      "states": [],
+      "relay_max_sequence": 0,
+      "floor": 0,
+      "add": {
+        "id": "dev-a",
+        "key": "a"
+      },
+      "error": null,
+      "expect": {
+        "sequence": 1,
+        "devices": [["dev-a", "a", "active"]]
+      }
+    },
+    {
+      "name": "adds a device at max(highest, floor)+1",
+      "states": [
+        {
+          "sequence": 4,
+          "devices": [
+            {
+              "id": "dev-a",
+              "key": "a",
+              "status": "active"
+            }
+          ],
+          "revocations": [],
+          "signed_by": "root"
+        }
+      ],
+      "relay_max_sequence": 4,
+      "floor": 4,
+      "add": {
+        "id": "dev-b",
+        "key": "b"
+      },
+      "error": null,
+      "expect": {
+        "sequence": 5,
+        "devices": [
+          ["dev-a", "a", "active"],
+          ["dev-b", "b", "active"]
+        ]
+      }
+    },
+    {
+      "name": "re-pair replaces the same keys under an old id (#378)",
+      "states": [
+        {
+          "sequence": 2,
+          "devices": [
+            {
+              "id": "dev-old",
+              "key": "a",
+              "status": "active"
+            },
+            {
+              "id": "dev-c",
+              "key": "c",
+              "status": "active"
+            }
+          ],
+          "revocations": [],
+          "signed_by": "root"
+        }
+      ],
+      "relay_max_sequence": 2,
+      "floor": 2,
+      "add": {
+        "id": "dev-new",
+        "key": "a"
+      },
+      "error": null,
+      "expect": {
+        "sequence": 3,
+        "devices": [
+          ["dev-c", "c", "active"],
+          ["dev-new", "a", "active"]
+        ]
+      }
+    },
+    {
+      "name": "a document signed by another root",
+      "states": [
+        {
+          "sequence": 2,
+          "devices": [],
+          "revocations": [],
+          "signed_by": "other"
+        }
+      ],
+      "relay_max_sequence": 2,
+      "floor": 0,
+      "add": {
+        "id": "dev-b",
+        "key": "b"
+      },
+      "error": "AccountState",
+      "message_contains": "account state rejected"
+    },
+    {
+      "name": "unbacked max_sequence",
+      "states": [
+        {
+          "sequence": 3,
+          "devices": [
+            {
+              "id": "dev-a",
+              "key": "a",
+              "status": "active"
+            }
+          ],
+          "revocations": [],
+          "signed_by": "root"
+        }
+      ],
+      "relay_max_sequence": 4,
+      "floor": 0,
+      "add": {
+        "id": "dev-b",
+        "key": "b"
+      },
+      "error": "UnbackedMaxSequence",
+      "message_contains": "serves no verified document"
+    },
+    {
+      "name": "highest below the floor",
+      "states": [
+        {
+          "sequence": 3,
+          "devices": [
+            {
+              "id": "dev-a",
+              "key": "a",
+              "status": "active"
+            }
+          ],
+          "revocations": [],
+          "signed_by": "root"
+        }
+      ],
+      "relay_max_sequence": 3,
+      "floor": 5,
+      "add": {
+        "id": "dev-b",
+        "key": "b"
+      },
+      "error": "BelowFloor",
+      "message_contains": "rollback"
+    },
+    {
+      "name": "disagreeing siblings",
+      "states": [
+        {
+          "sequence": 3,
+          "devices": [
+            {
+              "id": "dev-a",
+              "key": "a",
+              "status": "active"
+            }
+          ],
+          "revocations": [],
+          "signed_by": "root"
+        },
+        {
+          "sequence": 3,
+          "devices": [
+            {
+              "id": "dev-c",
+              "key": "c",
+              "status": "active"
+            }
+          ],
+          "revocations": [],
+          "signed_by": "root"
+        }
+      ],
+      "relay_max_sequence": 3,
+      "floor": 0,
+      "add": {
+        "id": "dev-b",
+        "key": "b"
+      },
+      "error": "ConflictingStates",
+      "message_contains": "differing account-state documents"
+    },
+    {
+      "name": "revoked id",
+      "states": [
+        {
+          "sequence": 2,
+          "devices": [],
+          "revocations": ["dev-b"],
+          "signed_by": "root"
+        }
+      ],
+      "relay_max_sequence": 2,
+      "floor": 0,
+      "add": {
+        "id": "dev-b",
+        "key": "b"
+      },
+      "error": "DeviceRevoked",
+      "message_contains": "is revoked"
+    },
+    {
+      "name": "same id, different keys (rotation is #199)",
+      "states": [
+        {
+          "sequence": 2,
+          "devices": [
+            {
+              "id": "dev-b",
+              "key": "c",
+              "status": "active"
+            }
+          ],
+          "revocations": [],
+          "signed_by": "root"
+        }
+      ],
+      "relay_max_sequence": 2,
+      "floor": 0,
+      "add": {
+        "id": "dev-b",
+        "key": "b"
+      },
+      "error": "DeviceKeyMismatch",
+      "message_contains": "#199"
+    },
+    {
+      "name": "already active with these keys",
+      "states": [
+        {
+          "sequence": 2,
+          "devices": [
+            {
+              "id": "dev-b",
+              "key": "b",
+              "status": "active"
+            }
+          ],
+          "revocations": [],
+          "signed_by": "root"
+        }
+      ],
+      "relay_max_sequence": 2,
+      "floor": 0,
+      "add": {
+        "id": "dev-b",
+        "key": "b"
+      },
+      "error": "AlreadyActive",
+      "message_contains": "already active"
+    },
+    {
+      "name": "keys of a revoked id",
+      "states": [
+        {
+          "sequence": 2,
+          "devices": [
+            {
+              "id": "dev-gone",
+              "key": "b",
+              "status": "revoked"
+            }
+          ],
+          "revocations": ["dev-gone"],
+          "signed_by": "root"
+        }
+      ],
+      "relay_max_sequence": 2,
+      "floor": 0,
+      "add": {
+        "id": "dev-new",
+        "key": "b"
+      },
+      "error": "KeysRevoked",
+      "message_contains": "revoked device"
+    }
+  ]
+}
