@@ -320,8 +320,10 @@ builder error it is fail-closed: the caller denies, and no human is asked.
 | `empty_program`             | the first word that is neither is the empty string                                       | `''`, `'' rm -rf x`, `FOO=1 "" ls` |
 
 The check reads the tokens only. Each word is split on `;`, `&`, `|`, `(`, `)`; an empty piece (an operator) or a
-pure assignment (`NAME=…`, `NAME+=…`, `A[0]=…`, with no backtick, `<` or `>` in it) is skipped, and any other piece
-is a program, so the line is built. A substitution or a redirection therefore always counts as running something
+pure assignment (`NAME=…`, `NAME+=…`, `A[0]=…`, where `NAME` is a shell identifier, with no backtick, `<` or `>` in
+it) is skipped, and any other piece is a program, so the line is built. A command with an `=` in it split out of a
+substitution (`git log --format=%H` from `V="$(git log --format=%H)"`) is not an assignment, because its "name" is
+not an identifier (#391). A substitution or a redirection therefore always counts as running something
 (`FOO=$(id)` and `> out.txt` are built and go to a human).
 
 **What the refusal guarantees.** It never refuses a line whose first command word runs. It can refuse a line where
@@ -331,8 +333,6 @@ the shell would still run something, and that is deliberate: every refusal is a 
   examined: `'' || rm -rf x` and `'' ; rm -rf x` are refused (`empty_program`).
 - `shlex` drops quotes, so a quoted operator or assignment (`';'`, `'FOO=1'`) is read as unquoted, though bash would
   run it as a program name.
-- An assignment is recognised by its first character only, so `FO-O=1` is refused, though bash would run it as a
-  program name.
 
 **`action_from_argv`** (a canonical, pre-tokenized argv, such as the OpenClaw bridge's `systemRunPlan.argv` or a
 native caller's) is fallible with the same `CommandError`, whatever `raw` says: an empty argv is `no_command`; leading

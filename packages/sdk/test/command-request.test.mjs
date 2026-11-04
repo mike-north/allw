@@ -254,6 +254,17 @@ test("commandAction keeps its own argv refusals and maps the core's all-assignme
   assert.equal((await commandAction(["&&"])).syntactic.bin, "&&");
 });
 
+// #391: an assignment whose `$( … )` command holds an `=` is a program, not an all-assignment line.
+test("commandActionFromLine builds an assignment whose substitution holds '=' (#391)", async () => {
+  const version = await commandActionFromLine('VERSION="$(git log --format=%H -1)"');
+  assert.equal(version.surface, "command");
+  const dd = await commandActionFromLine('x="$(nice -n 1 dd if=/dev/zero of=/dev/sda)"');
+  assert.equal(dd.risk, "critical");
+  for (const line of ["X=1", "A=1 B=2", "A[0]=1", "X+=y"]) {
+    await rejectsWith(commandActionFromLine(line), "command_line_no_program", /runs no program/);
+  }
+});
+
 test("rejects a non-string command line", async () => {
   await rejectsWith(
     commandActionFromLine(["ls"]),

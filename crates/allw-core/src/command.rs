@@ -314,13 +314,31 @@ const CONTROL_OPERATOR_CHARS: [char; 5] = [';', '&', '|', '(', ')'];
 const ASSIGNMENT_EFFECT_CHARS: [char; 3] = ['`', '<', '>'];
 
 /// Is `piece` a pure shell variable assignment (`NAME=value`, `NAME+=value`, `A[0]=value`), one
-/// that runs nothing? The name must start with a letter or `_`; the value must hold no
-/// [`ASSIGNMENT_EFFECT_CHARS`] (`$(` and `<(` are already split apart on their `(`).
+/// that runs nothing? The name must be a shell identifier (`[A-Za-z_][A-Za-z0-9_]*`), optionally
+/// followed by a `[…]` subscript, then `=` or `+=` (#391); the value must hold no
+/// [`ASSIGNMENT_EFFECT_CHARS`] (`$(` and `<(` are already split apart on their `(`). So a piece
+/// holding a command with an `=` in it (`git log --format=%H`, split out of `$( … )`) is a
+/// program, not an assignment.
 fn is_pure_assignment(piece: &str) -> bool {
     piece
         .split_once('=')
-        .is_some_and(|(name, _)| name.bytes().next().is_some_and(is_ident_start))
+        .is_some_and(|(name, _)| is_assignment_name(name))
         && !piece.contains(ASSIGNMENT_EFFECT_CHARS)
+}
+
+/// Is `name` (the text before an assignment's first `=`) a shell identifier, optionally followed by
+/// a `[…]` subscript and then a `+` (for `+=`)? `X`, `_x1`, `A[0]`, `X+`, `A[i]+` are; `nice -n 1 dd
+/// if`, `FO-O`, `1X`, `A[0` and `` are not.
+fn is_assignment_name(name: &str) -> bool {
+    let name = name.strip_suffix('+').unwrap_or(name);
+    let (ident, subscript) = match name.find('[') {
+        Some(open) => (&name[..open], Some(&name[open..])),
+        None => (name, None),
+    };
+    let mut bytes = ident.bytes();
+    bytes.next().is_some_and(is_ident_start)
+        && bytes.all(is_ident_cont)
+        && subscript.is_none_or(|s| s.len() >= 2 && s.ends_with(']') && !s[1..].contains('['))
 }
 
 /// Refuse a tokenized command line that runs no program (#376):
@@ -342,9 +360,7 @@ fn is_pure_assignment(piece: &str) -> bool {
 /// - only the words up to the first program word are read, so a later segment after an empty
 ///   program word is not examined (`'' || rm -rf x`, `'' ; rm -rf x` are refused);
 /// - `shlex` removes quotes, so a quoted operator or assignment (`';'`, `'FOO=1'`) is read as
-///   unquoted, though bash runs it as a program name;
-/// - an assignment is recognised by its first character only, so `FO-O=1` is read as one, though
-///   bash runs it as a program name.
+///   unquoted, though bash runs it as a program name.
 fn check_runs_a_program(argv: &[String]) -> Result<(), CommandError> {
     if argv.is_empty() {
         return Err(CommandError::NoCommand);
@@ -924,6 +940,77 @@ mod tests {
         ] {
             let result = action_from_command(line, &ctx_no_cwd());
             assert!(result.is_ok(), "{line:?} runs something: {result:?}");
+        }
+    }
+
+    // ── #391: a command with an `=` inside `$( … )` is not an assignment ────────
+
+    /// Regression for #391: `$( … )` is split out of an assignment on its parentheses, and the
+    /// command inside it holds an `=` (`--format=%H`). Its "name" (`git log --format`) is not a shell
+    /// identifier, so it is a program and the line is built, not refused as `no_program`.
+    #[test]
+    fn issue_391_substitution_with_an_equals_sign_is_not_refused() {
+        for line in [
+            r#"VERSION="$(git log --format=%H -1)""#,
+            r#"x="$(nice -n 1 dd if=/dev/zero of=/dev/sda)""#,
+            "x=$(env A=1 ls)",
+            "x=`git log --format=%H -1`",
+        ] {
+            let result = action_from_command(line, &ctx_no_cwd());
+            assert!(result.is_ok(), "{line:?} runs a program: {result:?}");
+        }
+    }
+
+    /// Regression for #391: the substitution's command keeps its risk once the line is built; the
+    /// inner `dd of=/dev/sda` is Critical.
+    #[test]
+    fn issue_391_substitution_with_dd_inside_an_assignment_is_critical() {
+        let r = action_from_command(
+            r#"x="$(nice -n 1 dd if=/dev/zero of=/dev/sda)""#,
+            &ctx_no_cwd(),
+        )
+        .unwrap();
+        assert_eq!(r.risk, Risk::Critical);
+    }
+
+    /// Regression for #391: genuine all-assignment lines are still refused as `no_program`.
+    #[test]
+    fn issue_391_genuine_assignments_are_still_refused() {
+        for line in [
+            "X=1",
+            "A=1 B=2",
+            "A[0]=1",
+            "X+=y",
+            "A[i]+=1",
+            "_x1=v",
+            "FOO='a b'",
+        ] {
+            assert_refused(line, CommandError::NoProgram);
+        }
+    }
+
+    /// Regression for #391: a name that is not a shell identifier (with an optional `[…]`) is a
+    /// program word, so the line is built.
+    #[test]
+    fn issue_391_a_non_identifier_name_is_not_an_assignment() {
+        for line in ["FO-O=1", "1X=1", "A[0=1", "A]=1", "A[0]x=1", "X++=1", "=1"] {
+            let result = action_from_command(line, &ctx_no_cwd());
+            assert!(result.is_ok(), "{line:?} is not an assignment: {result:?}");
+        }
+        for name in ["X", "_x1", "A[0]", "X+", "A[i]+"] {
+            assert!(is_assignment_name(name), "{name:?}");
+        }
+        for name in [
+            "",
+            "nice -n 1 dd if",
+            "git log --format",
+            "FO-O",
+            "1X",
+            "A[0",
+            "A[]x",
+            "X++",
+        ] {
+            assert!(!is_assignment_name(name), "{name:?}");
         }
     }
 
