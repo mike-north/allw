@@ -34,7 +34,9 @@ export interface HookWasm {
   /**
    * Build an `ActionRecord` JSON for a shell command (the `command` surface). `cwd` is the working
    * directory at invocation, or omitted/`null` when unknown. **Throws** on invalid shell syntax
-   * (unmatched quotes) — the hook denies rather than guessing.
+   * (unmatched quotes) and for a line that runs no program (blank, only assignments or operators,
+   * an empty program word, #376): an `Error` whose `kind` is the core's code (`invalid_shell_syntax`,
+   * `no_command`, `no_program`, `empty_program`). The hook denies rather than guessing.
    */
   action_from_command(commandLine: string, cwd?: string | null): string;
   /**
@@ -42,7 +44,8 @@ export interface HookWasm {
    * Claude Code's `PowerShell` tool). `raw` is the exact line and argv is always its whitespace
    * split (PowerShell quoting is never read with POSIX rules); risk is at least Medium, or at least
    * High for a compound, escaped or dynamic-execution line. Never throws for PowerShell syntax, so a
-   * valid PowerShell command is never denied for its quoting.
+   * valid PowerShell command is never denied for its quoting; **throws** only for a line that runs
+   * no program (#376), with a `kind` as {@link HookWasm.action_from_command}.
    */
   action_from_powershell_command(commandLine: string, cwd?: string | null): string;
   /**
