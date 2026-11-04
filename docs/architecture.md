@@ -148,6 +148,15 @@ Relay device presence sockets expose the topology hook with an optional `surface
 Durable Object fans out/flushes a request to only one live socket per surface. Clients that omit `surface_id` keep
 independent delivery, and retractions still broadcast to every live socket so stale notifications clear.
 
+`AccountRelay` extends `DurableObject` from `cloudflare:workers`, so `env.ACCOUNT` is a
+`DurableObjectNamespace<AccountRelay>`. That base class makes every prototype method callable on a stub over
+Workers RPC, and TypeScript's `private` does not stop it (the keyword is erased at compile time). Stubs are only
+obtainable inside the Worker, which uses `fetch` alone, so the RPC surface is kept to exactly that:
+the public members are `fetch` plus the runtime handlers `alarm`, `webSocketMessage` and `webSocketClose` (workerd
+rejects RPC calls to those as reserved names), and every other method is `#private` or an instance property.
+`packages/relay/test/rpc-surface.test.ts` pins the list and probes every non-public member over a real stub. A new
+public method on `AccountRelay` fails that test until the surface change is reviewed.
+
 ## Platform mapping (native)
 
 Core access: **UniFFI** (Swift/Kotlin); **direct crate** (Linux `gtk4-rs`); **C ABI / P-Invoke** (Windows, C#/.NET).
