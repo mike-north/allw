@@ -103,9 +103,13 @@
 //! - Argv positions past [`MAX_PROGRAM_CANDIDATES`] are not analyzed. They count as a `High`
 //!   candidate for any wrapper, shell or assignment in front of them.
 //! - Before any budgeted work, an unbudgeted pre-pass records the tier of every visible program
-//!   word: each argv word, and the command word of every segment, descending into substitutions,
-//!   backticks and heredoc bodies down to [`MAX_SHELL_NESTING`] levels. It scans each level's
-//!   text once, so it is linear for each level.
+//!   word: each argv word, the command word of every segment, and, when that command word is a
+//!   wrapper, every later non-flag word (so `"$(sudo dd …)"` keeps `dd`'s tier). It descends into
+//!   substitutions, backticks, heredoc bodies, the `-c` / `--command` / `-Command` strings of a
+//!   shell and the arguments of `eval` (where the argv rules read them: at the command word or
+//!   after a wrapper there) down to [`MAX_SHELL_NESTING`] levels. A segment that only names a
+//!   program as an argument (`echo dd`) adds nothing beyond the `shlex` words. It reads each
+//!   level's text once, so it is linear for each level.
 //! - All analysis of one record shares one budget of [`MAX_RISK_WORK`] units (bytes scanned,
 //!   split or copied, plus argv positions classified). Exhausting it makes the record at least
 //!   `High`, and never lowers a tier already found: any program word the pre-pass sees keeps its
@@ -1798,16 +1802,18 @@ fn shell_line_risk(text: &str, source: Source, depth: usize, budget: &mut Budget
 
 /// Record, before any budgeted work, the program-table tier of every program word visible in the
 /// text: every word of `words` (the line's `shlex` split, or the argv), and the command word of
-/// every segment of `line` in the bash reading, descending into substitutions, backticks and
-/// heredoc bodies down to [`MAX_SHELL_NESTING`] levels. The pass isn't charged; each level scans
-/// its text once, so it is linear for each level. Its tiers are only read if the budget runs out,
-/// so a `dd` the line plainly runs, at the top level or in a `$(dd)`, keeps its tier however much
-/// padding follows it. Counting a word that turns out not to run (`echo dd`) can only raise the
-/// tier.
+/// every segment of `line` in the bash reading, descending into substitutions, backticks, heredoc
+/// bodies, `-c` strings and `eval` arguments down to [`MAX_SHELL_NESTING`] levels (see
+/// [`note_argv_reach`]). The pass isn't charged; each level scans its text once, so it is linear
+/// for each level. Its tiers are only read if the budget runs out, so a `dd` the line plainly
+/// runs, at the top level, in a `$(dd)`, a `sh -c 'dd'` or behind a wrapper, keeps its tier
+/// however much padding follows it. Counting a word that turns out not to run (`echo dd`) can
+/// only raise the tier.
 fn note_visible_programs(line: Option<&str>, words: &[String], budget: &mut Budget) {
     for word in words {
         budget.note(classify_program(word, &[], &[]));
     }
+    note_argv_reach(words, 0, budget);
     if let Some(line) = line {
         note_line_programs(line, 0, budget);
     }
@@ -1824,13 +1830,11 @@ fn note_line_programs(text: &str, depth: usize, budget: &mut Budget) {
             .collect();
         if let (Some(c), _) = command_word(&unquoted) {
             if !unquoted[c].expansion {
-                let argv: Vec<String> = unquoted[c..].iter().map(|w| w.text.clone()).collect();
+                let mut argv: Vec<String> = unquoted[c..].iter().map(|w| w.text.clone()).collect();
+                argv[0] = program_name(&argv[0]).to_string();
                 let (flags, positionals) = split_flags_and_positionals(&argv);
-                budget.note(classify_program(
-                    program_name(&unquoted[c].text),
-                    &flags,
-                    &positionals,
-                ));
+                budget.note(classify_program(&argv[0], &flags, &positionals));
+                note_argv_reach(&argv, depth, budget);
             }
         }
     }
@@ -1841,6 +1845,67 @@ fn note_line_programs(text: &str, depth: usize, budget: &mut Budget) {
     let substitutions = line.substitutions.iter().map(|sub| sub.body);
     for nested in substitutions.chain(line.heredocs.iter().copied()) {
         note_line_programs(nested, depth + 1, budget);
+    }
+}
+
+/// The [`note_visible_programs`] pass over what an argv at nesting `depth` runs past its own
+/// command word, mirroring the argv rules (module doc § The program that actually runs):
+///
+/// - When `argv[0]` is a wrapper, every later non-flag word is noted as a program start. Only
+///   the name matters here: on exhaustion the record is already at least `High`, and `Critical`
+///   depends only on the name.
+/// - The first shell (with a later `-c` / `--command` / PowerShell `-Command` flag) or `eval`
+///   that runs, at `argv[0]` or after a wrapper there, has its command strings read as lines one
+///   level down: each later non-flag word (and a `--command=` value) for a shell, the rest of the
+///   argv joined by spaces for `eval`. Only the first is read, since the text it reads holds
+///   every later one, so each word is read at most once for each level.
+///
+/// One pass over the words, plus the nested lines. A segment whose command word is none of these
+/// (`echo dd`) adds nothing.
+fn note_argv_reach(argv: &[String], depth: usize, budget: &mut Budget) {
+    let Some(first) = argv.first() else {
+        return;
+    };
+    let wrapped = WRAPPERS.contains(&basename(first));
+    if wrapped {
+        for word in argv[1..].iter().filter(|w| !is_flag(w)) {
+            budget.note(classify_program(word, &[], &[]));
+        }
+    }
+    if depth >= MAX_SHELL_NESTING {
+        return;
+    }
+    // The last command flag of each kind: a shell at `j` reads command strings if one follows it.
+    let last_shell_flag = argv
+        .iter()
+        .rposition(|w| is_flag(w) && is_shell_command_flag(w));
+    let last_pwsh_flag = argv
+        .iter()
+        .rposition(|w| is_flag(w) && is_pwsh_command_flag(w));
+    let reach = if wrapped { argv.len() } else { 1 };
+    for (j, word) in argv[..reach].iter().enumerate() {
+        let base = basename(word);
+        if base == "eval" {
+            if j + 1 < argv.len() {
+                note_line_programs(&argv[j + 1..].join(" "), depth + 1, budget);
+            }
+            return;
+        }
+        let reads = (SHELLS.contains(&base) && last_shell_flag.is_some_and(|f| f > j))
+            || (POWERSHELLS.contains(&base) && last_pwsh_flag.is_some_and(|f| f > j));
+        if reads {
+            for later in &argv[j + 1..] {
+                let text = if is_flag(later) {
+                    later.strip_prefix("--command=")
+                } else {
+                    Some(later.as_str())
+                };
+                if let Some(text) = text {
+                    note_line_programs(text, depth + 1, budget);
+                }
+            }
+            return;
+        }
     }
 }
 

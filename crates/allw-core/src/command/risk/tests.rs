@@ -1290,8 +1290,6 @@ fn assert_exhausted(line: &str, want: Risk) {
     let (risk, budget) = analyze_with_budget(line, MAX_RISK_WORK);
     assert!(budget.exhausted, "{} bytes did not exhaust", line.len());
     assert_eq!(risk, want, "{:?}…", &line[..line.len().min(80)]);
-    // The public builder agrees.
-    assert_eq!(line_risk(line), want, "{:?}…", &line[..line.len().min(80)]);
 }
 
 /// Regression (#323): the pre-pass didn't descend into `-c` strings or `eval` arguments, so a

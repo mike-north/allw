@@ -279,9 +279,12 @@ a program it runs.
   - one shared work budget per record (bytes scanned, split or copied, plus words classified), so
     classification time stays linear and bounded inside the synchronous hook. Running out of it never lowers a
     tier already found. An unbudgeted pre-pass first records every visible program word (each argv word,
-    and each segment's command word, descending into substitutions, backticks and heredoc bodies down to the
-    nesting limit), so those keep their tier on exhaustion: a `$(dd …)` that runs first stays `critical`
-    however much padding follows it. Only text never reached falls back to `high`.
+    each segment's command word, and every later non-flag word of a segment whose command word is a wrapper,
+    descending into substitutions, backticks, heredoc bodies, the `-c` / `--command` / PowerShell `-Command`
+    strings of the curated shells, and `eval` arguments, down to the nesting limit), so those keep their tier
+    on exhaustion: a `$(dd …)`, `"$(sudo dd …)"`, `sh -c 'dd …'` or `eval 'dd …'` that runs first stays
+    `critical` however much padding follows it (#323, #324). It reads each word once per level, so it stays
+    linear for each level. Only text never reached falls back to `high`.
 
 **Known T1 limits.** For these the tier can still understate what runs (decision B: curated list plus documented
 limits, no name-sniffing of later words):
