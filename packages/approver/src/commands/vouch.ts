@@ -23,8 +23,12 @@
  *    signing key is covered only by the human's fingerprint comparison in step 5.
  * 4. Have the core compose the next account state (`next_account_state`, #379). This refuses a
  *    rollback, disagreeing documents, a revoked id, or an id already listed with other keys.
- * 5. Show the device id, the relay's label for it, and both key fingerprints, all escaped by the
- *    core, and ask for confirmation. The human compares them with what the device itself shows.
+ *    Refuse, too, if the composition would replace **this keyfile's own device** (#378: same keys
+ *    under another id): the device holds the CLI's keys, so it is this keyfile's device under a
+ *    stale id, and vouching it would stop the CLI decrypting. `pair` is the tool for it.
+ * 5. Show the device id, the relay's label for it, both key fingerprints, every id the new state
+ *    replaces, the new sequence and the resulting recipients, all escaped by the core, and ask for
+ *    confirmation. The human compares the device's values with what the device itself shows.
  * 6. Root-sign and publish the state, then record its sequence as this keyfile's floor.
  */
 
@@ -122,6 +126,13 @@ export async function runVouch(
     encryptionPubkey: options.encryptionPubkey,
     signingPubkey: options.signingPubkey,
   });
+  if (keyfile.device_id !== undefined && draft.replacedDeviceIds.includes(keyfile.device_id)) {
+    throw new Error(
+      `device ${options.deviceId} has this keyfile's own keys: vouching it would replace this ` +
+        `keyfile's device ${keyfile.device_id}, and the CLI would stop decrypting. Use pair for ` +
+        `this device, and paste this keyfile's current values into a web approver set up from it`,
+    );
+  }
 
   // Truncated raw, then escaped once by `log` with the rest of its line.
   const label = registered.label === null ? "(none)" : truncate(registered.label);
@@ -132,6 +143,12 @@ export async function runVouch(
   log(`  relay label:     ${label}`);
   log(`  encryption key:  ${wasm.device_key_fingerprint("encryption", options.encryptionPubkey)}`);
   log(`  signing key:     ${wasm.device_key_fingerprint("signing", options.signingPubkey)}`);
+  log("");
+  log(`The new account state (sequence ${String(draft.sequence)}):`);
+  for (const replaced of draft.replacedDeviceIds) {
+    log(`  replaces:        ${replaced} (same keys; it stops receiving requests)`);
+  }
+  log(`  recipients:      ${draft.activeDeviceIds.join(", ")}`);
   log("");
   log(
     "Compare the device id and all eight groups of both fingerprints with what the device shows.",
@@ -152,6 +169,10 @@ export async function runVouch(
   }
   log(
     `Vouched for device ${options.deviceId}: published account state sequence ${String(draft.sequence)}.`,
+  );
+  log(
+    "It can now decrypt requests. Its approvals are denied until it holds a device certificate " +
+      "from this account root, which vouch does not issue (#199).",
   );
   return draft.sequence;
 }

@@ -22,12 +22,23 @@ export interface DeviceToAdd {
   readonly signingPubkey: string;
 }
 
-/** The next account state the core composed, not yet signed. */
+/**
+ * The next account state the core composed, not yet signed, with what it changes. A caller that
+ * asks a human to confirm shows {@link replacedDeviceIds} and {@link activeDeviceIds}: both come
+ * from the core, never recomputed here.
+ */
 export interface AccountStateDraft {
   /** The unsigned `AccountState` JSON, exactly as the core produced it. */
   readonly stateJson: string;
   /** The new state's sequence: `max(highest, floor) + 1`. */
   readonly sequence: number;
+  /**
+   * Ids the change retires because they carried the added device's key pair under another id
+   * (#378). They stop receiving requests once this state is published.
+   */
+  readonly replacedDeviceIds: readonly string[];
+  /** Every active device id in the new state: the request recipients once it is published. */
+  readonly activeDeviceIds: readonly string[];
 }
 
 /**
@@ -42,7 +53,7 @@ export async function composeAddDevice(
   device: DeviceToAdd,
 ): Promise<AccountStateDraft> {
   const fetched = await fetchAccountStatesWithMetadata(relayUrl, accountId);
-  const stateJson = wasm.next_account_state(
+  const composed = wasm.next_account_state(
     JSON.stringify(fetched.accountStates),
     fetched.maxSequence,
     keyfile.account_state_highest_sequence ?? 0,
@@ -55,8 +66,18 @@ export async function composeAddDevice(
       signing_pubkey: device.signingPubkey,
     }),
   );
-  const { sequence } = JSON.parse(stateJson) as { sequence: number };
-  return { stateJson, sequence };
+  const parsed = JSON.parse(composed) as {
+    state_json: string;
+    sequence: number;
+    replaced_device_ids: string[];
+    active_device_ids: string[];
+  };
+  return {
+    stateJson: parsed.state_json,
+    sequence: parsed.sequence,
+    replacedDeviceIds: parsed.replaced_device_ids,
+    activeDeviceIds: parsed.active_device_ids,
+  };
 }
 
 /** Root-sign a composed draft with the keyfile's account root and publish it to the relay. */

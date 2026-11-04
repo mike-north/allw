@@ -107,6 +107,9 @@ allw-approver pair". Upgrade the pairing once:
 4. **iPhone approver, or a web approver with keys of its own** (not set up from this keyfile):
    re-pairing does not list it. Vouch for it once with the values it shows
    (`allw-approver vouch`, interim until #199; see [§Vouch for a device with its own keys](#vouch-for-a-device-with-its-own-keys)).
+   Vouching lets it decrypt requests only: its approvals are denied until it holds a device
+   certificate from this account root, which `vouch` does not issue (#199). Never vouch for a web
+   approver set up from this keyfile; paste the new values into it (step 3).
 
 #### Vouch for a device with its own keys
 
@@ -136,10 +139,15 @@ no vouch.
   encryption key;
 - the relay's account states don't verify, disagree, or are older than the keyfile has seen, or the
   id is revoked or already listed with other keys (a key change is a rotation, #199's job);
+- the device carries **this keyfile's own keys**, so the new state would replace this keyfile's
+  device (a web approver set up from the keyfile, still on a device id from before a re-pair). Use
+  `pair` for this device and paste the keyfile's current values into that browser;
 - you don't answer `y`.
 
 Before asking, it prints the device id, the relay's label for it, and a fingerprint of each key:
-eight groups of four hex digits, the same ones the device shows. **Compare the device id and all
+eight groups of four hex digits, the same ones the device shows. It also prints what the signed
+state will do: its sequence, every device id it **replaces** (an entry with the same keys under
+another id, which then stops receiving requests, #378), and the full list of recipients after it. **Compare the device id and all
 eight groups of both fingerprints.** That comparison is the only check on the signing key (the
 relay stores only the encryption key). A wrong signing key fails closed: the device's verdicts don't
 verify, so they deny. On `y`, it root-signs and publishes the next account state, and records its
@@ -150,6 +158,10 @@ vouched, the device can read requests, but its approvals don't verify (integrato
 deny) until it holds a certificate from this account root for its signing key. That certificate
 comes from the cross-device enrollment ceremony (#199), not from `vouch`. Before `vouch` existed it
 was the same: only `pair` issued certificates, for its own keyfile's key.
+
+Library callers: `runVouch` takes the confirmation as an injected `Confirmer`, so a program can
+answer yes without a terminal. That grants nothing new: the caller already holds the keyfile, and
+with it the account root.
 
 See `docs/enrollment.md` §Interim vouching and `docs/threat-model.md` R9.
 

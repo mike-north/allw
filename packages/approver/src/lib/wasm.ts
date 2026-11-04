@@ -98,11 +98,14 @@ export interface AllwWasm {
     account_root_pubkey_b64: string,
   ): string;
   /**
-   * Compose the next **unsigned** account state (JSON `AccountState`) from the relay's documents,
-   * its claimed `max_sequence`, this root holder's `floor`, and a change such as
-   * `{"kind":"add_device","device_id","encryption_pubkey","signing_pubkey"}` (#379). Throws on any
-   * refusal: a document that does not verify, an unbacked max sequence, a rollback, disagreeing
-   * siblings, invalid device material, a revoked id, or a conflicting entry.
+   * Compose the next **unsigned** account state from the relay's documents, its claimed
+   * `max_sequence`, this root holder's `floor`, and a change such as
+   * `{"kind":"add_device","device_id","encryption_pubkey","signing_pubkey"}` (#379). Returns JSON
+   * `{ state_json, sequence, replaced_device_ids, active_device_ids }`: `state_json` is the
+   * `AccountState` JSON to pass unchanged to `sign_account_state`, and the id lists are what the
+   * change does (#378 replacements; the resulting recipients). Throws on any refusal: a document
+   * that does not verify, an unbacked max sequence, a rollback, disagreeing siblings, invalid
+   * device material, a revoked id, or a conflicting entry.
    */
   next_account_state(
     account_states_json: string,

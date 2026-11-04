@@ -12,15 +12,15 @@
  * constraint). ⚠ v0 stand-in: device keys are software-held (see README / issue #23).
  */
 
-import { createInterface } from "node:readline/promises";
 import { parseArgs } from "node:util";
 
 import { runKeygen } from "./commands/keygen.js";
 import { runPair } from "./commands/pair.js";
-import { runVouch, type Confirmer } from "./commands/vouch.js";
+import { runVouch } from "./commands/vouch.js";
 import { createReadlinePrompter, runWatch, type WebSocketLike } from "./commands/watch.js";
 import { printSameMachineDemoWarning } from "./lib/demo-warning.js";
 import { defaultKeyfilePath } from "./lib/paths.js";
+import { createTerminalConfirmer } from "./lib/terminal-confirmer.js";
 import { loadWasm } from "./lib/wasm.js";
 import { getVersion } from "./version.js";
 
@@ -175,7 +175,11 @@ async function main(): Promise<void> {
       return;
     }
     case "vouch": {
-      const confirmer = createTerminalConfirmer();
+      const confirmer = createTerminalConfirmer({
+        input: process.stdin,
+        output: process.stdout,
+        interactive: process.stdin.isTTY && process.stdout.isTTY,
+      });
       try {
         await runVouch(
           wasm,
@@ -214,26 +218,6 @@ async function main(): Promise<void> {
       printUsageAndExit(1);
     }
   }
-}
-
-/**
- * The terminal confirmer for `vouch`: interactive only when both stdin and stdout are a TTY, and
- * only an explicit `y` / `yes` confirms. The readline interface is opened lazily, so a refused
- * non-interactive run never touches stdin.
- */
-function createTerminalConfirmer(): Confirmer & { close(): void } {
-  let rl: ReturnType<typeof createInterface> | undefined;
-  return {
-    interactive: process.stdin.isTTY && process.stdout.isTTY,
-    async confirm(question: string): Promise<boolean> {
-      rl ??= createInterface({ input: process.stdin, output: process.stdout });
-      const answer = (await rl.question(question)).trim().toLowerCase();
-      return answer === "y" || answer === "yes";
-    },
-    close(): void {
-      rl?.close();
-    },
-  };
 }
 
 /**

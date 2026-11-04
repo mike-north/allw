@@ -41,11 +41,21 @@ function deviceKeys(wasm) {
   };
 }
 
+/** The CLI keyfile's own device, as `pair` listed it. */
+function cliEntry(keyfile) {
+  return {
+    device_id: CLI_DEVICE_ID,
+    encryption_pubkey: keyfile.device_encryption_pubkey,
+    signing_pubkey: keyfile.device_signing_pubkey,
+    status: "active",
+  };
+}
+
 /**
- * A relay holding one published state (sequence 1, the CLI's own device) and a device registry.
- * Returns { url, requests, published(), close }.
+ * A relay holding one published state (sequence 1; by default only the CLI's own device) and a
+ * device registry. Returns { url, requests, published(), close }.
  */
-async function startRelay(wasm, keyfile, registry) {
+async function startRelay(wasm, keyfile, registry, devices = [cliEntry(keyfile)]) {
   const accountId = keyfile.account_id;
   let current = {
     account_states: [
@@ -56,14 +66,7 @@ async function startRelay(wasm, keyfile, registry) {
           sequence: 1,
           current_root: keyfile.account_root_pubkey,
           previous_roots: [],
-          devices: [
-            {
-              device_id: CLI_DEVICE_ID,
-              encryption_pubkey: keyfile.device_encryption_pubkey,
-              signing_pubkey: keyfile.device_signing_pubkey,
-              status: "active",
-            },
-          ],
+          devices,
           actors: [],
           revocations: [],
         }),
@@ -139,9 +142,14 @@ function confirmer(answer, interactive = true) {
 
 /**
  * Run `fn` with a paired CLI keyfile (floor 1), a phone with its own keys, and a relay. `registry`
- * builds the relay's device list from the phone's keys (default: the phone, registered honestly).
+ * builds the relay's device list (default: the phone, registered honestly); `stateDevices` builds
+ * the devices of the relay's sequence-1 account state (default: only the CLI's own device).
  */
-async function withSetup(fn, registry = (phone) => [registered(PHONE_DEVICE_ID, phone)]) {
+async function withSetup(
+  fn,
+  registry = (phone) => [registered(PHONE_DEVICE_ID, phone)],
+  stateDevices = (keyfile) => [cliEntry(keyfile)],
+) {
   const wasm = await loadWasm();
   const dir = mkdtempSync(join(tmpdir(), "allw-vouch-"));
   const keyfilePath = join(dir, "keyfile.json");
@@ -154,11 +162,24 @@ async function withSetup(fn, registry = (phone) => [registered(PHONE_DEVICE_ID, 
     account_state_highest_sequence: 1,
   };
   const phone = deviceKeys(wasm);
-  const relay = await startRelay(wasm, keyfile, registry(phone));
+  const relay = await startRelay(
+    wasm,
+    keyfile,
+    registry(phone, keyfile),
+    stateDevices(keyfile, phone),
+  );
   writeKeyfile(keyfilePath, { ...keyfile, relay_url: relay.url });
   const lines = [];
   try {
-    await fn({ wasm, keyfilePath, phone, relay, lines, log: (line) => lines.push(line) });
+    await fn({
+      wasm,
+      keyfilePath,
+      keyfile,
+      phone,
+      relay,
+      lines,
+      log: (line) => lines.push(line),
+    });
   } finally {
     await relay.close();
     rmSync(dir, { recursive: true, force: true });
@@ -211,7 +232,99 @@ test("vouch lists the device after the human confirms, showing core fingerprints
     assert.match(encFp, /^([0-9a-f]{4} ){7}[0-9a-f]{4}$/);
     assert.ok(text.includes(`encryption key:  ${encFp}`));
     assert.ok(text.includes(`signing key:     ${sigFp}`));
+    assert.match(text, /The new account state \(sequence 2\):/);
+    assert.ok(text.includes(`recipients:      ${CLI_DEVICE_ID}, ${PHONE_DEVICE_ID}`));
+    assert.doesNotMatch(text, /replaces:/, "a plain add replaces nothing");
+    // Review-387 F3: success says the device can decrypt but cannot yet approve.
+    assert.match(text, /approvals are denied until it holds a device certificate/);
   });
+});
+
+test("vouch shows every id the new state replaces and its recipients before asking (review-387 F1)", async () => {
+  // The phone re-paired: the relay gave its same keys a new id. The state still lists the old id,
+  // which the #378 rule replaces. The human must see that before confirming.
+  const OLD_PHONE_ID = "dev-phone-old";
+  await withSetup(
+    async ({ wasm, keyfilePath, phone, relay, lines, log }) => {
+      let shownAtAsk = "";
+      const ask = {
+        interactive: true,
+        confirm: () => {
+          shownAtAsk = lines.join("\n");
+          return Promise.resolve(true);
+        },
+      };
+      await runVouch(wasm, vouchOptions(keyfilePath, phone), ask, log);
+      assert.ok(
+        shownAtAsk.includes(`replaces:        ${OLD_PHONE_ID} (same keys`),
+        "the replaced id is shown before the question",
+      );
+      assert.ok(shownAtAsk.includes(`recipients:      ${CLI_DEVICE_ID}, ${PHONE_DEVICE_ID}`));
+      assert.match(shownAtAsk, /sequence 2/);
+      assert.deepEqual(
+        relay.published().devices.map((d) => d.device_id),
+        [CLI_DEVICE_ID, PHONE_DEVICE_ID],
+        "what was shown is what was published",
+      );
+    },
+    (phone) => [registered(PHONE_DEVICE_ID, phone)],
+    (keyfile, phone) => [
+      cliEntry(keyfile),
+      {
+        device_id: OLD_PHONE_ID,
+        encryption_pubkey: phone.encryptionPubkey,
+        signing_pubkey: phone.signingPubkey,
+        status: "active",
+      },
+    ],
+  );
+});
+
+test("vouch refuses a device carrying this keyfile's own keys under a stale id (review-387 F1)", async () => {
+  // After a re-pair the state lists the CLI under its current id, but the relay still registers
+  // the old id with the same keys. A browser set up from the keyfile before the re-pair shows that
+  // old id. Vouching it would replace the CLI's own entry, so the CLI would stop decrypting.
+  const STALE_ID = "dev-cli-before-repair";
+  await withSetup(
+    async ({ wasm, keyfilePath, keyfile, relay, log }) => {
+      const ask = confirmer(true);
+      await assert.rejects(
+        () =>
+          runVouch(
+            wasm,
+            {
+              keyfilePath,
+              deviceId: STALE_ID,
+              encryptionPubkey: keyfile.device_encryption_pubkey,
+              signingPubkey: keyfile.device_signing_pubkey,
+            },
+            ask,
+            log,
+          ),
+        /has this keyfile's own keys.*replace this keyfile's device dev-cli.*Use pair/s,
+      );
+      assert.equal(ask.asked.length, 0, "refused before asking");
+      assertNothingChanged(relay, keyfilePath);
+      assert.deepEqual(
+        relay.published().devices.map((d) => d.device_id),
+        [CLI_DEVICE_ID, PHONE_DEVICE_ID],
+        "the CLI's own entry is untouched",
+      );
+    },
+    (phone, keyfile) => [
+      registered(PHONE_DEVICE_ID, phone),
+      registered(STALE_ID, { encryptionPubkey: keyfile.device_encryption_pubkey }, "browser"),
+    ],
+    (keyfile, phone) => [
+      cliEntry(keyfile),
+      {
+        device_id: PHONE_DEVICE_ID,
+        encryption_pubkey: phone.encryptionPubkey,
+        signing_pubkey: phone.signingPubkey,
+        status: "active",
+      },
+    ],
+  );
 });
 
 test("vouch refuses a device id the relay never registered, before asking (#381)", async () => {
