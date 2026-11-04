@@ -272,9 +272,13 @@ Flow, fail-closed at every step. Nothing is signed before step 6:
    registered with a different X25519 key. The registry holds no signing key (§Pairing Flow, step 3), so the
    signing key is checked only by the human in step 5.
 4. Compose the next state in the core (below). It refuses a rollback, disagreeing documents, a revoked id, or an
-   id already listed with other keys.
-5. Show the account id, the device id, the relay's label for it (truncated to 80 characters), and the core
-   fingerprint of each key, every line through the core escape. The human compares the device id and all eight
+   id already listed with other keys. `vouch` also refuses when the new state would **replace this keyfile's own
+   device** (the same keys under another id): that device is the CLI's, typically a web approver set up from the
+   keyfile before a re-pair, and vouching it would stop the CLI decrypting. `pair` is the tool for it.
+5. Show the account id, the device id, the relay's label for it (truncated to 80 characters), the core
+   fingerprint of each key, and what the signed state does: its sequence, every id it replaces (#378), and every
+   recipient after it. The core returns the replaced and active ids with the state (`NextAccountState`), so the
+   surface shows exactly what it signs. Every line goes through the core escape. The human compares the device id and all eight
    groups of both fingerprints with the device's own screen, and must answer `y`/`yes`.
 6. Root-sign and publish (`POST /{acct}/account-states`), then record the published sequence as the keyfile's
    floor.
@@ -323,7 +327,10 @@ rotation and revocation. Adding a device:
 - **one entry per key pair (#378).** An entry under another id with the **same** key pair is replaced. A re-pair
   registers a new relay device id for the same seeds, and the old entry would otherwise stay a recipient forever,
   readable only by the same keys under an id no approver uses. If that other id is revoked, the add is refused:
-  reusing a revoked key pair under a new id would undo the revocation;
+  reusing a revoked key pair under a new id would undo the revocation. This check finds the revoked key pair
+  through its entry, so **a revoked device's entry is never removed from `devices[]`**: a revocation keeps the
+  entry (status `revoked`) alongside its `revocations` record. #199's revocation must keep that invariant, or a
+  revoked key pair could be re-listed under a new id;
 - an entry that shares only one of the two keys with the new device is refused as a conflict: a key pair is never
   split across ids.
 
@@ -986,7 +993,9 @@ When a device is revoked:
 2. Any live device WebSocket for that device is closed.
 3. Future `GET /devices` responses omit the revoked device (routing only; integrators never read keys there).
 4. Future verdict submissions from that device are rejected.
-5. Account state records a revocation entry with `revoked_at`.
+5. Account state records a revocation entry with `revoked_at`, and **keeps the device's `devices[]` entry** (with
+   status `revoked`). The entry is how the next state's author recognizes the revoked key pair: without it, the
+   same keys could be listed again under a new device id (§Interim vouching → Composing the next state).
 6. Offline verifiers reject verdicts whose device id appears in the highest-sequence revocation state they have
    seen, even if the verdict's `device_cert` cryptographically chains to an old root.
 

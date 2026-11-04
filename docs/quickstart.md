@@ -202,6 +202,9 @@ allw-approver pair". Upgrade the pairing once:
 4. **iPhone approver, or a web approver with keys of its own** (not set up from this keyfile):
    re-pairing does not list it. Vouch for it once with the values it shows
    (`allw-approver vouch`, interim until #199; see [`packages/approver/README.md` §Vouch for a device with its own keys](../packages/approver/README.md#vouch-for-a-device-with-its-own-keys)).
+   Vouching lets it decrypt requests only: its approvals are denied until it holds a device
+   certificate from this account root, which `vouch` does not issue (#199). Never vouch for a web
+   approver set up from this keyfile; paste the new values into it (step 3).
 
 ---
 

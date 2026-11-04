@@ -501,12 +501,17 @@ Rules:
   checked before it is used: each key is the canonical unpadded base64url of 32 bytes; the X25519 key is canonical
   and not small-order; the Ed25519 key is a canonical, non-small-order point; the id is 1–64 base64url-alphabet
   characters.
-- `vouch` signs nothing without an interactive terminal and an explicit `y`/`yes`. There is no `--yes`.
+- `vouch` signs nothing without an interactive terminal and an explicit `y`/`yes` submitted with Enter; an input
+  that closes mid-question is "not confirmed" (exit 1). There is no `--yes`.
+- What is signed is what is shown: before asking, `vouch` prints the new sequence, every id the state replaces
+  (#378: same keys under another id) and the full recipient list, all returned by the core with the state.
+  `vouch` refuses outright when the replaced id is the keyfile's own device, which would stop the CLI decrypting.
 - Every value shown to the human (ids, the relay's label, fingerprints) goes through the core display escape. The
   relay label is truncated to 80 characters.
 - The next state comes from the core's `next_account_state`. Every fetched document must verify; the relay's
   `max_sequence` must be backed; the highest sequence must not be below the keyfile's floor; siblings must agree.
-  A revoked id or a revoked key pair is never re-listed. An id is never re-listed with different keys (rotation
+  A revoked id or a revoked key pair is never re-listed; the key-pair check relies on a revoked device's entry
+  staying in `devices[]`, an invariant any revocation author (#199) must keep. An id is never re-listed with different keys (rotation
   is #199). One key pair has exactly one entry (#378).
 - Vouching grants **decrypt only** and issues no `device_cert`, by decision. A verdict verifies with a root-issued
   cert plus non-revocation, and listing in account state does not count, so a cert would be a separate and larger
