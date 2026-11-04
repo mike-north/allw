@@ -14,7 +14,8 @@
  * @see ../../../docs/threat-model.md "Relay denial of service", Push residual
  */
 
-import { SELF, env, runInDurableObject } from "cloudflare:test";
+import { runInDurableObject } from "cloudflare:test";
+import { env, exports } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import type { AccountRelay } from "../src/index.js";
 import {
@@ -28,6 +29,7 @@ import {
 import { WebPushTransport, type VapidConfig } from "../src/web-push.js";
 import { testAccount, testRequestId as rid } from "./support/accounts.js";
 import { bindAccountRoot, pinRelayClock } from "./support/relay-state.js";
+import { urlOf } from "./support/fetch-input.js";
 
 /** The first submit's instant (2099-12-31T00:00Z). Every other time is an offset from it. */
 const T0 = 4_102_358_400_000;
@@ -38,6 +40,8 @@ const APNS_TOKEN = "a".repeat(64);
 const FCM_TOKEN = "fcm-registration-token-1";
 const WEBPUSH_ENDPOINT = "https://fcm.googleapis.com/fcm/send/c3Vic2NyaXB0aW9uLWE";
 
+/** A `webpush_trailing_wakeup` row: a push token owed one wakeup once its window ends. */
+// eslint-disable-next-line @typescript-eslint/consistent-type-definitions -- a type alias satisfies SqlStorage.exec's row constraint; an interface doesn't.
 type TrailingRow = {
   device_id: string;
   transport: string;
@@ -46,7 +50,7 @@ type TrailingRow = {
   last_skipped_request_id: string | null;
 };
 
-function stub(accountId: string): DurableObjectStub {
+function stub(accountId: string): DurableObjectStub<AccountRelay> {
   return env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
 }
 
@@ -71,7 +75,7 @@ function recorder(kind: PushTransportKind): PushTransport & { sent: PushWakeup[]
 async function account(
   name: string,
   transports: PushTransportRegistry,
-  tokens: ReadonlyArray<{ device_id: string; transport: PushTransportKind; token: string }>,
+  tokens: readonly { device_id: string; transport: PushTransportKind; token: string }[],
 ): Promise<string> {
   const acct = testAccount(`native-coalesce-${name}`);
   await bindAccountRoot(acct);
@@ -102,7 +106,7 @@ async function submitAt(
   ttlMs = 10 * 60_000,
 ): Promise<number> {
   await pinRelayClock(acct, at);
-  const resp = await SELF.fetch(`https://relay.allw.test/${acct}/requests`, {
+  const resp = await exports.default.fetch(`https://relay.allw.test/${acct}/requests`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -115,7 +119,7 @@ async function submitAt(
     }),
   });
   expect(resp.status).toBe(202);
-  const { push_wakeups } = (await resp.json()) as { push_wakeups: number };
+  const { push_wakeups } = await resp.json<{ push_wakeups: number }>();
   await fanOutSettled(acct);
   return push_wakeups;
 }
@@ -333,7 +337,7 @@ describe("APNs/FCM wakeups are bounded per window, with one trailing wakeup (#24
 
     // The leading wakeup is held in flight; a submit arrives mid-window, before it is accepted.
     await pinRelayClock(acct, T0);
-    const lead = SELF.fetch(`https://relay.allw.test/${acct}/requests`, {
+    const lead = exports.default.fetch(`https://relay.allw.test/${acct}/requests`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -350,7 +354,7 @@ describe("APNs/FCM wakeups are bounded per window, with one trailing wakeup (#24
       expect(sent).toEqual([rid("in-flight-lead")]);
     });
     await pinRelayClock(acct, T0 + 10_000);
-    const midWindow = await SELF.fetch(`https://relay.allw.test/${acct}/requests`, {
+    const midWindow = await exports.default.fetch(`https://relay.allw.test/${acct}/requests`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -362,7 +366,7 @@ describe("APNs/FCM wakeups are bounded per window, with one trailing wakeup (#24
         context_ciphertext: "eyJhbGciOiJFQ0RILUVTK0EyNTZLVyJ9.FAKE.JWE",
       }),
     });
-    expect(((await midWindow.json()) as { push_wakeups: number }).push_wakeups).toBe(0);
+    expect((await midWindow.json<{ push_wakeups: number }>()).push_wakeups).toBe(0);
 
     // The leading wakeup is accepted only now. It predates the mid-window submit, so it does not
     // cover it: the owed trailing wakeup survives.
@@ -464,7 +468,7 @@ describe("trailing-wakeup schema migration (#248)", () => {
   });
 
   it("a web-push wakeup owed before the migration survives it and still fires", async () => {
-    const fetcher = vi.fn<typeof fetch>(async () => new Response(null, { status: 201 }));
+    const fetcher = vi.fn<typeof fetch>(() => Promise.resolve(new Response(null, { status: 201 })));
     const webpush = new WebPushTransport({ vapid: await makeVapid(), fetcher, now: () => T0 });
     const acct = await account("migration", { webpush }, [
       { device_id: "dev-1", transport: "webpush", token: WEBPUSH_ENDPOINT },
@@ -514,7 +518,7 @@ describe("trailing-wakeup schema migration (#248)", () => {
 
     await alarmAt(acct, WINDOW_END);
     expect(fetcher).toHaveBeenCalledTimes(2);
-    expect(String(fetcher.mock.calls[1]?.[0])).toBe(WEBPUSH_ENDPOINT);
+    expect(urlOf(fetcher.mock.calls[1]?.[0])).toBe(WEBPUSH_ENDPOINT);
     expect(await trailingRows(acct)).toEqual([]);
   });
 });

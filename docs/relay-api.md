@@ -42,8 +42,16 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   §3). The router claims the whole `/.well-known` segment before account routing, so it never reaches an
   account; a leading `.` is outside the base64url alphabet account ids use, so it cannot collide with one.
   Every relay-level route, present or future, lives there.
-- **Auth.** `Authorization: Bearer <token>` (token = base64url, `^[A-Za-z0-9_-]+$`, ~43 chars). For
-  **WebSocket** upgrades (which can't easily set headers), pass `?auth=<token>` as a query param.
+- **Auth.** `Authorization: Bearer <token>` (token = base64url, `^[A-Za-z0-9_-]+$`, ~43 chars). Every
+  HTTP route takes the token **only** from this header. The `?auth=<token>` query form is accepted
+  only on the two **WebSocket** upgrade routes (`…/devices/{device_id}/connect` and
+  `…/requests/{request_id}/wait`), because browsers can't set headers on a WebSocket; elsewhere a
+  query token alone is **401** (#303). A token in a URL ends up in access, proxy and CDN logs, browser
+  history and `Referer`, so it is kept out of URLs everywhere else. When an `Authorization` header is
+  present it is the only credential considered, even on a WebSocket route: a wrong one is **403**, and
+  a malformed one or another scheme is **401**, whatever the query says. An empty or whitespace-only
+  `Authorization` header is dropped by the Workers runtime before the relay sees it, so it counts as
+  absent: on a WebSocket upgrade route, the `?auth=` token then applies.
   The relay stores only `SHA-256(token)`; the plaintext is returned **once** at issuance — cache it.
   Missing token ⇒ **401**; wrong/expired/cross-scope token ⇒ **403**.
 - **No existence answers before auth (#357).** A request id and a pairing code are each guarded by

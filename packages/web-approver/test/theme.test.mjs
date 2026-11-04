@@ -33,6 +33,17 @@ import { JSDOM } from "jsdom";
 
 const publicDir = new URL("../public/", import.meta.url).pathname;
 
+/** Poll `condition` until true; reject with a clear error once `timeoutMs` elapses. */
+async function waitFor(condition, what, timeoutMs = 10_000) {
+  const start = performance.now();
+  while (!condition()) {
+    if (performance.now() - start > timeoutMs) {
+      throw new Error(`timed out after ${timeoutMs} ms waiting for ${what}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 /**
  * Load `public/index.html` for real — real stylesheet fetch/parse and `theme.js` load
  * (`resources: "usable"`), real script execution (`runScripts: "dangerously"`) — with an injected
@@ -57,8 +68,16 @@ async function loadIndexHtml({ prefersDark }) {
       });
     },
   });
-  // Let the linked stylesheets finish loading before assertions run.
-  await new Promise((resolve) => setTimeout(resolve, 100));
+  // Wait (bounded) for the linked stylesheets and theme.js to finish loading, instead of a fixed sleep.
+  await waitFor(
+    () =>
+      dom.window.document.readyState === "complete" &&
+      dom.window
+        .getComputedStyle(dom.window.document.documentElement)
+        .getPropertyValue("--bg")
+        .trim() !== "",
+    "stylesheets and theme.js to load",
+  );
   return { dom, fireChange: (matches) => listeners.forEach((listener) => listener({ matches })) };
 }
 

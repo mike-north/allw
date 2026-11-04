@@ -16,7 +16,8 @@
  * @see https://www.rfc-editor.org/rfc/rfc8037 (EdDSA in JOSE)
  */
 
-import { SELF, env, runInDurableObject } from "cloudflare:test";
+import { runInDurableObject } from "cloudflare:test";
+import { env, exports } from "cloudflare:workers";
 import { describe, it, expect } from "vitest";
 import { AccountRelay } from "../src/index.js";
 import {
@@ -35,7 +36,7 @@ async function postStart(
   accountId: string,
   body: unknown,
 ): Promise<{ status: number; data: Record<string, unknown> }> {
-  const resp = await SELF.fetch(`http://relay.test/${accountId}/pairing/start`, {
+  const resp = await exports.default.fetch(`http://relay.test/${accountId}/pairing/start`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: typeof body === "string" ? body : JSON.stringify(body),
@@ -478,8 +479,8 @@ describe("pairing — state from before root binding is never adopted", () => {
     await seed(acct, device.sql, ...(await device.params()));
 
     expect((await postStart(acct, pairingStartBody(acct))).status).toBe(409);
-    const resp = await SELF.fetch(`http://relay.test/${acct}/devices`);
-    const listed = (await resp.json()) as { devices: { device_id: string }[] };
+    const resp = await exports.default.fetch(`http://relay.test/${acct}/devices`);
+    const listed = await resp.json<{ devices: { device_id: string }[] }>();
     expect(listed.devices.map((d) => d.device_id)).toEqual(["attacker-device"]);
   });
 
@@ -504,7 +505,7 @@ describe("pairing — state from before root binding is never adopted", () => {
     if (!pairing) throw new Error("missing pairing row fixture");
     await seed(acct, pairing.sql, ...(await pairing.params()));
 
-    const resp = await SELF.fetch(`http://relay.test/${acct}/pairing/complete`, {
+    const resp = await exports.default.fetch(`http://relay.test/${acct}/pairing/complete`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",

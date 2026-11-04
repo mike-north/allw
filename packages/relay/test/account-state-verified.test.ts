@@ -14,7 +14,8 @@
  * @see ../../../crates/allw-core/src/crypto.rs (`verify_account_state`)
  */
 
-import { SELF, env, runInDurableObject } from "cloudflare:test";
+import { runInDurableObject } from "cloudflare:test";
+import { env, exports } from "cloudflare:workers";
 import { describe, it, expect } from "vitest";
 import { AccountRelay } from "../src/index.js";
 import {
@@ -44,7 +45,7 @@ async function request(
   path: string,
   init: { method: "GET" | "POST"; body?: unknown; headers?: Record<string, string> },
 ): Promise<Result> {
-  const resp = await SELF.fetch(`https://relay.allw.test/${accountId}${path}`, {
+  const resp = await exports.default.fetch(`https://relay.allw.test/${accountId}${path}`, {
     method: init.method,
     headers: { "Content-Type": "application/json", ...init.headers },
     ...(init.body === undefined
@@ -73,7 +74,11 @@ async function bindRoot(accountId: string): Promise<{ code: string; pairing_auth
     body: pairingStartBody(accountId),
   });
   expect(status).toBe(201);
-  return data as { code: string; pairing_auth_token: string };
+  const { code, pairing_auth_token } = data;
+  if (typeof code !== "string" || typeof pairing_auth_token !== "string") {
+    throw new Error("pairing/start returned no code or pairing token");
+  }
+  return { code, pairing_auth_token };
 }
 
 /** Bind the root and enroll one device; returns its device token. */
@@ -85,7 +90,10 @@ async function enrollDevice(accountId: string): Promise<string> {
     headers: { Authorization: `Bearer ${start.pairing_auth_token}` },
   });
   expect(status).toBe(201);
-  return (data as { device_auth_token: string }).device_auth_token;
+  const { device_auth_token } = data;
+  if (typeof device_auth_token !== "string")
+    throw new Error("pairing/complete returned no device token");
+  return device_auth_token;
 }
 
 /** The stored verified rows, read directly from the Durable Object's SQLite. */

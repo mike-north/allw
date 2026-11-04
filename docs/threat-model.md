@@ -330,10 +330,20 @@ trust decision, and it lives in the core:
   summary is labelled as the agent's description and sits below the action heading. Whenever the hidden-character
   badge shows, the escaped character is visible on the card. When `raw` and the hash-bound argv diverge, the card
   heading is the argv form and a "raw and argv differ" alert shows, as on the CLI; the two approvers decide divergence
-  with the same rule, tested against one shared fixture. The card heading uses the CLI's headline precedence whatever
-  the surface (a file edit's summary, then `raw`, then the reconstructed argv, then `server :: tool`), so a record
-  that mixes substrates (a tool call that also carries `argv`) heads with the command on both; a second shared
-  fixture covers it.
+  with the same rule, tested against one shared fixture. Both approvers head a request the same way, pinned by a second
+  shared fixture. On a tool surface (`mcp_tool_call`, `agent_tool_call`) naming a tool or a server, the heading is
+  the tool identity (`server :: tool`, the tool alone, or `server :: (tool missing)`), never `raw`: there `raw` is the
+  caller's description (an OpenClaw plugin's prose, say), not what executes. It is shown labelled as the description
+  (CLI `Description:`, web `description:`), and the hash-bound `server` always has its own row. Each half of the
+  identity is shown bare only when it is printable ASCII with no `::` and nothing that would quote a command token;
+  otherwise it is single-quoted, so server `fs :: read_file` + tool `delete_all` and server `fs` + tool
+  `read_file :: delete_all` never look alike, and a non-ASCII lookalike of the separator can't fake a split.
+  Raw/argv divergence does not apply there; instead, a hash-bound bin/argv on a tool call is shown with an alert that
+  the call also carries a command (#321). On the CLI that command is repeated on an `Argv:` row directly under
+  `Deciding on:`, above the alert, because agent-controlled `params` can push the block's own `Argv:` row a screen or
+  more up. The alert fires whenever a tool call carries a command, even one that matches its `raw`; no in-repo
+  producer emits that shape ([policy-seam.md](./policy-seam.md) §The action record). Every other record heads with the
+  first of: a file edit's summary, `raw`, the reconstructed argv.
 - **Nothing on the web card or the audit receipt is clipped at any width.** Every value wraps
   (`overflow-wrap: anywhere`) and nothing is hidden behind `overflow: hidden` or a sideways scroll. The card's grid
   track is `minmax(0, 1fr)`, and the receipt's detail pane sets `min-width: 0`, so one long token cannot widen the page
@@ -614,6 +624,9 @@ attestation, audit records, hook/SDK fail-closed behavior, or enrollment.
       (`docs/relay-api.md` §4, #245).
 - [ ] Network failures, hung reads, refused connections, and malformed relay responses deny or expire, never allow.
 - [ ] Any new endpoint states who may call it and what authentication/authorization is required.
+- [ ] Bearer tokens stay out of URLs: HTTP routes read them only from the `Authorization` header. The
+      `?auth=` query form is accepted only on the WebSocket upgrade routes, where browsers cannot set headers
+      (`docs/relay-api.md` §1, #303). A new route never opts into it unless it is a WebSocket upgrade.
 - [ ] A token-guarded identifier (a request id, a pairing code) answers an unknown identifier exactly as a wrong
       token (401 / 403, same body); no route says "not found" before its credential check (`docs/relay-api.md` §1,
       #357).

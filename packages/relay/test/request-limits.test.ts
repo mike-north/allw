@@ -20,9 +20,10 @@
  * @see ../../../docs/contract.md §Invariants (fail-closed)
  */
 
-import { SELF, env, runInDurableObject } from "cloudflare:test";
+import { runInDurableObject } from "cloudflare:test";
+import { env, exports } from "cloudflare:workers";
 import { describe, it, expect, vi } from "vitest";
-import { AccountRelay, type Env } from "../src/index.js";
+import { AccountRelay } from "../src/index.js";
 import {
   DEFAULT_MAX_REQUEST_TTL_MS,
   MAX_CONTEXT_CIPHERTEXT_BYTES,
@@ -70,7 +71,7 @@ function relayUrl(accountId: string, subPath: string): string {
 }
 
 async function submitRaw(accountId: string, body: BodyInit): Promise<Response> {
-  return SELF.fetch(relayUrl(accountId, "/requests"), {
+  return exports.default.fetch(relayUrl(accountId, "/requests"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body,
@@ -82,7 +83,7 @@ async function submit(
   body: unknown,
 ): Promise<{ status: number; error: string | undefined }> {
   const resp = await submitRaw(accountId, JSON.stringify(body));
-  const data = (await resp.json()) as { error?: string };
+  const data = await resp.json<{ error?: string }>();
   return { status: resp.status, error: data.error };
 }
 
@@ -94,7 +95,7 @@ async function freshAccount(name: string): Promise<string> {
   return acct;
 }
 
-function stubFor(accountId: string): DurableObjectStub {
+function stubFor(accountId: string): DurableObjectStub<AccountRelay> {
   return env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
 }
 
@@ -262,7 +263,7 @@ describe("POST /requests body size", () => {
 
   it("413 through the Worker for a Content-Length past the safe-integer range", async () => {
     const acct = await freshAccount("body-length-overflow");
-    const resp = await SELF.fetch(relayUrl(acct, "/requests"), {
+    const resp = await exports.default.fetch(relayUrl(acct, "/requests"), {
       method: "POST",
       headers: { "Content-Type": "application/json", "Content-Length": "99999999999999999999" },
       body: "{}",
@@ -424,23 +425,21 @@ describe("POST /requests expires_at horizon", () => {
     ).toBe(400);
   });
 
-  it("the Durable Object reads MAX_REQUEST_TTL_MS from its env", () => {
-    // Construct directly with a stub state so the env → horizon wiring is checked end to end.
-    const ctx = {
-      storage: {
-        sql: { exec: () => [] },
-        transactionSync: (fn: () => unknown) => fn(),
-        deleteAlarm: () => Promise.resolve(),
-        setAlarm: () => Promise.resolve(),
+  it("the Durable Object reads MAX_REQUEST_TTL_MS from its env", async () => {
+    // Construct directly over the runtime's own state (the base class needs a real one) so the
+    // env → horizon wiring is checked end to end. These extra instances are not side-effect free:
+    // each runs `initSchema` and arms alarms against that account's real storage (both idempotent).
+    await runInDurableObject(
+      stubFor("acct-ttl-env"),
+      (_instance: AccountRelay, state: DurableObjectState) => {
+        const relay = new AccountRelay(state, { ...env, MAX_REQUEST_TTL_MS: "123456" });
+        expect(relay["maxRequestTtlMs"]).toBe(123_456);
+        // The var unset (omitted, not `undefined`: `exactOptionalPropertyTypes`) falls back to the default.
+        const { MAX_REQUEST_TTL_MS: _unset, ...envWithoutTtl } = { ...env };
+        const fallback = new AccountRelay(state, envWithoutTtl);
+        expect(fallback["maxRequestTtlMs"]).toBe(DEFAULT_MAX_REQUEST_TTL_MS);
       },
-      waitUntil: () => undefined,
-    } as unknown as DurableObjectState;
-    const relay = new AccountRelay(ctx, { ...env, MAX_REQUEST_TTL_MS: "123456" } as Env);
-    expect(relay["maxRequestTtlMs"]).toBe(123_456);
-    // The var unset (omitted, not `undefined`: `exactOptionalPropertyTypes`) falls back to the default.
-    const { MAX_REQUEST_TTL_MS: _unset, ...envWithoutTtl } = { ...env } as Env;
-    const fallback = new AccountRelay(ctx, envWithoutTtl);
-    expect(fallback["maxRequestTtlMs"]).toBe(DEFAULT_MAX_REQUEST_TTL_MS);
+    );
   });
 
   it("parseMaxRequestTtlMs: unset uses the default; invalid values fall back to it", () => {
@@ -635,21 +634,24 @@ describe("terminal transitions blank the stored envelope", () => {
       JSON.stringify(envelope(rid("req-blank-ret"), { context_ciphertext: BIG })),
     );
     expect(resp.status).toBe(202);
-    const { request_auth_token: token } = (await resp.json()) as { request_auth_token: string };
+    const { request_auth_token: token } = await resp.json<{ request_auth_token: string }>();
     const auth = { Authorization: `Bearer ${token}` };
 
-    const retract = await SELF.fetch(relayUrl(acct, `/requests/${rid("req-blank-ret")}/retract`), {
-      method: "POST",
-      headers: auth,
-    });
+    const retract = await exports.default.fetch(
+      relayUrl(acct, `/requests/${rid("req-blank-ret")}/retract`),
+      {
+        method: "POST",
+        headers: auth,
+      },
+    );
     expect(retract.status).toBe(200);
     expect(await storedEnvelopes(acct)).toEqual({ [rid("req-blank-ret")]: "" });
 
-    const poll = await SELF.fetch(relayUrl(acct, `/requests/${rid("req-blank-ret")}`), {
+    const poll = await exports.default.fetch(relayUrl(acct, `/requests/${rid("req-blank-ret")}`), {
       headers: auth,
     });
     expect(poll.status).toBe(200);
-    expect(((await poll.json()) as { status: string }).status).toBe("retracted");
+    expect((await poll.json<{ status: string }>()).status).toBe("retracted");
   });
 
   it("the sweep blanks terminal rows stored before envelopes were blanked", async () => {
@@ -710,7 +712,7 @@ describe("pairing body size caps", () => {
   }
 
   async function postRaw(acct: string, subPath: string, body: string, headers = {}) {
-    return SELF.fetch(relayUrl(acct, subPath), {
+    return exports.default.fetch(relayUrl(acct, subPath), {
       method: "POST",
       headers: { "Content-Type": "application/json", ...headers },
       body,
@@ -737,7 +739,7 @@ describe("pairing body size caps", () => {
   async function startedPairing(acct: string): Promise<{ code: string; token: string }> {
     const resp = await postRaw(acct, "/pairing/start", JSON.stringify(pairingStartBody(acct)));
     expect(resp.status).toBe(201);
-    const data = (await resp.json()) as { code: string; pairing_auth_token: string };
+    const data = await resp.json<{ code: string; pairing_auth_token: string }>();
     return { code: data.code, token: data.pairing_auth_token };
   }
 

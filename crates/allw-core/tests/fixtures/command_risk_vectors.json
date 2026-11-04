@@ -1,0 +1,389 @@
+{
+  "description": "Shared Rust <-> WASM vectors for command risk classification on the program that actually runs (issue #268). Expected values are derived by hand from the rule in crates/allw-core/src/command/risk.rs and docs/policy-seam.md; bin is always argv[0] (unchanged by #268). Append-only.",
+  "cases": [
+    {
+      "command": "FOO=1 git push --force origin main",
+      "risk": "high",
+      "bin": "FOO=1",
+      "why": "assignment skipped; git push with a force flag is High"
+    },
+    {
+      "command": "X=1 rm -rf ~",
+      "risk": "high",
+      "bin": "X=1",
+      "why": "assignment skipped; rm recursive+force is High"
+    },
+    {
+      "command": "A=1 B=2 dd if=/dev/zero of=/dev/sda",
+      "risk": "critical",
+      "bin": "A=1",
+      "why": "both assignments skipped; dd is Critical"
+    },
+    {
+      "command": "env FOO=1 rm -rf ~",
+      "risk": "high",
+      "bin": "env",
+      "why": "env wraps an assignment + rm -rf: High"
+    },
+    {
+      "command": "env rm -rf ~",
+      "risk": "high",
+      "bin": "env",
+      "why": "env is Low alone but wraps rm -rf: High"
+    },
+    {
+      "command": "/usr/bin/env rm -rf ~",
+      "risk": "high",
+      "bin": "/usr/bin/env",
+      "why": "wrapper matched by basename"
+    },
+    {
+      "command": "command rm -rf ~",
+      "risk": "high",
+      "bin": "command",
+      "why": "command wraps rm -rf"
+    },
+    {
+      "command": "nice rm -rf ~",
+      "risk": "high",
+      "bin": "nice",
+      "why": "nice wraps rm -rf"
+    },
+    {
+      "command": "nice -n 10 rm -rf ~",
+      "risk": "high",
+      "bin": "nice",
+      "why": "option value 10 is a candidate too; rm -rf still found"
+    },
+    {
+      "command": "exec rm -rf ~",
+      "risk": "high",
+      "bin": "exec",
+      "why": "exec wraps rm -rf"
+    },
+    {
+      "command": "time rm -rf ~",
+      "risk": "high",
+      "bin": "time",
+      "why": "time wraps rm -rf"
+    },
+    {
+      "command": "nohup rm -rf ~",
+      "risk": "high",
+      "bin": "nohup",
+      "why": "nohup wraps rm -rf"
+    },
+    {
+      "command": "timeout 5 git push -f origin main",
+      "risk": "high",
+      "bin": "timeout",
+      "why": "timeout wraps a force push"
+    },
+    {
+      "command": "xargs rm -rf",
+      "risk": "high",
+      "bin": "xargs",
+      "why": "xargs wraps rm -rf"
+    },
+    {
+      "command": "sudo dd if=/dev/zero of=/dev/sda",
+      "risk": "critical",
+      "bin": "sudo",
+      "why": "sudo is High but wraps dd: Critical"
+    },
+    {
+      "command": "sudo -u root env X=1 rm -rf /",
+      "risk": "high",
+      "bin": "sudo",
+      "why": "nested wrappers and an assignment"
+    },
+    {
+      "command": "sh -c 'rm -rf ~'",
+      "risk": "high",
+      "bin": "sh",
+      "why": "sh -c command string is classified"
+    },
+    {
+      "command": "bash -c 'git push --force'",
+      "risk": "high",
+      "bin": "bash",
+      "why": "bash -c command string is classified"
+    },
+    {
+      "command": "bash -lc 'dd if=/dev/zero of=/dev/sda'",
+      "risk": "critical",
+      "bin": "bash",
+      "why": "combined -lc carries -c"
+    },
+    {
+      "command": "env",
+      "risk": "low",
+      "bin": "env",
+      "why": "negative: env alone (prints the environment) stays Low"
+    },
+    {
+      "command": "env -i",
+      "risk": "low",
+      "bin": "env",
+      "why": "negative: flags after a wrapper are not wrapped programs"
+    },
+    {
+      "command": "FOO=bar",
+      "risk": "medium",
+      "bin": "FOO=bar",
+      "why": "negative: a bare assignment is Medium, as before"
+    },
+    {
+      "command": "X=1 ls",
+      "risk": "medium",
+      "bin": "X=1",
+      "why": "negative: an assignment never classifies below Medium (LD_PRELOAD, PATH, ...)"
+    },
+    {
+      "command": "1FOO=1 rm -rf ~",
+      "risk": "medium",
+      "bin": "1FOO=1",
+      "why": "negative: not a valid NAME, so it is the program itself, not an assignment"
+    },
+    {
+      "command": "nice ls",
+      "risk": "medium",
+      "bin": "nice",
+      "why": "negative: a wrapper never lowers its own tier"
+    },
+    {
+      "command": "bash script.sh",
+      "risk": "medium",
+      "bin": "bash",
+      "why": "negative: without -c the argument is a script path, not a command string"
+    },
+    {
+      "command": "sh -c 'echo \"unterminated'",
+      "risk": "high",
+      "bin": "sh",
+      "why": "an unterminated -c string is High: bash runs the lines before the syntax error, and the rest can't be read"
+    },
+    {
+      "command": "git push origin main",
+      "risk": "medium",
+      "bin": "git",
+      "why": "negative: unprefixed baseline unchanged"
+    },
+    {
+      "command": "rm -rf ~",
+      "risk": "high",
+      "bin": "rm",
+      "why": "negative: unprefixed baseline unchanged"
+    },
+    {
+      "command": "X=/bin/dd ls",
+      "risk": "critical",
+      "bin": "X=/bin/dd",
+      "why": "negative: never lower than the argv[0]-only classification (basename of X=/bin/dd is dd)"
+    },
+    {
+      "command": "X+=1 rm -rf ~",
+      "risk": "high",
+      "bin": "X+=1",
+      "why": "X+=1 is an assignment prefix (bash append): rm -rf ~ runs"
+    },
+    {
+      "command": "A[0]=1 rm -rf ~",
+      "risk": "high",
+      "bin": "A[0]=1",
+      "why": "A[0]=1 is an array-element assignment prefix: rm -rf ~ runs"
+    },
+    {
+      "command": "env -S 'rm -rf ~'",
+      "risk": "high",
+      "bin": "env",
+      "why": "env -S splits its value into a command: rm -rf ~"
+    },
+    {
+      "command": "env -S'rm -rf ~'",
+      "risk": "high",
+      "bin": "env",
+      "why": "env -S with an attached value: rm -rf ~"
+    },
+    {
+      "command": "env -iS'rm -rf ~'",
+      "risk": "high",
+      "bin": "env",
+      "why": "-S inside a short-flag bundle: rm -rf ~"
+    },
+    {
+      "command": "env --split-string='rm -rf ~'",
+      "risk": "high",
+      "bin": "env",
+      "why": "--split-string=VALUE: rm -rf ~"
+    },
+    {
+      "command": "env ls",
+      "risk": "medium",
+      "bin": "env",
+      "why": "env running a program is never Low"
+    },
+    {
+      "command": "sh -c 'true; rm -rf ~'",
+      "risk": "high",
+      "bin": "sh",
+      "why": "the -c string is a full command line: its second command is rm -rf ~"
+    },
+    {
+      "command": "bash -o pipefail -c 'ls | dd if=/dev/zero of=/dev/sda'",
+      "risk": "critical",
+      "bin": "bash",
+      "why": "-c after other options; the pipeline runs dd"
+    },
+    {
+      "command": "fish -c 'rm -rf ~'",
+      "risk": "high",
+      "bin": "fish",
+      "why": "fish -c runs its string"
+    },
+    {
+      "command": "tcsh -c 'rm -rf ~'",
+      "risk": "high",
+      "bin": "tcsh",
+      "why": "tcsh -c runs its string"
+    },
+    {
+      "command": "su -c 'dd if=/dev/zero of=/dev/sda'",
+      "risk": "critical",
+      "bin": "su",
+      "why": "su -c runs its string: dd"
+    },
+    {
+      "command": "pwsh -Command 'dd if=/dev/zero of=/dev/sda'",
+      "risk": "critical",
+      "bin": "pwsh",
+      "why": "pwsh -Command runs its string"
+    },
+    {
+      "command": "pwsh -EncodedCommand ZABkAA==",
+      "risk": "high",
+      "bin": "pwsh",
+      "why": "an encoded PowerShell command can't be read: High"
+    },
+    {
+      "command": "builtin eval 'rm -rf ~'",
+      "risk": "high",
+      "bin": "builtin",
+      "why": "builtin runs eval, which runs rm -rf ~"
+    },
+    {
+      "command": "exec -a NAME rm -rf ~",
+      "risk": "high",
+      "bin": "exec",
+      "why": "exec -a NAME runs rm -rf ~"
+    },
+    {
+      "command": "busybox rm -rf ~",
+      "risk": "high",
+      "bin": "busybox",
+      "why": "busybox runs the rm applet"
+    },
+    {
+      "command": "find . -exec rm -rf {} +",
+      "risk": "high",
+      "bin": "find",
+      "why": "find -exec runs rm -rf"
+    },
+    {
+      "command": "find . -execdir rm -rf {} ;",
+      "risk": "high",
+      "bin": "find",
+      "why": "find -execdir runs rm -rf"
+    },
+    {
+      "command": "xargs sh -c 'rm -rf ~'",
+      "risk": "high",
+      "bin": "xargs",
+      "why": "xargs runs sh -c, which runs rm -rf ~"
+    },
+    {
+      "command": "gtimeout 5 rm -rf ~",
+      "risk": "high",
+      "bin": "gtimeout",
+      "why": "GNU-prefixed timeout runs rm -rf ~"
+    },
+    {
+      "command": "caffeinate -i rm -rf ~",
+      "risk": "high",
+      "bin": "caffeinate",
+      "why": "caffeinate runs rm -rf ~"
+    },
+    {
+      "command": "arch -arm64 rm -rf ~",
+      "risk": "high",
+      "bin": "arch",
+      "why": "arch runs rm -rf ~"
+    },
+    {
+      "command": "script -q /dev/null rm -rf ~",
+      "risk": "high",
+      "bin": "script",
+      "why": "script runs rm -rf ~"
+    },
+    {
+      "command": "chroot / rm -rf ~",
+      "risk": "high",
+      "bin": "chroot",
+      "why": "chroot runs rm -rf ~"
+    },
+    {
+      "command": "flock /tmp/lock rm -rf ~",
+      "risk": "high",
+      "bin": "flock",
+      "why": "flock runs rm -rf ~"
+    },
+    {
+      "command": "watch 'rm -rf ~'",
+      "risk": "high",
+      "bin": "watch",
+      "why": "watch runs its whitespace word as a command line"
+    },
+    {
+      "command": "ssh host 'rm -rf ~'",
+      "risk": "high",
+      "bin": "ssh",
+      "why": "ssh runs its command words on the remote host"
+    },
+    {
+      "command": "doas ls",
+      "risk": "high",
+      "bin": "doas",
+      "why": "doas escalates privilege like sudo"
+    },
+    {
+      "command": "run0 ls",
+      "risk": "high",
+      "bin": "run0",
+      "why": "run0 escalates privilege like sudo"
+    },
+    {
+      "command": "pkexec ls",
+      "risk": "high",
+      "bin": "pkexec",
+      "why": "pkexec escalates privilege like sudo"
+    },
+    {
+      "command": "eval eval eval eval dd if=/dev/zero of=/dev/sda",
+      "risk": "critical",
+      "bin": "eval",
+      "why": "eval nested 4 deep (the limit) is analyzed: dd"
+    },
+    {
+      "command": "eval eval eval eval eval dd if=/dev/zero of=/dev/sda",
+      "risk": "high",
+      "bin": "eval",
+      "why": "eval nested past the limit is High, not analyzed"
+    },
+    {
+      "command": "bash script.sh",
+      "risk": "medium",
+      "bin": "bash",
+      "why": "negative: a shell running a script file keeps its own tier"
+    }
+  ]
+}

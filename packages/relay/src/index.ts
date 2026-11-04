@@ -28,6 +28,7 @@
  * `pairing/complete` likewise refuses (403) on an unbound account.
  */
 
+import { DurableObject } from "cloudflare:workers";
 import { AlarmMultiplexer } from "./alarms.js";
 import { matchesStoredHash, timingSafeEqual } from "./auth-token.js";
 import {
@@ -81,7 +82,7 @@ import { accountSubPathSegments, resolveAccountRoute, routeParam } from "./route
 import { handleWellKnown, isWellKnownPath } from "./well-known.js";
 
 export interface Env extends VapidEnv, CorsEnv {
-  readonly ACCOUNT: DurableObjectNamespace;
+  readonly ACCOUNT: DurableObjectNamespace<AccountRelay>;
   readonly APNS_ENDPOINT?: string;
   readonly APNS_TOPIC?: string;
   readonly APNS_BEARER_TOKEN?: string;
@@ -287,10 +288,30 @@ async function hashAuthToken(token: string): Promise<string> {
   return base64UrlEncode(new Uint8Array(digest));
 }
 
-function bearerToken(request: Request): string | null {
-  const auth = request.headers.get("Authorization") ?? "";
-  const match = /^Bearer ([A-Za-z0-9_-]+)$/.exec(auth);
-  if (match) return match[1] ?? null;
+/**
+ * Where a route accepts its bearer token from.
+ *
+ * - `header`: only `Authorization: Bearer …`. This is every HTTP route.
+ * - `header-or-websocket-query`: also `?auth=<token>`, but only on a WebSocket upgrade request and
+ *   only when no `Authorization` header is present. Browsers cannot set headers on a WebSocket, so
+ *   the two WebSocket routes (`…/connect`, `…/wait`) need the query form.
+ *
+ * A token in a URL leaks where a header does not: access, proxy and CDN logs, browser history,
+ * `Referer`, error reports. So the query form exists only where it is needed (#303).
+ */
+type BearerSource = "header" | "header-or-websocket-query";
+
+/**
+ * The bearer token a request presents for a route accepting `source`, or `null` if none.
+ * An `Authorization` header, when present, is the only credential considered. The query is never
+ * a fallback for a header that is malformed or of another scheme.
+ */
+function bearerToken(request: Request, source: BearerSource): string | null {
+  const auth = request.headers.get("Authorization");
+  if (auth !== null) {
+    return /^Bearer ([A-Za-z0-9_-]+)$/.exec(auth)?.[1] ?? null;
+  }
+  if (source !== "header-or-websocket-query" || !isWebSocketUpgrade(request)) return null;
   const queryToken = new URL(request.url).searchParams.get("auth");
   return queryToken && /^[A-Za-z0-9_-]+$/.test(queryToken) ? queryToken : null;
 }
@@ -569,7 +590,8 @@ function parseSurfaceId(request: Request): string | null | undefined {
  * so the one-per-window bound holds across it (#319). Removing the token removes its claim too.
  */
 class DevicePushTokenClaimStore implements WakeupClaimStore {
-  private readonly sql: SqlStorage;
+  /** Assigned at construction; mutable so tests can inject through checked element access. */
+  private sql: SqlStorage;
 
   constructor(sql: SqlStorage) {
     this.sql = sql;
@@ -620,9 +642,9 @@ class DevicePushTokenClaimStore implements WakeupClaimStore {
  * account root itself (a root-signed authorization verified by the core), and the first verified
  * root is bound in `account_meta`.
  */
-export class AccountRelay implements DurableObject {
-  private readonly sql: SqlStorage;
-  private readonly ctx: DurableObjectState;
+export class AccountRelay extends DurableObject<Env> {
+  /** Assigned at construction; mutable so tests can inject through checked element access. */
+  private sql: SqlStorage;
   /**
    * Assigned only at construction in production; mutable so tests can inject through checked
    * element access.
@@ -659,7 +681,7 @@ export class AccountRelay implements DurableObject {
   private readonly alarms: AlarmMultiplexer<RelayAlarmPurpose>;
 
   constructor(ctx: DurableObjectState, env: Env) {
-    this.ctx = ctx;
+    super(ctx, env);
     this.sql = ctx.storage.sql;
     // The Web Push TTL is derived from the same injectable clock as the submit limits.
     this.pushTransports = buildPushTransports(env, () => this.now());
@@ -672,7 +694,7 @@ export class AccountRelay implements DurableObject {
     this.alarms = new AlarmMultiplexer(ctx.storage, () => this.now());
     // On reactivation, restore every alarm purpose from its persisted rows, in case the previous
     // isolate exited after a write but before the scheduled alarm was durably restored.
-    this.ctx.waitUntil(this.armExpiryAlarm().then(() => this.armTrailingWakeupAlarm()));
+    this.ctx.waitUntil(this.#armExpiryAlarm().then(() => this.#armTrailingWakeupAlarm()));
   }
 
   // ---------------------------------------------------------------------------
@@ -684,7 +706,7 @@ export class AccountRelay implements DurableObject {
    * the older `(device_id, token)` key. Every owed row is copied, so no wakeup is lost. Runs after
    * the column migrations (so `transport` exists) in one transaction; a no-op once rekeyed.
    */
-  private rekeyTrailingWakeupsByTransport(): void {
+  #rekeyTrailingWakeupsByTransport(): void {
     const keyColumns = [
       ...this.sql.exec<{ name: string; pk: number }>(`PRAGMA table_info(webpush_trailing_wakeup)`),
     ]
@@ -718,7 +740,7 @@ export class AccountRelay implements DurableObject {
     });
   }
 
-  private initSchema(): void {
+  private readonly initSchema = (): void => {
     // SECURITY: These tables store ONLY public keys + routing/lifecycle metadata.
     // Private keys and plaintext context MUST NEVER appear here (zero-knowledge invariant).
     this.sql.exec(`
@@ -861,7 +883,7 @@ export class AccountRelay implements DurableObject {
         // Fresh schemas already have the column; older local DO state is migrated above.
       }
     }
-    this.rekeyTrailingWakeupsByTransport();
+    this.#rekeyTrailingWakeupsByTransport();
     this.sql.exec(`
       UPDATE request
       SET terminal_at = expires_at
@@ -907,17 +929,23 @@ export class AccountRelay implements DurableObject {
       `CREATE INDEX IF NOT EXISTS request_pending_by_expiry
        ON request (expires_at) WHERE status = 'pending'`,
     );
-  }
+  };
 
   // ---------------------------------------------------------------------------
   // Durable Object fetch handler
   // ---------------------------------------------------------------------------
 
-  async fetch(request: Request): Promise<Response> {
+  override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     // The Worker forwards the full path; its first segment is the account id, and every route
     // matches the rest exactly (`routes.ts`, #302).
     const accountId = url.pathname.split("/")[1] ?? "";
+    // The path's account id must be this object's own identity. The Worker routes by that id, but a
+    // stub's `fetch` takes any URL, so a mismatched request would otherwise be answered as the
+    // path's account over this object's storage (#373).
+    if (accountId === "" || !this.ctx.id.equals(this.env.ACCOUNT.idFromName(accountId))) {
+      return json({ error: "not found" }, 404);
+    }
     const method = request.method.toUpperCase();
     const route = resolveAccountRoute(method, accountSubPathSegments(url.pathname));
 
@@ -931,44 +959,44 @@ export class AccountRelay implements DurableObject {
     switch (route.name) {
       // POST /pairing/start — root-signed; binds the account root on first success.
       case "pairingStart":
-        return this.handlePairingStart(request, accountId);
+        return this.#handlePairingStart(request, accountId);
 
       // POST /pairing/complete
       case "pairingComplete":
-        return this.handlePairingComplete(request);
+        return this.#handlePairingComplete(request);
 
       // POST /actors
       case "actorEnroll":
-        return this.handleActorEnroll(request);
+        return this.#handleActorEnroll(request);
 
       // GET /actors
       case "actorList":
-        return this.handleActorList();
+        return this.#handleActorList();
 
       // POST /account-states — anyone may publish; only documents verified against the bound
       // root are stored.
       case "accountStatePublish":
-        return this.handleAccountStatePublish(request, accountId);
+        return this.#handleAccountStatePublish(request, accountId);
 
       // GET /account-states — unauthenticated: the documents are public and relay-verified.
       case "accountStateList":
-        return this.handleAccountStateList();
+        return this.#handleAccountStateList();
 
       // GET /devices
       case "deviceList":
-        return this.handleDeviceList();
+        return this.#handleDeviceList();
 
       // POST /devices/{device_id}/revoke
       case "deviceRevoke":
-        return this.handleDeviceRevoke(routeParam(params, "device_id"), request);
+        return this.#handleDeviceRevoke(routeParam(params, "device_id"), request);
 
       // PUT /devices/{device_id}/push-tokens — the device replaces its own push-token set.
       case "devicePushTokens":
-        return this.handleDevicePushTokens(routeParam(params, "device_id"), request);
+        return this.#handleDevicePushTokens(routeParam(params, "device_id"), request);
 
       // GET /devices/{device_id}/inbox — authenticated device polls its pending envelopes.
       case "deviceInbox":
-        return this.handleDeviceInbox(routeParam(params, "device_id"), request);
+        return this.#handleDeviceInbox(routeParam(params, "device_id"), request);
 
       // GET /devices/{device_id}/connect (WebSocket) — device presence + offline-queue flush.
       case "deviceConnect":
@@ -979,22 +1007,22 @@ export class AccountRelay implements DurableObject {
 
       // POST /requests — integrator submits an ApprovalRequest envelope (ciphertext + routing).
       case "requestSubmit":
-        return this.handleSubmit(request, accountId);
+        return this.#handleSubmit(request, accountId);
 
       // GET /requests/{request_id}/wait (WebSocket) — integrator awaits the verdict (pushed).
       case "requestWait":
         if (!isWebSocketUpgrade(request)) {
           return json({ error: "WebSocket upgrade required" }, 426);
         }
-        return this.handleIntegratorWait(routeParam(params, "request_id"), request);
+        return this.#handleIntegratorWait(routeParam(params, "request_id"), request);
 
       // GET /requests/{request_id} — integrator polls request status / fetches the verdict.
       case "requestGet":
-        return this.handleGetRequest(routeParam(params, "request_id"), request);
+        return this.#handleGetRequest(routeParam(params, "request_id"), request);
 
       // POST /requests/{request_id}/retract — integrator cancels its own pending request (#195).
       case "requestRetract":
-        return this.handleRetract(routeParam(params, "request_id"), request);
+        return this.#handleRetract(routeParam(params, "request_id"), request);
     }
   }
 
@@ -1010,11 +1038,12 @@ export class AccountRelay implements DurableObject {
    * on why it does not match. So a row without a stored hash, and an identifier with no row at all
    * ({@link unknownIdentifierAuthFailure}), answer exactly as a wrong token would (#357).
    */
-  private async authorizeStoredHash(
+  async #authorizeStoredHash(
     request: Request,
     storedHash: string | null | undefined,
+    source: BearerSource = "header",
   ): Promise<Response | null> {
-    const token = bearerToken(request);
+    const token = bearerToken(request, source);
     if (token === null) return authError(401);
     // A missing hash is a legacy/migration row, not proof of authorization. Fail closed and require
     // re-pairing or re-submission so no endpoint silently falls back to unauthenticated access.
@@ -1029,12 +1058,17 @@ export class AccountRelay implements DurableObject {
    * unauthenticated caller cannot learn whether the identifier exists (#357). No caller can hold a
    * valid token for a row that does not exist, so this never refuses a legitimate request.
    */
-  private async unknownIdentifierAuthFailure(request: Request): Promise<Response> {
-    return (await this.authorizeStoredHash(request, null)) ?? authError(403);
+  async #unknownIdentifierAuthFailure(
+    request: Request,
+    source: BearerSource = "header",
+  ): Promise<Response> {
+    // The same `source` as the route's real check, so a WebSocket route's `?auth=` token is read
+    // for an unknown identifier exactly as for a known one.
+    return (await this.#authorizeStoredHash(request, null, source)) ?? authError(403);
   }
 
-  private async authorizedDeviceId(request: Request): Promise<string | Response> {
-    const token = bearerToken(request);
+  async #authorizedDeviceId(request: Request): Promise<string | Response> {
+    const token = bearerToken(request, "header");
     if (token === null) return authError(401);
     const tokenHash = await hashAuthToken(token);
     const rows = [
@@ -1054,7 +1088,7 @@ export class AccountRelay implements DurableObject {
    * The account-root public key this Durable Object is bound to, or `null` before the first
    * verified root-signed pairing start. Root-authorized operations verify against this row.
    */
-  private boundRootPubkey(): string | null {
+  #boundRootPubkey(): string | null {
     const rows = [
       ...this.sql.exec<AccountMetaRow>(`SELECT root_pubkey FROM account_meta WHERE id = 1`),
     ];
@@ -1069,7 +1103,7 @@ export class AccountRelay implements DurableObject {
    * trusted); `verified_account_state` can only be written once a root is bound, so it is checked
    * here as defense in depth.
    */
-  private hasPreBindingState(): boolean {
+  #hasPreBindingState(): boolean {
     for (const table of ["device", "pairing", "actor", "verified_account_state"]) {
       if ([...this.sql.exec(`SELECT 1 FROM ${table} LIMIT 1`)].length > 0) return true;
     }
@@ -1096,7 +1130,7 @@ export class AccountRelay implements DurableObject {
    * On success the root is bound to the account (first time only) and a short pairing code plus its
    * pairing auth token are issued. See `docs/relay-api.md` §3 Pairing.
    */
-  private async handlePairingStart(request: Request, accountId: string): Promise<Response> {
+  async #handlePairingStart(request: Request, accountId: string): Promise<Response> {
     try {
       ensureCore();
     } catch (err) {
@@ -1147,9 +1181,9 @@ export class AccountRelay implements DurableObject {
 
     // Defense in depth: the id derives from the root, so a different bound root would need a
     // SHA-256 collision. Never let a second root act on an account regardless.
-    const boundRoot = this.boundRootPubkey();
+    const boundRoot = this.#boundRootPubkey();
     if (boundRoot !== null && boundRoot !== rootPubkey) return authError(403);
-    if (boundRoot === null && this.hasPreBindingState()) {
+    if (boundRoot === null && this.#hasPreBindingState()) {
       return json(
         {
           error:
@@ -1214,10 +1248,10 @@ export class AccountRelay implements DurableObject {
    *        invalid / over-budget push_tokens
    * - 500: the relay's verification core failed to initialize
    */
-  private async handlePairingComplete(request: Request): Promise<Response> {
+  async #handlePairingComplete(request: Request): Promise<Response> {
     // Every pairing row this relay issues is created together with (or after) the root bind, so a
     // code on an unbound account is a pre-binding leftover: never let it enroll a device.
-    if (this.boundRootPubkey() === null) {
+    if (this.#boundRootPubkey() === null) {
       return json({ error: "account root not bound; start a root-signed pairing first" }, 403);
     }
 
@@ -1251,8 +1285,8 @@ export class AccountRelay implements DurableObject {
     const pairing = rows[0];
     // An unknown code answers exactly as a wrong pairing token does (#357): existence is never
     // revealed before the token is checked.
-    if (!pairing) return this.unknownIdentifierAuthFailure(request);
-    const authFailure = await this.authorizeStoredHash(request, pairing.auth_token_hash);
+    if (!pairing) return this.#unknownIdentifierAuthFailure(request);
+    const authFailure = await this.#authorizeStoredHash(request, pairing.auth_token_hash);
     if (authFailure) return authFailure;
     if (pairing.used !== 0) return json({ error: "pairing code already used" }, 409);
     if (this.now() > pairing.expires_at) {
@@ -1264,7 +1298,7 @@ export class AccountRelay implements DurableObject {
     const deviceAuthTokenHash = await hashAuthToken(deviceAuthToken);
     const now = this.now();
     // Checked after the last await so the count and the inserts below are one atomic step.
-    const pushTokenBudget = this.pushTokenBudgetFailure(pushTokens.length);
+    const pushTokenBudget = this.#pushTokenBudgetFailure(pushTokens.length);
     if (pushTokenBudget) return pushTokenBudget;
 
     // Mark the code as used and insert the device record atomically.
@@ -1303,8 +1337,8 @@ export class AccountRelay implements DurableObject {
    * Enrolls a machine/agent actor key. Duplicate actor_id is rejected with 409.
    * SECURITY: only the public key is stored (zero-knowledge invariant).
    */
-  private async handleActorEnroll(request: Request): Promise<Response> {
-    const authorizedDevice = await this.authorizedDeviceId(request);
+  async #handleActorEnroll(request: Request): Promise<Response> {
+    const authorizedDevice = await this.#authorizedDeviceId(request);
     if (authorizedDevice instanceof Response) return authorizedDevice;
 
     const body = await parseJsonBody(request);
@@ -1350,7 +1384,7 @@ export class AccountRelay implements DurableObject {
    * Lists all enrolled devices for this account.
    * Returns only public key material + metadata (zero-knowledge invariant holds).
    */
-  private handleDeviceList(): Response {
+  #handleDeviceList(): Response {
     const rows = [
       ...this.sql.exec<DeviceRow>(
         `SELECT device_id, pubkey, label, created_at FROM device ORDER BY created_at ASC`,
@@ -1375,7 +1409,7 @@ export class AccountRelay implements DurableObject {
    * Lists all enrolled actor keys for this account.
    * Returns only public key material + metadata (zero-knowledge invariant holds).
    */
-  private handleActorList(): Response {
+  #handleActorList(): Response {
     const rows = [
       ...this.sql.exec<ActorRow>(
         `SELECT actor_id, pubkey, label, created_at FROM actor ORDER BY created_at ASC`,
@@ -1394,7 +1428,7 @@ export class AccountRelay implements DurableObject {
   }
 
   /** The stored relay-verified account-state documents and their (shared) highest sequence. */
-  private verifiedAccountStates(): { states: string[]; sequence: number | null } {
+  #verifiedAccountStates(): { states: string[]; sequence: number | null } {
     const rows = [
       ...this.sql.exec<VerifiedAccountStateRow>(
         `SELECT state_jws, sequence FROM verified_account_state ORDER BY state_jws ASC`,
@@ -1427,7 +1461,7 @@ export class AccountRelay implements DurableObject {
    * On success the stored documents are replaced by the submitted documents at the highest verified
    * sequence. See `docs/relay-api.md` §3 Account state.
    */
-  private async handleAccountStatePublish(request: Request, accountId: string): Promise<Response> {
+  async #handleAccountStatePublish(request: Request, accountId: string): Promise<Response> {
     // A broken core must not surface as a 403 that blames the caller's documents.
     try {
       ensureCore();
@@ -1452,7 +1486,7 @@ export class AccountRelay implements DurableObject {
       return json({ error: "'max_sequence' must be a non-negative safe integer" }, 400);
     }
 
-    const boundRoot = this.boundRootPubkey();
+    const boundRoot = this.#boundRootPubkey();
     if (boundRoot === null) {
       return json(
         { error: "account root not bound; start a root-signed pairing for this account first" },
@@ -1487,7 +1521,7 @@ export class AccountRelay implements DurableObject {
       );
     }
 
-    const stored = this.verifiedAccountStates().sequence;
+    const stored = this.#verifiedAccountStates().sequence;
     if (stored !== null && highest <= stored) {
       return json(
         {
@@ -1523,8 +1557,8 @@ export class AccountRelay implements DurableObject {
    * them — #243). `max_sequence` is the highest verified sequence (0 when none is stored).
    * Consumers still verify the root signature themselves; the relay is not the trust anchor.
    */
-  private handleAccountStateList(): Response {
-    const { states, sequence } = this.verifiedAccountStates();
+  #handleAccountStateList(): Response {
+    const { states, sequence } = this.#verifiedAccountStates();
     return json({ account_states: states, max_sequence: sequence ?? 0 });
   }
 
@@ -1534,8 +1568,8 @@ export class AccountRelay implements DurableObject {
    *
    * Removes the device record. Returns 404 if the device is not enrolled.
    */
-  private async handleDeviceRevoke(deviceId: string, request: Request): Promise<Response> {
-    const authorizedDevice = await this.authorizedDeviceId(request);
+  async #handleDeviceRevoke(deviceId: string, request: Request): Promise<Response> {
+    const authorizedDevice = await this.#authorizedDeviceId(request);
     if (authorizedDevice instanceof Response) return authorizedDevice;
     const existing = [
       ...this.sql.exec<DeviceRow>(`SELECT device_id FROM device WHERE device_id = ?`, deviceId),
@@ -1579,8 +1613,8 @@ export class AccountRelay implements DurableObject {
    * The replace is a diff applied in one transaction: unchanged tokens keep their row (and
    * `created_at`), so repeating the same body is a no-op.
    */
-  private async handleDevicePushTokens(deviceId: string, request: Request): Promise<Response> {
-    const authorizedDevice = await this.authorizedDeviceId(request);
+  async #handleDevicePushTokens(deviceId: string, request: Request): Promise<Response> {
+    const authorizedDevice = await this.#authorizedDeviceId(request);
     if (authorizedDevice instanceof Response) return authorizedDevice;
     const body = await parseJsonBody(request);
     // Everything below is synchronous, so the device checks, budget, and writes are one atomic step.
@@ -1666,7 +1700,7 @@ export class AccountRelay implements DurableObject {
    * Auth: device bearer token (same token as `…/connect`).
    * Returns 404 if the device is not enrolled, 401/403 on auth failure.
    */
-  private async handleDeviceInbox(deviceId: string, request: Request): Promise<Response> {
+  async #handleDeviceInbox(deviceId: string, request: Request): Promise<Response> {
     const enrolled = [
       ...this.sql.exec<DeviceRow>(
         `SELECT device_id, auth_token_hash FROM device WHERE device_id = ?`,
@@ -1677,10 +1711,10 @@ export class AccountRelay implements DurableObject {
     if (!device) {
       return json({ error: "device not enrolled" }, 404);
     }
-    const authFailure = await this.authorizeStoredHash(request, device.auth_token_hash);
+    const authFailure = await this.#authorizeStoredHash(request, device.auth_token_hash);
     if (authFailure) return authFailure;
 
-    const pending = this.livePendingRequests(this.now());
+    const pending = this.#livePendingRequests(this.now());
 
     const envelopes = pending.map((p) => JSON.parse(p.envelope) as unknown);
     return json({ envelopes });
@@ -1700,7 +1734,10 @@ export class AccountRelay implements DurableObject {
    * `{ type: "retract", request_id }` (another surface resolved it).
    * Protocol (device → relay): `{ type: "verdict", request_id, verdict }` (signed decision).
    */
-  private async handleDeviceConnect(deviceId: string, request: Request): Promise<Response> {
+  private readonly handleDeviceConnect = async (
+    deviceId: string,
+    request: Request,
+  ): Promise<Response> => {
     const enrolled = [
       ...this.sql.exec<DeviceRow>(
         `SELECT device_id, auth_token_hash FROM device WHERE device_id = ?`,
@@ -1711,14 +1748,18 @@ export class AccountRelay implements DurableObject {
     if (!device) {
       return json({ error: "device not enrolled" }, 404);
     }
-    const authFailure = await this.authorizeStoredHash(request, device.auth_token_hash);
+    const authFailure = await this.#authorizeStoredHash(
+      request,
+      device.auth_token_hash,
+      "header-or-websocket-query",
+    );
     if (authFailure) return authFailure;
     const surfaceId = parseSurfaceId(request);
     if (surfaceId === null) {
       return json({ error: "surface_id must be 1-128 URL-safe identifier chars" }, 400);
     }
     const shouldFlushOfflineQueue =
-      surfaceId === undefined || !this.hasOpenSocketOnSurface(surfaceId);
+      surfaceId === undefined || !this.#hasOpenSocketOnSurface(surfaceId);
 
     const pair = new WebSocketPair();
     const client = pair[0];
@@ -1734,7 +1775,7 @@ export class AccountRelay implements DurableObject {
       // request is never re-pushed to a reconnecting device. (Submit fan-out needs no such guard —
       // `handleSubmit` rejects a request whose deadline has passed, so a freshly stored request is
       // always live.)
-      const pending = this.livePendingRequests(this.now());
+      const pending = this.#livePendingRequests(this.now());
       for (const p of pending) {
         trySendJson(server, {
           type: "request",
@@ -1745,7 +1786,7 @@ export class AccountRelay implements DurableObject {
     }
 
     return new Response(null, { status: 101, webSocket: client });
-  }
+  };
 
   /**
    * POST /requests
@@ -1764,10 +1805,10 @@ export class AccountRelay implements DurableObject {
    * - 413: the body exceeds `MAX_REQUEST_BODY_BYTES` (checked before parsing) or
    *        `context_ciphertext` exceeds `MAX_CONTEXT_CIPHERTEXT_BYTES`.
    */
-  private async handleSubmit(request: Request, accountId: string): Promise<Response> {
+  async #handleSubmit(request: Request, accountId: string): Promise<Response> {
     // No bound root ⇒ no device can have paired (#242), so nothing could ever decide this request.
     // Refuse before reading the body rather than store requests for accounts nobody owns.
-    if (this.boundRootPubkey() === null) return json({ error: "unknown account" }, 404);
+    if (this.#boundRootPubkey() === null) return json({ error: "unknown account" }, 404);
 
     // Size-check the body BEFORE parsing it: an unauthenticated caller must not make the relay
     // buffer or parse an arbitrarily large document.
@@ -1834,7 +1875,7 @@ export class AccountRelay implements DurableObject {
         400,
       );
     }
-    const createdAtFailure = this.createdAtFailure(createdAt, expiresAt, now);
+    const createdAtFailure = this.#createdAtFailure(createdAt, expiresAt, now);
     if (createdAtFailure !== null) return json({ error: createdAtFailure }, 400);
     const requestAuthToken = generateAuthToken();
     const requestAuthTokenHash = await hashAuthToken(requestAuthToken);
@@ -1863,17 +1904,17 @@ export class AccountRelay implements DurableObject {
       // Primary-key conflict: a concurrent submit with this id won the race → consistently a 409.
       return json({ error: "request already submitted" }, 409);
     }
-    await this.armExpiryAlarm();
+    await this.#armExpiryAlarm();
 
     const delivered = this.sendRequestToOneSocketPerSurface(id, envelope);
-    const { scheduled: pushWakeups, coalesced } = this.schedulePushWakeups(
+    const { scheduled: pushWakeups, coalesced } = this.#schedulePushWakeups(
       accountId,
       id,
       expiresAt,
     );
-    if (coalesced > 0) await this.armTrailingWakeupAlarm();
+    if (coalesced > 0) await this.#armTrailingWakeupAlarm();
 
-    return this.requestSubmitResponse(id, delivered, pushWakeups, requestAuthToken);
+    return this.#requestSubmitResponse(id, delivered, pushWakeups, requestAuthToken);
   }
 
   /**
@@ -1885,7 +1926,7 @@ export class AccountRelay implements DurableObject {
    * - no further back than the request horizon (`now - maxRequestTtlMs`);
    * - no further ahead than `MAX_CREATED_AT_SKEW_MS` (clock skew).
    */
-  private createdAtFailure(createdAt: number, expiresAt: number, now: number): string | null {
+  #createdAtFailure(createdAt: number, expiresAt: number, now: number): string | null {
     if (!Number.isInteger(createdAt)) return "'created_at' must be an integer (i64 ms)";
     if (createdAt > expiresAt) return "'created_at' is after 'expires_at'";
     if (createdAt < now - this.maxRequestTtlMs) {
@@ -1897,9 +1938,10 @@ export class AccountRelay implements DurableObject {
     return null;
   }
 
-  private async authorizeRequestRead(
+  async #authorizeRequestRead(
     requestId: string,
     request: Request,
+    source: BearerSource = "header",
   ): Promise<{ row: RequestRow; status: string } | Response> {
     const rows = [
       ...this.sql.exec<RequestRow>(
@@ -1912,16 +1954,16 @@ export class AccountRelay implements DurableObject {
     // An unknown id answers exactly as a wrong request token does (#357): existence is never
     // revealed before the token is checked. A request swept after its retention window answers its
     // old token the same way.
-    if (!req) return this.unknownIdentifierAuthFailure(request);
-    const authFailure = await this.authorizeStoredHash(request, req.auth_token_hash);
+    if (!req) return this.#unknownIdentifierAuthFailure(request, source);
+    const authFailure = await this.#authorizeStoredHash(request, req.auth_token_hash, source);
     if (authFailure) return authFailure;
     return {
       row: req,
-      status: this.expireIfDue(req, this.now()),
+      status: this.#expireIfDue(req, this.now()),
     };
   }
 
-  private requestSubmitResponse(
+  #requestSubmitResponse(
     id: string,
     delivered: number,
     pushWakeups: number,
@@ -1964,7 +2006,7 @@ export class AccountRelay implements DurableObject {
    * were coalesced. When the second is non-zero the caller arms the alarm with
    * {@link armTrailingWakeupAlarm}.
    */
-  private schedulePushWakeups(
+  #schedulePushWakeups(
     accountId: string,
     requestId: string,
     expiresAt: number,
@@ -2024,8 +2066,8 @@ export class AccountRelay implements DurableObject {
     });
     // The just-stored request is pending, so the latest pending deadline is never before its own
     // (stored with `created_at = now`, its deadline is `expiresAt`: submit refused anything later).
-    const wakeupExpiresAt = Math.max(expiresAt, this.latestPendingRequest(now)?.deadline ?? 0);
-    this.startPushFanOut(tokens, claimedKeys, accountId, requestId, wakeupExpiresAt, now);
+    const wakeupExpiresAt = Math.max(expiresAt, this.#latestPendingRequest(now)?.deadline ?? 0);
+    this.#startPushFanOut(tokens, claimedKeys, accountId, requestId, wakeupExpiresAt, now);
     return { scheduled: tokens.length, coalesced };
   }
 
@@ -2033,7 +2075,7 @@ export class AccountRelay implements DurableObject {
    * Start one background fan-out under `waitUntil`, then release the coalescing claims it holds,
    * whatever the outcome. Does nothing for an empty token list.
    */
-  private startPushFanOut(
+  #startPushFanOut(
     tokens: readonly StoredPushToken[],
     claimedKeys: readonly string[],
     accountId: string,
@@ -2042,7 +2084,7 @@ export class AccountRelay implements DurableObject {
     claimedAt: number,
   ): void {
     if (tokens.length === 0) return;
-    const fanOut = this.deliverPushWakeups(
+    const fanOut = this.#deliverPushWakeups(
       tokens,
       accountId,
       requestId,
@@ -2060,7 +2102,7 @@ export class AccountRelay implements DurableObject {
    * Its deadline is how long any wakeup stays useful: a wakeup leads to an inbox fetch that returns
    * every live pending request.
    */
-  private latestPendingRequest(now: number): { request_id: string; deadline: number } | undefined {
+  #latestPendingRequest(now: number): { request_id: string; deadline: number } | undefined {
     return [
       ...this.sql.exec<{ request_id: string; deadline: number }>(
         `SELECT request_id, ${DEADLINE_SQL} AS deadline FROM request
@@ -2074,7 +2116,7 @@ export class AccountRelay implements DurableObject {
   }
 
   /** `requestId` if it names a live pending request at `now` ({@link deadlineOf}); otherwise `fallback`. */
-  private pendingRequestIdOr(requestId: string | null, now: number, fallback: string): string {
+  #pendingRequestIdOr(requestId: string | null, now: number, fallback: string): string {
     if (requestId === null) return fallback;
     const live = [
       ...this.sql.exec(
@@ -2091,7 +2133,7 @@ export class AccountRelay implements DurableObject {
    * Every live pending request at `now` ({@link deadlineOf}), oldest first: what the device inbox
    * returns and the reconnect flush sends.
    */
-  private livePendingRequests(now: number): Pick<RequestRow, "request_id" | "envelope">[] {
+  #livePendingRequests(now: number): Pick<RequestRow, "request_id" | "envelope">[] {
     return [
       ...this.sql.exec<Pick<RequestRow, "request_id" | "envelope">>(
         `SELECT request_id, envelope FROM request
@@ -2103,7 +2145,7 @@ export class AccountRelay implements DurableObject {
   }
 
   /** Point the `webpush-trailing-wakeup` alarm purpose at the earliest owed trailing wakeup, if any. */
-  private async armTrailingWakeupAlarm(): Promise<void> {
+  async #armTrailingWakeupAlarm(): Promise<void> {
     const next = [
       ...this.sql.exec<{ next: number | null }>(
         `SELECT MIN(due_at) AS next FROM webpush_trailing_wakeup`,
@@ -2132,7 +2174,7 @@ export class AccountRelay implements DurableObject {
    * - The wakeup's deadline is that of the longest-lived pending request, so it lasts as long as
    *   anything it covers.
    */
-  private async sendTrailingWakeups(now: number): Promise<void> {
+  async #sendTrailingWakeups(now: number): Promise<void> {
     const configured = (["apns", "fcm", "webpush"] as const).filter(
       (transport) => this.pushTransports[transport] !== undefined,
     );
@@ -2147,10 +2189,10 @@ export class AccountRelay implements DurableObject {
           )`,
       JSON.stringify(configured),
     );
-    const latest = this.latestPendingRequest(now);
+    const latest = this.#latestPendingRequest(now);
     if (latest === undefined) {
       this.sql.exec(`DELETE FROM webpush_trailing_wakeup WHERE due_at <= ?`, now);
-      await this.armTrailingWakeupAlarm();
+      await this.#armTrailingWakeupAlarm();
       return;
     }
     const due = [
@@ -2181,7 +2223,7 @@ export class AccountRelay implements DurableObject {
         const requestId =
           row.transport === "webpush"
             ? latest.request_id
-            : this.pendingRequestIdOr(row.last_skipped_request_id, now, latest.request_id);
+            : this.#pendingRequestIdOr(row.last_skipped_request_id, now, latest.request_id);
         const batch = batches.get(requestId) ?? { tokens: [], claimedKeys: [] };
         batch.tokens.push(token);
         batch.claimedKeys.push(key);
@@ -2200,7 +2242,7 @@ export class AccountRelay implements DurableObject {
       }
     }
     for (const [requestId, batch] of batches) {
-      this.startPushFanOut(
+      this.#startPushFanOut(
         batch.tokens,
         batch.claimedKeys,
         accountId,
@@ -2209,7 +2251,7 @@ export class AccountRelay implements DurableObject {
         now,
       );
     }
-    await this.armTrailingWakeupAlarm();
+    await this.#armTrailingWakeupAlarm();
   }
 
   /**
@@ -2217,7 +2259,7 @@ export class AccountRelay implements DurableObject {
    * the trailing wakeups the accepted ones cover. Never rejects: push is best-effort, and devices
    * still receive requests via WebSocket or polling.
    */
-  private async deliverPushWakeups(
+  async #deliverPushWakeups(
     tokens: readonly StoredPushToken[],
     accountId: string,
     requestId: string,
@@ -2239,7 +2281,7 @@ export class AccountRelay implements DurableObject {
           gone.token,
         );
       }
-      await this.clearCoveredTrailingWakeups(deliveredTokens, claimedAt);
+      await this.#clearCoveredTrailingWakeups(deliveredTokens, claimedAt);
     } catch (error) {
       console.warn("push fan-out bookkeeping failed", error);
     }
@@ -2251,7 +2293,7 @@ export class AccountRelay implements DurableObject {
    * was skipped at or after the claim. That submit's request may postdate
    * the inbox fetch, so it still needs the trailing wakeup.
    */
-  private async clearCoveredTrailingWakeups(
+  async #clearCoveredTrailingWakeups(
     deliveredTokens: readonly StoredPushToken[],
     claimedAt: number,
   ): Promise<void> {
@@ -2267,14 +2309,14 @@ export class AccountRelay implements DurableObject {
       );
       if (result.rowsWritten > 0) cleared = true;
     }
-    if (cleared) await this.armTrailingWakeupAlarm();
+    if (cleared) await this.#armTrailingWakeupAlarm();
   }
 
   /**
    * Enforce the per-account push-token budget for registering `adding` more tokens: a 409 (the
    * account is full; nothing is stored) or `null` when they fit.
    */
-  private pushTokenBudgetFailure(adding: number): Response | null {
+  #pushTokenBudgetFailure(adding: number): Response | null {
     if (adding === 0) return null;
     const row = [...this.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM device_push_token`)][0];
     if ((row?.n ?? 0) + adding <= MAX_PUSH_TOKENS_PER_ACCOUNT) return null;
@@ -2290,8 +2332,8 @@ export class AccountRelay implements DurableObject {
    * The polling counterpart to `…/wait` — lets a disconnected integrator fetch a persisted verdict.
    * Lazy-expires a past-deadline request on read so it never reports a perpetual `pending`.
    */
-  private async handleGetRequest(requestId: string, request: Request): Promise<Response> {
-    const authorized = await this.authorizeRequestRead(requestId, request);
+  async #handleGetRequest(requestId: string, request: Request): Promise<Response> {
+    const authorized = await this.#authorizeRequestRead(requestId, request);
     if (authorized instanceof Response) return authorized;
     const status = authorized.status;
     if (status !== "resolved") {
@@ -2301,7 +2343,7 @@ export class AccountRelay implements DurableObject {
     return json({
       request_id: requestId,
       status: "resolved",
-      verdict: this.loadVerdict(requestId),
+      verdict: this.#loadVerdict(requestId),
     });
   }
 
@@ -2319,8 +2361,8 @@ export class AccountRelay implements DurableObject {
    * already landed, so a legitimate verdict or a fail-closed expiry can never be discarded by a
    * racing cancellation. Retracting an already-retracted request is idempotent (200).
    */
-  private async handleRetract(requestId: string, request: Request): Promise<Response> {
-    const authorized = await this.authorizeRequestRead(requestId, request);
+  async #handleRetract(requestId: string, request: Request): Promise<Response> {
+    const authorized = await this.#authorizeRequestRead(requestId, request);
     if (authorized instanceof Response) return authorized;
     const status = authorized.status;
     if (status === "resolved") {
@@ -2340,8 +2382,8 @@ export class AccountRelay implements DurableObject {
       now,
       requestId,
     );
-    this.notifyRetractedRequest(requestId);
-    await this.armExpiryAlarm();
+    this.#notifyRetractedRequest(requestId);
+    await this.#armExpiryAlarm();
     return json({ request_id: requestId, status: "retracted" });
   }
 
@@ -2358,8 +2400,12 @@ export class AccountRelay implements DurableObject {
    * `{ type: "expired", request_id }`, or `{ type: "retracted", request_id }` (terminal, no verdict
    * will come for either of the latter two).
    */
-  private async handleIntegratorWait(requestId: string, request: Request): Promise<Response> {
-    const authorized = await this.authorizeRequestRead(requestId, request);
+  async #handleIntegratorWait(requestId: string, request: Request): Promise<Response> {
+    const authorized = await this.#authorizeRequestRead(
+      requestId,
+      request,
+      "header-or-websocket-query",
+    );
     if (authorized instanceof Response) return authorized;
     const status = authorized.status;
 
@@ -2372,7 +2418,7 @@ export class AccountRelay implements DurableObject {
       trySendJson(server, {
         type: "verdict",
         request_id: requestId,
-        verdict: this.loadVerdict(requestId),
+        verdict: this.#loadVerdict(requestId),
       });
       try {
         server.close(1000, "resolved");
@@ -2408,7 +2454,7 @@ export class AccountRelay implements DurableObject {
    * late verdict cannot clear the alarm while leaving existing waiters/devices stuck on the stale
    * pending request.
    */
-  private expireIfDue(
+  #expireIfDue(
     req: Pick<RequestRow, "request_id" | "status" | "created_at" | "expires_at">,
     now: number,
     options: { skipDeviceSocket?: WebSocket } = {},
@@ -2421,15 +2467,15 @@ export class AccountRelay implements DurableObject {
         now,
         requestId,
       );
-      this.notifyExpiredRequest(requestId, options.skipDeviceSocket);
-      this.ctx.waitUntil(this.armExpiryAlarm());
+      this.#notifyExpiredRequest(requestId, options.skipDeviceSocket);
+      this.ctx.waitUntil(this.#armExpiryAlarm());
       return "expired";
     }
     return status;
   }
 
   /** Load and parse the stored (opaque) verdict for a request, or null if none recorded. */
-  private loadVerdict(requestId: string): unknown {
+  #loadVerdict(requestId: string): unknown {
     const rows = [
       ...this.sql.exec<VerdictRow>(`SELECT verdict FROM verdict WHERE request_id = ?`, requestId),
     ];
@@ -2438,7 +2484,7 @@ export class AccountRelay implements DurableObject {
   }
 
   /** Resolve the `device:<id>` identity tag for a hibernation socket, if it carries one. */
-  private deviceIdForSocket(ws: WebSocket): string | null {
+  #deviceIdForSocket(ws: WebSocket): string | null {
     for (const tag of this.ctx.getTags(ws)) {
       if (tag.startsWith("device:")) return tag.slice("device:".length);
     }
@@ -2446,7 +2492,7 @@ export class AccountRelay implements DurableObject {
   }
 
   /** Resolve the visible surface tag for a hibernation socket. */
-  private surfaceIdForSocket(ws: WebSocket): string | null {
+  #surfaceIdForSocket(ws: WebSocket): string | null {
     for (const tag of this.ctx.getTags(ws)) {
       if (tag.startsWith("surface:")) return tag.slice("surface:".length);
     }
@@ -2454,7 +2500,7 @@ export class AccountRelay implements DurableObject {
   }
 
   /** True when a same-surface peer is still open enough to own queued reconnect delivery. */
-  private hasOpenSocketOnSurface(surfaceId: string): boolean {
+  #hasOpenSocketOnSurface(surfaceId: string): boolean {
     for (const ws of this.ctx.getWebSockets(surfaceTag(surfaceId))) {
       // Hibernation tag indexes can briefly retain closing sockets; those must not suppress the
       // reconnecting live socket's offline-queue flush.
@@ -2464,11 +2510,14 @@ export class AccountRelay implements DurableObject {
   }
 
   /** Send a request to at most one live socket per visible surface. */
-  private sendRequestToOneSocketPerSurface(requestId: string, envelope: unknown): number {
+  private readonly sendRequestToOneSocketPerSurface = (
+    requestId: string,
+    envelope: unknown,
+  ): number => {
     const deliveredSurfaces = new Set<string>();
     let delivered = 0;
     for (const ws of this.ctx.getWebSockets(DEVICE_TAG)) {
-      const surfaceId = this.surfaceIdForSocket(ws);
+      const surfaceId = this.#surfaceIdForSocket(ws);
       if (surfaceId !== null && deliveredSurfaces.has(surfaceId)) continue;
       if (trySendJson(ws, { type: "request", request_id: requestId, envelope })) {
         delivered++;
@@ -2478,7 +2527,7 @@ export class AccountRelay implements DurableObject {
       }
     }
     return delivered;
-  }
+  };
 
   // ---------------------------------------------------------------------------
   // WebSocket hibernation handlers
@@ -2491,7 +2540,7 @@ export class AccountRelay implements DurableObject {
    * it to any waiting integrator. A verdict for an already-resolved request is ignored (dedupe /
    * cross-device race).
    */
-  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+  override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     const text = typeof message === "string" ? message : new TextDecoder().decode(message);
     let parsed: unknown;
     try {
@@ -2505,7 +2554,7 @@ export class AccountRelay implements DurableObject {
       return;
     }
     if (parsed.type === "verdict") {
-      this.onDeviceVerdict(ws, parsed);
+      this.#onDeviceVerdict(ws, parsed);
       return;
     }
     // Unknown message types are ignored (forward-compatible: e.g. future client-side acks/pings).
@@ -2513,7 +2562,7 @@ export class AccountRelay implements DurableObject {
   }
 
   /** Hibernation close handler — finish the closing handshake from our side. */
-  async webSocketClose(
+  override async webSocketClose(
     ws: WebSocket,
     code: number,
     _reason: string,
@@ -2537,12 +2586,12 @@ export class AccountRelay implements DurableObject {
    * gets an `error` frame and changes nothing, so the request stays answerable. Provenance is not a
    * decision: the integrator still verifies the verdict in full and decides what it means.
    */
-  private onDeviceVerdict(ws: WebSocket, msg: Record<string, unknown>): void {
+  #onDeviceVerdict(ws: WebSocket, msg: Record<string, unknown>): void {
     // SECURITY: only a device presence socket may submit a verdict. An integrator `…/wait` socket
     // (or any other non-device client) carries no `device:<id>` tag — it must NEVER be able to
     // resolve a request by sending a forged verdict payload. The verdict body's provenance is checked
     // below; the integrator still verifies it in full.
-    const deviceId = this.deviceIdForSocket(ws);
+    const deviceId = this.#deviceIdForSocket(ws);
     if (deviceId === null) {
       trySendJson(ws, { type: "error", error: "verdicts are only accepted from device sockets" });
       return;
@@ -2607,7 +2656,7 @@ export class AccountRelay implements DurableObject {
     // approvable. Transition pending→expired and refuse to record the verdict. The same `now` is
     // the verdict's received/terminal time below, so acceptance and recording read one instant.
     const now = this.now();
-    if (this.expireIfDue(req, now, { skipDeviceSocket: ws }) === "expired") {
+    if (this.#expireIfDue(req, now, { skipDeviceSocket: ws }) === "expired") {
       trySendJson(ws, { type: "ack", request_id: requestId, status: "expired" });
       return;
     }
@@ -2640,7 +2689,7 @@ export class AccountRelay implements DurableObject {
     // failed check records nothing, retracts nothing, and leaves the request pending for another
     // device's verdict.
     const verdictJson = JSON.stringify(msg.verdict);
-    const signer = this.verdictSigner(verdictJson, requestId, req);
+    const signer = this.#verdictSigner(verdictJson, requestId, req);
     if (signer === null) {
       trySendJson(ws, {
         type: "error",
@@ -2680,7 +2729,7 @@ export class AccountRelay implements DurableObject {
       now,
       requestId,
     );
-    this.ctx.waitUntil(this.armExpiryAlarm());
+    this.ctx.waitUntil(this.#armExpiryAlarm());
 
     const verdictValue = JSON.parse(verdictJson) as unknown;
 
@@ -2714,12 +2763,12 @@ export class AccountRelay implements DurableObject {
    * relay's receive time, so it is not used here: a device clock slightly behind the relay's would
    * otherwise be refused for a verdict the integrator accepts.)
    */
-  private verdictSigner(
+  #verdictSigner(
     verdictJson: string,
     requestId: string,
     req: Pick<RequestRow, "envelope" | "expires_at">,
   ): string | null {
-    const root = this.boundRootPubkey();
+    const root = this.#boundRootPubkey();
     if (root === null) return null;
     try {
       const envelope = JSON.parse(req.envelope) as unknown;
@@ -2731,7 +2780,7 @@ export class AccountRelay implements DurableObject {
         req.expires_at,
         accountIdForRoot(root),
         root,
-        this.verifiedAccountStates().states,
+        this.#verifiedAccountStates().states,
       ).device_id;
     } catch {
       return null;
@@ -2744,12 +2793,12 @@ export class AccountRelay implements DurableObject {
    * table, so running it early is harmless, and an alarm left by an older deploy still expires and
    * sweeps.
    */
-  async alarm(): Promise<void> {
+  override async alarm(): Promise<void> {
     await this.alarms.run(
       this.now(),
       {
-        "request-expiry": (now) => this.expireDueRequests(now),
-        "webpush-trailing-wakeup": (now) => this.sendTrailingWakeups(now),
+        "request-expiry": (now) => this.#expireDueRequests(now),
+        "webpush-trailing-wakeup": (now) => this.#sendTrailingWakeups(now),
       },
       { everyFiring: ["request-expiry"] },
     );
@@ -2760,13 +2809,13 @@ export class AccountRelay implements DurableObject {
    * connected devices, wake live integrator waiters, sweep old terminal rows, and then schedule the
    * next pending deadline.
    */
-  private async expireDueRequests(now: number): Promise<void> {
-    const expired = this.expirePendingDue(now);
+  async #expireDueRequests(now: number): Promise<void> {
+    const expired = this.#expirePendingDue(now);
     for (const request of expired) {
-      this.notifyExpiredRequest(request.request_id);
+      this.#notifyExpiredRequest(request.request_id);
     }
-    this.sweepTerminalRows(now);
-    await this.armExpiryAlarm();
+    this.#sweepTerminalRows(now);
+    await this.#armExpiryAlarm();
   }
 
   /**
@@ -2774,7 +2823,7 @@ export class AccountRelay implements DurableObject {
    * or clear it when no pending request remains. The horizon cap means a row stored before the
    * horizon existed (far-future `expires_at`) is still expired and swept.
    */
-  private async armExpiryAlarm(): Promise<void> {
+  async #armExpiryAlarm(): Promise<void> {
     const next = [
       ...this.sql.exec<{ deadline: number }>(
         `SELECT ${DEADLINE_SQL} AS deadline FROM request
@@ -2792,7 +2841,7 @@ export class AccountRelay implements DurableObject {
    * Once expired, a row is removed by {@link sweepTerminalRows} after the retention window, so no
    * pending row is stored forever.
    */
-  private expirePendingDue(now: number): RequestRow[] {
+  #expirePendingDue(now: number): RequestRow[] {
     const overdue = [
       ...this.sql.exec<RequestRow>(
         `SELECT request_id, envelope, created_at, expires_at, status, terminal_at FROM request
@@ -2814,7 +2863,7 @@ export class AccountRelay implements DurableObject {
   }
 
   /** Fan out terminal expiry to surfaces that might still be showing or waiting on the request. */
-  private notifyExpiredRequest(requestId: string, skipDeviceSocket?: WebSocket): void {
+  #notifyExpiredRequest(requestId: string, skipDeviceSocket?: WebSocket): void {
     for (const sock of this.ctx.getWebSockets(DEVICE_TAG)) {
       if (sock === skipDeviceSocket) continue;
       trySendJson(sock, { type: "retract", request_id: requestId });
@@ -2834,7 +2883,7 @@ export class AccountRelay implements DurableObject {
    * message devices already understand for cross-device dedupe — and tell any live integrator
    * waiter it will never receive a verdict for this request.
    */
-  private notifyRetractedRequest(requestId: string): void {
+  #notifyRetractedRequest(requestId: string): void {
     for (const sock of this.ctx.getWebSockets(DEVICE_TAG)) {
       trySendJson(sock, { type: "retract", request_id: requestId });
     }
@@ -2854,7 +2903,7 @@ export class AccountRelay implements DurableObject {
    * pending row past its deadline (including the horizon cap) is expired there, so no pending row
    * outlives `deadline + REQUEST_RETENTION_MS`.
    */
-  private sweepTerminalRows(now: number): void {
+  #sweepTerminalRows(now: number): void {
     const cutoff = now - REQUEST_RETENTION_MS;
     this.sql.exec(
       `DELETE FROM request

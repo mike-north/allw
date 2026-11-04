@@ -10,7 +10,7 @@
  * @see ../../../docs/relay-api.md §3 Pairing (`POST /{acct}/pairing/complete`)
  */
 
-import { SELF } from "cloudflare:test";
+import { exports } from "cloudflare:workers";
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { pairingStartBody, testAccount } from "./support/accounts.js";
 import { DEVICE_X25519_PUBKEY } from "./support/keys.js";
@@ -35,22 +35,28 @@ afterEach(() => {
 
 async function completeWithFreshCode(name: string): Promise<{ status: number; body: unknown }> {
   const accountId = testAccount(name);
-  const startResp = await SELF.fetch(`https://relay.allw.test/${accountId}/pairing/start`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(pairingStartBody(accountId)),
-  });
-  expect(startResp.status).toBe(201);
-  const start = (await startResp.json()) as { code: string; pairing_auth_token: string };
-
-  const resp = await SELF.fetch(`https://relay.allw.test/${accountId}/pairing/complete`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${start.pairing_auth_token}`,
+  const startResp = await exports.default.fetch(
+    `https://relay.allw.test/${accountId}/pairing/start`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(pairingStartBody(accountId)),
     },
-    body: JSON.stringify({ code: start.code, pubkey: DEVICE_X25519_PUBKEY }),
-  });
+  );
+  expect(startResp.status).toBe(201);
+  const start = await startResp.json<{ code: string; pairing_auth_token: string }>();
+
+  const resp = await exports.default.fetch(
+    `https://relay.allw.test/${accountId}/pairing/complete`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${start.pairing_auth_token}`,
+      },
+      body: JSON.stringify({ code: start.code, pubkey: DEVICE_X25519_PUBKEY }),
+    },
+  );
   return { status: resp.status, body: await resp.json() };
 }
 

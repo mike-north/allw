@@ -8,7 +8,7 @@
  * @see ../src/core.ts (`CoreUnavailableError`, `ensureCore`)
  */
 
-import { SELF } from "cloudflare:test";
+import { exports } from "cloudflare:workers";
 import { describe, it, expect, vi } from "vitest";
 
 vi.mock("@allw/sdk/vendor/allw-wasm/allw_wasm.js", () => ({
@@ -20,13 +20,13 @@ vi.mock("@allw/sdk/vendor/allw-wasm/allw_wasm.js", () => ({
 describe("core unavailable", () => {
   it("pairing/start returns 500 and logs, without judging the request", async () => {
     const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const resp = await SELF.fetch("http://relay.test/some-account/pairing/start", {
+    const resp = await exports.default.fetch("http://relay.test/some-account/pairing/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ root_pubkey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }),
     });
     expect(resp.status).toBe(500);
-    const body = (await resp.json()) as { error: string };
+    const body = await resp.json<{ error: string }>();
     expect(body.error).toMatch(/core unavailable/);
     expect(body.error).not.toMatch(/root_pubkey|Ed25519|derive/);
     expect(errors).toHaveBeenCalled();
@@ -35,13 +35,13 @@ describe("core unavailable", () => {
 
   it("POST account-states returns 500 and logs, without judging the documents", async () => {
     const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const resp = await SELF.fetch("http://relay.test/some-account/account-states", {
+    const resp = await exports.default.fetch("http://relay.test/some-account/account-states", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ account_states: ["eyJhbGciOiJFZERTQSJ9.eyJzIjoxfQ.sig"] }),
     });
     expect(resp.status).toBe(500);
-    const body = (await resp.json()) as { error: string };
+    const body = await resp.json<{ error: string }>();
     expect(body.error).toMatch(/core unavailable/);
     expect(body.error).not.toMatch(/verify|account root/);
     expect(errors).toHaveBeenCalled();

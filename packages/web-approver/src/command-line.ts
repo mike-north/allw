@@ -13,6 +13,8 @@
  * @see ../../approver/src/lib/render.ts (the CLI rules this mirrors)
  */
 
+import type { ApprovalContext } from "./index.js";
+
 /**
  * Quote one token **for display** so its boundaries are visible: `["rm","-rf","my dir"]` shows as
  * `rm -rf 'my dir'`, never like three separate arguments. A token with whitespace, a quoting or
@@ -125,4 +127,63 @@ export function rawDivergesFromArgv(syntactic: unknown): boolean {
   });
   if (tokens === undefined || isWhitespaceSplitOf(tokens, raw)) return false;
   return renderArgv(tokens) !== raw;
+}
+
+/**
+ * Shown in place of the tool when a request names a `server` but no `tool`: `fs :: (tool missing)`.
+ * A real tool literally named `(tool missing)` contains a space, so it is always shown quoted and
+ * can't pass for this marker. The CLI uses the same text.
+ */
+export const TOOL_MISSING = "(tool missing)";
+
+/**
+ * Quote one half of a `server :: tool` identity so the split between the two stays visible. A half
+ * is shown bare only when it is printable ASCII, contains no `::`, and {@link quoteToken} would
+ * leave it bare. Anything else, including any non-ASCII text (which could hold a lookalike of the
+ * ` :: ` separator), is single-quoted, so server `fs :: read_file` + tool `delete_all` shows as
+ * `'fs :: read_file' :: delete_all`, never like server `fs` + tool `read_file :: delete_all`.
+ */
+function quoteIdentityPart(part: string): string {
+  if (/^[\x21-\x7e]+$/.test(part) && !part.includes("::")) return quoteToken(part);
+  return `'${part.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * The `server :: tool` identity of whichever tool-call fields a request carries, each half quoted
+ * by {@link quoteIdentityPart}: the tool alone when there is no server, `server :: (tool missing)`
+ * when there is no tool, `undefined` when there is neither. Mirrors the CLI's rule in
+ * `packages/approver/src/lib/render.ts`.
+ */
+export function joinToolIdentity(
+  server: string | undefined,
+  tool: string | undefined,
+): string | undefined {
+  if (tool === undefined) {
+    return server !== undefined ? `${quoteIdentityPart(server)} :: ${TOOL_MISSING}` : undefined;
+  }
+  const quotedTool = quoteIdentityPart(tool);
+  return server !== undefined ? `${quoteIdentityPart(server)} :: ${quotedTool}` : quotedTool;
+}
+
+/**
+ * What {@link toolIdentity} reads: the request's surface kind (the view model's `kind`, not the
+ * wire surface, so `"mcp"` rather than `"mcp_tool_call"`) and its tool-call fields.
+ */
+export interface ToolIdentityParts {
+  readonly kind: ApprovalContext["kind"];
+  readonly substrate: { readonly server?: string | undefined; readonly tool?: string | undefined };
+}
+
+/**
+ * The tool identity a tool-surface request heads with ({@link joinToolIdentity}): `server :: tool`,
+ * the tool alone, or `server :: (tool missing)`. A `.` join would make server `fs.delete` + tool
+ * `x` look like server `fs` + tool `delete.x`, hence `::`. It is `undefined` on any other surface,
+ * or when the request names neither a server nor a tool. On a tool surface `raw` is the caller's
+ * description of the call (e.g. OpenClaw's plugin text), not the action (#321). Mirrors the CLI's
+ * `toolIdentity` in `packages/approver/src/lib/render.ts`.
+ */
+export function toolIdentity(parts: ToolIdentityParts): string | undefined {
+  const isToolSurface = parts.kind === "mcp" || parts.kind === "agent_tool_call";
+  if (!isToolSurface) return undefined;
+  return joinToolIdentity(parts.substrate.server, parts.substrate.tool);
 }
