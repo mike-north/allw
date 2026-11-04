@@ -68,7 +68,8 @@
 //! **Unicode-version skew fails closed.** The tables come from one Unicode version,
 //! [`UNICODE_VERSION`], but a renderer may know a newer one, with marks the tables don't list. So
 //! for run counting only, a code point that is unassigned (`Cn`) in [`UNICODE_VERSION`] counts as a
-//! combining mark: a future mark cannot extend a run unflagged. Outside a run it is shown as-is, so a
+//! combining mark: a future mark cannot extend a run unflagged. Outside a run it is shown as-is, unless
+//! it is a hidden character (a default-ignorable code point, escaped wherever it appears), so a
 //! new character on its own (a new emoji, say) is unaffected unless it follows two marks; three or
 //! more unassigned code points in a row show from the third escaped.
 //!
