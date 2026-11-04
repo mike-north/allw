@@ -1295,3 +1295,238 @@ fn the_alternate_open_quote_exemption_is_narrow() {
     // A substitution no reading closes stays High.
     assert_eq!(line_risk("echo \"$(echo hi # it's )\""), Risk::High);
 }
+
+// ── Pre-pass reach on budget exhaustion (#323, #324) ─────────────────────────
+
+/// Padding that exhausts the budget after the command it follows: `" rm"` × 1,500,000.
+fn exhausting_pad() -> String {
+    " rm".repeat(1_500_000)
+}
+
+/// Assert `line` exhausts the budget and still has tier `want`.
+fn assert_exhausted(line: &str, want: Risk) {
+    let (risk, budget) = analyze_with_budget(line, MAX_RISK_WORK);
+    assert!(budget.exhausted, "{} bytes did not exhaust", line.len());
+    assert_eq!(risk, want, "{:?}…", &line[..line.len().min(80)]);
+}
+
+/// Regression (#323): the pre-pass didn't descend into `-c` strings or `eval` arguments, so a
+/// `dd` in one was lost when later padding exhausted the budget (High).
+#[test]
+fn a_dd_in_a_command_string_or_eval_survives_budget_exhaustion() {
+    let pad = exhausting_pad();
+    for line in [
+        format!("sh -c 'echo x; {DD}' ;:{pad}"),
+        format!("echo $(bash -c '{DD}') ;:{pad}"),
+        format!("eval 'echo x; {DD}' ;:{pad}"),
+        // Reached through a wrapper, a `--command=` value, a bundled `-lc`, and PowerShell.
+        format!("sudo -u root bash -lc 'echo x; {DD}' ;:{pad}"),
+        format!("bash --command='{DD}' ;:{pad}"),
+        format!("pwsh -NoProfile -Command '{DD}' ;:{pad}"),
+        format!("env eval 'echo x; {DD}' ;:{pad}"),
+        // Nested: a `-c` string inside an `eval` inside a substitution.
+        format!("echo \"$(eval \"sh -c '{DD}'\")\" ;:{pad}"),
+    ] {
+        assert_exhausted(&line, Risk::Critical);
+    }
+    // Controls: unpadded, and a substitution the pre-pass already reached.
+    assert_eq!(line_risk(&format!("sh -c 'echo x; {DD}'")), Risk::Critical);
+    assert_exhausted(&format!("echo $({DD}) ;:{pad}"), Risk::Critical);
+}
+
+/// The pre-pass reads a `-c` string only where the argv rules do: a shell with no command flag,
+/// an `eval` or shell that is only an argument, and nesting past [`MAX_SHELL_NESTING`] stay High
+/// on exhaustion.
+#[test]
+fn the_pre_pass_reads_command_strings_only_where_they_run() {
+    let pad = exhausting_pad();
+    let mut nested = DD.to_string();
+    for _ in 0..=MAX_SHELL_NESTING {
+        nested = format!("sh -c {}", quoted(&nested));
+    }
+    for line in [
+        format!("echo \"$(sh 'echo x; {DD}')\" ;:{pad}"),
+        format!("echo \"$(echo sh -c 'echo x; {DD}')\" ;:{pad}"),
+        format!("echo \"$(echo eval '{DD}')\" ;:{pad}"),
+        format!("echo \"$(pwsh -EncodedCommand '{DD}')\" ;:{pad}"),
+        format!("echo \"$({nested})\" ;:{pad}"),
+    ] {
+        assert_exhausted(&line, Risk::High);
+    }
+}
+
+/// Regression (#324): the pre-pass recorded a wrapper's own tier, so a `dd` it wraps inside one
+/// quoted word (`"$(sudo dd …)"`) was lost when later padding exhausted the budget (High).
+#[test]
+fn a_wrapped_dd_survives_budget_exhaustion() {
+    let pad = exhausting_pad();
+    for line in [
+        format!("echo \"$(sudo {DD})\" ;:{pad}"),
+        format!("echo \"$(env {DD})\" ;:{pad}"),
+        format!("echo \"$(nice -n 1 {DD})\" ;:{pad}"),
+        format!("x=\"$(sudo {DD})\";:{pad}"),
+        format!("echo \"$(sudo -E env nice {DD})\" ;:{pad}"),
+    ] {
+        assert_exhausted(&line, Risk::Critical);
+    }
+    // Controls: no wrapper, and no padding.
+    assert_exhausted(&format!("echo \"$({DD})\" ;:{pad}"), Risk::Critical);
+    assert_eq!(line_risk(&format!("echo \"$(sudo {DD})\"")), Risk::Critical);
+}
+
+/// A segment that only names a program as an argument, with no wrapper, is not over-counted
+/// beyond the `shlex` words: `"$(echo dd)"` stays High on exhaustion.
+#[test]
+fn an_argument_named_like_a_program_is_not_a_wrapped_program() {
+    let pad = exhausting_pad();
+    assert_exhausted(&format!("echo \"$(echo {DD})\" ;:{pad}"), Risk::High);
+    assert_exhausted(&format!("echo \"$(ls -l {DD})\" ;:{pad}"), Risk::High);
+}
+
+/// The pre-pass stays linear for each level with `-c` strings and `eval` in it: a line that
+/// nests them to the limit around megabytes of words is scanned in a small multiple of its
+/// length.
+#[test]
+fn the_pre_pass_is_linear_per_level_through_command_strings() {
+    let mut text = "x ".repeat(200_000);
+    for level in 0..MAX_SHELL_NESTING {
+        text = if level % 2 == 0 {
+            format!("sudo sh -c {} eval {}", quoted(&text), quoted(&text))
+        } else {
+            format!("eval {} ; bash -c {}", quoted(&text), quoted(&text))
+        };
+    }
+    let words = shlex::split(&text).expect("tokenizes");
+    SCANNED.with(|c| c.set(0));
+    let mut budget = Budget::new(MAX_RISK_WORK);
+    note_visible_programs(Some(&text), &words, &mut budget);
+    let scanned = SCANNED.with(std::cell::Cell::get);
+    assert!(
+        scanned < 4 * (MAX_SHELL_NESTING + 1) * text.len(),
+        "scanned {scanned} for {} bytes",
+        text.len()
+    );
+}
+
+/// Regression (#384 review, 1): the argv pre-pass didn't skip leading assignments, so on the
+/// `action_from_argv` surface `X=1 sh -c '…'`, `X=1 eval …` and `X=1 pwsh -Command …` lost their
+/// `-c` / `eval` reach when padding exhausted the budget (High).
+#[test]
+fn an_argv_after_assignments_keeps_its_command_string_reach() {
+    let pad = vec!["rm".to_string(); 60_000];
+    for head in [
+        vec!["X=1", "sh", "-c", DD],
+        vec!["X=1", "Y=2", "eval", DD],
+        vec!["X=1", "pwsh", "-Command", DD],
+    ] {
+        let mut argv: Vec<String> = head.iter().map(|s| s.to_string()).collect();
+        assert_eq!(argv_of(&head), Risk::Critical, "{head:?} unpadded");
+        argv.extend(pad.iter().cloned());
+        let mut budget = Budget::new(MAX_RISK_WORK);
+        note_visible_programs(None, &argv, &mut budget);
+        let risk = classify_argv(&argv, 0, &mut budget);
+        let risk = budget.finish(risk);
+        assert!(budget.exhausted, "{head:?} did not exhaust");
+        assert_eq!(risk, Risk::Critical, "{head:?} padded");
+        assert_eq!(
+            action_from_argv(&argv, None, &ctx()).unwrap().risk,
+            Risk::Critical,
+            "{head:?} padded, public builder"
+        );
+    }
+}
+
+/// Regression (#384 review, 2): words after a wrapper were noted by name only, so a command line
+/// a wrapper runs from one word (`su -c '…'`, `watch '…'`, `ssh host '…'`, `env -S'…'`) lost its
+/// `dd` on exhaustion (High).
+#[test]
+fn a_command_line_a_wrapper_runs_survives_budget_exhaustion() {
+    let pad = exhausting_pad();
+    for line in [
+        format!("su -c '{DD}' ;:{pad}"),
+        format!("watch 'echo x; {DD}' ;:{pad}"),
+        format!("ssh host 'echo x; {DD}' ;:{pad}"),
+        format!("env -S'{DD}' ;:{pad}"),
+        format!("env --split-string='{DD}' ;:{pad}"),
+        format!("echo \"$(sudo watch 'echo x; {DD}')\" ;:{pad}"),
+    ] {
+        assert_exhausted(&line, Risk::Critical);
+    }
+    // Not after a wrapper: a whitespace word that is only an argument is not read.
+    assert_exhausted(&format!("echo \"$(echo 'x; {DD}')\" ;:{pad}"), Risk::High);
+}
+
+/// Rows of the shared fixtures that padding still lowers. Each is a pre-existing gap of the
+/// pre-pass tracked in #389 (here-strings and the dash / ANSI-C / arithmetic alternate readings
+/// are only read by the budgeted analysis). Remove a row when #389 fixes it; the guard fails if a
+/// listed row stops being lowered, so the list only shrinks.
+const PADDING_LOWERS_TRACKED_IN_389: &[&str] = &[
+    // Here-strings: the pre-pass doesn't read a `<<<` body as a script.
+    "bash <<< \"dd if=/dev/zero of=/dev/sda\"",
+    "cat <<< \"dd if=/dev/zero of=/dev/sda\"",
+    "{ bash; } <<< 'dd if=/dev/zero of=/dev/sda'",
+    // Alternate readings (dash: no `$'…'`; no arithmetic commands): the pre-pass reads bash only.
+    "dash -c 'echo $'\"'\"'\\'\"'\"'\ndd if=/dev/zero of=/dev/sda\necho \\'\"'\"''\"'\"''",
+    "dash -c 'echo $'\"'\"'\\'\"'\"' ; dd if=/dev/zero of=/dev/sda ; echo \\'\"'\"''\"'\"''\"'\"''",
+    "sh -c '((: ; dd if=/dev/zero of=/dev/sda))'",
+    "eval 'echo $'\"'\"'\\'\"'\"' ; dd if=/dev/zero of=/dev/sda ; echo \\'\"'\"''\"'\"''\"'\"''",
+    "echo \"$(((: ; dd if=/dev/zero of=/dev/sda)))\"",
+];
+
+/// Guard: padding after any shared-fixture row never lowers its tier. For every row of
+/// `command_risk_vectors.json` and `command_line_risk_vectors.json`, `row ;:<pad>` is at least as
+/// risky as `row`, so every Critical row stays Critical. Two pads, each exhausting the budget a
+/// different way:
+///
+/// - one word longer than the budget: the line's first charge exhausts it, so only the pre-pass
+///   and the argv classification of the `shlex` words remain;
+/// - `" rm"` × 6000 (~18 KB): every `rm` position pays `direct_risk`'s suffix charge, so the argv
+///   analysis of the `shlex` words exhausts it, which catches wrapper-class drift (`su -c '…'`).
+///
+/// The allow-list must still be lowered by the first pad, so it only shrinks.
+#[test]
+fn padding_never_lowers_a_fixture_row() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let long_word = format!(" ;:{}", "x".repeat(MAX_RISK_WORK));
+    let rm_words = format!(" ;:{}", " rm".repeat(6000));
+    let mut lowered = Vec::new();
+    let mut tracked_fixed = Vec::new();
+    for file in [
+        "command_risk_vectors.json",
+        "command_line_risk_vectors.json",
+    ] {
+        let text = std::fs::read_to_string(dir.join(file)).expect("fixture is committed");
+        let fixture: serde_json::Value = serde_json::from_str(&text).expect("fixture is JSON");
+        for case in fixture["cases"].as_array().expect("cases") {
+            let row = case["command"].as_str().expect("command");
+            let Ok(unpadded) = action_from_command(row, &ctx()).map(|a| a.risk) else {
+                continue;
+            };
+            let tracked = PADDING_LOWERS_TRACKED_IN_389.contains(&row);
+            for (name, pad) in [("long word", &long_word), ("rm words", &rm_words)] {
+                let line = format!("{row}{pad}");
+                let (padded, budget) = analyze_with_budget(&line, MAX_RISK_WORK);
+                assert!(budget.exhausted, "{file}: {row:?} + {name} did not exhaust");
+                let is_lowered = risk_rank(padded) < risk_rank(unpadded);
+                if is_lowered && !tracked {
+                    lowered.push(format!(
+                        "{file}: {row:?} + {name}: {unpadded:?} → {padded:?}"
+                    ));
+                }
+                if tracked && !is_lowered && name == "long word" {
+                    tracked_fixed.push(format!("{file}: {row:?}"));
+                }
+            }
+        }
+    }
+    assert!(
+        lowered.is_empty(),
+        "padding lowers:\n{}",
+        lowered.join("\n")
+    );
+    assert!(
+        tracked_fixed.is_empty(),
+        "no longer lowered by padding; remove from PADDING_LOWERS_TRACKED_IN_389:\n{}",
+        tracked_fixed.join("\n")
+    );
+}
