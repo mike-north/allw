@@ -1277,3 +1277,117 @@ fn the_alternate_open_quote_exemption_is_narrow() {
     // A substitution no reading closes stays High.
     assert_eq!(line_risk("echo \"$(echo hi # it's )\""), Risk::High);
 }
+
+// ── Pre-pass reach on budget exhaustion (#323, #324) ─────────────────────────
+
+/// Padding that exhausts the budget after the command it follows: `" rm"` × 1,500,000.
+fn exhausting_pad() -> String {
+    " rm".repeat(1_500_000)
+}
+
+/// Assert `line` exhausts the budget and still has tier `want`.
+fn assert_exhausted(line: &str, want: Risk) {
+    let (risk, budget) = analyze_with_budget(line, MAX_RISK_WORK);
+    assert!(budget.exhausted, "{} bytes did not exhaust", line.len());
+    assert_eq!(risk, want, "{:?}…", &line[..line.len().min(80)]);
+    // The public builder agrees.
+    assert_eq!(line_risk(line), want, "{:?}…", &line[..line.len().min(80)]);
+}
+
+/// Regression (#323): the pre-pass didn't descend into `-c` strings or `eval` arguments, so a
+/// `dd` in one was lost when later padding exhausted the budget (High).
+#[test]
+fn a_dd_in_a_command_string_or_eval_survives_budget_exhaustion() {
+    let pad = exhausting_pad();
+    for line in [
+        format!("sh -c 'echo x; {DD}' ;:{pad}"),
+        format!("echo $(bash -c '{DD}') ;:{pad}"),
+        format!("eval 'echo x; {DD}' ;:{pad}"),
+        // Reached through a wrapper, a `--command=` value, a bundled `-lc`, and PowerShell.
+        format!("sudo -u root bash -lc 'echo x; {DD}' ;:{pad}"),
+        format!("bash --command='{DD}' ;:{pad}"),
+        format!("pwsh -NoProfile -Command '{DD}' ;:{pad}"),
+        format!("env eval 'echo x; {DD}' ;:{pad}"),
+        // Nested: a `-c` string inside an `eval` inside a substitution.
+        format!("echo \"$(eval \"sh -c '{DD}'\")\" ;:{pad}"),
+    ] {
+        assert_exhausted(&line, Risk::Critical);
+    }
+    // Controls: unpadded, and a substitution the pre-pass already reached.
+    assert_eq!(line_risk(&format!("sh -c 'echo x; {DD}'")), Risk::Critical);
+    assert_exhausted(&format!("echo $({DD}) ;:{pad}"), Risk::Critical);
+}
+
+/// The pre-pass reads a `-c` string only where the argv rules do: a shell with no command flag,
+/// an `eval` or shell that is only an argument, and nesting past [`MAX_SHELL_NESTING`] stay High
+/// on exhaustion.
+#[test]
+fn the_pre_pass_reads_command_strings_only_where_they_run() {
+    let pad = exhausting_pad();
+    let mut nested = DD.to_string();
+    for _ in 0..=MAX_SHELL_NESTING {
+        nested = format!("sh -c {}", quoted(&nested));
+    }
+    for line in [
+        format!("echo \"$(sh 'echo x; {DD}')\" ;:{pad}"),
+        format!("echo \"$(echo sh -c 'echo x; {DD}')\" ;:{pad}"),
+        format!("echo \"$(echo eval '{DD}')\" ;:{pad}"),
+        format!("echo \"$(pwsh -EncodedCommand '{DD}')\" ;:{pad}"),
+        format!("echo \"$({nested})\" ;:{pad}"),
+    ] {
+        assert_exhausted(&line, Risk::High);
+    }
+}
+
+/// Regression (#324): the pre-pass recorded a wrapper's own tier, so a `dd` it wraps inside one
+/// quoted word (`"$(sudo dd …)"`) was lost when later padding exhausted the budget (High).
+#[test]
+fn a_wrapped_dd_survives_budget_exhaustion() {
+    let pad = exhausting_pad();
+    for line in [
+        format!("echo \"$(sudo {DD})\" ;:{pad}"),
+        format!("echo \"$(env {DD})\" ;:{pad}"),
+        format!("echo \"$(nice -n 1 {DD})\" ;:{pad}"),
+        format!("x=\"$(sudo {DD})\";:{pad}"),
+        format!("echo \"$(sudo -E env nice {DD})\" ;:{pad}"),
+    ] {
+        assert_exhausted(&line, Risk::Critical);
+    }
+    // Controls: no wrapper, and no padding.
+    assert_exhausted(&format!("echo \"$({DD})\" ;:{pad}"), Risk::Critical);
+    assert_eq!(line_risk(&format!("echo \"$(sudo {DD})\"")), Risk::Critical);
+}
+
+/// A segment that only names a program as an argument, with no wrapper, is not over-counted
+/// beyond the `shlex` words: `"$(echo dd)"` stays High on exhaustion.
+#[test]
+fn an_argument_named_like_a_program_is_not_a_wrapped_program() {
+    let pad = exhausting_pad();
+    assert_exhausted(&format!("echo \"$(echo {DD})\" ;:{pad}"), Risk::High);
+    assert_exhausted(&format!("echo \"$(ls -l {DD})\" ;:{pad}"), Risk::High);
+}
+
+/// The pre-pass stays linear for each level with `-c` strings and `eval` in it: a line that
+/// nests them to the limit around megabytes of words is scanned in a small multiple of its
+/// length.
+#[test]
+fn the_pre_pass_is_linear_per_level_through_command_strings() {
+    let mut text = "x ".repeat(200_000);
+    for level in 0..MAX_SHELL_NESTING {
+        text = if level % 2 == 0 {
+            format!("sudo sh -c {} eval {}", quoted(&text), quoted(&text))
+        } else {
+            format!("eval {} ; bash -c {}", quoted(&text), quoted(&text))
+        };
+    }
+    let words = shlex::split(&text).expect("tokenizes");
+    SCANNED.with(|c| c.set(0));
+    let mut budget = Budget::new(MAX_RISK_WORK);
+    note_visible_programs(Some(&text), &words, &mut budget);
+    let scanned = SCANNED.with(std::cell::Cell::get);
+    assert!(
+        scanned < 4 * (MAX_SHELL_NESTING + 1) * text.len(),
+        "scanned {scanned} for {} bytes",
+        text.len()
+    );
+}
