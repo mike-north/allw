@@ -103,6 +103,59 @@ test("the core's Unicode tables are not older than this runtime's Unicode", () =
   );
 });
 
+/** Parses a generated `(char, char)` range table from `unicode_tables.rs` into `[lo, hi]` pairs. */
+function parseRanges(tables, name) {
+  const body = new RegExp(`const ${name}: \\[\\(char, char\\); \\d+\\] = \\[([^\\]]*)\\];`).exec(
+    tables,
+  )?.[1];
+  assert.ok(body, `unicode_tables.rs declares ${name}`);
+  const pairs = [...body.matchAll(/\('\\u\{([0-9A-F]+)\}', '\\u\{([0-9A-F]+)\}'\)/g)];
+  assert.ok(pairs.length > 100, `${name} parsed`);
+  return pairs.map((m) => [parseInt(m[1], 16), parseInt(m[2], 16)]);
+}
+
+/** Code points (surrogates skipped) where membership in `ranges` disagrees with `re`. */
+function tableDisagreements(ranges, re) {
+  const inTable = new Uint8Array(0x110000);
+  for (const [lo, hi] of ranges) inTable.fill(1, lo, hi + 1);
+  const missing = []; // ICU says yes, the table says no
+  const extra = []; // the table says yes, ICU says no
+  for (let cp = 0; cp <= 0x10ffff; cp += 1) {
+    if (cp >= 0xd800 && cp <= 0xdfff) continue;
+    const icu = re.test(String.fromCodePoint(cp));
+    if (icu && !inTable[cp]) missing.push(codepointNotation(cp));
+    else if (!icu && inTable[cp]) extra.push(codepointNotation(cp));
+  }
+  return { missing, extra };
+}
+
+test("the generated mark and unassigned tables equal this runtime's ICU, both ways", (t) => {
+  // Enforces "generated, never edited by hand" (#334): a hand-added or hand-removed range
+  // disagrees with ICU. Only meaningful when the runtime's Unicode is the core's (major.minor).
+  const tables = readFileSync(
+    join(here, "..", "..", "..", "crates", "allw-core", "src", "display", "unicode_tables.rs"),
+    "utf8",
+  );
+  const core = /pub const UNICODE_VERSION: &str = "([^"]+)";/.exec(tables)?.[1];
+  assert.ok(core, "unicode_tables.rs declares UNICODE_VERSION");
+  const runtime = process.versions.unicode;
+  assert.ok(runtime, "this runtime reports process.versions.unicode");
+  if (majorMinor(core).join(".") !== majorMinor(runtime).join(".")) {
+    t.skip(
+      `runtime Unicode ${runtime} differs from the core's ${core} (major.minor); ` +
+        "the both-ways table check only applies when they are equal",
+    );
+    return;
+  }
+  const marks = tableDisagreements(
+    parseRanges(tables, "COMBINING_MARK_RANGES"),
+    /^[\p{Mn}\p{Me}]$/u,
+  );
+  assert.deepEqual(marks, { missing: [], extra: [] }, "COMBINING_MARK_RANGES vs ICU Mn|Me");
+  const unassigned = tableDisagreements(parseRanges(tables, "UNASSIGNED_RANGES"), /^\p{Cn}$/u);
+  assert.deepEqual(unassigned, { missing: [], extra: [] }, "UNASSIGNED_RANGES vs ICU Cn");
+});
+
 test("display_model matches the shared vector's full model case", async () => {
   const wasm = await loadWasm();
   const { display_model_case: dm } = loadVector();
