@@ -45,7 +45,8 @@ fn every_case_in_the_shared_vector_builds_the_expected_record() {
         let ctx = CommandContext {
             cwd: case.cwd.clone(),
         };
-        let record = action_from_powershell_command(&case.command, &ctx);
+        let record = action_from_powershell_command(&case.command, &ctx)
+            .unwrap_or_else(|e| panic!("{}: must build: {e}", case.class));
         let json = serde_json::to_value(&record).expect("serialize ActionRecord");
         assert_eq!(json["surface"], "command", "{}", case.class);
         assert_eq!(json["risk"], case.risk.as_str(), "{}", case.class);

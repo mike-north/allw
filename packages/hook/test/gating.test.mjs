@@ -522,7 +522,7 @@ test("(#374) gateToolCall refuses a command with no program, with the hooks' exa
     approverRootKey: "x".repeat(43),
   };
   for (const toolName of ["Bash", "Monitor"]) {
-    for (const command of ["", "   ", "\t\n\t", "'' rm -rf x"]) {
+    for (const command of ["", "   ", "\t\n\t", "\r", "'' rm -rf x", "FOO=1", "FOO=1; &&", "|"]) {
       const gate = gateToolCall(wasm, toolName, { command }, "/repo");
       const label = `${toolName} ${JSON.stringify(command)}`;
       assert.equal(gate.kind, "build-error", label);
@@ -543,6 +543,29 @@ test("(#374) gateToolCall refuses a command with no program, with the hooks' exa
   }
   // A command with a program still gates.
   assert.equal(gateToolCall(wasm, "Bash", { command: "rm -rf x" }, "/repo").kind, "gated");
+});
+
+test("(#376) gateToolCall(PowerShell) refuses a line that runs no program, from the core", async () => {
+  const wasm = await loadWasm();
+  const prefix =
+    "allw: could not build an ActionRecord for the PowerShell command (fail-closed deny): " +
+    "action_from_powershell_command failed: ";
+  for (const [command, message] of [
+    ["", "command line contains no command"],
+    [" \t\r\n", "command line contains no command"],
+    ["$env:FOO=1", "command line runs no program (only variable assignments or shell operators)"],
+    ["; &&", "command line runs no program (only variable assignments or shell operators)"],
+    ["& ''", "command line's first program word is empty"],
+  ]) {
+    const gate = gateToolCall(wasm, "PowerShell", { command }, "C:\\w");
+    assert.equal(gate.kind, "build-error", JSON.stringify(command));
+    assert.equal(gate.reason, `${prefix}${message}`, JSON.stringify(command));
+  }
+  // A line that may run something still gates.
+  assert.equal(
+    gateToolCall(wasm, "PowerShell", { command: "$x = Get-Item a" }, "C:\\w").kind,
+    "gated",
+  );
 });
 
 test("(#374) commandBuildFailureReason recognises the SDK's error by name and reason, not instanceof", async () => {

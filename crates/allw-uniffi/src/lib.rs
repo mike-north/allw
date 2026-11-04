@@ -150,6 +150,9 @@ fn decode_b64_vec(value: &str, what: &str) -> Result<Vec<u8>, AllwFfiError> {
 /// (`docs/openclaw-integration.md` §5.1). `raw` carries the original command text (empty string
 /// when the caller has none) and is used only to record `syntactic.raw` and extract `env_refs`
 /// names; it is never re-tokenized. `cwd` is the bound working directory, empty when unbound.
+///
+/// Fails (fail-closed) for an argv with no program (#376): empty, an empty program word, or only
+/// variable assignments.
 #[uniffi::export]
 pub fn action_from_argv_json(
     argv: Vec<String>,
@@ -159,10 +162,16 @@ pub fn action_from_argv_json(
     let ctx = CommandContext {
         cwd: if cwd.is_empty() { None } else { Some(cwd) },
     };
-    let action = core_action_from_argv(&argv, if raw.is_empty() { None } else { Some(&raw) }, &ctx);
+    let action = core_action_from_argv(&argv, if raw.is_empty() { None } else { Some(&raw) }, &ctx)
+        .map_err(|e| AllwFfiError::failure(format!("failed to build command action: {e}")))?;
     to_json(&action, "ActionRecord")
 }
 
+/// Builds an [`ActionRecord`] from a raw shell command line, returning it as JSON.
+///
+/// Fails (fail-closed) for invalid shell syntax and for a line that runs no program (#376): blank,
+/// only variable assignments or shell operators, or an empty program word. The caller must deny,
+/// never ask a human to approve the line.
 #[uniffi::export]
 pub fn action_from_command_json(command: String, cwd: String) -> Result<String, AllwFfiError> {
     let ctx = CommandContext {
@@ -484,6 +493,45 @@ pub fn escape_for_display(text: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The native binding inherits the core's no-program refusal (#376): a blank line, a line of
+    /// only assignments or operators, and an empty program word all fail instead of building a
+    /// record.
+    #[test]
+    fn action_from_command_json_refuses_a_line_that_runs_no_program() {
+        for (line, message) in [
+            ("", "contains no command"),
+            ("   ", "contains no command"),
+            ("FOO=1", "runs no program"),
+            ("&&", "runs no program"),
+            ("'' rm -rf x", "first program word is empty"),
+        ] {
+            let err = action_from_command_json(line.to_string(), String::new())
+                .expect_err("a line that runs no program must be refused");
+            assert!(err.to_string().contains(message), "{line:?}: {err}");
+        }
+        assert!(action_from_command_json("ls".to_string(), String::new()).is_ok());
+    }
+
+    /// The argv binding inherits the core's no-program refusal too (#376).
+    #[test]
+    fn action_from_argv_json_refuses_an_argv_with_no_program() {
+        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (argv, message) in [
+            (words(&[]), "contains no command"),
+            (words(&[""]), "first program word is empty"),
+            (
+                words(&["", "rm", "-rf", "x"]),
+                "first program word is empty",
+            ),
+            (words(&["FOO=1"]), "runs no program"),
+        ] {
+            let err = action_from_argv_json(argv.clone(), "rm -rf x".to_string(), String::new())
+                .expect_err("an argv with no program must be refused");
+            assert!(err.to_string().contains(message), "{argv:?}: {err}");
+        }
+        assert!(action_from_argv_json(words(&["ls"]), String::new(), String::new()).is_ok());
+    }
 
     /// A valid 32-byte seed decodes into a `Zeroizing<[u8; 32]>` whose bytes match the input.
     /// The return type itself is the proof the scrubbing wrapper is wired (issue #90): if the

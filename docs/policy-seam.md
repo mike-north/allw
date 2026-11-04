@@ -155,7 +155,8 @@ raw line as bash would; §v1 command risk below lists the rules and their limits
 - Policy matching. A `{ bin: "ls" }` any-args allow rule still matches `ls && rm -rf /`. Making the matcher fail
   closed on compound lines is an open policy-seam decision (#272).
 
-`action_from_argv` records an argv run without a shell, so its words are never read as shell syntax.
+`action_from_argv` records an argv run without a shell, so its words are never read as shell syntax. (Both
+builders refuse a line or argv that runs no program; see §Command lines that run no program.)
 
 **PowerShell lines** (Claude Code's `PowerShell` tool, #298) are also `command` records, built by the core's
 `action_from_powershell_command` (decided 2026-11-03). `raw` is the exact line and argv is **always** a plain
@@ -174,7 +175,8 @@ ignored (`'-enc'`, `-"enc"`, `-e''nc`, #328), or dot-sourcing (a leading `.`
 word, or `.` directly followed by a quoted or variable path such as `.'x.ps1'`). There is no PowerShell field on the
 record and no schema change: surfaces label the line for the human in the summary (`PowerShell: <command>`). The
 other substrate fields come from the command builder's T1 scans of the tokens and `raw`, so they can disagree with
-PowerShell: for example `$env:PATH` records `env` in `env_refs`. `raw` is authoritative.
+PowerShell: for example `$env:PATH` records `env` in `env_refs`. `raw` is authoritative. A line that runs no program (blank, only separators or
+literal assignments, an empty-string program) is refused instead (§Command lines that run no program, #376).
 
 ### Forward-compat requirements on `allw-core` v1 (cheap now, painful later)
 
@@ -301,6 +303,65 @@ policy-matcher rule for prefixed commands first (see #268).
 
 Shared Rust ↔ WASM vectors are in `crates/allw-core/tests/fixtures/command_risk_vectors.json` (argv rules) and
 `command_line_risk_vectors.json` (command lines).
+
+### Command lines that run no program
+
+The core refuses, with a typed error, a command line or argv that runs nothing a human could meaningfully approve,
+instead of building a record with no program (#376). The refusal lives in the core builders, so every surface inherits it:
+the hooks, the SDK, the OpenClaw bridge, native (UniFFI) callers and third-party integrators. Like every other
+builder error it is fail-closed: the caller denies, and no human is asked.
+
+`action_from_command` (`CommandError`, `crates/allw-core/src/command.rs`):
+
+| Code (`CommandError::code`) | When                                                                                     | Examples                           |
+| --------------------------- | ---------------------------------------------------------------------------------------- | ---------------------------------- |
+| `no_command`                | the line is blank (empty, or only whitespace by Unicode's definition), or only a comment | `""`, `"  \t"`, `"\r"`, `# x`      |
+| `no_program`                | every word is a pure variable assignment or a control operator                           | `FOO=1`, `FOO=1; BAR=2`, `&&`, `;` |
+| `empty_program`             | the first word that is neither is the empty string                                       | `''`, `'' rm -rf x`, `FOO=1 "" ls` |
+
+The check reads the tokens only. Each word is split on `;`, `&`, `|`, `(`, `)`; an empty piece (an operator) or a
+pure assignment (`NAME=…`, `NAME+=…`, `A[0]=…`, with no backtick, `<` or `>` in it) is skipped, and any other piece
+is a program, so the line is built. A substitution or a redirection therefore always counts as running something
+(`FOO=$(id)` and `> out.txt` are built and go to a human).
+
+**What the refusal guarantees.** It never refuses a line whose first command word runs. It can refuse a line where
+the shell would still run something, and that is deliberate: every refusal is a deny, so it fails closed.
+
+- Only the words up to the first program word are read, so a later segment after an empty program word is not
+  examined: `'' || rm -rf x` and `'' ; rm -rf x` are refused (`empty_program`).
+- `shlex` drops quotes, so a quoted operator or assignment (`';'`, `'FOO=1'`) is read as unquoted, though bash would
+  run it as a program name.
+- An assignment is recognised by its first character only, so `FO-O=1` is refused, though bash would run it as a
+  program name.
+
+**`action_from_argv`** (a canonical, pre-tokenized argv, such as the OpenClaw bridge's `systemRunPlan.argv` or a
+native caller's) is fallible with the same `CommandError`, whatever `raw` says: an empty argv is `no_command`; leading
+pure assignments are skipped, then an empty word is `empty_program` (`[""]`, `["", "rm", "-rf", "x"]`,
+`["FOO=1", ""]`); only assignments is `no_program` (`["FOO=1"]`). Words are not split on operators, because an argv
+runs without a shell: `["&&"]` names a program and is built. Assignments are treated as the line builder treats them
+(and as the risk rules skip them), although without a shell `FOO=1` would be a program name: no real program is
+named like an assignment, so refusing it fails closed and keeps the two builders consistent (decided for #376).
+
+`action_from_powershell_command` is fallible with the same `CommandError`, and refuses only these (no PowerShell line
+is refused for its syntax). Quoting is not interpreted. The raw line is read line by line; a `#` that starts a token
+begins a comment, which is dropped up to the end of its line. The rest is split on `;`, `|`, `&`, `(`, `)`, and the
+trimmed pieces are read in order. Empty pieces and a variable assigned a literal (`$env:FOO=1`, `$x = 'a'`,
+`$x = -2.5`: a quoted string with no quote, `$` or backtick inside, or a plain number) are skipped. A piece whose
+first word is `''` or `""` (including after the call operator, `& ''`) is `empty_program`. Any other piece may run
+something, so the line is built. A bareword value runs a command in PowerShell (`$x = notepad`), so it is not a
+literal. A line that is blank once comments are dropped (`# rm -rf x`) is `no_command`. A `<#` block comment is not
+recognised: `<# x #> Remove-Item x` is built, and so is a bare `<# x #>` line, which then goes to a human (that
+fails toward asking, never toward allowing). As on POSIX, later statements after the first one that is neither
+skipped nor built are not examined, so `'' ; Remove-Item x` is refused (a deliberate deny).
+
+The WASM bindings throw an `Error` whose own `kind` property is the code (callers classify on it, never on the
+message); UniFFI fails with the core message. The SDK maps the codes to its `CommandActionError` reasons:
+`commandActionFromLine` to `command_line_empty`, `command_line_no_program` and `argv_program_empty`, and
+`commandAction` to `argv_empty`, `argv_no_program` and `argv_program_empty`. `commandAction` still validates an
+argv first, so an empty argv or an empty `argv[0]` is refused before the core is called, as before; the only change
+there is that an all-assignment argv is now refused (`argv_no_program`). The SDK and the hooks keep their own checks
+on the record as defence in depth, with the same messages. The shared Rust ↔ WASM vector is
+`crates/allw-core/tests/fixtures/command_refusal_vector.json`.
 
 ---
 
