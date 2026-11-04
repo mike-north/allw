@@ -139,9 +139,11 @@ no vouch.
   encryption key;
 - the relay's account states don't verify, disagree, or are older than the keyfile has seen, or the
   id is revoked or already listed with other keys (a key change is a rotation, #199's job);
-- the device carries **this keyfile's own keys**, so the new state would replace this keyfile's
-  device (a web approver set up from the keyfile, still on a device id from before a re-pair). Use
-  `pair` for this device and paste the keyfile's current values into that browser;
+- the pasted encryption key **or** signing key is **this keyfile's own**, under any device id
+  (typically a web approver set up from the keyfile). Those are the CLI's own keys: use `pair`, and
+  paste the keyfile's current values into that browser;
+- the new state would replace this keyfile's device for any other reason (the account state lists
+  this keyfile's device id with the pasted keys);
 - you don't answer `y`.
 
 Before asking, it prints the device id, the relay's label for it, and a fingerprint of each key:

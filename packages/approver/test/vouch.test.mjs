@@ -280,6 +280,60 @@ test("vouch shows every id the new state replaces and its recipients before aski
   );
 });
 
+for (const [kind, ownField] of [
+  ["encryption", "encryptionPubkey"],
+  ["signing", "signingPubkey"],
+]) {
+  test(`vouch refuses when only the pasted ${kind} key is this keyfile's own (#381)`, async () => {
+    await withSetup(async ({ wasm, keyfilePath, keyfile, phone, relay, log }) => {
+      const own = {
+        encryptionPubkey: keyfile.device_encryption_pubkey,
+        signingPubkey: keyfile.device_signing_pubkey,
+      };
+      // The phone's keys, except one taken from this keyfile.
+      const pasted = { ...phone, [ownField]: own[ownField] };
+      const ask = confirmer(true);
+      await assert.rejects(
+        () => runVouch(wasm, { keyfilePath, deviceId: PHONE_DEVICE_ID, ...pasted }, ask, log),
+        (err) => {
+          assert.match(err.message, /these are this keyfile's own keys — use pair/);
+          assert.match(err.message, new RegExp(`pasted ${kind} key matches`));
+          return true;
+        },
+      );
+      assert.equal(ask.asked.length, 0, "refused before asking");
+      assert.deepEqual(relay.requests, [], "refused before contacting the relay");
+      assertNothingChanged(relay, keyfilePath);
+    });
+  });
+}
+
+test("vouch refuses a state that would replace this keyfile's device, even with other keys (review-387 F1)", async () => {
+  // Defence in depth behind the own-keys check: the state lists this keyfile's device id with the
+  // phone's keys (not the keyfile's), so the pasted keys are not this keyfile's own, but composing
+  // would still replace this keyfile's device. That is refused too.
+  await withSetup(
+    async ({ wasm, keyfilePath, phone, relay, log }) => {
+      const ask = confirmer(true);
+      await assert.rejects(
+        () => runVouch(wasm, vouchOptions(keyfilePath, phone), ask, log),
+        /lists for this keyfile's device dev-cli: vouching it would replace this keyfile's device.*Use pair/s,
+      );
+      assert.equal(ask.asked.length, 0, "refused before asking");
+      assertNothingChanged(relay, keyfilePath);
+    },
+    (phone) => [registered(PHONE_DEVICE_ID, phone)],
+    (_keyfile, phone) => [
+      {
+        device_id: CLI_DEVICE_ID,
+        encryption_pubkey: phone.encryptionPubkey,
+        signing_pubkey: phone.signingPubkey,
+        status: "active",
+      },
+    ],
+  );
+});
+
 test("vouch refuses a device carrying this keyfile's own keys under a stale id (review-387 F1)", async () => {
   // After a re-pair the state lists the CLI under its current id, but the relay still registers
   // the old id with the same keys. A browser set up from the keyfile before the re-pair shows that
@@ -301,9 +355,10 @@ test("vouch refuses a device carrying this keyfile's own keys under a stale id (
             ask,
             log,
           ),
-        /has this keyfile's own keys.*replace this keyfile's device dev-cli.*Use pair/s,
+        /these are this keyfile's own keys — use pair/,
       );
       assert.equal(ask.asked.length, 0, "refused before asking");
+      assert.deepEqual(relay.requests, [], "refused before contacting the relay");
       assertNothingChanged(relay, keyfilePath);
       assert.deepEqual(
         relay.published().devices.map((d) => d.device_id),
@@ -423,10 +478,10 @@ test("vouch escapes the relay's label before showing it (#381)", async () => {
       await runVouch(wasm, vouchOptions(keyfilePath, phone), confirmer(true), log);
       const text = lines.join("\n");
       assert.ok(!text.includes("\u001b"), "no raw escape character reaches the terminal");
-      assert.ok(!text.includes("‮"), "no raw bidi override reaches the terminal");
+      assert.ok(!text.includes("\u202e"), "no raw bidi override reaches the terminal");
       assert.match(text, /relay label: +.*\\x1b/, "the escape is shown in core notation");
     },
-    (phone) => [registered(PHONE_DEVICE_ID, phone, "phone\u001b[2J‮evil")],
+    (phone) => [registered(PHONE_DEVICE_ID, phone, "phone\u001b[2J\u202eevil")],
   );
 });
 

@@ -121,6 +121,17 @@ export interface AllwWasm {
     encryption_pubkey_b64: string,
     signing_pubkey_b64: string,
   ): void;
+  /**
+   * Which of the device's keys equal the other key pair's, compared as parsed 32-byte keys: a JSON
+   * array of `"encryption"` / `"signing"`, `[]` for none (#381). Throws on invalid device material.
+   */
+  shared_device_keys(
+    device_id: string,
+    encryption_pubkey_b64: string,
+    signing_pubkey_b64: string,
+    other_encryption_pubkey_b64: string,
+    other_signing_pubkey_b64: string,
+  ): string;
   /** The core's 128-bit fingerprint of a device key: eight groups of four hex digits (#381). */
   device_key_fingerprint(kind: "encryption" | "signing", key_b64: string): string;
   /**

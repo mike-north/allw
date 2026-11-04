@@ -17,15 +17,18 @@
  * 1. Require an interactive terminal. A device is never vouched for unseen, so there is no
  *    `--yes`.
  * 2. Load the paired keyfile, which holds the account root. Check the pasted device id and keys in
- *    the core (`check_device_enrollment`).
+ *    the core (`check_device_enrollment`). Refuse if either pasted key is **this keyfile's own**
+ *    (the core compares the parsed keys with the ones it derives from the keyfile's seeds): such a
+ *    device is the keyfile's own device, or a copy of its secrets, under whatever id it shows, and
+ *    `pair` is the tool for it.
  * 3. Fetch the relay's device registry. Refuse if the relay never registered the id, or
  *    registered it with a different encryption key. The registry holds no signing key, so the
  *    signing key is covered only by the human's fingerprint comparison in step 5.
  * 4. Have the core compose the next account state (`next_account_state`, #379). This refuses a
  *    rollback, disagreeing documents, a revoked id, or an id already listed with other keys.
  *    Refuse, too, if the composition would replace **this keyfile's own device** (#378: same keys
- *    under another id): the device holds the CLI's keys, so it is this keyfile's device under a
- *    stale id, and vouching it would stop the CLI decrypting. `pair` is the tool for it.
+ *    under another id), which would stop the CLI decrypting. Step 2 already refuses the keyfile's
+ *    own keys; this also covers a state that lists this keyfile's device id with other keys.
  * 5. Show the device id, the relay's label for it, both key fingerprints, every id the new state
  *    replaces, the new sequence and the resulting recipients, all escaped by the core, and ask for
  *    confirmation. The human compares the device's values with what the device itself shows.
@@ -105,6 +108,21 @@ export async function runVouch(
   const accountId = wasm.account_id_for_root(keyfile.account_root_pubkey);
 
   wasm.check_device_enrollment(options.deviceId, options.encryptionPubkey, options.signingPubkey);
+  const ownKeys = JSON.parse(
+    wasm.shared_device_keys(
+      options.deviceId,
+      options.encryptionPubkey,
+      options.signingPubkey,
+      wasm.x25519_public_key(keyfile.device_encryption_seed),
+      wasm.ed25519_public_key(keyfile.device_signing_seed),
+    ),
+  ) as string[];
+  if (ownKeys.length > 0) {
+    throw new Error(
+      `the pasted ${ownKeys.join(" and ")} key${ownKeys.length > 1 ? "s match" : " matches"} ` +
+        `this keyfile's: these are this keyfile's own keys — use pair`,
+    );
+  }
 
   const registry = await fetchDeviceRegistry(relayUrl, accountId);
   const registered = registry.find((d) => d.device_id === options.deviceId);
@@ -128,9 +146,9 @@ export async function runVouch(
   });
   if (keyfile.device_id !== undefined && draft.replacedDeviceIds.includes(keyfile.device_id)) {
     throw new Error(
-      `device ${options.deviceId} has this keyfile's own keys: vouching it would replace this ` +
-        `keyfile's device ${keyfile.device_id}, and the CLI would stop decrypting. Use pair for ` +
-        `this device, and paste this keyfile's current values into a web approver set up from it`,
+      `device ${options.deviceId} has the keys the account state lists for this keyfile's ` +
+        `device ${keyfile.device_id}: vouching it would replace this keyfile's device, and the ` +
+        `CLI would stop decrypting. Use pair for this device`,
     );
   }
 
