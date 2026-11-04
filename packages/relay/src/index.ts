@@ -940,6 +940,12 @@ export class AccountRelay extends DurableObject<Env> {
     // The Worker forwards the full path; its first segment is the account id, and every route
     // matches the rest exactly (`routes.ts`, #302).
     const accountId = url.pathname.split("/")[1] ?? "";
+    // The path's account id must be this object's own identity. The Worker routes by that id, but a
+    // stub's `fetch` takes any URL, so a mismatched request would otherwise be answered as the
+    // path's account over this object's storage (#373).
+    if (accountId === "" || !this.ctx.id.equals(this.env.ACCOUNT.idFromName(accountId))) {
+      return json({ error: "not found" }, 404);
+    }
     const method = request.method.toUpperCase();
     const route = resolveAccountRoute(method, accountSubPathSegments(url.pathname));
 

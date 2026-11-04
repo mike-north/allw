@@ -427,7 +427,8 @@ describe("POST /requests expires_at horizon", () => {
 
   it("the Durable Object reads MAX_REQUEST_TTL_MS from its env", async () => {
     // Construct directly over the runtime's own state (the base class needs a real one) so the
-    // env → horizon wiring is checked end to end.
+    // env → horizon wiring is checked end to end. These extra instances are not side-effect free:
+    // each runs `initSchema` and arms alarms against that account's real storage (both idempotent).
     await runInDurableObject(
       stubFor("acct-ttl-env"),
       (_instance: AccountRelay, state: DurableObjectState) => {

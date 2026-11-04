@@ -319,10 +319,14 @@ async function withRelayOverStubState<T>(
         vi.spyOn(realState, "getWebSockets").mockImplementation(state.getWebSockets),
       state.getTags && vi.spyOn(realState, "getTags").mockImplementation(state.getTags),
     ];
+    const realSql = relay["sql"];
+    const realNow = relay["now"];
     relay["sql"] = stubSql.storage.sql;
     try {
       return await body(relay);
     } finally {
+      relay["sql"] = realSql;
+      relay["now"] = realNow;
       for (const spy of spies) spy?.mockRestore();
     }
   });
