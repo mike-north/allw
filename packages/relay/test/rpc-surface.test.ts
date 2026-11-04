@@ -56,6 +56,7 @@ function classMembers(): Member[] {
   const start = source.indexOf("export class AccountRelay");
   const end = source.indexOf("\n}\n", start);
   expect(start).toBeGreaterThan(-1);
+  expect(end).toBeGreaterThan(start);
   return membersOf(source.slice(start, end).split("\n").slice(1).join("\n"));
 }
 
