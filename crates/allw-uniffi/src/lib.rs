@@ -163,6 +163,11 @@ pub fn action_from_argv_json(
     to_json(&action, "ActionRecord")
 }
 
+/// Builds an [`ActionRecord`] from a raw shell command line, returning it as JSON.
+///
+/// Fails (fail-closed) for invalid shell syntax and for a line that runs no program (#376): blank,
+/// only variable assignments or shell operators, or an empty program word. The caller must deny,
+/// never ask a human to approve the line.
 #[uniffi::export]
 pub fn action_from_command_json(command: String, cwd: String) -> Result<String, AllwFfiError> {
     let ctx = CommandContext {
@@ -484,6 +489,25 @@ pub fn escape_for_display(text: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The native binding inherits the core's no-program refusal (#376): a blank line, a line of
+    /// only assignments or operators, and an empty program word all fail instead of building a
+    /// record.
+    #[test]
+    fn action_from_command_json_refuses_a_line_that_runs_no_program() {
+        for (line, message) in [
+            ("", "contains no command"),
+            ("   ", "contains no command"),
+            ("FOO=1", "runs no program"),
+            ("&&", "runs no program"),
+            ("'' rm -rf x", "first program word is empty"),
+        ] {
+            let err = action_from_command_json(line.to_string(), String::new())
+                .expect_err("a line that runs no program must be refused");
+            assert!(err.to_string().contains(message), "{line:?}: {err}");
+        }
+        assert!(action_from_command_json("ls".to_string(), String::new()).is_ok());
+    }
 
     /// A valid 32-byte seed decodes into a `Zeroizing<[u8; 32]>` whose bytes match the input.
     /// The return type itself is the proof the scrubbing wrapper is wired (issue #90): if the

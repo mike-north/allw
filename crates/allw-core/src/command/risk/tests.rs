@@ -126,7 +126,9 @@ fn append_and_array_assignments_do_not_hide_program() {
 #[test]
 fn assignment_before_low_program_is_medium() {
     assert_eq!(line_risk("X=1 ls"), Risk::Medium);
-    assert_eq!(line_risk("FOO=bar"), Risk::Medium);
+    // A bare `FOO=bar` runs no program, so the builder refuses it (#376); its argv tier is still
+    // at least Medium.
+    assert_eq!(argv_of(&["FOO=bar"]), Risk::Medium);
 }
 
 /// Negative: a word whose name doesn't start like an identifier is the command, not skipped.

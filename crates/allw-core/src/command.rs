@@ -138,12 +138,37 @@ pub struct CommandContext {
 // ── Error ─────────────────────────────────────────────────────────────────────
 
 /// Errors that can occur when building an [`ActionRecord`] from a command string.
+///
+/// Every variant is a **refusal**: the caller must deny (fail-closed), never ask a human to approve
+/// the line. The last three are the "no program" refusals (#376): a line that runs nothing a human
+/// could meaningfully approve is refused here, in the core, so every surface inherits the refusal
+/// (`docs/policy-seam.md` §Command lines that run no program).
 #[derive(Debug, PartialEq)]
 pub enum CommandError {
     /// The command string has unmatched quotes or other shell-tokenization errors.
     ///
     /// Use [`action_from_argv`] if you already have a pre-tokenized argv.
     InvalidShellSyntax,
+    /// The line holds no words at all: empty, whitespace only, or only a comment.
+    NoCommand,
+    /// The line has words, but none of them is a program: only variable assignments (`FOO=1`)
+    /// and/or shell control operators (`;`, `&&`, `|`, …).
+    NoProgram,
+    /// The line's first program word is the empty string (`''`, `'' rm -rf x`, `FOO=1 "" ls`).
+    EmptyProgram,
+}
+
+impl CommandError {
+    /// A stable, machine-readable code for the refusal. Surfaces classify on this, never on the
+    /// human-readable message (the WASM binding exposes it as the thrown error's `kind`).
+    pub fn code(&self) -> &'static str {
+        match self {
+            CommandError::InvalidShellSyntax => "invalid_shell_syntax",
+            CommandError::NoCommand => "no_command",
+            CommandError::NoProgram => "no_program",
+            CommandError::EmptyProgram => "empty_program",
+        }
+    }
 }
 
 impl std::fmt::Display for CommandError {
@@ -155,6 +180,14 @@ impl std::fmt::Display for CommandError {
                     "command string has unmatched quotes or invalid shell syntax"
                 )
             }
+            CommandError::NoCommand => write!(f, "command line contains no command"),
+            CommandError::NoProgram => write!(
+                f,
+                "command line runs no program (only variable assignments or shell operators)"
+            ),
+            CommandError::EmptyProgram => {
+                write!(f, "command line's first program word is empty")
+            }
         }
     }
 }
@@ -165,9 +198,19 @@ impl std::error::Error for CommandError {}
 
 /// Build an [`ActionRecord`] from a raw shell command string.
 ///
-/// The string is tokenized using POSIX word-splitting (via [`shlex`]).  Returns
-/// [`CommandError::InvalidShellSyntax`] if the string has unmatched quotes or other
-/// tokenization errors.
+/// The string is tokenized using POSIX word-splitting (via [`shlex`]).
+///
+/// # Errors
+///
+/// - [`CommandError::InvalidShellSyntax`] if the string has unmatched quotes or other
+///   tokenization errors.
+/// - [`CommandError::NoCommand`] if it is blank (empty, or only whitespace by Unicode's
+///   definition) or tokenizes to no words (only a comment).
+/// - [`CommandError::NoProgram`] if every word is a variable assignment or a control operator.
+/// - [`CommandError::EmptyProgram`] if the first program word is the empty string.
+///
+/// The last three are checked by `check_runs_a_program` on the tokens; see
+/// `docs/policy-seam.md` §Command lines that run no program.
 ///
 /// # Examples
 ///
@@ -179,7 +222,16 @@ pub fn action_from_command(
     command_line: &str,
     ctx: &CommandContext,
 ) -> Result<ActionRecord, CommandError> {
+    // A line that is blank to the eye is refused before tokenizing. `shlex` (like bash) does not
+    // split on every whitespace character (`\r`, U+00A0), so a "blank" line could otherwise tokenize
+    // to a word made only of whitespace, which a human would see as nothing.
+    if command_line.trim().is_empty() {
+        return Err(CommandError::NoCommand);
+    }
     let argv = shlex::split(command_line).ok_or(CommandError::InvalidShellSyntax)?;
+    // Refuse a line that runs no program before building anything: a human must never be asked to
+    // approve nothing (#376).
+    check_runs_a_program(&argv)?;
     // A command line can hold more than one command (`ls && rm -rf /`). `bin` / `argv` / `flags`
     // / `positionals` still describe the word list, but risk covers every command a shell would
     // run (`risk` module).
@@ -220,6 +272,61 @@ pub fn action_from_argv(argv: &[String], raw: Option<&str>, ctx: &CommandContext
     // The argv runs without a shell, so `raw` is display text and is not read for risk.
     let risk = risk::argv_risk(argv);
     build_record(argv.to_vec(), ctx, raw.map(str::to_string), risk)
+}
+
+// ── No-program refusal ───────────────────────────────────────────────────────
+
+/// The characters bash reads as (part of) a control operator: `;`, `&`, `|`, `(`, `)`. A tokenized
+/// word is split on these to find what it holds, because `shlex` keeps `FOO=1;ls` as one word.
+const CONTROL_OPERATOR_CHARS: [char; 5] = [';', '&', '|', '(', ')'];
+
+/// Characters that make an assignment word run something or touch a file: a command or process
+/// substitution (`` ` ``, `$(`, `<(`, `>(`) or a redirection (`<`, `>`). A word containing one is
+/// never a *pure* assignment, so a line holding it is not refused as running no program.
+const ASSIGNMENT_EFFECT_CHARS: [char; 3] = ['`', '<', '>'];
+
+/// Is `piece` a pure shell variable assignment (`NAME=value`, `NAME+=value`, `A[0]=value`), one
+/// that runs nothing? The name must start with a letter or `_`; the value must hold no
+/// [`ASSIGNMENT_EFFECT_CHARS`] (`$(` and `<(` are already split apart on their `(`).
+fn is_pure_assignment(piece: &str) -> bool {
+    piece
+        .split_once('=')
+        .is_some_and(|(name, _)| name.bytes().next().is_some_and(is_ident_start))
+        && !piece.contains(ASSIGNMENT_EFFECT_CHARS)
+}
+
+/// Refuse a tokenized command line that runs no program (#376):
+///
+/// - no words at all → [`CommandError::NoCommand`];
+/// - the first word that is not a pure assignment or a control operator is the empty string →
+///   [`CommandError::EmptyProgram`];
+/// - no such word → [`CommandError::NoProgram`].
+///
+/// Each word is split on [`CONTROL_OPERATOR_CHARS`]; an empty piece (an operator) or a
+/// [pure assignment](is_pure_assignment) is skipped, and any other piece is a program. This reads
+/// the tokens only; it does not change them or the record.
+///
+/// It can only refuse a line that runs nothing. `shlex` removes quotes, so a quoted operator or
+/// assignment (`';'`, `'FOO=1'`) is read as unquoted; but bash runs such a word as a program name
+/// that does not exist, so refusing it denies nothing that would run. Anything that does run (a
+/// program word, a substitution, a redirection such as `> f`) leaves a piece that is not skipped,
+/// so the line is built and goes to a human as before.
+fn check_runs_a_program(argv: &[String]) -> Result<(), CommandError> {
+    if argv.is_empty() {
+        return Err(CommandError::NoCommand);
+    }
+    for word in argv {
+        if word.is_empty() {
+            return Err(CommandError::EmptyProgram);
+        }
+        let runs_something = word
+            .split(CONTROL_OPERATOR_CHARS)
+            .any(|piece| !piece.is_empty() && !is_pure_assignment(piece));
+        if runs_something {
+            return Ok(());
+        }
+    }
+    Err(CommandError::NoProgram)
 }
 
 // ── Core builder ─────────────────────────────────────────────────────────────
@@ -668,38 +775,136 @@ mod tests {
         assert_eq!(r, back, "ActionRecord must survive a serde JSON round-trip");
     }
 
-    // ── Edge case: empty command string ─────────────────────────────────────
+    // ── Refusal: a line that runs no program (#376) ─────────────────────────
 
-    /// An empty command string tokenizes to an empty argv (shlex returns `Some([])`).
-    /// The builder returns an ActionRecord with all command fields None (no bin, no argv,
-    /// no flags, no positionals) and risk Medium.
-    #[test]
-    fn empty_command_string_returns_record_with_no_fields() {
-        let r = action_from_command("", &ctx_no_cwd()).unwrap();
-
-        assert!(
-            r.syntactic.bin.is_none(),
-            "empty command → bin must be None"
-        );
-        assert!(
-            r.syntactic.argv.is_none(),
-            "empty command → argv must be None"
-        );
-        assert!(
-            r.syntactic.flags.is_none(),
-            "empty command → flags must be None"
-        );
-        assert!(
-            r.syntactic.positionals.is_none(),
-            "empty command → positionals must be None"
-        );
+    /// Builds `line` and asserts the core refuses it with `expected` — no record is produced, so no
+    /// surface can ask a human to approve it.
+    fn assert_refused(line: &str, expected: CommandError) {
         assert_eq!(
-            r.risk,
-            Risk::Medium,
-            "empty command defaults to Risk::Medium"
+            action_from_command(line, &ctx_no_cwd()),
+            Err(expected),
+            "{line:?} must be refused"
         );
-        assert!(r.capabilities.is_none());
-        assert!(r.scope.is_none());
+    }
+
+    #[test]
+    fn empty_command_string_is_refused_as_no_command() {
+        assert_refused("", CommandError::NoCommand);
+    }
+
+    #[test]
+    fn whitespace_only_command_is_refused_as_no_command() {
+        for line in [
+            " ",
+            "   ",
+            "\t",
+            "\n",
+            "\r",
+            " \t\r\n ",
+            "\u{a0}",
+            "\u{2003}\u{3000}",
+        ] {
+            assert_refused(line, CommandError::NoCommand);
+        }
+    }
+
+    #[test]
+    fn comment_only_command_is_refused_as_no_command() {
+        assert_refused("# rm -rf /", CommandError::NoCommand);
+    }
+
+    #[test]
+    fn assignment_only_command_is_refused_as_no_program() {
+        for line in [
+            "FOO=1",
+            "FOO=",
+            "FOO=1 BAR=2",
+            "_X=1",
+            "X+=1",
+            "A[0]=1",
+            "FOO=$BAR",
+            "FOO=1;",
+            "FOO=1 && BAR=2",
+        ] {
+            assert_refused(line, CommandError::NoProgram);
+        }
+    }
+
+    #[test]
+    fn operator_only_command_is_refused_as_no_program() {
+        for line in [";", "&&", "||", "|", "&", ";;", "( )", "; && |", "&&&"] {
+            assert_refused(line, CommandError::NoProgram);
+        }
+    }
+
+    #[test]
+    fn empty_program_word_is_refused_as_empty_program() {
+        for line in [
+            "''",
+            "\"\"",
+            "'' rm -rf x",
+            "\"\" ls",
+            "FOO=1 '' rm -rf x",
+            "&& '' rm",
+            "FOO=1; \"\"",
+        ] {
+            assert_refused(line, CommandError::EmptyProgram);
+        }
+    }
+
+    /// The refusal reads only what runs nothing: a line with a program word, a substitution or a
+    /// redirection anywhere is still built (and goes to a human), never refused.
+    #[test]
+    fn a_line_that_runs_something_is_not_refused() {
+        for line in [
+            "ls",
+            "FOO=1 ls",
+            "FOO=1; ls",
+            "FOO=1;ls",
+            "FOO=1 && rm -rf x",
+            "ls ''",
+            "FOO=$(rm -rf ~)",
+            "FOO=$(id)",
+            "FOO=`id`",
+            "FOO=<(id)",
+            "> out.txt",
+            "FOO=1 >out.txt",
+            "2>&1",
+            "!",
+            "=1",
+        ] {
+            let result = action_from_command(line, &ctx_no_cwd());
+            assert!(result.is_ok(), "{line:?} runs something: {result:?}");
+        }
+    }
+
+    /// A substitution hidden in an assignment keeps its risk: the line is not refused, and risk
+    /// still covers the command it runs.
+    #[test]
+    fn assignment_with_a_substitution_keeps_its_risk() {
+        let r = action_from_command("FOO=$(rm -rf ~)", &ctx_no_cwd()).unwrap();
+        assert_eq!(r.risk, Risk::High);
+    }
+
+    #[test]
+    fn every_refusal_has_a_distinct_stable_code_and_message() {
+        let all = [
+            CommandError::InvalidShellSyntax,
+            CommandError::NoCommand,
+            CommandError::NoProgram,
+            CommandError::EmptyProgram,
+        ];
+        let codes: HashSet<&str> = all.iter().map(CommandError::code).collect();
+        let messages: HashSet<String> = all.iter().map(ToString::to_string).collect();
+        assert_eq!(codes.len(), all.len());
+        assert_eq!(messages.len(), all.len());
+        assert_eq!(CommandError::NoCommand.code(), "no_command");
+        assert_eq!(CommandError::NoProgram.code(), "no_program");
+        assert_eq!(CommandError::EmptyProgram.code(), "empty_program");
+        assert_eq!(
+            CommandError::InvalidShellSyntax.code(),
+            "invalid_shell_syntax"
+        );
     }
 
     // ── Edge case: invalid shell syntax ──────────────────────────────────────
