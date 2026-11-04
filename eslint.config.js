@@ -47,7 +47,10 @@ export default tseslint.config(
     rules: {
       // Tests reach AccountRelay's private state through element access (`relay["sql"]`), which
       // TypeScript checks against the class (#367); dot access to a private member does not compile.
-      "@typescript-eslint/dot-notation": ["error", { allowPrivateClassPropertyAccess: true }],
+      "@typescript-eslint/dot-notation": [
+        "error",
+        { allowPrivateClassPropertyAccess: true, allowProtectedClassPropertyAccess: true },
+      ],
     },
   },
   {
