@@ -54,11 +54,12 @@ use allw_core::{
     check_account_id_for_root as core_check_account_id_for_root,
     compute_request_hash as core_compute_request_hash, decrypt_context as core_decrypt_context,
     derive_number_match_challenge as core_derive_number_match_challenge,
-    display_model as core_display_model, encrypt_context as core_encrypt_context,
-    escape_for_display as core_escape_for_display, evaluate as core_evaluate,
-    evaluate_for_actor as core_evaluate_for_actor,
+    device_key_fingerprint as core_device_key_fingerprint, display_model as core_display_model,
+    encrypt_context as core_encrypt_context, escape_for_display as core_escape_for_display,
+    evaluate as core_evaluate, evaluate_for_actor as core_evaluate_for_actor,
     is_small_order_x25519_public_key as core_is_small_order_x25519_public_key,
-    issue_device_cert as core_issue_device_cert, revoked_device_ids as core_revoked_device_ids,
+    issue_device_cert as core_issue_device_cert, next_account_state as core_next_account_state,
+    revoked_device_ids as core_revoked_device_ids,
     seal_context_for_account_state as core_seal_context_for_account_state,
     select_recipients as core_select_recipients, sign_account_state as core_sign_account_state,
     sign_actor_attestation as core_sign_actor_attestation,
@@ -77,10 +78,10 @@ use allw_core::{
     verify_verdict_provenance as core_verify_verdict_provenance,
     verify_verdict_with_account_states as core_verify_verdict_with_account_states,
     verify_verdict_with_account_states_for_account as core_verify_verdict_with_account_states_for_account,
-    AccountState, ActionRecord, Actor, ApprovalContext, ApprovalRequest, Approver, CommandContext,
-    ContextRecipient, Decision, PolicyRule, PolicyRuleScope, PublicKey, SigningKeyPair,
-    UnsignedPolicyRule, UnsignedVerdict, Verdict, VerifyError, X25519KeyPair, X25519PublicKey,
-    X25519_SMALL_ORDER_POINTS,
+    AccountState, AccountStateChange, ActionRecord, Actor, ApprovalContext, ApprovalRequest,
+    Approver, CommandContext, ContextRecipient, Decision, DeviceEnrollment, DeviceKeyKind,
+    PolicyRule, PolicyRuleScope, PublicKey, SigningKeyPair, UnsignedPolicyRule, UnsignedVerdict,
+    Verdict, VerifyError, X25519KeyPair, X25519PublicKey, X25519_SMALL_ORDER_POINTS,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::rngs::OsRng;
@@ -969,6 +970,189 @@ fn parse_account_root_pubkey(account_root_pubkey_b64: &str) -> Result<PublicKey,
             "account_root_pubkey_b64 is not a valid Ed25519 key: {e}"
         ))
     })
+}
+
+// ── Root-holder enrollment authoring (#379, #381) ───────────────────────────────────
+
+/// Converts a JS-number account-state sequence to `u64`, refusing anything that is not a
+/// non-negative safe integer.
+fn sequence_from_f64(n: f64, what: &str) -> Result<u64, JsError> {
+    if !n.is_finite() || n.fract() != 0.0 || n < 0.0 || n > JS_MAX_SAFE_INTEGER {
+        return Err(JsError::new(&format!(
+            "{what} must be a non-negative safe integer, got {n}"
+        )));
+    }
+    Ok(n as u64)
+}
+
+/// Validates a device id and its public keys exactly as the core does before vouching for them
+/// (core [`DeviceEnrollment::parse`](allw_core::DeviceEnrollment::parse)): a 1-64 character
+/// base64url-alphabet id, canonical unpadded base64url keys of 32 bytes, a canonical X25519 key
+/// that is not small-order, and a canonical, non-small-order Ed25519 point.
+///
+/// # Errors
+///
+/// Throws naming the first value that fails.
+#[wasm_bindgen]
+pub fn check_device_enrollment(
+    device_id: &str,
+    encryption_pubkey_b64: &str,
+    signing_pubkey_b64: &str,
+) -> Result<(), JsError> {
+    DeviceEnrollment::parse(device_id, encryption_pubkey_b64, signing_pubkey_b64)
+        .map(|_| ())
+        .map_err(|e| JsError::new(&format!("invalid device material: {e}")))
+}
+
+/// Which of a pasted device's keys equal another key pair's (core
+/// [`DeviceEnrollment::shared_key_kinds`](allw_core::DeviceEnrollment::shared_key_kinds)), as a
+/// JSON array of `"encryption"` / `"signing"`; `[]` when neither matches. `allw-approver vouch`
+/// passes the keyfile's own public keys (derived from its seeds by the core) and refuses on any
+/// match (#381). The device's values are validated exactly as [`check_device_enrollment`] does
+/// and compared as parsed 32-byte keys, never as text.
+///
+/// # Errors
+///
+/// Throws if the device material is invalid or either other key does not decode to 32 bytes.
+#[wasm_bindgen]
+pub fn shared_device_keys(
+    device_id: &str,
+    encryption_pubkey_b64: &str,
+    signing_pubkey_b64: &str,
+    other_encryption_pubkey_b64: &str,
+    other_signing_pubkey_b64: &str,
+) -> Result<String, JsError> {
+    let device = DeviceEnrollment::parse(device_id, encryption_pubkey_b64, signing_pubkey_b64)
+        .map_err(|e| JsError::new(&format!("invalid device material: {e}")))?;
+    let other_encryption = decode_b64_32(other_encryption_pubkey_b64, "other_encryption_pubkey")?;
+    let other_signing = decode_b64_32(other_signing_pubkey_b64, "other_signing_pubkey")?;
+    let kinds: Vec<&str> = device
+        .shared_key_kinds(&other_encryption, &other_signing)
+        .into_iter()
+        .map(|kind| match kind {
+            DeviceKeyKind::Encryption => "encryption",
+            DeviceKeyKind::Signing => "signing",
+        })
+        .collect();
+    to_json(&kinds, "shared device keys")
+}
+
+/// The human-comparable fingerprint of a device public key (core
+/// [`device_key_fingerprint`](allw_core::device_key_fingerprint)): 32 lowercase hex digits in
+/// eight space-separated groups of four. `kind` is `"encryption"` (X25519) or `"signing"`
+/// (Ed25519); the kind is bound into the fingerprint.
+///
+/// # Errors
+///
+/// Throws if `kind` is neither value or `key_b64` does not decode to 32 bytes.
+#[wasm_bindgen]
+pub fn device_key_fingerprint(kind: &str, key_b64: &str) -> Result<String, JsError> {
+    let kind = match kind {
+        "encryption" => DeviceKeyKind::Encryption,
+        "signing" => DeviceKeyKind::Signing,
+        other => {
+            return Err(JsError::new(&format!(
+                "kind must be \"encryption\" or \"signing\", got {other:?}"
+            )))
+        }
+    };
+    let key = decode_b64_32(key_b64, "key_b64")?;
+    Ok(core_device_key_fingerprint(kind, &key))
+}
+
+/// A change to the account state, as JavaScript passes it to [`next_account_state`]. Tagged by
+/// `kind` so the enrollment ceremony (#199) can add rotation and revocation without a new export.
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum WasmAccountStateChange {
+    AddDevice {
+        device_id: String,
+        encryption_pubkey: String,
+        signing_pubkey: String,
+    },
+}
+
+/// The result of [`next_account_state`], as JSON. `state_json` is the unsigned `AccountState`
+/// exactly as the core serialized it, passed unchanged to [`sign_account_state`] so the signed
+/// bytes are never re-encoded in JavaScript. The id lists are what a human confirming the change
+/// must see (core [`NextAccountState`](allw_core::NextAccountState)).
+#[derive(Serialize)]
+struct WasmNextAccountState<'a> {
+    state_json: String,
+    sequence: u64,
+    /// Ids of entries retired because they carried the added key pair under another id (#378).
+    replaced_device_ids: &'a [String],
+    /// Every active device id in the next state: the request recipients once it is published.
+    active_device_ids: Vec<&'a str>,
+}
+
+/// Composes the next **unsigned** root-signed account state (core
+/// [`next_account_state`](allw_core::next_account_state)). Every surface that changes account
+/// state (`allw-approver pair` and `vouch`) goes through this, so the composition rules exist once.
+///
+/// Returns JSON `{ state_json, sequence, replaced_device_ids, active_device_ids }`: `state_json`
+/// is the `AccountState` JSON for [`sign_account_state`], and the two id lists are what the change
+/// does, for the caller to show before it signs.
+///
+/// - `account_states_json`: a JSON array of the compact account-state JWS the relay served.
+/// - `relay_max_sequence`: the relay's claimed highest sequence (`0` when it holds none).
+/// - `floor`: the highest sequence this root holder already published or accepted (`0` if none).
+/// - `change_json`: `{"kind":"add_device","device_id":…,"encryption_pubkey":…,"signing_pubkey":…}`.
+///
+/// # Errors
+///
+/// Throws on malformed input, invalid device material, or any composition refusal (a document
+/// that does not verify, an unbacked max sequence, a rollback below `floor`, disagreeing siblings,
+/// a revoked or conflicting device, too many devices), and if the new sequence is not a JS safe
+/// integer.
+#[wasm_bindgen]
+pub fn next_account_state(
+    account_states_json: &str,
+    relay_max_sequence: f64,
+    floor: f64,
+    expected_account_id: &str,
+    account_root_pubkey_b64: &str,
+    change_json: &str,
+) -> Result<String, JsError> {
+    let account_states = parse_account_states_json(account_states_json)?;
+    let refs: Vec<&str> = account_states.iter().map(String::as_str).collect();
+    let relay_max_sequence = sequence_from_f64(relay_max_sequence, "relay_max_sequence")?;
+    let floor = sequence_from_f64(floor, "floor")?;
+    let root = parse_account_root_pubkey(account_root_pubkey_b64)?;
+    let change = match parse_json::<WasmAccountStateChange>(change_json, "account-state change")? {
+        WasmAccountStateChange::AddDevice {
+            device_id,
+            encryption_pubkey,
+            signing_pubkey,
+        } => AccountStateChange::AddDevice(
+            DeviceEnrollment::parse(&device_id, &encryption_pubkey, &signing_pubkey)
+                .map_err(|e| JsError::new(&format!("invalid device material: {e}")))?,
+        ),
+    };
+    let next = core_next_account_state(
+        &refs,
+        relay_max_sequence,
+        floor,
+        expected_account_id,
+        &root,
+        &change,
+    )
+    .map_err(|e| JsError::new(&format!("next_account_state refused: {e}")))?;
+    let sequence = next.state().sequence;
+    if sequence > JS_MAX_SAFE_SEQUENCE {
+        return Err(JsError::new(&format!(
+            "next account-state sequence {sequence} exceeds JS safe-integer range (2^53-1)"
+        )));
+    }
+    to_json(
+        &WasmNextAccountState {
+            state_json: to_json(next.state(), "AccountState")?,
+            sequence,
+            replaced_device_ids: next.replaced_device_ids(),
+            active_device_ids: next.active_device_ids().collect(),
+        },
+        "next account state",
+    )
 }
 
 /// Derives the self-certifying account id for an account-root public key

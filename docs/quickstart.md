@@ -189,14 +189,22 @@ allw-approver pair". Upgrade the pairing once:
 
    It keeps your seeds and account, registers a new device id, mints a new device certificate and
    token, and publishes an account state naming that device ("Published account state —
-   sequence 1"). The account id and account-root public key are unchanged, so integrator config
-   needs no edit.
+   sequence N"). The account id and account-root public key are unchanged, so integrator config
+   needs no edit. The state lists your keys once, under the new id: an entry with the same keys
+   under an older id is dropped (#378), so the old device id can no longer read requests.
 
 3. **Web approver:** open it, press **Use another device**, and paste the keyfile's values again.
    `device_id`, `device_cert` and `device_auth_token` changed. The seeds did not. This step is
    required: requests are encrypted to the device id the account state names, so a browser still
-   holding the old device id cannot read them. A running `allw-approver watch` picks the new values
-   up from the keyfile on restart.
+   holding the old device id cannot read them. Repeat it after every later re-pair. A running
+   `allw-approver watch` picks the new values up from the keyfile on restart.
+
+4. **iPhone approver, or a web approver with keys of its own** (not set up from this keyfile):
+   re-pairing does not list it. Vouch for it once with the values it shows
+   (`allw-approver vouch`, interim until #199; see [`packages/approver/README.md` §Vouch for a device with its own keys](../packages/approver/README.md#vouch-for-a-device-with-its-own-keys)).
+   Vouching lets it decrypt requests only: its approvals are denied until it holds a device
+   certificate from this account root, which `vouch` does not issue (#199). Never vouch for a web
+   approver set up from this keyfile; paste the new values into it (step 3).
 
 ---
 

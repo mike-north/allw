@@ -15,6 +15,9 @@
  *   reads it for recipients, #243).
  * - `GET  /:acct/account-states`     → the root-signed account-state documents published with
  *   {@link InProcessRelay.publishAccountStates}; the SDK encrypts only to the devices they vouch for.
+ * - `POST /:acct/account-states`     → what `allw-approver pair` / `vouch` publish: replace the
+ *   stored set with the highest-sequence documents, 409 unless that sequence is strictly above the
+ *   stored one (see {@link InProcessRelay.fetchImpl} for what this double does not verify).
  * - `POST /:acct/requests`           → store the opaque envelope; reject any non-contract key
  *   (the zero-knowledge guard) and an already-expired `expires_at`; fan out to online devices;
  *   return the request-scoped bearer token used by the poll path.
@@ -94,6 +97,20 @@ export interface InProcessRelayOptions {
 }
 
 /** Extract `Authorization` from the fetch-compatible header shapes Node/browser tests may pass. */
+/** The `sequence` in a compact JWS's payload, read without verifying it; `undefined` if malformed. */
+function unverifiedSequence(jws: string): number | undefined {
+  const parts = jws.split(".");
+  if (parts.length !== 3) return undefined;
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1] ?? "", "base64url").toString("utf8")) as {
+      sequence?: unknown;
+    };
+    return Number.isSafeInteger(payload.sequence) ? (payload.sequence as number) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function authHeader(headers: HeadersInit | undefined): string | null {
   if (headers === undefined) return null;
   if (headers instanceof Headers) return headers.get("Authorization");
@@ -181,6 +198,9 @@ export class InProcessRelay {
         this.json({ account_states: this.accountStates, max_sequence: this.maxSequence }),
       );
     }
+    if (url.endsWith("/account-states") && method === "POST") {
+      return Promise.resolve(this.handlePublishAccountStates(init?.body));
+    }
     if (url.endsWith("/requests") && method === "POST") {
       return Promise.resolve(this.handleSubmit(init?.body));
     }
@@ -208,6 +228,46 @@ export class InProcessRelay {
   }
 
   // --- internals ---------------------------------------------------------------------------------
+
+  /**
+   * `POST /account-states` — the root holder's publish (`docs/relay-api.md` §Account state).
+   *
+   * Mirrors the real relay's storage rule: keep only the documents at the highest sequence, and
+   * refuse (409) a publish whose highest sequence is not strictly above the stored one. Unlike the
+   * real relay it does **not** verify the root signature (it has no WASM core): it reads each
+   * document's `sequence` from the unverified payload. That is safe for a test double because every
+   * consumer (SDK, approver, web approver) verifies the documents again in the core, which is the
+   * property these tests exercise.
+   */
+  private handlePublishAccountStates(body: BodyInit | null | undefined): Response {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(typeof body === "string" ? body : "");
+    } catch {
+      return this.json({ error: "invalid JSON body" }, 400);
+    }
+    const states = (parsed as { account_states?: unknown } | null)?.account_states;
+    if (!Array.isArray(states) || states.length === 0 || states.length > 16) {
+      return this.json({ error: "'account_states' must hold 1-16 compact JWS" }, 400);
+    }
+    const withSequence: { jws: string; sequence: number }[] = [];
+    for (const jws of states) {
+      const sequence = typeof jws === "string" ? unverifiedSequence(jws) : undefined;
+      if (typeof jws !== "string" || sequence === undefined) {
+        return this.json({ error: "every account state must be a compact JWS" }, 400);
+      }
+      withSequence.push({ jws, sequence });
+    }
+    const highest = Math.max(...withSequence.map((s) => s.sequence));
+    if (highest <= this.maxSequence) {
+      return this.json({ error: "account state sequence is not above the stored one" }, 409);
+    }
+    this.publishAccountStates(
+      withSequence.filter((s) => s.sequence === highest).map((s) => s.jws),
+      highest,
+    );
+    return this.json({ account_states: this.accountStates, max_sequence: this.maxSequence });
+  }
 
   /**
    * `POST /requests` — store the opaque envelope and fan it out to online devices.

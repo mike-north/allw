@@ -98,6 +98,43 @@ export interface AllwWasm {
     account_root_pubkey_b64: string,
   ): string;
   /**
+   * Compose the next **unsigned** account state from the relay's documents, its claimed
+   * `max_sequence`, this root holder's `floor`, and a change such as
+   * `{"kind":"add_device","device_id","encryption_pubkey","signing_pubkey"}` (#379). Returns JSON
+   * `{ state_json, sequence, replaced_device_ids, active_device_ids }`: `state_json` is the
+   * `AccountState` JSON to pass unchanged to `sign_account_state`, and the id lists are what the
+   * change does (#378 replacements; the resulting recipients). Throws on any refusal: a document
+   * that does not verify, an unbacked max sequence, a rollback, disagreeing siblings, invalid
+   * device material, a revoked id, or a conflicting entry.
+   */
+  next_account_state(
+    account_states_json: string,
+    relay_max_sequence: number,
+    floor: number,
+    expected_account_id: string,
+    account_root_pubkey_b64: string,
+    change_json: string,
+  ): string;
+  /** Throw unless the device id and both public keys pass the core's enrollment checks (#381). */
+  check_device_enrollment(
+    device_id: string,
+    encryption_pubkey_b64: string,
+    signing_pubkey_b64: string,
+  ): void;
+  /**
+   * Which of the device's keys equal the other key pair's, compared as parsed 32-byte keys: a JSON
+   * array of `"encryption"` / `"signing"`, `[]` for none (#381). Throws on invalid device material.
+   */
+  shared_device_keys(
+    device_id: string,
+    encryption_pubkey_b64: string,
+    signing_pubkey_b64: string,
+    other_encryption_pubkey_b64: string,
+    other_signing_pubkey_b64: string,
+  ): string;
+  /** The core's 128-bit fingerprint of a device key: eight groups of four hex digits (#381). */
+  device_key_fingerprint(kind: "encryption" | "signing", key_b64: string): string;
+  /**
    * Build the escaped display model (JSON `DisplayModel`) for an ApprovalContext JSON — the only
    * form in which untrusted context text may reach the terminal (#246). Throws on malformed input.
    */

@@ -29,6 +29,9 @@
  *    a signing key.
  * 5. Recipients are root-vouched (#243): a key the relay lists in its device registry but the
  *    root-signed account state does not name receives no way to decrypt the request.
+ * 6. Interim vouching (#381): after the root holder runs `allw-approver vouch` for a separately
+ *    keyed web device, the SDK seals the next request to that device's kid too, and the web
+ *    approver's own runtime decrypts it. Before the vouch, the same device could not.
  *
  * Deterministic: fixed clock (no `Date.now()` in fixtures), no real network, no WebSocket.
  *
@@ -39,12 +42,15 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { createClient, fileSequenceFloorStore, relayAccountStateSource } from "@allw/sdk";
-import { loadWasm } from "@allw/approver";
+import { loadWasm, runVouch, writeKeyfile } from "@allw/approver";
+import { createWasmRuntime, initWasmSync } from "@allw/web-approver";
 import { runHook } from "@allw/hook";
 
 import { InProcessRelay } from "../dist/lib/in-process-relay.js";
@@ -401,4 +407,161 @@ test("root-vouched recipients: a key injected into the relay's device list canno
     wasm.decrypt_context(jwe, DEVICE_ID, identity.keyfile.device_encryption_seed),
   );
   assert.equal(plaintext.summary, "force push to main", "the vouched device reads it");
+});
+
+// ── Acceptance item 6: interim vouching reaches a separately keyed web device (#381) ────────────
+
+/**
+ * The web approver's WASM core, loaded the way its Node tests do: the same vendored artifact the
+ * SDK ships, instantiated through the web approver's own `initWasmSync`.
+ */
+async function loadWebApproverWasm() {
+  const dir = dirname(
+    fileURLToPath(import.meta.resolve("@allw/sdk/vendor/allw-wasm/allw_wasm_bg.wasm")),
+  );
+  const glue = await import(pathToFileURL(join(dir, "allw_wasm.js")).href);
+  return initWasmSync(glue, new WebAssembly.Module(readFileSync(join(dir, "allw_wasm_bg.wasm"))));
+}
+
+/** Run `fn` with the global `fetch` (which the approver CLI's relay client uses) routed to `relay`. */
+async function withRelayFetch(relay, fn) {
+  const original = globalThis.fetch;
+  globalThis.fetch = relay.fetchImpl;
+  try {
+    return await fn();
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+test("interim vouching: after vouch, the SDK seals to the web device's kid and the web approver decrypts it", async () => {
+  const { wasm, identity, relay, log } = await harness("approved");
+  const accountId = identity.keyfile.account_id;
+
+  // A web approver with keys of its own (not set up from the CLI keyfile). It paired with the relay,
+  // so the registry lists its X25519 key, but the account root has not vouched for it yet.
+  const WEB_DEVICE_ID = "dev-web-own-keys";
+  const webEncryptionSeed = randomBytes(32).toString("base64url");
+  const webSigningSeed = randomBytes(32).toString("base64url");
+  const webEncryptionPubkey = wasm.x25519_public_key(webEncryptionSeed);
+  const webSigningPubkey = wasm.ed25519_public_key(webSigningSeed);
+  relay.enrollDevice({
+    device_id: WEB_DEVICE_ID,
+    pubkey: webEncryptionPubkey,
+    label: "browser on the work laptop",
+    created_at: NOW_MS - 5_000,
+  });
+  const pushedToWeb = [];
+  relay.connectDevice().onRequest((_requestId, envelope) => pushedToWeb.push(envelope));
+
+  const client = createClient({
+    relayUrl: RELAY_URL,
+    accountId,
+    approverRootKey: identity.keyfile.account_root_pubkey,
+    accountStates: accountStatesFrom(relay, identity),
+    ...sdkOverrides(relay),
+  });
+  const request = (summary) =>
+    client.requestApproval({
+      action: {
+        recordSchemaVersion: 1,
+        surface: "command",
+        syntactic: { argv: ["git", "push", "--force", "origin", "main"] },
+        risk: "high",
+      },
+      summary,
+      actor: { id: "machine:laptop", kind: "claude-code" },
+      risk: "high",
+      reversible: false,
+      timeoutMs: TIMEOUT_MS,
+    });
+
+  // Before vouching: the relay pushes the request to the web device, but it is not a recipient.
+  assert.equal((await request("before vouching")).decision, "approved");
+  assert.equal(pushedToWeb.length, 1, "the relay pushed the first request to the web device");
+  assert.throws(
+    () =>
+      wasm.decrypt_context(
+        String(pushedToWeb[0].context_ciphertext),
+        WEB_DEVICE_ID,
+        webEncryptionSeed,
+      ),
+    /no recipient header kid matches the requested device id/,
+    "an unvouched device cannot read the request",
+  );
+
+  // The root holder vouches, from the keyfile, for exactly what the web device shows.
+  const keyfilePath = join(
+    mkdtempSync(join(tmpdir(), "allw-walking-skeleton-vouch-")),
+    "keyfile.json",
+  );
+  writeKeyfile(keyfilePath, identity.keyfile);
+  const shown = [];
+  const questions = [];
+  const sequence = await withRelayFetch(relay, () =>
+    runVouch(
+      wasm,
+      {
+        keyfilePath,
+        deviceId: WEB_DEVICE_ID,
+        encryptionPubkey: webEncryptionPubkey,
+        signingPubkey: webSigningPubkey,
+      },
+      {
+        interactive: true,
+        confirm: (question) => {
+          questions.push(question);
+          return Promise.resolve(true);
+        },
+      },
+      (line) => shown.push(line),
+    ),
+  );
+  assert.equal(sequence, 2, "vouch published the state after pair's sequence 1");
+  assert.equal(questions.length, 1, "vouch asked the human exactly once");
+  assert.ok(
+    shown.some((line) =>
+      line.includes(wasm.device_key_fingerprint("encryption", webEncryptionPubkey)),
+    ),
+    "vouch showed the web device's encryption-key fingerprint for comparison",
+  );
+
+  // After vouching: the next request is sealed to the web device as well as the CLI device.
+  assert.equal(
+    (await request("after vouching")).decision,
+    "approved",
+    "the CLI device still approves",
+  );
+  assert.equal(pushedToWeb.length, 2, "the relay pushed the second request to the web device");
+  const envelope = pushedToWeb[1];
+
+  // The web approver's own runtime (its WASM instance, its identity) decrypts and recomputes it.
+  const webWasm = await loadWebApproverWasm();
+  const runtime = createWasmRuntime({
+    wasm: webWasm,
+    identity: {
+      accountId,
+      deviceId: WEB_DEVICE_ID,
+      deviceEncryptionSeed: webEncryptionSeed,
+      deviceSigningSeed: webSigningSeed,
+      deviceCert: wasm.issue_device_cert(
+        identity.keyfile.account_root_seed,
+        accountId,
+        WEB_DEVICE_ID,
+        webSigningPubkey,
+        NOW_MS - 1000,
+      ),
+      accountRootPubkey: identity.keyfile.account_root_pubkey,
+      deviceAuthToken: "unused-by-prepare",
+    },
+    nowMs: now,
+  });
+  const prepared = await runtime.prepare(envelope);
+  assert.equal(prepared.context.kind, "command", "the web approver reads the request");
+  assert.equal(log.length, 2, "the CLI device handled both requests");
+  assert.equal(
+    prepared.requestHash,
+    log[1].requestHash,
+    "the web approver recomputed the same WYSIWYS hash as the CLI device for the same request",
+  );
 });

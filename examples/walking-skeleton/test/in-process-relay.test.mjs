@@ -7,7 +7,12 @@
  * the full submit-validation allowlist — mirroring the corresponding cases in the real relay's
  * `workers-pool` suite so a regression in either surface is caught here, not only live.
  *
+ * The double also mirrors the account-state publish rule (`docs/relay-api.md` §Account state):
+ * keep only the highest-sequence documents, and 409 a publish that is not strictly above the stored
+ * sequence.
+ *
  * @see ../../../packages/relay/test/relay-routing.test.ts (the same cases against the real workerd relay)
+ * @see ../../../docs/relay-api.md §Account state (trust distribution)
  * @see ../../../docs/contract.md §Transport, §Messages
  */
 
@@ -198,4 +203,46 @@ test("poll auth: an unknown id answers exactly as a wrong token, never 'not foun
     status: 403,
     body: { error: "authorization denied" },
   });
+});
+
+// ── Account-state publish (`POST /:acct/account-states`) ────────────────────────────────────────
+
+/** A compact-JWS-shaped string whose payload carries `sequence` (unsigned: the double never verifies). */
+function stateJws(sequence) {
+  const part = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  return `${part({ alg: "EdDSA" })}.${part({ sequence })}.c2ln`;
+}
+
+async function publish(relay, accountStates) {
+  const resp = await relay.fetchImpl("https://relay.test/acct-double/account-states", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ account_states: accountStates }),
+  });
+  return { status: resp.status, body: await resp.json() };
+}
+
+test("account-state publish: keeps only the highest-sequence documents and serves them", async () => {
+  const relay = new InProcessRelay({ now });
+  const published = await publish(relay, [stateJws(1), stateJws(2)]);
+  assert.equal(published.status, 200);
+  assert.deepEqual(published.body, { account_states: [stateJws(2)], max_sequence: 2 });
+
+  const read = await relay.fetchImpl("https://relay.test/acct-double/account-states");
+  assert.deepEqual(await read.json(), { account_states: [stateJws(2)], max_sequence: 2 });
+});
+
+test("account-state publish: refuses a sequence not strictly above the stored one (409)", async () => {
+  const relay = new InProcessRelay({ now });
+  assert.equal((await publish(relay, [stateJws(2)])).status, 200);
+  assert.equal((await publish(relay, [stateJws(2)])).status, 409, "an idempotent republish");
+  assert.equal((await publish(relay, [stateJws(1)])).status, 409, "a rollback");
+  const read = await relay.fetchImpl("https://relay.test/acct-double/account-states");
+  assert.equal((await read.json()).max_sequence, 2, "a refused publish leaves the stored state");
+});
+
+test("account-state publish: refuses an empty set or a non-JWS entry (400)", async () => {
+  const relay = new InProcessRelay({ now });
+  assert.equal((await publish(relay, [])).status, 400);
+  assert.equal((await publish(relay, ["not-a-jws"])).status, 400);
 });
