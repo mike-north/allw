@@ -62,6 +62,14 @@
 //!    ([`NextAccountStateError::TooManyDevices`]). Publishing more would make every request fail;
 //! 7. the new sequence is `max(highest, floor) + 1`.
 //!
+//! **Invariant this relies on:** a revoked device's entry stays in `devices[]` next to its
+//! `revocations` record. [`NextAccountStateError::KeysRevoked`] recognizes a revoked key pair only
+//! through that entry, so a revocation that removed it would let the key pair be listed again under
+//! a new id. Whoever authors revocations (#199) must keep the entry.
+//!
+//! The result ([`NextAccountState`]) carries the ids the change replaced and the resulting active
+//! ids, so a surface shows the human what the signed state does before it signs.
+//!
 //! With no document at all (a new account) the base is empty, and the account id must derive from
 //! the root ([`NextAccountStateError::AccountIdMismatch`]). The base's previous roots, actors and
 //! revocations are carried forward unchanged. The function returns the *unsigned* state: the
@@ -336,7 +344,10 @@ pub enum AccountStateChange {
     ///   exactly one entry. Re-running `pair` registers a new relay id for the same keys, and this
     ///   retires the old one.
     /// - The key pair must not belong to a revoked id ([`NextAccountStateError::KeysRevoked`]):
-    ///   otherwise a revoked device could come back under a new name.
+    ///   otherwise a revoked device could come back under a new name. The check finds the key pair
+    ///   through the revoked device's `devices[]` entry, so **a revocation must keep that entry**
+    ///   alongside its `revocations` record. Any revocation author (#199) has to keep this
+    ///   invariant; dropping the entry would let the revoked key pair back in under a new id.
     /// - Neither key may be shared with a device that has different other key
     ///   ([`NextAccountStateError::KeyConflict`]); no honest enrollment produces that.
     AddDevice(DeviceEnrollment),
@@ -449,13 +460,56 @@ impl From<AccountStateError> for NextAccountStateError {
     }
 }
 
+/// The next account state [`next_account_state`] composed, with what the change does to the base
+/// that a human confirming it must see.
+///
+/// A root holder signs [`NextAccountState::state`] only after showing the
+/// [`replaced_device_ids`](NextAccountState::replaced_device_ids) and the resulting
+/// [`active_device_ids`](NextAccountState::active_device_ids): an add can silently retire another
+/// id (#378), and the confirmation must not hide that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NextAccountState {
+    state: AccountState,
+    replaced_device_ids: Vec<String>,
+}
+
+impl NextAccountState {
+    /// The unsigned next state, ready for [`crate::sign_account_state`].
+    pub fn state(&self) -> &AccountState {
+        &self.state
+    }
+
+    /// Consume the result, keeping only the unsigned state.
+    pub fn into_state(self) -> AccountState {
+        self.state
+    }
+
+    /// Ids of base entries the change removed because they carried the added device's exact key
+    /// pair under another id (#378), in base order. Empty when nothing was replaced. These ids stop
+    /// receiving requests once the state is published.
+    pub fn replaced_device_ids(&self) -> &[String] {
+        &self.replaced_device_ids
+    }
+
+    /// Ids of every `active` device in the next state, in state order: exactly the devices
+    /// integrators will seal requests to once it is published.
+    pub fn active_device_ids(&self) -> impl Iterator<Item = &str> {
+        self.state
+            .devices
+            .iter()
+            .filter(|d| d.status == DEVICE_STATUS_ACTIVE)
+            .map(|d| d.device_id.as_str())
+    }
+}
+
 /// Composes the next (unsigned) account state from the documents the relay serves.
 ///
 /// - `account_states`: every compact account-state JWS the relay served for the account.
 /// - `relay_max_sequence`: the highest sequence the relay says it holds (`0` when it holds none).
 /// - `floor`: the highest sequence this root holder already published or accepted (`0` if none).
 ///
-/// See the module docs for the rules and [`AccountStateChange`] for each change's.
+/// See the module docs for the rules and [`AccountStateChange`] for each change's. The result also
+/// names what the change replaced ([`NextAccountState`]), so a caller can show it before signing.
 ///
 /// # Errors
 ///
@@ -467,7 +521,7 @@ pub fn next_account_state(
     expected_account_id: &str,
     account_root: &PublicKey,
     change: &AccountStateChange,
-) -> Result<AccountState, NextAccountStateError> {
+) -> Result<NextAccountState, NextAccountStateError> {
     if account_states.len() > MAX_ACCOUNT_STATES {
         return Err(NextAccountStateError::TooManyAccountStates {
             count: account_states.len(),
@@ -517,7 +571,7 @@ pub fn next_account_state(
         }
     };
 
-    let mut next = match change {
+    let (mut next, replaced_device_ids) = match change {
         AccountStateChange::AddDevice(device) => add_device(base, device)?,
     };
 
@@ -533,14 +587,18 @@ pub fn next_account_state(
         .max(floor)
         .checked_add(1)
         .ok_or(NextAccountStateError::SequenceOverflow)?;
-    Ok(next)
+    Ok(NextAccountState {
+        state: next,
+        replaced_device_ids,
+    })
 }
 
 /// Applies [`AccountStateChange::AddDevice`] to `base` (see its docs for the rules).
+/// Apply [`AccountStateChange::AddDevice`]; returns the new state and the ids it replaced (#378).
 fn add_device(
     mut base: AccountState,
     device: &DeviceEnrollment,
-) -> Result<AccountState, NextAccountStateError> {
+) -> Result<(AccountState, Vec<String>), NextAccountStateError> {
     let revoked = |id: &str| {
         base.revocations
             .iter()
@@ -578,11 +636,16 @@ fn add_device(
         }
     }
     // Every remaining entry with this id or this key pair has these exact keys: replace them all
-    // with one active entry.
+    // with one active entry. Entries under other ids are reported, so the change is never silent.
+    let mut replaced = Vec::new();
     base.devices.retain(|entry| {
-        entry.device_id != device.device_id
+        let keep = entry.device_id != device.device_id
             && !(entry.encryption_pubkey == device.encryption_pubkey
-                && entry.signing_pubkey == device.signing_pubkey)
+                && entry.signing_pubkey == device.signing_pubkey);
+        if !keep && entry.device_id != device.device_id {
+            replaced.push(entry.device_id.clone());
+        }
+        keep
     });
     base.devices.push(AccountStateDevice {
         device_id: device.device_id.clone(),
@@ -591,7 +654,7 @@ fn add_device(
         status: DEVICE_STATUS_ACTIVE.to_string(),
         cert_expires_at: None,
     });
-    Ok(base)
+    Ok((base, replaced))
 }
 
 #[cfg(test)]
@@ -677,6 +740,15 @@ mod tests {
         floor: u64,
         device: DeviceEnrollment,
     ) -> Result<AccountState, NextAccountStateError> {
+        next_full(docs, max, floor, device).map(NextAccountState::into_state)
+    }
+
+    fn next_full(
+        docs: &[String],
+        max: u64,
+        floor: u64,
+        device: DeviceEnrollment,
+    ) -> Result<NextAccountState, NextAccountStateError> {
         let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
         next_account_state(
             &refs,
@@ -1055,6 +1127,47 @@ mod tests {
                 entry("dev-new", 1, "active")
             ]
         );
+    }
+
+    #[test]
+    fn reports_every_id_it_replaces_issue_378() {
+        // Review-387 F1: the replacement must be visible to whoever confirms the state. Both the
+        // active and the pending entry under other ids carry the added keys, so both are reported;
+        // the unrelated phone is not.
+        let base = state(
+            2,
+            vec![
+                entry("dev-old", 1, "active"),
+                entry("dev-phone", 3, "active"),
+                entry("dev-older", 1, "pending"),
+            ],
+        );
+        let result = next_full(&[signed(&base)], 2, 0, enrollment("dev-new", 1)).expect("composes");
+        assert_eq!(result.replaced_device_ids(), ["dev-old", "dev-older"]);
+        assert_eq!(
+            result.active_device_ids().collect::<Vec<_>>(),
+            ["dev-phone", "dev-new"]
+        );
+    }
+
+    #[test]
+    fn a_plain_add_replaces_nothing() {
+        let base = state(1, vec![entry("dev-a", 1, "active")]);
+        let result = next_full(&[signed(&base)], 1, 0, enrollment("dev-b", 2)).expect("composes");
+        assert!(result.replaced_device_ids().is_empty());
+        assert_eq!(
+            result.active_device_ids().collect::<Vec<_>>(),
+            ["dev-a", "dev-b"]
+        );
+    }
+
+    #[test]
+    fn reactivating_an_entry_is_not_a_replacement() {
+        // The same id with the same keys, not active: it comes back, and no other id is retired.
+        let base = state(1, vec![entry("dev-b", 2, "pending")]);
+        let result = next_full(&[signed(&base)], 1, 0, enrollment("dev-b", 2)).expect("composes");
+        assert!(result.replaced_device_ids().is_empty());
+        assert_eq!(result.active_device_ids().collect::<Vec<_>>(), ["dev-b"]);
     }
 
     #[test]

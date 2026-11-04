@@ -30,6 +30,8 @@ async function loadWasm() {
   return glue;
 }
 
+// A state's `sequence` can be u64::MAX, beyond JS number precision: keep each one's source text,
+// and splice that text into the state JSON the core signs.
 const vector = JSON.parse(
   readFileSync(
     join(
@@ -45,7 +47,20 @@ const vector = JSON.parse(
     ),
     "utf8",
   ),
+  (key, value, context) =>
+    key === "sequence" && typeof value === "number" ? { raw: context.source } : value,
 );
+
+/** The raw decimal text of a fixture sequence (see the reviver above). */
+const rawSequence = (sequence) => sequence.raw;
+
+/** JSON for an AccountState whose `sequence` is spliced in as exact decimal text. */
+function stateJson(state, sequenceText) {
+  return JSON.stringify({ ...state, sequence: "__SEQUENCE__" }).replace(
+    '"__SEQUENCE__"',
+    sequenceText,
+  );
+}
 
 const ROOT_SEED = Buffer.alloc(32, 0x11).toString("base64url");
 const OTHER_ROOT_SEED = Buffer.alloc(32, 0x33).toString("base64url");
@@ -79,38 +94,43 @@ test("next_account_state: the WASM composes or refuses exactly the vector's case
   const rootPubkey = wasm.ed25519_public_key(ROOT_SEED);
   const accountId = wasm.account_id_for_root(rootPubkey);
   const keyOf = (name) => vector.keys[name];
+  const otherAccountId = wasm.account_id_for_root(wasm.ed25519_public_key(OTHER_ROOT_SEED));
   for (const c of vector.next_state) {
-    const docs = c.states.map((s) =>
+    const signedOnce = c.states.map((s) =>
       wasm.sign_account_state(
-        JSON.stringify({
-          v: 1,
-          account_id: accountId,
-          sequence: s.sequence,
-          current_root: rootPubkey,
-          previous_roots: [],
-          devices: s.devices.map((d) => ({
-            device_id: d.id,
-            encryption_pubkey: keyOf(d.key).encryption_pubkey,
-            signing_pubkey: keyOf(d.key).signing_pubkey,
-            status: d.status,
-          })),
-          actors: [],
-          revocations: s.revocations.map((id) => ({
-            kind: "device",
-            id,
-            revoked_at: 1700000000000,
-          })),
-        }),
+        stateJson(
+          {
+            v: 1,
+            account_id: accountId,
+            current_root: rootPubkey,
+            previous_roots: [],
+            devices: s.devices.map((d) => ({
+              device_id: d.id,
+              encryption_pubkey: keyOf(d.key).encryption_pubkey,
+              signing_pubkey: keyOf(d.key).signing_pubkey,
+              status: d.status,
+            })),
+            actors: [],
+            revocations: s.revocations.map((id) => ({
+              kind: "device",
+              id,
+              revoked_at: 1700000000000,
+            })),
+          },
+          rawSequence(s.sequence),
+        ),
         s.signed_by === "other" ? OTHER_ROOT_SEED : ROOT_SEED,
       ),
     );
+    const docs = Array.from({ length: c.repeat ?? 1 }, () => signedOnce).flat();
+    const expectedAccountId = c.account === "other" ? otherAccountId : accountId;
     const run = () =>
       JSON.parse(
         wasm.next_account_state(
           JSON.stringify(docs),
           c.relay_max_sequence,
           c.floor,
-          accountId,
+          expectedAccountId,
           rootPubkey,
           JSON.stringify({
             kind: "add_device",
@@ -121,9 +141,17 @@ test("next_account_state: the WASM composes or refuses exactly the vector's case
         ),
       );
     if (c.error === null) {
-      const next = run();
-      assert.equal(next.sequence, c.expect.sequence, c.name);
+      const result = run();
+      const next = JSON.parse(result.state_json);
+      assert.equal(result.sequence, next.sequence, c.name);
+      assert.equal(String(next.sequence), rawSequence(c.expect.sequence), c.name);
       assert.equal(next.account_id, accountId, c.name);
+      assert.deepEqual(result.replaced_device_ids, c.expect.replaced, c.name);
+      assert.deepEqual(
+        result.active_device_ids,
+        c.expect.devices.filter(([, , status]) => status === "active").map(([id]) => id),
+        c.name,
+      );
       assert.deepEqual(
         next.devices.map((d) => [d.device_id, d.encryption_pubkey, d.signing_pubkey, d.status]),
         c.expect.devices.map(([id, key, status]) => [

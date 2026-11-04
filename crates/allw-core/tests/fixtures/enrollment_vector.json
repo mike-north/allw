@@ -1,5 +1,5 @@
 {
-  "description": "Shared Rust/WASM vector for root-holder enrollment authoring (#379, #381): device material validation, key fingerprints, and next_account_state refusals. Keys were generated with Node's own X25519/Ed25519, fingerprints computed with Node's SHA-256 over 'allw/device-key-fingerprint/v1' || 0x00 || kind || 0x00 || key (first 16 bytes, hex, groups of 4). Expected outcomes are written from docs/enrollment.md and the core module docs. States are signed at test time with the root seed [0x11; 32] (or [0x33; 32] for signed_by 'other'); device keys refer to the 'keys' table.",
+  "description": "Shared Rust/WASM vector for root-holder enrollment authoring (#379, #381): device material validation, key fingerprints, and next_account_state refusals. Keys were generated with Node's own X25519/Ed25519, fingerprints computed with Node's SHA-256 over 'allw/device-key-fingerprint/v1' || 0x00 || kind || 0x00 || key (first 16 bytes, hex, groups of 4). Expected outcomes are written from docs/enrollment.md and the core module docs. Optional fields: 'repeat' (supply the states list that many times), 'account' ('other' expects the other root's account id), 'expect.replaced' (ids the change retires, #378). One sequence is u64::MAX, beyond JS number precision: read it as source text. States are signed at test time with the root seed [0x11; 32] (or [0x33; 32] for signed_by 'other'); device keys refer to the 'keys' table.",
   "keys": {
     "a": {
       "encryption_pubkey": "656QImt3_WS8nNS_xQmNsxA_ZgDqwNmNAFBGspvz2EE",
@@ -16,6 +16,74 @@
     "d": {
       "encryption_pubkey": "Eo7gev5WIq4Kel1AQZ7l9Eu2gc9ienda3NPMrqeL-lI",
       "signing_pubkey": "ACCYQTz_BGwTtNg2V2OSxG1yx5mYcxWzROT5SNGKM2M"
+    },
+    "p01": {
+      "encryption_pubkey": "hoRfoOMqsrRvvtg5I-GO0Cqn6dReC4w6Ga3kYrkzbxs",
+      "signing_pubkey": "FWuQUj0K5lx6rPJ-pyuukbnYSvyRZdykdL8OlrXmm3g"
+    },
+    "p02": {
+      "encryption_pubkey": "ymeecAgJ9ClmSV0t8T69-EnWSa5Z1bnpwrBRn4QZ-Gw",
+      "signing_pubkey": "7vAl5kJ6IP-dgIA8zoR_pjxoWAUze3eEBLxssXSwLP8"
+    },
+    "p03": {
+      "encryption_pubkey": "KhlhKVsNWMtz0WBVjPPIV1mzYECA7yGz32ymF_qD0z8",
+      "signing_pubkey": "dwUm37ZTdeD-ehnURARR0_yZ0COVBaz__aNk9PgMIF4"
+    },
+    "p04": {
+      "encryption_pubkey": "VhA8zxJVfRqMT6Db44VyTmjVBVjqANp7ce1pDGJ052M",
+      "signing_pubkey": "djxYFMk6RnpPZQgF8JO5FZJbXTHGXiNh2Jnn2GBK8YI"
+    },
+    "p05": {
+      "encryption_pubkey": "Q_GKzUe-MWIqM76TZRYAM-nHSFSLFS2uEwjSPwCbiFQ",
+      "signing_pubkey": "0F7nD8hw6Kdxdx-K3Fk9t7gN0irCTlDtjKZiarR4D1Y"
+    },
+    "p06": {
+      "encryption_pubkey": "sLuZtIyd-jgA49CXZPZw8HqpREDY_J_BlHmrGEDh4mM",
+      "signing_pubkey": "a5iD4m4rOZtKaARhKJakvVVMHISxLn_UsewD3iM0p-4"
+    },
+    "p07": {
+      "encryption_pubkey": "L9PyJGVtP0GmcAvoECSByGxc2Kg3i85k2qSDfzXDMC0",
+      "signing_pubkey": "_VUHVEGpUvOBZ85egNd9anwKMlv-al6O3Tgd-14ywzY"
+    },
+    "p08": {
+      "encryption_pubkey": "7-MMClwDT1CLI-P2u_mCkqUq8TgxfdQieC4590Bt20w",
+      "signing_pubkey": "SGwfdhe2g51q1ni7Tj7NR0_CViCT_a2TvAnj0iUwQ_8"
+    },
+    "p09": {
+      "encryption_pubkey": "jwphay34Zwu6esZppupP8Aa1-Tmxyg2h1GrEJnwBuhg",
+      "signing_pubkey": "xSQCSudaR-uoGla9D_le2GkOLmSCdga12AyPv5Bjggg"
+    },
+    "p10": {
+      "encryption_pubkey": "OaKyvY_yEfF1N3W7uGZ1AuArPfPWfSah6crrf558dwY",
+      "signing_pubkey": "l_awkCJqTVUsjX8UFAPcsbsf7CIMjYrcWjWyO91430Y"
+    },
+    "p11": {
+      "encryption_pubkey": "KvThclLiGRLxTW59mFI9SfyDM13wt6JoA0uSEf9zWAY",
+      "signing_pubkey": "0WJXmlJHgYMtxJ9YnfpmBv0A8ZfKK997PHl6THRNohU"
+    },
+    "p12": {
+      "encryption_pubkey": "TxgUdFBevkuYyRgg5lIuO3VT730066hP0PEGCUYmqHw",
+      "signing_pubkey": "T-vhN6O3uvK1YYbMXMIXpIFLq2OvoraN7MJ98wCRCTA"
+    },
+    "p13": {
+      "encryption_pubkey": "GOT_wMmx56-xFqS1N-5817bduYx1PwwwDXc_mbB31wk",
+      "signing_pubkey": "R8VHfyfgVzpfwN8WWZZfyRrZS2lkpnHolxDLiu8QCb8"
+    },
+    "p14": {
+      "encryption_pubkey": "2RaQjR6m0O_VU-zAcrjqkIDJLPOrEX9Hq6c8kYRHZDQ",
+      "signing_pubkey": "JpTwB65vYhgolwd5gE29lek-hyHNmsD63o_zdIsrJzQ"
+    },
+    "p15": {
+      "encryption_pubkey": "6zC4g3RT1LxPC8dp6tGvbfGXT-OXXrQBGQL_uDjJpVM",
+      "signing_pubkey": "-ZOfSYc6u_KW1dr5VODnseNLPYaXqsysyAzCk6jTofs"
+    },
+    "p16": {
+      "encryption_pubkey": "zhG83HFuDMKwIuTWagCos_NLMIE7bmHw_o-9S9Wpgg0",
+      "signing_pubkey": "qL412GgmgNw4luek4IT5yxFkxW3oJBjoIRywq-iHOiI"
+    },
+    "p17": {
+      "encryption_pubkey": "y9FBu6cSlIhzcKYDim0FxoP52I4bNQ08Awu7KnDH5Ak",
+      "signing_pubkey": "LQmHhtxt2iQhwYVTUrppG3VI7dZiMTSKsTmA14iVB_o"
     }
   },
   "material": [
@@ -150,7 +218,8 @@
       "error": null,
       "expect": {
         "sequence": 1,
-        "devices": [["dev-a", "a", "active"]]
+        "devices": [["dev-a", "a", "active"]],
+        "replaced": []
       }
     },
     {
@@ -181,7 +250,8 @@
         "devices": [
           ["dev-a", "a", "active"],
           ["dev-b", "b", "active"]
-        ]
+        ],
+        "replaced": []
       }
     },
     {
@@ -217,7 +287,8 @@
         "devices": [
           ["dev-c", "c", "active"],
           ["dev-new", "a", "active"]
-        ]
+        ],
+        "replaced": ["dev-old"]
       }
     },
     {
@@ -394,6 +465,158 @@
       },
       "error": "AlreadyActive",
       "message_contains": "already active"
+    },
+    {
+      "name": "more active devices than recipients",
+      "states": [
+        {
+          "sequence": 1,
+          "devices": [
+            {
+              "id": "dev-p01",
+              "key": "p01",
+              "status": "active"
+            },
+            {
+              "id": "dev-p02",
+              "key": "p02",
+              "status": "active"
+            },
+            {
+              "id": "dev-p03",
+              "key": "p03",
+              "status": "active"
+            },
+            {
+              "id": "dev-p04",
+              "key": "p04",
+              "status": "active"
+            },
+            {
+              "id": "dev-p05",
+              "key": "p05",
+              "status": "active"
+            },
+            {
+              "id": "dev-p06",
+              "key": "p06",
+              "status": "active"
+            },
+            {
+              "id": "dev-p07",
+              "key": "p07",
+              "status": "active"
+            },
+            {
+              "id": "dev-p08",
+              "key": "p08",
+              "status": "active"
+            },
+            {
+              "id": "dev-p09",
+              "key": "p09",
+              "status": "active"
+            },
+            {
+              "id": "dev-p10",
+              "key": "p10",
+              "status": "active"
+            },
+            {
+              "id": "dev-p11",
+              "key": "p11",
+              "status": "active"
+            },
+            {
+              "id": "dev-p12",
+              "key": "p12",
+              "status": "active"
+            },
+            {
+              "id": "dev-p13",
+              "key": "p13",
+              "status": "active"
+            },
+            {
+              "id": "dev-p14",
+              "key": "p14",
+              "status": "active"
+            },
+            {
+              "id": "dev-p15",
+              "key": "p15",
+              "status": "active"
+            },
+            {
+              "id": "dev-p16",
+              "key": "p16",
+              "status": "active"
+            }
+          ],
+          "revocations": [],
+          "signed_by": "root"
+        }
+      ],
+      "relay_max_sequence": 1,
+      "floor": 0,
+      "add": {
+        "id": "dev-p17",
+        "key": "p17"
+      },
+      "error": "TooManyDevices",
+      "message_contains": "17 active devices"
+    },
+    {
+      "name": "more documents than MAX_ACCOUNT_STATES",
+      "states": [
+        {
+          "sequence": 1,
+          "devices": [],
+          "revocations": [],
+          "signed_by": "root"
+        }
+      ],
+      "repeat": 65,
+      "relay_max_sequence": 1,
+      "floor": 0,
+      "add": {
+        "id": "dev-b",
+        "key": "b"
+      },
+      "error": "TooManyAccountStates",
+      "message_contains": "65 account-state documents"
+    },
+    {
+      "name": "sequence overflow",
+      "states": [
+        {
+          "sequence": 18446744073709551615,
+          "devices": [],
+          "revocations": [],
+          "signed_by": "root"
+        }
+      ],
+      "relay_max_sequence": 0,
+      "floor": 0,
+      "add": {
+        "id": "dev-b",
+        "key": "b"
+      },
+      "error": "SequenceOverflow",
+      "message_contains": "sequence overflow"
+    },
+    {
+      "name": "a new account whose id does not derive from the root",
+      "states": [],
+      "account": "other",
+      "relay_max_sequence": 0,
+      "floor": 0,
+      "add": {
+        "id": "dev-b",
+        "key": "b"
+      },
+      "error": "AccountIdMismatch",
+      "message_contains": "does not derive"
     },
     {
       "name": "keys of a revoked id",

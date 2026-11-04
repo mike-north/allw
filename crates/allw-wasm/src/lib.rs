@@ -1039,10 +1039,27 @@ enum WasmAccountStateChange {
     },
 }
 
+/// The result of [`next_account_state`], as JSON. `state_json` is the unsigned `AccountState`
+/// exactly as the core serialized it, passed unchanged to [`sign_account_state`] so the signed
+/// bytes are never re-encoded in JavaScript. The id lists are what a human confirming the change
+/// must see (core [`NextAccountState`](allw_core::NextAccountState)).
+#[derive(Serialize)]
+struct WasmNextAccountState<'a> {
+    state_json: String,
+    sequence: u64,
+    /// Ids of entries retired because they carried the added key pair under another id (#378).
+    replaced_device_ids: &'a [String],
+    /// Every active device id in the next state: the request recipients once it is published.
+    active_device_ids: Vec<&'a str>,
+}
+
 /// Composes the next **unsigned** root-signed account state (core
-/// [`next_account_state`](allw_core::next_account_state)), returned as `AccountState` JSON for
-/// [`sign_account_state`]. Every surface that changes account state (`allw-approver pair` and
-/// `vouch`) goes through this, so the composition rules exist once.
+/// [`next_account_state`](allw_core::next_account_state)). Every surface that changes account
+/// state (`allw-approver pair` and `vouch`) goes through this, so the composition rules exist once.
+///
+/// Returns JSON `{ state_json, sequence, replaced_device_ids, active_device_ids }`: `state_json`
+/// is the `AccountState` JSON for [`sign_account_state`], and the two id lists are what the change
+/// does, for the caller to show before it signs.
 ///
 /// - `account_states_json`: a JSON array of the compact account-state JWS the relay served.
 /// - `relay_max_sequence`: the relay's claimed highest sequence (`0` when it holds none).
@@ -1088,13 +1105,21 @@ pub fn next_account_state(
         &change,
     )
     .map_err(|e| JsError::new(&format!("next_account_state refused: {e}")))?;
-    if next.sequence > JS_MAX_SAFE_SEQUENCE {
+    let sequence = next.state().sequence;
+    if sequence > JS_MAX_SAFE_SEQUENCE {
         return Err(JsError::new(&format!(
-            "next account-state sequence {} exceeds JS safe-integer range (2^53-1)",
-            next.sequence
+            "next account-state sequence {sequence} exceeds JS safe-integer range (2^53-1)"
         )));
     }
-    to_json(&next, "AccountState")
+    to_json(
+        &WasmNextAccountState {
+            state_json: to_json(next.state(), "AccountState")?,
+            sequence,
+            replaced_device_ids: next.replaced_device_ids(),
+            active_device_ids: next.active_device_ids().collect(),
+        },
+        "next account state",
+    )
 }
 
 /// Derives the self-certifying account id for an account-root public key

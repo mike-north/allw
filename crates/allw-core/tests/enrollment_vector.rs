@@ -73,12 +73,20 @@ struct AddRef {
 struct Expect {
     sequence: u64,
     devices: Vec<(String, String, String)>,
+    /// Ids the change retires because they carried the added key pair (#378).
+    replaced: Vec<String>,
 }
 
 #[derive(Deserialize)]
 struct NextStateCase {
     name: String,
     states: Vec<StateCase>,
+    /// Supply `states` this many times (default once).
+    #[serde(default)]
+    repeat: Option<usize>,
+    /// `"other"` passes the other root's account id as the expected one.
+    #[serde(default)]
+    account: Option<String>,
     relay_max_sequence: u64,
     floor: u64,
     add: AddRef,
@@ -227,7 +235,17 @@ fn next_account_state_cases() {
                 )
             })
             .collect();
+        let docs: Vec<String> = docs
+            .iter()
+            .cycle()
+            .take(docs.len() * case.repeat.unwrap_or(1))
+            .cloned()
+            .collect();
         let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let expected_account_id = match case.account.as_deref() {
+            Some("other") => account_id_for_root(&other.public_key()),
+            _ => account_id.clone(),
+        };
         let keys = &fx.keys[&case.add.key];
         let change = AccountStateChange::AddDevice(
             DeviceEnrollment::parse(&case.add.id, &keys.encryption_pubkey, &keys.signing_pubkey)
@@ -237,12 +255,13 @@ fn next_account_state_cases() {
             &refs,
             case.relay_max_sequence,
             case.floor,
-            &account_id,
+            &expected_account_id,
             &root.public_key(),
             &change,
         );
         match (&case.error, result) {
-            (None, Ok(next)) => {
+            (None, Ok(result)) => {
+                let next = result.state();
                 let expect = case.expect.as_ref().expect("a success case has `expect`");
                 assert_eq!(next.sequence, expect.sequence, "{}", case.name);
                 let got: Vec<(String, [u8; 32], [u8; 32], String)> = next
@@ -270,6 +289,12 @@ fn next_account_state_cases() {
                     })
                     .collect();
                 assert_eq!(got, want, "{}", case.name);
+                assert_eq!(
+                    result.replaced_device_ids(),
+                    expect.replaced,
+                    "{}",
+                    case.name
+                );
             }
             (Some(expected), Err(e)) => {
                 assert_eq!(next_error_name(&e), expected, "{}", case.name);

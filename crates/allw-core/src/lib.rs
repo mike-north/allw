@@ -75,7 +75,7 @@ pub use display::{
 };
 pub use enrollment::{
     device_key_fingerprint, next_account_state, AccountStateChange, DeviceEnrollment,
-    DeviceKeyKind, DeviceMaterialError, NextAccountStateError, DEVICE_ID_MAX_LEN,
+    DeviceKeyKind, DeviceMaterialError, NextAccountState, NextAccountStateError, DEVICE_ID_MAX_LEN,
     FINGERPRINT_BYTES,
 };
 pub use file_edit::action_from_file_edit;
