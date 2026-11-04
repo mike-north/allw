@@ -602,6 +602,18 @@
       "why": "#324 control: a substitution runs dd through nice"
     },
     {
+      "command": "x=\"$(nice -n 1 dd if=/dev/zero of=/dev/sda)\"",
+      "risk": "critical",
+      "bin": "x=$(nice -n 1 dd if=/dev/zero of=/dev/sda)",
+      "why": "#391 regression: an assignment whose substitution runs dd through nice is built (not refused as no_program) and tiers on the dd it runs"
+    },
+    {
+      "command": "VERSION=\"$(git log --format=%H -1)\"",
+      "risk": "high",
+      "bin": "VERSION=$(git log --format=%H -1)",
+      "why": "#391 regression: a substitution whose command holds '=' is a program, so the line is built, not refused as no_program. An assignment carrying a substitution is High (fail-upward, as V=$(ls) already is), above git's own Medium"
+    },
+    {
       "command": "echo \"$(echo dd if=/dev/zero of=/dev/sda)\"",
       "risk": "medium",
       "bin": "echo",

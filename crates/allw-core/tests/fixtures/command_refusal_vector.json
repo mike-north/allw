@@ -170,13 +170,6 @@
       "message": "command line's first program word is empty"
     },
     {
-      "class": "deliberate: an assignment is recognised by its first character",
-      "builder": "posix",
-      "command": "FO-O=1",
-      "code": "no_program",
-      "message": "command line runs no program (only variable assignments or shell operators)"
-    },
-    {
       "class": "comment only",
       "builder": "powershell",
       "command": "# rm -rf x",
@@ -257,6 +250,13 @@
       "raw": null,
       "code": "no_program",
       "message": "command line runs no program (only variable assignments or shell operators)"
+    },
+    {
+      "class": "#391: an indexed append is still an assignment",
+      "builder": "posix",
+      "command": "A[0]=1 X+=y",
+      "code": "no_program",
+      "message": "command line runs no program (only variable assignments or shell operators)"
     }
   ],
   "accepted": [
@@ -324,6 +324,33 @@
       "builder": "argv",
       "command": "",
       "argv": ["ls", ""],
+      "raw": null
+    },
+    {
+      "class": "#391: a substitution whose command holds '=' is a program, not an assignment",
+      "builder": "posix",
+      "command": "VERSION=\"$(git log --format=%H -1)\""
+    },
+    {
+      "class": "#391: a dd inside an assignment's substitution is built (and tiered by risk)",
+      "builder": "posix",
+      "command": "x=\"$(nice -n 1 dd if=/dev/zero of=/dev/sda)\""
+    },
+    {
+      "class": "#391: a name that is not a shell identifier is a program word",
+      "builder": "posix",
+      "command": "FO-O=1"
+    },
+    {
+      "class": "#391: a subscript body holding ']' is not an assignment (bash runs it as a command)",
+      "builder": "posix",
+      "command": "A[a]b]=1"
+    },
+    {
+      "class": "#391: ['FO-O=1', ''] used to be empty_program; FO-O=1 is not an identifier, so it is the program",
+      "builder": "argv",
+      "command": "",
+      "argv": ["FO-O=1", ""],
       "raw": null
     }
   ]

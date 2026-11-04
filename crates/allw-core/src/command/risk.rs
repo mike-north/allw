@@ -24,7 +24,10 @@
 //!
 //! - **Assignments.** A leading assignment-like word (`NAME=value`, and also `X+=1`, `A[0]=1`: any
 //!   word with an `=` whose name starts with a letter or `_`) is skipped. The tier is that of the
-//!   command after it, and at least `Medium`.
+//!   command after it, and at least `Medium`. This first-character test is deliberately wider than
+//!   the no-program refusal's shell-identifier rule (#391): it fails upward, so
+//!   `FO-O=1 dd … of=/dev/sda` stays `Critical`, where the narrow rule would make `FO-O=1` the
+//!   program and the tier `Medium`. Do not unify them.
 //! - **Wrappers** ([`WRAPPERS`]: `env`, `sudo`, `nice`, `xargs`, `find`, `ssh`, `watch`, …) are at
 //!   least as risky as anything they may run:
 //!   - every later non-flag word, as a program start;
@@ -398,6 +401,12 @@ fn combined_short_flags(token: &str) -> &str {
 
 /// Is `token` assignment-like for risk: an `=` whose name starts with a letter or `_`
 /// (`NAME=v`, `X+=1`, `A[0]=1`)? Over-matching only raises risk.
+///
+/// This is deliberately wider than the no-program check's identifier rule (`is_assignment_name` in
+/// `command.rs`, #391), and the two must not be unified. Risk skips an assignment-like word and also
+/// classifies what follows, so `FO-O=1 dd if=/dev/zero of=/dev/sda` stays `Critical`; with the
+/// narrower rule `FO-O=1` would be the program and the tier would drop to `Medium`. The refusal, by
+/// contrast, must never catch a word bash runs as a command, so it uses the narrow rule.
 fn is_assignment_like(token: &str) -> bool {
     token
         .split_once('=')
