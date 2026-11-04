@@ -235,6 +235,25 @@ test("rejects an empty program (argv[0])", async () => {
   await rejectsWith(commandAction(["", "x"]), "argv_program_empty", /argv\[0\]/);
 });
 
+// #376: validateArgv's own refusals are unchanged; an all-assignment argv is now refused by the
+// core, and the SDK maps it to its own reason with no cause.
+test("commandAction keeps its own argv refusals and maps the core's all-assignment refusal", async () => {
+  await rejectsWith(commandAction([]), "argv_empty", /^allw: argv must not be empty/);
+  await rejectsWith(commandAction([""]), "argv_program_empty", /^allw: argv\[0\] \(the program\)/);
+  for (const argv of [["FOO=1"], ["FOO=1", "BAR=2"]]) {
+    await assert.rejects(commandAction(argv), (err) => {
+      assert.ok(err instanceof CommandActionError);
+      assert.equal(err.reason, "argv_no_program");
+      assert.equal(err.message, "allw: argv runs no program (only variable assignments)");
+      assert.equal(err.cause, undefined);
+      return true;
+    });
+  }
+  await rejectsWith(commandAction(["FOO=1", ""]), "argv_program_empty", /non-empty/);
+  // An operator word is a program name in an argv (no shell runs it): still built.
+  assert.equal((await commandAction(["&&"])).syntactic.bin, "&&");
+});
+
 test("rejects a non-string command line", async () => {
   await rejectsWith(
     commandActionFromLine(["ls"]),

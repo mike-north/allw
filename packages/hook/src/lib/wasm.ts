@@ -54,7 +54,8 @@ export interface HookWasm {
    * used only to extract `env_refs` names — it is never re-tokenized. Use this instead of
    * {@link HookWasm.action_from_command} whenever the upstream gate already owns the exact token
    * vector that will execute (`docs/openclaw-integration.md` §5.1). **Throws** when `argvJson` is
-   * not a JSON array of strings.
+   * not a JSON array of strings, and for an argv with no program (empty, an empty program word, or
+   * only assignments; #376), with a `kind` as {@link HookWasm.action_from_command}.
    */
   action_from_argv(argvJson: string, raw?: string | null, cwd?: string | null): string;
   /**

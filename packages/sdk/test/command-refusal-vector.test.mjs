@@ -16,7 +16,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 
-import { CommandActionError, commandActionFromLine } from "../dist/index.js";
+import { CommandActionError, commandAction, commandActionFromLine } from "../dist/index.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const vendorDir = join(here, "..", "vendor", "allw-wasm");
@@ -50,9 +50,30 @@ function loadVector() {
 const FUNCTIONS = {
   posix: "action_from_command",
   powershell: "action_from_powershell_command",
+  argv: "action_from_argv",
 };
 
-/** The SDK reason for each core code (`command-request.ts`). */
+/** Call the case's WASM builder. */
+function build(wasm, c) {
+  return c.builder === "argv"
+    ? wasm.action_from_argv(JSON.stringify(c.argv), c.raw ?? null, null)
+    : wasm[FUNCTIONS[c.builder]](c.command, null);
+}
+
+/** A case's label, naming the input. */
+function label(c) {
+  const input = c.builder === "argv" ? JSON.stringify(c.argv) : JSON.stringify(c.command);
+  return `${c.class} (${c.builder}: ${input})`;
+}
+
+/** The SDK reason for each core code from `action_from_argv` (`command-request.ts`). */
+const SDK_ARGV_REASONS = {
+  no_command: "argv_empty",
+  no_program: "argv_no_program",
+  empty_program: "argv_program_empty",
+};
+
+/** The SDK reason for each core code from `action_from_command` (`command-request.ts`). */
 const SDK_REASONS = {
   no_command: "command_line_empty",
   no_program: "command_line_no_program",
@@ -65,17 +86,16 @@ test("the WASM builders refuse every case in the shared vector with its kind and
   assert.ok(cases.length >= 10);
   for (const c of cases) {
     const fn = FUNCTIONS[c.builder];
-    const label = `${c.class} (${c.builder}: ${JSON.stringify(c.command)})`;
     assert.throws(
-      () => wasm[fn](c.command, null),
+      () => build(wasm, c),
       (err) => {
-        assert.ok(err instanceof Error, label);
-        assert.equal(err.kind, c.code, label);
-        assert.ok(Object.hasOwn(err, "kind"), label);
-        assert.equal(err.message, `${fn} failed: ${c.message}`, label);
+        assert.ok(err instanceof Error, label(c));
+        assert.equal(err.kind, c.code, label(c));
+        assert.ok(Object.hasOwn(err, "kind"), label(c));
+        assert.equal(err.message, `${fn} failed: ${c.message}`, label(c));
         return true;
       },
-      label,
+      label(c),
     );
   }
 });
@@ -85,9 +105,10 @@ test("the WASM builders build every accepted case in the shared vector", async (
   const { accepted } = loadVector();
   assert.ok(accepted.length > 0);
   for (const c of accepted) {
-    const record = JSON.parse(wasm[FUNCTIONS[c.builder]](c.command, null));
-    assert.equal(record.surface, "command", c.class);
-    assert.equal(record.syntactic.raw, c.command, c.class);
+    const record = JSON.parse(build(wasm, c));
+    assert.equal(record.surface, "command", label(c));
+    if (c.builder === "argv") assert.deepEqual(record.syntactic.argv, c.argv, label(c));
+    else assert.equal(record.syntactic.raw, c.command, label(c));
   }
 });
 
@@ -97,6 +118,21 @@ test("commandActionFromLine refuses every POSIX case with the matching SDK reaso
     await assert.rejects(commandActionFromLine(c.command), (err) => {
       assert.ok(err instanceof CommandActionError, c.class);
       assert.equal(err.reason, SDK_REASONS[c.code], c.class);
+      return true;
+    });
+  }
+});
+
+// `validateArgv` refuses an empty argv and an empty `argv[0]` before the core is called (unchanged
+// by #376); an empty program after an assignment and an all-assignment argv come from the core.
+test("commandAction refuses every argv case with the matching SDK reason", async () => {
+  const { cases } = loadVector();
+  const argvCases = cases.filter((c) => c.builder === "argv");
+  assert.ok(argvCases.length >= 4);
+  for (const c of argvCases) {
+    await assert.rejects(commandAction(c.argv, c.raw === null ? {} : { raw: c.raw }), (err) => {
+      assert.ok(err instanceof CommandActionError, label(c));
+      assert.equal(err.reason, SDK_ARGV_REASONS[c.code], label(c));
       return true;
     });
   }

@@ -350,6 +350,25 @@ test("a command text that runs no program is refused by the core: build-error (#
   }
 });
 
+test("a canonical argv with no program is refused by the core: build-error (#376)", () => {
+  // The canonical-argv path binds the plan verbatim through action_from_argv, which now refuses an
+  // empty argv, an empty program word and an all-assignment argv, whatever commandText says.
+  for (const argv of [[], [""], ["", "rm", "-rf", "x"], ["FOO=1"], ["FOO=1", ""]]) {
+    for (const event of [
+      execEvent({ systemRunPlan: { argv, commandText: "rm -rf x", cwd: "/srv/app" } }),
+      execEvent({ request: { commandArgv: argv, command: "rm -rf x", systemRunPlan: undefined } }),
+    ]) {
+      const result = build({
+        event,
+        snapshot: execSnapshot({ presentation: { commandText: "rm -rf x" } }),
+      });
+      assert.equal(result.kind, "deny", JSON.stringify(argv));
+      assert.equal(result.reason, "build-error", JSON.stringify(argv));
+      assert.match(result.detail, /^core rejected the exec substrate: action_from_argv failed: /);
+    }
+  }
+});
+
 test("a malformed gateway id denies config-error per request (§7.1, §9)", () => {
   for (const bad of ["", "  ", "Has Space", "x".repeat(64)]) {
     const result = build({ gatewayId: bad });

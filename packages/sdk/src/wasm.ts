@@ -128,7 +128,9 @@ export interface AllwWasm {
    * For callers that hold the exact token vector that will execute and must bind it verbatim —
    * re-tokenizing their command text would risk binding different tokens than the ones that run
    * (`docs/openclaw-integration.md` §5.1). `raw` is the original command text (recorded verbatim
-   * and the only source of `env_refs`; never re-tokenized).
+   * and the only source of `env_refs`; never re-tokenized). **Throws** for malformed JSON (no
+   * `kind`), and for an argv with no program (#376) with a `kind` as `action_from_command`:
+   * `no_command` (empty), `empty_program`, or `no_program` (only assignments).
    */
   action_from_argv(argvJson: string, raw?: string | null, cwd?: string | null): string;
   /**
