@@ -267,14 +267,18 @@ Flow, fail-closed at every step. Nothing is signed before step 6:
 2. Load the root keyfile and check the pasted id and both keys in the core (`DeviceEnrollment::parse`, WASM
    `check_device_enrollment`): an id of 1–64 base64url-alphabet characters; each key the canonical unpadded
    base64url of exactly 32 bytes; the X25519 key canonical and not small-order (#248's denylist); the Ed25519 key
-   a canonical, non-small-order point.
+   a canonical, non-small-order point. Then refuse if the pasted encryption key **or** signing key equals this
+   keyfile's own, under any device id ("these are this keyfile's own keys — use pair"). The core compares the
+   parsed 32-byte keys (`DeviceEnrollment::shared_key_kinds`), not the pasted strings. A browser set up from the
+   keyfile holds the CLI's own keys; vouching it would replace the CLI's entry, and a single shared key would
+   put one key in two entries.
 3. Fetch the relay's device registry (`GET /{acct}/devices`). Refuse if the id is not registered, or is
    registered with a different X25519 key. The registry holds no signing key (§Pairing Flow, step 3), so the
    signing key is checked only by the human in step 5.
 4. Compose the next state in the core (below). It refuses a rollback, disagreeing documents, a revoked id, or an
-   id already listed with other keys. `vouch` also refuses when the new state would **replace this keyfile's own
-   device** (the same keys under another id): that device is the CLI's, typically a web approver set up from the
-   keyfile before a re-pair, and vouching it would stop the CLI decrypting. `pair` is the tool for it.
+   id already listed with other keys. As defence in depth behind step 2, `vouch` also refuses when the new state
+   would **replace this keyfile's own device id** (an account state that lists that id with the pasted keys):
+   vouching it would stop the CLI decrypting. `pair` is the tool for it.
 5. Show the account id, the device id, the relay's label for it (truncated to 80 characters), the core
    fingerprint of each key, and what the signed state does: its sequence, every id it replaces (#378), and every
    recipient after it. The core returns the replaced and active ids with the state (`NextAccountState`), so the

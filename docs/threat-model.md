@@ -506,6 +506,9 @@ Rules:
 - What is signed is what is shown: before asking, `vouch` prints the new sequence, every id the state replaces
   (#378: same keys under another id) and the full recipient list, all returned by the core with the state.
   `vouch` refuses outright when the replaced id is the keyfile's own device, which would stop the CLI decrypting.
+- `vouch` refuses, before contacting the relay, when the pasted encryption key or signing key equals the
+  keyfile's own under any id: those are the CLI's keys, and `pair` handles them. The core compares the parsed
+  key bytes, each key checked separately.
 - Every value shown to the human (ids, the relay's label, fingerprints) goes through the core display escape. The
   relay label is truncated to 80 characters.
 - The next state comes from the core's `next_account_state`. Every fetched document must verify; the relay's
