@@ -335,6 +335,21 @@ test("a whitespace-only command text is build-error (§9)", () => {
   assert.equal(result.reason, "build-error");
 });
 
+test("a command text that runs no program is refused by the core: build-error (#376)", () => {
+  // No canonical argv, so the core tokenizes the text itself, and now refuses these lines. (A blank
+  // text never reaches the core: the bridge's own check above denies it first.)
+  for (const command of ["FOO=1", "&& ;", "'' rm -rf x"]) {
+    const event = execEvent({ request: { command, systemRunPlan: undefined } });
+    const result = build({
+      event,
+      snapshot: execSnapshot({ presentation: { commandText: undefined } }),
+    });
+    assert.equal(result.kind, "deny", JSON.stringify(command));
+    assert.equal(result.reason, "build-error", JSON.stringify(command));
+    assert.match(result.detail, /^core rejected the exec substrate: action_from_command failed: /);
+  }
+});
+
 test("a malformed gateway id denies config-error per request (§7.1, §9)", () => {
   for (const bad of ["", "  ", "Has Space", "x".repeat(64)]) {
     const result = build({ gatewayId: bad });
