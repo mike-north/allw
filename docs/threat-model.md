@@ -508,8 +508,11 @@ Rules:
   `max_sequence` must be backed; the highest sequence must not be below the keyfile's floor; siblings must agree.
   A revoked id or a revoked key pair is never re-listed. An id is never re-listed with different keys (rotation
   is #199). One key pair has exactly one entry (#378).
-- Vouching issues no `device_cert`. A vouched device can read requests; its verdicts verify only once it holds a
-  cert from this root for its signing key.
+- Vouching grants **decrypt only** and issues no `device_cert`, by decision. A verdict verifies with a root-issued
+  cert plus non-revocation, and listing in account state does not count, so a cert would be a separate and larger
+  grant (approval authority). That grant stays with #199's MAC-authenticated CSR ceremony (R8) and is never made
+  on a fingerprint comparison alone. A vouched device without a cert can read requests, but its verdicts fail
+  verification (deny). This is the same as before `vouch`: only `pair` issued certs, for its own keyfile's key.
 
 Validation:
 

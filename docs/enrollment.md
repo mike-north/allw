@@ -289,10 +289,14 @@ Flow, fail-closed at every step. Nothing is signed before step 6:
 
 A wrong signing key cannot widen access. It only makes that device's verdicts fail verification, which is deny.
 
-**What it does not do.** `vouch` adds the device to account state, so integrators encrypt to it. It does **not**
-issue a `device_cert`. A verdict from that device verifies only with a cert from this account root for its signing
-key (§Device Certificate Validation); without one, its verdicts deny. Issuing that cert across devices is #199's
-job.
+**Read access only, never approval authority.** `vouch` adds the device to account state, so integrators encrypt
+to it: it grants **decrypt only**. It does **not** issue a `device_cert`, by decision. A verdict verifies with a
+cert from this account root for the device's signing key and the device not being revoked (§Device Certificate
+Validation); being listed in account state is not enough. So a vouched device without such a cert can read
+requests, but its approvals and denials fail verification, which integrators treat as deny. Approval authority
+for a device that does not hold the root comes only from #199's MAC-authenticated ceremony, never from a
+fingerprint comparison. This matches `main` before `vouch` existed: the only cert issuer was `pair`, signing its
+own keyfile's key, so no other device's verdicts verified.
 
 **Composing the next state (#379).** The core's `next_account_state(account_states, relay_max_sequence, floor,
 account_id, account_root, change)` is the one place this logic lives. `pair` and `vouch` call it through WASM

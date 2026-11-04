@@ -145,8 +145,11 @@ relay stores only the encryption key). A wrong signing key fails closed: the dev
 verify, so they deny. On `y`, it root-signs and publishes the next account state, and records its
 sequence in the keyfile.
 
-`vouch` does not issue a device certificate. The device can read requests once vouched; its
-verdicts verify only with a certificate from this account root.
+`vouch` grants **decrypt only**: it does not issue a device certificate, by decision. Once
+vouched, the device can read requests, but its approvals don't verify (integrators treat them as
+deny) until it holds a certificate from this account root for its signing key. That certificate
+comes from the cross-device enrollment ceremony (#199), not from `vouch`. Before `vouch` existed it
+was the same: only `pair` issued certificates, for its own keyfile's key.
 
 See `docs/enrollment.md` §Interim vouching and `docs/threat-model.md` R9.
 

@@ -47,7 +47,9 @@ browser needs vouching depends on where its keys came from:
 - **Keys of its own**: the account-root holder runs the panel's command
   (`allw-approver vouch`, **interim until #199**) and compares the device id and all eight groups of
   both fingerprints with this panel before confirming. Until then, requests reach this browser but
-  it cannot decrypt them.
+  it cannot decrypt them. Vouching grants **decrypt only**: approvals from this browser verify only
+  with a device certificate from the account root for its signing key, which comes from the
+  enrollment ceremony (#199), never from `vouch`.
 
 See `docs/enrollment.md` §Interim vouching.
 

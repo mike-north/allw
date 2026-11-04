@@ -6,6 +6,11 @@
  * The CLI's own device does not need it: `pair` vouches for that one, and a web approver that was
  * set up from this keyfile is the same device.
  *
+ * **Decrypt only.** Vouching lists the device as a request recipient and nothing more. It issues no
+ * `device_cert`, by decision: a cert is approval authority (a verdict verifies with a root-issued
+ * cert plus non-revocation), and that grant belongs to #199's MAC-authenticated ceremony, never to
+ * a fingerprint comparison. A vouched device without a cert can read requests; its verdicts deny.
+ *
  * Flow (`docs/enrollment.md` §Interim vouching, #381). Every failure refuses with a non-zero exit,
  * and nothing is signed before the last step:
  *
