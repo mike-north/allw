@@ -1004,6 +1004,39 @@ pub fn check_device_enrollment(
         .map_err(|e| JsError::new(&format!("invalid device material: {e}")))
 }
 
+/// Which of a pasted device's keys equal another key pair's (core
+/// [`DeviceEnrollment::shared_key_kinds`](allw_core::DeviceEnrollment::shared_key_kinds)), as a
+/// JSON array of `"encryption"` / `"signing"`; `[]` when neither matches. `allw-approver vouch`
+/// passes the keyfile's own public keys (derived from its seeds by the core) and refuses on any
+/// match (#381). The device's values are validated exactly as [`check_device_enrollment`] does
+/// and compared as parsed 32-byte keys, never as text.
+///
+/// # Errors
+///
+/// Throws if the device material is invalid or either other key does not decode to 32 bytes.
+#[wasm_bindgen]
+pub fn shared_device_keys(
+    device_id: &str,
+    encryption_pubkey_b64: &str,
+    signing_pubkey_b64: &str,
+    other_encryption_pubkey_b64: &str,
+    other_signing_pubkey_b64: &str,
+) -> Result<String, JsError> {
+    let device = DeviceEnrollment::parse(device_id, encryption_pubkey_b64, signing_pubkey_b64)
+        .map_err(|e| JsError::new(&format!("invalid device material: {e}")))?;
+    let other_encryption = decode_b64_32(other_encryption_pubkey_b64, "other_encryption_pubkey")?;
+    let other_signing = decode_b64_32(other_signing_pubkey_b64, "other_signing_pubkey")?;
+    let kinds: Vec<&str> = device
+        .shared_key_kinds(&other_encryption, &other_signing)
+        .into_iter()
+        .map(|kind| match kind {
+            DeviceKeyKind::Encryption => "encryption",
+            DeviceKeyKind::Signing => "signing",
+        })
+        .collect();
+    to_json(&kinds, "shared device keys")
+}
+
 /// The human-comparable fingerprint of a device public key (core
 /// [`device_key_fingerprint`](allw_core::device_key_fingerprint)): 32 lowercase hex digits in
 /// eight space-separated groups of four. `kind` is `"encryption"` (X25519) or `"signing"`

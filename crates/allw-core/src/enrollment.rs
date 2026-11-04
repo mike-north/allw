@@ -233,6 +233,29 @@ impl DeviceEnrollment {
     pub fn signing_pubkey(&self) -> &[u8; 32] {
         &self.signing_pubkey
     }
+
+    /// Which of this device's keys are byte-for-byte equal to the given key pair's, encryption
+    /// first. Empty when neither matches.
+    ///
+    /// The root holder uses it to refuse vouching for its **own** keys (#381): a device carrying
+    /// the keyfile's encryption or signing key is the keyfile's own device (or a copy of its
+    /// secrets) under whatever id it shows, and `pair`, not `vouch`, lists that device. The
+    /// comparison is on the parsed 32-byte keys, never on their text.
+    #[must_use]
+    pub fn shared_key_kinds(
+        &self,
+        encryption_pubkey: &[u8; 32],
+        signing_pubkey: &[u8; 32],
+    ) -> Vec<DeviceKeyKind> {
+        let mut shared = Vec::new();
+        if &self.encryption_pubkey == encryption_pubkey {
+            shared.push(DeviceKeyKind::Encryption);
+        }
+        if &self.signing_pubkey == signing_pubkey {
+            shared.push(DeviceKeyKind::Signing);
+        }
+        shared
+    }
 }
 
 /// 1–[`DEVICE_ID_MAX_LEN`] characters of the base64url alphabet.
@@ -773,6 +796,26 @@ mod tests {
         .expect("valid");
         assert_eq!(device.encryption_pubkey(), &enc);
         assert_eq!(device.signing_pubkey(), &sig);
+    }
+
+    #[test]
+    fn shared_key_kinds_compares_each_key_separately() {
+        let (enc, sig) = keys(1);
+        let (other_enc, other_sig) = keys(2);
+        let device = DeviceEnrollment::parse("dev-1", &b64(&enc), &b64(&sig)).expect("valid");
+        assert_eq!(device.shared_key_kinds(&other_enc, &other_sig), vec![]);
+        assert_eq!(
+            device.shared_key_kinds(&enc, &other_sig),
+            vec![DeviceKeyKind::Encryption]
+        );
+        assert_eq!(
+            device.shared_key_kinds(&other_enc, &sig),
+            vec![DeviceKeyKind::Signing]
+        );
+        assert_eq!(
+            device.shared_key_kinds(&enc, &sig),
+            vec![DeviceKeyKind::Encryption, DeviceKeyKind::Signing]
+        );
     }
 
     #[test]
