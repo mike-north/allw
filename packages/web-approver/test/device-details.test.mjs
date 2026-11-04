@@ -63,10 +63,10 @@ test("the model derives the public keys and core fingerprints from the stored se
 
 test("a device id the core refuses is shown escaped, with no vouch command", async () => {
   const wasm = await loadTestWasm();
-  const model = deviceDetailsModel(wasm, identity("dev\u001b[2J‮evil"));
+  const model = deviceDetailsModel(wasm, identity("dev\u001b[2J\u202eevil"));
   assert.equal(model.vouchCommand, null);
   assert.match(model.problem, /device id must be/);
-  assert.ok(!model.deviceIdDisplay.includes("\u001b") && !model.deviceIdDisplay.includes("‮"));
+  assert.ok(!model.deviceIdDisplay.includes("\u001b") && !model.deviceIdDisplay.includes("\u202e"));
 
   const host = document.getElementById("device");
   mountDeviceDetails({ host, model, copy: null });
