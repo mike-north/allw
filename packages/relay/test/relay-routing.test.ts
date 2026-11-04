@@ -295,29 +295,41 @@ async function installPushTransports(
 }
 
 /**
- * A real `AccountRelay` over a stub Durable Object state, for driving one private method without a
- * runtime instance. `state` supplies the WebSocket methods the test needs; `exec` answers every SQL
- * statement, the constructor's schema setup included. Alarm and transaction calls are no-ops.
- *
- * The constructor's migrations and alarm arming run against the stub and have no effect: nothing is
- * persisted and no alarm is set, so a test can't rely on schema or alarm state from it.
+ * Run `body` on a real `AccountRelay` whose Durable Object state is partly replaced, for driving one
+ * private method without a runtime fan-out. `AccountRelay` extends the runtime's `DurableObject`,
+ * so it can only be built over a real state: this takes the instance the runtime already holds for
+ * a fresh account, and swaps in the pieces the test needs. `state` supplies the WebSocket methods
+ * (spied on the real state for the call), and `exec` answers every SQL statement the body runs.
+ * The schema setup has already run for real.
  */
-function relayOverStubState(
+async function withRelayOverStubState<T>(
   state: Partial<Pick<DurableObjectState, "acceptWebSocket" | "getWebSockets" | "getTags">>,
-  exec: (query: string) => unknown[] = () => [],
-): AccountRelay {
-  const ctx = {
-    ...state,
-    storage: {
-      sql: { exec: (query: string) => exec(query) },
-      transactionSync: (fn: () => unknown) => fn(),
-      setAlarm: () => Promise.resolve(),
-      deleteAlarm: () => Promise.resolve(),
-      getAlarm: () => Promise.resolve(null),
-    },
-    waitUntil: () => undefined,
-  } as unknown as DurableObjectState;
-  return new AccountRelay(ctx, env);
+  exec: (query: string) => unknown[],
+  body: (relay: AccountRelay) => T | Promise<T>,
+): Promise<T> {
+  const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(testAccount("acct-stub-state")));
+  return runInDurableObject(stub, async (relay: AccountRelay, realState) => {
+    const stubSql = {
+      storage: { sql: { exec: (query: string) => exec(query) } },
+    } as unknown as DurableObjectState;
+    const spies = [
+      state.acceptWebSocket &&
+        vi.spyOn(realState, "acceptWebSocket").mockImplementation(state.acceptWebSocket),
+      state.getWebSockets &&
+        vi.spyOn(realState, "getWebSockets").mockImplementation(state.getWebSockets),
+      state.getTags && vi.spyOn(realState, "getTags").mockImplementation(state.getTags),
+    ];
+    const realSql = relay["sql"];
+    const realNow = relay["now"];
+    relay["sql"] = stubSql.storage.sql;
+    try {
+      return await body(relay);
+    } finally {
+      relay["sql"] = realSql;
+      relay["now"] = realNow;
+      for (const spy of spies) spy?.mockRestore();
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -786,7 +798,7 @@ describe("AccountRelay — cross-device coordination", () => {
     await mirroredPhone.expectNothingPending();
   });
 
-  it("continues same-surface fan-out when the first tagged socket cannot be sent to", () => {
+  it("continues same-surface fan-out when the first tagged socket cannot be sent to", async () => {
     const staleMac = { send: () => void 0 } as unknown as WebSocket;
     const liveMacMessages: string[] = [];
     const liveMac = {
@@ -803,20 +815,23 @@ describe("AccountRelay — cross-device coordination", () => {
       [phone, ["device", "surface:phone-screen"]],
     ]);
 
-    const relay = relayOverStubState({
-      getTags: (ws: WebSocket) => tags.get(ws) ?? [],
-      getWebSockets: (tag: string) => (tag === "device" ? [staleMac, liveMac, phone] : []),
-    });
-
     // A closing hibernation socket can still be returned by the tag index but reject `send()`. It
     // must not claim the visible surface unless the relay actually sends the request to it.
     vi.spyOn(staleMac, "send").mockImplementation(() => {
       throw new Error("socket already closing");
     });
 
-    const delivered = relay["sendRequestToOneSocketPerSurface"](
-      rid("req-surface-stale-1"),
-      makeEnvelope(rid("req-surface-stale-1")),
+    const delivered = await withRelayOverStubState(
+      {
+        getTags: (ws: WebSocket) => tags.get(ws) ?? [],
+        getWebSockets: (tag: string) => (tag === "device" ? [staleMac, liveMac, phone] : []),
+      },
+      () => [],
+      (relay) =>
+        relay["sendRequestToOneSocketPerSurface"](
+          rid("req-surface-stale-1"),
+          makeEnvelope(rid("req-surface-stale-1")),
+        ),
     );
 
     expect(delivered).toBe(2);
@@ -860,7 +875,7 @@ describe("AccountRelay — cross-device coordination", () => {
     const authTokenHash = await testAuthTokenHash("stale-device-token");
 
     // The stub `exec` ignores the deadline filter: it returns the queued row for any request query.
-    const relay = relayOverStubState(
+    await withRelayOverStubState(
       {
         acceptWebSocket: (ws: WebSocket) => {
           ws.accept();
@@ -878,37 +893,39 @@ describe("AccountRelay — cross-device coordination", () => {
         }
         return [];
       },
+      async (relay) => {
+        relay["now"] = () => RELAY_NOW;
+
+        const response = await relay["handleDeviceConnect"](
+          "dev-stale-flush",
+          new Request(
+            "https://relay.allw.test/acct/devices/dev-stale-flush/connect?surface_id=mac-screen&auth=stale-device-token",
+            // A real WebSocket client sends the upgrade header; the query token is accepted only then.
+            { headers: { Upgrade: "websocket" } },
+          ),
+        );
+        expect(response.status).toBe(101);
+        expect(response.webSocket).toBeDefined();
+
+        const client = response.webSocket;
+        if (!client) throw new Error("expected a WebSocket on the 101 response");
+        const queued = new Promise<WsMessage>((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            reject(new Error("WebSocket message timeout"));
+          }, 500);
+          client.addEventListener("message", (event: MessageEvent) => {
+            clearTimeout(timeout);
+            resolve(JSON.parse(event.data as string) as WsMessage);
+          });
+        });
+        client.accept();
+
+        await expect(queued).resolves.toMatchObject({
+          type: "request",
+          request_id: rid("req-surface-stale-queued"),
+        });
+      },
     );
-    relay["now"] = () => RELAY_NOW;
-
-    const response = await relay["handleDeviceConnect"](
-      "dev-stale-flush",
-      new Request(
-        "https://relay.allw.test/acct/devices/dev-stale-flush/connect?surface_id=mac-screen&auth=stale-device-token",
-        // A real WebSocket client sends the upgrade header; the query token is accepted only then.
-        { headers: { Upgrade: "websocket" } },
-      ),
-    );
-    expect(response.status).toBe(101);
-    expect(response.webSocket).toBeDefined();
-
-    const client = response.webSocket;
-    if (!client) throw new Error("expected a WebSocket on the 101 response");
-    const queued = new Promise<WsMessage>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new Error("WebSocket message timeout"));
-      }, 500);
-      client.addEventListener("message", (event: MessageEvent) => {
-        clearTimeout(timeout);
-        resolve(JSON.parse(event.data as string) as WsMessage);
-      });
-    });
-    client.accept();
-
-    await expect(queued).resolves.toMatchObject({
-      type: "request",
-      request_id: rid("req-surface-stale-queued"),
-    });
   });
 });
 
@@ -2108,7 +2125,7 @@ describe("AccountRelay — one deadline for every lifecycle path (#292)", () => 
    * reconnect flush, lazy expiry (poll, wait, retract), verdict acceptance and the wakeup deadline
    * all read `expires_at` alone, so such a row stayed live on them while the alarm expired it.
    */
-  function stubFor(accountId: string): DurableObjectStub {
+  function stubFor(accountId: string): DurableObjectStub<AccountRelay> {
     return env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
   }
 
