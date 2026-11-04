@@ -95,7 +95,7 @@ async function freshAccount(name: string): Promise<string> {
   return acct;
 }
 
-function stubFor(accountId: string): DurableObjectStub {
+function stubFor(accountId: string): DurableObjectStub<AccountRelay> {
   return env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
 }
 
@@ -425,23 +425,21 @@ describe("POST /requests expires_at horizon", () => {
     ).toBe(400);
   });
 
-  it("the Durable Object reads MAX_REQUEST_TTL_MS from its env", () => {
-    // Construct directly with a stub state so the env → horizon wiring is checked end to end.
-    const ctx = {
-      storage: {
-        sql: { exec: () => [] },
-        transactionSync: (fn: () => unknown) => fn(),
-        deleteAlarm: () => Promise.resolve(),
-        setAlarm: () => Promise.resolve(),
+  it("the Durable Object reads MAX_REQUEST_TTL_MS from its env", async () => {
+    // Construct directly over the runtime's own state (the base class needs a real one) so the
+    // env → horizon wiring is checked end to end. These extra instances are not side-effect free:
+    // each runs `initSchema` and arms alarms against that account's real storage (both idempotent).
+    await runInDurableObject(
+      stubFor("acct-ttl-env"),
+      (_instance: AccountRelay, state: DurableObjectState) => {
+        const relay = new AccountRelay(state, { ...env, MAX_REQUEST_TTL_MS: "123456" });
+        expect(relay["maxRequestTtlMs"]).toBe(123_456);
+        // The var unset (omitted, not `undefined`: `exactOptionalPropertyTypes`) falls back to the default.
+        const { MAX_REQUEST_TTL_MS: _unset, ...envWithoutTtl } = { ...env };
+        const fallback = new AccountRelay(state, envWithoutTtl);
+        expect(fallback["maxRequestTtlMs"]).toBe(DEFAULT_MAX_REQUEST_TTL_MS);
       },
-      waitUntil: () => undefined,
-    } as unknown as DurableObjectState;
-    const relay = new AccountRelay(ctx, { ...env, MAX_REQUEST_TTL_MS: "123456" });
-    expect(relay["maxRequestTtlMs"]).toBe(123_456);
-    // The var unset (omitted, not `undefined`: `exactOptionalPropertyTypes`) falls back to the default.
-    const { MAX_REQUEST_TTL_MS: _unset, ...envWithoutTtl } = { ...env };
-    const fallback = new AccountRelay(ctx, envWithoutTtl);
-    expect(fallback["maxRequestTtlMs"]).toBe(DEFAULT_MAX_REQUEST_TTL_MS);
+    );
   });
 
   it("parseMaxRequestTtlMs: unset uses the default; invalid values fall back to it", () => {

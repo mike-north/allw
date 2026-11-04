@@ -50,7 +50,7 @@ type TrailingRow = {
   last_skipped_request_id: string | null;
 };
 
-function stub(accountId: string): DurableObjectStub {
+function stub(accountId: string): DurableObjectStub<AccountRelay> {
   return env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
 }
 

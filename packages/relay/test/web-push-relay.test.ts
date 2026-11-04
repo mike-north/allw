@@ -733,7 +733,7 @@ describe("submit — Web Push wakeups are coalesced per subscription", () => {
 // eslint-disable-next-line @typescript-eslint/consistent-type-definitions -- a type alias satisfies SqlStorage.exec's row constraint; an interface doesn't.
 type TrailingRow = { device_id: string; token: string; due_at: number };
 
-function relayStub(accountId: string): DurableObjectStub {
+function relayStub(accountId: string): DurableObjectStub<AccountRelay> {
   return env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
 }
 
