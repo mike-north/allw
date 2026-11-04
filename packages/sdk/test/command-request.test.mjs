@@ -33,7 +33,7 @@ import {
   commandRequest,
   createClient,
 } from "../dist/index.js";
-import { actionRecordFromCoreJson } from "../dist/command-request.js";
+import { actionRecordFromCoreJson, assertRecordHasProgram } from "../dist/command-request.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const vendorDir = join(here, "..", "vendor", "allw-wasm");
@@ -255,6 +255,80 @@ test("rejects a command line whose program is the empty string", async () => {
     "argv_program_empty",
     /program/,
   );
+});
+
+test("rejects a command line that runs no program (only assignments or operators)", async () => {
+  for (const line of ["FOO=1", "FOO=1 BAR=2", "FOO=1; BAR=2", "&&", "; |"]) {
+    await rejectsWith(
+      commandActionFromLine(line),
+      "command_line_no_program",
+      /^allw: commandLine runs no program \(only variable assignments or shell operators\)$/,
+    );
+  }
+  await rejectsWith(
+    commandRequest({ commandLine: "FOO=1", summary: "s" }),
+    "command_line_no_program",
+    /runs no program/,
+  );
+});
+
+// The core refuses these itself (#376); the SDK maps its `kind` to the same reason and message it
+// used before, with no `cause`, so the hooks' deny reasons are unchanged.
+test("maps each core no-program refusal to the SDK's own message, with no cause", async () => {
+  for (const [line, reason, message] of [
+    ["   ", "command_line_empty", "allw: commandLine contains no command"],
+    ["# only a comment", "command_line_empty", "allw: commandLine contains no command"],
+    [
+      "FOO=1",
+      "command_line_no_program",
+      "allw: commandLine runs no program (only variable assignments or shell operators)",
+    ],
+    [
+      "'' rm",
+      "argv_program_empty",
+      "allw: commandLine's first word (the program) must be non-empty",
+    ],
+  ]) {
+    await assert.rejects(commandActionFromLine(line), (err) => {
+      assert.ok(err instanceof CommandActionError);
+      assert.equal(err.reason, reason, line);
+      assert.equal(err.message, message, line);
+      assert.equal(err.cause, undefined, line);
+      return true;
+    });
+  }
+});
+
+test("invalid shell syntax still carries the core's error as its cause", async () => {
+  await assert.rejects(commandActionFromLine("echo 'open"), (err) => {
+    assert.equal(err.reason, "command_line_unparseable");
+    assert.ok(err.cause instanceof Error);
+    assert.equal(err.cause.kind, "invalid_shell_syntax");
+    return true;
+  });
+});
+
+// Defence in depth: the real core never returns these records, so the check is exercised directly.
+test("assertRecordHasProgram refuses a record with no argv or an empty program", () => {
+  const record = (syntactic) => ({
+    recordSchemaVersion: 1,
+    surface: "command",
+    syntactic,
+    risk: "medium",
+  });
+  for (const [syntactic, reason] of [
+    [{}, "command_line_empty"],
+    [{ argv: [] }, "command_line_empty"],
+    [{ argv: "ls" }, "command_line_empty"],
+    [{ argv: ["", "rm"] }, "argv_program_empty"],
+  ]) {
+    assert.throws(
+      () => assertRecordHasProgram(record(syntactic)),
+      (err) => err instanceof CommandActionError && err.reason === reason,
+      JSON.stringify(syntactic),
+    );
+  }
+  assert.doesNotThrow(() => assertRecordHasProgram(record({ argv: ["ls"] })));
 });
 
 test("rejects a blank cwd", async () => {

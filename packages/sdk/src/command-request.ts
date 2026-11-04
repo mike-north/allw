@@ -40,7 +40,10 @@ import { loadWasm } from "./wasm.js";
  * - `argv_program_empty` — the program (`argv[0]`, or a command line's first word) was empty.
  * - `command_line_not_string` — `commandLine` was not a string.
  * - `command_line_unparseable` — the core could not tokenize `commandLine` (e.g. an unmatched quote).
- * - `command_line_empty` — `commandLine` tokenized to no command at all (blank or whitespace).
+ * - `command_line_empty` — `commandLine` contains no command at all (blank, whitespace or only a
+ *   comment).
+ * - `command_line_no_program` — `commandLine` runs no program: only variable assignments (`FOO=1`)
+ *   and/or shell operators (`&&`, `;`).
  * - `invalid_option` — an option (`cwd`, `raw`, `summary`, `actor`, `timeoutMs`, …) had the wrong
  *   type or was blank, or `raw` was passed to {@link commandRequest}.
  * - `ambiguous_command` — {@link commandRequest} got both or neither of `argv` / `commandLine`.
@@ -55,6 +58,7 @@ export type CommandActionErrorReason =
   | "command_line_not_string"
   | "command_line_unparseable"
   | "command_line_empty"
+  | "command_line_no_program"
   | "invalid_option"
   | "ambiguous_command"
   | "core_record_invalid";
@@ -208,7 +212,10 @@ export async function commandAction(
  * `argv` and run it with `execFile` / `spawn` (no shell) instead.
  *
  * @throws {@link CommandActionError} (as a rejection) if `commandLine` is not a string, cannot be
- * tokenized (e.g. an unmatched quote), contains no command, or its program is the empty string.
+ * tokenized (e.g. an unmatched quote), contains no command, runs no program (only assignments or
+ * operators), or its program is the empty string. The core refuses the last three itself (#376);
+ * the SDK maps the core's refusal `kind` to a reason here, and still checks the record as defence
+ * in depth.
  */
 export async function commandActionFromLine(
   commandLine: string,
@@ -222,27 +229,86 @@ export async function commandActionFromLine(
   }
   const cwd = optionalCwd(options.cwd);
   const wasm = await loadWasm();
-  const json = callCore(
-    () => wasm.action_from_command(commandLine, cwd ?? null),
-    "command_line_unparseable",
-    // The text itself is not echoed: a command line can carry secrets.
-    "commandLine could not be parsed as a command (check for an unmatched quote)",
-  );
-  const action = actionRecordFromCoreJson(json);
-  // A blank line tokenizes to nothing: the core then records no argv. Refuse rather than ask a
-  // human to approve an empty command. (This reads the core's output; it does not re-tokenize.)
-  const syntacticArgv = (action.syntactic as { argv?: unknown }).argv;
-  if (!Array.isArray(syntacticArgv) || syntacticArgv.length === 0) {
-    throw new CommandActionError("command_line_empty", "commandLine contains no command");
-  }
-  // `''` or `'' rm …` tokenizes to an empty first word: there is no program to show the human.
-  if (syntacticArgv[0] === "") {
+  let json: string;
+  try {
+    json = wasm.action_from_command(commandLine, cwd ?? null);
+  } catch (cause) {
+    // The core refuses a line that runs no program (#376); its `kind` names which refusal.
+    const refusal = noProgramRefusal(cause);
+    if (refusal !== undefined) throw new CommandActionError(refusal.reason, refusal.message);
     throw new CommandActionError(
-      "argv_program_empty",
-      "commandLine's first word (the program) must be non-empty",
+      "command_line_unparseable",
+      // The text itself is not echoed: a command line can carry secrets.
+      "commandLine could not be parsed as a command (check for an unmatched quote)",
+      { cause },
     );
   }
+  const action = actionRecordFromCoreJson(json);
+  assertRecordHasProgram(action);
   return action;
+}
+
+/**
+ * The SDK's reason and message for each core no-program refusal (`CommandError::code`, thrown by
+ * the WASM `action_from_command` as the error's `kind`, #376). The messages are the SDK's own,
+ * unchanged from before the core refused these, so the hooks' deny reasons stay the same; the core
+ * message for each is in `crates/allw-core/tests/fixtures/command_refusal_vector.json`.
+ */
+const NO_PROGRAM_REFUSALS = {
+  no_command: { reason: "command_line_empty", message: "commandLine contains no command" },
+  no_program: {
+    reason: "command_line_no_program",
+    message: "commandLine runs no program (only variable assignments or shell operators)",
+  },
+  empty_program: {
+    reason: "argv_program_empty",
+    message: "commandLine's first word (the program) must be non-empty",
+  },
+} as const satisfies Record<
+  string,
+  { readonly reason: CommandActionErrorReason; readonly message: string }
+>;
+
+/** The SDK refusal for a core error's `kind`, or `undefined` when it is not a no-program refusal. */
+function noProgramRefusal(
+  err: unknown,
+): { readonly reason: CommandActionErrorReason; readonly message: string } | undefined {
+  const kind = coreRefusalKind(err);
+  return Object.hasOwn(NO_PROGRAM_REFUSALS, kind)
+    ? NO_PROGRAM_REFUSALS[kind as keyof typeof NO_PROGRAM_REFUSALS]
+    : undefined;
+}
+
+/**
+ * Defence in depth for {@link commandActionFromLine}: the core already refuses a line that runs no
+ * program (#376), but a record with no `argv`, or an empty first word, still has no program to show
+ * the human, so refuse it here too, with the same reason and message. This reads the core's output;
+ * it does not re-tokenize.
+ *
+ * @internal Exported only so its branches can be tested directly (the real core never returns such
+ * a record); not re-exported from the package entry point.
+ */
+export function assertRecordHasProgram(action: ActionRecord): void {
+  const syntacticArgv = (action.syntactic as { argv?: unknown }).argv;
+  if (!Array.isArray(syntacticArgv) || syntacticArgv.length === 0) {
+    throw new CommandActionError(
+      NO_PROGRAM_REFUSALS.no_command.reason,
+      NO_PROGRAM_REFUSALS.no_command.message,
+    );
+  }
+  if (syntacticArgv[0] === "") {
+    throw new CommandActionError(
+      NO_PROGRAM_REFUSALS.empty_program.reason,
+      NO_PROGRAM_REFUSALS.empty_program.message,
+    );
+  }
+}
+
+/** The `kind` own property of an error the core threw, or `""` when it has none. */
+function coreRefusalKind(err: unknown): string {
+  if (typeof err !== "object" || err === null || !Object.hasOwn(err, "kind")) return "";
+  const kind = (err as { kind?: unknown }).kind;
+  return typeof kind === "string" ? kind : "";
 }
 
 /**
