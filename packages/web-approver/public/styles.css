@@ -946,8 +946,13 @@ input {
 }
 
 .device-details-text,
+.device-details-warning,
 .device-details-problem {
   margin: 8px 0;
+}
+
+.device-details-warning {
+  font-weight: 600;
 }
 
 .device-details-problem {

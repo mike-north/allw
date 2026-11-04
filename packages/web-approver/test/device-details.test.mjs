@@ -102,6 +102,12 @@ test("the panel renders every value, collapsed, with copy buttons for keys and t
     assert.ok(host.textContent.includes(value), value);
   }
   assert.match(host.textContent, /allw-approver vouch/);
+  // Review-387 F1(c)/F10: never vouch the CLI's own device; copy only from this panel.
+  const warning = host.querySelector(".device-details-warning")?.textContent ?? "";
+  assert.match(warning, /Do not vouch for this device if it was set up from the CLI keyfile/);
+  assert.match(warning, /Copy these values only from this panel/);
+  // Review-387 F3: vouching grants read access only.
+  assert.match(host.textContent, /approvals are denied until it holds a device certificate/);
   const buttons = [...host.querySelectorAll("button")];
   assert.deepEqual(
     buttons.map((b) => b.textContent),

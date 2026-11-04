@@ -102,6 +102,20 @@ export function mountDeviceDetails(options: DeviceDetailsOptions): void {
         "below with allw-approver vouch, and compare the device id and all eight groups of both " +
         "fingerprints with what their terminal shows.",
     ),
+    el(
+      "p",
+      "device-details-warning",
+      "Do not vouch for this device if it was set up from the CLI keyfile: it is the CLI's own " +
+        "device, which allw-approver pair already lists. After a re-pair, paste the keyfile's new " +
+        "values here instead. Copy these values only from this panel, never from a request or a " +
+        "message.",
+    ),
+    el(
+      "p",
+      "device-details-text",
+      "Vouching lets this device read requests. Its approvals are denied until it holds a device " +
+        "certificate from the account root, which vouching does not issue.",
+    ),
   );
 
   const list = el("dl", "device-details-list");

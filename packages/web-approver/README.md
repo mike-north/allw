@@ -43,7 +43,8 @@ browser needs vouching depends on where its keys came from:
 - **Set up from the CLI keyfile** (the pairing form takes its seeds, cert and token): this browser
   _is_ the CLI's device, and `allw-approver pair` already lists it. The panel is informational. After
   a re-pair, paste the keyfile's new values (`docs/quickstart.md` §Upgrading an existing pairing):
-  the account state names only the new device id (#378).
+  the account state names only the new device id (#378). Never vouch for it: `vouch` refuses a
+  device carrying the keyfile's own keys, since that would replace the CLI's entry.
 - **Keys of its own**: the account-root holder runs the panel's command
   (`allw-approver vouch`, **interim until #199**) and compares the device id and all eight groups of
   both fingerprints with this panel before confirming. Until then, requests reach this browser but

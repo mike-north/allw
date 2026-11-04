@@ -141,6 +141,8 @@ async function bootWith({
   const inboxStarts = [];
   const notificationStarts = [];
   const deviceDetailsStarts = [];
+  /** Each panel start's `isStillPaired`, and how many times boot cleared the panel. */
+  const deviceDetails = { stillPaired: [], clears: 0 };
   /**
    * How many times boot asked to forget notifications (clear the credential mirror), and the
    * forgotten relay credentials each request carried.
@@ -157,8 +159,12 @@ async function bootWith({
     startNotifications: (identity) => {
       notificationStarts.push(identity);
     },
-    startDeviceDetails: (identity) => {
+    startDeviceDetails: (identity, isStillPaired) => {
       deviceDetailsStarts.push(identity);
+      deviceDetails.stillPaired.push(isStillPaired);
+    },
+    clearDeviceDetails: () => {
+      deviceDetails.clears += 1;
     },
     forgetNotifications: async (forgotten) => {
       forgets.count += 1;
@@ -167,7 +173,15 @@ async function bootWith({
     },
     loadDisplayEscape,
   });
-  return { root, noticeHost, inboxStarts, notificationStarts, deviceDetailsStarts, forgets };
+  return {
+    root,
+    noticeHost,
+    inboxStarts,
+    notificationStarts,
+    deviceDetailsStarts,
+    deviceDetails,
+    forgets,
+  };
 }
 
 /**
@@ -223,6 +237,24 @@ describe("boot — this device's keys panel (#381)", () => {
     assert.equal(deviceDetailsStarts.length, 1);
     assert.equal(deviceDetailsStarts[0].deviceId, PINNED_IDENTITY.deviceId);
     assert.equal(deviceDetailsStarts[0].relayUrl, PINNED_RELAY);
+  });
+
+  test("'Use another device' clears the panel and its identity stops being current (review-387 F9)", async () => {
+    const storage = memoryStorage();
+    storage.setItem(PAIRING_KEY, JSON.stringify(PINNED_IDENTITY));
+    const { root, deviceDetails } = await bootWith({ search: "", storage });
+    click(root, "Unlock inbox");
+    assert.equal(deviceDetails.clears, 0, "unlocking clears nothing");
+    assert.equal(deviceDetails.stillPaired[0](), true, "the mounted identity is current");
+    // Back on the pairing gate: the unlocked device is forgotten.
+    click(root, "Use another device");
+    assert.equal(storage.getItem(PAIRING_KEY), null);
+    assert.ok(deviceDetails.clears >= 1, "forgetting the pairing clears the panel");
+    assert.equal(
+      deviceDetails.stillPaired[0](),
+      false,
+      "a panel mount that finishes late sees the identity is gone",
+    );
   });
 
   test("an unpaired browser gets no panel until it pairs", async () => {
