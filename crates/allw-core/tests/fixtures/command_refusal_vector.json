@@ -44,6 +44,13 @@
       "message": "command line runs no program (only variable assignments or shell operators)"
     },
     {
+      "class": "a bare assignment (was a Medium-risk record before #376)",
+      "builder": "posix",
+      "command": "FOO=bar",
+      "code": "no_program",
+      "message": "command line runs no program (only variable assignments or shell operators)"
+    },
+    {
       "class": "only env assignments",
       "builder": "posix",
       "command": "FOO=1 BAR=$HOME",
