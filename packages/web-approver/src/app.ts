@@ -55,6 +55,7 @@
 
 import { createRelayAccountStateResolver } from "./account-state.js";
 import { mountWebApprover, type WebApproverMount } from "./browser.js";
+import { deviceDetailsModel, mountDeviceDetails } from "./device-details.js";
 import { mountOnboardingGate } from "./onboarding.js";
 import {
   createLocalPairingStore,
@@ -147,6 +148,11 @@ export interface BootEnvironment {
    * forget or replace it), so the controls never re-mirror or re-register a forgotten identity.
    */
   readonly startNotifications?: (identity: PinnedIdentity, isStillPaired: () => boolean) => void;
+  /**
+   * Mount the "This device" panel (#381) for a paired identity, outside the inbox: the device id,
+   * public keys and fingerprints the root holder needs for `allw-approver vouch`. Never awaited.
+   */
+  readonly startDeviceDetails?: (identity: PinnedIdentity) => void;
   /**
    * Undo notifications for a forgotten pairing (#237): clear the service worker's credential
    * mirror, then best-effort clear the browser's subscription and the relay's push tokens. Called
@@ -438,6 +444,7 @@ export async function boot(env: BootEnvironment): Promise<void> {
         }
         const pinned: PinnedIdentity = { ...identity, relayUrl: identity.relayUrl };
         void env.startInbox(root, pinned);
+        env.startDeviceDetails?.(pinned);
         env.startNotifications?.(pinned, () => {
           // Another tab may forget or replace the pairing while this one stays open.
           const now = pairingStore.load();
@@ -475,6 +482,15 @@ function startBrowserNotifications(identity: PinnedIdentity, isStillPaired: () =
   });
 }
 
+/** Mount the "This device" panel (#381) into `#device`, with fingerprints from the vendored core. */
+async function startBrowserDeviceDetails(identity: PinnedIdentity): Promise<void> {
+  const wasm = await initWasm(await VENDORED_WASM.loadGlue(), VENDORED_WASM.moduleSource);
+  mountDeviceDetails({
+    host: requireElement("device"),
+    model: deviceDetailsModel(wasm, identity),
+  });
+}
+
 if (typeof window !== "undefined" && typeof document !== "undefined") {
   void boot({
     root: requireElement("app"),
@@ -483,6 +499,9 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
     search: window.location.search,
     startInbox: bootInbox,
     startNotifications: startBrowserNotifications,
+    startDeviceDetails: (identity) => {
+      void startBrowserDeviceDetails(identity);
+    },
     forgetNotifications: (forgotten) =>
       forgetNotifications(
         browserForgetNotificationsDeps(

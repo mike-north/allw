@@ -140,6 +140,7 @@ async function bootWith({
   const noticeHost = document.getElementById("notices");
   const inboxStarts = [];
   const notificationStarts = [];
+  const deviceDetailsStarts = [];
   /**
    * How many times boot asked to forget notifications (clear the credential mirror), and the
    * forgotten relay credentials each request carried.
@@ -156,6 +157,9 @@ async function bootWith({
     startNotifications: (identity) => {
       notificationStarts.push(identity);
     },
+    startDeviceDetails: (identity) => {
+      deviceDetailsStarts.push(identity);
+    },
     forgetNotifications: async (forgotten) => {
       forgets.count += 1;
       forgets.forgotten.push(forgotten);
@@ -163,7 +167,7 @@ async function bootWith({
     },
     loadDisplayEscape,
   });
-  return { root, noticeHost, inboxStarts, notificationStarts, forgets };
+  return { root, noticeHost, inboxStarts, notificationStarts, deviceDetailsStarts, forgets };
 }
 
 /**
@@ -208,6 +212,31 @@ async function waitFor(probe, ticks = 100) {
   }
   assert.fail("condition not met within the tick budget");
 }
+
+describe("boot — this device's keys panel (#381)", () => {
+  test("mounts only once the human unlocks, with the pinned identity", async () => {
+    const storage = memoryStorage();
+    storage.setItem(PAIRING_KEY, JSON.stringify(PINNED_IDENTITY));
+    const { root, deviceDetailsStarts } = await bootWith({ search: "", storage });
+    assert.equal(deviceDetailsStarts.length, 0, "nothing before the returning-device unlock");
+    click(root, "Unlock inbox");
+    assert.equal(deviceDetailsStarts.length, 1);
+    assert.equal(deviceDetailsStarts[0].deviceId, PINNED_IDENTITY.deviceId);
+    assert.equal(deviceDetailsStarts[0].relayUrl, PINNED_RELAY);
+  });
+
+  test("an unpaired browser gets no panel until it pairs", async () => {
+    const storage = memoryStorage();
+    storage.setItem(ONBOARDING_KEY, "1");
+    const { root, deviceDetailsStarts } = await bootWith({
+      search: relayQuery("https://relay.selfhost.example"),
+      storage,
+    });
+    assert.equal(deviceDetailsStarts.length, 0);
+    submitPairingForm(root, LEGACY_IDENTITY);
+    assert.equal(deviceDetailsStarts.length, 1);
+  });
+});
 
 describe("boot — notification controls (#237)", () => {
   test("mount only once the human unlocks, with the pinned identity, after the inbox starts", async () => {
