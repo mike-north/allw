@@ -596,10 +596,10 @@
       "why": "#324 control: a wrapper inside one quoted substitution word runs dd (the padded, budget-exhausting rows are built in code in risk/tests.rs)"
     },
     {
-      "command": "x=\"$(nice -n 1 dd if=/dev/zero of=/dev/sda)\"",
+      "command": "echo \"$(nice -n 1 dd if=/dev/zero of=/dev/sda)\"",
       "risk": "critical",
-      "bin": "x=$(nice -n 1 dd if=/dev/zero of=/dev/sda)",
-      "why": "#324 control: an assignment's substitution runs dd through nice"
+      "bin": "echo",
+      "why": "#324 control: a substitution runs dd through nice"
     },
     {
       "command": "echo \"$(echo dd if=/dev/zero of=/dev/sda)\"",

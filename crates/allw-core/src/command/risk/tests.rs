@@ -1429,7 +1429,7 @@ fn an_argv_after_assignments_keeps_its_command_string_reach() {
         assert!(budget.exhausted, "{head:?} did not exhaust");
         assert_eq!(risk, Risk::Critical, "{head:?} padded");
         assert_eq!(
-            action_from_argv(&argv, None, &ctx()).risk,
+            action_from_argv(&argv, None, &ctx()).unwrap().risk,
             Risk::Critical,
             "{head:?} padded, public builder"
         );
@@ -1475,13 +1475,20 @@ const PADDING_LOWERS_TRACKED_IN_389: &[&str] = &[
 
 /// Guard: padding after any shared-fixture row never lowers its tier. For every row of
 /// `command_risk_vectors.json` and `command_line_risk_vectors.json`, `row ;:<pad>` is at least as
-/// risky as `row`, so every Critical row stays Critical. The pad is one word longer than the
-/// budget: the line's first charge exhausts it, so only the pre-pass and the argv classification
-/// of the `shlex` words (as with `" rm"` padding, whose words past the 256th are unseen) remain.
+/// risky as `row`, so every Critical row stays Critical. Two pads, each exhausting the budget a
+/// different way:
+///
+/// - one word longer than the budget: the line's first charge exhausts it, so only the pre-pass
+///   and the argv classification of the `shlex` words remain;
+/// - `" rm"` × 6000 (~18 KB): every `rm` position pays `direct_risk`'s suffix charge, so the argv
+///   analysis of the `shlex` words exhausts it, which catches wrapper-class drift (`su -c '…'`).
+///
+/// The allow-list must still be lowered by the first pad, so it only shrinks.
 #[test]
 fn padding_never_lowers_a_fixture_row() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-    let pad = format!(" ;:{}", "x".repeat(MAX_RISK_WORK));
+    let long_word = format!(" ;:{}", "x".repeat(MAX_RISK_WORK));
+    let rm_words = format!(" ;:{}", " rm".repeat(6000));
     let mut lowered = Vec::new();
     let mut tracked_fixed = Vec::new();
     for file in [
@@ -1495,14 +1502,20 @@ fn padding_never_lowers_a_fixture_row() {
             let Ok(unpadded) = action_from_command(row, &ctx()).map(|a| a.risk) else {
                 continue;
             };
-            let padded = line_risk(&format!("{row}{pad}"));
-            let is_lowered = risk_rank(padded) < risk_rank(unpadded);
             let tracked = PADDING_LOWERS_TRACKED_IN_389.contains(&row);
-            if is_lowered && !tracked {
-                lowered.push(format!("{file}: {row:?}: {unpadded:?} → {padded:?}"));
-            }
-            if tracked && !is_lowered {
-                tracked_fixed.push(format!("{file}: {row:?}"));
+            for (name, pad) in [("long word", &long_word), ("rm words", &rm_words)] {
+                let line = format!("{row}{pad}");
+                let (padded, budget) = analyze_with_budget(&line, MAX_RISK_WORK);
+                assert!(budget.exhausted, "{file}: {row:?} + {name} did not exhaust");
+                let is_lowered = risk_rank(padded) < risk_rank(unpadded);
+                if is_lowered && !tracked {
+                    lowered.push(format!(
+                        "{file}: {row:?} + {name}: {unpadded:?} → {padded:?}"
+                    ));
+                }
+                if tracked && !is_lowered && name == "long word" {
+                    tracked_fixed.push(format!("{file}: {row:?}"));
+                }
             }
         }
     }
