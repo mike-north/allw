@@ -340,6 +340,18 @@
       "class": "#391: a name that is not a shell identifier is a program word",
       "builder": "posix",
       "command": "FO-O=1"
+    },
+    {
+      "class": "#391: a subscript body holding ']' is not an assignment (bash runs it as a command)",
+      "builder": "posix",
+      "command": "A[a]b]=1"
+    },
+    {
+      "class": "#391: ['FO-O=1', ''] used to be empty_program; FO-O=1 is not an identifier, so it is the program",
+      "builder": "argv",
+      "command": "",
+      "argv": ["FO-O=1", ""],
+      "raw": null
     }
   ]
 }

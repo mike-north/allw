@@ -215,7 +215,11 @@ a program it runs.
 
 - **Assignments.** Leading assignment-like words (`NAME=value`, `X+=1`, `A[0]=1`) are skipped. The tier is that
   of the command after them, and at least `medium`: an assignment can change what a program does (`LD_PRELOAD`,
-  `PATH`, `GIT_SSH_COMMAND`). `X=1 rm -rf ~` is `high`.
+  `PATH`, `GIT_SSH_COMMAND`). `X=1 rm -rf ~` is `high`. "Assignment-like" here means any word with an `=` whose
+  name starts with a letter or `_`. That is deliberately wider than the shell-identifier rule the no-program
+  refusal uses (§Command lines that run no program, #391), and the two are not unified: risk fails upward, so
+  `FO-O=1 dd if=/dev/zero of=/dev/sda` stays `critical`, where the narrow rule would make `FO-O=1` the program and
+  the tier `medium`.
 - **Wrappers.** The wrappers are a curated list:
   - `env`, `sudo`, `doas`, `run0`, `pkexec`, `su`, `nice`, `ionice`, `nohup`, `time`, `timeout`
   - `command`, `builtin`, `exec`, `xargs`, `stdbuf`, `setsid`, `find`, `caffeinate`, `arch`
@@ -326,8 +330,9 @@ builder error it is fail-closed: the caller denies, and no human is asked.
 | `empty_program`             | the first word that is neither is the empty string                                       | `''`, `'' rm -rf x`, `FOO=1 "" ls` |
 
 The check reads the tokens only. Each word is split on `;`, `&`, `|`, `(`, `)`; an empty piece (an operator) or a
-pure assignment (`NAME=…`, `NAME+=…`, `A[0]=…`, where `NAME` is a shell identifier, with no backtick, `<` or `>` in
-it) is skipped, and any other piece is a program, so the line is built. A command with an `=` in it split out of a
+pure assignment (`NAME=…`, `NAME+=…`, `A[0]=…`, where `NAME` is a shell identifier with at most one `[…]`
+subscript whose body holds no `[` or `]`, and with no backtick, `<` or `>` in it) is skipped, and any other piece is
+a program, so the line is built. A command with an `=` in it split out of a
 substitution (`git log --format=%H` from `V="$(git log --format=%H)"`) is not an assignment, because its "name" is
 not an identifier (#391). A substitution or a redirection therefore always counts as running something
 (`FOO=$(id)` and `> out.txt` are built and go to a human).
@@ -344,9 +349,10 @@ the shell would still run something, and that is deliberate: every refusal is a 
 native caller's) is fallible with the same `CommandError`, whatever `raw` says: an empty argv is `no_command`; leading
 pure assignments are skipped, then an empty word is `empty_program` (`[""]`, `["", "rm", "-rf", "x"]`,
 `["FOO=1", ""]`); only assignments is `no_program` (`["FOO=1"]`). Words are not split on operators, because an argv
-runs without a shell: `["&&"]` names a program and is built. Assignments are treated as the line builder treats them
-(and as the risk rules skip them), although without a shell `FOO=1` would be a program name: no real program is
-named like an assignment, so refusing it fails closed and keeps the two builders consistent (decided for #376).
+runs without a shell: `["&&"]` names a program and is built. Assignments are recognised as the line builder
+recognises them (a shell-identifier name), although without a shell `FOO=1` would be a program name: no real program
+is named like an assignment, so refusing it fails closed and keeps the two builders consistent (decided for #376).
+The risk rules use a wider, first-character test (§v1 command risk).
 
 `action_from_powershell_command` is fallible with the same `CommandError`, and refuses only these (no PowerShell line
 is refused for its syntax). Quoting is not interpreted. The raw line is read line by line; a `#` that starts a token

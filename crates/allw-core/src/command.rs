@@ -269,10 +269,11 @@ pub fn action_from_command(
 /// - [`CommandError::NoProgram`] when every word is a pure assignment (`["FOO=1"]`).
 ///
 /// The words are never read as shell syntax: an operator word (`["&&"]`) is a program name, so it
-/// is built. Assignments are treated as the line builder treats them (and as the risk rules skip
-/// them) even though an argv runs without a shell, where `FOO=1` would be a program name: no real
-/// program is named like an assignment, so refusing it fails closed and keeps both builders
-/// consistent. See `docs/policy-seam.md` §Command lines that run no program.
+/// is built. Assignments are recognised as the line builder recognises them (a shell-identifier name,
+/// [`is_assignment_name`]), even though an argv runs without a shell, where `FOO=1` would be a
+/// program name: no real program is named like an assignment, so refusing it fails closed and keeps
+/// both builders consistent. (The risk rules use a wider, first-character test; see
+/// `risk::is_assignment_like`.) See `docs/policy-seam.md` §Command lines that run no program.
 ///
 /// # Examples
 ///
@@ -327,8 +328,13 @@ fn is_pure_assignment(piece: &str) -> bool {
 }
 
 /// Is `name` (the text before an assignment's first `=`) a shell identifier, optionally followed by
-/// a `[…]` subscript and then a `+` (for `+=`)? `X`, `_x1`, `A[0]`, `X+`, `A[i]+` are; `nice -n 1 dd
-/// if`, `FO-O`, `1X`, `A[0` and `` are not.
+/// one `[…]` subscript whose body holds no `[` or `]`, and then a `+` (for `+=`)? `X`, `_x1`, `A[0]`,
+/// `X+`, `A[i]+` are; `nice -n 1 dd if`, `FO-O`, `1X`, `A[0`, `A[a]b]`, `A[]]` and `` are not (bash
+/// runs each of those as a command).
+///
+/// This is deliberately narrower than the risk rules' `is_assignment_like` (first character only):
+/// refusing must never catch a word bash runs as a command, while risk over-matching only raises the
+/// tier.
 fn is_assignment_name(name: &str) -> bool {
     let name = name.strip_suffix('+').unwrap_or(name);
     let (ident, subscript) = match name.find('[') {
@@ -338,7 +344,9 @@ fn is_assignment_name(name: &str) -> bool {
     let mut bytes = ident.bytes();
     bytes.next().is_some_and(is_ident_start)
         && bytes.all(is_ident_cont)
-        && subscript.is_none_or(|s| s.len() >= 2 && s.ends_with(']') && !s[1..].contains('['))
+        && subscript.is_none_or(|s| {
+            s.len() >= 2 && s.ends_with(']') && !s[1..s.len() - 1].contains(['[', ']'])
+        })
 }
 
 /// Refuse a tokenized command line that runs no program (#376):
@@ -993,7 +1001,10 @@ mod tests {
     /// program word, so the line is built.
     #[test]
     fn issue_391_a_non_identifier_name_is_not_an_assignment() {
-        for line in ["FO-O=1", "1X=1", "A[0=1", "A]=1", "A[0]x=1", "X++=1", "=1"] {
+        for line in [
+            "FO-O=1", "1X=1", "A[0=1", "A]=1", "A[0]x=1", "X++=1", "=1", "A[a]b]=1", "A[]]=1",
+            "A[a]]=1", "A[x]]+=1",
+        ] {
             let result = action_from_command(line, &ctx_no_cwd());
             assert!(result.is_ok(), "{line:?} is not an assignment: {result:?}");
         }
@@ -1009,9 +1020,24 @@ mod tests {
             "A[0",
             "A[]x",
             "X++",
+            "A[a]b",
+            "A[]]",
+            "A[a]]",
+            "A[x]]+",
         ] {
             assert!(!is_assignment_name(name), "{name:?}");
         }
+        // The argv builder uses the same rule: bash would run each of these words as a command.
+        for word in ["FO-O=1", "A[a]b]=1", "A[]]=1", "A[a]]=1", "A[x]]+=1"] {
+            let argv = vec![word.to_string()];
+            let result = action_from_argv(&argv, None, &ctx_no_cwd());
+            assert!(result.is_ok(), "{argv:?} is not an assignment: {result:?}");
+        }
+        // `["FO-O=1", ""]` used to be refused as `empty_program`; `FO-O=1` is now the program.
+        let argv = vec!["FO-O=1".to_string(), String::new()];
+        let r = action_from_argv(&argv, None, &ctx_no_cwd()).unwrap();
+        assert_eq!(r.syntactic.bin.as_deref(), Some("FO-O=1"));
+        assert_eq!(r.risk, Risk::Medium);
     }
 
     /// A substitution hidden in an assignment keeps its risk: the line is not refused, and risk
