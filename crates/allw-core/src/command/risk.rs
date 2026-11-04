@@ -106,10 +106,16 @@
 //!   word: each argv word, the command word of every segment, and, when that command word is a
 //!   wrapper, every later non-flag word (so `"$(sudo dd …)"` keeps `dd`'s tier). It descends into
 //!   substitutions, backticks, heredoc bodies, the `-c` / `--command` / `-Command` strings of a
-//!   shell and the arguments of `eval` (where the argv rules read them: at the command word or
-//!   after a wrapper there) down to [`MAX_SHELL_NESTING`] levels. A segment that only names a
-//!   program as an argument (`echo dd`) adds nothing beyond the `shlex` words. It reads each
-//!   level's text once, so it is linear for each level.
+//!   shell, the arguments of `eval` (where the argv rules read them: at the command word, after
+//!   leading assignments, or after a wrapper there), and the whitespace words a wrapper runs
+//!   (`su -c 'dd …'`, `watch 'dd …'`, `env -S'dd …'`), down to [`MAX_SHELL_NESTING`] levels. A
+//!   segment that only names a program as an argument (`echo dd`) adds nothing beyond the
+//!   `shlex` words. It reads each word a bounded number of times for each level, so it is linear
+//!   for each level.
+//!
+//!   Known limits (#389): the pre-pass doesn't read here-strings (`bash <<< "dd …"`) or the
+//!   alternate readings (dash, no ANSI-C quotes, no arithmetic commands), so a `dd` only those
+//!   reach can still drop to `High` on exhaustion.
 //! - All analysis of one record shares one budget of [`MAX_RISK_WORK`] units (bytes scanned,
 //!   split or copied, plus argv positions classified). Exhausting it makes the record at least
 //!   `High`, and never lowers a tier already found: any program word the pre-pass sees keeps its
@@ -149,6 +155,12 @@ const MAX_PROGRAM_CANDIDATES: usize = 256;
 /// classification bounded in time: the call is synchronous WASM inside the hook, and a hook that
 /// outlives the agent's timeout fails open.
 const MAX_RISK_WORK: usize = 4 * 1024 * 1024;
+
+/// How many of a wrapper flag's possible command values ([`flag_command_values`]) the lexical
+/// pre-pass reads. A short-flag bundle has one value for each leading letter, so reading them all
+/// would be quadratic in an unbudgeted pass; real bundles are a few letters long. Past it the
+/// budgeted analysis still reads every value, and exhaustion is `High`.
+const PRE_PASS_FLAG_VALUES: usize = 8;
 
 /// Programs that run another command given later in their argv.
 const WRAPPERS: &[&str] = &[
@@ -1813,7 +1825,9 @@ fn note_visible_programs(line: Option<&str>, words: &[String], budget: &mut Budg
     for word in words {
         budget.note(classify_program(word, &[], &[]));
     }
-    note_argv_reach(words, 0, budget);
+    // Leading assignments (`X=1 sh -c '…'`) are skipped, as the argv rules skip them.
+    let start = words.iter().take_while(|w| is_assignment_like(w)).count();
+    note_argv_reach(&words[start..], 0, budget);
     if let Some(line) = line {
         note_line_programs(line, 0, budget);
     }
@@ -1853,26 +1867,44 @@ fn note_line_programs(text: &str, depth: usize, budget: &mut Budget) {
 ///
 /// - When `argv[0]` is a wrapper, every later non-flag word is noted as a program start. Only
 ///   the name matters here: on exhaustion the record is already at least `High`, and `Critical`
-///   depends only on the name.
+///   depends only on the name. Every later word with whitespace in it is also read as a line one
+///   level down (`su -c 'dd …'`, `watch 'dd …'`, `ssh host 'dd …'`); for a flag that is its
+///   values (`env -S'dd …'`), at most [`PRE_PASS_FLAG_VALUES`] of them.
 /// - The first shell (with a later `-c` / `--command` / PowerShell `-Command` flag) or `eval`
 ///   that runs, at `argv[0]` or after a wrapper there, has its command strings read as lines one
 ///   level down: each later non-flag word (and a `--command=` value) for a shell, the rest of the
 ///   argv joined by spaces for `eval`. Only the first is read, since the text it reads holds
-///   every later one, so each word is read at most once for each level.
+///   every later one, and a shell skips the words the wrapper rule already read.
 ///
-/// One pass over the words, plus the nested lines. A segment whose command word is none of these
-/// (`echo dd`) adds nothing.
+/// So each word is read a bounded number of times for each level. A segment whose command word
+/// is none of these (`echo dd`) adds nothing.
 fn note_argv_reach(argv: &[String], depth: usize, budget: &mut Budget) {
     let Some(first) = argv.first() else {
         return;
     };
     let wrapped = WRAPPERS.contains(&basename(first));
+    let nested = depth < MAX_SHELL_NESTING;
     if wrapped {
-        for word in argv[1..].iter().filter(|w| !is_flag(w)) {
-            budget.note(classify_program(word, &[], &[]));
+        for word in &argv[1..] {
+            let flag = is_flag(word);
+            if !flag {
+                budget.note(classify_program(word, &[], &[]));
+            }
+            if nested && has_whitespace(word) {
+                if flag {
+                    for value in flag_command_values(word)
+                        .into_iter()
+                        .take(PRE_PASS_FLAG_VALUES)
+                    {
+                        note_line_programs(value, depth + 1, budget);
+                    }
+                } else {
+                    note_line_programs(word, depth + 1, budget);
+                }
+            }
         }
     }
-    if depth >= MAX_SHELL_NESTING {
+    if !nested {
         return;
     }
     // The last command flag of each kind: a shell at `j` reads command strings if one follows it.
@@ -1894,7 +1926,11 @@ fn note_argv_reach(argv: &[String], depth: usize, budget: &mut Budget) {
         let reads = (SHELLS.contains(&base) && last_shell_flag.is_some_and(|f| f > j))
             || (POWERSHELLS.contains(&base) && last_pwsh_flag.is_some_and(|f| f > j));
         if reads {
-            for later in &argv[j + 1..] {
+            // Words with whitespace after a wrapper were read by the wrapper rule above.
+            for later in argv[j + 1..]
+                .iter()
+                .filter(|w| !(wrapped && has_whitespace(w)))
+            {
                 let text = if is_flag(later) {
                     later.strip_prefix("--command=")
                 } else {

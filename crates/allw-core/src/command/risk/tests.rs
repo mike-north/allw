@@ -1389,3 +1389,113 @@ fn the_pre_pass_is_linear_per_level_through_command_strings() {
         text.len()
     );
 }
+
+/// Regression (#384 review, 1): the argv pre-pass didn't skip leading assignments, so on the
+/// `action_from_argv` surface `X=1 sh -c '…'`, `X=1 eval …` and `X=1 pwsh -Command …` lost their
+/// `-c` / `eval` reach when padding exhausted the budget (High).
+#[test]
+fn an_argv_after_assignments_keeps_its_command_string_reach() {
+    let pad = vec!["rm".to_string(); 60_000];
+    for head in [
+        vec!["X=1", "sh", "-c", DD],
+        vec!["X=1", "Y=2", "eval", DD],
+        vec!["X=1", "pwsh", "-Command", DD],
+    ] {
+        let mut argv: Vec<String> = head.iter().map(|s| s.to_string()).collect();
+        assert_eq!(argv_of(&head), Risk::Critical, "{head:?} unpadded");
+        argv.extend(pad.iter().cloned());
+        let mut budget = Budget::new(MAX_RISK_WORK);
+        note_visible_programs(None, &argv, &mut budget);
+        let risk = classify_argv(&argv, 0, &mut budget);
+        let risk = budget.finish(risk);
+        assert!(budget.exhausted, "{head:?} did not exhaust");
+        assert_eq!(risk, Risk::Critical, "{head:?} padded");
+        assert_eq!(
+            action_from_argv(&argv, None, &ctx()).risk,
+            Risk::Critical,
+            "{head:?} padded, public builder"
+        );
+    }
+}
+
+/// Regression (#384 review, 2): words after a wrapper were noted by name only, so a command line
+/// a wrapper runs from one word (`su -c '…'`, `watch '…'`, `ssh host '…'`, `env -S'…'`) lost its
+/// `dd` on exhaustion (High).
+#[test]
+fn a_command_line_a_wrapper_runs_survives_budget_exhaustion() {
+    let pad = exhausting_pad();
+    for line in [
+        format!("su -c '{DD}' ;:{pad}"),
+        format!("watch 'echo x; {DD}' ;:{pad}"),
+        format!("ssh host 'echo x; {DD}' ;:{pad}"),
+        format!("env -S'{DD}' ;:{pad}"),
+        format!("env --split-string='{DD}' ;:{pad}"),
+        format!("echo \"$(sudo watch 'echo x; {DD}')\" ;:{pad}"),
+    ] {
+        assert_exhausted(&line, Risk::Critical);
+    }
+    // Not after a wrapper: a whitespace word that is only an argument is not read.
+    assert_exhausted(&format!("echo \"$(echo 'x; {DD}')\" ;:{pad}"), Risk::High);
+}
+
+/// Rows of the shared fixtures that padding still lowers. Each is a pre-existing gap of the
+/// pre-pass tracked in #389 (here-strings and the dash / ANSI-C / arithmetic alternate readings
+/// are only read by the budgeted analysis). Remove a row when #389 fixes it; the guard fails if a
+/// listed row stops being lowered, so the list only shrinks.
+const PADDING_LOWERS_TRACKED_IN_389: &[&str] = &[
+    // Here-strings: the pre-pass doesn't read a `<<<` body as a script.
+    "bash <<< \"dd if=/dev/zero of=/dev/sda\"",
+    "cat <<< \"dd if=/dev/zero of=/dev/sda\"",
+    "{ bash; } <<< 'dd if=/dev/zero of=/dev/sda'",
+    // Alternate readings (dash: no `$'…'`; no arithmetic commands): the pre-pass reads bash only.
+    "dash -c 'echo $'\"'\"'\\'\"'\"'\ndd if=/dev/zero of=/dev/sda\necho \\'\"'\"''\"'\"''",
+    "dash -c 'echo $'\"'\"'\\'\"'\"' ; dd if=/dev/zero of=/dev/sda ; echo \\'\"'\"''\"'\"''\"'\"''",
+    "sh -c '((: ; dd if=/dev/zero of=/dev/sda))'",
+    "eval 'echo $'\"'\"'\\'\"'\"' ; dd if=/dev/zero of=/dev/sda ; echo \\'\"'\"''\"'\"''\"'\"''",
+    "echo \"$(((: ; dd if=/dev/zero of=/dev/sda)))\"",
+];
+
+/// Guard: padding after any shared-fixture row never lowers its tier. For every row of
+/// `command_risk_vectors.json` and `command_line_risk_vectors.json`, `row ;:<pad>` is at least as
+/// risky as `row`, so every Critical row stays Critical. The pad is one word longer than the
+/// budget: the line's first charge exhausts it, so only the pre-pass and the argv classification
+/// of the `shlex` words (as with `" rm"` padding, whose words past the 256th are unseen) remain.
+#[test]
+fn padding_never_lowers_a_fixture_row() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let pad = format!(" ;:{}", "x".repeat(MAX_RISK_WORK));
+    let mut lowered = Vec::new();
+    let mut tracked_fixed = Vec::new();
+    for file in [
+        "command_risk_vectors.json",
+        "command_line_risk_vectors.json",
+    ] {
+        let text = std::fs::read_to_string(dir.join(file)).expect("fixture is committed");
+        let fixture: serde_json::Value = serde_json::from_str(&text).expect("fixture is JSON");
+        for case in fixture["cases"].as_array().expect("cases") {
+            let row = case["command"].as_str().expect("command");
+            let Ok(unpadded) = action_from_command(row, &ctx()).map(|a| a.risk) else {
+                continue;
+            };
+            let padded = line_risk(&format!("{row}{pad}"));
+            let is_lowered = risk_rank(padded) < risk_rank(unpadded);
+            let tracked = PADDING_LOWERS_TRACKED_IN_389.contains(&row);
+            if is_lowered && !tracked {
+                lowered.push(format!("{file}: {row:?}: {unpadded:?} → {padded:?}"));
+            }
+            if tracked && !is_lowered {
+                tracked_fixed.push(format!("{file}: {row:?}"));
+            }
+        }
+    }
+    assert!(
+        lowered.is_empty(),
+        "padding lowers:\n{}",
+        lowered.join("\n")
+    );
+    assert!(
+        tracked_fixed.is_empty(),
+        "no longer lowered by padding; remove from PADDING_LOWERS_TRACKED_IN_389:\n{}",
+        tracked_fixed.join("\n")
+    );
+}
