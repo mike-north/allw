@@ -64,7 +64,8 @@ export const PAIRING_START_AUTH_LIFETIME_MS = 2 * 60 * 1000;
  * floor, disagreeing siblings, or a revoked id. Entries for the same keys under an earlier relay id
  * are replaced (#378), so re-running `pair` leaves one entry for this keyfile's device.
  *
- * @returns the published sequence.
+ * @returns the published sequence, and the ids the published state retired: earlier relay ids for
+ *   this keyfile's keys, which no longer receive requests.
  */
 async function publishDeviceAccountState(
   wasm: AllwWasm,
@@ -72,14 +73,14 @@ async function publishDeviceAccountState(
   relayUrl: string,
   accountId: string,
   deviceId: string,
-): Promise<number> {
+): Promise<{ sequence: number; replacedDeviceIds: readonly string[] }> {
   const draft = await composeAddDevice(wasm, keyfile, relayUrl, accountId, {
     deviceId,
     encryptionPubkey: keyfile.device_encryption_pubkey,
     signingPubkey: keyfile.device_signing_pubkey,
   });
   await signAndPublish(wasm, keyfile, relayUrl, accountId, draft);
-  return draft.sequence;
+  return { sequence: draft.sequence, replacedDeviceIds: draft.replacedDeviceIds };
 }
 
 /** A sink for human-facing output (stdout by default; captured in tests). */
@@ -187,8 +188,20 @@ export async function runPair(
   // 4. Publish the account state that vouches for this device, so integrators can encrypt to it.
   // Before the keyfile write: a failure here leaves the keyfile unpaired, and re-running `pair`
   // starts over cleanly.
-  const sequence = await publishDeviceAccountState(wasm, existing, relayUrl, accountId, deviceId);
+  const { sequence, replacedDeviceIds } = await publishDeviceAccountState(
+    wasm,
+    existing,
+    relayUrl,
+    accountId,
+    deviceId,
+  );
   log(`Published account state — sequence ${String(sequence)}`);
+  // The retired ids came from the relay: `log` escapes them with the rest of the line.
+  for (const retired of replacedDeviceIds) {
+    log(
+      `  retired: ${retired} (same keys; a web approver still using it must re-paste the keyfile values)`,
+    );
+  }
 
   // 5. Persist the fully-paired identity (no partial writes before this point).
   const updated: Keyfile = {

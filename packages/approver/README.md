@@ -53,7 +53,8 @@ that account state lists (#243), so a device is unreachable until a state naming
 The core composes that state (`next_account_state`, #379): it carries the existing devices forward at
 the next sequence, keeps one entry per key pair (a re-pair replaces this keyfile's entry under its
 old device id, #378), and refuses to publish when the relay's account states don't verify, disagree,
-or are older than the keyfile has seen.
+or are older than the keyfile has seen. `pair` prints a `retired:` line for each old id it replaces;
+a web approver still using that id must re-paste the keyfile's values.
 
 The account id is self-certifying (`docs/enrollment.md` §Self-Certifying Account Id): it is
 `base64url(SHA-256("allw/account-id/v1" || 0x00 || account_root_pubkey))`, so only the root holder

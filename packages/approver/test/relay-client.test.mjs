@@ -924,6 +924,74 @@ test("two consecutive re-pairs leave exactly one entry for the keyfile's keys, u
   }
 });
 
+// #378: pair names every id its published state retires, so the human knows which web approver
+// must re-paste the keyfile values. The core validates only the id being added, so an id already in
+// a root-signed state (one written before that check, from a relay-issued id) is untrusted text:
+// the line is escaped.
+test("a re-pair prints an escaped 'retired' line for the id it replaces, and a first pair prints none (#378)", async () => {
+  const wasm = await loadWasm();
+  const hostileId = "dev-cli-0\u001b[2J\u0007";
+  const relay = await startFakeRelay({
+    unpublished: NO_ACCOUNT_STATES,
+    deviceIds: ["dev-cli-1", "dev-cli-2"],
+  });
+  try {
+    await withTempKeyfile(async (cliPath) => {
+      const firstLines = [];
+      const first = await runPair(
+        wasm,
+        { relayUrl: relay.url, keyfilePath: cliPath, now: FIXED_NOW },
+        (line) => firstLines.push(line),
+      );
+      assert.ok(!firstLines.some((l) => l.includes("retired:")), "a first pair retires nothing");
+
+      // A later root-signed state lists this keyfile's keys under the hostile id.
+      const jws = wasm.sign_account_state(
+        JSON.stringify({
+          v: 1,
+          account_id: first.account_id,
+          sequence: 2,
+          current_root: first.account_root_pubkey,
+          previous_roots: [],
+          devices: [
+            {
+              device_id: hostileId,
+              encryption_pubkey: first.device_encryption_pubkey,
+              signing_pubkey: first.device_signing_pubkey,
+              status: "active",
+            },
+          ],
+          actors: [],
+          revocations: [],
+        }),
+        first.account_root_seed,
+      );
+      relay.publishedStates.set(first.account_id, { account_states: [jws], max_sequence: 2 });
+
+      const lines = [];
+      const repaired = await runPair(
+        wasm,
+        { relayUrl: relay.url, keyfilePath: cliPath, now: FIXED_NOW },
+        (line) => lines.push(line),
+      );
+      assert.equal(repaired.device_id, "dev-cli-2");
+      const retired = lines.filter((l) => l.includes("retired:"));
+      assert.deepEqual(retired, [
+        `  retired: ${wasm.escape_for_display(hostileId)} (same keys; a web approver still using it must re-paste the keyfile values)`,
+      ]);
+      assert.notEqual(wasm.escape_for_display(hostileId), hostileId, "the id needed escaping");
+      assert.ok(
+        !/[\u0000-\u001f\u007f]/.test(retired[0]),
+        "no raw control character reaches the terminal",
+      );
+      const published = lines.findIndex((l) => l === "Published account state — sequence 3");
+      assert.equal(lines.indexOf(retired[0]), published + 1, "listed under the published state");
+    });
+  } finally {
+    await relay.close();
+  }
+});
+
 // Regression: a relay deployed before account-state GET became unauthenticated answers it with 401.
 // pair must still fail closed (nothing published, keyfile unpaired) and say to redeploy the relay.
 test("runPair against a relay too old for account-state GET (401) fails closed and says redeploy the relay", async () => {
