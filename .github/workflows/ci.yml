@@ -69,8 +69,9 @@ jobs:
       # asserting request-hash/v2 parity and verdict accept/reject (fail-closed).
       - run: pnpm --filter @allw/sdk test
       # The stand-in approver's integration tests run the same compiled wasm (decrypt → recompute
-      # request_hash → sign → verify_verdict round-trip). It imports from dist/, so build first.
-      - run: pnpm --filter @allw/approver build
+      # request_hash → sign → verify_verdict round-trip). It imports from dist/, so build it and its
+      # workspace deps first (the `...` suffix): tests never rebuild dependencies (#275).
+      - run: pnpm --filter "@allw/approver..." build
       - run: pnpm --filter @allw/approver test
       # The Claude Code hook (the v1 beachhead) runs the same compiled wasm: it builds ActionRecords
       # via the core and runs the full SDK round-trip against a relay double. It imports from dist/
@@ -80,10 +81,12 @@ jobs:
       - run: pnpm --filter @allw/hook test
       # The v0 walking-skeleton e2e composes the SAME compiled wasm through the real sdk + approver +
       # hook in one round-trip (approve→allow, deny→deny, timeout→expired, integrator re-verify, and
-      # the zero-knowledge storage assertion). It imports from dist/ (and depends on sdk/approver/hook
-      # dist), so build it after them. The genuinely-live workerd stack is the local `demo:e2e`
-      # script, not CI (see examples/walking-skeleton/README.md → Test layers).
-      - run: pnpm --filter @allw/example-walking-skeleton build
+      # the zero-knowledge storage assertion), and the interim-vouch e2e decrypts with the real web
+      # approver runtime. It imports from dist/ (and its workspace deps' dist), so build it with
+      # every dependency (the `...` suffix) rather than relying on earlier steps' order. The
+      # genuinely-live workerd stack is the local `demo:e2e` script, not CI (see
+      # examples/walking-skeleton/README.md → Test layers).
+      - run: pnpm --filter "@allw/example-walking-skeleton..." build
       - run: pnpm --filter @allw/example-walking-skeleton test
       # The web approver's production static-site bundle (issue #180) needs the vendored wasm to
       # copy into dist-site/ (scripts/build-site.mjs), so it is re-built here rather than in the
