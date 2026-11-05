@@ -18,15 +18,10 @@ and [enrollment.md](./enrollment.md) (account/device enrollment, rotation, revoc
    key(s) — exactly the devices root-signed account state lists as active (`docs/enrollment.md` §Model,
    recipient selection rule), never the relay's device list, so the relay cannot add a reader. The verdict is
    signed by a device key.
-2. **Structure-not-data** — the relay (and anything off-device) may see action **structure** — the surface kind,
-   program name (commands) / server + tool name (MCP calls), and session label — but **never** action **data**:
-   arguments, parameter values, environment variable names or values, or any content the agent is operating on.
-   Shorthand: "know the function, not the arguments." For MCP calls the function identity is the (server, tool)
-   pair, parallel to a command's program name; both are structure. This is enforced on-device (in the WASM/native
-   client) before any bytes reach the relay, and it tightens the E2EE invariant — it does not loosen it. Full
-   `ActionRecord` data travels only inside the JWE (`context_ciphertext`), visible exclusively to enrolled
-   approver devices. A RESERVED `privacy_preference` wire field (null = default in v1) controls how much
-   structure the relay sees; see §Messages for the three tiers.
+2. **Relay data boundary** — the implemented request envelope exposes only routing/lifecycle metadata
+   (`v`, `id`, `created_at`, `expires_at`, `approver`) and opaque `context_ciphertext`. The relay never
+   sees program names, surface, MCP names, session labels, arguments or plaintext action data. Structure
+   metadata/privacy tiers are unimplemented proposals; #216 needs reconsideration after parser removal.
 3. **Verifiable verdict** — a signed artifact any party can verify _without trusting the relay_, cryptographically
    **bound to the exact request** (no replay, no swap).
 4. **WYSIWYS (what you see is what you sign)** — the verdict binds to a single `request_hash` over the _entire_
@@ -48,8 +43,8 @@ and [enrollment.md](./enrollment.md) (account/device enrollment, rotation, revoc
 - **Integrator / Relying Party** — the code calling `requestApproval` (a hook, the proxy, a gateway). Verifies and enforces.
 - **Approver** — the human; owns an account with one or more enrolled **devices** (the "inbox").
 - **Relay** — zero-knowledge router (Cloudflare Workers + Durable Objects). At the default (structure-visible)
-  tier it sees: routing metadata, opaque `context_ciphertext`, and action structure (surface / program name or
-  server+tool name / session-label). It never sees action data (arguments, values, env). At the
+  tier it sees only routing/lifecycle metadata and opaque `context_ciphertext`. It never sees action
+  structure or action data. At the
   paranoid/enterprise tier (reserved; not built in v1) it sees routing metadata only.
 
 ---
@@ -57,22 +52,29 @@ and [enrollment.md](./enrollment.md) (account/device enrollment, rotation, revoc
 ## What is approved: the `ActionRecord`
 
 The payload being approved is an **`ActionRecord`** — defined in [policy-seam.md](./policy-seam.md). v1 carries the
-**syntactic substrate** (`surface` + tokenized command / MCP call); the semantic `capabilities`/`scope` fields are
-reserved and null, and a device refuses a context that sets one (§Device-side context checks). The contract is
+**caller-described action substrate** (`surface` + command / MCP / file-edit facts). Risk and reserved
+`capabilities`/`scope` slots are removed. New builders stamp `record_schema_version: 2` for this
+breaking record shape. Temporary parsed fields await #406 slice 2. The contract is
 **action-agnostic**: it transports and binds whatever `ActionRecord` it's given.
 
 ---
 
+**#406 partial implementation:** allw does not interpret what an action does or rate its danger.
+Risk labels/scoring and policy-only wire metadata are removed. `reversible` is an optional caller assertion;
+hooks and the OpenClaw bridge omit it. Command/PowerShell tokenization, no-program refusals, web command
+interpretation, and parsed/derived fields remain temporarily and are scheduled for removal in slice 2.
+They are not product scope. Faithful raw/cwd/caller argv/MCP/file-edit display and escaping remain.
+
 ## Lifecycle
 
-1. Integrator builds an **ApprovalContext** (actor identity + `ActionRecord` + `summary` + `risk` + `reversible` +
+1. Integrator builds an **ApprovalContext** (actor identity + `ActionRecord` + `summary` + optional `reversible` +
    constraints) and computes `request_hash` over the canonical _request-hash input_ — the `ApprovalContext` fields
    **plus** the shown `expires_at`, as one flat object (see §Wire encoding).
 2. Encrypts the `ApprovalContext` to the approver's device key(s) → `context_ciphertext` (JWE), and wraps it in an
    **ApprovalRequest** envelope (routing + lifecycle only).
 3. Submits to relay → push **wakeup (request id only)** → device fetches the envelope's ciphertext.
 4. Device decrypts the `ApprovalContext`, verifies the actor `attestation`, **renders** (WYSIWYS), recomputes
-   `request_hash`, human decides; destructive ops may require a **number-match** challenge.
+   `request_hash`, human decides; the caller may require a **number-match** challenge.
 5. Device emits a **Verdict** signed (JWS/COSE) over `(request_id, request_hash, decision, decided_at, nonce)`;
    if an approval requires number-match, the signed `challenge_response` must be the derived challenge for that
    `request_hash`. Denials do not need to satisfy the approval challenge.
@@ -95,9 +97,7 @@ ciphertext. **The relay never sees the `ActionRecord` or any rendered content.**
 `action_structure` is the **structure-not-data** surface (Invariant 2): when present, it carries only structure
 fields — `surface` kind, function identity (`program` name for commands; `server` + `tool` name for MCP calls),
 `session_label` — never data (arguments, parameter values, env). For MCP calls the (server, tool) pair is the
-function identity, parallel to a command's program name; both are structure. In the default (structure-visible)
-tier the integrator SHOULD populate this field so the relay can use structure for routing intelligence. In the
-paranoid/enterprise tier (reserved; not built in v1) this field is omitted.
+function identity, parallel to a command's program name; both are structure. A future structure-visible tier was proposed for routing intelligence; no such field is implemented. This remains an unimplemented proposal held in #216; no caller populates it today.
 
 **`action_structure` itself is not yet implemented in any surface** (v1's `ApprovalRequest` envelope carries only
 `v` · `id` · `created_at` · `expires_at` · `approver` · `context_ciphertext` — routing + lifecycle metadata, with
@@ -123,7 +123,7 @@ no visibility into content.)
 ### ApprovalContext — _inside the JWE; the approver's devices only_
 
 `action`: **`ActionRecord`** · `summary` · `actor` { `id`, `kind`, `attestation`: actor-key signature } ·
-`risk`(low|med|high|critical) · `reversible` · `constraints` { allowed verdicts, challenge policy } ·
+`reversible`? (optional caller assertion) · `constraints` { allowed verdicts, challenge policy } ·
 `chain`? (upstream-gate ids, audit correlation only).
 
 This is the **complete human-shown payload**; `request_hash` is computed over the canonical _request-hash input_ —
@@ -133,29 +133,17 @@ one hash is the complete WYSIWYS binding. The actor's `attestation` is verified 
 locally (it builds it and runs its policy engine before escalating), so this split only changes what crosses the
 wire to the relay.
 
-#### Device-side context checks
+#### Unknown fields and optional assertions
 
-The hash binds the whole context, but approvers show only part of it. So when a device opens a context
-(`decrypt_context` in the core, used by every approver surface), it refuses one whose hidden part says something
-the shown part doesn't. The device can't approve a refused request, so the caller is denied (fail-closed). The
-error names what broke the rule; surfaces only render it. Decided 2026-11-03 (#296).
+Core contract objects retain serde's existing **ignore unknown fields** behavior, identically in Rust,
+WASM and UniFFI. Removed `risk`, `capabilities`, `scope` and `policy` keys are unknown, are not retained
+or reserialized, and cannot influence the new canonical hash. This is not a compatibility mode:
+old signed hashes do not verify under the new hash domain. Malformed known fields and missing required
+fields still fail closed. SDK command-builder output validation requires the exact current core output shape.
 
-1. **Reserved semantic fields must be null.** `action.capabilities` and `action.scope` are reserved for the T3 tier
-   ([policy-seam.md](./policy-seam.md) §Forward-compat). A context that sets either one is refused, whatever the
-   value: any `scope` value, including `{}`, `[]`, `""`, `0` and `false`, and any `capabilities` array, including
-   `[]`. A non-array `capabilities` is a malformed context and was already refused. Absent and `null` both pass.
-   The error names each field that is set, for example
-   `action.capabilities and action.scope are reserved and must be null in v1`. This is checked first.
-2. **No hidden risk downgrade.** Approvers show the context's `risk`, not `action.risk`. A context whose `risk` is
-   lower than `action.risk` would hide the record's tier behind a milder one, so it is refused. The error names
-   both tiers (`context risk low is lower than action.risk critical`). A context may **raise** the risk, since an
-   integrator can ask for more care than the record's tier, so `risk >= action.risk` passes. Showing both tiers
-   when they differ is a later display change ([#340](https://github.com/mike-north/allw/issues/340)). On the raw
-   SDK path both `risk` and `action.risk` are integrator inputs, so this is a consistency check: what is shown can't
-   be milder than what is recorded. It can't stop an integrator that writes `low` in both places.
-
-The integrator side doesn't check these today: an integrator that sends such a context gets a denial, not an
-error.
+`reversible` is an optional boolean asserted by the caller. Absent or null means no assertion and is
+omitted when serialized and hashed; approvers show a yes/no claim only when present. Hooks and the
+bridge do not infer it. No device-side risk-downgrade or reserved-policy-slot check remains.
 
 ### Verdict — _one-shot and scope-free_
 
@@ -170,7 +158,7 @@ error.
 
 `seq` · `prev_hash` · `record_hash` · `request_id` · `request_hash` · `actor` · `approver` · `decision` ·
 `decided_at` · `action`(ActionRecord) ·
-`policy` { decision, rule_id?, tier, schema_version } (reserved; v1 writes `escalate`) · `note`? ·
+`note`? ·
 verdict `sig` (+ optional integrator counter-sign). Periodically anchor the head hash for non-repudiation.
 
 > The audit `note` MUST come from the **verified** verdict — the note the core returns from the signed claims
@@ -214,7 +202,7 @@ verdict `sig` (+ optional integrator counter-sign). Periodically anchor the head
    ([#311](https://github.com/mike-north/allw/issues/311)). Any other failure is unverifiable: the SDK keeps waiting for a fully verified verdict until
    `expires_at`, then reports `expired` if none arrives.
 4. Not expired; `decided_at` within window; nonce unseen (anti-replay).
-5. If the verdict is approved and destructive challenge is required: `challenge_response` equals the derived
+5. If the verdict is approved and the caller requires a challenge: `challenge_response` equals the derived
    number-match challenge. Authenticated denials stay denials without a challenge response.
 6. **Then** `effective_allow = approved ∧ verified ∧ local_policy ∧ (other gates)`. The primitive contributes a
    verified human decision; it never authorizes by itself.
@@ -377,11 +365,12 @@ after the local call has settled cannot change its result.
 ## v1 scope
 
 - **Ship:** one-shot scope-free verdicts · actor-key attestation · **syntactic** `ActionRecord` (policy-seam T1) ·
-  number-match challenge for destructive/critical · optional human `note` · E2EE + verifiable verdict + audit chain ·
-  **structure-not-data boundary** (default / structure-visible tier only; `privacy_preference` reserved as null).
+  caller-requested number-match challenge · optional human `note` · E2EE + verifiable verdict + audit chain ·
+  **relay data boundary** (routing/lifecycle metadata and ciphertext only; structure metadata unimplemented).
 - **External responsibility:** standing autonomy, conditions, and predicate rules belong to the separate policy
   project; allw does not evaluate, hold, generate or sign them.
-- **Defer:** semantic `ActionRecord` fields and paranoid/enterprise and ai-summary privacy tiers.
+- **Outside allw:** semantic capability inference and policy metadata.
+- **Defer:** paranoid/enterprise and ai-summary privacy tiers.
 
 > **Caller set (MVP).** The set of integrators calling this contract has grown beyond the original Claude Code /
 > Codex hooks to include the **OpenClaw** approval client and the **macts** HITL-provider plugin (see
@@ -413,8 +402,7 @@ integrator (pre-send) and the device (post-decrypt) compute it independently and
   action,        // full ActionRecord
   summary,       // string
   actor,         // { id, kind } ONLY — attestation excluded
-  risk,          // "low" | "medium" | "high" | "critical"
-  reversible,    // bool
+  reversible,    // optional bool; omitted when absent or null
   constraints,   // { allowed_decisions, challenge_required }
   chain,         // string[] — key omitted entirely when absent
   expires_at     // i64 ms — read from the envelope (relay needs it for lifecycle), bound here
@@ -432,23 +420,25 @@ envelope's other routing/lifecycle fields (`id`, `created_at`, `approver`, `v`),
 **Recipe:**
 
 ```
-request_hash = SHA-256( b"allw/request-hash/v2" || 0x00 || JCS(request-hash input) )
+request_hash = SHA-256( b"allw/request-hash/v3" || 0x00 || JCS(request-hash input) )
 ```
 
 where `JCS(...)` is the [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785) JSON Canonicalization Scheme encoding of
 the single flat object above (object keys lexicographically sorted by JCS; `expires_at` canonicalizes as a sibling
 of `action`/`summary`/…). The `0x00` byte separates the domain tag from the payload.
 
-**Versioning:** the broadened input is a breaking change from the four-field v1, so the domain tag bumps to
-`b"allw/request-hash/v2"`; the frozen cross-platform vector is re-pinned when this lands in code.
+**Versioning:** #406 removes risk fields and makes reversibility optional. The domain is
+`b"allw/request-hash/v3"`; old v2 receipts cannot verify as new-format receipts. Audit records similarly
+use `allw/audit-record/v2` after removing policy metadata. Preserve old history as explicitly unverifiable
+under this format; do not discard it or automatically migrate it into apparently verified history.
 
 ### audit record_hash
 
-`record_hash = SHA-256( b"allw/audit-record/v1" || 0x00 || JCS(record_without_record_hash) )`
+`record_hash = SHA-256( b"allw/audit-record/v2" || 0x00 || JCS(record_without_record_hash) )`
 
 Every field of the `AuditRecord` is covered **except `record_hash` itself** (circular). Critically
 `prev_hash` is included, so each record commits to its predecessor → tamper-evident chain.
-Domain tag `b"allw/audit-record/v1"` is distinct from the request-hash tag; the `/v1` suffix is the
+Domain tag `b"allw/audit-record/v2"` is distinct from the request-hash tag; the `/v1` suffix is the
 version knob.
 
 ### verdict signature (EdDSA JWS)

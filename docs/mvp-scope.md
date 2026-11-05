@@ -14,6 +14,12 @@ milestone descriptions and this table in sync; they are two views of one decisio
 
 ---
 
+**#406 partial implementation:** allw does not interpret what an action does or rate its danger.
+Risk labels/scoring and policy-only wire metadata are removed. `reversible` is an optional caller assertion;
+hooks and the OpenClaw bridge omit it. Command/PowerShell tokenization, no-program refusals, web command
+interpretation, and parsed/derived fields remain temporarily and are scheduled for removal in slice 2.
+They are not product scope. Faithful raw/cwd/caller argv/MCP/file-edit display and escaping remain.
+
 ## (a) The three integration goals
 
 The MVP is proven by three callers, deliberately chosen to be unlike each other. Together they show that allw
@@ -162,9 +168,9 @@ is a PR with a design problem.
   the separate external policy layer's job. ([contract.md](./contract.md) §Verdict.)
 - **WYSIWYS.** The verdict binds to `request_hash` over the exact plaintext the human was shown, computed
   device-side after decryption.
-- **Zero-knowledge relay.** The relay routes ciphertext and signed verdicts — never plaintext. At the default
-  privacy tier it may additionally see action _structure_ (surface kind, function identity, session label),
-  never action _data_. ([contract.md](./contract.md) Invariant 2.)
+- **Zero-knowledge relay.** The relay routes ciphertext and signed verdicts — never plaintext. The current
+  envelope exposes routing/lifecycle metadata and ciphertext only; structure metadata remains unimplemented
+  and held in #216. ([contract.md](./contract.md) Invariant 2.)
 - **WASM-local, no native binary on the local surface.** Every on-machine caller added by this scope — the
   hooks, the OpenClaw bridge, the macts provider — ships as WASM under `node`.
   ([architecture.md](./architecture.md) §Local execution: WASM, not native binaries.)
@@ -180,7 +186,7 @@ is a PR with a design problem.
 - **Rule evaluation, holding, generation or signing inside allw.** No replacement or placeholder is built. Every escalation the MVP handles is decided by the _caller's_
   policy (the hook's, OpenClaw's, macts's) before allw is invoked.
 - **The paranoid/enterprise and ai-summary privacy tiers.** `privacy_preference` stays reserved and null;
-  only the default structure-visible tier is built.
+  the current envelope exposes no action structure.
 - **Standing autonomy / reuse affordances** ("approve and don't ask again"), and the decision-history
   suggestion loop that would feed them.
 - **The native Apple app as a gating deliverable.** It is M7, in parallel, by decision (d)(1).

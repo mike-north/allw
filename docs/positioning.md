@@ -59,12 +59,12 @@ feature is not built now.
 
 ## Why not just…
 
-| Alternative                             | What it gives you                                                       | What's missing                                                                            |
-| --------------------------------------- | ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| **Clawvisor**                           | Vault + approval + E2EE, as a gateway over ~14 cloud-service connectors | Can't govern your _local_ tools; single deployment shape                                  |
-| **DIY ntfy / Telegram hooks**           | A free "ping my phone, tap a button"                                    | No E2EE, no audit trail, no native app, no Windows, no path to a real permission boundary |
-| **Web-agent settings (ChatGPT/Claude)** | allow / deny / ask per tool                                             | No predicates, no instance-level control, no cross-agent or cross-machine view            |
-| **HumanLayer**                          | Approvals via Slack / email / SMS                                       | No native apps, no E2EE, and a steep jump from free to enterprise pricing                 |
+| Alternative                             | What it gives you                                                       | What's missing                                                            |
+| --------------------------------------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| **Clawvisor**                           | Vault + approval + E2EE, as a gateway over ~14 cloud-service connectors | Can't govern your _local_ tools; single deployment shape                  |
+| **DIY ntfy / Telegram hooks**           | A free "ping my phone, tap a button"                                    | No E2EE, no audit trail, no native app, no Windows                        |
+| **Web-agent settings (ChatGPT/Claude)** | allow / deny / ask per tool                                             | No cross-agent or cross-machine view                                      |
+| **HumanLayer**                          | Approvals via Slack / email / SMS                                       | No native apps, no E2EE, and a steep jump from free to enterprise pricing |
 
 ---
 

@@ -60,6 +60,12 @@ integration whose actor-identity and timeout-ordering discipline this follows).
 
 ---
 
+**#406 partial implementation:** allw does not interpret what an action does or rate its danger.
+Risk labels/scoring and policy-only wire metadata are removed. `reversible` is an optional caller assertion;
+hooks and the OpenClaw bridge omit it. Command/PowerShell tokenization, no-program refusals, web command
+interpretation, and parsed/derived fields remain temporarily and are scheduled for removal in slice 2.
+They are not product scope. Faithful raw/cwd/caller argv/MCP/file-edit display and escaping remain.
+
 ## 1. Verified upstream contract
 
 Every claim below was checked against OpenClaw's published documentation, its generated protocol
@@ -332,7 +338,6 @@ which the gateway stores at request time and reuses verbatim when forwarding the
 | `syntactic.raw`         | `systemRunPlan.commandText` → else `request.command`                                | The exact string OpenClaw shows its other reviewers; also what the core derives `env_refs` from.                            |
 | `syntactic.host`        | core-derived from the command (ssh/scp target)                                      | **Not** OpenClaw's `host` field — see the name-collision note below.                                                        |
 | `syntactic.env_refs`    | core-derived from `raw`                                                             | Names only; values are never captured.                                                                                      |
-| `risk`                  | core `classify_risk`, floored at `high` when `request.warningText` is non-empty     | §6.4.                                                                                                                       |
 
 **Name collision, called out so nobody wires it wrong:** OpenClaw's `host` on an exec approval is the
 _execution locus_ (`gateway` \| `node` \| `sandbox`). allw's `syntactic.host` is the _remote host a
@@ -356,14 +361,13 @@ event only when the snapshot omits it, and a value present on **both** that disa
 two sources both carry, including `severity` (the sharpest case: a lower event severity must never
 silently suppress a higher, canonical snapshot severity and its number-match challenge).
 
-| `ActionRecord` field | Source                                                                     | Notes                                                                                                                                                         |
-| -------------------- | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `surface`            | constant `"agent_tool_call"`                                               | New surface; see the decision below.                                                                                                                          |
-| `syntactic.server`   | pinned `pluginId` → else event `pluginId` → else `"openclaw"`              | The gating provider identity — the function-identity slot, shared with `mcp_tool_call`.                                                                       |
-| `syntactic.tool`     | pinned `toolName` → else event `toolName` → else a slug of `title`         | Fail closed if neither yields a non-empty token.                                                                                                              |
-| `syntactic.params`   | **absent**                                                                 | OpenClaw exposes no structured parameters to a reviewer. Do not synthesize one.                                                                               |
-| `syntactic.raw`      | pinned `description`, plus pinned `detail` when present                    | The prose the plugin author wrote for the approver; fallback matching. Approvers show it labelled as the description; the heading is `server :: tool` (#321). |
-| `risk`               | pinned `severity`: `info`→`low`, `warning`→`medium`, `critical`→`critical` | `severity` defaults to `warning` upstream when genuinely absent from both sources.                                                                            |
+| `ActionRecord` field | Source                                                             | Notes                                                                                                                                                         |
+| -------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `surface`            | constant `"agent_tool_call"`                                       | New surface; see the decision below.                                                                                                                          |
+| `syntactic.server`   | pinned `pluginId` → else event `pluginId` → else `"openclaw"`      | The gating provider identity — the function-identity slot, shared with `mcp_tool_call`.                                                                       |
+| `syntactic.tool`     | pinned `toolName` → else event `toolName` → else a slug of `title` | Fail closed if neither yields a non-empty token.                                                                                                              |
+| `syntactic.params`   | **absent**                                                         | OpenClaw exposes no structured parameters to a reviewer. Do not synthesize one.                                                                               |
+| `syntactic.raw`      | pinned `description`, plus pinned `detail` when present            | The prose the plugin author wrote for the approver; fallback matching. Approvers show it labelled as the description; the heading is `server :: tool` (#321). |
 
 **Decision: a new `agent_tool_call` surface, not `mcp_tool_call`.** `surface` is a permanent,
 relay-visible (`action_structure`), policy-matchable namespace — the single most expensive kind of
@@ -395,8 +399,8 @@ the installed `@openclaw/gateway-protocol` schema, `title`, `description`, `seve
 cross-checks against — it is simply the _only_ source during backfill, so it is used directly as
 canonical rather than merely as a cross-check. There is nothing to fabricate: `pluginId`/`toolName`
 fall back to `"openclaw"`/`slug(title)` only when the _pinned presentation itself_ omits them (the
-same fallback a live event gets when its own untyped payload omits them), and `severity` drives risk
-exactly as it does for a live event.
+same fallback a live event gets when its own untyped payload omits them), and `severity` is schema-checked and reconciled
+exactly as it is for a live event; allw assigns no danger tier.
 
 A backfilled plugin approval therefore drives through the identical path a live event does,
 including the identical fail-closed outcomes: `build-error` when the pinned presentation itself
@@ -472,9 +476,8 @@ Rule:
 | `summary`               | `OpenClaw <gateway-id> · <host>[/<nodeId>] · agent <agentId> · <commandText>[ · bound file <path>]` | `OpenClaw <gateway-id> · agent <agentId> · <pluginId>/<toolName>: <title> — <description>` |
 | `actor.id`              | `openclaw:<gateway-id>` (§7)                                                                        | same                                                                                       |
 | `actor.kind`            | `"openclaw"`                                                                                        | same                                                                                       |
-| `risk`                  | §6.4                                                                                                | §6.4                                                                                       |
-| `reversible`            | `risk ∈ {low, medium}`                                                                              | same                                                                                       |
-| `constraints`           | `{ allowed_decisions: ["approved", "denied"], challenge_required: risk === "critical" }`            | same                                                                                       |
+| `reversible`            | omitted; the bridge makes no assertion                                                              | same                                                                                       |
+| `constraints`           | `{ allowed_decisions: ["approved", "denied"], challenge_required: true }`                           | same                                                                                       |
 | `chain`                 | `["openclaw:<gateway-id>:approval:<approval_id>", "openclaw:session:<sessionKey>"]`                 | same, plus `"openclaw:tool_call:<toolCallId>"` when present                                |
 
 Notes on the non-obvious choices:
@@ -508,17 +511,11 @@ Notes on the non-obvious choices:
 - **An absent `cwd`.** Rendered as an explicit "working directory not bound" line rather than
   omitted, so a weaker binding is visible to the human instead of looking like a normal request.
 
-### 6.4 Risk, challenge, and reversibility
+### 6.4 Caller-requested challenge and optional reversibility
 
-| Family | Risk                                                                                        |
-| ------ | ------------------------------------------------------------------------------------------- |
-| exec   | the core's `classify_risk` over the bound argv, floored at `high` when `warningText` is set |
-| plugin | `severity`: `info` → `low`, `warning` → `medium`, `critical` → `critical`                   |
-
-`challenge_required = (risk === "critical")`, which routes genuinely destructive actions through the
-number-match challenge ([contract.md](./contract.md) §number-match challenge derivation).
-`reversible = risk ∈ {low, medium}`, matching the Codex hook's `reversibleForRisk` helper — this is
-deliberate cross-surface consistency, not an independent judgement.
+The bridge sets `challenge_required: true` for every exec and plugin request. It emits no risk field
+and makes no reversibility assertion. Upstream warning prose is caller-supplied information, not an
+allw danger classifier. Claude/Codex number-match behavior is unchanged; #252 remains Mike's decision.
 
 ### 6.5 Structure-not-data
 
@@ -828,7 +825,7 @@ Rust core rather than being silently accepted. Tracked separately from this docu
 | 1   | **Core: argv-with-raw command records.** `allw-core` already has `action_from_argv`, but it is not exposed to WASM and cannot carry the original command text (it sets `raw: None`, which also suppresses `env_refs` extraction).                                                                                                  | A core builder taking `(argv, raw, ctx)`; a WASM export `action_from_argv`; UniFFI parity per the return-type suffix convention; SDK/hook `wasm.ts` type additions. | Rust unit tests for argv+raw (incl. empty argv, `env_refs` from `raw`); a cross-platform vector proving Rust and WASM produce byte-identical records.                                                                                                    |
 | 2   | **Core: the `agent_tool_call` surface.** Adds the `Surface` variant reserved in `policy-seam.md`, a builder over `(server, tool)` function identity, relay `action_structure` acceptance, and SDK `Surface` union widening.                                                                                                        | Core enum + builder, WASM + UniFFI exports, SDK types, relay validation, `docs/policy-seam.md` classification note.                                                 | Structure/data split test (server+tool are structure; `raw` is data); a negative test that an unknown surface string fails closed rather than defaulting.                                                                                                |
 | 3   | **Bridge skeleton: gateway client.** New `packages/openclaw-bridge`; Ed25519 device identity, `connect.challenge` proof, `PAIRING_REQUIRED` handling, device-token persistence in the OS keystore, protocol pin, capability advertisement, subscription + `*.approval.list` backfill + reconnect re-projection. No allw calls yet. | A connectable, scope-minimal operator client that logs pending approvals.                                                                                           | Integration tests against a fake gateway WebSocket speaking real `RequestFrame`/`ResponseFrame`/`EventFrame` shapes; negatives for challenge without `ts`, wrong protocol version, scope downgrade, reconnect double-delivery.                           |
-| 4   | **Mapping.** Event → `approval.get` reconcile → `ApprovalContext` construction for both families; deterministic summary templates; actor-id validation; risk/reversible/constraints derivation; `chain` correlation.                                                                                                               | Pure, I/O-free mapping module (the `decide.ts` analogue).                                                                                                           | Field-by-field assertions derived from §5/§6 of this spec (never from captured output); negatives for `presentation-divergence`, empty `commandText`, missing tool identity, malformed gateway id.                                                       |
+| 4   | **Mapping.** Event → `approval.get` reconcile → `ApprovalContext` construction for both families; deterministic summary templates; actor-id validation; caller-requested challenge and omitted reversibility; `chain` correlation.                                                                                                 | Pure, I/O-free mapping module (the `decide.ts` analogue).                                                                                                           | Field-by-field assertions derived from §5/§6 of this spec (never from captured output); negatives for `presentation-divergence`, empty `commandText`, missing tool identity, malformed gateway id.                                                       |
 | 5   | **Decision + resolution.** `requestApproval` wiring, full verdict verification, `approval.resolve` submission, `applied: false` reconcile, timeout budgeting, the complete §9 matrix.                                                                                                                                              | End-to-end fail-closed behavior.                                                                                                                                    | One direct negative test per §9 row, plus: `allow-always` is never submitted under any input; `no-expressible-allow`; `insufficient-budget`; gateway loss both not-restored and restored-while-pending; unsupported kind is neither approved nor denied. |
 | 6   | **Operability + UAT.** `scripts/uat-openclaw.sh`, package README, structured logging that never emits plaintext context, and the operator-prerequisite checks from §3 surfaced as startup diagnostics.                                                                                                                             | Operator-runnable UAT and a bridge that refuses to start misconfigured.                                                                                             | Script test in the style of `scripts/uat-codex.test.mjs`; a startup-diagnostic test asserting refusal on `tools.exec.mode: auto` and on a margin below the fetch timeout.                                                                                |
 

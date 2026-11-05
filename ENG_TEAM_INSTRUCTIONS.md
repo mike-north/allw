@@ -70,8 +70,10 @@ label is the _urgency_.
 `type:spec` (a design/spec doc under `docs/`, not implementation), `enhancement` (feature),
 `bug`, `documentation`.
 
-**Area labels** (`area:core`, `area:sdk`, `area:hook`, `area:relay`, `area:apps`, `area:policy`,
+**Area labels** (`area:core`, `area:sdk`, `area:hook`, `area:relay`, `area:apps`,
 `area:infra`) scope the work — use them to filter for issues in your wheelhouse.
+
+`retired:policy` is historical only; the lead renamed `area:policy` after rule evaluation was removed.
 
 The PM keeps this scheme current; if a label is missing or ambiguous, ask rather than inventing one.
 
@@ -84,7 +86,7 @@ The PM keeps this scheme current; if a label is missing or ambiguous, ask rather
    run CI and cannot merge, and an approved-but-conflicted PR blocks the whole queue. When
    resolving, preserve both sides' tests (the common conflict is two PRs appending to the same
    test file).
-8. Branch names: `<area>/<short-slug>` (e.g. `policy/glob-cap`, `relay/push-fanout`). Internal-only.
+8. Branch names: `<area>/<short-slug>` (e.g. `relay/push-fanout`). Internal-only.
 
 ## The contract with the PM review
 

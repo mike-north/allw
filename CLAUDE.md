@@ -99,8 +99,9 @@ or decide whether an action should run. The policy layer is a separate project. 
 is carrying policy-adjustment options from that layer to the human, and passing the human's policy modification
 signal back.
 
-That policy-modification feature is not built or reserved by this change. Command parsing and risk decisions
-remain open; retain the existing `ActionRecord` substrate and null semantic slots pending that decision.
+That policy-modification feature is not built or reserved. allw does not interpret what an action does or
+rate its danger. Temporary command interpretation and parsed/derived fields remain only until #406 slice 2;
+they are scheduled for removal, not product scope. Risk labels/scoring and policy-only metadata are removed.
 
 **WASM-local is a hard constraint, not a preference** (`docs/architecture.md`). On-machine code (the hook, the
 SDK) runs as **WASM under `node`**, never a standalone native binary — so enterprise binary-allowlisting (Google
