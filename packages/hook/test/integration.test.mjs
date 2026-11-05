@@ -253,6 +253,36 @@ for (const decision of ["denied", "expired", "aborted"]) {
   });
 }
 
+/**
+ * Pin the configured transport budget independently of the subprocess startup slack: a slower
+ * fetch timeout must not hide inside that generous process bound. A pending fetch ignores abort,
+ * so only the SDK's scheduled timeout can settle this run; microtasks avoid wall-clock waiting.
+ *
+ * @see ../../../docs/claude-code-integration.md (ALLW_FETCH_TIMEOUT_MS and timeout ordering)
+ * @see ../../../docs/contract.md §Invariants #7 (timeout/no-response must deny)
+ */
+test("end-to-end (#388): the configured 100 ms fetch budget schedules an expired deny", async () => {
+  const wasm = await loadWasm();
+  const approver = await pairedApprover(wasm);
+  const scheduled = [];
+
+  const output = await runHook(
+    bashStdin("rm -rf build", "/workspace/project"),
+    { ...env(approver, 1000), ALLW_FETCH_TIMEOUT_MS: "100" },
+    {
+      ...overrides(() => new Promise(() => {})),
+      scheduleImpl: (fn, ms) => {
+        scheduled.push(ms);
+        queueMicrotask(fn);
+      },
+    },
+  );
+
+  assert.deepEqual(scheduled, [100], "the env-configured fetch budget must reach the scheduler");
+  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /\(verdict: expired\)$/);
+});
+
 test("end-to-end (fail-closed): missing config (no ALLW_RELAY_URL) → deny without dialing the relay", async () => {
   const wasm = await loadWasm();
   const approver = await pairedApprover(wasm);
