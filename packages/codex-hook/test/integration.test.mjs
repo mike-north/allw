@@ -108,6 +108,14 @@ function nonce() {
 
 function relayDouble(wasm, approver, decision, forge = (verdict) => verdict, options = {}) {
   const accountStates = options.accountStates ?? [accountState(wasm, approver)];
+  // Fixture metadata reflects signed sequences, independently of list order and document count.
+  const maxSequence = Math.max(
+    0,
+    ...accountStates.map(
+      (state) =>
+        JSON.parse(Buffer.from(state.split(".")[1], "base64url").toString("utf8")).sequence,
+    ),
+  );
   // Count resolved responses, not attempted GETs: rejection tests must actually receive a verdict.
   const state = { submitted: 0, polled: 0 };
   let captured = null;
@@ -128,7 +136,7 @@ function relayDouble(wasm, approver, decision, forge = (verdict) => verdict, opt
     if (url.endsWith("/account-states") && method === "GET") {
       if (options.accountStatesStatus !== undefined)
         return json({ error: "authorization required" }, options.accountStatesStatus);
-      return json({ account_states: accountStates, max_sequence: accountStates.length });
+      return json({ account_states: accountStates, max_sequence: maxSequence });
     }
 
     if (url.endsWith("/requests") && method === "POST") {
@@ -535,4 +543,22 @@ test("end-to-end (#243): foreign-root account state denies with nothing submitte
   );
   assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
   assert.equal(relay.state.submitted, 0, "untrusted state must be rejected before POST /requests");
+});
+
+/** Relay metadata describes the highest signed sequence, independent of document count or order.
+ * @see ../../../docs/contract.md §Transport (GET account-states)
+ */
+test("relay double: max_sequence is the maximum served sequence, or zero for no state", async () => {
+  const wasm = await loadWasm();
+  const approver = await pairedApprover(wasm);
+  for (const [sequences, expected] of [
+    [[7, 3], 7],
+    [[], 0],
+  ]) {
+    const relay = relayDouble(wasm, approver, "approved", undefined, {
+      accountStates: sequences.map((sequence) => accountState(wasm, approver, sequence)),
+    });
+    const response = await relay.fetchImpl(`https://relay.allw.test/${ACCOUNT_ID}/account-states`);
+    assert.equal((await response.json()).max_sequence, expected);
+  }
 });

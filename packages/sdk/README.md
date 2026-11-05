@@ -99,8 +99,11 @@ rejected.
 `expectedAccountId` defaults to the client's configured `accountId` when omitted or empty.
 A device certificate issued by the same root for a different account cannot answer the request.
 This defense complements account-state binding and remains in force when `Verdict.verify()` is
-called with `accountStates: []` or `accountStates: undefined` to omit revocation context.
-Standalone verification exports have no client default; pass `expectedAccountId` explicitly.
+called with `accountStates: []` or `accountStates: undefined` to omit revocation context. A per-call
+`expectedAccountId` that is omitted, `undefined` or empty preserves the client account guard.
+Standalone verdict verification, policy-rule verification and policy evaluation exports **require**
+a non-empty `expectedAccountId`; they have no client account default and reject missing or empty
+values at runtime as well as requiring the property in TypeScript.
 
 - **`relayAccountStateSource({ relayUrl, accountId, floorStore })`** is what the hooks use. It fetches
   `GET /{account}/account-states` for each request; the documents are verified in the core against

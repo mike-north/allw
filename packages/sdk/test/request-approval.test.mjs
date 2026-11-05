@@ -2349,58 +2349,64 @@ for (const explicit of [true, false]) {
  */
 for (const explicit of [true, false]) {
   for (const states of [[], undefined]) {
-    test(`(S20 reverify) ${explicit ? "explicit" : "default"} account, states ${states === undefined ? "undefined" : "empty"}`, async () => {
-      const wasm = await loadWasm();
-      const approver = makeApprover(wasm);
-      const req = sampleRequest();
-      let delivered;
-      const relay = makeRelayDouble({
-        behavior: {
-          poll: (envelope) => {
-            delivered = signVerdict(wasm, approver, req, envelope);
-            return delivered;
+    for (const [overrideName, override] of [
+      ["omitted", {}],
+      ["undefined", { expectedAccountId: undefined }],
+      ["empty", { expectedAccountId: "" }],
+    ]) {
+      test(`(S20 reverify) ${explicit ? "explicit" : "default"} account, override ${overrideName}, states ${states === undefined ? "undefined" : "empty"}`, async () => {
+        const wasm = await loadWasm();
+        const approver = makeApprover(wasm);
+        const req = sampleRequest();
+        let delivered;
+        const relay = makeRelayDouble({
+          behavior: {
+            poll: (envelope) => {
+              delivered = signVerdict(wasm, approver, req, envelope);
+              return delivered;
+            },
           },
-        },
+        });
+        const result = await pollClient(
+          approver,
+          relay,
+          explicit ? { expectedAccountId: ACCOUNT_ID } : {},
+        ).requestApproval(req);
+        assert.equal(result.decision, "approved");
+        assert.equal(
+          await result.verify(approver.accountRootPub, { accountStates: states, ...override }),
+          true,
+          "own-account approvals still verify without states",
+        );
+        const foreign = {
+          ...approver,
+          accountId: "foreign_account",
+          cert: wasm.issue_device_cert(
+            approver.accountSeed,
+            "foreign_account",
+            approver.deviceId,
+            approver.devicePub,
+            NOW_MS - 1000,
+          ),
+        };
+        Object.assign(
+          delivered,
+          signVerdict(wasm, foreign, req, relay.state.captured, { nonceByte: 18 }),
+        );
+        assert.equal(
+          await result.verify(approver.accountRootPub, { accountStates: states, ...override }),
+          false,
+          "removing revocation context must preserve the client's account constraint",
+        );
       });
-      const result = await pollClient(
-        approver,
-        relay,
-        explicit ? { expectedAccountId: ACCOUNT_ID } : {},
-      ).requestApproval(req);
-      assert.equal(result.decision, "approved");
-      assert.equal(
-        await result.verify(approver.accountRootPub, { accountStates: states }),
-        true,
-        "own-account approvals still verify without states",
-      );
-      const foreign = {
-        ...approver,
-        accountId: "foreign_account",
-        cert: wasm.issue_device_cert(
-          approver.accountSeed,
-          "foreign_account",
-          approver.deviceId,
-          approver.devicePub,
-          NOW_MS - 1000,
-        ),
-      };
-      Object.assign(
-        delivered,
-        signVerdict(wasm, foreign, req, relay.state.captured, { nonceByte: 18 }),
-      );
-      assert.equal(
-        await result.verify(approver.accountRootPub, { accountStates: states }),
-        false,
-        "removing revocation context must preserve the client's account constraint",
-      );
-    });
+    }
   }
 }
 
-/** Standalone verification has no configured client account; callers supply its sole account guard.
+/** Standalone verification requires its account guard even when revocation context is omitted.
  * @see ../../../docs/contract.md §Verification checklist
  */
-test("(S20 export) empty account state still enforces explicit expectedAccountId", async () => {
+test("(S20 export) empty account state requires and enforces expectedAccountId", async (t) => {
   const wasm = await loadWasm();
   const approver = makeApprover(wasm);
   const req = sampleRequest();
@@ -2430,11 +2436,14 @@ test("(S20 export) empty account state still enforces explicit expectedAccountId
     nowMs: NOW_MS,
     accountStates: [],
   };
-  assert.equal(
-    (await verifyVerdictWithAccountStates(input)).approved,
-    true,
-    "without a client or explicit constraint only root trust applies",
-  );
+  for (const expectedAccountId of [undefined, ""]) {
+    await t.test(expectedAccountId === undefined ? "missing account" : "empty account", () =>
+      assert.rejects(
+        () => verifyVerdictWithAccountStates({ ...input, expectedAccountId }),
+        /expectedAccountId is required/,
+      ),
+    );
+  }
   await assert.rejects(
     () => verifyVerdictWithAccountStates({ ...input, expectedAccountId: ACCOUNT_ID }),
     /account/i,
