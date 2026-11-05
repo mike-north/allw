@@ -64,7 +64,9 @@ export interface AllwWasm {
    * Verifies a `Verdict` JSON against the request, the human-shown context, and the approver's
    * account-root Ed25519 public key (base64url). Returns
    * `{ approved: true, device_id, decided_at, nonce_b64, note? }` JSON on success; **throws** on any
-   * verification failure. An authenticated non-approval throws an `Error` with own properties
+   * verification failure. The optional string `note` comes verbatim from the authenticated signed
+   * claims, for audit consumers; it is omitted when no note was signed.
+   * An authenticated non-approval throws an `Error` with own properties
    * `kind: "not_approved"` and `decision` (`denied`/`expired`/`aborted`, from the signed claims);
    * every other failure throws an `Error` with no `kind`. Never classify by the message: untrusted
    * input is echoed into it.
