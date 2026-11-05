@@ -101,7 +101,7 @@ A device certificate issued by the same root for a different account cannot answ
 This defense complements account-state binding and remains in force when `Verdict.verify()` is
 called with `accountStates: []` or `accountStates: undefined` to omit revocation context. A per-call
 `expectedAccountId` that is omitted, `undefined` or empty preserves the client account guard.
-Standalone verdict verification, policy-rule verification and policy evaluation exports **require**
+Standalone verdict verification exports **require**
 a non-empty `expectedAccountId`; they have no client account default and reject missing or empty
 values at runtime as well as requiring the property in TypeScript.
 
@@ -158,3 +158,6 @@ try {
   return deny(); // every rejection is a deny
 }
 ```
+
+The SDK does not evaluate policy, hold rules, or generate or sign standing grants. The caller owns its
+external policy and combines it with the verified human decision.

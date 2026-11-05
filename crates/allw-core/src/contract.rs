@@ -594,10 +594,10 @@ impl Verdict {
 
 // ── PolicyDecision / PolicyBlock ──────────────────────────────────────────────
 
-/// The policy engine's outcome for an action.
+/// Caller-policy outcome vocabulary preserved in the audit wire contract.
 ///
 /// v1 always writes `Escalate` (the action was sent to the human gate). `Allow`/`Deny`
-/// are reserved for the T3 engine so that audit history is policy-analyzable later.
+/// remain wire values for external caller policy; allw does not evaluate rules.
 /// See `docs/policy-seam.md` §forward-compat req #4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -609,22 +609,22 @@ pub enum PolicyDecision {
 
 /// Reserved policy block embedded in every [`AuditRecord`].
 ///
-/// v1 always writes `decision: escalate`. The block exists so that the audit history is
-/// policy-analyzable once the T3 engine is built. See `docs/policy-seam.md` §forward-compat
-/// req #4 and `AuditRecord` doc.
+/// v1 always writes `decision: escalate`. The block preserves caller-policy provenance in
+/// audit history without making allw an evaluator or rule holder. See `docs/policy-seam.md`
+/// §Forward-compat requirements, item 4, and `AuditRecord`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PolicyBlock {
-    /// The policy engine's decision that led to this audit entry.
+    /// The caller-policy decision recorded with this human escalation.
     pub decision: PolicyDecision,
 
-    /// The policy rule that matched, if any. Omitted when no rule matched (escalate path).
+    /// Optional external rule identifier for correlation; allw never resolves or evaluates it.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub rule_id: Option<String>,
 
-    /// Policy tier that produced this decision (`"syntactic"` in v1; `"semantic"` later).
+    /// Caller-policy classification label (`"syntactic"` in v1), retained as wire metadata.
     pub tier: String,
 
-    /// Schema version of the policy evaluation that produced this block.
+    /// Version of the caller-policy metadata format recorded in this block.
     pub schema_version: u32,
 }
 
@@ -1305,7 +1305,16 @@ mod tests {
         let verdict = make_verdict();
         let val: Value = serde_json::to_value(&verdict).unwrap();
 
-        for forbidden in &["scope", "reuse", "standing", "autonomy", "ttl", "max_uses"] {
+        for forbidden in &[
+            "scope",
+            "reuse",
+            "standing",
+            "autonomy",
+            "ttl",
+            "max_uses",
+            "rule_id",
+            "policy_rule",
+        ] {
             assert!(
                 val.get(forbidden).is_none(),
                 "Verdict must not contain a \"{forbidden}\" field (one-shot scope-free invariant, \

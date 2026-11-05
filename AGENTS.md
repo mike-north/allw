@@ -4,14 +4,13 @@ This file provides guidance to Codex (codex.ai/code) when working with code in t
 
 ## What this is
 
-`allw` is an end-to-end-encrypted, human-in-the-loop **approval primitive** for AI agents, plus the user-owned
-governance layer growing around it. The design is **documentation-driven**: `docs/` is the source of truth; the
+`allw` is an end-to-end-encrypted, human-in-the-loop **approval primitive** for AI agents. The design is **documentation-driven**: `docs/` is the source of truth; the
 code is currently a skeleton built down from those decisions. **Read the relevant `docs/*.md` before
 implementing** — the architecture only makes sense across several docs together:
 
 - `docs/contract.md` — the approval-primitive contract (the keystone everything else consumes).
 - `docs/enrollment.md` — account/device enrollment, rotation, revocation, and recovery.
-- `docs/policy-seam.md` — the policy layer's `ActionRecord` and its syntactic-first tiering.
+- `docs/policy-seam.md` — the `ActionRecord` substrate and external-policy boundary.
 - `docs/architecture.md` — tech-stack and system-design decisions (and their rationale).
 - `docs/threat-model.md` — adversaries, residual risks, and the security review checklist.
 - `docs/positioning.md` — the product thesis (why decisions are shaped the way they are).
@@ -83,14 +82,19 @@ it — the TS SDK / relay / hook via **WASM**, native apps via **UniFFI**. Never
 - **Fail-closed:** timeout / no-response / unverifiable ⇒ deny.
 - **WYSIWYS:** the verdict binds to a hash of the exact plaintext the human saw, computed device-side.
 - **E2EE:** the relay is zero-knowledge — it routes ciphertext + signed verdicts, never plaintext.
-- **One-shot & scope-free verdicts:** reuse / "don't ask again" is the _policy layer's_ job (it emits signed
-  rules), never a field on the verdict.
+- **One-shot & scope-free verdicts:** reuse / "don't ask again" belongs to the caller's external policy,
+  never a field on the verdict.
 
-**Policy is tiered; build syntactic-first** (`docs/policy-seam.md`). Every action reduces to an `ActionRecord`
-with a `surface` (`command` | `mcp_tool_call` | …) and a **syntactic substrate**. The semantic
-`capabilities` / `scope` fields are **reserved and null in v1** — the capability-inference engine (which aligns
-to the AgentRC / Arc Flow model) is the deferred, paid tier. v1's only forward-compat duty is to capture the
-syntactic substrate and reserve the semantic slots; **do not build capability inference.**
+## Scope
+
+allw is a human-in-the-loop approval primitive: a caller describes an action, allw shows it to a human, and
+returns a verified decision bound to what the human saw. allw doesn't evaluate policy, hold or generate rules,
+or decide whether an action should run. The policy layer is a separate project. allw's only relationship to it
+is carrying policy-adjustment options from that layer to the human, and passing the human's policy modification
+signal back.
+
+That policy-modification feature is not built or reserved by this change. Command parsing and risk decisions
+remain open; retain the existing `ActionRecord` substrate and null semantic slots pending that decision.
 
 **WASM-local is a hard constraint, not a preference** (`docs/architecture.md`). On-machine code (the hook, the
 SDK) runs as **WASM under `node`**, never a standalone native binary — so enterprise binary-allowlisting (Google
@@ -109,8 +113,7 @@ addon is itself a native binary). Native binaries belong only in signed, store-d
 
 - **vaultkeeper** — holds the _credential perimeter_: agents _use_ secrets via delegated injection, never _read_
   them. This is why `allw` deliberately does not gate raw network egress (`docs/policy-seam.md`).
-- **macts / ofocus** — turn macOS apps into MCP surfaces; the eventual semantic policy tier reuses their
-  AgentRC / Arc Flow capability model rather than inventing its own.
+- **macts / ofocus** — turn macOS apps into MCP surfaces; their policy choices stay in the caller, outside allw.
 
 ## Commits
 

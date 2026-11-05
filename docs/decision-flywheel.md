@@ -1,5 +1,7 @@
 # allw — Decision-History Flywheel: Recognized-Tool Tallies
 
+**Status (2026-11-05):** rule outputs are superseded by the decision to remove allw rule evaluation and signed-rule artifacts (#404); this document is under review.
+
 **Scope:** the design of **recognized-tool tallies** — the **only sanctioned data egress** from a user's device
 (CEO roadmap Decision 8). This document defines, precisely, what _aggregate-only, recognized-only_ means; how
 tallies are aggregated on-device; where the **recognized-tool registry** boundary sits (deferred to the semantic

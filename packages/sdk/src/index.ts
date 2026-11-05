@@ -239,9 +239,9 @@ export interface AccountStateOptions {
   readonly accountStates?: readonly string[];
   /**
    * Optional caller-asserted account namespace. Multi-account verifiers should set this so a
-   * verdict or policy rule whose signed account id differs from the intended account fails closed.
+   * verdict whose certified account id differs from the intended account fails closed.
    * On a returned verdict, omission, `undefined` and `""` fall back to the client account.
-   * Standalone verification and evaluation inputs require a non-empty account namespace.
+   * Standalone verification inputs require a non-empty account namespace.
    */
   readonly expectedAccountId?: string;
 }
@@ -293,7 +293,7 @@ export interface AccountStateSource {
   accepted?(sequence: number): void | Promise<void>;
 }
 
-/** Root-signed account trust state used by offline verdict/policy verifiers for revocation. */
+/** Root-signed account trust state used by offline verdict verifiers for revocation. */
 export interface AccountState {
   readonly v: number;
   readonly account_id: string;
@@ -334,22 +334,8 @@ export interface VerifiedVerdictResult {
   readonly note?: string;
 }
 
-/** Result of verifying a signed policy rule, normalized from the core's snake_case JSON. */
-export interface VerifiedPolicyRule {
-  readonly rule: unknown;
-  readonly deviceId: string;
-}
-
+/** @public Caller-policy decision vocabulary retained for contract/audit wire compatibility. */
 export type PolicyDecision = "allow" | "deny" | "escalate";
-export type PolicyTier = "syntactic" | "semantic";
-
-/** Result of policy evaluation for one action. */
-export interface PolicyEvaluation {
-  readonly decision: PolicyDecision;
-  readonly ruleId?: string;
-  readonly tier: PolicyTier;
-  readonly schemaVersion: number;
-}
 
 export interface VerifyVerdictWithAccountStatesInput extends AccountStateOptions {
   /** Required account namespace; standalone helpers have no client account to fall back to. */
@@ -361,24 +347,6 @@ export interface VerifyVerdictWithAccountStatesInput extends AccountStateOptions
   readonly nowMs: number;
   /** Optional cross-call replay store. When omitted, the WASM core still enforces one-shot local replay. */
   readonly nonceStore?: NonceStore;
-}
-
-export interface VerifyPolicyRuleWithAccountStatesInput extends AccountStateOptions {
-  /** Required account namespace; standalone helpers have no client account to fall back to. */
-  readonly expectedAccountId: string;
-  readonly rule: unknown;
-  readonly accountRootKey: string;
-  readonly nowMs: number;
-}
-
-export interface EvaluatePolicyWithAccountStatesInput extends AccountStateOptions {
-  /** Required account namespace; standalone helpers have no client account to fall back to. */
-  readonly expectedAccountId: string;
-  readonly action: unknown;
-  readonly actor?: unknown;
-  readonly signedRules: readonly unknown[];
-  readonly accountRootKey: string;
-  readonly nowMs: number;
 }
 
 /** Configuration for {@link createClient}. */
@@ -917,61 +885,6 @@ export async function verifyVerdictWithAccountStates(
     throw new Error("allw: verdict nonce replayed");
   }
   return result;
-}
-
-/** Verify one signed policy rule while enforcing account-state device revocations. */
-export async function verifyPolicyRuleWithAccountStates(
-  input: VerifyPolicyRuleWithAccountStatesInput,
-): Promise<VerifiedPolicyRule> {
-  const expectedAccountId = requireExpectedAccountId(input.expectedAccountId);
-  const wasm = await loadWasm();
-  const value = JSON.parse(
-    wasm.verify_policy_rule_with_account_states(
-      JSON.stringify(input.rule),
-      input.accountRootKey,
-      input.nowMs,
-      accountStatesJson(input.accountStates),
-      expectedAccountId,
-    ),
-  ) as { rule?: unknown; device_id?: unknown };
-  if (typeof value.device_id !== "string" || value.device_id.length === 0) {
-    throw new Error("allw: verified policy rule did not include a device_id");
-  }
-  return { rule: value.rule, deviceId: value.device_id };
-}
-
-/** Evaluate signed policy rules after revocation-aware verification of every rule. */
-export async function evaluatePolicyWithAccountStates(
-  input: EvaluatePolicyWithAccountStatesInput,
-): Promise<PolicyEvaluation> {
-  const expectedAccountId = requireExpectedAccountId(input.expectedAccountId);
-  const wasm = await loadWasm();
-  const value = JSON.parse(
-    wasm.evaluate_policy_with_account_states(
-      JSON.stringify(input.action),
-      input.actor === undefined ? null : JSON.stringify(input.actor),
-      JSON.stringify(input.signedRules),
-      input.accountRootKey,
-      input.nowMs,
-      accountStatesJson(input.accountStates),
-      expectedAccountId,
-    ),
-  ) as { decision?: unknown; rule_id?: unknown; tier?: unknown; schema_version?: unknown };
-  if (value.decision !== "allow" && value.decision !== "deny" && value.decision !== "escalate") {
-    throw new Error("allw: policy evaluation returned an invalid decision");
-  }
-  if (value.tier !== "syntactic" && value.tier !== "semantic") {
-    throw new Error("allw: policy evaluation returned an invalid tier");
-  }
-  if (typeof value.schema_version !== "number" || !Number.isSafeInteger(value.schema_version)) {
-    throw new Error("allw: policy evaluation returned an invalid schema_version");
-  }
-  return {
-    decision: value.decision,
-    ...(typeof value.rule_id === "string" ? { ruleId: value.rule_id } : {}),
-    tier: value.tier,
-    schemaVersion: value.schema_version,
-  };
 }
 
 /**

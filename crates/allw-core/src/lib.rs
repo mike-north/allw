@@ -34,7 +34,6 @@ pub mod file_edit;
 pub mod hash;
 pub mod jwe;
 pub mod mcp;
-pub mod policy;
 pub mod powershell;
 pub mod recipients;
 pub mod sealing;
@@ -86,14 +85,6 @@ pub use jwe::{
 };
 pub use mcp::{
     action_from_agent_tool_call, action_from_agent_tool_call_with_raw, action_from_mcp_tool_call,
-};
-pub use policy::{
-    evaluate, evaluate_for_actor, sign_policy_rule, verify_policy_rule,
-    verify_policy_rule_for_account, verify_policy_rule_with_account_states,
-    verify_policy_rule_with_account_states_for_account, ActorMatcher, CommandMatcher, McpMatcher,
-    ParamMatcher, PolicyEffect, PolicyEvaluation, PolicyPredicate, PolicyProvenance, PolicyRule,
-    PolicyRuleBuildError, PolicyRuleError, PolicyRuleScope, PolicyTier, UnsignedPolicyRule,
-    VerifiedPolicyRule,
 };
 pub use powershell::action_from_powershell_command;
 pub use recipients::{

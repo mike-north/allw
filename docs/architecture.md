@@ -24,6 +24,9 @@ deliberate moat over web / Electron / push-only competitors.
 
 ## Architecture
 
+The policy layer is a separate project. allw verifies human decisions; it does not evaluate policy, hold or
+generate rules, or decide whether an action runs. Callers compose that decision with their own gates.
+
 ```
                     ┌──────────────────────────────────────────┐
                     │           allw-core  (Rust crate)         │

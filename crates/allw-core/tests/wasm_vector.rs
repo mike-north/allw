@@ -243,12 +243,11 @@ struct WasmVector {
     self_certifying_cases: Vec<SelfCertifyingCase>,
 }
 
-/// Same signed account/certificate relationship for verdicts and standing policy rules.
+/// Signed account/certificate relationships for verdict and provenance verification.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct SelfCertifyingCase {
     account_id: String,
     verdict_json: String,
-    policy_rule_json: String,
     /// None for the canonical account, otherwise the documented root-binding rejection.
     expected_error: Option<String>,
 }
@@ -280,26 +279,12 @@ fn self_certifying_cases(
         );
         let mut verdict = clone_unsigned(unsigned);
         verdict.approver.account_id = account.clone();
-        let verdict = sign_verdict(&verdict, &device, NONCE, Some(cert.clone())).unwrap();
-        let policy = allw_core::UnsignedPolicyRule {
-            id: "allow-git".into(),
-            account_id: account.clone(),
-            subject: allw_core::ActorMatcher::Any,
-            predicate: allw_core::PolicyPredicate::command_bin("git"),
-            effect: allw_core::PolicyEffect::Allow,
-            bounds: None,
-            provenance: allw_core::PolicyProvenance::Manual,
-            tier: allw_core::PolicyTier::Syntactic,
-            created_at: TS_CREATED,
-            expires_at: None,
-        };
-        let policy = allw_core::sign_policy_rule(&policy, DEVICE_ID, &device, Some(cert));
+        let verdict = sign_verdict(&verdict, &device, NONCE, Some(cert)).unwrap();
         SelfCertifyingCase {
             expected_error: (account != canonical)
                 .then(|| "account id does not derive from the account root key".into()),
             account_id: account,
             verdict_json: serde_json::to_string(&verdict).unwrap(),
-            policy_rule_json: serde_json::to_string(&policy).unwrap(),
         }
     })
     .collect()
@@ -1364,7 +1349,6 @@ fn fixture_self_certifying_accounts() {
     let root = SigningKeyPair::from_seed(&ROOT_SEED).public_key();
     for case in vector.self_certifying_cases {
         let verdict: Verdict = serde_json::from_str(&case.verdict_json).unwrap();
-        let rule: allw_core::PolicyRule = serde_json::from_str(&case.policy_rule_json).unwrap();
         let result = verify_verdict(
             &verdict,
             &make_request(),
@@ -1373,7 +1357,6 @@ fn fixture_self_certifying_accounts() {
             &mut InMemoryNonceStore::new(),
             NOW_MS,
         );
-        let policy = allw_core::verify_policy_rule(&rule, &root, NOW_MS);
         let provenance = verify_verdict_provenance(
             &verdict,
             REQUEST_ID,
@@ -1385,19 +1368,10 @@ fn fixture_self_certifying_accounts() {
         );
         if let Some(error) = case.expected_error {
             assert_eq!(result.unwrap_err(), VerifyError::AccountIdMismatch);
-            assert_eq!(
-                policy.unwrap_err(),
-                allw_core::PolicyRuleError::AccountIdMismatch
-            );
             assert_eq!(provenance.unwrap_err(), VerifyError::AccountIdMismatch);
             assert_eq!(VerifyError::AccountIdMismatch.to_string(), error);
-            assert_eq!(
-                allw_core::PolicyRuleError::AccountIdMismatch.to_string(),
-                error
-            );
         } else {
             result.unwrap();
-            policy.unwrap();
             provenance.unwrap();
         }
     }

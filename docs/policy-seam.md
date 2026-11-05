@@ -1,49 +1,21 @@
 # allw — Policy Layer Seam
 
-**Scope:** the _seam_ between the approval primitive and the (later) policy layer — the parts that are expensive
-to retrofit and must be pinned in `allw-core` v1: the **record of an action**, the **decision interface**, the
-**rule shape**, and the **audit fields**. The policy _engine_ is built later. **And a tiering discipline:** early
-allw matches actions **syntactically**; the **semantic** (capability/meaning) tier is the deferred north star.
+**Scope:** the policy layer is a separate project. allw does not evaluate policy, hold rules, generate rules,
+or decide whether an action should run. A caller may consult its own policy before requesting a one-shot human
+decision. allw never widens the caller's boundary itself.
 
-> This aligns to the **AgentRC / Arc Flow** model (capabilities, per-command schemas, the syntactic→semantic
-> tiering). allw's policy layer _is_ Arc Flow; the human gate is the **`ask`** outcome of its permission model,
-> sitting after `attestation → approval → permission`.
+allw's relationship to policy is carrying policy-adjustment options from that layer to the human and passing
+the human's policy modification signal back. That feature is not built here; there is no replacement API or
+placeholder. [hitl-seam.md](./hitl-seam.md) §6 describes the host-offer/human-choice direction; authentication of
+that choice remains open until scheduled.
 
----
+The action-record material below is retained while command parsing and risk scope are decided separately.
+References to T1/T3 describe the existing substrate and reserved fields, not an allw policy-engine roadmap.
 
 ## Where the policy layer sits
 
-For each agent action, _before_ the primitive is invoked:
-
-```
-evaluate(ActionRecord) ──▶  Allow    → execute, no human
-                            Deny     → refuse
-                            Escalate → allw.requestApproval(...)   (= the "ask" effect; one-shot human gate)
-```
-
-The primitive fires only on **Escalate**. Auto-allow inside the envelope reduces fatigue; the primitive stays
-one-shot and scope-free.
-
----
-
-## The three tiers (and where early allw lives)
-
-The cost of policy is not in any one command — it's in classifying actions **generally and semantically**.
-That generality is what made Flow expensive. So we tier it:
-
-| Tier                                | What it matches                                                                                                                                                  | Needs                                                                | allw                                |
-| ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- | ----------------------------------- |
-| **T1 — pure syntactic**             | command name, `command_pattern` globs, `args_any` (exact-token/glob), flags, env; MCP `server`/`tool`/`params`-as-strings                                        | nothing (no schema)                                                  | **v1 lives here**                   |
-| **T2 — curated-command syntactic**  | precise positional / path / target matching for ~15–20 high-value dangerous commands (`rm`, `find`, `git`, `curl`, `chmod`, `dd`, `kubectl`, key MCP CRUD tools) | hand-written arg grammar for _that curated set only_                 | optional early stretch              |
-| **T3 — full semantic / capability** | abstract capabilities (`delete`, `network`, …) + named fields/scope, generalized across hundreds of commands ("`rm` _means_ delete; arg1 _is a path_")           | per-command schema DB, capability inference, doc-extraction pipeline | **deferred north star (paid tier)** |
-
-> **Why the line is here:** T1/T2 are mechanical. T3 is the syntax→meaning bridge — the classification product
-> (man-page extraction, capability inference, version graphs) that made Flow hard. allw must ship without it.
-
-**Business-model alignment:** **syntactic = free**, **semantic = paid** — the same Sync/Flow line. Syntactic
-rules are a strict subset of semantic, so nothing written at T1/T2 breaks when T3 lands.
-
----
+The caller evaluates its own policy. It may refuse, proceed within its own authority, or ask a human through
+`allw.requestApproval(...)`. The returned decision satisfies only the human term of the caller's gates.
 
 ## Structure vs. data in the ActionRecord
 
@@ -87,11 +59,10 @@ silently sweep in tool calls that no MCP server ever served.
 
 `allw-core` reduces every approvable action to an `ActionRecord` and embeds it in both the `ApprovalRequest`
 context and the `AuditRecord`. **v1 populates the syntactic fields; the semantic fields are reserved (null) and
-filled later by the T3 engine** — adding them must not break the wire format.
+not interpreted by allw** — adding them must not break the wire format.
 
 `actor` is not part of `ActionRecord`: it is carried at the `ApprovalRequest` / `AuditRecord` envelope level, and
-policy evaluation receives `actor` plus `ActionRecord` as separate inputs (`PolicyRule.subject` matches the actor;
-`PolicyRule.match` matches the action).
+the caller may use that actor identity alongside the action in its external policy.
 
 ```
 ActionRecord {
@@ -152,8 +123,8 @@ raw line as bash would; §v1 command risk below lists the rules and their limits
 `echo hi > f` is `medium`. Only `risk` changes. Two things are deliberately **not** changed:
 
 - `bin` / `argv` / `flags` / `positionals`.
-- Policy matching. A `{ bin: "ls" }` any-args allow rule still matches `ls && rm -rf /`. Making the matcher fail
-  closed on compound lines is an open policy-seam decision (#272).
+- External policy: callers must not infer authorization from the first word of a compound line.
+  Command substrate questions remain held separately (#272).
 
 `action_from_argv` records an argv run without a shell, so its words are never read as shell syntax. (Both
 builders refuse a line or argv that runs no program; see §Command lines that run no program.)
@@ -200,8 +171,7 @@ Do **not** build capability inference or a schema DB in v1. Just don't foreclose
 `risk` on a `command` record is a coarse T1 heuristic. Its rules and table live in
 `crates/allw-core/src/command/risk.rs`.
 
-**Who reads it.** `policy::evaluate` does not read risk, so risk never makes an action allowed. Risk is not only
-display, though:
+**Who reads it.** Risk never authorizes an action. Its existing consumers are:
 
 - The human sees it.
 - The Codex hook and the OpenClaw bridge derive `reversible` from it (`low` / `medium` ⇒ reversible).
@@ -306,10 +276,7 @@ limits, no name-sniffing of later words):
 - non-bash grammars (fish, csh, PowerShell strings) are read with bash's rules.
 
 This changes **only `risk`**. `bin`, `argv`, `flags`, `positionals` and `env_refs` keep their T1 meaning, and
-`bin` is still `argv[0]` (`X=1 rm -rf ~` has `bin: "X=1"`). The `bin` question is **open**: `CommandMatcher`
-matches `bin` exactly, so a `{ bin: "ls" }` any-args `allow` rule would start matching
-`LD_PRELOAD=/tmp/evil.so ls` if `bin` became the real program. Changing `bin` therefore needs a matching
-policy-matcher rule for prefixed commands first (see #268).
+`bin` is still `argv[0]` (`X=1 rm -rf ~` has `bin: "X=1"`). The `bin` question remains **open** (#268); no command-builder or external-policy semantics change here.
 
 Shared Rust ↔ WASM vectors are in `crates/allw-core/tests/fixtures/command_risk_vectors.json` (argv rules) and
 `command_line_risk_vectors.json` (command lines).
@@ -377,73 +344,6 @@ on the record as defence in depth, with the same messages. The shared Rust ↔ W
 
 ---
 
-## The rule shape
-
-A `PolicyRule` is **as trusted as a verdict** — signed by a device key. v1 rules are **syntactic**; semantic
-(capability) rules are a strict-superset upgrade.
-
-```
-PolicyRule {
-  id
-  account_id: string                           // account root that must certify the signing device
-  subject:    ActorMatcher                    // actor.id == "machine:macbook" | any
-  match:      Predicate                       // T1/T2: surface + bin/tool + glob/args/flag/param matchers
-                                              // T3 (later): capability + named-field/scope matchers
-  effect:     "allow" | "ask" | "deny"
-  bounds?:    { ttl?, max_uses?, time_window? }
-  provenance: "manual" | "from_approval"
-  tier:       "syntactic" | "semantic"
-  created_at, expires_at?
-  sig:        device-key compact JWS over every unsigned field above
-  device_cert?: account-root compact JWS       // chains device key -> account root
-}
-```
-
-**Precedence within a policy:** `deny` > `ask` > `allow`. **No match ⇒ `ask` (Escalate).** Unknown is fail-safe.
-
-An empty `match: {}` is invalid. A rule must constrain the action through at least one surface,
-command, or MCP predicate field; otherwise it would become an accidental match-everything grant.
-For command argument matching, `args_any_globs` runs only against structured `argv` / positional
-tokens, never raw shell text. Patterns without `*` or `?` are exact token matches; explicit glob
-patterns are still anchored to one structured token and cannot span whitespace or shell
-metacharacter boundaries.
-
-Policy rule verification mirrors verdict verification for key trust: the verifier takes an account-root public key,
-verifies `device_cert`, requires the signed cert `account_id` to match the rule `account_id`, verifies the policy JWS
-with the certified device key, and requires the policy JWS `kid` to match the certified `device_id`. A rule missing a
-cert, signed by an uncertified key, bound to a different account, or carrying a confused `kid` fails closed.
-Multi-account verifiers that already know the account namespace they intended to verify SHOULD also pass that
-`expected_account_id`; a rule whose signed `account_id` does not match it fails closed before policy evaluation.
-
----
-
-## The approval → rule bridge ("approve & don't ask again")
-
-The fatigue-reducing affordance emits a **signed `PolicyRule`, not a scoped verdict** (the verdict stays
-one-shot). The scope chooser's options derive from the action's **syntactic** form in v1:
-
-| Choice                      | Generated `match` (v1, syntactic)                           | `effect` |
-| --------------------------- | ----------------------------------------------------------- | -------- |
-| Just this once              | (none — one-shot verdict only)                              | —        |
-| This exact call             | `surface + bin/tool + exact argv/params`                    | allow    |
-| This command/tool, any args | `surface + bin/tool`                                        | allow    |
-| This tool with param P = V  | `mcp + tool + params.P == V` (e.g. `list == "Agent Inbox"`) | allow    |
-| Glob over a path-ish arg    | `args_any.match: "<glob>"`                                  | allow    |
-
-(Once T3 exists, the chooser can also offer capability/scope-level rules — "any delete under this folder.")
-
----
-
-## Composition & monotonicity
-
-- **Within one user's policy:** matching rules combine by precedence (`deny` > `ask` > `allow`); no match ⇒ ask.
-- **Across gates (a chain):** effective = **intersection** — a downstream gate can only further restrict.
-  `allw` contributes `human_decision ∧ verified`; a corporate gate's policy intersects.
-- **Widening your own envelope is not "loosening."** An `allow` rule is the user's deliberate grant; the
-  most-restrictive-wins property governs _cross-gate_ composition, not a user's own policy.
-
----
-
 ## Network egress & the credential perimeter (why `http_request` is dropped)
 
 Raw network egress (`curl`, `wget`, `node -e "fetch(...)"`, the agent's own web-fetch tools) is **deliberately
@@ -476,25 +376,13 @@ crown jewels, not by a credential vault or an approval gate.
 
 ---
 
-## Explicitly out of scope (deferred)
+## External policy responsibility
 
-- **The entire semantic / T3 engine:** capability inference, per-command schema DB, the doc-extraction &
-  classification pipeline, capability-based rules, named-field/typed/scope matchers. (Reuse Arc Flow when we get
-  there — do not rebuild it.) **The recognized-tool registry** that defines which tools are "recognized" is part
-  of this deferred tier; the decision-history flywheel's tallies depend on it only through a narrow structure-only
-  `is_recognized` seam (stubbed `false` until T3 lands) — see
-  [decision-flywheel.md](./decision-flywheel.md) §"The recognized-tool registry boundary".
-- The **suggestion loop** ("approved 20× → propose a rule") — needs the accumulated decision history; the
-  reflection pass over the on-device, ephemeral, structure-only history ([decision-history.md](./decision-history.md),
-  #134) is what surfaces these candidate rules. Reflection only **proposes**; the rule itself is still a signed
-  `PolicyRule` the user accepts (§The approval → rule bridge).
-- Rule **storage/sync** and management UI; conflict resolution beyond precedence; org-distributed policy.
+Rule evaluation, storage, generation, signing, composition, synchronization, and capability inference belong
+outside allw. The retained `PolicyDecision` and `PolicyBlock` contract/audit fields are wire vocabulary,
+not an evaluator; v1 audit records still write `escalate`.
 
 ## Open questions
 
-- **T2 curated set:** which ~15–20 commands + MCP tools earn hand-written arg grammar first.
-- **Rule residence & sync:** device-local first, or E2EE-synced via the relay from day one.
-- **Where T3 plugs in:** confirm allw reuses Arc Flow's capability model + schema DB wholesale (read
-  `permission-model`, `policy-evaluation-v2` [privacy-preserving client-side eval — fits E2EE], `danger.ts`,
-  `attestation-model` before building the semantic tier).
-- **Instance identity stability** for param/scope matching: stable id vs human-readable label.
+- Command parsing, risk scoring, and the command substrate remain held for Mike's separate decision.
+- Authentication of the human's policy-modification choice remains open until that work is scheduled.

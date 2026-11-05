@@ -109,7 +109,7 @@ The PM keeps this scheme current; if a label is missing or ambiguous, ask rather
     replay, double-submit. If a verification function has N error branches, expect to write ~N
     tests. PRs have been blocked on exactly this five times; write them proactively.
 15. Thin-shell discipline: surfaces (WASM/SDK/UniFFI/UI) never reimplement core logic — hashing,
-    verification, signing, policy evaluation live in `crates/allw-core` only. UI surfaces must make
+    verification and signing live in `crates/allw-core` only. UI surfaces must make
     unsafe states _unreachable_ (e.g. approve disabled structurally), not merely styled as warnings.
 16. Repo testing rules: no `Date.now()`/`new Date()` in test data (inject fixed clocks);
     assertions derive from the spec, not from captured program output; `@see` links to the spec
@@ -176,3 +176,9 @@ The PM keeps this scheme current; if a label is missing or ambiguous, ask rather
     `--model fable` on a launched agent. That covers adversarial reviews of security-boundary PRs,
     security audits, and hunting for correctness bugs in a diff or module. A security-boundary PR is
     implemented by Opus and reviewed by Fable, never reviewed by Sonnet.
+
+## Scope gate
+
+New capability needs a milestone or an explicit line in `docs/mvp-scope.md`. A design doc, a reviewer finding
+or a security bug doesn't create scope. If a problem exists only in code that's outside that scope, or a fix
+would grow it, escalate before doing anything.
