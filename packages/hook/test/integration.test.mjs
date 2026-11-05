@@ -126,16 +126,19 @@ function nonce() {
  */
 function relayDouble(wasm, approver, decision, forge = (verdict) => verdict, options = {}) {
   const accountStates = options.accountStates ?? [accountState(wasm, approver)];
-  const state = { submitted: 0 };
+  // Count resolved responses, not attempted GETs: rejection tests must actually receive a verdict.
+  const state = { submitted: 0, polled: 0 };
   /** @type {Record<string, unknown> | null} */
   let captured = null;
   let requestAuthToken = null;
 
-  const json = (body, status = 200) =>
-    new Response(JSON.stringify(body), {
+  const json = (body, status = 200) => {
+    if (body.status === "resolved") state.polled += 1;
+    return new Response(JSON.stringify(body), {
       status,
       headers: { "Content-Type": "application/json" },
     });
+  };
 
   const fetchImpl = async (input, init) => {
     const url = typeof input === "string" ? input : input.url;
@@ -594,7 +597,7 @@ for (const [name, outer, field] of [
   test(`end-to-end (fail-closed, #311): a forged verdict (${name}) is denied at expiry`, async () => {
     const wasm = await loadWasm();
     const approver = await pairedApprover(wasm);
-    const { fetchImpl } = relayDouble(wasm, approver, "denied", (verdict) => ({
+    const { fetchImpl, state } = relayDouble(wasm, approver, "denied", (verdict) => ({
       ...verdict,
       decision: outer,
       [field]: "verified human decision was not 'approved'",
@@ -625,6 +628,10 @@ for (const [name, outer, field] of [
     });
     await ready;
     await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(
+      state.polled > 0,
+      "the resolved row with the forged verdict was served before expiry",
+    );
     assert.equal(settled, false, "a forged verdict cannot finalize the SDK wait");
     current += TIMEOUT_MS;
     for (const timer of timers) if (timer.at <= current) timer.fn();

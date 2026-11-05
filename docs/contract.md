@@ -250,7 +250,8 @@ retracted}`. `retracted` (cancelled by the submitting integrator) is **distinct 
   timeout, §Invariants #7) — different cause, same "no verdict will ever arrive" shape.
 - **Cannot discard a real decision.** A retract is refused once the request already reached a terminal state:
   `resolved` (a device decided — the recorded verdict stands) or `expired`. Only a still-`pending` request can be
-  retracted; a race between a human deciding and an integrator cancelling always resolves in the human's favor.
+  retracted. The relay preserves a decision recorded before cancellation; the SDK may still end its
+  pending local wait fail-closed when cancellation cannot retract that row (§Transport).
 - **Scoped to the submitting integrator.** Authorized the same way as polling/wait — the `request_auth_token`
   `POST /requests` returned — so an integrator can retract only the request it submitted, never an arbitrary one.
 - **Devices clear it live.** A retract fans out the SAME `{ type: "retract", request_id }` message devices already
@@ -332,7 +333,8 @@ relay refuses at `now >= deadline` on its own receipt clock (`docs/relay-api.md`
 exactly `expires_at` it already treats the request as expired, 1 ms before the window `verify_verdict` checks
 (`decided_at` in `[created_at, expires_at]`, inclusive) closes. This is intentional, not a mismatch to fix on
 either side: the two checks are in series, so the stricter relay rule only ever tightens, and it matches the SDK's own wait, which
-fails closed at `now >= deadline`. A
+fails closed at `now >= deadline`. Pending async verification keeps the Node caller alive until
+this fail-closed result; terminal settlement releases its deadline backstop. A
 verdict for an expired request is refused (acked `expired`, not stored); the offline-queue flush skips expired
 requests (no dead request is re-pushed); and a read after the deadline **lazy-expires** the row — poll returns the
 terminal `expired` status and `…/wait` is pushed `{ type: "expired", request_id }`. In addition, the relay's
@@ -349,7 +351,12 @@ request_id }` to connected devices (the same message a resolve/expiry already se
 already-retracted request is refused (acked `retracted`, not stored) — retraction, like expiry, can never be
 overridden by a late decision. Retracting a `resolved` or already-`expired` request is refused (409): a retract can
 only affect a request still awaiting a decision, never discard one that already landed. Retracting an
-already-`retracted` request is idempotent (200).
+already-`retracted` request is idempotent (200). The SDK races the caller's abort signal with verdict
+delivery and its deadline. Once the retract attempt settles, confirmation rejects the pending call
+with `RequestRetractedError`; a 409 or any failure instead resolves it `expired`, even when the relay
+has already resolved on an SDK-unverifiable verdict. The SDK does not claim that a refused retract
+cancelled the server-side request. The original deadline still bounds a hung retract, and aborting
+after the local call has settled cannot change its result.
 
 ---
 

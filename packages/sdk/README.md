@@ -9,8 +9,11 @@ Waiting ends on the first fully verified verdict, including a verified denial or
 WebSocket frames and polled verdicts are ignored until `expires_at`; without a verified verdict the
 result is `expired`. Verification reuses the account-state set loaded once for the request. Polling
 keeps its cadence after a rejected verdict, even if the relay has already resolved and cannot deliver
-a replacement. Transport failures still fail closed, and cancellation rejects with
-`RequestRetractedError`.
+a replacement. Transport failures still fail closed. When the caller aborts a pending request,
+the SDK attempts retraction: confirmation rejects with `RequestRetractedError`; a refusal or failure
+ends the local wait `expired` once that attempt settles, without waiting for `expires_at`. The
+original deadline still bounds a hung retract. This applies even if the relay has already resolved
+on an SDK-unverifiable verdict; it does not imply that the server-side request was retracted.
 
 The SDK never returns "allow". It returns a verified human decision. Your code decides whether to
 proceed, and it must fail closed: anything other than `decision === "approved"` means stop.

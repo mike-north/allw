@@ -7,7 +7,9 @@
  * integrator that submitted the request cancelled it (issue #195). If the socket cannot be used
  * (no global `WebSocket`, or it errors), fall back to polling `GET /:acct/requests/:id` until a
  * fully verified verdict, another terminal status, or the deadline. Without a fully verified
- * verdict or other terminal signal at the deadline, resolve to `timeout`.
+ * verdict or other terminal signal at the deadline, resolve to `timeout`. Caller abort races the
+ * wait too: confirmed retraction is `retracted`, while refusal/failure is local `timeout`. The
+ * native deadline keeps Node alive through pending async verification and is cleared on settlement.
  *
  * Every path that is not a delivered verdict is a **deny** outcome (`expired`/`timeout`) — the SDK
  * never fabricates an approval. `retracted` is different in kind, not degree: it is not a verdict at
@@ -46,13 +48,14 @@ export interface WaitDeps {
    * transport delivery and relay provenance alone cannot decide a human outcome.
    */
   readonly acceptVerdict: (value: unknown) => Promise<boolean>;
+  /** Caller cancellation retracts once, then ends the local wait even if the relay refuses it. */
+  readonly signal?: AbortSignal;
   /**
    * Schedules `fn` after `ms`; injectable so tests can drive a fake clock. When absent, the wait
-   * uses two defaults: an `unref`'d `setTimeout` for the deadline backstop (so it never holds a
-   * process open after a verdict) and a plain, ref'd `setTimeout` for the poll sleep (so a process
-   * stays alive between polls). An override replaces **both**, and must honor the same keep-alive
-   * contract: if the poll sleep does not hold the event loop, node can exit mid-wait with no
-   * verdict (#254).
+   * keeps a referenced deadline timer until the wait settles, then clears it, so async nonce
+   * verification cannot let Node exit without a result. Poll sleeps are also referenced and
+   * clamped to the deadline. An override replaces both timers and owns their keep-alive/cleanup
+   * behavior; unref'ing all active timers can let Node exit mid-wait with no verdict (#254).
    */
   readonly schedule?: (fn: () => void, ms: number) => void;
 }
@@ -98,22 +101,9 @@ function frameToOutcome(frame: Record<string, unknown>): VerdictOutcome | null {
 }
 
 /**
- * Default scheduler for the **deadline backstop**. The timer is `unref`'d so a still-pending
- * deadline does not keep a node process alive after the verdict has already won the race (no-op in
- * browsers/workers, where `unref` is absent). While the wait is still in progress, the open
- * WebSocket or the ref'd poll sleep ({@link DEFAULT_POLL_SCHEDULE}) holds the process instead.
- */
-const DEFAULT_DEADLINE_SCHEDULE = (fn: () => void, ms: number): void => {
-  const timer = setTimeout(fn, ms);
-  (timer as { unref?: () => void }).unref?.();
-};
-
-/**
- * Default scheduler for the **poll sleep**. Deliberately *not* `unref`'d: on the poll path it is the
- * only thing holding the event loop between polls. If it were unref'd, node would exit mid-wait
- * with no verdict at all (code 13 under top-level await; code 0 with no output under `void main()`,
- * which a hook host would read as "no decision"). It cannot hold the process past the deadline:
- * each sleep is clamped to the time remaining, and the loop stops once the wait has settled.
+ * Default scheduler for the **poll sleep**. A referenced timer preserves keep-alive between polls;
+ * injected schedulers own the same responsibility. Each sleep is clamped to the time remaining,
+ * so it cannot hold the process beyond the deadline, and the loop stops once the wait settles.
  */
 const DEFAULT_POLL_SCHEDULE = (fn: () => void, ms: number): void => {
   setTimeout(fn, ms);
@@ -126,47 +116,74 @@ const DEFAULT_POLL_SCHEDULE = (fn: () => void, ms: number): void => {
  * verdict (the timeout path → `expired`), never an approval.
  */
 export async function awaitVerdict(requestId: string, deps: WaitDeps): Promise<VerdictOutcome> {
-  const schedule = deps.schedule ?? DEFAULT_DEADLINE_SCHEDULE;
   const pollSchedule = deps.schedule ?? DEFAULT_POLL_SCHEDULE;
 
-  // The deadline timer is the fail-closed backstop shared by both strategies.
+  // Async verification and cancellation may own no live I/O handle. Keep a native backstop
+  // referenced until terminal settlement, then clear it so an early result exits promptly.
+  const deadlineTimer: { handle?: ReturnType<typeof setTimeout> } = {};
   const deadlinePromise = new Promise<VerdictOutcome>((resolve) => {
     const remaining = Math.max(0, deps.deadline - deps.now());
-    schedule(() => {
+    const expire = (): void => {
       resolve({ kind: "timeout" });
-    }, remaining);
+    };
+    if (deps.schedule) deps.schedule(expire, remaining);
+    else deadlineTimer.handle = setTimeout(expire, remaining);
   });
 
   const lifetime = new AbortController();
-  try {
+  // Cancellation has its own terminal outcome: relay confirmation is a retraction, while refusal
+  // or transport failure is only local expiry. Neither trusts an SDK-unverifiable stored verdict.
+  const cancellationPromise = new Promise<VerdictOutcome>((resolve) => {
+    const signal = deps.signal;
+    if (!signal) return;
+    const onAbort = (): void => {
+      void deps.relay.retract(requestId).then(
+        () => {
+          resolve({ kind: "retracted" });
+        },
+        () => {
+          resolve({ kind: "timeout" });
+        },
+      );
+    };
+    signal.addEventListener("abort", onAbort, { once: true, signal: lifetime.signal });
+    // Abort may have happened during submission, before the wait was armed with the request token.
+    if (signal.aborted) onAbort();
+  });
+
+  const waitForTransport = async (): Promise<VerdictOutcome> => {
     if (deps.webSocketFactory) {
       try {
-        const wsOutcome = await Promise.race([
-          waitOverSocket(requestId, deps, deps.webSocketFactory, lifetime.signal),
-          deadlinePromise,
-        ]);
-        if (wsOutcome) return wsOutcome;
-        // The socket closed without a terminal frame before the deadline — fall through to polling
-        // as a robustness backstop.
+        const outcome = await waitOverSocket(
+          requestId,
+          deps,
+          deps.webSocketFactory,
+          lifetime.signal,
+        );
+        if (outcome) return outcome;
+        // A socket that closes without an accepted frame degrades to polling.
       } catch {
         // Socket construction/connection failed — degrade to polling.
       }
     }
+    return pollUntilTerminal(requestId, deps, pollSchedule, () => lifetime.signal.aborted);
+  };
 
-    // `isSettled` stops the poll loop once the race is decided (e.g. the deadline won while a poll sleep
-    // was pending), so it neither lingers nor sends a poll after the caller already has its outcome.
-    let settled = false;
-    const isSettled = (): boolean => settled;
-    try {
-      return await Promise.race([
-        pollUntilTerminal(requestId, deps, pollSchedule, isSettled),
-        deadlinePromise,
-      ]);
-    } finally {
-      settled = true;
-    }
+  try {
+    // A pre-existing abort needs only its retract attempt, not a new socket or poll. Once abort
+    // is observed, a concurrent delivery cannot replace cancellation with an approval. The local
+    // deadline still bounds a hung retract, just as it bounds transport and nonce verification.
+    if (deps.signal?.aborted) return await Promise.race([cancellationPromise, deadlinePromise]);
+    const outcome = await Promise.race([waitForTransport(), deadlinePromise, cancellationPromise]);
+    return deps.signal?.aborted
+      ? await Promise.race([cancellationPromise, deadlinePromise])
+      : outcome;
+  } catch (cause) {
+    if (deps.signal?.aborted) return await Promise.race([cancellationPromise, deadlinePromise]);
+    throw cause;
   } finally {
-    // Stop listening even when the deadline wins while verification is in flight.
+    // Release the owned backstop, cancellation listeners, socket and further polling together.
+    if (deadlineTimer.handle !== undefined) clearTimeout(deadlineTimer.handle);
     lifetime.abort();
   }
 }

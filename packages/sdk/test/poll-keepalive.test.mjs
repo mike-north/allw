@@ -56,7 +56,7 @@ test("an outcome before the deadline still lets the process exit promptly", asyn
   const result = await runFixture("early");
   assert.equal(result.code, 0, `stderr: ${result.stderr}`);
   assert.match(result.stdout, /^decision: expired$/m);
-  // The pending 60 s deadline timer is unref'd, so it does not keep the process alive.
+  // Terminal settlement clears the referenced 60 s backstop, allowing an immediate exit.
   assert.ok(result.ms < 10_000, `exited promptly (took ${String(Math.round(result.ms))} ms)`);
 });
 
@@ -68,3 +68,27 @@ test("a poll interval longer than the deadline does not hold the process past it
   // so the process exits well before a full poll interval would have elapsed.
   assert.ok(result.ms < 3_000, `exited promptly (took ${String(Math.round(result.ms))} ms)`);
 });
+
+/**
+ * Pending promise work is not a Node event-loop handle. A valid delivered verdict can therefore
+ * leave the caller without a poll sleep or network I/O while its nonce store is still pending.
+ * The real deadline must keep both script and hook callers alive to receive fail-closed expiry.
+ * @see ../../../docs/contract.md §Transport → Fail-closed expiry
+ */
+for (const mode of ["pending-verification", "pending-verification-void"]) {
+  test(`poll-path ${mode} keeps Node alive until expired`, async () => {
+    const result = await runFixture(mode);
+    assert.equal(result.signal, null, "the deadline, not the test harness, ends the wait");
+    assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+    assert.match(
+      result.stdout,
+      /^nonce: pending$/m,
+      "real WASM verification reached the nonce store",
+    );
+    assert.match(
+      result.stdout,
+      /^decision: expired$/m,
+      "the caller receives expiry even while async verification owns no active handle",
+    );
+  });
+}
