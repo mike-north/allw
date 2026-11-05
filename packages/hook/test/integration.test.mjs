@@ -409,6 +409,45 @@ test("end-to-end (#388): the configured 100 ms fetch budget schedules a fail-clo
   );
 });
 
+/**
+ * Account-state loading and submission use separate transports. A resolved state GET must not
+ * hide a missing submit budget: the hung POST must expire under the same configured timeout.
+ * @see ../../../docs/claude-code-integration.md (ALLW_FETCH_TIMEOUT_MS)
+ * @see ../../../docs/contract.md §Invariants #7 (timeout must deny)
+ */
+test("end-to-end (#388): the configured 100 ms fetch budget also bounds submit after account state loads", async (t) => {
+  const wasm = await loadWasm();
+  const approver = await pairedApprover(wasm);
+  withConfigHome(t);
+  const relay = relayDouble(wasm, approver, "approved", undefined, {
+    accountStates: [accountState(wasm, approver)],
+  });
+  const scheduled = [];
+  const calls = [];
+  const output = await runHook(
+    bashStdin("rm -rf build", "/workspace/project"),
+    { ...env(approver, 1000), ALLW_FETCH_TIMEOUT_MS: "100" },
+    {
+      ...overrides((input, init) => {
+        const url = typeof input === "string" ? input : input.url;
+        const method = init?.method ?? "GET";
+        calls.push(`${method} ${new URL(url).pathname}`);
+        if (url.endsWith("/requests") && method === "POST") return new Promise(() => {});
+        return relay.fetchImpl(input, init);
+      }),
+      scheduleImpl: (fn, ms) => {
+        scheduled.push(ms);
+        // The GET resolves normally; only the hung submit's timeout should fire.
+        if (scheduled.length === 2) queueMicrotask(fn);
+      },
+    },
+  );
+  assert.deepEqual(calls, [`GET /${ACCOUNT_ID}/account-states`, `POST /${ACCOUNT_ID}/requests`]);
+  assert.deepEqual(scheduled, [100, 100], "the configured budget reaches both fetch transports");
+  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /\(verdict: expired\)$/);
+});
+
 test("end-to-end (fail-closed): missing config (no ALLW_RELAY_URL) → deny without dialing the relay", async () => {
   const wasm = await loadWasm();
   const approver = await pairedApprover(wasm);
