@@ -25,8 +25,9 @@
 //!
 //! - **JCS** — RFC 8785 JSON Canonicalization Scheme via `serde_jcs`.
 //! - **Domain tag** `b"allw/audit-record/v2"` provides domain separation from every other
-//!   SHA-256 use in the system (e.g. `b"allw/request-hash/v1"` in `hash.rs`).  The `/v1`
-//!   suffix is the version knob — bump it if the hashed fields or recipe change.
+//!   SHA-256 use in the system (e.g. `b"allw/request-hash/v3"` in `hash.rs`). The `/v2`
+//!   suffix versions the removal of policy-only audit metadata and the schema-2 action record;
+//!   prior v1 record hashes are not current-format verification evidence.
 //! - **`record_hash` is excluded** (circular; including it would make the hash impossible to
 //!   compute).  Every other field is included — critically `prev_hash`, which is how each
 //!   record commits to its predecessor.
@@ -59,9 +60,9 @@ use crate::contract::{ActionRecord, Actor, Approver, AuditRecord, Decision};
 
 /// The domain separation tag for audit record hashes.
 ///
-/// Distinct from `b"allw/request-hash/v1"` in `hash.rs` — cryptographic domain separation
-/// ensures these digests cannot collide with request hashes.  The `/v1` suffix is the
-/// canonicalization version knob; bump it if the hashed fields or recipe change.
+/// Distinct from `b"allw/request-hash/v3"` in `hash.rs` — cryptographic domain separation
+/// keeps audit and request hashes separate. The `/v2` suffix versions removal of policy-only
+/// audit metadata and the schema-2 action record; old v1 hashes are not converted.
 const AUDIT_DOMAIN_TAG: &[u8] = b"allw/audit-record/v2";
 
 /// Null-byte separator between the domain tag and the JCS payload in the hash input.
@@ -317,7 +318,7 @@ impl AuditChain {
 ///
 /// # Domain separation
 ///
-/// `b"allw/audit-record/v2"` is distinct from `b"allw/request-hash/v1"` (in `hash.rs`),
+/// `b"allw/audit-record/v2"` is distinct from `b"allw/request-hash/v3"` (in `hash.rs`),
 /// ensuring audit record hashes cannot be confused with request hashes.
 ///
 /// # Determinism
@@ -753,11 +754,6 @@ mod tests {
             "an adjacent reorder must be detected (here via SeqMismatch at the first bad position)"
         );
     }
-
-    //
-    // docs/policy-seam.md §forward-compat req #4: the `policy` block must be present even
-    // though v1 only writes `escalate`.  Assert the block serializes with the `policy` key
-    // present and round-trips correctly.
 
     // ── 7. Determinism ────────────────────────────────────────────────────────
 
