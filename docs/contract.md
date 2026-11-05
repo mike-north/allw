@@ -438,8 +438,10 @@ under this format; do not discard it or automatically migrate it into apparently
 
 Every field of the `AuditRecord` is covered **except `record_hash` itself** (circular). Critically
 `prev_hash` is included, so each record commits to its predecessor → tamper-evident chain.
-Domain tag `b"allw/audit-record/v2"` is distinct from the request-hash tag; the `/v1` suffix is the
-version knob.
+Domain tag `b"allw/audit-record/v2"` is distinct from the request-hash tag. The `/v2` suffix versions
+the clean break from v1: policy-only audit metadata is removed and the embedded ActionRecord uses schema 2.
+Old v1 record hashes cannot verify as current-format audit evidence; preserve their original bytes rather
+than converting them into apparently verified new history.
 
 ### verdict signature (EdDSA JWS)
 

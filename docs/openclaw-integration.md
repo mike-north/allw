@@ -358,8 +358,10 @@ not the event (§6.1) — verified against the installed `@openclaw/gateway-prot
 `toolName`, `agentId` are schema-optional. Every field below is read from the snapshot first, the
 event only when the snapshot omits it, and a value present on **both** that disagrees is a
 `presentation-divergence` deny (§6.1, §9) — extended beyond `title`/`description` to every field the
-two sources both carry, including `severity` (the sharpest case: a lower event severity must never
-silently suppress a higher, canonical snapshot severity and its number-match challenge).
+two sources both carry, including `severity`. Severity is upstream schema data: the bridge validates
+and reconciles it but does not turn it into an allw danger tier or use it to select number-match.
+Both exec and plugin requests unconditionally set `challenge_required: true` (§6.4). Claude/Codex
+challenge behavior is unchanged.
 
 | `ActionRecord` field | Source                                                             | Notes                                                                                                                                                         |
 | -------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -369,24 +371,16 @@ silently suppress a higher, canonical snapshot severity and its number-match cha
 | `syntactic.params`   | **absent**                                                         | OpenClaw exposes no structured parameters to a reviewer. Do not synthesize one.                                                                               |
 | `syntactic.raw`      | pinned `description`, plus pinned `detail` when present            | The prose the plugin author wrote for the approver; fallback matching. Approvers show it labelled as the description; the heading is `server :: tool` (#321). |
 
-**Decision: a new `agent_tool_call` surface, not `mcp_tool_call`.** `surface` is a permanent,
-relay-visible (`action_structure`), policy-matchable namespace — the single most expensive kind of
-name to get wrong. Most plugin permission requests are not MCP tool calls at all (OpenClaw's own
-worked example gates a plugin-owned "deploy service" operation), and the bridge cannot isolate the
-genuinely-MCP subset: Codex marks those with `_meta.codex_approval_kind: "mcp_tool_call"` inside the
-harness runtime, and that marker never reaches an operator client. Filing the whole family under
-`mcp_tool_call` would mean a future "allow any `mcp_tool_call` on server X" policy rule, the relay's
-structure-based routing, and the T3 recognized-tool registry all sweep in things that are not MCP
-calls — the category-wide-change failure mode `agent_tool_call` exists to avoid.
-[policy-seam.md](./policy-seam.md) already reserves the name (`// interception paradigm (more added
-as needed: agent_tool_call, delegated_fetch …)`), so this spends the reservation rather than
-inventing a concept.
+**Decision: a distinct `agent_tool_call` surface.** Most plugin permission requests are not MCP
+calls (OpenClaw's own example gates a plugin-owned "deploy service" operation). The bridge cannot
+isolate the genuinely-MCP subset: the harness's `_meta.codex_approval_kind: "mcp_tool_call"` marker
+never reaches an operator client. The distinct surface preserves the caller's interception paradigm
+instead of labelling a plugin call as something an MCP server served.
 
-The new surface **reuses the existing `(server, tool)` function-identity fields** rather than adding
-parallel `provider`/`tool` fields. That is a mild naming stretch — `server` holds a plugin id — but
-it keeps one function-identity slot for the structure/data boundary to classify, keeps the relay's
-`action_structure` shape unchanged, and adds no syntactic field that would need a new
-structure-vs-data ruling ([policy-seam.md](./policy-seam.md) forward-compat requirement #5).
+The surface reuses the existing encrypted `(server, tool)` fields: `server` holds the plugin id,
+`tool` the tool name. It adds no syntactic field and exposes no function identity to the relay.
+The proposed `action_structure` metadata is unimplemented and held in #216; this mapping neither
+adds it nor supplies a replacement program-name source.
 
 **Backfilled instances are driven faithfully — the pinned snapshot IS the canonical source.**
 §4.3's backfill (`exec.approval.list` / `plugin.approval.list`) discovers approvals that predate the
@@ -517,15 +511,18 @@ The bridge sets `challenge_required: true` for every exec and plugin request. It
 and makes no reversibility assertion. Upstream warning prose is caller-supplied information, not an
 allw danger classifier. Claude/Codex number-match behavior is unchanged; #252 remains Mike's decision.
 
-### 6.5 Structure-not-data
+### 6.5 Relay data boundary
 
-The relay may see, at the default privacy tier, only the `action_structure` fields: `surface`, and
-the function identity (`bin` for exec; `server` + `tool` for plugin approvals). Everything else —
-`argv`, `cwd`, `env_refs`, `raw`, the summary, the OpenClaw approval id — is data and travels only
-inside the JWE. Concretely, the relay learns "an `openclaw` actor is running `kubectl`", never which
-cluster, which namespace, or in which directory. The split is enforced in the WASM core when the
-envelope is constructed, not by the bridge ([architecture.md](./architecture.md)
-§Structure-not-data boundary).
+The current relay accepts exactly `v`, `id`, `created_at`, `expires_at`, `approver`, and
+`context_ciphertext` in the request envelope (`packages/relay/src/index.ts`, `ENVELOPE_KEYS`;
+`packages/relay/test/relay-routing.test.ts`, unexpected-envelope-key rejection). These are
+routing/lifecycle metadata and opaque ciphertext. This envelope exposes no action surface, program name,
+MCP/plugin server or tool identity, actor, session label, summary, argv, cwd or OpenClaw approval id.
+Those action/context values travel only inside the JWE.
+
+The proposed structure-visible metadata/privacy tiers remain unimplemented and held in #216.
+`action_structure` is not an accepted envelope key. No new field, privacy tier or program derivation
+is introduced here; see [architecture.md](./architecture.md) §Relay data boundary.
 
 ---
 
@@ -815,15 +812,14 @@ permission-request families, including the §11 UAT checklist's plugin rows.
 
 The `action_structure` envelope field ([contract.md](./contract.md) §Messages) — the relay-visible
 plaintext structure summary — is **not yet implemented in any surface** (the wire `ApprovalRequest`
-envelope carries only `{ v, id, created_at, expires_at, approver, context_ciphertext }`). Building it
-is a separate, materially larger slice than either family's mapping and is not required for either
+envelope carries only `{ v, id, created_at, expires_at, approver, context_ciphertext }`). The proposal remains unimplemented and held in #216, and is not required for either
 family's fail-closed correctness: an unrecognized `Surface` string already fails to deserialize in the
-Rust core rather than being silently accepted. Tracked separately from this document.
+Rust core rather than being silently accepted. No metadata field or program-name derivation is added by this change.
 
 | #   | Scope                                                                                                                                                                                                                                                                                                                              | Deliverable                                                                                                                                                         | Tests                                                                                                                                                                                                                                                    |
 | --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 1   | **Core: argv-with-raw command records.** `allw-core` already has `action_from_argv`, but it is not exposed to WASM and cannot carry the original command text (it sets `raw: None`, which also suppresses `env_refs` extraction).                                                                                                  | A core builder taking `(argv, raw, ctx)`; a WASM export `action_from_argv`; UniFFI parity per the return-type suffix convention; SDK/hook `wasm.ts` type additions. | Rust unit tests for argv+raw (incl. empty argv, `env_refs` from `raw`); a cross-platform vector proving Rust and WASM produce byte-identical records.                                                                                                    |
-| 2   | **Core: the `agent_tool_call` surface.** Adds the `Surface` variant reserved in `policy-seam.md`, a builder over `(server, tool)` function identity, relay `action_structure` acceptance, and SDK `Surface` union widening.                                                                                                        | Core enum + builder, WASM + UniFFI exports, SDK types, relay validation, `docs/policy-seam.md` classification note.                                                 | Structure/data split test (server+tool are structure; `raw` is data); a negative test that an unknown surface string fails closed rather than defaulting.                                                                                                |
+| 2   | **Core: the `agent_tool_call` surface.** Adds the `Surface` variant reserved in `policy-seam.md`, a builder over encrypted `(server, tool)` function identity and SDK `Surface` union widening. No relay `action_structure` acceptance.                                                                                            | Core enum + builder, WASM + UniFFI exports, SDK types; existing routing/ciphertext-only envelope validation is unchanged.                                           | Encrypted-substrate tests (server/tool/raw stay inside JWE); a negative test that an unknown surface string fails closed rather than defaulting.                                                                                                         |
 | 3   | **Bridge skeleton: gateway client.** New `packages/openclaw-bridge`; Ed25519 device identity, `connect.challenge` proof, `PAIRING_REQUIRED` handling, device-token persistence in the OS keystore, protocol pin, capability advertisement, subscription + `*.approval.list` backfill + reconnect re-projection. No allw calls yet. | A connectable, scope-minimal operator client that logs pending approvals.                                                                                           | Integration tests against a fake gateway WebSocket speaking real `RequestFrame`/`ResponseFrame`/`EventFrame` shapes; negatives for challenge without `ts`, wrong protocol version, scope downgrade, reconnect double-delivery.                           |
 | 4   | **Mapping.** Event → `approval.get` reconcile → `ApprovalContext` construction for both families; deterministic summary templates; actor-id validation; caller-requested challenge and omitted reversibility; `chain` correlation.                                                                                                 | Pure, I/O-free mapping module (the `decide.ts` analogue).                                                                                                           | Field-by-field assertions derived from §5/§6 of this spec (never from captured output); negatives for `presentation-divergence`, empty `commandText`, missing tool identity, malformed gateway id.                                                       |
 | 5   | **Decision + resolution.** `requestApproval` wiring, full verdict verification, `approval.resolve` submission, `applied: false` reconcile, timeout budgeting, the complete §9 matrix.                                                                                                                                              | End-to-end fail-closed behavior.                                                                                                                                    | One direct negative test per §9 row, plus: `allow-always` is never submitted under any input; `no-expressible-allow`; `insufficient-budget`; gateway loss both not-restored and restored-while-pending; unsupported kind is neither approved nor denied. |

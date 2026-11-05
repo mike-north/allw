@@ -170,8 +170,10 @@ fn ms_to_i64(ms: f64, what: &str) -> Result<i64, JsError> {
 /// Computes the WYSIWYS `request_hash` for an [`ApprovalContext`](allw_core::ApprovalContext)
 /// bound to `expires_at`, returning the 32-byte digest as a **base64url-unpadded** string.
 ///
-/// This must reproduce the exact value the Rust core produces (`request-hash/v2`); the
-/// cross-platform test vector anchors that parity.
+/// This reproduces the Rust `request-hash/v3` value; the cross-platform vector anchors parity.
+/// The v3 canonical contract removes risk/policy-only action slots, uses ActionRecord schema 2,
+/// and makes reversibility an optional caller assertion. Its domain separates prior v2 receipts
+/// from the current format; no compatibility conversion is performed.
 ///
 /// # Errors
 ///

@@ -36,7 +36,10 @@ import { MAX_ESCAPED_DIAGNOSTIC_CHARS, escapeToPrintableAscii } from "./printabl
 export interface AllwWasm {
   /**
    * Computes the WYSIWYS `request_hash` (base64url-unpadded 32 bytes) for an `ApprovalContext`
-   * JSON bound to `expiresAt` (Unix ms). Reproduces the Rust `request-hash/v2` value exactly.
+   * JSON bound to `expiresAt` (Unix ms). Reproduces the Rust `request-hash/v3` value exactly.
+   * The v3 canonical contract removes risk/policy-only action slots, uses ActionRecord schema 2,
+   * and binds reversibility only when the caller supplies an assertion. Prior v2 receipts cannot
+   * verify as current-format receipts.
    */
   compute_request_hash(contextJson: string, expiresAt: number): string;
   /**

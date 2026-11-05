@@ -51,9 +51,10 @@
 //! # Domain tag and versioning
 //!
 //! `DOMAIN_TAG = b"allw/request-hash/v3"` provides cryptographic domain separation so this
-//! hash cannot be confused with any other SHA-256 digest in the system.  The `/v2` suffix is the
-//! version knob: the broadened input (every [`ApprovalContext`] field, not the four-field v1
-//! subset) is a breaking change from `request-hash/v1`, so the tag bumps with it.
+//! hash cannot be confused with any other SHA-256 digest in the system. The `/v3` suffix is the
+//! canonical-contract version: removing risk/policy-only action slots, using ActionRecord schema 2,
+//! and making reversibility an optional caller assertion changes the v2 input contract. The clean
+//! domain break prevents prior v2 signed receipts from verifying as current-format receipts.
 //!
 //! # JCS crate
 //!
@@ -70,8 +71,9 @@ use crate::contract::{ActionRecord, ApprovalContext, Constraints};
 
 /// Domain separation tag — prefixed to the JCS bytes before hashing.
 ///
-/// The `/v2` suffix is the version knob; it was bumped from `/v1` when the hashed input
-/// broadened from the four-field subset to the full [`ApprovalContext`] (plus `expires_at`).
+/// The `/v3` suffix separates the current canonical contract from v2: risk/policy-only action
+/// slots are removed, the action record is schema 2, and reversibility is an optional assertion.
+/// The input remains a flat context projection plus `expires_at`; old signed hashes are not converted.
 const DOMAIN_TAG: &[u8] = b"allw/request-hash/v3";
 
 /// Null-byte separator between domain tag and payload in the hash input.
@@ -273,7 +275,7 @@ mod tests {
 
     // ── Test 1: Canonicalization is spec-correct (the anchor test) ────────────
     //
-    // This expected string is derived BY HAND from RFC 8785 rules for the v2 flat object:
+    // This expected string is derived BY HAND from RFC 8785 rules for the v3 flat object:
     //   - No whitespace
     //   - Object keys sorted lexicographically by UTF-16 code unit (= byte order for ASCII)
     //   - Numbers in shortest form
@@ -358,7 +360,7 @@ mod tests {
 
     // ── Test 4: Sensitivity — each hashed field changes the hash ─────────────
     //
-    // The v2 request-hash input binds every ApprovalContext field plus expires_at, so each of
+    // The v3 request-hash input binds the context projection plus expires_at, so each of
     // these mutations must perturb the hash (docs/contract.md §request_hash).
 
     #[test]
@@ -434,7 +436,7 @@ mod tests {
         );
     }
 
-    /// `reversible` is now a hashed field (v2), so mutating it must change the hash.
+    /// A present caller reversibility assertion is hash-bound; changing it changes the hash.
     #[test]
     fn mutating_reversible_changes_hash() {
         let base = make_minimal_context();
@@ -450,7 +452,7 @@ mod tests {
         );
     }
 
-    /// `constraints` is now a hashed field (v2): flipping `challenge_required` must change it.
+    /// Constraints are hash-bound: flipping `challenge_required` changes the hash.
     #[test]
     fn mutating_constraints_challenge_required_changes_hash() {
         let base = make_minimal_context();
@@ -466,7 +468,7 @@ mod tests {
         );
     }
 
-    /// `constraints.allowed_decisions` is hashed (v2): changing it must change the hash.
+    /// Allowed decisions are hash-bound: changing the set changes the hash.
     #[test]
     fn mutating_constraints_allowed_decisions_changes_hash() {
         let base = make_minimal_context();
@@ -482,7 +484,7 @@ mod tests {
         );
     }
 
-    /// `chain` is now a hashed field (v2): going from absent to present must change the hash.
+    /// An upstream chain is hash-bound when present; adding one changes the hash.
     #[test]
     fn adding_chain_changes_hash() {
         let base = make_minimal_context(); // chain: None
@@ -518,7 +520,7 @@ mod tests {
     // ── Test 5: Exclusion — excluded fields do NOT change the hash ───────────
     //
     // This is the critical WYSIWYS-scope test: it proves the hash binds exactly the
-    // documented input and nothing else. In v2 the only excluded ApprovalContext-adjacent
+    // documented input and nothing else. The only excluded ApprovalContext-adjacent
     // field is `actor.attestation` (a verification artifact, not shown content); the envelope's
     // routing/lifecycle fields are not part of the ApprovalContext at all and so cannot be
     // mutated here.
