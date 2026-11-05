@@ -29,7 +29,11 @@ import { loadTestWasm } from "./wasm-helper.mjs";
 
 // ── Deterministic fixtures (fixed timestamps; never Date.now() in test data) ──────────────────
 
-const ACCOUNT_ID = "acct-web-runtime-test";
+/** The valid browser identity and request helpers share the fixed root's canonical account. */
+const fixtureWasm = await loadTestWasm();
+const ACCOUNT_ID = fixtureWasm.account_id_for_root(
+  fixtureWasm.ed25519_public_key(Buffer.alloc(32, 0x11).toString("base64url")),
+);
 const DEVICE_ID = "dev-web-runtime-test";
 const REQUEST_ID = "req-web-runtime-test-1";
 /** 2023-11-14T22:13:20Z — cert issuance. */
