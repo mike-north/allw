@@ -71,7 +71,10 @@ use serde::{Deserialize, Serialize};
 const ROOT_SEED: [u8; 32] = [0x11u8; 32];
 const DEVICE_SEED: [u8; 32] = [0x22u8; 32];
 
-const ACCOUNT_ID: &str = "acc_wasm_vector_01";
+/// The fixture account is always the canonical identity of its signing root.
+fn account_id() -> String {
+    allw_core::account_id_for_root(&SigningKeyPair::from_seed(&ROOT_SEED).public_key())
+}
 const DEVICE_ID: &str = "dev_wasm_vector_01";
 const REQUEST_ID: &str = "req_wasm_vector_01";
 
@@ -236,6 +239,70 @@ struct WasmVector {
     provenance_expires_at: i64,
     /// Verdict-provenance cases (#245), each checked with `approver_root_pubkey_b64`.
     provenance_cases: Vec<ProvenanceCase>,
+    /// Root-signed aliases must fail on every surface; the derived account is a valid control.
+    self_certifying_cases: Vec<SelfCertifyingCase>,
+}
+
+/// Same signed account/certificate relationship for verdicts and standing policy rules.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct SelfCertifyingCase {
+    account_id: String,
+    verdict_json: String,
+    policy_rule_json: String,
+    /// None for the canonical account, otherwise the documented root-binding rejection.
+    expected_error: Option<String>,
+}
+
+/// Construct genuine signatures, so failure proves account binding rather than signature rejection.
+fn self_certifying_cases(
+    root: &SigningKeyPair,
+    unsigned: &UnsignedVerdict,
+) -> Vec<SelfCertifyingCase> {
+    let canonical = account_id_for_root(&root.public_key());
+    let other = account_id_for_root(&SigningKeyPair::from_seed(&[0x33; 32]).public_key());
+    let device = SigningKeyPair::from_seed(&DEVICE_SEED);
+    [
+        canonical.clone(),
+        other,
+        "legacy-account".into(),
+        String::new(),
+        format!("{canonical}="),
+    ]
+    .into_iter()
+    .map(|account| {
+        let cert = issue_device_cert(
+            root,
+            &account,
+            DEVICE_ID,
+            &device.public_key(),
+            TS_CREATED,
+            None,
+        );
+        let mut verdict = clone_unsigned(unsigned);
+        verdict.approver.account_id = account.clone();
+        let verdict = sign_verdict(&verdict, &device, NONCE, Some(cert.clone())).unwrap();
+        let policy = allw_core::UnsignedPolicyRule {
+            id: "allow-git".into(),
+            account_id: account.clone(),
+            subject: allw_core::ActorMatcher::Any,
+            predicate: allw_core::PolicyPredicate::command_bin("git"),
+            effect: allw_core::PolicyEffect::Allow,
+            bounds: None,
+            provenance: allw_core::PolicyProvenance::Manual,
+            tier: allw_core::PolicyTier::Syntactic,
+            created_at: TS_CREATED,
+            expires_at: None,
+        };
+        let policy = allw_core::sign_policy_rule(&policy, DEVICE_ID, &device, Some(cert));
+        SelfCertifyingCase {
+            expected_error: (account != canonical)
+                .then(|| "account id does not derive from the account root key".into()),
+            account_id: account,
+            verdict_json: serde_json::to_string(&verdict).unwrap(),
+            policy_rule_json: serde_json::to_string(&policy).unwrap(),
+        }
+    })
+    .collect()
 }
 
 /// One `verify_verdict_provenance` case.
@@ -541,7 +608,7 @@ fn make_request() -> ApprovalRequest {
         id: REQUEST_ID.to_string(),
         created_at: TS_CREATED,
         expires_at: TS_EXPIRES,
-        approver: ACCOUNT_ID.to_string(),
+        approver: account_id(),
         context_ciphertext: None,
     }
 }
@@ -561,7 +628,7 @@ fn build_vector() -> WasmVector {
     // Device cert: account root certifies the device key (no expiry).
     let cert = issue_device_cert(
         &root,
-        ACCOUNT_ID,
+        account_id().as_str(),
         DEVICE_ID,
         &device.public_key(),
         TS_CREATED,
@@ -575,7 +642,7 @@ fn build_vector() -> WasmVector {
         decision: Decision::Approved,
         decided_at: TS_DECIDED,
         approver: Approver {
-            account_id: ACCOUNT_ID.to_string(),
+            account_id: account_id(),
             device_id: DEVICE_ID.to_string(),
         },
         note: None,
@@ -657,10 +724,11 @@ fn build_vector() -> WasmVector {
         seal_sequence: SEAL_SEQUENCE,
         not_approved_verdicts,
         forged_not_approved_verdicts,
-        provenance_account_id: ACCOUNT_ID.to_string(),
+        provenance_account_id: account_id(),
         provenance_created_at: TS_CREATED,
         provenance_expires_at: TS_EXPIRES,
         provenance_cases,
+        self_certifying_cases: self_certifying_cases(&root, &unsigned),
     }
 }
 
@@ -695,7 +763,7 @@ fn provenance_cases(
     let signed_at = |decided_at: i64, cert_expires_at: Option<i64>| {
         let cert = issue_device_cert(
             root,
-            ACCOUNT_ID,
+            account_id().as_str(),
             DEVICE_ID,
             &device.public_key(),
             TS_CREATED - 10_000,
@@ -729,7 +797,7 @@ fn provenance_cases(
     let second_key = SigningKeyPair::from_seed(&SECOND_DEVICE_SEED);
     let second_cert = issue_device_cert(
         root,
-        ACCOUNT_ID,
+        account_id().as_str(),
         SECOND_DEVICE_ID,
         &second_key.public_key(),
         TS_CREATED,
@@ -738,7 +806,7 @@ fn provenance_cases(
     let second = sign_verdict(
         &UnsignedVerdict {
             approver: Approver {
-                account_id: ACCOUNT_ID.to_string(),
+                account_id: account_id(),
                 device_id: SECOND_DEVICE_ID.to_string(),
             },
             ..clone_unsigned(unsigned)
@@ -752,7 +820,7 @@ fn provenance_cases(
     let revoking = sign_account_state(
         &AccountState {
             v: 1,
-            account_id: ACCOUNT_ID.to_string(),
+            account_id: account_id(),
             sequence: PROVENANCE_REVOKING_SEQUENCE,
             current_root: root.public_key().to_bytes(),
             previous_roots: vec![],
@@ -1284,6 +1352,53 @@ fn fixture_provenance_cases_follow_the_rules() {
                     case.name
                 );
             }
+        }
+    }
+}
+
+/// Rust and WASM consume identical genuine signatures with spec-derived success/error expectations.
+/// @see docs/enrollment.md §Self-Certifying Account Id.
+#[test]
+fn fixture_self_certifying_accounts() {
+    let vector = build_vector();
+    let root = SigningKeyPair::from_seed(&ROOT_SEED).public_key();
+    for case in vector.self_certifying_cases {
+        let verdict: Verdict = serde_json::from_str(&case.verdict_json).unwrap();
+        let rule: allw_core::PolicyRule = serde_json::from_str(&case.policy_rule_json).unwrap();
+        let result = verify_verdict(
+            &verdict,
+            &make_request(),
+            &make_minimal_context(),
+            &root,
+            &mut InMemoryNonceStore::new(),
+            NOW_MS,
+        );
+        let policy = allw_core::verify_policy_rule(&rule, &root, NOW_MS);
+        let provenance = verify_verdict_provenance(
+            &verdict,
+            REQUEST_ID,
+            TS_CREATED,
+            TS_EXPIRES,
+            &case.account_id,
+            &root,
+            &[],
+        );
+        if let Some(error) = case.expected_error {
+            assert_eq!(result.unwrap_err(), VerifyError::AccountIdMismatch);
+            assert_eq!(
+                policy.unwrap_err(),
+                allw_core::PolicyRuleError::AccountIdMismatch
+            );
+            assert_eq!(provenance.unwrap_err(), VerifyError::AccountIdMismatch);
+            assert_eq!(VerifyError::AccountIdMismatch.to_string(), error);
+            assert_eq!(
+                allw_core::PolicyRuleError::AccountIdMismatch.to_string(),
+                error
+            );
+        } else {
+            result.unwrap();
+            policy.unwrap();
+            provenance.unwrap();
         }
     }
 }

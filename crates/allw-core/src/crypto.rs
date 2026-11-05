@@ -5,7 +5,8 @@
 //! *without trusting the relay*, cryptographically bound to the exact request. It also
 //! enforces **fail-closed** (#6): every code path here returns `Err` — never a permissive
 //! default — on any failure, and the only success is an *authenticated, bound, fresh,
-//! approved* decision.
+//! approved* decision. The shared certificate verifier also binds verdicts and policy rules
+//! to the exact self-certifying account identity of their trusted root, independent of caller guards.
 //!
 //! # Signing substrate: hand-rolled EdDSA compact JWS
 //!
@@ -866,6 +867,8 @@ pub enum VerifyError {
     CertSignatureInvalid,
     /// Step 1 — the cert's `account_id` does not match the verdict's `approver.account_id`.
     CertAccountMismatch,
+    /// Step 1 — the certified account id is not exactly derived from the trusted root.
+    AccountIdMismatch,
     /// Step 1 — the verdict's `approver.account_id` does not match the caller-asserted account.
     ExpectedAccountMismatch,
     /// Step 1 — the cert's `device_id` does not match the verdict's `approver.device_id`.
@@ -933,6 +936,9 @@ impl std::fmt::Display for VerifyError {
                     f,
                     "device cert account_id does not match the verdict approver"
                 )
+            }
+            Self::AccountIdMismatch => {
+                write!(f, "account id does not derive from the account root key")
             }
             Self::ExpectedAccountMismatch => {
                 write!(f, "verdict account_id does not match expected account_id")
@@ -1025,6 +1031,8 @@ pub(crate) struct CertifiedDevice {
 pub(crate) enum DeviceCertError {
     SignatureInvalid,
     AccountMismatch,
+    /// The certificate names an account other than the canonical identity of its root.
+    AccountIdMismatch,
     CertExpired,
 }
 
@@ -1032,8 +1040,9 @@ pub(crate) enum DeviceCertError {
 ///
 /// The certificate must be an `allw-device-cert+jws` signed by `account_root`, its header `kid`
 /// must name the same account as the signed claims, and the signed `account_id` must match
-/// `expected_account_id`. The helper intentionally does not compare device ids; each caller checks
-/// that its own artifact header or outer identity matches the certified device id.
+/// `expected_account_id`, which must derive exactly from `account_root`. The helper intentionally
+/// does not compare device ids; each caller checks that its own artifact header or outer identity
+/// matches the certified device id.
 pub(crate) fn verify_certified_device(
     device_cert: &str,
     expected_account_id: &str,
@@ -1047,6 +1056,10 @@ pub(crate) fn verify_certified_device(
     if cert.header.kid != cert.claims.account_id || cert.claims.account_id != expected_account_id {
         return Err(DeviceCertError::AccountMismatch);
     }
+    // A valid root signature authenticates a certificate, but cannot create an alias for
+    // the root-derived account. Enforce this even without caller account/state guards.
+    crate::account::check_account_id_for_root(expected_account_id, account_root)
+        .map_err(|_| DeviceCertError::AccountIdMismatch)?;
     if cert
         .claims
         .expires_at
@@ -1096,7 +1109,8 @@ pub fn derive_number_match_challenge(request_hash: &[u8; 32]) -> String {
 /// 1. **Device cert → root** (checklist #1). Requires `verdict.device_cert`
 ///    ([`VerifyError::MissingDeviceCert`]); verifies its JWS against `approver_root`
 ///    ([`VerifyError::CertSignatureInvalid`]); checks `typ`, the signed header `kid` and
-///    `account_id` ([`VerifyError::CertAccountMismatch`]) and `device_id`
+///    `account_id` ([`VerifyError::CertAccountMismatch`]); requires the account derived from
+///    `approver_root` ([`VerifyError::AccountIdMismatch`]); checks `device_id`
 ///    ([`VerifyError::CertDeviceMismatch`]); enforces `expires_at` if set
 ///    ([`VerifyError::CertExpired`]). Yields the certified device public key.
 /// 2. **Verdict signature** (checklist #1). Parses `verdict.sig` as a verdict JWS, checks
@@ -1269,7 +1283,8 @@ pub struct VerdictProvenance {
 /// 3. `verdict.approver.account_id == account_id` ([`VerifyError::ExpectedAccountMismatch`]);
 /// 4. the device certificate chains to `account_root` and is unexpired at the verdict's
 ///    `decided_at` ([`VerifyError::MissingDeviceCert`], [`VerifyError::CertSignatureInvalid`],
-///    [`VerifyError::CertAccountMismatch`], [`VerifyError::CertDeviceMismatch`],
+///    [`VerifyError::CertAccountMismatch`], [`VerifyError::AccountIdMismatch`],
+///    [`VerifyError::CertDeviceMismatch`],
 ///    [`VerifyError::CertExpired`]);
 /// 5. the device is not revoked in the highest-sequence state of `account_states`, when any are
 ///    given ([`VerifyError::DeviceRevoked`], [`VerifyError::AccountStateInvalid`]);
@@ -1361,6 +1376,7 @@ fn authenticate_verdict(
     .map_err(|e| match e {
         DeviceCertError::SignatureInvalid => VerifyError::CertSignatureInvalid,
         DeviceCertError::AccountMismatch => VerifyError::CertAccountMismatch,
+        DeviceCertError::AccountIdMismatch => VerifyError::AccountIdMismatch,
         DeviceCertError::CertExpired => VerifyError::CertExpired,
     })?;
 
@@ -1560,7 +1576,10 @@ mod tests {
     const OTHER_ROOT_SEED: [u8; 32] = [0x33u8; 32];
 
     // ── Fixed identities ──────────────────────────────────────────────────────────
-    const ACCOUNT_ID: &str = "acc_test_01";
+    /// The fixture account is always the canonical identity of its signing root.
+    fn account_id() -> String {
+        crate::account::account_id_for_root(&SigningKeyPair::from_seed(&ROOT_SEED).public_key())
+    }
     const DEVICE_ID: &str = "dev_test_01";
     const REQUEST_ID: &str = "req_test_01";
 
@@ -1592,7 +1611,7 @@ mod tests {
 
     fn make_approver() -> Approver {
         Approver {
-            account_id: ACCOUNT_ID.to_string(),
+            account_id: account_id(),
             device_id: DEVICE_ID.to_string(),
         }
     }
@@ -1631,7 +1650,7 @@ mod tests {
             id: REQUEST_ID.to_string(),
             created_at: TS_CREATED,
             expires_at: TS_EXPIRES,
-            approver: ACCOUNT_ID.to_string(),
+            approver: account_id(),
             context_ciphertext: None,
         }
     }
@@ -1666,7 +1685,7 @@ mod tests {
     fn make_cert(root: &SigningKeyPair) -> String {
         issue_device_cert(
             root,
-            ACCOUNT_ID,
+            account_id().as_str(),
             DEVICE_ID,
             &device_key().public_key(),
             TS_CREATED,
@@ -1704,6 +1723,96 @@ mod tests {
             Some(cert),
         )
         .expect("note within cap")
+    }
+
+    /// Even a genuine root-issued cert cannot give that root a second account identity.
+    /// @see docs/enrollment.md §Self-Certifying Account Id; docs/contract.md §Verification checklist.
+    #[test]
+    fn self_certifying_account_rejects_same_root_other_accounts() {
+        let root = root_key();
+        let canonical = crate::account::account_id_for_root(&root.public_key());
+        let other = crate::account::account_id_for_root(
+            &SigningKeyPair::from_seed(&OTHER_ROOT_SEED).public_key(),
+        );
+        for account in [
+            other,
+            "legacy-account".into(),
+            String::new(),
+            format!("{canonical}="),
+        ] {
+            let mut unsigned = make_unsigned(Decision::Approved, canonical_hash(false), None);
+            unsigned.approver.account_id = account.clone();
+            let cert = issue_device_cert(
+                &root,
+                &account,
+                DEVICE_ID,
+                &device_key().public_key(),
+                TS_CREATED,
+                None,
+            );
+            let verdict = sign_verdict(&unsigned, &device_key(), NONCE, Some(cert)).unwrap();
+            let request = make_request();
+            let context = make_context(false);
+            let root_pub = root.public_key();
+            let results = [
+                verify_verdict(
+                    &verdict,
+                    &request,
+                    &context,
+                    &root_pub,
+                    &mut InMemoryNonceStore::new(),
+                    NOW_OK,
+                ),
+                verify_verdict_for_account(
+                    &verdict,
+                    &request,
+                    &context,
+                    &root_pub,
+                    &mut InMemoryNonceStore::new(),
+                    NOW_OK,
+                    &account,
+                ),
+                verify_verdict_with_account_states(
+                    &verdict,
+                    &request,
+                    &context,
+                    &root_pub,
+                    &mut InMemoryNonceStore::new(),
+                    NOW_OK,
+                    &[],
+                ),
+                verify_verdict_with_account_states_for_account(
+                    &verdict,
+                    &request,
+                    &context,
+                    &root_pub,
+                    &mut InMemoryNonceStore::new(),
+                    NOW_OK,
+                    &[],
+                    &account,
+                ),
+            ];
+            for result in results {
+                assert_eq!(
+                    result,
+                    Err(VerifyError::AccountIdMismatch),
+                    "account {account:?}"
+                );
+            }
+            assert_eq!(
+                verify_verdict_provenance(
+                    &verdict,
+                    REQUEST_ID,
+                    TS_CREATED,
+                    TS_EXPIRES,
+                    &account,
+                    &root_pub,
+                    &[]
+                ),
+                Err(VerifyError::AccountIdMismatch),
+                "provenance must reject {account:?}"
+            );
+        }
     }
 
     // ── Round-trip happy path ─────────────────────────────────────────────────────
@@ -1818,7 +1927,7 @@ mod tests {
             &root_pub,
             &mut ok_store,
             NOW_OK,
-            ACCOUNT_ID,
+            account_id().as_str(),
         )
         .expect("matching expected account id must preserve the happy path");
 
@@ -1841,7 +1950,7 @@ mod tests {
     fn expired_cert_detected() {
         let cert = issue_device_cert(
             &root_key(),
-            ACCOUNT_ID,
+            account_id().as_str(),
             DEVICE_ID,
             &device_key().public_key(),
             TS_CREATED,
@@ -2025,7 +2134,7 @@ mod tests {
         // claiming a different account — but leave the original root signature in place.
         let mut parts: Vec<String> = cert.split('.').map(str::to_string).collect();
         let forged = DeviceCertClaims {
-            account_id: ACCOUNT_ID.to_string(),
+            account_id: account_id(),
             device_id: DEVICE_ID.to_string(),
             device_pubkey: device_key().public_key().to_bytes(),
             issued_at: TS_CREATED + 999, // changed → signature no longer covers it
@@ -2360,7 +2469,7 @@ mod tests {
             kid: "wrong-account".to_string(), // != claims.account_id
         };
         let claims = DeviceCertClaims {
-            account_id: ACCOUNT_ID.to_string(),
+            account_id: account_id(),
             device_id: DEVICE_ID.to_string(),
             device_pubkey: device_key().public_key().to_bytes(),
             issued_at: TS_CREATED,
@@ -2724,7 +2833,13 @@ mod tests {
 
     fn signed_account_state(sequence: u64, revoked_device_ids: &[&str]) -> String {
         sign_account_state(
-            &account_state_claims(1, ACCOUNT_ID, sequence, &root_key(), revoked_device_ids),
+            &account_state_claims(
+                1,
+                account_id().as_str(),
+                sequence,
+                &root_key(),
+                revoked_device_ids,
+            ),
             &root_key(),
         )
     }
@@ -2761,17 +2876,17 @@ mod tests {
         let state = account_state_claims(1, "acc_other", 1, &root_key(), &[]);
         let compact = sign_account_state(&state, &root_key());
 
-        let err = verify_account_state(&compact, ACCOUNT_ID, &root_key().public_key())
+        let err = verify_account_state(&compact, account_id().as_str(), &root_key().public_key())
             .expect_err("account state for another account must fail closed");
         assert_eq!(err, AccountStateError::AccountMismatch);
     }
 
     #[test]
     fn account_state_rejects_wrong_signing_key() {
-        let state = account_state_claims(1, ACCOUNT_ID, 1, &root_key(), &[]);
+        let state = account_state_claims(1, account_id().as_str(), 1, &root_key(), &[]);
         let compact = sign_account_state(&state, &device_key());
 
-        let err = verify_account_state(&compact, ACCOUNT_ID, &root_key().public_key())
+        let err = verify_account_state(&compact, account_id().as_str(), &root_key().public_key())
             .expect_err("account state not signed by the root must fail closed");
         assert_eq!(err, AccountStateError::InvalidSignature);
     }
@@ -2779,20 +2894,20 @@ mod tests {
     #[test]
     fn account_state_rejects_wrong_current_root() {
         let other_root = SigningKeyPair::from_seed(&OTHER_ROOT_SEED);
-        let state = account_state_claims(1, ACCOUNT_ID, 1, &other_root, &[]);
+        let state = account_state_claims(1, account_id().as_str(), 1, &other_root, &[]);
         let compact = sign_account_state(&state, &root_key());
 
-        let err = verify_account_state(&compact, ACCOUNT_ID, &root_key().public_key())
+        let err = verify_account_state(&compact, account_id().as_str(), &root_key().public_key())
             .expect_err("account state with a different current root must fail closed");
         assert_eq!(err, AccountStateError::RootMismatch);
     }
 
     #[test]
     fn account_state_rejects_unsupported_version() {
-        let state = account_state_claims(2, ACCOUNT_ID, 1, &root_key(), &[]);
+        let state = account_state_claims(2, account_id().as_str(), 1, &root_key(), &[]);
         let compact = sign_account_state(&state, &root_key());
 
-        let err = verify_account_state(&compact, ACCOUNT_ID, &root_key().public_key())
+        let err = verify_account_state(&compact, account_id().as_str(), &root_key().public_key())
             .expect_err("unknown account-state versions must fail closed");
         assert_eq!(err, AccountStateError::UnsupportedVersion);
     }
@@ -2801,7 +2916,7 @@ mod tests {
     fn account_state_rejects_cross_typ_device_cert_jws() {
         let cert = make_cert(&root_key());
 
-        let err = verify_account_state(&cert, ACCOUNT_ID, &root_key().public_key())
+        let err = verify_account_state(&cert, account_id().as_str(), &root_key().public_key())
             .expect_err("device cert JWS must not verify as account state");
         assert_eq!(err, AccountStateError::InvalidSignature);
     }
@@ -2810,7 +2925,7 @@ mod tests {
     fn account_state_rejects_malformed_compact_jws() {
         let err = verify_account_state(
             "not.a.valid.compact.jws",
-            ACCOUNT_ID,
+            account_id().as_str(),
             &root_key().public_key(),
         )
         .expect_err("malformed compact JWS must fail closed");
@@ -2883,7 +2998,7 @@ mod tests {
             REQUEST_ID,
             TS_CREATED,
             TS_EXPIRES,
-            ACCOUNT_ID,
+            account_id().as_str(),
             &root_key().public_key(),
             states,
         )
@@ -3010,7 +3125,7 @@ mod tests {
     fn provenance_rejects_a_cert_for_another_device() {
         let cert = issue_device_cert(
             &root_key(),
-            ACCOUNT_ID,
+            account_id().as_str(),
             "dev_other",
             &device_key().public_key(),
             TS_CREATED,
@@ -3029,7 +3144,7 @@ mod tests {
         let cert_expiring = |expires_at| {
             issue_device_cert(
                 &root_key(),
-                ACCOUNT_ID,
+                account_id().as_str(),
                 DEVICE_ID,
                 &device_key().public_key(),
                 TS_CREATED,
@@ -3049,7 +3164,7 @@ mod tests {
     fn signed_at(decided_at: i64, cert_expires_at: Option<i64>) -> Verdict {
         let cert = issue_device_cert(
             &root_key(),
-            ACCOUNT_ID,
+            account_id().as_str(),
             DEVICE_ID,
             &device_key().public_key(),
             TS_CREATED,
@@ -3186,7 +3301,7 @@ mod tests {
     #[test]
     fn provenance_rejects_an_invalid_account_state() {
         let forged = sign_account_state(
-            &account_state_claims(1, ACCOUNT_ID, 3, &root_key(), &[]),
+            &account_state_claims(1, account_id().as_str(), 3, &root_key(), &[]),
             &device_key(),
         );
         assert_eq!(
@@ -3205,8 +3320,12 @@ mod tests {
     fn revoked_device_ids_includes_highest_sequence_revocation() {
         let revoked = signed_account_state(2, &[DEVICE_ID]);
 
-        let ids = revoked_device_ids(&[revoked.as_str()], ACCOUNT_ID, &root_key().public_key())
-            .expect("a valid account state must resolve");
+        let ids = revoked_device_ids(
+            &[revoked.as_str()],
+            account_id().as_str(),
+            &root_key().public_key(),
+        )
+        .expect("a valid account state must resolve");
         assert!(ids.contains(DEVICE_ID));
     }
 
@@ -3220,7 +3339,7 @@ mod tests {
 
         let ids = revoked_device_ids(
             &[newer_revocation.as_str(), stale_without_revocation.as_str()],
-            ACCOUNT_ID,
+            account_id().as_str(),
             &root_key().public_key(),
         )
         .expect("valid account states must resolve");
@@ -3239,7 +3358,7 @@ mod tests {
 
         let ids = revoked_device_ids(
             &[older_revocation.as_str(), newer_without_revocation.as_str()],
-            ACCOUNT_ID,
+            account_id().as_str(),
             &root_key().public_key(),
         )
         .expect("valid account states must resolve");
@@ -3253,7 +3372,7 @@ mod tests {
     /// SDK's filter is a no-op when the caller has no account-state material yet.
     #[test]
     fn revoked_device_ids_empty_when_no_account_states_supplied() {
-        let ids = revoked_device_ids(&[], ACCOUNT_ID, &root_key().public_key())
+        let ids = revoked_device_ids(&[], account_id().as_str(), &root_key().public_key())
             .expect("no account states is not itself an error");
         assert!(ids.is_empty());
     }
@@ -3270,7 +3389,7 @@ mod tests {
 
         let err = revoked_device_ids(
             &[wrong_account.as_str()],
-            ACCOUNT_ID,
+            account_id().as_str(),
             &root_key().public_key(),
         )
         .expect_err("an account state for the wrong account must fail closed");
