@@ -49,6 +49,9 @@ const DEVICE_AUTH_TOKEN = "device-token-from-relay";
 /** The fixed clock both `runPair` (`now`) and the fake relay's verifier use. */
 const FIXED_NOW = 1700000000000;
 /** What the fake relay serves for an account nothing was published to (opaque to the client). */
+/** What the real relay serves for an account that has never published account state. */
+const NO_ACCOUNT_STATES = { account_states: [], max_sequence: 0 };
+
 const DEFAULT_ACCOUNT_STATES = {
   account_states: ["account-state-jws-1", "account-state-jws-2"],
   max_sequence: 7,
@@ -61,10 +64,19 @@ const DEFAULT_ACCOUNT_STATES = {
  * must accept it at `now` with an unused `jti` (403); the first success binds the root.
  * `account-states` mirrors the relay too: `POST` needs a bound root (409), every document must pass
  * the core's `verify_account_state` (403), and the highest sequence must rise (409); `GET` needs no
- * token. Unpublished accounts serve `DEFAULT_ACCOUNT_STATES`.
- * Returns { url, requests, boundRoots, close }.
+ * token. Unpublished accounts serve `unpublished` (default `DEFAULT_ACCOUNT_STATES`; pairing tests
+ * use the real relay's empty set). `/pairing/complete` assigns `deviceIds` in order (the last one
+ * repeats). `accountStatesGetStatus` makes `GET account-states` answer that status instead, as a relay
+ * deployed before the endpoint was unauthenticated does (401). Returns { url, requests, boundRoots,
+ * publishedStates, close }.
  */
-async function startFakeRelay({ now = FIXED_NOW } = {}) {
+async function startFakeRelay({
+  now = FIXED_NOW,
+  unpublished = DEFAULT_ACCOUNT_STATES,
+  deviceIds = [ASSIGNED_DEVICE_ID],
+  accountStatesGetStatus,
+} = {}) {
+  let completes = 0;
   const wasm = await loadWasm();
   const requests = [];
   /** account id → bound root pubkey. */
@@ -133,10 +145,12 @@ async function startFakeRelay({ now = FIXED_NOW } = {}) {
           res.end(JSON.stringify({ error: "authorization denied" }));
           return;
         }
+        const deviceId = deviceIds[Math.min(completes, deviceIds.length - 1)];
+        completes += 1;
         res.writeHead(201, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
-            device_id: ASSIGNED_DEVICE_ID,
+            device_id: deviceId,
             device_auth_token: DEVICE_AUTH_TOKEN,
           }),
         );
@@ -178,9 +192,14 @@ async function startFakeRelay({ now = FIXED_NOW } = {}) {
       }
       // GET /:acct/account-states → { account_states, max_sequence } (unauthenticated)
       if (req.method === "GET" && req.url.endsWith("/account-states")) {
+        if (accountStatesGetStatus !== undefined) {
+          res.writeHead(accountStatesGetStatus, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "authorization required" }));
+          return;
+        }
         const accountId = decodeURIComponent(req.url.split("/")[1] ?? "");
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(publishedStates.get(accountId) ?? DEFAULT_ACCOUNT_STATES));
+        res.end(JSON.stringify(publishedStates.get(accountId) ?? unpublished));
         return;
       }
       res.writeHead(404, { "Content-Type": "application/json" });
@@ -194,6 +213,7 @@ async function startFakeRelay({ now = FIXED_NOW } = {}) {
         url: `http://127.0.0.1:${port}`,
         requests,
         boundRoots,
+        publishedStates,
         close: () => new Promise((r) => server.close(r)),
       });
     });
@@ -230,10 +250,11 @@ function startHungRelay() {
   });
 }
 
-function withTempKeyfile(fn) {
+async function withTempKeyfile(fn) {
   const dir = mkdtempSync(join(tmpdir(), "allw-approver-pair-"));
   try {
-    return fn(join(dir, "keyfile.json"));
+    // Awaited, so the directory outlives an async `fn`.
+    return await fn(join(dir, "keyfile.json"));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -453,7 +474,7 @@ test("publishAccountStates fails closed on a relay rejection", async () => {
 
 test("runPair self-drives start+complete, mints a device_cert, and persists pairing state", async () => {
   const wasm = await loadWasm();
-  const relay = await startFakeRelay();
+  const relay = await startFakeRelay({ unpublished: NO_ACCOUNT_STATES });
   const logLines = [];
   try {
     await withTempKeyfile(async (keyfilePath) => {
@@ -670,7 +691,7 @@ test("runPair rejects an explicit --account that does not match the derived id, 
 
 test("runPair accepts an explicit --account equal to the derived id", async () => {
   const wasm = await loadWasm();
-  const relay = await startFakeRelay();
+  const relay = await startFakeRelay({ unpublished: NO_ACCOUNT_STATES });
   try {
     await withTempKeyfile(async (keyfilePath) => {
       // Generate the identity first so the test knows the derived id up front.
@@ -708,5 +729,318 @@ test("runPair fails closed when the relay rejects the authorization (e.g. stale 
     });
   } finally {
     await relay.close();
+  }
+});
+
+// ── pair publishes the account state that vouches for the device (#243) ─────────────────────────
+
+/** Verify the relay's published documents for `keyfile`'s account; returns the AccountState JSONs. */
+function publishedStatesFor(wasm, relay, keyfile) {
+  const published = relay.publishedStates.get(keyfile.account_id);
+  assert.ok(published, "pair published account state");
+  return published.account_states.map((jws) =>
+    JSON.parse(wasm.verify_account_state(jws, keyfile.account_id, keyfile.account_root_pubkey)),
+  );
+}
+
+test("runPair publishes a root-signed account state vouching for exactly this device (#243)", async () => {
+  const wasm = await loadWasm();
+  const relay = await startFakeRelay({ unpublished: NO_ACCOUNT_STATES });
+  try {
+    await withTempKeyfile(async (keyfilePath) => {
+      const updated = await runPair(
+        wasm,
+        { relayUrl: relay.url, keyfilePath, now: FIXED_NOW },
+        () => {},
+      );
+      const [state] = publishedStatesFor(wasm, relay, updated);
+      assert.equal(state.sequence, 1, "the first state of a fresh account");
+      assert.equal(state.current_root, updated.account_root_pubkey);
+      assert.deepEqual(state.devices, [
+        {
+          device_id: ASSIGNED_DEVICE_ID,
+          encryption_pubkey: updated.device_encryption_pubkey,
+          signing_pubkey: updated.device_signing_pubkey,
+          status: "active",
+        },
+      ]);
+      assert.equal(updated.account_state_highest_sequence, 1, "the device's own floor follows");
+      // The publish came after pairing/complete and carried no device token.
+      const urls = relay.requests.map((r) => `${r.method} ${r.url.split("/").slice(2).join("/")}`);
+      assert.deepEqual(urls.slice(-2), ["GET account-states", "POST account-states"]);
+      assert.equal(relay.requests.at(-1).authorization, undefined);
+    });
+  } finally {
+    await relay.close();
+  }
+});
+
+test("runPair for a second device carries the first device forward at the next sequence (#243)", async () => {
+  const wasm = await loadWasm();
+  const relay = await startFakeRelay({
+    unpublished: NO_ACCOUNT_STATES,
+    deviceIds: ["dev-first", "dev-second"],
+  });
+  try {
+    await withTempKeyfile(async (firstPath) => {
+      const first = await runPair(
+        wasm,
+        { relayUrl: relay.url, keyfilePath: firstPath, now: FIXED_NOW },
+        () => {},
+      );
+      await withTempKeyfile(async (secondPath) => {
+        // A second device under the same account root: same root seed, its own device keys.
+        const { generateKeyfile, writeKeyfile } = await import("../dist/lib/keyfile.js");
+        const fresh = generateKeyfile(wasm);
+        writeKeyfile(secondPath, {
+          ...fresh,
+          account_root_seed: first.account_root_seed,
+          account_root_pubkey: first.account_root_pubkey,
+        });
+        const second = await runPair(
+          wasm,
+          { relayUrl: relay.url, keyfilePath: secondPath, now: FIXED_NOW },
+          () => {},
+        );
+        const [state] = publishedStatesFor(wasm, relay, second);
+        assert.equal(state.sequence, 2);
+        assert.deepEqual(
+          state.devices.map((d) => [d.device_id, d.encryption_pubkey]),
+          [
+            ["dev-first", first.device_encryption_pubkey],
+            ["dev-second", second.device_encryption_pubkey],
+          ],
+        );
+      });
+    });
+  } finally {
+    await relay.close();
+  }
+});
+
+// The documented upgrade (docs/quickstart.md §Upgrading an existing pairing): an account paired before
+// pair published account state has none on the relay. Re-running pair with the same keyfile keeps the
+// seeds and account, gets a new device id, and publishes a state naming only that new id.
+test("re-running runPair on an already-paired keyfile with no published state publishes one for the new device id (#243 upgrade)", async () => {
+  const wasm = await loadWasm();
+  const relay = await startFakeRelay({
+    unpublished: NO_ACCOUNT_STATES,
+    deviceIds: ["dev-old", "dev-new"],
+  });
+  try {
+    await withTempKeyfile(async (keyfilePath) => {
+      const before = await runPair(
+        wasm,
+        { relayUrl: relay.url, keyfilePath, now: FIXED_NOW },
+        () => {},
+      );
+      // Simulate the pre-#243 world: the old pairing left nothing published on the relay, and the
+      // keyfile has no recorded account-state floor.
+      relay.publishedStates.delete(before.account_id);
+      const { account_state_highest_sequence: _floor, ...legacy } = readKeyfile(keyfilePath);
+      const { writeKeyfile } = await import("../dist/lib/keyfile.js");
+      writeKeyfile(keyfilePath, legacy);
+
+      const after = await runPair(
+        wasm,
+        { relayUrl: relay.url, keyfilePath, now: FIXED_NOW },
+        () => {},
+      );
+      assert.equal(after.account_id, before.account_id, "same account");
+      assert.equal(after.account_root_pubkey, before.account_root_pubkey);
+      assert.equal(after.device_encryption_seed, before.device_encryption_seed, "seeds kept");
+      assert.equal(after.device_signing_seed, before.device_signing_seed);
+      assert.equal(after.device_id, "dev-new", "a new device id");
+      assert.notEqual(after.device_cert, before.device_cert, "a new cert for the new id");
+      const [state] = publishedStatesFor(wasm, relay, after);
+      assert.equal(state.sequence, 1);
+      assert.deepEqual(
+        state.devices.map((d) => [d.device_id, d.encryption_pubkey]),
+        [["dev-new", before.device_encryption_pubkey]],
+        "the state names only the new device id, so a client on the old id must re-paste",
+      );
+    });
+  } finally {
+    await relay.close();
+  }
+});
+
+// #378: re-running pair registers a new relay id for the same keyfile keys. The core composition
+// replaces the entry for those keys, so ids never pile up; another device's entry is untouched.
+test("two consecutive re-pairs leave exactly one entry for the keyfile's keys, under the newest id (#378)", async () => {
+  const wasm = await loadWasm();
+  const relay = await startFakeRelay({
+    unpublished: NO_ACCOUNT_STATES,
+    deviceIds: ["dev-cli-1", "dev-other", "dev-cli-2", "dev-cli-3"],
+  });
+  try {
+    await withTempKeyfile(async (cliPath) => {
+      const first = await runPair(
+        wasm,
+        { relayUrl: relay.url, keyfilePath: cliPath, now: FIXED_NOW },
+        () => {},
+      );
+      let other;
+      await withTempKeyfile(async (otherPath) => {
+        // Another device under the same root, with its own keys.
+        const { generateKeyfile, writeKeyfile } = await import("../dist/lib/keyfile.js");
+        writeKeyfile(otherPath, {
+          ...generateKeyfile(wasm),
+          account_root_seed: first.account_root_seed,
+          account_root_pubkey: first.account_root_pubkey,
+        });
+        other = await runPair(
+          wasm,
+          { relayUrl: relay.url, keyfilePath: otherPath, now: FIXED_NOW },
+          () => {},
+        );
+      });
+      // The other device's pair advanced the published state to 2; the CLI keyfile's floor is 1.
+      for (const [expectedId, expectedSequence] of [
+        ["dev-cli-2", 3],
+        ["dev-cli-3", 4],
+      ]) {
+        const repaired = await runPair(
+          wasm,
+          { relayUrl: relay.url, keyfilePath: cliPath, now: FIXED_NOW },
+          () => {},
+        );
+        assert.equal(repaired.device_id, expectedId);
+        const [state] = publishedStatesFor(wasm, relay, repaired);
+        assert.equal(state.sequence, expectedSequence);
+        assert.deepEqual(
+          state.devices.map((d) => [d.device_id, d.encryption_pubkey]),
+          [
+            ["dev-other", other.device_encryption_pubkey],
+            [expectedId, first.device_encryption_pubkey],
+          ],
+          "the previous id for these keys is gone; the other device stays",
+        );
+        assert.equal(repaired.account_state_highest_sequence, expectedSequence);
+      }
+    });
+  } finally {
+    await relay.close();
+  }
+});
+
+// #378: pair names every id its published state retires, so the human knows which web approver
+// must re-paste the keyfile values. The core validates only the id being added, so an id already in
+// a root-signed state (one written before that check, from a relay-issued id) is untrusted text:
+// the line is escaped.
+test("a re-pair prints an escaped 'retired' line for the id it replaces, and a first pair prints none (#378)", async () => {
+  const wasm = await loadWasm();
+  const hostileId = "dev-cli-0\u001b[2J\u0007";
+  const relay = await startFakeRelay({
+    unpublished: NO_ACCOUNT_STATES,
+    deviceIds: ["dev-cli-1", "dev-cli-2"],
+  });
+  try {
+    await withTempKeyfile(async (cliPath) => {
+      const firstLines = [];
+      const first = await runPair(
+        wasm,
+        { relayUrl: relay.url, keyfilePath: cliPath, now: FIXED_NOW },
+        (line) => firstLines.push(line),
+      );
+      assert.ok(!firstLines.some((l) => l.includes("retired:")), "a first pair retires nothing");
+
+      // A later root-signed state lists this keyfile's keys under the hostile id.
+      const jws = wasm.sign_account_state(
+        JSON.stringify({
+          v: 1,
+          account_id: first.account_id,
+          sequence: 2,
+          current_root: first.account_root_pubkey,
+          previous_roots: [],
+          devices: [
+            {
+              device_id: hostileId,
+              encryption_pubkey: first.device_encryption_pubkey,
+              signing_pubkey: first.device_signing_pubkey,
+              status: "active",
+            },
+          ],
+          actors: [],
+          revocations: [],
+        }),
+        first.account_root_seed,
+      );
+      relay.publishedStates.set(first.account_id, { account_states: [jws], max_sequence: 2 });
+
+      const lines = [];
+      const repaired = await runPair(
+        wasm,
+        { relayUrl: relay.url, keyfilePath: cliPath, now: FIXED_NOW },
+        (line) => lines.push(line),
+      );
+      assert.equal(repaired.device_id, "dev-cli-2");
+      const retired = lines.filter((l) => l.includes("retired:"));
+      assert.deepEqual(retired, [
+        `  retired: ${wasm.escape_for_display(hostileId)} (same keys; a web approver still using it must re-paste the keyfile values)`,
+      ]);
+      assert.notEqual(wasm.escape_for_display(hostileId), hostileId, "the id needed escaping");
+      assert.ok(
+        !/[\u0000-\u001f\u007f]/.test(retired[0]),
+        "no raw control character reaches the terminal",
+      );
+      const published = lines.findIndex((l) => l === "Published account state — sequence 3");
+      assert.equal(lines.indexOf(retired[0]), published + 1, "listed under the published state");
+    });
+  } finally {
+    await relay.close();
+  }
+});
+
+// Regression: a relay deployed before account-state GET became unauthenticated answers it with 401.
+// pair must still fail closed (nothing published, keyfile unpaired) and say to redeploy the relay.
+test("runPair against a relay too old for account-state GET (401) fails closed and says redeploy the relay", async () => {
+  const wasm = await loadWasm();
+  const relay = await startFakeRelay({
+    unpublished: NO_ACCOUNT_STATES,
+    accountStatesGetStatus: 401,
+  });
+  try {
+    await withTempKeyfile(async (keyfilePath) => {
+      await assert.rejects(
+        () => runPair(wasm, { relayUrl: relay.url, keyfilePath, now: FIXED_NOW }, () => {}),
+        /HTTP 401.*relay is too old to publish account state; redeploy it from current allw main/,
+      );
+      assert.equal(readKeyfile(keyfilePath).device_id, undefined, "not paired on disk");
+      assert.equal(
+        relay.requests.some((r) => r.method === "POST" && r.url.endsWith("/account-states")),
+        false,
+        "nothing published",
+      );
+    });
+  } finally {
+    await relay.close();
+  }
+});
+
+test("runPair fails closed, leaving the keyfile unpaired, when the relay's account state cannot be trusted (#243)", async () => {
+  const wasm = await loadWasm();
+  for (const [name, unpublished] of [
+    ["a document that does not verify", DEFAULT_ACCOUNT_STATES],
+    ["a max_sequence no document backs", { account_states: [], max_sequence: 4 }],
+  ]) {
+    const relay = await startFakeRelay({ unpublished });
+    try {
+      await withTempKeyfile(async (keyfilePath) => {
+        await assert.rejects(
+          () => runPair(wasm, { relayUrl: relay.url, keyfilePath, now: FIXED_NOW }, () => {}),
+          undefined,
+          name,
+        );
+        assert.equal(readKeyfile(keyfilePath).device_id, undefined, `${name}: not paired on disk`);
+        assert.equal(
+          relay.requests.some((r) => r.method === "POST" && r.url.endsWith("/account-states")),
+          false,
+          `${name}: nothing published`,
+        );
+      });
+    } finally {
+      await relay.close();
+    }
   }
 });

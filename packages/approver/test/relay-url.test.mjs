@@ -255,13 +255,26 @@ describe("pair --relay (#267)", () => {
 describe("pair persists the canonical relay URL (#267)", () => {
   test("a padded, upper-case, default-port, trailing-slash --relay is stored and used canonically", async () => {
     const keyfilePath = join(dir, "keyfile.json");
-    // A relay that completes pairing: start returns a code, complete returns the device ids.
-    globalThis.fetch = (input) => {
+    // A relay that completes pairing: start returns a code, complete returns the device ids, and
+    // account-states holds nothing until pair publishes the state naming the device (#243).
+    globalThis.fetch = (input, init = {}) => {
       const url = String(input);
       fetchCalls.push(url);
-      const body = url.endsWith("/pairing/start")
-        ? { code: "123456", expires_at: 1_900_000_000_000, pairing_auth_token: "pairing-token" }
-        : { device_id: "dev-canonical-267", device_auth_token: "device-token" };
+      let body;
+      if (url.endsWith("/pairing/start")) {
+        body = {
+          code: "123456",
+          expires_at: 1_900_000_000_000,
+          pairing_auth_token: "pairing-token",
+        };
+      } else if (url.endsWith("/account-states")) {
+        body =
+          (init.method ?? "GET") === "POST"
+            ? { account_states: JSON.parse(String(init.body)).account_states, max_sequence: 1 }
+            : { account_states: [], max_sequence: 0 };
+      } else {
+        body = { device_id: "dev-canonical-267", device_auth_token: "device-token" };
+      }
       return Promise.resolve(new Response(JSON.stringify(body), { status: 200 }));
     };
     const paired = await runPair(
@@ -274,7 +287,10 @@ describe("pair persists the canonical relay URL (#267)", () => {
     const canonical = "https://relay.example.com/base";
     assert.equal(paired.relay_url, canonical);
     assert.equal(readKeyfile(keyfilePath).relay_url, canonical, "the persisted relay_url");
-    assert.equal(fetchCalls.length, 2);
+    // pairing/start, pairing/complete, then the account-state fetch and publish (#243): every one
+    // is built from the canonical URL.
+    assert.equal(fetchCalls.length, 4);
+    assert.equal(fetchCalls.filter((url) => url.endsWith("/account-states")).length, 2);
     for (const url of fetchCalls) assertBuiltFromCanonical(url, canonical);
   });
 });

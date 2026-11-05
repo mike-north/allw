@@ -21,6 +21,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { createClient } from "../../dist/index.js";
+import { oneDeviceAccountStates } from "./account-state.mjs";
 
 const vendorDir = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "vendor", "allw-wasm");
 const glue = await import(pathToFileURL(join(vendorDir, "allw_wasm.js")).href);
@@ -31,12 +32,14 @@ glue.initSync({
 const json = (body, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
-const device = {
-  device_id: "dev_poll_keepalive",
-  pubkey: glue.x25519_public_key(Buffer.alloc(32, 11).toString("base64url")),
-  label: null,
-  created_at: 0,
-};
+const ACCOUNT_ID = "acct_poll_keepalive";
+const ACCOUNT_SEED = Buffer.alloc(32, 7).toString("base64url");
+const accountStates = oneDeviceAccountStates(glue, {
+  accountId: ACCOUNT_ID,
+  accountSeed: ACCOUNT_SEED,
+  deviceId: "dev_poll_keepalive",
+  encryptionPub: glue.x25519_public_key(Buffer.alloc(32, 11).toString("base64url")),
+});
 
 const mode = process.argv[2] ?? "never";
 
@@ -44,7 +47,6 @@ const mode = process.argv[2] ?? "never";
 const fetchImpl = async (url, init = {}) => {
   const path = new URL(url).pathname;
   const method = (init.method ?? "GET").toUpperCase();
-  if (method === "GET" && path.endsWith("/devices")) return json({ devices: [device] });
   if (method === "POST" && path.endsWith("/requests")) {
     const { id } = JSON.parse(init.body);
     return json(
@@ -57,8 +59,9 @@ const fetchImpl = async (url, init = {}) => {
 
 const client = createClient({
   relayUrl: "https://relay.allw.test",
-  accountId: "acct_poll_keepalive",
-  approverRootKey: glue.ed25519_public_key(Buffer.alloc(32, 7).toString("base64url")),
+  accountId: ACCOUNT_ID,
+  approverRootKey: glue.ed25519_public_key(ACCOUNT_SEED),
+  accountStates,
   fetchImpl,
   webSocketFactory: undefined,
   pollIntervalMs: mode === "long-interval" ? 5_000 : 100,

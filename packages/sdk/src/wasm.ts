@@ -47,6 +47,20 @@ export interface AllwWasm {
    */
   encrypt_context(contextJson: string, recipientsJson: string): string;
   /**
+   * Encrypts an `ApprovalContext` JSON to exactly the devices root-signed account state selects
+   * (core `seal_context_for_account_state`), returning `{ ciphertext, sequence }` JSON. Recipient
+   * keys never cross into JavaScript. `minSequence` is the caller's persisted floor, or
+   * `undefined`. **Throws** (nothing encrypted) on any selection failure.
+   */
+  seal_context_for_account_state(
+    contextJson: string,
+    accountStatesJson: string,
+    expectedAccountId: string,
+    accountRootPubkeyB64: string,
+    nowMs: number,
+    minSequence?: number,
+  ): string;
+  /**
    * Verifies a `Verdict` JSON against the request, the human-shown context, and the approver's
    * account-root Ed25519 public key (base64url). Returns
    * `{ approved: true, device_id, decided_at, nonce_b64, note? }` JSON on success; **throws** on any

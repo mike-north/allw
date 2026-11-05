@@ -7,6 +7,20 @@
 /** Pairing HTTP requests are short; bound them so a hung relay can't stall the CLI indefinitely. */
 export const PAIRING_TIMEOUT_MS = 15_000;
 
+/**
+ * A non-2xx relay response. The message is the human-facing error; `status` lets a caller name a
+ * specific fix for a specific status without parsing the message.
+ */
+export class RelayHttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = "RelayHttpError";
+  }
+}
+
 /** Trim a trailing slash so `${base}/path` never doubles up. */
 function normalizeBase(url: string): string {
   return url.replace(/\/+$/, "");
@@ -42,7 +56,7 @@ async function postJson(
   if (!resp.ok) {
     const detail =
       parsed && typeof parsed === "object" && "error" in parsed ? String(parsed.error) : text;
-    throw new Error(`relay ${url} → HTTP ${String(resp.status)}: ${detail}`);
+    throw new RelayHttpError(`relay ${url} → HTTP ${String(resp.status)}: ${detail}`, resp.status);
   }
   return parsed;
 }
@@ -71,7 +85,7 @@ async function getJson(
   if (!resp.ok) {
     const detail =
       parsed && typeof parsed === "object" && "error" in parsed ? String(parsed.error) : text;
-    throw new Error(`relay ${url} → HTTP ${String(resp.status)}: ${detail}`);
+    throw new RelayHttpError(`relay ${url} → HTTP ${String(resp.status)}: ${detail}`, resp.status);
   }
   return parsed;
 }
@@ -220,7 +234,22 @@ export async function fetchAccountStatesWithMetadata(
   accountId: string,
   timeoutMs: number = PAIRING_TIMEOUT_MS,
 ): Promise<AccountStateFetchResult> {
-  return parseAccountStateSet(await getJson(accountStatesUrl(relayUrl, accountId), timeoutMs));
+  let body: unknown;
+  try {
+    body = await getJson(accountStatesUrl(relayUrl, accountId), timeoutMs);
+  } catch (err) {
+    // The endpoint is unauthenticated on current relays, so a 401 means the relay predates it.
+    if (err instanceof RelayHttpError && err.status === 401) {
+      throw new RelayHttpError(
+        `${err.message} — this relay requires authorization for GET /account-states, which ` +
+          `current relays serve without it, so the relay is too old to publish account state; ` +
+          `redeploy it from current allw main (docs/relay-deploy.md)`,
+        err.status,
+      );
+    }
+    throw err;
+  }
+  return parseAccountStateSet(body);
 }
 
 /** {@link fetchAccountStatesWithMetadata} without the relay's sequence bookkeeping. */
@@ -256,6 +285,54 @@ export async function publishAccountStates(
     timeoutMs,
   );
   return parseAccountStateSet(result);
+}
+
+/** One entry of the relay's device registry (`GET /:acct/devices`). */
+export interface RegisteredDevice {
+  readonly device_id: string;
+  /** The X25519 encryption key the device registered at `/pairing/complete` (base64url). */
+  readonly pubkey: string;
+  /** The device's label as the relay holds it: untrusted text, shown only escaped. */
+  readonly label: string | null;
+}
+
+/**
+ * Fetch the account's relay device registry (`GET /:acct/devices`, unauthenticated).
+ *
+ * The registry is routing data the relay controls: it never decides who reads a request. `vouch`
+ * reads it only to **refuse**: a pasted device id the relay never registered, or registered with a
+ * different encryption key, is not vouched for. Fails closed on any shape drift.
+ */
+export async function fetchDeviceRegistry(
+  relayUrl: string,
+  accountId: string,
+  timeoutMs: number = PAIRING_TIMEOUT_MS,
+): Promise<readonly RegisteredDevice[]> {
+  const body = await getJson(
+    `${normalizeBase(relayUrl)}/${encodeURIComponent(accountId)}/devices`,
+    timeoutMs,
+  );
+  const devices = (body as { devices?: unknown } | null)?.devices;
+  if (
+    !Array.isArray(devices) ||
+    !devices.every(
+      (d: unknown) =>
+        typeof d === "object" &&
+        d !== null &&
+        typeof (d as { device_id?: unknown }).device_id === "string" &&
+        typeof (d as { pubkey?: unknown }).pubkey === "string" &&
+        ((d as { label?: unknown }).label === null ||
+          (d as { label?: unknown }).label === undefined ||
+          typeof (d as { label?: unknown }).label === "string"),
+    )
+  ) {
+    throw new Error("relay device registry returned an unexpected shape");
+  }
+  return (devices as { device_id: string; pubkey: string; label?: string | null }[]).map((d) => ({
+    device_id: d.device_id,
+    pubkey: d.pubkey,
+    label: d.label ?? null,
+  }));
 }
 
 /**

@@ -28,7 +28,8 @@
   "dependencies": {
     "@allw/approver": "workspace:*",
     "@allw/hook": "workspace:*",
-    "@allw/sdk": "workspace:*"
+    "@allw/sdk": "workspace:*",
+    "@allw/web-approver": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^22.0.0"

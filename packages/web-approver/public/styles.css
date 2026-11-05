@@ -924,3 +924,79 @@ input {
     width: 100%;
   }
 }
+
+/* "This device" panel (#381). Lives in #device, below the inbox; collapsed by default. Neutral
+   surface like the notification controls. Keys and fingerprints are monospace and wrap anywhere,
+   so a 43-character key never forces horizontal scroll at phone width. */
+.device-details {
+  margin: var(--step-3) auto;
+  max-width: 640px;
+  border-radius: var(--r-sm);
+  padding: 10px 14px;
+  color: var(--ink-2);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.device-details-summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.device-details-text,
+.device-details-warning,
+.device-details-problem {
+  margin: 8px 0;
+}
+
+.device-details-warning {
+  font-weight: 600;
+}
+
+.device-details-problem {
+  color: var(--risk-med-fg);
+}
+
+.device-details-list {
+  margin: 8px 0;
+}
+
+.device-details-label {
+  margin-top: 8px;
+  font-weight: 700;
+}
+
+.device-details-value {
+  margin: 2px 0 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+.device-details-code {
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+.device-details-command {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.device-details-copy {
+  min-height: 32px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 0 10px;
+  font-size: 13px;
+  color: var(--ink-2);
+  background: var(--surface);
+  cursor: pointer;
+  align-self: flex-start;
+}

@@ -279,7 +279,7 @@ export async function decide(
   try {
     verdict = await deps.requestApproval(req);
   } catch (err) {
-    // Any thrown error (network, no enrolled devices, relay rejection) ⇒ deny. We never allow on a
+    // Any thrown error (network, no usable account state, relay rejection) ⇒ deny. We never allow on a
     // failure to obtain a verified verdict. The error text may carry relay-supplied text, so it is
     // escaped and capped before the agent reads it.
     return denyOutput(

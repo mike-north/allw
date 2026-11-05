@@ -6,6 +6,7 @@
  *   pair    Pair this approver with an account on the relay (mints a device cert).
  *   watch   Open the device presence socket and approve/deny incoming requests (alias: serve).
  *   keygen  Generate a fresh local keyfile without pairing.
+ *   vouch   Interim (#199): vouch for a separately keyed device after comparing its fingerprints.
  *
  * All cryptography is delegated to the WASM core (`docs/architecture.md` — WASM-local hard
  * constraint). ⚠ v0 stand-in: device keys are software-held (see README / issue #23).
@@ -15,9 +16,11 @@ import { parseArgs } from "node:util";
 
 import { runKeygen } from "./commands/keygen.js";
 import { runPair } from "./commands/pair.js";
+import { runVouch } from "./commands/vouch.js";
 import { createReadlinePrompter, runWatch, type WebSocketLike } from "./commands/watch.js";
 import { printSameMachineDemoWarning } from "./lib/demo-warning.js";
 import { defaultKeyfilePath } from "./lib/paths.js";
+import { createTerminalConfirmer } from "./lib/terminal-confirmer.js";
 import { loadWasm } from "./lib/wasm.js";
 import { getVersion } from "./version.js";
 
@@ -33,6 +36,10 @@ COMMANDS:
   watch     Open the device presence WebSocket and approve/deny requests as they arrive.
             Alias: serve.
   keygen    Generate a fresh local keyfile (three software-held seeds) without pairing.
+  vouch     Interim, until the enrollment ceremony (#199): as the account-root holder, vouch for
+            a device that has its own keys (an iPhone approver, or a separately keyed web
+            approver), so requests are encrypted to it. Shows the device's key fingerprints and
+            asks you to confirm they match what the device shows. Needs an interactive terminal.
   help      Show this help.
 
 COMMON OPTIONS:
@@ -59,6 +66,12 @@ watch OPTIONS:
 keygen OPTIONS:
   --force            Overwrite an existing keyfile (orphans the current device's seeds).
 
+vouch OPTIONS:
+  --device-id=<id>             The device's id, as the device shows it (required).
+  --encryption-pubkey=<b64url> The device's encryption public key, as the device shows it (required).
+  --signing-pubkey=<b64url>    The device's signing public key, as the device shows it (required).
+  --relay <url>                Override the paired relay URL (same rule as pair --relay).
+
 ⚠ v0 stand-in: device keys are held in software in the keyfile. Production custody is hardware-
   backed (Secure Enclave / StrongBox) — see issue #23. The wire protocol is unchanged either way.
 
@@ -83,7 +96,13 @@ function requireOption(value: string | undefined, flag: string): string {
 }
 
 /** Commands that create or use the keyfile's account-root and signing seeds (`serve` = `watch`). */
-const DEMO_WARNING_COMMANDS: ReadonlySet<string> = new Set(["pair", "watch", "serve", "keygen"]);
+const DEMO_WARNING_COMMANDS: ReadonlySet<string> = new Set([
+  "pair",
+  "watch",
+  "serve",
+  "keygen",
+  "vouch",
+]);
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
@@ -117,6 +136,9 @@ async function main(): Promise<void> {
       label: { type: "string" },
       code: { type: "string" },
       "pairing-token": { type: "string" },
+      "device-id": { type: "string" },
+      "encryption-pubkey": { type: "string" },
+      "signing-pubkey": { type: "string" },
       force: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
       version: { type: "boolean", short: "v", default: false },
@@ -150,6 +172,29 @@ async function main(): Promise<void> {
           ? { pairingAuthToken: values["pairing-token"] }
           : {}),
       });
+      return;
+    }
+    case "vouch": {
+      const confirmer = createTerminalConfirmer({
+        input: process.stdin,
+        output: process.stdout,
+        interactive: process.stdin.isTTY && process.stdout.isTTY,
+      });
+      try {
+        await runVouch(
+          wasm,
+          {
+            keyfilePath,
+            deviceId: requireOption(values["device-id"], "--device-id"),
+            encryptionPubkey: requireOption(values["encryption-pubkey"], "--encryption-pubkey"),
+            signingPubkey: requireOption(values["signing-pubkey"], "--signing-pubkey"),
+            ...(values.relay !== undefined ? { relayUrl: values.relay } : {}),
+          },
+          confirmer,
+        );
+      } finally {
+        confirmer.close();
+      }
       return;
     }
     case "watch":

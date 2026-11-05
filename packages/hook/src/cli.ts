@@ -33,16 +33,11 @@ import { realpathSync } from "node:fs";
 import { hostname as osHostname } from "node:os";
 import { pathToFileURL } from "node:url";
 
-import {
-  MAX_ESCAPED_DIAGNOSTIC_CHARS,
-  commandRequest,
-  createClient,
-  escapeToPrintableAscii,
-  type ClientConfig,
-} from "@allw/sdk";
+import { MAX_ESCAPED_DIAGNOSTIC_CHARS, commandRequest, escapeToPrintableAscii } from "@allw/sdk";
 
+import { createHookClient, type HookClientOverrides } from "./lib/client.js";
 import { readConfig } from "./lib/config.js";
-import { decide, type RequestApprovalFn } from "./lib/decide.js";
+import { agentSafeErrorText, decide, type RequestApprovalFn } from "./lib/decide.js";
 import { isGatedTool } from "./lib/gating.js";
 import { installDecisionBackstop } from "./lib/decision-output.js";
 import {
@@ -63,17 +58,7 @@ import { getVersion } from "./version.js";
  * Every field is optional (`Partial`): `runHook`'s `overrides = {}` default must type-check, and
  * each seam is independently injectable, so a test can override just the ones it needs.
  */
-export type RunHookOverrides = Partial<
-  Pick<
-    ClientConfig,
-    | "fetchImpl"
-    | "nowImpl"
-    | "webSocketFactory"
-    | "pollIntervalMs"
-    | "fetchTimeoutMs"
-    | "scheduleImpl"
-  >
->;
+export type RunHookOverrides = HookClientOverrides;
 
 /** Read all of stdin to a string (the hook input is a single JSON object). */
 async function readStdin(): Promise<string> {
@@ -128,13 +113,15 @@ export async function runHook(
   // for a verified verdict, and `denied`/`expired` (never a bare allow) otherwise. The `overrides`
   // are the SDK's own transport seams — production passes none, so the global fetch/WebSocket/clock
   // are used; tests inject a relay double to exercise the full crypto round-trip deterministically.
-  const client = createClient({
-    relayUrl: config.relayUrl,
-    accountId: config.accountId,
-    approverRootKey: config.approverRootKey,
-    ...(config.fetchTimeoutMs !== undefined ? { fetchTimeoutMs: config.fetchTimeoutMs } : {}),
-    ...overrides,
-  });
+  // Recipients come from root-signed account state, never the relay's device list (./lib/client.ts).
+  let client;
+  try {
+    client = createHookClient(config, overrides);
+  } catch (err) {
+    return denyOutput(
+      `allw: client setup failed (fail-closed deny): ${agentSafeErrorText(wasm, err)}`,
+    );
+  }
   const requestApproval: RequestApprovalFn = (req) =>
     // The SDK's ApprovalRequest is structurally what the hook builds; the SDK validates it.
     client.requestApproval(req as Parameters<typeof client.requestApproval>[0]);

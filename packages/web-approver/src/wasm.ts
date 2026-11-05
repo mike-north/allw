@@ -75,6 +75,14 @@ export interface AllwWasm {
   ): string;
   /** Derive the Ed25519 verifying (public) key for a 32-byte signing seed (base64url). */
   ed25519_public_key(seed_b64: string): string;
+  /** The core's 128-bit fingerprint of a device key: eight groups of four hex digits (#381). */
+  device_key_fingerprint(kind: "encryption" | "signing", key_b64: string): string;
+  /** Throw unless the device id and both public keys pass the core's enrollment checks (#381). */
+  check_device_enrollment(
+    device_id: string,
+    encryption_pubkey_b64: string,
+    signing_pubkey_b64: string,
+  ): void;
   /** Derive the X25519 public key for a 32-byte secret seed (base64url). */
   x25519_public_key(seed_b64: string): string;
 }

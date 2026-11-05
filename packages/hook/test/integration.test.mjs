@@ -5,7 +5,7 @@
  *
  * This exercises the full crypto round-trip end-to-end through the WASM core — there is NO verdict
  * stubbing. The relay double plays the approver's role with software-held keys (mirroring
- * `@allw/approver`): it serves the device list, captures the submitted ciphertext envelope,
+ * `@allw/approver`): it serves the root-signed account state that names the device, captures the submitted ciphertext envelope,
  * decrypts the human-shown context, recomputes the WYSIWYS `request_hash`, and signs a verdict the
  * SDK then verifies against the account-root key. The poll path is forced (no WebSocket) and the
  * clock is fixed, so the run is fully deterministic — no `Date.now()`, no real network.
@@ -19,14 +19,29 @@
  * @see https://code.claude.com/docs/en/hooks (the PreToolUse stdin/stdout contract)
  */
 
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { runHook } from "../dist/cli.js";
 import { loadWasm } from "../dist/lib/wasm.js";
+
+// The hook keeps a per-account sequence floor under ~/.allw/state: point HOME at a throwaway dir
+// for this whole file so a real ~/.allw is never read or written (tests that need their own HOME
+// override it again with `withConfigHome`).
+const originalHome = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+const integrationHome = mkdtempSync(join(tmpdir(), "allw-hook-integration-home-"));
+process.env.HOME = integrationHome;
+process.env.USERPROFILE = integrationHome;
+after(() => {
+  for (const [key, value] of Object.entries(originalHome)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  rmSync(integrationHome, { recursive: true, force: true });
+});
 
 // ── Fixed, deterministic timeline (no Date.now in fixtures) ─────────────────────────────────────
 const NOW_MS = 1_700_000_000_000;
@@ -40,7 +55,6 @@ const ACCOUNT_ID = await (async () => {
   );
 })();
 const DEVICE_ID = "dev-hook-integration";
-const DEVICE_LABEL = "test device";
 
 /** Build a paired software approver (account-root + device keys + device cert) via the WASM core. */
 async function pairedApprover(wasm) {
@@ -72,20 +86,47 @@ async function pairedApprover(wasm) {
   };
 }
 
+/** Root-sign an account state at `sequence` that vouches for the approver's one device. */
+function accountState(wasm, approver, sequence = 1) {
+  return wasm.sign_account_state(
+    JSON.stringify({
+      v: 1,
+      account_id: ACCOUNT_ID,
+      sequence,
+      current_root: approver.accountRootPub,
+      previous_roots: [],
+      devices: [
+        {
+          device_id: DEVICE_ID,
+          encryption_pubkey: approver.deviceEncryptionPub,
+          signing_pubkey: approver.deviceSigningPub,
+          status: "active",
+        },
+      ],
+      actors: [],
+      revocations: [],
+    }),
+    approver.accountSeed,
+  );
+}
+
 /** A 16-byte high-entropy nonce (fixed for determinism; entropy is irrelevant in a single-shot test). */
 function nonce() {
   return Buffer.alloc(16, 7).toString("base64url");
 }
 
 /**
- * Build a `fetchImpl` relay double. It serves `GET /:acct/devices`, accepts `POST /:acct/requests`
+ * Build a `fetchImpl` relay double. It serves `GET /:acct/account-states` (by default one
+ * root-signed state naming the device; `options.accountStates` overrides it), accepts `POST /:acct/requests`
  * (capturing the envelope), and answers `GET /:acct/requests/:id` with a signed verdict of the
  * requested `decision`. The verdict is bound to the captured envelope + the decrypted context, so
  * the SDK's verification (against `approverRootPub`) genuinely passes/round-trips.
  *
  * `forge` lets a test play a hostile relay: it rewrites the signed verdict before delivery.
  */
-function relayDouble(wasm, approver, decision, forge = (verdict) => verdict) {
+function relayDouble(wasm, approver, decision, forge = (verdict) => verdict, options = {}) {
+  const accountStates = options.accountStates ?? [accountState(wasm, approver)];
+  const state = { submitted: 0 };
   /** @type {Record<string, unknown> | null} */
   let captured = null;
   let requestAuthToken = null;
@@ -100,23 +141,20 @@ function relayDouble(wasm, approver, decision, forge = (verdict) => verdict) {
     const url = typeof input === "string" ? input : input.url;
     const method = init?.method ?? "GET";
 
-    // GET /:acct/devices — one enrolled device (the X25519 encryption pubkey is the JWE recipient).
-    if (url.endsWith("/devices") && method === "GET") {
-      return json({
-        devices: [
-          {
-            device_id: DEVICE_ID,
-            pubkey: approver.deviceEncryptionPub,
-            label: DEVICE_LABEL,
-            created_at: NOW_MS - 10_000,
-          },
-        ],
-      });
+    // GET /:acct/account-states — the root-signed states that decide who may read the request.
+    if (url.endsWith("/account-states") && method === "GET") {
+      if (options.accountStatesStatus !== undefined) {
+        return new Response(JSON.stringify({ error: "authorization required" }), {
+          status: options.accountStatesStatus,
+        });
+      }
+      return json({ account_states: accountStates, max_sequence: accountStates.length });
     }
 
     // POST /:acct/requests — capture the opaque envelope and issue the relay-scoped poll token.
     if (url.endsWith("/requests") && method === "POST") {
       captured = JSON.parse(String(init?.body));
+      state.submitted += 1;
       requestAuthToken = `token-${captured.id}`;
       return json(
         {
@@ -170,7 +208,7 @@ function relayDouble(wasm, approver, decision, forge = (verdict) => verdict) {
     throw new Error(`relayDouble: unexpected ${method} ${url}`);
   };
 
-  return { fetchImpl };
+  return { fetchImpl, state };
 }
 
 /** A realistic PreToolUse stdin payload for a Bash command. */
@@ -253,6 +291,99 @@ for (const decision of ["denied", "expired", "aborted"]) {
   });
 }
 
+// ── Root-vouched recipients and the sequence floor (#243) ───────────────────────────────────────
+
+test("end-to-end (#243): the selected account-state sequence is recorded under ~/.allw/state", async (t) => {
+  const wasm = await loadWasm();
+  const approver = await pairedApprover(wasm);
+  const home = withConfigHome(t);
+  const { fetchImpl } = relayDouble(wasm, approver, "approved", undefined, {
+    accountStates: [accountState(wasm, approver, 1), accountState(wasm, approver, 2)],
+  });
+
+  const output = await runHook(
+    bashStdin("rm -rf build", "/w"),
+    env(approver, TIMEOUT_MS),
+    overrides(fetchImpl),
+  );
+  assert.equal(output, null);
+  const floorFile = join(home, ".allw", "state", `${ACCOUNT_ID}.floor.json`);
+  assert.deepEqual(JSON.parse(readFileSync(floorFile, "utf8")), {
+    v: 1,
+    account_id: ACCOUNT_ID,
+    sequence: 2,
+  });
+});
+
+test("end-to-end (#243, fail-closed): a relay that rolls back below the floor → deny, nothing sent", async (t) => {
+  const wasm = await loadWasm();
+  const approver = await pairedApprover(wasm);
+  withConfigHome(t);
+  const first = relayDouble(wasm, approver, "approved", undefined, {
+    accountStates: [accountState(wasm, approver, 3)],
+  });
+  assert.equal(
+    await runHook(bashStdin("ls", "/w"), env(approver, TIMEOUT_MS), overrides(first.fetchImpl)),
+    null,
+  );
+
+  // A later run sees only an older state (one that might still list a since-revoked device).
+  const rolledBack = relayDouble(wasm, approver, "approved", undefined, {
+    accountStates: [accountState(wasm, approver, 2)],
+  });
+  const output = await runHook(
+    bashStdin("rm -rf build", "/w"),
+    env(approver, TIMEOUT_MS),
+    overrides(rolledBack.fetchImpl),
+  );
+  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /sequence floor|below/i);
+  assert.equal(rolledBack.state.submitted, 0, "the request is never sent");
+});
+
+// Regression: against a relay deployed before account-state GET became unauthenticated, the hook
+// must still deny, and the reason must tell the operator to redeploy the relay.
+test("end-to-end (#243, fail-closed): a relay too old for account-state GET (401) → deny saying redeploy", async (t) => {
+  const wasm = await loadWasm();
+  const approver = await pairedApprover(wasm);
+  withConfigHome(t);
+  const relay = relayDouble(wasm, approver, "approved", undefined, { accountStatesStatus: 401 });
+
+  const output = await runHook(
+    bashStdin("rm -rf build", "/w"),
+    env(approver, TIMEOUT_MS),
+    overrides(relay.fetchImpl),
+  );
+  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(
+    output.hookSpecificOutput.permissionDecisionReason,
+    /relay is too old .*; redeploy it from current allw main, see docs\/relay-deploy\.md$/,
+    "the whole fix survives the deny-reason length cap",
+  );
+  assert.equal(relay.state.submitted, 0);
+});
+
+test("end-to-end (#243, fail-closed): no published account state → deny naming allw-approver pair", async (t) => {
+  const wasm = await loadWasm();
+  const approver = await pairedApprover(wasm);
+  const home = withConfigHome(t);
+  const relay = relayDouble(wasm, approver, "approved", undefined, { accountStates: [] });
+
+  const output = await runHook(
+    bashStdin("rm -rf build", "/w"),
+    env(approver, TIMEOUT_MS),
+    overrides(relay.fetchImpl),
+  );
+  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /allw-approver pair/);
+  assert.equal(relay.state.submitted, 0);
+  assert.equal(
+    existsSync(join(home, ".allw", "state")),
+    false,
+    "no floor without a sealed request",
+  );
+});
+
 /**
  * Pin the configured transport budget independently of the subprocess startup slack: a slower
  * fetch timeout must not hide inside that generous process bound. A pending fetch ignores abort,
@@ -261,7 +392,7 @@ for (const decision of ["denied", "expired", "aborted"]) {
  * @see ../../../docs/claude-code-integration.md (ALLW_FETCH_TIMEOUT_MS and timeout ordering)
  * @see ../../../docs/contract.md §Invariants #7 (timeout/no-response must deny)
  */
-test("end-to-end (#388): the configured 100 ms fetch budget schedules an expired deny", async () => {
+test("end-to-end (#388): the configured 100 ms fetch budget schedules a fail-closed deny", async () => {
   const wasm = await loadWasm();
   const approver = await pairedApprover(wasm);
   const scheduled = [];
@@ -279,6 +410,49 @@ test("end-to-end (#388): the configured 100 ms fetch budget schedules an expired
   );
 
   assert.deepEqual(scheduled, [100], "the env-configured fetch budget must reach the scheduler");
+  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  // Account state loads before submission; its transport timeout must deny just as a submit timeout does.
+  assert.match(
+    output.hookSpecificOutput.permissionDecisionReason,
+    /loading account state failed: .*timed out after 100ms \(fail-closed\)/,
+  );
+});
+
+/**
+ * Account-state loading and submission use separate transports. A resolved state GET must not
+ * hide a missing submit budget: the hung POST must expire under the same configured timeout.
+ * @see ../../../docs/claude-code-integration.md (ALLW_FETCH_TIMEOUT_MS)
+ * @see ../../../docs/contract.md §Invariants #7 (timeout must deny)
+ */
+test("end-to-end (#388): the configured 100 ms fetch budget also bounds submit after account state loads", async (t) => {
+  const wasm = await loadWasm();
+  const approver = await pairedApprover(wasm);
+  withConfigHome(t);
+  const relay = relayDouble(wasm, approver, "approved", undefined, {
+    accountStates: [accountState(wasm, approver)],
+  });
+  const scheduled = [];
+  const calls = [];
+  const output = await runHook(
+    bashStdin("rm -rf build", "/workspace/project"),
+    { ...env(approver, 1000), ALLW_FETCH_TIMEOUT_MS: "100" },
+    {
+      ...overrides((input, init) => {
+        const url = typeof input === "string" ? input : input.url;
+        const method = init?.method ?? "GET";
+        calls.push(`${method} ${new URL(url).pathname}`);
+        if (url.endsWith("/requests") && method === "POST") return new Promise(() => {});
+        return relay.fetchImpl(input, init);
+      }),
+      scheduleImpl: (fn, ms) => {
+        scheduled.push(ms);
+        // The GET resolves normally; only the hung submit's timeout should fire.
+        if (scheduled.length === 2) queueMicrotask(fn);
+      },
+    },
+  );
+  assert.deepEqual(calls, [`GET /${ACCOUNT_ID}/account-states`, `POST /${ACCOUNT_ID}/requests`]);
+  assert.deepEqual(scheduled, [100, 100], "the configured budget reaches both fetch transports");
   assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
   assert.match(output.hookSpecificOutput.permissionDecisionReason, /\(verdict: expired\)$/);
 });

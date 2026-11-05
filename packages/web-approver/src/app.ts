@@ -55,6 +55,7 @@
 
 import { createRelayAccountStateResolver } from "./account-state.js";
 import { mountWebApprover, type WebApproverMount } from "./browser.js";
+import { deviceDetailsModel, mountDeviceDetails } from "./device-details.js";
 import { mountOnboardingGate } from "./onboarding.js";
 import {
   createLocalPairingStore,
@@ -148,6 +149,19 @@ export interface BootEnvironment {
    */
   readonly startNotifications?: (identity: PinnedIdentity, isStillPaired: () => boolean) => void;
   /**
+   * Mount the "This device" panel (#381) for a paired identity, outside the inbox: the device id,
+   * public keys and fingerprints the root holder needs for `allw-approver vouch`. Never awaited.
+   * `isStillPaired` reports whether that identity is still this browser's pairing, so a panel whose
+   * mount finishes after the pairing was forgotten is never shown.
+   */
+  readonly startDeviceDetails?: (identity: PinnedIdentity, isStillPaired: () => boolean) => void;
+  /**
+   * Remove the "This device" panel. Called whenever the pairing store clears an identity ("Use
+   * another device", a confirmed re-pair), so a forgotten device's id and keys never stay on
+   * screen next to the next pairing's form (review-387 F9).
+   */
+  readonly clearDeviceDetails?: () => void;
+  /**
    * Undo notifications for a forgotten pairing (#237): clear the service worker's credential
    * mirror, then best-effort clear the browser's subscription and the relay's push tokens. Called
    * whenever the pairing store clears an identity, and at boot when no identity is stored (absent or
@@ -156,6 +170,29 @@ export interface BootEnvironment {
    * pairing: the token source for withdrawing its registration if the mirror is already empty.
    */
   readonly forgetNotifications?: (forgotten: PushCredentials | null) => Promise<void>;
+}
+
+/**
+ * `store`, except that a successful clear also runs `cleared`. Used to take down UI that shows the
+ * forgotten identity (the "This device" panel), on every path that forgets the pairing.
+ */
+function onIdentityCleared(store: PairingStore, cleared: (() => void) | undefined): PairingStore {
+  if (cleared === undefined) return store;
+  return {
+    load: () => store.load(),
+    save: (identity) => {
+      store.save(identity);
+    },
+    clear: () => {
+      store.clear();
+      cleared();
+    },
+    clearIfUnchanged: (snapshot) => {
+      const wasCleared = store.clearIfUnchanged(snapshot);
+      if (wasCleared) cleared();
+      return wasCleared;
+    },
+  };
 }
 
 /**
@@ -377,9 +414,9 @@ export async function bootInbox(
  */
 export async function boot(env: BootEnvironment): Promise<void> {
   const { root, storage } = env;
-  const pairingStore = clearingNotifications(
-    createLocalPairingStore(storage),
-    env.forgetNotifications,
+  const pairingStore = onIdentityCleared(
+    clearingNotifications(createLocalPairingStore(storage), env.forgetNotifications),
+    env.clearDeviceDetails,
   );
   let loaded = pairingStore.load();
   // No identity stored (absent or corrupt): whatever a previous pairing mirrored for notifications
@@ -437,16 +474,18 @@ export async function boot(env: BootEnvironment): Promise<void> {
           throw new Error("allw web approver: paired identity has no pinned relay");
         }
         const pinned: PinnedIdentity = { ...identity, relayUrl: identity.relayUrl };
-        void env.startInbox(root, pinned);
-        env.startNotifications?.(pinned, () => {
-          // Another tab may forget or replace the pairing while this one stays open.
+        // Another tab may forget or replace the pairing while this one stays open.
+        const isStillPaired = (): boolean => {
           const now = pairingStore.load();
           return (
             now.status === "paired" &&
             now.identity.deviceId === pinned.deviceId &&
             now.identity.deviceAuthToken === pinned.deviceAuthToken
           );
-        });
+        };
+        void env.startInbox(root, pinned);
+        env.startDeviceDetails?.(pinned, isStillPaired);
+        env.startNotifications?.(pinned, isStillPaired);
       },
     });
   }
@@ -475,6 +514,20 @@ function startBrowserNotifications(identity: PinnedIdentity, isStillPaired: () =
   });
 }
 
+/** Mount the "This device" panel (#381) into `#device`, with fingerprints from the vendored core. */
+async function startBrowserDeviceDetails(
+  identity: PinnedIdentity,
+  isStillPaired: () => boolean,
+): Promise<void> {
+  const wasm = await initWasm(await VENDORED_WASM.loadGlue(), VENDORED_WASM.moduleSource);
+  // The core may load after the pairing was forgotten: never show a forgotten device's keys.
+  if (!isStillPaired()) return;
+  mountDeviceDetails({
+    host: requireElement("device"),
+    model: deviceDetailsModel(wasm, identity),
+  });
+}
+
 if (typeof window !== "undefined" && typeof document !== "undefined") {
   void boot({
     root: requireElement("app"),
@@ -483,6 +536,12 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
     search: window.location.search,
     startInbox: bootInbox,
     startNotifications: startBrowserNotifications,
+    startDeviceDetails: (identity, isStillPaired) => {
+      void startBrowserDeviceDetails(identity, isStillPaired);
+    },
+    clearDeviceDetails: () => {
+      requireElement("device").replaceChildren();
+    },
     forgetNotifications: (forgotten) =>
       forgetNotifications(
         browserForgetNotificationsDeps(

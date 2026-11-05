@@ -15,14 +15,16 @@ import { hostname as osHostname } from "node:os";
 import { appendFileSync, realpathSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { MAX_ESCAPED_DIAGNOSTIC_CHARS, commandRequest, escapeToPrintableAscii } from "@allw/sdk";
 import {
-  MAX_ESCAPED_DIAGNOSTIC_CHARS,
-  commandRequest,
-  createClient,
-  escapeToPrintableAscii,
-  type ClientConfig,
-} from "@allw/sdk";
-import { installDecisionBackstop, isGatedTool, loadWasm, readConfig } from "@allw/hook";
+  agentSafeErrorText,
+  createHookClient,
+  installDecisionBackstop,
+  isGatedTool,
+  loadWasm,
+  readConfig,
+  type HookClientOverrides,
+} from "@allw/hook";
 
 import { decide, type RequestApprovalFn } from "./lib/decide.js";
 import {
@@ -35,17 +37,7 @@ import {
 import { getVersion } from "./version.js";
 
 /** Test-only SDK transport seams; production uses SDK defaults. */
-export type RunCodexHookOverrides = Partial<
-  Pick<
-    ClientConfig,
-    | "fetchImpl"
-    | "nowImpl"
-    | "webSocketFactory"
-    | "pollIntervalMs"
-    | "fetchTimeoutMs"
-    | "scheduleImpl"
-  >
->;
+export type RunCodexHookOverrides = HookClientOverrides;
 
 /** Read the whole stdin stream; Codex sends one JSON object. */
 async function readStdin(): Promise<string> {
@@ -105,13 +97,16 @@ export async function runCodexHook(
   }
   const config = configResult.config;
   const wasm = await loadWasm();
-  const client = createClient({
-    relayUrl: config.relayUrl,
-    accountId: config.accountId,
-    approverRootKey: config.approverRootKey,
-    ...(config.fetchTimeoutMs !== undefined ? { fetchTimeoutMs: config.fetchTimeoutMs } : {}),
-    ...overrides,
-  });
+  // Recipients come from root-signed account state, never the relay's device list (@allw/hook).
+  let client;
+  try {
+    client = createHookClient(config, overrides);
+  } catch (err) {
+    return denyOutput(
+      `allw: client setup failed (fail-closed deny): ${agentSafeErrorText(wasm, err)}`,
+      "config-error",
+    );
+  }
   const requestApproval: RequestApprovalFn = (req) =>
     client.requestApproval(req as Parameters<typeof client.requestApproval>[0]);
 

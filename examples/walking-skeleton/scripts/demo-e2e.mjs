@@ -248,6 +248,8 @@ async function main() {
 
     // 3. Drive the gated command through the real hook bin and read the decision.
     const env = {
+      // The demo owns its rollback floor alongside its temporary pairing artifacts.
+      HOME: workdir,
       ALLW_RELAY_URL: relay.base,
       ALLW_ACCOUNT_ID: accountId,
       ALLW_APPROVER_ROOT_KEY: accountRootKey,

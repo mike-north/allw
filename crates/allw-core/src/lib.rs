@@ -29,6 +29,7 @@ pub mod command;
 pub mod contract;
 pub mod crypto;
 pub mod display;
+pub mod enrollment;
 pub mod file_edit;
 pub mod hash;
 pub mod jwe;
@@ -71,6 +72,11 @@ pub use display::{
     display_model, escape_for_display, has_hidden_or_control_chars, is_combining_mark,
     is_hidden_or_control_char, is_variation_selector, DisplayModel, DisplaySubstrate, CRLF_MARKER,
     MAX_STACKED_COMBINING_MARKS, TAB_MARKER,
+};
+pub use enrollment::{
+    device_key_fingerprint, next_account_state, AccountStateChange, DeviceEnrollment,
+    DeviceKeyKind, DeviceMaterialError, NextAccountState, NextAccountStateError, DEVICE_ID_MAX_LEN,
+    FINGERPRINT_BYTES,
 };
 pub use file_edit::action_from_file_edit;
 pub use hash::{canonical_request_bytes, compute_request_hash};

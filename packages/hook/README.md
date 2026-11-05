@@ -220,23 +220,33 @@ Widening the matcher only ever adds gating: a tool allw doesn't gate gets no dec
 
 The primitive never returns a bare "allow", and neither does the hook. Every uncertain path blocks:
 
-| Situation                                                    | Decision            |
-| ------------------------------------------------------------ | ------------------- |
-| Not a gated tool                                             | none (empty stdout) |
-| Gated, verified verdict `decision === "approved"`            | none (empty stdout) |
-| Gated, verified human `denied` / `expired` / `aborted`       | `deny`              |
-| Gated, request timed out (no response by the deadline)       | `deny`              |
-| Gated, the `ActionRecord` could not be built                 | `deny`              |
-| Gated, the approval request threw (network/relay/no devices) | `deny`              |
-| Malformed hook stdin (not JSON, wrong event, …)              | `deny`              |
-| Missing/invalid configuration (file and env)                 | `deny`              |
-| Any unexpected internal error                                | `deny`              |
-| The process reached exit before deciding (exit backstop)     | `deny`              |
+| Situation                                                          | Decision            |
+| ------------------------------------------------------------------ | ------------------- |
+| Not a gated tool                                                   | none (empty stdout) |
+| Gated, verified verdict `decision === "approved"`                  | none (empty stdout) |
+| Gated, verified human `denied` / `expired` / `aborted`             | `deny`              |
+| Gated, request timed out (no response by the deadline)             | `deny`              |
+| Gated, the `ActionRecord` could not be built                       | `deny`              |
+| Gated, the approval request threw (network/relay/no account state) | `deny`              |
+| Malformed hook stdin (not JSON, wrong event, …)                    | `deny`              |
+| Missing/invalid configuration (file and env)                       | `deny`              |
+| Any unexpected internal error                                      | `deny`              |
+| The process reached exit before deciding (exit backstop)           | `deny`              |
 
 A gated call escapes allw's `deny` **only** when its verdict is delivered, cryptographically verified
 against the approver's account-root key, bound to this exact request (WYSIWYS), fresh, and a human
 "yes". The verification itself lives in the audited core; the hook just maps the verified result
 onto the Claude Code decision.
+
+### Who can read a request: account state
+
+The SDK encrypts each request only to the devices your account root vouches for in signed account
+state (`GET /{acct}/account-states`), never to the relay's device list, so a relay that lists a key it
+holds cannot read the request (`docs/enrollment.md` §Model, #243). `allw-approver pair` publishes that
+state. If the relay has none, the call is denied with an error naming `allw-approver pair`; a state that does not verify is denied too. Each machine records the highest account-state sequence it has accepted in
+`~/.allw/state/<account-id>.floor.json` (`0600` in a `0700` directory) before sending, and denies a
+request when the relay serves an older state. A floor file that is unreadable, corrupt, or not owned
+by you also denies; delete it only if you know why it is wrong.
 
 ## Development
 

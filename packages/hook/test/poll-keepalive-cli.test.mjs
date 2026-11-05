@@ -14,9 +14,11 @@
  * @see ../../../docs/contract.md §Invariants (fail-closed)
  */
 
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -32,7 +34,7 @@ const ANSWER_AFTER_MS = 2500;
 function runCli(stdin, env) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [CLI], {
-      env: { PATH: process.env.PATH, ...env },
+      env: { PATH: process.env.PATH, HOME: CHILD_HOME, ...env },
       stdio: ["pipe", "pipe", "pipe"],
     });
     const timer = setTimeout(() => {
@@ -51,10 +53,40 @@ function runCli(stdin, env) {
   });
 }
 
+/** One root-signed account state (root seed 7) vouching for the relay's one device (X25519 seed 11). */
+function slowAccountState(wasm) {
+  const accountSeed = Buffer.alloc(32, 7).toString("base64url");
+  const accountRootPub = wasm.ed25519_public_key(accountSeed);
+  return wasm.sign_account_state(
+    JSON.stringify({
+      v: 1,
+      account_id: wasm.account_id_for_root(accountRootPub),
+      sequence: 1,
+      current_root: accountRootPub,
+      previous_roots: [],
+      devices: [
+        {
+          device_id: "dev_slow",
+          encryption_pubkey: wasm.x25519_public_key(Buffer.alloc(32, 11).toString("base64url")),
+          signing_pubkey: wasm.ed25519_public_key(Buffer.alloc(32, 9).toString("base64url")),
+          status: "active",
+        },
+      ],
+      actors: [],
+      revocations: [],
+    }),
+    accountSeed,
+  );
+}
+
+/** A throwaway HOME for the child, so its sequence floor never lands in a real ~/.allw. */
+const CHILD_HOME = mkdtempSync(join(tmpdir(), "allw-poll-keepalive-home-"));
+after(() => rmSync(CHILD_HOME, { recursive: true, force: true }));
+
 test("hook bin waits across poll intervals and prints a decision (never exits silently)", async (t) => {
   const wasm = await loadWasm();
   const relay = await startSlowRelay({
-    devicePubkey: wasm.x25519_public_key(Buffer.alloc(32, 11).toString("base64url")),
+    accountStates: [slowAccountState(wasm)],
     answerAfterMs: ANSWER_AFTER_MS,
   });
   t.after(relay.close);

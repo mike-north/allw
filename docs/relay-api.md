@@ -9,10 +9,9 @@ relay source + tests; this doc is the source of truth for client implementations
 > content. Honor `docs/contract.md` / `docs/threat-model.md` — clients decrypt/verify/sign **on
 > device** via the core; the relay is a dumb router.
 >
-> **Not yet zero-knowledge against the relay itself:** integrators encrypt to the device list the relay
-> serves (`GET /{acct}/devices`, unauthenticated, not root-vouched), so a malicious relay can add a
-> recipient key it holds. Fix: encrypt only to root-vouched devices (#243) from verified account state
-> (#242). See `docs/threat-model.md` §Residual Risks.
+> **Recipients are root-vouched:** integrators encrypt only to devices listed in verified root-signed
+> account state (`GET /{acct}/account-states`), never to `GET /{acct}/devices`, so a relay that adds a
+> key it holds cannot read requests (#243). See `docs/threat-model.md` §Residual Risks.
 
 ---
 
@@ -370,7 +369,8 @@ device's own), 404 (device not enrolled or revoked), 403 (another device's token
 deletes its push tokens.
 
 **`GET /{acct}/devices`** — no auth. → **200**
-`{ devices: [{ device_id, pubkey, label|null, created_at }] }`. No secrets / no push tokens.
+`{ devices: [{ device_id, pubkey, label|null, created_at }] }`. No secrets / no push tokens. Routing
+information only: it is not root-vouched, and integrators never choose encryption recipients from it (#243).
 
 ### Actors (requester attestation) — Bearer `device_auth_token` for POST
 
@@ -446,8 +446,7 @@ integrators can hit with honest input: it caps the encrypted context, which is l
 context the SDK encrypts. Over-size fails closed — the relay stores nothing, and the SDK's
 `requestApproval` rejects with a `RelayError` with `status` 413, which a caller must treat as deny.
 `RelayError` is exported from `@allw/sdk`, so a caller narrows with
-`err instanceof RelayError && err.status === 413` (#365). `requestApproval` rejects with a `RelayError`
-only for a non-2xx or malformed reply to the device fetch or the submit; once the request is submitted,
+`err instanceof RelayError && err.status === 413` (#365). `requestApproval` rejects with a `RelayError` only for a non-2xx or malformed reply to the submit (a failed account-state fetch rejects with a `RecipientSelectionError` whose `cause` is the `RelayError`); once the request is submitted,
 a non-2xx poll reply (such as 401 or 403) resolves to an `expired` verdict, and a failed retract is
 ignored. The SDK does no pre-check of its own. The 15-minute horizon covers the hooks' 420 s maximum
 timeout; an operator who lowers it below that makes hook requests fail closed.

@@ -9,14 +9,19 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
 import { mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { runCodexHook } from "../dist/cli.js";
 import { assertConformsToPreToolUseOutputContract } from "./support/codex-schema.mjs";
+
+/** Isolate persisted sequence floors from the developer's ~/.allw. */
+const CHILD_HOME = mkdtempSync(join(tmpdir(), "allw-hook-child-home-"));
+after(() => rmSync(CHILD_HOME, { recursive: true, force: true }));
 
 const here = dirname(fileURLToPath(import.meta.url));
 const CLI = join(here, "..", "dist", "cli.js");
@@ -24,7 +29,7 @@ const CLI = join(here, "..", "dist", "cli.js");
 function runCli(stdin, cliPath = CLI, env = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [cliPath], {
-      env: { PATH: process.env.PATH, ...env },
+      env: { PATH: process.env.PATH, HOME: CHILD_HOME, ...env },
       stdio: ["pipe", "pipe", "pipe"],
     });
     const timer = setTimeout(() => {

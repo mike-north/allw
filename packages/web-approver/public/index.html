@@ -26,6 +26,8 @@
     <!-- Notification controls (#237), shown after pairing, outside the inbox so they never gate it. -->
     <div id="notifications"></div>
     <div id="app"></div>
+    <!-- "This device" (#381): id, public keys and fingerprints for allw-approver vouch. -->
+    <div id="device"></div>
     <!--
       `scripts/build-site.mjs` copies this file into `dist-site/`, bundles `src/app.ts` (the
       production boot sequence: relay-URL config → pairing gate → WASM-backed runtime → live

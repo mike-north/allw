@@ -17,7 +17,7 @@ export type {
 export { attachAutoApprover } from "./lib/approver-harness.js";
 export type { ApproverIdentity, AutoDecision, DecisionLogEntry } from "./lib/approver-harness.js";
 
-export { buildPairedApprover } from "./lib/identity.js";
+export { buildPairedApprover, signDeviceAccountState } from "./lib/identity.js";
 export type { PairingParams } from "./lib/identity.js";
 
 export { autoPrompter, runLiveApprover } from "./lib/live-approver.js";

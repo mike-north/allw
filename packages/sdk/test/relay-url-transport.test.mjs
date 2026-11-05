@@ -30,6 +30,8 @@ function clientFor(relayUrl) {
   return createClient({
     relayUrl,
     accountId: "acct_transport_249",
+    // Construction checks only that account state is present; it is verified per request.
+    accountStates: ["unverified.account.state"],
     fetchImpl: forbiddenFetch,
     webSocketFactory: undefined,
   });

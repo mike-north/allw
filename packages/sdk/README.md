@@ -16,7 +16,12 @@ A script about to run a command uses the `command` surface, the same one the age
 
 ```js
 // Gate a command on a human approval from a plain script (issue #231). Usage: node gate-refund.mjs <charge-id>
-import { createClient, commandRequest } from "@allw/sdk";
+import {
+  createClient,
+  commandRequest,
+  fileSequenceFloorStore,
+  relayAccountStateSource,
+} from "@allw/sdk";
 
 const {
   ALLW_RELAY_URL: relayUrl,
@@ -25,7 +30,10 @@ const {
 } = process.env;
 const timeoutMs = Number(process.env.ALLW_TIMEOUT_MS ?? 300_000);
 const argv = ["stripe", "refunds", "create", "--charge", process.argv[2]];
-const client = createClient({ relayUrl, accountId, approverRootKey });
+// Encrypt only to the devices the root-signed account state vouches for; refuse a rollback.
+const floorStore = fileSequenceFloorStore({ accountId });
+const accountStates = relayAccountStateSource({ relayUrl, accountId, floorStore });
+const client = createClient({ relayUrl, accountId, approverRootKey, accountStates });
 const verdict = await client.requestApproval(
   await commandRequest({ argv, summary: `Refund charge ${process.argv[2]}`, timeoutMs }),
 );
@@ -71,6 +79,36 @@ operators (`FOO=1`, `&&`) rejects with `reason: "command_line_no_program"`, and 
 assignments (`["FOO=1"]`) with `reason: "argv_no_program"`. A blank or comment-only line is
 `command_line_empty`, and an empty program word is `argv_program_empty`.
 
+## Who can read a request: account state
+
+`createClient` requires `accountStates`. A request is encrypted only to the devices that root-signed
+account state vouches for (`docs/enrollment.md` §Model). The relay's own device list is never used
+for keys, so a relay cannot add a reader. Verdicts from devices that account state revokes are
+rejected.
+
+- **`relayAccountStateSource({ relayUrl, accountId, floorStore })`** is what the hooks use. It fetches
+  `GET /{account}/account-states` for each request; the documents are verified in the core against
+  `approverRootKey`, so the fetch needs no credentials.
+- **`fileSequenceFloorStore({ accountId })`** keeps the highest sequence used so far in
+  `~/.allw/state/<account_id>.floor.json`. A later state below it is refused, which stops a relay
+  from rolling back to a state that still lists a revoked device. Only a missing file means "no
+  floor yet". A file that is corrupt, unreadable, not a regular file (a symlink included), owned by
+  another user, or writable by others makes the request fail closed, as does a state directory that
+  is not a real directory, is owned by another user, or is group- or world-writable. Pass `dir` to
+  keep the floor somewhere else.
+- A fixed array of compact account-state documents also works. The caller then owns rollback
+  protection.
+- You can write your own `AccountStateSource`. `load()` is called once per request, and that set is
+  used for both encryption and verdict checks. After sealing, the SDK awaits
+  `accepted(sequence)` **before** sending; if it throws, nothing is sent.
+
+When account state can't be loaded, doesn't verify, is below the floor, or names no active device,
+`requestApproval` rejects with a `RecipientSelectionError` (`stage`: `"load"`, `"seal"` or
+`"accept"`) and nothing is sent. Treat that like a denial. If you call
+`relayAccountStateSource(...).load()` yourself, a fetch that hangs past `fetchTimeoutMs` rejects with
+`RelayTimeoutError`, exported from `@allw/sdk` so you can check it with `instanceof`. Until the account's root holder runs
+`allw-approver pair`, there is no account state, and every request is refused.
+
 ## Request size limit
 
 The relay refuses a request whose encrypted context (`context_ciphertext`) is over **64 KiB**, counted
@@ -81,10 +119,12 @@ fails closed: nothing is stored or shown to the human, and `requestApproval` rej
 into an approval.
 
 `RelayError` is exported, so you can narrow on it. `requestApproval` rejects with it only when
-the device fetch or the submit gets a non-2xx reply, or a 2xx whose body is malformed. Once the
-request is submitted, a non-2xx or malformed poll reply (for example 401 or 403) resolves to an
-`expired` verdict instead, and a failed retract is ignored. So does a relay that hangs or can't be
-reached. The error's message never quotes the relay's body.
+the submit gets a non-2xx reply, or a 2xx whose body is malformed. A failed account-state fetch
+rejects earlier, with a `RecipientSelectionError` (stage `"load"`) whose `cause` is the
+`RelayError` or `RelayTimeoutError` (see above). Once the request is submitted, a non-2xx or
+malformed poll reply (for example 401 or 403) resolves to an `expired` verdict instead, and a failed
+retract is ignored. So does a relay that hangs or can't be reached after that point. The error's
+message never quotes the relay's body.
 
 ```ts
 import { RelayError } from "@allw/sdk";

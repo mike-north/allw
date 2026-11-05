@@ -15,7 +15,9 @@ and [enrollment.md](./enrollment.md) (account/device enrollment, rotation, revoc
 ## Invariants (the whole design serves these)
 
 1. **E2EE** — the relay never sees plaintext context or rationale. Context is encrypted to the approver's device
-   key(s); the verdict is signed by a device key.
+   key(s) — exactly the devices root-signed account state lists as active (`docs/enrollment.md` §Model,
+   recipient selection rule), never the relay's device list, so the relay cannot add a reader. The verdict is
+   signed by a device key.
 2. **Structure-not-data** — the relay (and anything off-device) may see action **structure** — the surface kind,
    program name (commands) / server + tool name (MCP calls), and session label — but **never** action **data**:
    arguments, parameter values, environment variable names or values, or any content the agent is operating on.
@@ -470,7 +472,8 @@ source of authority: the same `request_hash` the device signs and the verifier r
 
 `context_ciphertext` is a multi-recipient **JWE in General JSON Serialization**
 ([RFC 7516](https://www.rfc-editor.org/rfc/rfc7516) §7.2.1) encrypting the `ApprovalContext` (JSON) to the
-approver's device key(s). The `ApprovalContext` is encrypted **once** under a random content-encryption key (CEK)
+approver's device key(s): the active devices in the highest verified root-signed account state, selected and
+sealed in the core by `seal_context_for_account_state` (`docs/enrollment.md` §Model). The `ApprovalContext` is encrypted **once** under a random content-encryption key (CEK)
 with `enc = "A256GCM"` ([RFC 7518](https://www.rfc-editor.org/rfc/rfc7518) §5.3; 96-bit IV; AAD =
 `ASCII(BASE64URL(protected_header))`). For **each** recipient device the CEK is wrapped independently with
 `alg = "ECDH-ES+A256KW"` (§4.6 + §4.4): an ephemeral X25519 keypair per recipient, `Z = ECDH(ephemeral, device)`

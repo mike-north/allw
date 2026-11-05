@@ -1,5 +1,5 @@
 /**
- * Regression tests for issue #52: the pre-deadline relay calls (`fetchDevices`, `submit`) and the
+ * Regression tests for issue #52: the pre-deadline relay calls (the account-state fetch, `submit`) and the
  * `poll()` loop must be bounded by a per-request fetch timeout, so a relay that accepts the TCP
  * connection but never responds (black-holed host, hung load balancer, captive portal) cannot wedge
  * `requestApproval` indefinitely. Before this fix those `fetch`es passed no `AbortSignal` and ran
@@ -12,6 +12,10 @@
  * (`expired`) — the same terminal a wait-stage timeout produces — and a bare network error likewise
  * fails closed. These tests assert that resolution happens within bounded (virtual) time, never
  * hangs, and never returns `approved`.
+ *
+ * The account-state fetch (`relayAccountStateSource`, #243) runs before anything is sealed, so a
+ * hung or failed one rejects with a deny-class `RecipientSelectionError` (stage `"load"`) instead
+ * of resolving `expired`: no request exists yet to expire.
  *
  * Driven entirely by an injected fake clock (the `scheduleImpl`/`nowImpl` seam the SDK already
  * exposes) — no wall-clock, no real timers.
@@ -32,7 +36,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 
-import { createClient } from "../dist/index.js";
+import { createClient, RecipientSelectionError, relayAccountStateSource } from "../dist/index.js";
+import { oneDeviceAccountStates } from "./fixtures/account-state.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const vendorDir = join(here, "..", "vendor", "allw-wasm");
@@ -68,23 +73,24 @@ function sampleRequest(overrides = {}) {
   };
 }
 
-/** Build an approver with one enrolled device record (for the cases that get past device fetch). */
+/** Build an approver whose root-signed account state vouches for one device. */
 function makeApprover(wasm) {
   const accountSeed = Buffer.alloc(32, 7).toString("base64url");
   const deviceX25519Seed = Buffer.alloc(32, 11).toString("base64url");
   const accountRootPub = wasm.ed25519_public_key(accountSeed);
   const deviceX25519Pub = wasm.x25519_public_key(deviceX25519Seed);
-  return { accountRootPub, deviceX25519Pub, deviceId: "dev_sdk_test_52" };
+  const deviceId = "dev_sdk_test_52";
+  const accountStates = oneDeviceAccountStates(wasm, {
+    accountId: ACCOUNT_ID,
+    accountSeed,
+    deviceId,
+    encryptionPub: deviceX25519Pub,
+  });
+  return { accountRootPub, deviceX25519Pub, deviceId, accountStates };
 }
 
-function deviceRecord(approver) {
-  return {
-    device_id: approver.deviceId,
-    pubkey: approver.deviceX25519Pub,
-    label: null,
-    created_at: 0,
-  };
-}
+/** A floor store that records nothing (these tests are about the fetch, not the floor). */
+const NO_FLOOR = { read: async () => undefined, raise: async () => {} };
 
 function jsonResponse(data, status = 200) {
   return { ok: status >= 200 && status < 300, status, json: () => Promise.resolve(data) };
@@ -113,22 +119,26 @@ function neverResolves() {
 }
 
 /**
- * A configurable relay double. `hang` names which call hangs forever (`devices` | `submit` |
+ * A configurable relay double. `hang` names which call hangs forever (`account-states` | `submit` |
  * `poll`); `reject` names which call rejects with a network-style `TypeError`. Other calls behave
- * normally (devices listed, submit accepted, poll pending).
+ * normally (account state served, submit accepted, poll pending).
  */
-function makeRelayDouble({ devices, hang, reject }) {
+function makeRelayDouble({ accountStates, hang, reject }) {
+  const state = { submitted: false };
   const fetchImpl = (url, init = {}) => {
     const u = new URL(url);
     const path = u.pathname;
     const method = (init.method ?? "GET").toUpperCase();
 
-    if (method === "GET" && path.endsWith("/devices")) {
-      if (hang === "devices") return neverResolves();
-      if (reject === "devices") return Promise.reject(new TypeError("fetch failed"));
-      return Promise.resolve(jsonResponse({ devices }));
+    if (method === "GET" && path.endsWith("/account-states")) {
+      if (hang === "account-states") return neverResolves();
+      if (reject === "account-states") return Promise.reject(new TypeError("fetch failed"));
+      return Promise.resolve(
+        jsonResponse({ account_states: accountStates, max_sequence: accountStates.length }),
+      );
     }
     if (method === "POST" && path.endsWith("/requests")) {
+      state.submitted = true;
       if (hang === "submit") return neverResolves();
       if (reject === "submit") return Promise.reject(new TypeError("fetch failed"));
       return Promise.resolve(
@@ -145,7 +155,7 @@ function makeRelayDouble({ devices, hang, reject }) {
     }
     return Promise.resolve(jsonResponse({ error: "not found" }, 404));
   };
-  return { fetchImpl };
+  return { fetchImpl, state };
 }
 
 /** Build a poll-only client driven by the fake clock and a short per-fetch timeout. */
@@ -154,6 +164,7 @@ function client(approver, relay, clock, overrides = {}) {
     relayUrl: RELAY_URL,
     accountId: ACCOUNT_ID,
     approverRootKey: approver.accountRootPub,
+    accountStates: approver.accountStates,
     fetchImpl: relay.fetchImpl,
     nowImpl: clock.now,
     webSocketFactory: undefined, // poll-only path (no real WS dials)
@@ -166,30 +177,53 @@ function client(approver, relay, clock, overrides = {}) {
 
 // ── #52: a hung pre-deadline fetch must fail closed (not hang, not approve) ───────────────────────
 
-test("(#52) hung fetchDevices (never responds) → fail-closed expired, never approved, never hangs", async () => {
+/** A client whose account state comes from the relay, through the same fake-clock-bounded fetch. */
+function relaySourcedClient(approver, relay, clock) {
+  return client(approver, relay, clock, {
+    accountStates: relayAccountStateSource({
+      relayUrl: RELAY_URL,
+      accountId: ACCOUNT_ID,
+      floorStore: NO_FLOOR,
+      fetchImpl: relay.fetchImpl,
+      fetchTimeoutMs: 30_000,
+      scheduleImpl: clock.schedule,
+    }),
+  });
+}
+
+test("(#52) hung account-state fetch (never responds) → deny-class rejection, never hangs, nothing sent", async () => {
   const wasm = await loadWasm();
   const approver = makeApprover(wasm);
-  const relay = makeRelayDouble({ devices: [deviceRecord(approver)], hang: "devices" });
+  const relay = makeRelayDouble({ accountStates: approver.accountStates, hang: "account-states" });
   const clock = makeFakeClock();
 
-  const verdict = await client(approver, relay, clock).requestApproval(sampleRequest());
-
-  assert.notEqual(verdict.decision, "approved", "a hung device fetch must NEVER resolve approved");
-  assert.equal(verdict.decision, "expired", "a hung pre-deadline fetch fails closed to expired");
-  assert.equal(
-    await verdict.verify(approver.accountRootPub),
-    false,
-    "no verifiable artifact → verify() is false",
+  await assert.rejects(
+    () => relaySourcedClient(approver, relay, clock).requestApproval(sampleRequest()),
+    (err) => {
+      assert.ok(err instanceof RecipientSelectionError, String(err));
+      assert.equal(err.stage, "load");
+      assert.equal(err.cause?.name, "RelayTimeoutError", "bounded by the per-fetch timeout");
+      return true;
+    },
   );
-  // The fetch-timeout fired at NOW + 30s, well under the 300s deadline — proving the bound is the
-  // per-fetch timeout, not the overall deadline.
-  assert.equal(typeof verdict.requestId, "string");
+  assert.equal(relay.state.submitted, false, "nothing is sealed or sent");
+});
+
+test("(#52) a relay-sourced account state that loads normally still reaches submit", async () => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const relay = makeRelayDouble({ accountStates: approver.accountStates, hang: "poll" });
+  const clock = makeFakeClock();
+
+  const verdict = await relaySourcedClient(approver, relay, clock).requestApproval(sampleRequest());
+  assert.equal(relay.state.submitted, true);
+  assert.equal(verdict.decision, "expired", "the hung poll still fails closed to expired");
 });
 
 test("(#52) hung submit (never responds) → fail-closed expired, never approved", async () => {
   const wasm = await loadWasm();
   const approver = makeApprover(wasm);
-  const relay = makeRelayDouble({ devices: [deviceRecord(approver)], hang: "submit" });
+  const relay = makeRelayDouble({ accountStates: approver.accountStates, hang: "submit" });
   const clock = makeFakeClock();
 
   const verdict = await client(approver, relay, clock).requestApproval(sampleRequest());
@@ -200,22 +234,26 @@ test("(#52) hung submit (never responds) → fail-closed expired, never approved
 
 // ── #52: a network error on a pre-deadline fetch likewise fails closed ────────────────────────────
 
-test("(#52) fetchDevices rejects (network TypeError) → fail-closed expired, never approved", async () => {
+test("(#52) account-state fetch rejects (network TypeError) → deny-class rejection, nothing sent", async () => {
   const wasm = await loadWasm();
   const approver = makeApprover(wasm);
-  const relay = makeRelayDouble({ devices: [deviceRecord(approver)], reject: "devices" });
+  const relay = makeRelayDouble({
+    accountStates: approver.accountStates,
+    reject: "account-states",
+  });
   const clock = makeFakeClock();
 
-  const verdict = await client(approver, relay, clock).requestApproval(sampleRequest());
-
-  assert.notEqual(verdict.decision, "approved", "a network-failed device fetch is NEVER approved");
-  assert.equal(verdict.decision, "expired", "a network error before the deadline fails closed");
+  await assert.rejects(
+    () => relaySourcedClient(approver, relay, clock).requestApproval(sampleRequest()),
+    (err) => err instanceof RecipientSelectionError && err.stage === "load",
+  );
+  assert.equal(relay.state.submitted, false);
 });
 
 test("(#52) submit rejects (network TypeError) → fail-closed expired, never approved", async () => {
   const wasm = await loadWasm();
   const approver = makeApprover(wasm);
-  const relay = makeRelayDouble({ devices: [deviceRecord(approver)], reject: "submit" });
+  const relay = makeRelayDouble({ accountStates: approver.accountStates, reject: "submit" });
   const clock = makeFakeClock();
 
   const verdict = await client(approver, relay, clock).requestApproval(sampleRequest());
@@ -229,7 +267,7 @@ test("(#52) submit rejects (network TypeError) → fail-closed expired, never ap
 test("(#52) hung poll loop → fail-closed expired (the per-fetch timeout unwedges the poll)", async () => {
   const wasm = await loadWasm();
   const approver = makeApprover(wasm);
-  const relay = makeRelayDouble({ devices: [deviceRecord(approver)], hang: "poll" });
+  const relay = makeRelayDouble({ accountStates: approver.accountStates, hang: "poll" });
   const clock = makeFakeClock();
 
   const verdict = await client(approver, relay, clock).requestApproval(sampleRequest());

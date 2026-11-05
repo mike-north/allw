@@ -15,13 +15,19 @@
  *    `device_id` and relay `device_auth_token`.
  * 4. Mint a **device_cert** (`issue_device_cert`): the account-root key signs the device Ed25519
  *    verifying key → cert, so verifiers need only the account-root key.
- * 5. Persist relay/account/device + cert into the keyfile, and print the **account id** and the
+ * 5. **Publish the next root-signed account state** listing this device (#243): integrators encrypt
+ *    only to devices a verified account state vouches for, so a device is not reachable until this
+ *    succeeds. The core composes it (#379): the previous verified state's devices, actors and
+ *    revocations carry forward — never keys from the relay's device list — and an entry for these
+ *    keys under an earlier relay id is replaced (#378).
+ * 6. Persist relay/account/device + cert into the keyfile, and print the **account id** and the
  *    **account-root pubkey** (the integrator's routing id and trust anchor, #12).
  */
 
 import { randomBytes } from "node:crypto";
 
 import { generateKeyfile, loadKeyfile, writeKeyfile, type Keyfile } from "../lib/keyfile.js";
+import { composeAddDevice, signAndPublish } from "../lib/account-state-authoring.js";
 import { pairingComplete, pairingStart } from "../lib/relay-client.js";
 import { assertCliRelayUrl } from "../lib/relay-url.js";
 import type { AllwWasm } from "../lib/wasm.js";
@@ -50,6 +56,32 @@ export interface PairOptions {
 
 /** Lifetime of the root-signed pairing-start authorization `pair` sends (the core allows ≤ 5 min). */
 export const PAIRING_START_AUTH_LIFETIME_MS = 2 * 60 * 1000;
+
+/**
+ * Root-sign and publish the account state that adds this keyfile's device as `deviceId`
+ * (`docs/enrollment.md` §Model). The core composes it (`next_account_state`, #379): it verifies
+ * the relay's documents and refuses an unbacked `max_sequence`, a rollback below this keyfile's
+ * floor, disagreeing siblings, or a revoked id. Entries for the same keys under an earlier relay id
+ * are replaced (#378), so re-running `pair` leaves one entry for this keyfile's device.
+ *
+ * @returns the published sequence, and the ids the published state retired: earlier relay ids for
+ *   this keyfile's keys, which no longer receive requests.
+ */
+async function publishDeviceAccountState(
+  wasm: AllwWasm,
+  keyfile: Keyfile,
+  relayUrl: string,
+  accountId: string,
+  deviceId: string,
+): Promise<{ sequence: number; replacedDeviceIds: readonly string[] }> {
+  const draft = await composeAddDevice(wasm, keyfile, relayUrl, accountId, {
+    deviceId,
+    encryptionPubkey: keyfile.device_encryption_pubkey,
+    signingPubkey: keyfile.device_signing_pubkey,
+  });
+  await signAndPublish(wasm, keyfile, relayUrl, accountId, draft);
+  return { sequence: draft.sequence, replacedDeviceIds: draft.replacedDeviceIds };
+}
 
 /** A sink for human-facing output (stdout by default; captured in tests). */
 export type Logger = (line: string) => void;
@@ -153,9 +185,28 @@ export async function runPair(
     now,
   );
 
-  // 4. Persist the fully-paired identity (no partial writes before this point).
+  // 4. Publish the account state that vouches for this device, so integrators can encrypt to it.
+  // Before the keyfile write: a failure here leaves the keyfile unpaired, and re-running `pair`
+  // starts over cleanly.
+  const { sequence, replacedDeviceIds } = await publishDeviceAccountState(
+    wasm,
+    existing,
+    relayUrl,
+    accountId,
+    deviceId,
+  );
+  log(`Published account state — sequence ${String(sequence)}`);
+  // The retired ids came from the relay: `log` escapes them with the rest of the line.
+  for (const retired of replacedDeviceIds) {
+    log(
+      `  retired: ${retired} (same keys; a web approver still using it must re-paste the keyfile values)`,
+    );
+  }
+
+  // 5. Persist the fully-paired identity (no partial writes before this point).
   const updated: Keyfile = {
     ...existing,
+    account_state_highest_sequence: sequence,
     relay_url: relayUrl,
     account_id: accountId,
     device_id: deviceId,

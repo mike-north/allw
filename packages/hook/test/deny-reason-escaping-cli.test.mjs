@@ -17,14 +17,20 @@
  * @see ../../../crates/allw-core/src/display.rs (escape_for_display)
  */
 
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { loadWasm } from "../dist/lib/wasm.js";
 import { startApprovingRelay } from "./support/approving-relay.mjs";
+
+/** Isolate persisted sequence floors from the developer's ~/.allw. */
+const CHILD_HOME = mkdtempSync(join(tmpdir(), "allw-hook-child-home-"));
+after(() => rmSync(CHILD_HOME, { recursive: true, force: true }));
 
 const here = dirname(fileURLToPath(import.meta.url));
 const CLI = join(here, "..", "dist", "cli.js");
@@ -45,7 +51,7 @@ const BIDI_CONTROL = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
 function runCli(stdin, env) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [CLI], {
-      env: { PATH: process.env.PATH, ...env },
+      env: { PATH: process.env.PATH, HOME: CHILD_HOME, ...env },
       stdio: ["pipe", "pipe", "pipe"],
     });
     const timer = setTimeout(() => {

@@ -35,6 +35,9 @@ importers:
       '@allw/sdk':
         specifier: workspace:*
         version: link:../../packages/sdk
+      '@allw/web-approver':
+        specifier: workspace:*
+        version: link:../../packages/web-approver
     devDependencies:
       '@types/node':
         specifier: ^22.0.0

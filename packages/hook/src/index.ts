@@ -19,6 +19,8 @@
 
 export { BACKSTOP_DENY_REASON, runHook } from "./cli.js";
 
+export { createHookClient, type HookClientOverrides } from "./lib/client.js";
+
 export {
   installDecisionBackstop,
   writeDecision,

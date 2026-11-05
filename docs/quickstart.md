@@ -62,12 +62,12 @@ That's the `<RELAY_URL>` referenced in the steps below — no Cloudflare account
 > The relay is only ever sent **ciphertext + signed verdicts** — never plaintext or any signing key
 > (`docs/architecture.md`, `docs/contract.md`).
 >
-> **Caveat — not yet zero-knowledge against the relay itself.** The SDK encrypts each request to the
-> device list the relay returns (`GET /{account}/devices`), and the shipped hooks do not yet check that
-> list against root-signed account state. A malicious or compromised relay operator could therefore
-> list a key it holds as a device and decrypt the action context. Until the fix lands
-> ([#243](https://github.com/mike-north/allw/issues/243): encrypt only to root-vouched devices), only
-> use a relay whose operator you trust — or run your own. See `docs/threat-model.md` §Residual Risks.
+> **Who can read a request.** The SDK encrypts each request only to the devices your root key vouches
+> for in signed account state, never to the relay's own device list, so a relay that lists a key it
+> holds still cannot read the context ([#243](https://github.com/mike-north/allw/issues/243)).
+> `allw-approver pair` publishes that account state. Until it has, requests fail closed with an error
+> naming `allw-approver pair`. Each machine also records the highest account-state sequence it has
+> seen under `~/.allw/state/` and refuses an older one. See `docs/threat-model.md` §Residual Risks.
 
 **Prefer to self-host?** Either option below gives you a `<RELAY_URL>` to use in place of the
 hosted one — everything else in this quickstart is unchanged.
@@ -162,7 +162,8 @@ npx --no-install allw-approver pair \
   account. `--account <id>` is optional and only checks that you got the id you expected.
 
 This generates a local keyfile (`~/.allw/approver-keyfile.json`, mode `0600`), registers the device,
-mints a device certificate, and prints two things you need for the hook:
+mints a device certificate, publishes a root-signed account state naming the device (integrators
+encrypt requests only to devices it names), and prints two things you need for the hook:
 
 - the **account id** (derived from the account root), and
 - the **account-root public key** (base64url) — the integrator's trust anchor.
@@ -170,6 +171,40 @@ mints a device certificate, and prints two things you need for the hook:
 Copy both values from the output.
 
 > v0 stand-in: keys are software-held in the keyfile (→ [#23](https://github.com/mike-north/allw/issues/23)).
+
+### Upgrading an existing pairing
+
+If you paired before root-vouched recipients shipped (#243), the relay holds no account state for
+your account, so integrators deny every gated call with "the relay has no account state … run
+allw-approver pair". Upgrade the pairing once:
+
+1. Make sure your relay runs current `main`. A relay that answers `GET /<account>/account-states`
+   with 401 is too old: integrators deny with "this relay is too old … redeploy it", and `pair` fails
+   the same way. Redeploy it ([`relay-deploy.md`](./relay-deploy.md)).
+2. Re-run `pair` with the **same keyfile** (and the same `--relay`):
+
+   ```sh
+   npx --no-install allw-approver pair --relay <RELAY_URL> --keyfile <your keyfile>
+   ```
+
+   It keeps your seeds and account, registers a new device id, mints a new device certificate and
+   token, and publishes an account state naming that device ("Published account state —
+   sequence N"). The account id and account-root public key are unchanged, so integrator config
+   needs no edit. The state lists your keys once, under the new id: an entry with the same keys
+   under an older id is dropped (#378), so the old device id can no longer read requests.
+
+3. **Web approver:** open it, press **Use another device**, and paste the keyfile's values again.
+   `device_id`, `device_cert` and `device_auth_token` changed. The seeds did not. This step is
+   required: requests are encrypted to the device id the account state names, so a browser still
+   holding the old device id cannot read them. Repeat it after every later re-pair. A running
+   `allw-approver watch` picks the new values up from the keyfile on restart.
+
+4. **iPhone approver, or a web approver with keys of its own** (not set up from this keyfile):
+   re-pairing does not list it. Vouch for it once with the values it shows
+   (`allw-approver vouch`, interim until #199; see [`packages/approver/README.md` §Vouch for a device with its own keys](../packages/approver/README.md#vouch-for-a-device-with-its-own-keys)).
+   Vouching lets it decrypt requests only: its approvals are denied until it holds a device
+   certificate from this account root, which `vouch` does not issue (#199). Never vouch for a web
+   approver set up from this keyfile; paste the new values into it (step 3).
 
 ---
 
@@ -328,15 +363,17 @@ agent, that decision is only as trustworthy as the machine: the agent can read t
 
 ## Troubleshooting
 
-| Symptom                                                                  | Cause / fix                                                                                                                                                          |
-| ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Hook denies with "group- or world-writable" or "not by the current user" | Run `chmod 600 ~/.allw/config.json` (and `chown` it to the user Claude Code runs as).                                                                                |
-| Hook always denies with "no allw config found"                           | `~/.allw/config.json` (step 4) doesn't exist for the user Claude Code runs as, and no `ALLW_*` overrides are set. Write the file (or set `ALLW_CONFIG` to its path). |
-| Hook denies with "vendored wasm not found"                               | You're running an unbuilt checkout, not the installed package. `npm install @allw/hook` (it bundles the WASM via `@allw/sdk`).                                       |
-| No prompt appears in the watch terminal                                  | The account id / `--relay` printed by `pair` must match `account_id` / `relay_url` in `~/.allw/config.json` (or their `ALLW_*` overrides).                           |
-| Request times out immediately                                            | Check the relay is running (step 0) and reachable at the configured `relay_url`.                                                                                     |
-| Transcript shows `PreToolUse:… hook error`                               | The hook couldn't start (bad path, or not installed). See [If the hook can't start](#if-the-hook-cant-start).                                                        |
-| A read or search runs without your approver                              | By design: only `Bash`, `Edit`/`MultiEdit`/`Write` and `mcp__*` are gated. allw makes no decision for the rest.                                                      |
+| Symptom                                                                    | Cause / fix                                                                                                                                                          |
+| -------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Hook denies with "group- or world-writable" or "not by the current user"   | Run `chmod 600 ~/.allw/config.json` (and `chown` it to the user Claude Code runs as).                                                                                |
+| Hook always denies with "no allw config found"                             | `~/.allw/config.json` (step 4) doesn't exist for the user Claude Code runs as, and no `ALLW_*` overrides are set. Write the file (or set `ALLW_CONFIG` to its path). |
+| Hook denies with "vendored wasm not found"                                 | You're running an unbuilt checkout, not the installed package. `npm install @allw/hook` (it bundles the WASM via `@allw/sdk`).                                       |
+| No prompt appears in the watch terminal                                    | The account id / `--relay` printed by `pair` must match `account_id` / `relay_url` in `~/.allw/config.json` (or their `ALLW_*` overrides).                           |
+| Hook denies with "the relay has no account state … run allw-approver pair" | Nothing has published account state for this account yet. See [Upgrading an existing pairing](#upgrading-an-existing-pairing).                                       |
+| Hook denies with "this relay is too old … redeploy it"                     | The relay predates unauthenticated `GET /account-states`. Redeploy it from current `main` ([`relay-deploy.md`](./relay-deploy.md)).                                  |
+| Request times out immediately                                              | Check the relay is running (step 0) and reachable at the configured `relay_url`.                                                                                     |
+| Transcript shows `PreToolUse:… hook error`                                 | The hook couldn't start (bad path, or not installed). See [If the hook can't start](#if-the-hook-cant-start).                                                        |
+| A read or search runs without your approver                                | By design: only `Bash`, `Edit`/`MultiEdit`/`Write` and `mcp__*` are gated. allw makes no decision for the rest.                                                      |
 
 ---
 
