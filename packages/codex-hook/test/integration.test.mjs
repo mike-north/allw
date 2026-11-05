@@ -9,11 +9,14 @@
  * paired approver device, recomputes the WYSIWYS request hash, signs a verdict through the WASM
  * core, and lets the SDK verify it against the account root.
  *
+ * @see ../../../docs/contract.md §Verification checklist
+ * @see ../../../docs/enrollment.md §Model
+ *
  * `forge` lets a test play a hostile relay: it rewrites the signed verdict before delivery.
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after } from "node:test";
@@ -76,12 +79,12 @@ async function pairedApprover(wasm) {
 }
 
 /** Root-sign an account state that vouches for the approver's one device. */
-function accountState(wasm, approver) {
+function accountState(wasm, approver, sequence = 1) {
   return wasm.sign_account_state(
     JSON.stringify({
       v: 1,
       account_id: ACCOUNT_ID,
-      sequence: 1,
+      sequence,
       current_root: approver.accountRootPub,
       previous_roots: [],
       devices: [
@@ -103,9 +106,18 @@ function nonce() {
   return Buffer.alloc(16, 17).toString("base64url");
 }
 
-function relayDouble(wasm, approver, decision, forge = (verdict) => verdict) {
+function relayDouble(wasm, approver, decision, forge = (verdict) => verdict, options = {}) {
+  const accountStates = options.accountStates ?? [accountState(wasm, approver)];
+  // Fixture metadata reflects signed sequences, independently of list order and document count.
+  const maxSequence = Math.max(
+    0,
+    ...accountStates.map(
+      (state) =>
+        JSON.parse(Buffer.from(state.split(".")[1], "base64url").toString("utf8")).sequence,
+    ),
+  );
   // Count resolved responses, not attempted GETs: rejection tests must actually receive a verdict.
-  const state = { polled: 0 };
+  const state = { submitted: 0, polled: 0 };
   let captured = null;
   let requestAuthToken = null;
 
@@ -122,10 +134,14 @@ function relayDouble(wasm, approver, decision, forge = (verdict) => verdict) {
     const method = init?.method ?? "GET";
 
     if (url.endsWith("/account-states") && method === "GET") {
-      return json({ account_states: [accountState(wasm, approver)], max_sequence: 1 });
+      if (options.accountStatesStatus !== undefined)
+        return json({ error: "authorization required" }, options.accountStatesStatus);
+      return json({ account_states: accountStates, max_sequence: maxSequence });
     }
 
     if (url.endsWith("/requests") && method === "POST") {
+      state.submitted += 1;
+      if (options.submitStatus) return json({ error: "submission refused" }, options.submitStatus);
       captured = JSON.parse(String(init?.body));
       requestAuthToken = `token-${captured.id}`;
       return json(
@@ -159,7 +175,7 @@ function relayDouble(wasm, approver, decision, forge = (verdict) => verdict) {
         request_hash: requestHash,
         decision,
         decided_at: NOW_MS,
-        approver: { account_id: ACCOUNT_ID, device_id: DEVICE_ID },
+        approver: { account_id: approver.accountId ?? ACCOUNT_ID, device_id: DEVICE_ID },
       };
       const verdict = JSON.parse(
         wasm.sign_verdict(
@@ -370,3 +386,179 @@ for (const [name, outer, field] of [
     assertConformsToPreToolUseOutputContract(output);
   });
 }
+
+test("end-to-end (#243): the selected account-state sequence is recorded under ~/.allw/state", async (t) => {
+  const wasm = await loadWasm();
+  const approver = await pairedApprover(wasm);
+  const home = withConfigHome(t);
+  const { fetchImpl } = relayDouble(wasm, approver, "approved", undefined, {
+    accountStates: [accountState(wasm, approver, 1), accountState(wasm, approver, 2)],
+  });
+
+  const output = await runCodexHook(
+    codexBashStdin("rm -rf build", "/w"),
+    env(approver, TIMEOUT_MS),
+    overrides(fetchImpl),
+  );
+  assert.equal(output, null);
+  const floorFile = join(home, ".allw", "state", `${ACCOUNT_ID}.floor.json`);
+  assert.deepEqual(JSON.parse(readFileSync(floorFile, "utf8")), {
+    v: 1,
+    account_id: ACCOUNT_ID,
+    sequence: 2,
+  });
+});
+
+test("end-to-end (#243, fail-closed): a relay that rolls back below the floor → deny, nothing sent", async (t) => {
+  const wasm = await loadWasm();
+  const approver = await pairedApprover(wasm);
+  withConfigHome(t);
+  const first = relayDouble(wasm, approver, "approved", undefined, {
+    accountStates: [accountState(wasm, approver, 3)],
+  });
+  assert.equal(
+    await runCodexHook(
+      codexBashStdin("ls", "/w"),
+      env(approver, TIMEOUT_MS),
+      overrides(first.fetchImpl),
+    ),
+    null,
+  );
+
+  // A later run sees only an older state (one that might still list a since-revoked device).
+  const rolledBack = relayDouble(wasm, approver, "approved", undefined, {
+    accountStates: [accountState(wasm, approver, 2)],
+  });
+  const output = await runCodexHook(
+    codexBashStdin("rm -rf build", "/w"),
+    env(approver, TIMEOUT_MS),
+    overrides(rolledBack.fetchImpl),
+  );
+  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /sequence floor|below/i);
+  assert.equal(rolledBack.state.submitted, 0, "the request is never sent");
+});
+
+// Regression: against a relay deployed before account-state GET became unauthenticated, the hook
+// must still deny, and the reason must tell the operator to redeploy the relay.
+test("end-to-end (#243, fail-closed): a relay too old for account-state GET (401) → deny saying redeploy", async (t) => {
+  const wasm = await loadWasm();
+  const approver = await pairedApprover(wasm);
+  withConfigHome(t);
+  const relay = relayDouble(wasm, approver, "approved", undefined, { accountStatesStatus: 401 });
+
+  const output = await runCodexHook(
+    codexBashStdin("rm -rf build", "/w"),
+    env(approver, TIMEOUT_MS),
+    overrides(relay.fetchImpl),
+  );
+  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(
+    output.hookSpecificOutput.permissionDecisionReason,
+    /relay is too old .*; redeploy it from current allw main, see docs\/relay-deploy\.md$/,
+    "the whole fix survives the deny-reason length cap",
+  );
+  assert.equal(relay.state.submitted, 0);
+});
+
+/** Isolate durable floors so each test models a fresh user's state directory. */
+function withConfigHome(t) {
+  const home = mkdtempSync(join(tmpdir(), "allw-codex-floor-"));
+  const prev = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  t.after(() => {
+    for (const [key, value] of Object.entries(prev)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    rmSync(home, { recursive: true, force: true });
+  });
+  return home;
+}
+
+/** Two independent layers (expected account and account-state binding) reject this verdict.
+ * A root signature alone cannot move device authority across account namespaces.
+ * @see ../../../docs/contract.md §Verification checklist
+ * @see ../../../docs/enrollment.md §Model
+ */
+test("end-to-end (S20): same-root foreign-account certificate denies at expiry", async (t) => {
+  const wasm = await loadWasm();
+  const approver = await pairedApprover(wasm);
+  withConfigHome(t);
+  const foreign = {
+    ...approver,
+    accountId: "foreign_account",
+    cert: wasm.issue_device_cert(
+      approver.accountSeed,
+      "foreign_account",
+      DEVICE_ID,
+      approver.deviceSigningPub,
+      NOW_MS - 1000,
+    ),
+  };
+  const { fetchImpl, state } = relayDouble(wasm, foreign, "approved");
+  let current = NOW_MS;
+  const timers = [];
+  let settled = false;
+  const pending = runCodexHook(codexBashStdin("rm -rf build", "/w"), env(approver, TIMEOUT_MS), {
+    ...overrides(fetchImpl),
+    nowImpl: () => current,
+    scheduleImpl: (fn, ms) => timers.push({ at: current + ms, fn }),
+  }).finally(() => {
+    settled = true;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(state.polled > 0, "the cross-account verdict was served");
+  assert.equal(settled, false, "a foreign-account verdict cannot finalize the wait");
+  current += TIMEOUT_MS;
+  for (const timer of timers) if (timer.at <= current) timer.fn();
+  const output = await pending;
+  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /verdict: expired/);
+});
+
+/** A hostile relay cannot substitute its own account-state signing authority.
+ * @see ../../../docs/enrollment.md §Model (recipient selection rule)
+ */
+test("end-to-end (#243): foreign-root account state denies with nothing submitted", async (t) => {
+  const wasm = await loadWasm();
+  const approver = await pairedApprover(wasm);
+  withConfigHome(t);
+  const accountSeed = Buffer.alloc(32, 91).toString("base64url");
+  const foreign = {
+    ...approver,
+    accountSeed,
+    accountRootPub: wasm.ed25519_public_key(accountSeed),
+  };
+  const relay = relayDouble(wasm, approver, "approved", undefined, {
+    accountStates: [accountState(wasm, foreign)],
+    // A submission refusal makes a broken recipient guard settle; the no-POST assertion still fails.
+    submitStatus: 503,
+  });
+  const output = await runCodexHook(
+    codexBashStdin("rm -rf build", "/w"),
+    env(approver, TIMEOUT_MS),
+    overrides(relay.fetchImpl),
+  );
+  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  assert.equal(relay.state.submitted, 0, "untrusted state must be rejected before POST /requests");
+});
+
+/** Relay metadata describes the highest signed sequence, independent of document count or order.
+ * @see ../../../docs/contract.md §Transport (GET account-states)
+ */
+test("relay double: max_sequence is the maximum served sequence, or zero for no state", async () => {
+  const wasm = await loadWasm();
+  const approver = await pairedApprover(wasm);
+  for (const [sequences, expected] of [
+    [[7, 3], 7],
+    [[], 0],
+  ]) {
+    const relay = relayDouble(wasm, approver, "approved", undefined, {
+      accountStates: sequences.map((sequence) => accountState(wasm, approver, sequence)),
+    });
+    const response = await relay.fetchImpl(`https://relay.allw.test/${ACCOUNT_ID}/account-states`);
+    assert.equal((await response.json()).max_sequence, expected);
+  }
+});

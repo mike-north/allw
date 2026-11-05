@@ -240,12 +240,16 @@ export interface AccountStateOptions {
   /**
    * Optional caller-asserted account namespace. Multi-account verifiers should set this so a
    * verdict or policy rule whose signed account id differs from the intended account fails closed.
-   * `""` is treated like omission at the SDK/WASM seam.
+   * On a returned verdict, omission, `undefined` and `""` fall back to the client account.
+   * Standalone verification and evaluation inputs require a non-empty account namespace.
    */
   readonly expectedAccountId?: string;
 }
 
-/** Options for re-verifying a returned {@link Verdict}. */
+/**
+ * Options for re-verifying a returned {@link Verdict}. Omitting or clearing the account option
+ * preserves the client account guard, even when account state is explicitly omitted.
+ */
 export type VerdictVerifyOptions = AccountStateOptions;
 
 /** One loaded set of account state for a request (see {@link AccountStateSource}). */
@@ -346,6 +350,8 @@ export interface PolicyEvaluation {
 }
 
 export interface VerifyVerdictWithAccountStatesInput extends AccountStateOptions {
+  /** Required account namespace; standalone helpers have no client account to fall back to. */
+  readonly expectedAccountId: string;
   readonly verdict: unknown;
   readonly request: unknown;
   readonly context: unknown;
@@ -356,12 +362,16 @@ export interface VerifyVerdictWithAccountStatesInput extends AccountStateOptions
 }
 
 export interface VerifyPolicyRuleWithAccountStatesInput extends AccountStateOptions {
+  /** Required account namespace; standalone helpers have no client account to fall back to. */
+  readonly expectedAccountId: string;
   readonly rule: unknown;
   readonly accountRootKey: string;
   readonly nowMs: number;
 }
 
 export interface EvaluatePolicyWithAccountStatesInput extends AccountStateOptions {
+  /** Required account namespace; standalone helpers have no client account to fall back to. */
+  readonly expectedAccountId: string;
   readonly action: unknown;
   readonly actor?: unknown;
   readonly signedRules: readonly unknown[];
@@ -417,8 +427,10 @@ export interface ClientConfig {
    */
   readonly accountStates: readonly string[] | AccountStateSource;
   /**
-   * Optional account namespace the client intended to verify. When set, verdict verification fails
-   * closed if the signed verdict's certified account id differs from this value.
+   * Account namespace the client intended to verify; defaults to `accountId` when omitted or empty.
+   * Verdict verification fails closed if the certified account id differs, even when a returned
+   * verdict is re-verified without account state. Per-call omission, `undefined` or `""` preserves
+   * this guard. This complements account-state account binding.
    */
   readonly expectedAccountId?: string;
   /**
@@ -766,6 +778,14 @@ function expectedAccountIdConstraint(expectedAccountId: string | undefined): str
   return expectedAccountId === "" ? undefined : expectedAccountId;
 }
 
+/** Standalone verifiers cannot infer an account; reject missing authority before invoking the core. */
+function requireExpectedAccountId(expectedAccountId: string): string {
+  if (typeof expectedAccountId !== "string" || expectedAccountId.length === 0) {
+    throw new TypeError("allw: expectedAccountId is required");
+  }
+  return expectedAccountId;
+}
+
 /**
  * Verify a (possibly null) verdict value through the WASM core and reduce it to a {@link Decision}.
  *
@@ -869,6 +889,7 @@ export async function verifyAccountState(
 export async function verifyVerdictWithAccountStates(
   input: VerifyVerdictWithAccountStatesInput,
 ): Promise<VerifiedVerdictResult> {
+  const expectedAccountId = requireExpectedAccountId(input.expectedAccountId);
   const wasm = await loadWasm();
   const result = readVerifiedWasmResult(
     wasm.verify_verdict_with_account_states(
@@ -878,7 +899,7 @@ export async function verifyVerdictWithAccountStates(
       input.approverRootKey,
       input.nowMs,
       accountStatesJson(input.accountStates),
-      expectedAccountIdConstraint(input.expectedAccountId),
+      expectedAccountId,
     ),
   );
   if (input.nonceStore && !(await input.nonceStore.checkAndInsert(result.nonceB64))) {
@@ -891,6 +912,7 @@ export async function verifyVerdictWithAccountStates(
 export async function verifyPolicyRuleWithAccountStates(
   input: VerifyPolicyRuleWithAccountStatesInput,
 ): Promise<VerifiedPolicyRule> {
+  const expectedAccountId = requireExpectedAccountId(input.expectedAccountId);
   const wasm = await loadWasm();
   const value = JSON.parse(
     wasm.verify_policy_rule_with_account_states(
@@ -898,7 +920,7 @@ export async function verifyPolicyRuleWithAccountStates(
       input.accountRootKey,
       input.nowMs,
       accountStatesJson(input.accountStates),
-      expectedAccountIdConstraint(input.expectedAccountId),
+      expectedAccountId,
     ),
   ) as { rule?: unknown; device_id?: unknown };
   if (typeof value.device_id !== "string" || value.device_id.length === 0) {
@@ -911,6 +933,7 @@ export async function verifyPolicyRuleWithAccountStates(
 export async function evaluatePolicyWithAccountStates(
   input: EvaluatePolicyWithAccountStatesInput,
 ): Promise<PolicyEvaluation> {
+  const expectedAccountId = requireExpectedAccountId(input.expectedAccountId);
   const wasm = await loadWasm();
   const value = JSON.parse(
     wasm.evaluate_policy_with_account_states(
@@ -920,7 +943,7 @@ export async function evaluatePolicyWithAccountStates(
       input.accountRootKey,
       input.nowMs,
       accountStatesJson(input.accountStates),
-      expectedAccountIdConstraint(input.expectedAccountId),
+      expectedAccountId,
     ),
   ) as { decision?: unknown; rule_id?: unknown; tier?: unknown; schema_version?: unknown };
   if (value.decision !== "allow" && value.decision !== "deny" && value.decision !== "escalate") {
@@ -967,6 +990,9 @@ function isPreDeadlineTransportFailure(err: unknown): boolean {
  */
 export function createClient(config: ClientConfig): Client {
   assertAccountStatesConfigured(config.accountStates);
+  // Preserve account authority even when a caller re-verifies without revocation context.
+  const expectedAccountId =
+    expectedAccountIdConstraint(config.expectedAccountId) ?? config.accountId;
   const fetchImpl = config.fetchImpl ?? globalThis.fetch.bind(globalThis);
   const now: NowImpl = config.nowImpl ?? Date.now;
   // An explicitly-present `webSocketFactory` key is authoritative — passing `undefined` disables
@@ -1084,7 +1110,7 @@ export function createClient(config: ClientConfig): Client {
             now(),
             nonceStore,
             accountStateSet.accountStates,
-            config.expectedAccountId,
+            expectedAccountId,
           );
           if (verified === null) return false;
           verification.accepted = verified;
@@ -1129,7 +1155,7 @@ export function createClient(config: ClientConfig): Client {
       now,
       nonceStore,
       accountStateSet.accountStates,
-      config.expectedAccountId,
+      expectedAccountId,
       acceptedNonceB64,
     );
   }
@@ -1165,10 +1191,9 @@ function makeVerdict(
       // An explicit option overrides the client-level account-state set, including `[]` for tests
       // that intentionally verify without revocation context.
       const states = options && "accountStates" in options ? options.accountStates : accountStates;
+      // Per-call options may name an account, but can never drop the client account guard.
       const expectedAccountId =
-        options && "expectedAccountId" in options
-          ? options.expectedAccountId
-          : clientExpectedAccountId;
+        expectedAccountIdConstraint(options?.expectedAccountId) ?? clientExpectedAccountId;
       const result = await verifyToDecision(
         wasm,
         verdictValue,

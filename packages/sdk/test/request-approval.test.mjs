@@ -40,7 +40,12 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 
-import { createClient, RecipientSelectionError, RequestRetractedError } from "../dist/index.js";
+import {
+  createClient,
+  verifyVerdictWithAccountStates,
+  RecipientSelectionError,
+  RequestRetractedError,
+} from "../dist/index.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const vendorDir = join(here, "..", "vendor", "allw-wasm");
@@ -204,7 +209,7 @@ function signVerdict(
     request_hash: requestHash,
     decision,
     decided_at: NOW_MS, // inside [created_at, expires_at]
-    approver: { account_id: ACCOUNT_ID, device_id: approver.deviceId },
+    approver: { account_id: approver.accountId ?? ACCOUNT_ID, device_id: approver.deviceId },
     ...(note === undefined ? {} : { note }),
   };
   const nonce = Buffer.alloc(16, nonceByte).toString("base64url");
@@ -872,7 +877,7 @@ test("(c-sig) verdict signed by an uncertified key → never approved", async ()
           request_hash: requestHash,
           decision: "approved",
           decided_at: NOW_MS,
-          approver: { account_id: ACCOUNT_ID, device_id: approver.deviceId },
+          approver: { account_id: approver.accountId ?? ACCOUNT_ID, device_id: approver.deviceId },
         };
         const wrongSeed = Buffer.alloc(32, 0x42).toString("base64url"); // not the certified key
         const nonce = Buffer.alloc(16, 4).toString("base64url");
@@ -2282,3 +2287,165 @@ function assertResolvedPoll(relay, minimum = 1) {
     "a resolved row containing the rejection candidate must be served before the deadline",
   );
 }
+
+/** Two independent layers (expected account and account-state binding) reject this verdict.
+ * Same-root certification does not authorize a different account's device to answer this request.
+ * @see ../../../docs/contract.md §Verification checklist
+ * @see ../../../docs/enrollment.md §Model
+ */
+for (const explicit of [true, false]) {
+  test(`(S20) same-root foreign-account cert (${explicit ? "explicit" : "default"} expectedAccountId) waits until expiry`, async () => {
+    const wasm = await loadWasm();
+    const approver = makeApprover(wasm);
+    const foreign = {
+      ...approver,
+      accountId: "foreign_account",
+      cert: wasm.issue_device_cert(
+        approver.accountSeed,
+        "foreign_account",
+        approver.deviceId,
+        approver.devicePub,
+        NOW_MS - 1000,
+      ),
+    };
+    const req = sampleRequest();
+    const clock = finalityClock();
+    let polls = 0;
+    const relay = makeRelayDouble({
+      behavior: {
+        poll: (envelope) => {
+          polls += 1;
+          return signVerdict(wasm, foreign, req, envelope);
+        },
+      },
+    });
+    const client = pollClient(approver, relay, {
+      ...(explicit ? { expectedAccountId: ACCOUNT_ID } : {}),
+      nowImpl: clock.now,
+      scheduleImpl: clock.schedule,
+    });
+    let settled = false;
+    const pending = client.requestApproval(req).finally(() => {
+      settled = true;
+    });
+    await clock.advance();
+    assert.ok(polls > 0, "the foreign-account verdict was actually delivered");
+    assert.equal(
+      settled,
+      false,
+      "same-root foreign-account certification cannot finalize the wait",
+    );
+    await clock.advance(TIMEOUT_MS);
+    const verdict = await pending;
+    assert.equal(verdict.decision, "expired");
+    assert.equal(await verdict.verify(approver.accountRootPub), false);
+  });
+}
+
+/** Re-verification can deliberately omit revocation context; the client account still constrains it.
+ * The relay double retains the delivered object so we can replace it with a genuinely signed
+ * foreign-account artifact after initial acceptance, exercising the returned verifier independently.
+ * @see ../../../docs/contract.md §Verification checklist
+ */
+for (const explicit of [true, false]) {
+  for (const states of [[], undefined]) {
+    for (const [overrideName, override] of [
+      ["omitted", {}],
+      ["undefined", { expectedAccountId: undefined }],
+      ["empty", { expectedAccountId: "" }],
+    ]) {
+      test(`(S20 reverify) ${explicit ? "explicit" : "default"} account, override ${overrideName}, states ${states === undefined ? "undefined" : "empty"}`, async () => {
+        const wasm = await loadWasm();
+        const approver = makeApprover(wasm);
+        const req = sampleRequest();
+        let delivered;
+        const relay = makeRelayDouble({
+          behavior: {
+            poll: (envelope) => {
+              delivered = signVerdict(wasm, approver, req, envelope);
+              return delivered;
+            },
+          },
+        });
+        const result = await pollClient(
+          approver,
+          relay,
+          explicit ? { expectedAccountId: ACCOUNT_ID } : {},
+        ).requestApproval(req);
+        assert.equal(result.decision, "approved");
+        assert.equal(
+          await result.verify(approver.accountRootPub, { accountStates: states, ...override }),
+          true,
+          "own-account approvals still verify without states",
+        );
+        const foreign = {
+          ...approver,
+          accountId: "foreign_account",
+          cert: wasm.issue_device_cert(
+            approver.accountSeed,
+            "foreign_account",
+            approver.deviceId,
+            approver.devicePub,
+            NOW_MS - 1000,
+          ),
+        };
+        Object.assign(
+          delivered,
+          signVerdict(wasm, foreign, req, relay.state.captured, { nonceByte: 18 }),
+        );
+        assert.equal(
+          await result.verify(approver.accountRootPub, { accountStates: states, ...override }),
+          false,
+          "removing revocation context must preserve the client's account constraint",
+        );
+      });
+    }
+  }
+}
+
+/** Standalone verification requires its account guard even when revocation context is omitted.
+ * @see ../../../docs/contract.md §Verification checklist
+ */
+test("(S20 export) empty account state requires and enforces expectedAccountId", async (t) => {
+  const wasm = await loadWasm();
+  const approver = makeApprover(wasm);
+  const req = sampleRequest();
+  const envelope = {
+    id: "s20-export",
+    v: 1,
+    created_at: NOW_MS,
+    expires_at: NOW_MS + TIMEOUT_MS,
+    approver: ACCOUNT_ID,
+  };
+  const foreign = {
+    ...approver,
+    accountId: "foreign_account",
+    cert: wasm.issue_device_cert(
+      approver.accountSeed,
+      "foreign_account",
+      approver.deviceId,
+      approver.devicePub,
+      NOW_MS - 1000,
+    ),
+  };
+  const input = {
+    verdict: signVerdict(wasm, foreign, req, envelope),
+    request: envelope,
+    context: wireContext(req),
+    approverRootKey: approver.accountRootPub,
+    nowMs: NOW_MS,
+    accountStates: [],
+  };
+  for (const expectedAccountId of [undefined, ""]) {
+    await t.test(expectedAccountId === undefined ? "missing account" : "empty account", () =>
+      assert.rejects(
+        () => verifyVerdictWithAccountStates({ ...input, expectedAccountId }),
+        /expectedAccountId is required/,
+      ),
+    );
+  }
+  await assert.rejects(
+    () => verifyVerdictWithAccountStates({ ...input, expectedAccountId: ACCOUNT_ID }),
+    /account/i,
+  );
+});

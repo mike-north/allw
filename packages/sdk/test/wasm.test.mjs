@@ -1253,19 +1253,18 @@ test("@allw/sdk account-state helpers verify documents and reject revoked verdic
   assert.equal(verifiedVerdict.approved, true);
   assert.equal(verifiedVerdict.deviceId, "dev_rt");
 
-  const emptyExpectedVerdict = await verifyVerdictWithAccountStates({
-    verdict,
-    request,
-    context,
-    approverRootKey: f.accountRootPub,
-    nowMs: f.v.now_ms,
-    accountStates: [stateJws],
-    expectedAccountId: "",
-  });
-  assert.equal(
-    emptyExpectedVerdict.approved,
-    true,
-    "SDK verdict helper treats empty expectedAccountId as omitted",
+  await assert.rejects(
+    () =>
+      verifyVerdictWithAccountStates({
+        verdict,
+        request,
+        context,
+        approverRootKey: f.accountRootPub,
+        nowMs: f.v.now_ms,
+        accountStates: [stateJws],
+        expectedAccountId: "",
+      }),
+    /expectedAccountId is required/,
   );
 
   await assert.rejects(
@@ -1301,6 +1300,7 @@ test("@allw/sdk account-state helpers verify documents and reject revoked verdic
         approverRootKey: f.accountRootPub,
         nowMs: f.v.now_ms,
         accountStates: [revokedStateJws, stateJws],
+        expectedAccountId: "acct_rt",
       }),
     /device id is revoked/,
     "SDK verdict verification must enforce highest-sequence account-state revocation",
@@ -1343,17 +1343,16 @@ test("@allw/sdk policy helpers reject rules from revoked devices", async () => {
   });
   assert.equal(verifiedRule.deviceId, f.deviceId);
 
-  const emptyExpectedRule = await verifyPolicyRuleWithAccountStates({
-    rule: signedRule,
-    accountRootKey: f.accountRootPub,
-    nowMs: f.nowMs,
-    accountStates: [activeState],
-    expectedAccountId: "",
-  });
-  assert.equal(
-    emptyExpectedRule.deviceId,
-    f.deviceId,
-    "SDK policy-rule helper treats empty expectedAccountId as omitted",
+  await assert.rejects(
+    () =>
+      verifyPolicyRuleWithAccountStates({
+        rule: signedRule,
+        accountRootKey: f.accountRootPub,
+        nowMs: f.nowMs,
+        accountStates: [activeState],
+        expectedAccountId: "",
+      }),
+    /expectedAccountId is required/,
   );
 
   const evaluation = await evaluatePolicyWithAccountStates({
@@ -1368,19 +1367,18 @@ test("@allw/sdk policy helpers reject rules from revoked devices", async () => {
   assert.equal(evaluation.decision, "allow");
   assert.equal(evaluation.ruleId, "allow-status-sdk");
 
-  const emptyExpectedSdkEvaluation = await evaluatePolicyWithAccountStates({
-    action,
-    actor,
-    signedRules: [signedRule],
-    accountRootKey: f.accountRootPub,
-    nowMs: f.nowMs,
-    accountStates: [activeState],
-    expectedAccountId: "",
-  });
-  assert.equal(
-    emptyExpectedSdkEvaluation.decision,
-    "allow",
-    "SDK policy evaluation treats empty expectedAccountId as omitted",
+  await assert.rejects(
+    () =>
+      evaluatePolicyWithAccountStates({
+        action,
+        actor,
+        signedRules: [signedRule],
+        accountRootKey: f.accountRootPub,
+        nowMs: f.nowMs,
+        accountStates: [activeState],
+        expectedAccountId: "",
+      }),
+    /expectedAccountId is required/,
   );
 
   await assert.rejects(
@@ -1426,6 +1424,7 @@ test("@allw/sdk policy helpers reject rules from revoked devices", async () => {
         accountRootKey: f.accountRootPub,
         nowMs: f.nowMs,
         accountStates: [revokedState, activeState],
+        expectedAccountId: f.accountId,
       }),
     /policy-rule signing device is revoked/,
     "SDK policy-rule verification must enforce account-state revocation",
@@ -1439,6 +1438,7 @@ test("@allw/sdk policy helpers reject rules from revoked devices", async () => {
         accountRootKey: f.accountRootPub,
         nowMs: f.nowMs,
         accountStates: [revokedState, activeState],
+        expectedAccountId: f.accountId,
       }),
     /policy-rule signing device is revoked/,
     "SDK policy evaluation must fail closed when a signed rule's device is revoked",
@@ -2664,3 +2664,55 @@ test("verify_verdict_provenance gives the Rust vector's answer for every case (#
   assert.throws(() => verify(genuine.verdict_json, genuine.request_id, { createdAt: Number.NaN }));
   assert.throws(() => verify(genuine.verdict_json, genuine.request_id, { expiresAt: 1.5 }));
 });
+
+/** An empty state set never waives a standalone policy verifier's account boundary.
+ * @see ../../../docs/contract.md §Verification checklist
+ * @see ../../../docs/enrollment.md §Model
+ */
+for (const evaluate of [false, true]) {
+  test(`(S20 policy export) ${evaluate ? "evaluate" : "verify rule"} requires an account and rejects a foreign rule`, async (t) => {
+    const wasm = await loadWasm();
+    const f = policyFixture(wasm);
+    const foreignAccountId = "foreign_account";
+    const cert = wasm.issue_device_cert(
+      f.accountSeed,
+      foreignAccountId,
+      f.deviceId,
+      wasm.ed25519_public_key(f.deviceSeed),
+      f.createdAt,
+    );
+    const unsigned = {
+      id: "foreign-allow-status",
+      account_id: foreignAccountId,
+      subject: { kind: "any" },
+      match: { surface: "command", command: { bin: "git", args_any_globs: ["status"] } },
+      effect: "allow",
+      provenance: "manual",
+      tier: "syntactic",
+      created_at: f.createdAt,
+    };
+    const rule = JSON.parse(
+      wasm.sign_policy_rule(JSON.stringify(unsigned), f.deviceId, f.deviceSeed, cert),
+    );
+    const input = { accountRootKey: f.accountRootPub, nowMs: f.nowMs, accountStates: [] };
+    const verify = (expectedAccountId) =>
+      evaluate
+        ? evaluatePolicyWithAccountStates({
+            ...input,
+            expectedAccountId,
+            action: JSON.parse(wasm.action_from_command("git status", null)),
+            signedRules: [rule],
+          })
+        : verifyPolicyRuleWithAccountStates({ ...input, expectedAccountId, rule });
+    for (const expectedAccountId of [undefined, ""]) {
+      await t.test(expectedAccountId === undefined ? "missing account" : "empty account", () =>
+        assert.rejects(() => verify(expectedAccountId), /expectedAccountId is required/),
+      );
+    }
+    await assert.rejects(() => verify(f.accountId), /expected account_id/);
+    // The rule itself is authentic: its own namespace still verifies under the same root.
+    const own = await verify(foreignAccountId);
+    if (evaluate) assert.equal(own.decision, "allow");
+    else assert.equal(own.deviceId, f.deviceId);
+  });
+}

@@ -188,7 +188,14 @@ verdict `sig` (+ optional integrator counter-sign). Periodically anchor the head
 1. Signature valid against the approver's device/account root key.
    Multi-account verifiers that already know the account namespace they intended to verify SHOULD also pass that
    `expected_account_id`; verification fails closed if the verdict's certified account does not match it, which
-   prevents accidentally accepting a verdict under the wrong trusted root.
+   prevents accidentally accepting a verdict for another account certified by the same trusted root.
+   The SDK client defaults `expectedAccountId` to its configured `accountId` when omitted or empty,
+   for both `requestApproval` and the returned `Verdict.verify()`. This complements the independent
+   binding of account state to the verdict's account, and still applies when re-verification explicitly
+   omits account state (`accountStates: []` or `undefined`). A per-call `expectedAccountId` that is
+   omitted, `undefined` or empty preserves the client account guard. Standalone verdict and policy-rule
+   verification and policy evaluation exports **require** a non-empty `expectedAccountId` from their
+   caller; they have no client account default and reject missing or empty values at runtime.
 2. Bound to the **exact request** (no swap): the verdict's `request_id` equals the request's `id`, **and** its
    `request_hash` equals the integrator's locally-computed hash of the canonical `ApprovalContext`. Both are
    required — `request_hash` excludes `id`, so two content-identical requests share a hash; the `id` check
