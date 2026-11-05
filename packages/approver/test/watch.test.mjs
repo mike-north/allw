@@ -20,7 +20,11 @@ import { loadWasm } from "../dist/index.js";
 import { generateKeyfile, readKeyfile, writeKeyfile } from "../dist/lib/keyfile.js";
 import { handleRequest, runWatch } from "../dist/commands/watch.js";
 
-const ACCOUNT_ID = "acct-watch-test";
+/** Fixed root identity shared by envelopes, state and certificate fixtures. */
+const fixtureWasm = await loadWasm();
+const ROOT_SEED = Buffer.alloc(32, 7).toString("base64url");
+const ROOT_PUB = fixtureWasm.ed25519_public_key(ROOT_SEED);
+const ACCOUNT_ID = fixtureWasm.account_id_for_root(ROOT_PUB);
 const DEVICE_ID = "dev-watch-test";
 const REQUEST_ID = "req-watch-1";
 const ISSUED_AT = 1700000000000;
@@ -44,7 +48,11 @@ const CONTEXT = {
 const CONTEXT_JSON = JSON.stringify(CONTEXT);
 
 function pairedApprover(wasm) {
-  const fresh = generateKeyfile(wasm);
+  const fresh = {
+    ...generateKeyfile(wasm),
+    account_root_seed: ROOT_SEED,
+    account_root_pubkey: ROOT_PUB,
+  };
   const cert = wasm.issue_device_cert(
     fresh.account_root_seed,
     ACCOUNT_ID,
@@ -475,7 +483,11 @@ function capturingPrompter(decision) {
 
 /** Build a paired approver whose decrypted context carries a correctly-signed actor attestation. */
 function pairedApproverWithAttestation(wasm, { actorSeed }) {
-  const fresh = generateKeyfile(wasm);
+  const fresh = {
+    ...generateKeyfile(wasm),
+    account_root_seed: ROOT_SEED,
+    account_root_pubkey: ROOT_PUB,
+  };
   const cert = wasm.issue_device_cert(
     fresh.account_root_seed,
     ACCOUNT_ID,

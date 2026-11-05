@@ -272,7 +272,13 @@ function approverFixture(wasm) {
   // Reuse the vector's decided_at/now_ms — a pair already known to be inside the verify window.
   const decidedAt = JSON.parse(v.verdict_json).decided_at;
 
-  const cert = wasm.issue_device_cert(accountSeed, "acct_rt", "dev_rt", devicePub, 1700000000000);
+  const cert = wasm.issue_device_cert(
+    accountSeed,
+    wasm.account_id_for_root(accountRootPub),
+    "dev_rt",
+    devicePub,
+    1700000000000,
+  );
 
   const unsigned = {
     v: 1,
@@ -280,7 +286,7 @@ function approverFixture(wasm) {
     request_hash: requestHash,
     decision: "approved",
     decided_at: decidedAt,
-    approver: { account_id: "acct_rt", device_id: "dev_rt" },
+    approver: { account_id: wasm.account_id_for_root(accountRootPub), device_id: "dev_rt" },
   };
   const nonce = Buffer.alloc(16, 3).toString("base64url");
   return { v, accountSeed, deviceSeed, accountRootPub, devicePub, cert, unsigned, nonce, request };
@@ -292,7 +298,7 @@ function policyFixture(wasm) {
   const deviceSeed = Buffer.alloc(32, 0x42).toString("base64url");
   const accountRootPub = wasm.ed25519_public_key(accountSeed);
   const devicePub = wasm.ed25519_public_key(deviceSeed);
-  const accountId = "acct_policy";
+  const accountId = wasm.account_id_for_root(accountRootPub);
   const deviceId = "device:phone";
   const createdAt = 1700000000000;
   const nowMs = createdAt + 1000;
@@ -774,13 +780,15 @@ test("verify_account_state accepts valid root-signed state and rejects wrong acc
   const f = approverFixture(wasm);
   const valid = signedAccountState(wasm, {
     accountSeed: f.accountSeed,
-    accountId: "acct_rt",
+    accountId: wasm.account_id_for_root(f.accountRootPub),
     currentRoot: f.accountRootPub,
     sequence: 3,
   });
 
-  const verified = JSON.parse(wasm.verify_account_state(valid, "acct_rt", f.accountRootPub));
-  assert.equal(verified.account_id, "acct_rt");
+  const verified = JSON.parse(
+    wasm.verify_account_state(valid, wasm.account_id_for_root(f.accountRootPub), f.accountRootPub),
+  );
+  assert.equal(verified.account_id, wasm.account_id_for_root(f.accountRootPub));
   assert.equal(verified.sequence, 3);
 
   assert.throws(
@@ -791,7 +799,8 @@ test("verify_account_state accepts valid root-signed state and rejects wrong acc
 
   const otherRootPub = wasm.ed25519_public_key(Buffer.alloc(32, 0x77).toString("base64url"));
   assert.throws(
-    () => wasm.verify_account_state(valid, "acct_rt", otherRootPub),
+    () =>
+      wasm.verify_account_state(valid, wasm.account_id_for_root(f.accountRootPub), otherRootPub),
     /account[- ]state/i,
     "account states signed for a different root must be rejected",
   );
@@ -887,13 +896,13 @@ test("verify_verdict_with_account_states rejects revoked devices and stale rollb
   const verdictJson = wasm.sign_verdict(JSON.stringify(f.unsigned), f.deviceSeed, f.nonce, f.cert);
   const staleWithoutRevocation = signedAccountState(wasm, {
     accountSeed: f.accountSeed,
-    accountId: "acct_rt",
+    accountId: wasm.account_id_for_root(f.accountRootPub),
     currentRoot: f.accountRootPub,
     sequence: 4,
   });
   const newerRevocation = signedAccountState(wasm, {
     accountSeed: f.accountSeed,
-    accountId: "acct_rt",
+    accountId: wasm.account_id_for_root(f.accountRootPub),
     currentRoot: f.accountRootPub,
     sequence: 5,
     revokedDeviceIds: ["dev_rt"],
@@ -935,27 +944,31 @@ test("revoked_device_ids resolves highest-sequence revocations and ignores stale
   const f = approverFixture(wasm);
   const staleWithoutRevocation = signedAccountState(wasm, {
     accountSeed: f.accountSeed,
-    accountId: "acct_rt",
+    accountId: wasm.account_id_for_root(f.accountRootPub),
     currentRoot: f.accountRootPub,
     sequence: 4,
   });
   const newerRevocation = signedAccountState(wasm, {
     accountSeed: f.accountSeed,
-    accountId: "acct_rt",
+    accountId: wasm.account_id_for_root(f.accountRootPub),
     currentRoot: f.accountRootPub,
     sequence: 5,
     revokedDeviceIds: ["dev_rt"],
   });
 
   const revokedAtHighest = JSON.parse(
-    wasm.revoked_device_ids(JSON.stringify([newerRevocation]), "acct_rt", f.accountRootPub),
+    wasm.revoked_device_ids(
+      JSON.stringify([newerRevocation]),
+      wasm.account_id_for_root(f.accountRootPub),
+      f.accountRootPub,
+    ),
   );
   assert.deepEqual(revokedAtHighest, ["dev_rt"], "the highest-sequence revocation is resolved");
 
   const revokedWithStaleMixedIn = JSON.parse(
     wasm.revoked_device_ids(
       JSON.stringify([newerRevocation, staleWithoutRevocation]),
-      "acct_rt",
+      wasm.account_id_for_root(f.accountRootPub),
       f.accountRootPub,
     ),
   );
@@ -966,7 +979,11 @@ test("revoked_device_ids resolves highest-sequence revocations and ignores stale
   );
 
   const noneRevoked = JSON.parse(
-    wasm.revoked_device_ids(JSON.stringify([]), "acct_rt", f.accountRootPub),
+    wasm.revoked_device_ids(
+      JSON.stringify([]),
+      wasm.account_id_for_root(f.accountRootPub),
+      f.accountRootPub,
+    ),
   );
   assert.deepEqual(noneRevoked, [], "no account states supplied ⇒ no known revocations");
 });
@@ -977,14 +994,19 @@ test("revoked_device_ids fails closed on a substituted wrong-root account state"
   const wrongRootSeed = Buffer.alloc(32, 0x79).toString("base64url");
   const wrongRootState = signedAccountState(wasm, {
     accountSeed: wrongRootSeed,
-    accountId: "acct_rt",
+    accountId: wasm.account_id_for_root(f.accountRootPub),
     currentRoot: wasm.ed25519_public_key(wrongRootSeed),
     sequence: 6,
     revokedDeviceIds: ["dev_rt"],
   });
 
   assert.throws(
-    () => wasm.revoked_device_ids(JSON.stringify([wrongRootState]), "acct_rt", f.accountRootPub),
+    () =>
+      wasm.revoked_device_ids(
+        JSON.stringify([wrongRootState]),
+        wasm.account_id_for_root(f.accountRootPub),
+        f.accountRootPub,
+      ),
     /revoked_device_ids failed/,
     "a substituted wrong-root account state must fail closed, not be silently ignored",
   );
@@ -997,7 +1019,7 @@ test("verify_verdict_with_account_states rejects substituted wrong-root account 
   const wrongRootSeed = Buffer.alloc(32, 0x77).toString("base64url");
   const wrongRootState = signedAccountState(wasm, {
     accountSeed: wrongRootSeed,
-    accountId: "acct_rt",
+    accountId: wasm.account_id_for_root(f.accountRootPub),
     currentRoot: wasm.ed25519_public_key(wrongRootSeed),
     sequence: 6,
     revokedDeviceIds: ["dev_rt"],
@@ -1226,14 +1248,18 @@ test("@allw/sdk account-state helpers verify documents and reject revoked verdic
   const wasm = await loadWasm();
   const f = approverFixture(wasm);
   const state = unsignedAccountState({
-    accountId: "acct_rt",
+    accountId: wasm.account_id_for_root(f.accountRootPub),
     currentRoot: f.accountRootPub,
     sequence: 7,
   });
   const stateJws = await signAccountState(state, f.accountSeed);
 
-  const verifiedState = await verifyAccountState(stateJws, "acct_rt", f.accountRootPub);
-  assert.equal(verifiedState.account_id, "acct_rt");
+  const verifiedState = await verifyAccountState(
+    stateJws,
+    wasm.account_id_for_root(f.accountRootPub),
+    f.accountRootPub,
+  );
+  assert.equal(verifiedState.account_id, wasm.account_id_for_root(f.accountRootPub));
   assert.equal(verifiedState.sequence, 7);
 
   const verdict = JSON.parse(
@@ -1248,7 +1274,7 @@ test("@allw/sdk account-state helpers verify documents and reject revoked verdic
     approverRootKey: f.accountRootPub,
     nowMs: f.v.now_ms,
     accountStates: [stateJws],
-    expectedAccountId: "acct_rt",
+    expectedAccountId: wasm.account_id_for_root(f.accountRootPub),
   });
   assert.equal(verifiedVerdict.approved, true);
   assert.equal(verifiedVerdict.deviceId, "dev_rt");
@@ -1284,7 +1310,7 @@ test("@allw/sdk account-state helpers verify documents and reject revoked verdic
 
   const revokedStateJws = await signAccountState(
     unsignedAccountState({
-      accountId: "acct_rt",
+      accountId: wasm.account_id_for_root(f.accountRootPub),
       currentRoot: f.accountRootPub,
       sequence: 8,
       revokedDeviceIds: ["dev_rt"],
@@ -1300,7 +1326,7 @@ test("@allw/sdk account-state helpers verify documents and reject revoked verdic
         approverRootKey: f.accountRootPub,
         nowMs: f.v.now_ms,
         accountStates: [revokedStateJws, stateJws],
-        expectedAccountId: "acct_rt",
+        expectedAccountId: wasm.account_id_for_root(f.accountRootPub),
       }),
     /device id is revoked/,
     "SDK verdict verification must enforce highest-sequence account-state revocation",
@@ -1507,7 +1533,7 @@ test("verify rejects a verdict whose device-cert has expired", async () => {
   // This is the only test that threads issue_device_cert's 6th (expires_at) parameter.
   const expiredCert = wasm.issue_device_cert(
     f.accountSeed,
-    "acct_rt",
+    wasm.account_id_for_root(f.accountRootPub),
     "dev_rt",
     f.devicePub,
     1000,
@@ -2710,9 +2736,73 @@ for (const evaluate of [false, true]) {
       );
     }
     await assert.rejects(() => verify(f.accountId), /expected account_id/);
-    // The rule itself is authentic: its own namespace still verifies under the same root.
-    const own = await verify(foreignAccountId);
-    if (evaluate) assert.equal(own.decision, "allow");
-    else assert.equal(own.deviceId, f.deviceId);
+    // Even explicitly naming a root-signed alias cannot waive the core's account invariant.
+    await assert.rejects(() => verify(foreignAccountId), /account id does not derive/);
   });
 }
+
+/** @see docs/enrollment.md §Self-Certifying Account Id; shared Rust/WASM #399 cases. */
+test("self-certifying accounts reject genuine root-signed aliases across WASM entry points", async () => {
+  const wasm = await loadWasm();
+  const v = loadVector();
+  for (const c of v.self_certifying_cases) {
+    const calls = [
+      () =>
+        wasm.verify_verdict(
+          c.verdict_json,
+          v.request_json,
+          v.context_json,
+          v.approver_root_pubkey_b64,
+          v.now_ms,
+        ),
+      () =>
+        wasm.verify_verdict_with_account_states(
+          c.verdict_json,
+          v.request_json,
+          v.context_json,
+          v.approver_root_pubkey_b64,
+          v.now_ms,
+          "[]",
+          c.account_id,
+        ),
+      () =>
+        wasm.verify_verdict_provenance(
+          c.verdict_json,
+          JSON.parse(v.request_json).id,
+          v.provenance_created_at,
+          v.provenance_expires_at,
+          c.account_id,
+          v.approver_root_pubkey_b64,
+          "[]",
+        ),
+      () =>
+        wasm.verify_policy_rule_with_account_states(
+          c.policy_rule_json,
+          v.approver_root_pubkey_b64,
+          v.now_ms,
+          "[]",
+        ),
+      () =>
+        wasm.verify_policy_rule_with_account_states(
+          c.policy_rule_json,
+          v.approver_root_pubkey_b64,
+          v.now_ms,
+          "[]",
+          c.account_id,
+        ),
+      () =>
+        wasm.evaluate_policy(
+          wasm.action_from_command("git status", null),
+          JSON.stringify({ id: "machine:test", kind: "test" }),
+          `[${c.policy_rule_json}]`,
+          v.approver_root_pubkey_b64,
+          v.now_ms,
+        ),
+    ];
+    for (const call of calls) {
+      if (c.expected_error)
+        assert.throws(call, (e) => e.message.endsWith(c.expected_error) && e.kind === undefined);
+      else assert.doesNotThrow(call);
+    }
+  }
+});
