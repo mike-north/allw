@@ -4,6 +4,8 @@
 
 # Node / TypeScript
 node_modules/
+# pnpm's fallback store when the global store isn't writable.
+.pnpm-store/
 dist/
 dist-site/
 dist-release/
