@@ -19,7 +19,7 @@
  * @see https://code.claude.com/docs/en/hooks (the PreToolUse stdin/stdout contract)
  */
 
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -31,8 +31,17 @@ import { loadWasm } from "../dist/lib/wasm.js";
 // The hook keeps a per-account sequence floor under ~/.allw/state: point HOME at a throwaway dir
 // for this whole file so a real ~/.allw is never read or written (tests that need their own HOME
 // override it again with `withConfigHome`).
-process.env.HOME = mkdtempSync(join(tmpdir(), "allw-hook-integration-home-"));
-process.env.USERPROFILE = process.env.HOME;
+const originalHome = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+const integrationHome = mkdtempSync(join(tmpdir(), "allw-hook-integration-home-"));
+process.env.HOME = integrationHome;
+process.env.USERPROFILE = integrationHome;
+after(() => {
+  for (const [key, value] of Object.entries(originalHome)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  rmSync(integrationHome, { recursive: true, force: true });
+});
 
 // ── Fixed, deterministic timeline (no Date.now in fixtures) ─────────────────────────────────────
 const NOW_MS = 1_700_000_000_000;

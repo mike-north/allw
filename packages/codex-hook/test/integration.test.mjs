@@ -13,10 +13,10 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 
 import { runCodexHook } from "../dist/cli.js";
 import { loadWasm } from "@allw/hook";
@@ -24,8 +24,17 @@ import { assertConformsToPreToolUseOutputContract } from "./support/codex-schema
 
 // The hook keeps a per-account sequence floor under ~/.allw/state: point HOME at a throwaway dir
 // for this whole file so a real ~/.allw is never read or written.
-process.env.HOME = mkdtempSync(join(tmpdir(), "allw-codex-integration-home-"));
-process.env.USERPROFILE = process.env.HOME;
+const originalHome = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+const integrationHome = mkdtempSync(join(tmpdir(), "allw-codex-integration-home-"));
+process.env.HOME = integrationHome;
+process.env.USERPROFILE = integrationHome;
+after(() => {
+  for (const [key, value] of Object.entries(originalHome)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  rmSync(integrationHome, { recursive: true, force: true });
+});
 
 const NOW_MS = 1_700_000_000_000;
 const TIMEOUT_MS = 300_000;
