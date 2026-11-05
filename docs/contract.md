@@ -197,8 +197,8 @@ verdict `sig` (+ optional integrator counter-sign). Periodically anchor the head
    _verified_ human "no". Report it with the decision from the **signed claims**, delivered structurally (the core's
    `NotApproved`; WASM throws an `Error` with `kind: "not_approved"` and `decision`). Never classify a failure by
    its error message, because untrusted verdict fields are echoed into parse errors
-   ([#311](https://github.com/mike-north/allw/issues/311)). Any other failure is unverifiable and reports a
-   synthesized `denied`.
+   ([#311](https://github.com/mike-north/allw/issues/311)). Any other failure is unverifiable: the SDK keeps waiting for a fully verified verdict until
+   `expires_at`, then reports `expired` if none arrives.
 4. Not expired; `decided_at` within window; nonce unseen (anti-replay).
 5. If the verdict is approved and destructive challenge is required: `challenge_response` equals the derived
    number-match challenge. Authenticated denials stay denials without a challenge response.
@@ -313,7 +313,13 @@ checks in the core, without plaintext, that it was signed for this request by th
 `decided_at` inside the request's `[created_at, expires_at]`, certified by the bound account root and not revoked. Any other verdict is refused with an `error` frame and changes nothing, so
 the request stays pending. The relay only forwards provenance-valid verdicts; it never decides what a verdict
 means. The integrator runs the full [verification checklist](#verification-checklist-integrator-must) and decides
-finality ([relay-api.md](./relay-api.md) §4). A device that was offline when a request arrived receives it
+finality: the SDK waits for the first fully verified verdict (approved, denied, expired, or aborted),
+ignoring unverifiable candidates over both WebSocket and polling until `expires_at`. Verification uses
+one account-state set loaded for the request, never a per-frame reload. Polling retains its cadence
+after rejection. If the relay has already resolved the request on a provenance-valid verdict that fails
+full verification, no replacement may arrive; the SDK still ends `expired` at its local deadline.
+Transport failures remain fail-closed and `retracted` remains cancellation rather than a human decision
+([relay-api.md](./relay-api.md) §4). A device that was offline when a request arrived receives it
 on its next `connect` (the queue), so delivery survives reconnect. If a device connection supplies `surface_id`,
 the relay fans out and flushes queued requests to at most one live socket per `surface_id`, preventing a single
 visible screen from showing both a native prompt and a mirrored prompt. Retractions still go to all live device

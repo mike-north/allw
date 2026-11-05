@@ -536,7 +536,13 @@ answer every request first. A genuine verdict, approving or not, is recorded as 
 first one the relay marks the request `resolved`, retracts it from other device sockets, and pushes
 it to any waiting integrator. Provenance is not a decision. The relay cannot check the WYSIWYS
 `request_hash` (it never sees the plaintext) or nonce replay, so the integrator still verifies
-every verdict in full (`docs/contract.md` §Verification checklist).
+every verdict in full (`docs/contract.md` §Verification checklist). The SDK ignores candidates that
+fail full verification and waits for the first fully verified verdict over WebSocket or polling,
+using the account-state set loaded once for the request. Rejected polled verdicts retain the normal
+poll cadence. If this relay has already resolved on a provenance-valid but SDK-unverifiable verdict,
+it cannot deliver a replacement; the SDK ends `expired` at `expires_at` regardless. A verified
+non-approval ends the wait just as a verified approval does; transport errors remain fail-closed,
+and `retracted` remains cancellation.
 
 A device can still backdate `decided_at` inside the request's window, so a device whose certificate
 expired partway through a request can answer it with a time when the certificate was valid. That
