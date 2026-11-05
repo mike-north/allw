@@ -158,6 +158,7 @@ function relayDouble(wasm, approver, decision, forge = (verdict) => verdict, opt
     if (url.endsWith("/requests") && method === "POST") {
       captured = JSON.parse(String(init?.body));
       state.submitted += 1;
+      if (options.submitStatus) return json({ error: "submission refused" }, options.submitStatus);
       requestAuthToken = `token-${captured.id}`;
       return json(
         {
@@ -195,7 +196,7 @@ function relayDouble(wasm, approver, decision, forge = (verdict) => verdict, opt
         request_hash: requestHash,
         decision,
         decided_at: NOW_MS, // inside [created_at, expires_at] under the fixed clock
-        approver: { account_id: ACCOUNT_ID, device_id: DEVICE_ID },
+        approver: { account_id: approver.accountId ?? ACCOUNT_ID, device_id: DEVICE_ID },
       };
       const verdict = JSON.parse(
         wasm.sign_verdict(
@@ -646,3 +647,71 @@ for (const [name, outer, field] of [
     assert.match(output.hookSpecificOutput.permissionDecisionReason, /\(verdict: expired\)$/);
   });
 }
+
+/** Two independent layers (expected account and account-state binding) reject this verdict.
+ * A root signature alone cannot move device authority across account namespaces.
+ * @see ../../../docs/contract.md §Verification checklist
+ * @see ../../../docs/enrollment.md §Model
+ */
+test("end-to-end (S20): same-root foreign-account certificate denies at expiry", async (t) => {
+  const wasm = await loadWasm();
+  const approver = await pairedApprover(wasm);
+  withConfigHome(t);
+  const foreign = {
+    ...approver,
+    accountId: "foreign_account",
+    cert: wasm.issue_device_cert(
+      approver.accountSeed,
+      "foreign_account",
+      DEVICE_ID,
+      approver.deviceSigningPub,
+      NOW_MS - 1000,
+    ),
+  };
+  const { fetchImpl, state } = relayDouble(wasm, foreign, "approved");
+  let current = NOW_MS;
+  const timers = [];
+  let settled = false;
+  const pending = runHook(bashStdin("rm -rf build", "/w"), env(approver, TIMEOUT_MS), {
+    ...overrides(fetchImpl),
+    nowImpl: () => current,
+    scheduleImpl: (fn, ms) => timers.push({ at: current + ms, fn }),
+  }).finally(() => {
+    settled = true;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(state.polled > 0, "the cross-account verdict was served");
+  assert.equal(settled, false, "a foreign-account verdict cannot finalize the wait");
+  current += TIMEOUT_MS;
+  for (const timer of timers) if (timer.at <= current) timer.fn();
+  const output = await pending;
+  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /verdict: expired/);
+});
+
+/** A hostile relay cannot substitute its own account-state signing authority.
+ * @see ../../../docs/enrollment.md §Model (recipient selection rule)
+ */
+test("end-to-end (#243): foreign-root account state denies with nothing submitted", async (t) => {
+  const wasm = await loadWasm();
+  const approver = await pairedApprover(wasm);
+  withConfigHome(t);
+  const accountSeed = Buffer.alloc(32, 91).toString("base64url");
+  const foreign = {
+    ...approver,
+    accountSeed,
+    accountRootPub: wasm.ed25519_public_key(accountSeed),
+  };
+  const relay = relayDouble(wasm, approver, "approved", undefined, {
+    accountStates: [accountState(wasm, foreign)],
+    // A submission refusal makes a broken recipient guard settle; the no-POST assertion still fails.
+    submitStatus: 503,
+  });
+  const output = await runHook(
+    bashStdin("rm -rf build", "/w"),
+    env(approver, TIMEOUT_MS),
+    overrides(relay.fetchImpl),
+  );
+  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  assert.equal(relay.state.submitted, 0, "untrusted state must be rejected before POST /requests");
+});
