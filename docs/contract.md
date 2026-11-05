@@ -176,6 +176,8 @@ verdict `sig` (+ optional integrator counter-sign). Periodically anchor the head
 > The audit `note` MUST come from the **verified** verdict — the note the core returns from the signed claims
 > (`VerifiedVerdict.note`; the `note` member of the WASM/UniFFI verify result) — never from the unverified outer
 > `Verdict.note` or the relay message ([#251](https://github.com/mike-north/allw/issues/251), S15).
+> The SDK exposes this note on `verifyVerdictWithAccountStates`'s `VerifiedVerdictResult`, but does not
+> surface it on `requestApproval`'s public `Verdict` yet ([#312](https://github.com/mike-north/allw/issues/312)).
 
 > No `context_digest` — `request_hash` (the hash of the canonical `ApprovalContext`) **is** the
 > "prove-what-was-shown-without-storing-plaintext" proof, so a second digest is redundant

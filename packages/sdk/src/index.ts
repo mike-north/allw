@@ -330,6 +330,8 @@ export interface VerifiedVerdictResult {
   readonly deviceId: string;
   readonly decidedAt: number;
   readonly nonceB64: string;
+  /** The human's note from the authenticated claims, suitable for the audit record. */
+  readonly note?: string;
 }
 
 /** Result of verifying a signed policy rule, normalized from the core's snake_case JSON. */
@@ -578,15 +580,18 @@ interface VerifiedWasmResult {
   readonly deviceId: string;
   readonly decidedAt: number;
   readonly nonceB64: string;
+  /** Preserved verbatim from the core's authenticated claims; absence stays absent. */
+  readonly note?: string;
 }
 
-/** Parse the WASM verification JSON and normalize its snake_case nonce field for SDK use. */
+/** Validate the core's verification result and normalize its wire fields without re-verifying it. */
 function readVerifiedWasmResult(json: string): VerifiedWasmResult {
   const value = JSON.parse(json) as {
     approved?: unknown;
     device_id?: unknown;
     decided_at?: unknown;
     nonce_b64?: unknown;
+    note?: unknown;
   };
   if (value.approved !== true) {
     throw new Error("allw: verify_verdict result was not approved");
@@ -600,11 +605,15 @@ function readVerifiedWasmResult(json: string): VerifiedWasmResult {
   if (typeof value.nonce_b64 !== "string" || value.nonce_b64.length === 0) {
     throw new Error("allw: verify_verdict result did not include a nonce_b64");
   }
+  if (value.note !== undefined && typeof value.note !== "string") {
+    throw new Error("allw: verify_verdict result included a malformed note");
+  }
   return {
     approved: true,
     deviceId: value.device_id,
     decidedAt: value.decided_at,
     nonceB64: value.nonce_b64,
+    ...(value.note === undefined ? {} : { note: value.note }),
   };
 }
 
