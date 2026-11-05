@@ -417,8 +417,9 @@ export interface ClientConfig {
    */
   readonly accountStates: readonly string[] | AccountStateSource;
   /**
-   * Optional account namespace the client intended to verify. When set, verdict verification fails
-   * closed if the signed verdict's certified account id differs from this value.
+   * Account namespace the client intended to verify; defaults to `accountId` when omitted or empty.
+   * Verdict verification fails closed if the certified account id differs, even when a returned
+   * verdict is re-verified without account state. This complements account-state account binding.
    */
   readonly expectedAccountId?: string;
   /**
@@ -967,6 +968,9 @@ function isPreDeadlineTransportFailure(err: unknown): boolean {
  */
 export function createClient(config: ClientConfig): Client {
   assertAccountStatesConfigured(config.accountStates);
+  // Preserve account authority even when a caller re-verifies without revocation context.
+  const expectedAccountId =
+    expectedAccountIdConstraint(config.expectedAccountId) ?? config.accountId;
   const fetchImpl = config.fetchImpl ?? globalThis.fetch.bind(globalThis);
   const now: NowImpl = config.nowImpl ?? Date.now;
   // An explicitly-present `webSocketFactory` key is authoritative — passing `undefined` disables
@@ -1084,7 +1088,7 @@ export function createClient(config: ClientConfig): Client {
             now(),
             nonceStore,
             accountStateSet.accountStates,
-            config.expectedAccountId,
+            expectedAccountId,
           );
           if (verified === null) return false;
           verification.accepted = verified;
@@ -1129,7 +1133,7 @@ export function createClient(config: ClientConfig): Client {
       now,
       nonceStore,
       accountStateSet.accountStates,
-      config.expectedAccountId,
+      expectedAccountId,
       acceptedNonceB64,
     );
   }
