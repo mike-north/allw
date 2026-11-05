@@ -123,7 +123,7 @@ approver whose seeds did not come from this keyfile) has to be vouched for by th
 holder, from the paired keyfile:
 
 ```sh
-allw-approver vouch --device-id <id> --encryption-pubkey <b64url> --signing-pubkey <b64url>
+allw-approver vouch --device-id=<id> --encryption-pubkey=<b64url> --signing-pubkey=<b64url>
 ```
 
 Copy the three values from the device's own screen (the web approver's "This device's keys"

@@ -9,7 +9,7 @@
  */
 
 import assert from "node:assert/strict";
-import { randomBytes } from "node:crypto";
+import { parseArgs } from "node:util";
 import { afterEach, beforeEach, test } from "node:test";
 
 import { JSDOM } from "jsdom";
@@ -22,8 +22,8 @@ const DEVICE_ID = "0f8c1e2a-3b4d-4e5f-8a9b-0c1d2e3f4a5b";
 function identity(deviceId = DEVICE_ID) {
   return {
     deviceId,
-    deviceEncryptionSeed: randomBytes(32).toString("base64url"),
-    deviceSigningSeed: randomBytes(32).toString("base64url"),
+    deviceEncryptionSeed: Buffer.alloc(32, 55).toString("base64url"),
+    deviceSigningSeed: Buffer.alloc(32, 56).toString("base64url"),
   };
 }
 
@@ -51,7 +51,7 @@ test("the model derives the public keys and core fingerprints from the stored se
   assert.match(model.encryptionFingerprint, /^([0-9a-f]{4} ){7}[0-9a-f]{4}$/);
   assert.equal(
     model.vouchCommand,
-    `allw-approver vouch --device-id ${DEVICE_ID} --encryption-pubkey ${enc} --signing-pubkey ${sig}`,
+    `allw-approver vouch --device-id=${DEVICE_ID} --encryption-pubkey=${enc} --signing-pubkey=${sig}`,
   );
   assert.equal(model.problem, null);
   const text = JSON.stringify(model);
@@ -121,4 +121,26 @@ test("the panel renders every value, collapsed, with copy buttons for keys and t
     model.signingPubkey,
     model.vouchCommand,
   ]);
+});
+
+/** @see ../../../docs/enrollment.md §Interim vouching (copyable public-key command) */
+test("the rendered vouch command parses a leading-dash public key", async () => {
+  const wasm = await loadTestWasm();
+  const id = { ...identity(), deviceEncryptionSeed: Buffer.alloc(32, 101).toString("base64url") };
+  const model = deviceDetailsModel(wasm, id);
+  assert.ok(model.encryptionPubkey.startsWith("-"), "fixed seed exercises option ambiguity");
+  const host = document.getElementById("device");
+  mountDeviceDetails({ host, model, copy: null });
+  const command = host.querySelector(".device-details-command code").textContent;
+  const { values } = parseArgs({
+    args: command.split(" ").slice(2),
+    options: {
+      "device-id": { type: "string" },
+      "encryption-pubkey": { type: "string" },
+      "signing-pubkey": { type: "string" },
+    },
+  });
+  assert.equal(values["device-id"], DEVICE_ID);
+  assert.equal(values["encryption-pubkey"], model.encryptionPubkey);
+  assert.equal(values["signing-pubkey"], model.signingPubkey);
 });

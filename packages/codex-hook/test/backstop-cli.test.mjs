@@ -16,7 +16,7 @@
  * @see https://github.com/mike-north/allw/issues/265
  */
 
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -49,6 +49,7 @@ function backstopCoordinates(wasm) {
 
 /** A throwaway HOME for the child, so its sequence floor never lands in a real ~/.allw. */
 const CHILD_HOME = mkdtempSync(join(tmpdir(), "allw-codex-cli-home-"));
+after(() => rmSync(CHILD_HOME, { recursive: true, force: true }));
 
 /**
  * Run the hook bin with node flags + `stdin`; resolves `{ code, signal, stdout, stderr }`. With

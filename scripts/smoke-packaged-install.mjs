@@ -163,7 +163,11 @@ try {
     tool_input: { file_path: "/etc/hostname" },
   });
   const hookBin = join(binDir, "allw-hook");
-  const hookOut = run(hookBin, [], { cwd: projectDir, input: nonGatedStdin }).stdout;
+  const hookOut = run(hookBin, [], {
+    cwd: projectDir,
+    input: nonGatedStdin,
+    env: { ...process.env, HOME: workDir },
+  }).stdout;
   assert.equal(hookOut, "", "the hook should make no decision (empty stdout) for a non-gated Read");
   ok("allw-hook makes no decision for a non-gated tool call (no relay)");
 
@@ -199,6 +203,8 @@ try {
     input: gatedStdin,
     env: {
       ...process.env,
+      // Even failed request paths must keep any sequence floor inside the smoke workspace.
+      HOME: workDir,
       ALLW_RELAY_URL: "http://127.0.0.1:9",
       ALLW_ACCOUNT_ID: coordinates.account,
       ALLW_APPROVER_ROOT_KEY: coordinates.root,

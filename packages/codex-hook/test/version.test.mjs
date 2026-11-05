@@ -11,13 +11,17 @@
  * @see ../../hook/test/version.test.mjs (the Claude Code hook's mirror of this test)
  */
 
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+
+/** Isolate persisted sequence floors from the developer's ~/.allw. */
+const CHILD_HOME = mkdtempSync(join(tmpdir(), "allw-hook-child-home-"));
+after(() => rmSync(CHILD_HOME, { recursive: true, force: true }));
 
 const here = dirname(fileURLToPath(import.meta.url));
 const CLI = join(here, "..", "dist", "cli.js");
@@ -31,7 +35,7 @@ function runCli(args, cliPath = CLI) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [cliPath, ...args], {
       // A clean env so an ambient ALLW_* on the dev machine can't influence the result.
-      env: { PATH: process.env.PATH },
+      env: { PATH: process.env.PATH, HOME: CHILD_HOME },
       stdio: ["ignore", "pipe", "pipe"],
     });
     const timer = setTimeout(() => {

@@ -15,10 +15,10 @@
  * @see ../../../docs/contract.md §Invariants (fail-closed)
  */
 
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -84,6 +84,7 @@ function slowAccountState(wasm) {
 
 /** A throwaway HOME for the child, so its sequence floor never lands in a real ~/.allw. */
 const CHILD_HOME = mkdtempSync(join(tmpdir(), "allw-poll-keepalive-home-"));
+after(() => rmSync(CHILD_HOME, { recursive: true, force: true }));
 
 test("codex hook bin waits across poll intervals and prints a deny (never empty stdout)", async (t) => {
   const wasm = await loadWasm();

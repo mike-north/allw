@@ -14,13 +14,13 @@
  * @see ../../../docs/claude-code-integration.md (timeout-ordering invariant)
  */
 
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -50,6 +50,7 @@ function bashStdin(command = "rm -rf build") {
 
 /** A throwaway HOME for the child, so its sequence floor never lands in a real ~/.allw. */
 const CHILD_HOME = mkdtempSync(join(tmpdir(), "allw-hook-cli-home-"));
+after(() => rmSync(CHILD_HOME, { recursive: true, force: true }));
 
 /**
  * Run the compiled hook bin under `node`, feeding `stdin`.

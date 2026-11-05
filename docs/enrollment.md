@@ -253,7 +253,7 @@ lists the CLI keyfile's own device. A device with **keys of its own** (the iPhon
 whose seeds did not come from the CLI keyfile) is not listed by anything until the root holder vouches for it:
 
 ```sh
-allw-approver vouch --device-id <id> --encryption-pubkey <b64url> --signing-pubkey <b64url>
+allw-approver vouch --device-id=<id> --encryption-pubkey=<b64url> --signing-pubkey=<b64url>
 ```
 
 The three values are what that device shows on its own screen (the web approver's "This device's keys" panel).

@@ -69,10 +69,10 @@ export function deviceDetailsModel(
     encryptionFingerprint: wasm.device_key_fingerprint("encryption", encryptionPubkey),
     signingPubkey,
     signingFingerprint: wasm.device_key_fingerprint("signing", signingPubkey),
-    // Only built from an id the core accepted (base64url alphabet), so it needs no quoting.
+    // The core accepts only base64url material; equals keeps a leading dash in a key as data.
     vouchCommand:
       problem === null
-        ? `allw-approver vouch --device-id ${identity.deviceId} --encryption-pubkey ${encryptionPubkey} --signing-pubkey ${signingPubkey}`
+        ? `allw-approver vouch --device-id=${identity.deviceId} --encryption-pubkey=${encryptionPubkey} --signing-pubkey=${signingPubkey}`
         : null,
     problem,
   };

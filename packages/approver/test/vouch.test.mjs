@@ -18,7 +18,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
 import { createServer } from "node:http";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -33,11 +32,13 @@ const here = dirname(fileURLToPath(import.meta.url));
 const CLI_DEVICE_ID = "dev-cli";
 const PHONE_DEVICE_ID = "0f8c1e2a-3b4d-4e5f-8a9b-0c1d2e3f4a5b";
 
-/** Fresh device public keys, as a phone generating its own would. */
-function deviceKeys(wasm) {
+/** Distinct fixed seeds make CLI parsing and key-conflict outcomes reproducible. */
+function deviceKeys(wasm, encryptionByte = 55, signingByte = 56) {
   return {
-    encryptionPubkey: wasm.x25519_public_key(randomBytes(32).toString("base64url")),
-    signingPubkey: wasm.ed25519_public_key(randomBytes(32).toString("base64url")),
+    encryptionPubkey: wasm.x25519_public_key(
+      Buffer.alloc(32, encryptionByte).toString("base64url"),
+    ),
+    signingPubkey: wasm.ed25519_public_key(Buffer.alloc(32, signingByte).toString("base64url")),
   };
 }
 
@@ -398,7 +399,7 @@ test("vouch refuses a device id the relay never registered, before asking (#381)
 });
 
 test("vouch refuses when the relay registered the id with a different encryption key (#381)", async () => {
-  const decoy = deviceKeys(await loadWasm());
+  const decoy = deviceKeys(await loadWasm(), 66, 67);
   await withSetup(
     async ({ wasm, keyfilePath, phone, relay, log }) => {
       const ask = confirmer(true);
@@ -513,4 +514,34 @@ test("the vouch CLI refuses with exit 1 when stdin is not a terminal (#381)", as
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+/** @see ../../../docs/enrollment.md §Interim vouching (pasted public keys) */
+test("vouch leading-dash public key: equals form reaches TTY refusal; space form fails closed", async () => {
+  await withSetup(async ({ wasm, keyfilePath, relay }) => {
+    // X25519 seed = 32 bytes of 101 gives a canonical public key beginning with '-'.
+    const phone = deviceKeys(wasm, 101, 102);
+    assert.equal(phone.encryptionPubkey, "-0Gx_PdcEif6CIdgVqXtB6xE_gwRbsLegLjlI5WdeCQ");
+    assert.ok(phone.encryptionPubkey.startsWith("-"));
+    const cli = join(here, "..", "dist", "cli.js");
+    for (const equals of [true, false]) {
+      const options = [
+        ["device-id", PHONE_DEVICE_ID],
+        ["encryption-pubkey", phone.encryptionPubkey],
+        ["signing-pubkey", phone.signingPubkey],
+      ].flatMap(([name, value]) => (equals ? [`--${name}=${value}`] : [`--${name}`, value]));
+      const result = spawnSync(
+        process.execPath,
+        [cli, "vouch", "--keyfile", keyfilePath, ...options],
+        {
+          input: "y\n",
+          encoding: "utf8",
+        },
+      );
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, equals ? /vouch needs an interactive terminal/ : /ambiguous/);
+      assertNothingChanged(relay, keyfilePath);
+      assert.deepEqual(relay.requests, [], "neither refusal reaches the relay");
+    }
+  });
 });

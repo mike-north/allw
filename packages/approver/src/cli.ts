@@ -67,9 +67,9 @@ keygen OPTIONS:
   --force            Overwrite an existing keyfile (orphans the current device's seeds).
 
 vouch OPTIONS:
-  --device-id <id>             The device's id, as the device shows it (required).
-  --encryption-pubkey <b64url> The device's encryption public key, as the device shows it (required).
-  --signing-pubkey <b64url>    The device's signing public key, as the device shows it (required).
+  --device-id=<id>             The device's id, as the device shows it (required).
+  --encryption-pubkey=<b64url> The device's encryption public key, as the device shows it (required).
+  --signing-pubkey=<b64url>    The device's signing public key, as the device shows it (required).
   --relay <url>                Override the paired relay URL (same rule as pair --relay).
 
 ⚠ v0 stand-in: device keys are held in software in the keyfile. Production custody is hardware-
