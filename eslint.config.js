@@ -6,7 +6,7 @@ import { relayPrivateStateRestrictions } from "./eslint/relay-private-state.js";
 const RELAY_TEST_CAST_TARGETS = ["WebSocket", "Env", "DurableObjectState", "DurableObjectStorage"];
 
 export default tseslint.config(
-  { ignores: ["**/dist/**", "**/target/**", "**/.wrangler/**"] },
+  { ignores: ["**/dist/**", "**/target/**", "**/.wrangler/**", "**/.pnpm-store/**"] },
   ...tseslint.configs.strictTypeChecked,
   ...tseslint.configs.stylisticTypeChecked,
   {
