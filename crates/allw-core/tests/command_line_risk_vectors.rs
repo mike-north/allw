@@ -30,6 +30,10 @@ struct Case {
     risk: String,
     bin: String,
     why: String,
+    /// Also check this row with one word larger than the analysis budget. Compact fixture
+    /// metadata keeps megabytes of inert padding out of the committed shared examples.
+    #[serde(default)]
+    exhaust_padding: bool,
 }
 
 fn load() -> Fixture {
@@ -48,6 +52,20 @@ fn every_vector_has_the_expected_risk_and_bin() {
     assert!(!fixture.cases.is_empty(), "fixture has cases");
     let mut failures = Vec::new();
     for case in &fixture.cases {
+        if case.exhaust_padding {
+            // The documented shared budget is 4 MiB. A larger first line charge forces the
+            // public builder to preserve the pre-pass tier without budgeted analysis.
+            let padded = format!("{} ;:{}", case.command, "x".repeat(4 * 1024 * 1024));
+            let record = action_from_command(&padded, &CommandContext::default())
+                .expect("padding preserves tokenization");
+            assert_eq!(
+                serde_json::to_value(record.risk).unwrap(),
+                case.risk,
+                "{}",
+                case.why
+            );
+            assert_eq!(record.syntactic.bin.as_deref(), Some(case.bin.as_str()));
+        }
         let record = action_from_command(&case.command, &CommandContext::default())
             .unwrap_or_else(|e| panic!("{:?} tokenizes: {e:?}", case.command));
         // Risk serializes as its lowercase wire name ("low" | "medium" | "high" | "critical").

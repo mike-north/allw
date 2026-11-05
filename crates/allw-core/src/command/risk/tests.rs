@@ -1168,16 +1168,30 @@ fn a_first_running_substitution_survives_budget_exhaustion() {
 /// multiple of its length.
 #[test]
 fn the_pre_pass_is_linear_per_level() {
-    let line = heredoc_bomb(200_000);
-    SCANNED.with(|c| c.set(0));
-    let mut budget = Budget::new(MAX_RISK_WORK);
-    note_visible_programs(Some(&line), &[], &mut budget);
-    let scanned = SCANNED.with(std::cell::Cell::get);
-    assert!(
-        scanned < 4 * (MAX_SHELL_NESTING + 1) * line.len(),
-        "scanned {scanned} for {} bytes",
-        line.len()
-    );
+    let mut work = Vec::new();
+    for size in [50_000, 100_000, 200_000] {
+        let line = heredoc_bomb(size);
+        SCANNED.with(|c| c.set(0));
+        PRE_PASS_KEY_BYTES.with(|c| c.set(0));
+        let mut budget = Budget::new(MAX_RISK_WORK);
+        note_visible_programs(Some(&line), &[], &mut budget);
+        let scanned =
+            SCANNED.with(std::cell::Cell::get) + PRE_PASS_KEY_BYTES.with(std::cell::Cell::get);
+        // Bash plus at most six alternate readings: a fixed factor at each level.
+        assert!(
+            scanned < 4 * 7 * (MAX_SHELL_NESTING + 1) * line.len(),
+            "scanned {scanned} for {} bytes",
+            line.len()
+        );
+        work.push(scanned);
+    }
+    eprintln!("heredoc pre-pass scan work: {work:?}");
+    for pair in work.windows(2) {
+        assert!(
+            pair[1] > pair[0] && pair[1] <= 2 * pair[0],
+            "nonlinear work: {work:?}"
+        );
+    }
 }
 
 /// Regression (R3-3): bash 5 ends a heredoc inside `$(…)` at a body line `EOF)`, and the `)`
@@ -1456,16 +1470,14 @@ fn a_command_line_a_wrapper_runs_survives_budget_exhaustion() {
     assert_exhausted(&format!("echo \"$(echo 'x; {DD}')\" ;:{pad}"), Risk::High);
 }
 
-/// Rows of the shared fixtures that padding still lowers. Each is a pre-existing gap of the
-/// pre-pass tracked in #389 (here-strings and the dash / ANSI-C / arithmetic alternate readings
-/// are only read by the budgeted analysis). Remove a row when #389 fixes it; the guard fails if a
-/// listed row stops being lowered, so the list only shrinks.
-const PADDING_LOWERS_TRACKED_IN_389: &[&str] = &[
-    // Here-strings: the pre-pass doesn't read a `<<<` body as a script.
+/// Critical examples whose here-string or alternate-reading reach must survive exhaustion.
+/// Each contains a visible `dd`, which the program table assigns Critical.
+const CRITICAL_READING_EXAMPLES: &[&str] = &[
+    // Every here-string body is read as a script.
     "bash <<< \"dd if=/dev/zero of=/dev/sda\"",
     "cat <<< \"dd if=/dev/zero of=/dev/sda\"",
     "{ bash; } <<< 'dd if=/dev/zero of=/dev/sda'",
-    // Alternate readings (dash: no `$'…'`; no arithmetic commands): the pre-pass reads bash only.
+    // Alternate readings reveal a command hidden by bash quoting or arithmetic.
     "dash -c 'echo $'\"'\"'\\'\"'\"'\ndd if=/dev/zero of=/dev/sda\necho \\'\"'\"''\"'\"''",
     "dash -c 'echo $'\"'\"'\\'\"'\"' ; dd if=/dev/zero of=/dev/sda ; echo \\'\"'\"''\"'\"''\"'\"''",
     "sh -c '((: ; dd if=/dev/zero of=/dev/sda))'",
@@ -1483,14 +1495,12 @@ const PADDING_LOWERS_TRACKED_IN_389: &[&str] = &[
 /// - `" rm"` × 6000 (~18 KB): every `rm` position pays `direct_risk`'s suffix charge, so the argv
 ///   analysis of the `shlex` words exhausts it, which catches wrapper-class drift (`su -c '…'`).
 ///
-/// The allow-list must still be lowered by the first pad, so it only shrinks.
 #[test]
 fn padding_never_lowers_a_fixture_row() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let long_word = format!(" ;:{}", "x".repeat(MAX_RISK_WORK));
     let rm_words = format!(" ;:{}", " rm".repeat(6000));
     let mut lowered = Vec::new();
-    let mut tracked_fixed = Vec::new();
     for file in [
         "command_risk_vectors.json",
         "command_line_risk_vectors.json",
@@ -1502,19 +1512,15 @@ fn padding_never_lowers_a_fixture_row() {
             let Ok(unpadded) = action_from_command(row, &ctx()).map(|a| a.risk) else {
                 continue;
             };
-            let tracked = PADDING_LOWERS_TRACKED_IN_389.contains(&row);
             for (name, pad) in [("long word", &long_word), ("rm words", &rm_words)] {
                 let line = format!("{row}{pad}");
                 let (padded, budget) = analyze_with_budget(&line, MAX_RISK_WORK);
                 assert!(budget.exhausted, "{file}: {row:?} + {name} did not exhaust");
                 let is_lowered = risk_rank(padded) < risk_rank(unpadded);
-                if is_lowered && !tracked {
+                if is_lowered {
                     lowered.push(format!(
                         "{file}: {row:?} + {name}: {unpadded:?} → {padded:?}"
                     ));
-                }
-                if tracked && !is_lowered && name == "long word" {
-                    tracked_fixed.push(format!("{file}: {row:?}"));
                 }
             }
         }
@@ -1524,9 +1530,99 @@ fn padding_never_lowers_a_fixture_row() {
         "padding lowers:\n{}",
         lowered.join("\n")
     );
-    assert!(
-        tracked_fixed.is_empty(),
-        "no longer lowered by padding; remove from PADDING_LOWERS_TRACKED_IN_389:\n{}",
-        tracked_fixed.join("\n")
+}
+
+/// Every body is a script, and alternate readings take the maximum tier. Thus the visible
+/// `dd` in each issue example is Critical even when later input exhausts analysis.
+/// @see docs/policy-seam.md §v1 command risk: classify what actually runs
+#[test]
+fn here_strings_and_alternate_readings_survive_exhaustion() {
+    let pad = format!(" ;:{}", "x".repeat(MAX_RISK_WORK));
+    let mut failures = Vec::new();
+    for head in CRITICAL_READING_EXAMPLES.iter().copied().chain([
+        "sh -c 'echo a # ; dd'",
+        "bash 3<<<'dd if=/dev/zero of=/dev/sda'",
+    ]) {
+        assert_eq!(line_risk(head), Risk::Critical, "{head:?}");
+        let (risk, budget) = analyze_with_budget(&format!("{head}{pad}"), MAX_RISK_WORK);
+        assert!(budget.exhausted);
+        if risk != Risk::Critical {
+            failures.push(format!("{head:?}: {risk:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Reading a body as a script consumes the same nesting level as `-c`; text past the
+/// documented limit must remain unread, even in the unbudgeted pass.
+/// @see docs/policy-seam.md §v1 command risk (Bounds)
+#[test]
+fn here_string_pre_pass_respects_the_nesting_limit() {
+    let mut head = DD.to_string();
+    for _ in 0..=MAX_SHELL_NESTING {
+        head = format!("bash <<< {}", quoted(&head));
+    }
+    assert_eq!(line_risk(&head), Risk::High);
+    assert_exhausted(
+        &format!("echo \"$({head})\" ;:{}", "x".repeat(MAX_RISK_WORK)),
+        Risk::High,
     );
+}
+
+/// All ambiguous grammars are a fixed set at fixed nesting depth. Doubling inert data
+/// must therefore double scan work, rather than multiply it by the number of words.
+/// @see docs/policy-seam.md §v1 command risk (Bounds)
+#[test]
+fn alternate_reading_pre_pass_work_scales_with_input_bytes() {
+    let mut work = Vec::new();
+    for size in [2_000, 4_000, 8_000] {
+        let mut text = "x ".repeat(size);
+        for _ in 0..MAX_SHELL_NESTING {
+            text = format!("echo a #\necho $'x'; ((:)); cat <<EOF\n{text}\nEOF\n");
+        }
+        SCANNED.with(|c| c.set(0));
+        PRE_PASS_KEY_BYTES.with(|c| c.set(0));
+        let mut budget = Budget::new(MAX_RISK_WORK);
+        note_line_programs(
+            &text,
+            0,
+            &mut PrePass {
+                budget: &mut budget,
+                visited: std::collections::HashSet::new(),
+            },
+        );
+        let scanned =
+            SCANNED.with(std::cell::Cell::get) + PRE_PASS_KEY_BYTES.with(std::cell::Cell::get);
+        assert!(
+            !budget.exhausted,
+            "the pre-pass must not spend the shared budget"
+        );
+        // At most seven readings per level, with memoized descendants and bounded
+        // scans per byte. This is independent of the number of words in the input.
+        assert!(scanned < 4 * 7 * (MAX_SHELL_NESTING + 1) * text.len());
+        assert_eq!(budget.used, 0, "the lexical pass only records tiers");
+        work.push(scanned);
+    }
+    eprintln!("alternate-reading pre-pass scan work: {work:?}");
+    assert!(work[0] > 0, "scan accounting must observe actual work");
+    for pair in work.windows(2) {
+        assert!(pair[1] > pair[0]);
+        assert!(pair[1] <= 2 * pair[0], "nonlinear scan work: {work:?}");
+    }
+}
+
+/// Reaching the same script at the depth limit must not hide its later shallower reach.
+/// @see docs/policy-seam.md §v1 command risk (Bounds)
+#[test]
+fn pre_pass_memoization_preserves_remaining_nesting_depth() {
+    let text = format!("sh -c '{}'", DD);
+    let mut budget = Budget::new(MAX_RISK_WORK);
+    let mut pass = PrePass {
+        budget: &mut budget,
+        visited: std::collections::HashSet::new(),
+    };
+    note_line_programs(&text, MAX_SHELL_NESTING, &mut pass);
+    assert_ne!(pass.budget.found, Risk::Critical);
+    note_line_programs(&text, 0, &mut pass);
+    assert_eq!(pass.budget.found, Risk::Critical);
 }

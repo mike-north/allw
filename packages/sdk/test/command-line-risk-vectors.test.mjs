@@ -69,3 +69,20 @@ for (const { command, risk, bin, why } of fixture.cases) {
     assert.equal(action.syntactic.bin, bin);
   });
 }
+
+// The shared exhaustion cases use compact metadata rather than literal megabyte fixtures.
+// A first charge larger than the documented 4 MiB budget exercises the pre-pass in WASM
+// and in the public SDK builder; the expected tier remains the hand-derived fixture tier.
+for (const { command, risk, bin, why, exhaust_padding } of fixture.cases) {
+  if (!exhaust_padding) continue;
+  test(`padded WASM/SDK command risk: ${JSON.stringify(command)}`, async () => {
+    const padded = `${command} ;:${"x".repeat(4 * 1024 * 1024)}`;
+    const wasm = await loadWasm();
+    const record = JSON.parse(wasm.action_from_command(padded, null));
+    const action = await commandActionFromLine(padded);
+    for (const result of [record, action]) {
+      assert.equal(result.risk, risk, why);
+      assert.equal(result.syntactic.bin, bin);
+    }
+  });
+}

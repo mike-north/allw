@@ -431,12 +431,14 @@
       "command": "bash <<< \"dd if=/dev/zero of=/dev/sda\"",
       "risk": "critical",
       "bin": "bash",
+      "exhaust_padding": true,
       "why": "a here-string fed to a shell is a script"
     },
     {
       "command": "cat <<< \"dd if=/dev/zero of=/dev/sda\"",
       "risk": "critical",
       "bin": "cat",
+      "exhaust_padding": true,
       "why": "a here-string is always also read as a script, whatever consumes it: dd"
     },
     {
@@ -479,6 +481,7 @@
       "command": "{ bash; } <<< 'dd if=/dev/zero of=/dev/sda'",
       "risk": "critical",
       "bin": "{",
+      "exhaust_padding": true,
       "why": "a here-string on a group is read as a script"
     },
     {
@@ -503,30 +506,35 @@
       "command": "dash -c 'echo $'\"'\"'\\'\"'\"'\ndd if=/dev/zero of=/dev/sda\necho \\'\"'\"''\"'\"''",
       "risk": "critical",
       "bin": "dash",
+      "exhaust_padding": true,
       "why": "dash has no $'…', so the middle line runs dd (alternate readings run at every nesting level)"
     },
     {
       "command": "dash -c 'echo $'\"'\"'\\'\"'\"' ; dd if=/dev/zero of=/dev/sda ; echo \\'\"'\"''\"'\"''\"'\"''",
       "risk": "critical",
       "bin": "dash",
+      "exhaust_padding": true,
       "why": "dash reads $'\\' as $ plus a single-quoted backslash, so dd runs"
     },
     {
       "command": "sh -c '((: ; dd if=/dev/zero of=/dev/sda))'",
       "risk": "critical",
       "bin": "sh",
+      "exhaust_padding": true,
       "why": "dash (sh on Debian/Ubuntu) reads (( as two subshells, so dd runs"
     },
     {
       "command": "eval 'echo $'\"'\"'\\'\"'\"' ; dd if=/dev/zero of=/dev/sda ; echo \\'\"'\"''\"'\"''\"'\"''",
       "risk": "critical",
       "bin": "eval",
+      "exhaust_padding": true,
       "why": "the eval argument gets the non-ANSI-C reading too"
     },
     {
       "command": "echo \"$(((: ; dd if=/dev/zero of=/dev/sda)))\"",
       "risk": "critical",
       "bin": "echo",
+      "exhaust_padding": true,
       "why": "fail-upward: bash, zsh, dash and ksh parse $((( as arithmetic and run nothing, but T1 also reads the (( as two subshells, which would run dd"
     },
     {
@@ -636,6 +644,20 @@
       "risk": "critical",
       "bin": "eval",
       "why": "#323 control: eval runs its argument as a command line"
+    },
+    {
+      "command": "sh -c 'echo a # ; dd'",
+      "risk": "critical",
+      "bin": "sh",
+      "exhaust_padding": true,
+      "why": "The no-comment reading runs dd: the maximum reading is Critical and exhaustion must preserve it."
+    },
+    {
+      "command": "bash 3<<<'dd if=/dev/zero of=/dev/sda'",
+      "risk": "critical",
+      "bin": "bash",
+      "exhaust_padding": true,
+      "why": "An attached fd-prefixed here-string is also read as a script, preserving visible dd on exhaustion."
     }
   ]
 }
