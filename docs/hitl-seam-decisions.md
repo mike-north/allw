@@ -350,3 +350,10 @@ binding/projection change, not a weaker common request identity.
 
 **Consequence:** the prior-art appendix records this drift. It does not change the L0 contract or
 turn the package implementation into an OpenClaw repair project.
+
+## 2026-11-05 — allw rule artifact superseded (#404)
+
+allw no longer has a separately signed rule artifact. Earlier references below preserve decision history,
+not current scope. The policy layer is a separate project: it offers policy-adjustment options to the human
+through allw and receives the human's modification signal. This feature is not being built now. Authentication
+of that choice remains open until the work is scheduled; a one-shot verdict does not authorize standing policy.

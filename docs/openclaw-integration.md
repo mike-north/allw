@@ -587,16 +587,10 @@ an OpenClaw request in v1, because `constraints.allowed_decisions` is `["approve
 the `Verdict` type has nowhere to put a scope. The mapping is not "unsupported"; it is structurally
 absent.
 
-**Reserved future path (do not build here).** The only artifact allowed to widen standing autonomy
-is a **signed `PolicyRule`** ([policy-seam.md](./policy-seam.md) §The approval → rule bridge),
-produced by `policy_rule_from_approval` and verified the same way a verdict is. A later slice could
-translate a verified rule (`effect: "allow"`, `tier: "syntactic"`, `provenance: "from_approval"`)
-into an OpenClaw allowlist entry via the exec-approvals policy management RPCs — a separate,
-explicit, signed, revocable artifact, submitted through `exec.approvals.set`, **never** through
-`approval.resolve`. Two problems must be solved before that is built, and neither is solved here:
-allw's `bounds` (`ttl`, `max_uses`, `time_window`) have no OpenClaw allowlist equivalent, so the
-translation is lossy in the dangerous direction; and rule revocation would need to propagate to the
-gateway's durable document.
+**External policy responsibility.** allw has no standing-rule artifact. If policy-modification work is
+scheduled, the external policy layer offers options, the human selects or edits them, and allw carries the
+modification signal back. The caller owns validation and application; authentication of that choice remains
+open. Nothing here maps a verdict to durable standing trust or adds a replacement API.
 
 ### 7.4 Submitting the resolve
 
@@ -732,8 +726,8 @@ The bridge is an **on-machine local surface** and inherits the hard constraint f
   machines and a `.wasm` is just data it loads.
 - **No packaged native executable** — no `pkg`, no single-file binary, no bundled `openclaw`
   companion binary. The bridge is `node dist/cli.js`, exactly like the Claude Code and Codex hooks.
-- **Thin shell only.** All hashing, JWE/JWS, verdict verification, `ActionRecord` construction, and
-  policy evaluation stay in `crates/allw-core` behind the WASM boundary. The bridge maps OpenClaw
+- **Thin shell only.** All hashing, JWE/JWS, verdict verification and `ActionRecord` construction
+  stay in `crates/allw-core` behind the WASM boundary; policy evaluation belongs to the caller. The bridge maps OpenClaw
   wire shapes to core inputs and back; it implements no crypto and no parsing the core already owns.
 - `@openclaw/gateway-client`'s Node entry owns its own WebSocket transport, which is pure JS and
   adds no native dependency — verify this at slice time, and reject any transitive native addon.
@@ -838,7 +832,7 @@ Rust core rather than being silently accepted. Tracked separately from this docu
 | 5   | **Decision + resolution.** `requestApproval` wiring, full verdict verification, `approval.resolve` submission, `applied: false` reconcile, timeout budgeting, the complete §9 matrix.                                                                                                                                              | End-to-end fail-closed behavior.                                                                                                                                    | One direct negative test per §9 row, plus: `allow-always` is never submitted under any input; `no-expressible-allow`; `insufficient-budget`; gateway loss both not-restored and restored-while-pending; unsupported kind is neither approved nor denied. |
 | 6   | **Operability + UAT.** `scripts/uat-openclaw.sh`, package README, structured logging that never emits plaintext context, and the operator-prerequisite checks from §3 surfaced as startup diagnostics.                                                                                                                             | Operator-runnable UAT and a bridge that refuses to start misconfigured.                                                                                             | Script test in the style of `scripts/uat-codex.test.mjs`; a startup-diagnostic test asserting refusal on `tools.exec.mode: auto` and on a margin below the fetch timeout.                                                                                |
 
-Explicitly out of scope for all six slices: the `allow-always` → `PolicyRule` bridge (§7.3),
+Explicitly out of scope for all six slices: policy modification (§7.3),
 `system-agent` mapping (§5.3), and anything requiring `operator.admin`.
 
 ---

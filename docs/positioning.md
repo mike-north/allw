@@ -2,8 +2,7 @@
 
 **One inbox for every agent approval, across every machine.**
 
-> Clawvisor asks for permission. **allw helps you author the boundary** — and gets you to real agent
-> autonomy without re-configuring every time you add a tool.
+> allw brings an exact action to the human and returns a verified decision. The caller owns the boundary.
 
 ---
 
@@ -47,25 +46,14 @@ a verifiable decision.
 
 ---
 
-## Why it's different: you converge on autonomy, you don't configure it
+## Human decisions within the caller's boundary
 
-Every approval tool is really trying to get you to the same place: **a richly-articulated permission boundary
-inside which an agent can operate autonomously.** The hard part is getting there _without an overwhelming setup
-process every time you add a new tool._
+allw gives callers one encrypted, auditable way to ask a human. The caller's external policy decides when to
+ask and whether an action may run. allw never widens that boundary or learns standing grants from approvals.
 
-Two ways to fail:
-
-- **Crude but easy** — per-tool allow/deny/ask. Trivial to set up, but you never reach a nuanced boundary.
-- **Nuanced but overwhelming** — define every permission up front. You can reach nuance, but the setup is
-  crushing, and you pay it again every time a new tool shows up. With MCP, new tools show up constantly.
-
-**allw threads the needle.** A new tool starts at a safe, coarse default. The boundary then **widens from your
-real decisions** — the system notices the patterns ("you've approved this 20 times, always yes") and offers to
-let the agent do it autonomously. Over time you converge on a precise, personal boundary, and the system asks you
-_less_. Marginal setup per new tool is effectively zero.
-
-That convergence journey is the moat. A static gate that just forwards each permission request never gets you
-there — and it never gets better the more you use it. allw does.
+When policy modification is scheduled, the external layer will offer adjustment options, allw will carry them
+to the human, and allw will return the human's modification signal. The external layer owns applying it. This
+feature is not built now.
 
 ---
 
@@ -85,20 +73,12 @@ there — and it never gets better the more you use it. allw does.
 **v1 (now):** the approval primitive — one inbox, end-to-end encrypted, verifiable one-shot decisions, paired to
 your machines and agents. A complete product on day one for anyone running agents.
 
-**Next:** a policy layer that sits in front of the primitive and holds your autonomy boundary — auto-allow inside
-it, ask at its edge, deny beyond it — widened over time by your own decisions.
+**Policy integration:** the policy layer is a separate project. Its only allw-facing role is to offer policy
+adjustments to the human through an approval and receive the human's modification signal. This is future work,
+not a policy evaluator, rule store, or rule generator in allw.
 
-**Then:** governing your _local_ capabilities. Safely give a web agent access to your Reminders, Notes, Calendar,
-or browser on a machine you own — you decide per item what's autonomous, what needs a tap, and what's forbidden;
-enforced on your hardware, approved from your phone, with no all-powerful key ever issued.
-
-> **Where macts fits on this ladder.** The MVP ([mvp-scope.md](./mvp-scope.md)) pulls **macts** forward as an
-> approval **caller**: a macts host holds a confirm-first operation and asks a human through allw. That is a
-> v1/MVP integration of the **first** rung — the primitive, with one more caller in front of it — and **not** an
-> early arrival of the third rung. "Governing your local capabilities" means the **semantic policy tier**
-> (capability inference, per-command schemas, capability-scoped rules), and that stays deferred exactly as
-> described above and in [policy-seam.md](./policy-seam.md) §The three tiers. Host ∧ key policy composition in
-> the MVP lives in **macts**, not in an allw policy engine. More callers, same rung.
+**macts:** a macts host owns policy and decides which confirm-first operations reach allw. Host and API-key
+policy composition stays in macts; allw supplies the verified human decision.
 
 ---
 

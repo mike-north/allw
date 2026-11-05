@@ -1,5 +1,7 @@
 # allw — On-Device Decision History (post-v1)
 
+**Status (2026-11-05):** rule outputs are superseded by the decision to remove allw rule evaluation and signed-rule artifacts (#404); this document is under review.
+
 **CEO roadmap Decision 7.** The first half of the decision-history flywheel: a learning loop that turns the
 user's own past approvals into better future governance — without anything sensitive ever leaving the device.
 

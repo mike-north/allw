@@ -102,7 +102,7 @@ The approval primitive has two independent device keys:
 | Key                   | Algorithm | Purpose                                        | Relay-visible?                                       |
 | --------------------- | --------- | ---------------------------------------------- | ---------------------------------------------------- |
 | Device encryption key | X25519    | JWE recipient for `ApprovalContext` ciphertext | public key only, in `GET /devices` and account state |
-| Device signing key    | Ed25519   | Signs verdicts and policy rules                | public key only through `device_cert`                |
+| Device signing key    | Ed25519   | Signs verdicts                                 | public key only through `device_cert`                |
 
 These two keys are derived from **two independently-drawn 32-byte random seeds** — enrollment MUST NOT derive both
 from one seed. The cross-platform smoke tests (`crates/allw-uniffi/tests/*`, and the WASM vectors) reuse a single
@@ -657,7 +657,7 @@ Enrollment requirements:
 
 **Resolved (#16):** actor enrollment is represented as **entries in signed account-state** (`actors`), reusing the
 same root-signed document and highest-sequence revocation semantics as device trust — not a separate root-signed
-`actor_cert` artifact. This follows the established pattern: device keys, policy-rule signing keys, and verdict
+`actor_cert` artifact. This follows the established pattern: device keys and verdict
 verification all resolve trust through the same account-state document. A standalone `actor_cert` remains an
 option for future flows that need the trust material to ride inside the request envelope, but v1 anchors through
 account state.
@@ -1029,8 +1029,8 @@ When an actor is revoked:
 
 - New requests from that actor must not be shown as verified.
 - Existing pending requests from that actor should be retracted or downgraded before approval.
-- Any policy rule scoped to that actor remains subject to policy precedence, but the actor can no longer produce a
-  valid requester attestation.
+- The actor can no longer produce a valid requester attestation; any standing policy remains the external
+  caller's responsibility.
 
 ## Recovery
 

@@ -134,8 +134,8 @@ the bridge never assumes its clock agrees.
 **`allow-always` is never submitted, under any circumstance** (§7.3). An allw verdict is one-shot and
 scope-free by construction; OpenClaw's `allow-always` writes durable standing trust. Turning one into
 the other would let a single human tap authorize an unbounded set of future, never-approved
-executions. The only artifact allowed to widen standing autonomy is a signed `PolicyRule`
-([`docs/policy-seam.md`](../../docs/policy-seam.md)), and that path is deliberately not built here.
+executions. Standing policy belongs to the external policy layer; allw does not produce a rule artifact or
+widen the boundary. Policy-modification signals are future work, not built here.
 
 If `allow-once` is not in the approval's `allowedDecisions`, an approved verdict cannot be faithfully
 expressed: the bridge submits `deny` with reason `no-expressible-allow` and logs loudly.

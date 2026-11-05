@@ -164,7 +164,7 @@ error.
 `challenge_response`? ·
 `sig` (device key) · `device_cert`? (chains device key → account root, so verifiers need only the root).
 
-> No `scope`/reuse field — standing autonomy lives in the policy layer ([policy-seam.md](./policy-seam.md)), not the verdict.
+> No `scope`/reuse field — standing autonomy belongs to the separate external policy layer ([policy-seam.md](./policy-seam.md)), not the verdict.
 
 ### AuditRecord — _append-only, hash-chained_
 
@@ -188,7 +188,7 @@ verdict `sig` (+ optional integrator counter-sign). Periodically anchor the head
 ## Verification checklist (integrator MUST)
 
 1. Signature valid against the approver's device/account root key. Core verdict verification (including
-   plaintext-free provenance) and policy-rule verification MUST require the certified account id to equal
+   plaintext-free provenance) MUST require the certified account id to equal
    `account_id_for_root` of the trusted verifying root, using the existing core derivation
    ([enrollment.md](./enrollment.md) §Self-Certifying Account Id). A valid root signature cannot create another
    account identity: other-root-derived, free-form, empty and noncanonical ids fail closed with the distinct
@@ -200,8 +200,8 @@ verdict `sig` (+ optional integrator counter-sign). Periodically anchor the head
    for both `requestApproval` and the returned `Verdict.verify()`. This complements the independent
    binding of account state to the verdict's account, and still applies when re-verification explicitly
    omits account state (`accountStates: []` or `undefined`). A per-call `expectedAccountId` that is
-   omitted, `undefined` or empty preserves the client account guard. Standalone verdict and policy-rule
-   verification and policy evaluation exports **require** a non-empty `expectedAccountId` from their
+   omitted, `undefined` or empty preserves the client account guard. Standalone verdict
+   verification exports **require** a non-empty `expectedAccountId` from their
    caller; they have no client account default and reject missing or empty values at runtime.
 2. Bound to the **exact request** (no swap): the verdict's `request_id` equals the request's `id`, **and** its
    `request_hash` equals the integrator's locally-computed hash of the canonical `ApprovalContext`. Both are
@@ -234,9 +234,9 @@ verdict `sig` (+ optional integrator counter-sign). Periodically anchor the head
   with **biometric-gated signing** (the verdict key is released by Face ID / Touch ID and never leaves hardware).
   A `device_cert` chains each device key to an account root so verifiers need only the root; see
   [enrollment.md](./enrollment.md) for pairing, rotation, revocation, and recovery.
-- **Crypto:** **JOSE** — JWE (X25519 ECDH) for context, JWS (Ed25519) for verdicts/rules — reusing vaultkeeper's
-  substrate. Verdict and policy-rule JWS verification both chain the signing device key through `device_cert` to the
-  account root and reject account / `kid` confusion. Static ECDH for v1; forward secrecy later.
+- **Crypto:** **JOSE** — JWE (X25519 ECDH) for context, JWS (Ed25519) for verdicts — reusing vaultkeeper's
+  substrate. Verdict JWS verification chains the signing device key through `device_cert` to the
+  account root and rejects account / `kid` confusion. Static ECDH for v1; forward secrecy later.
 
 ---
 
@@ -379,8 +379,9 @@ after the local call has settled cannot change its result.
 - **Ship:** one-shot scope-free verdicts · actor-key attestation · **syntactic** `ActionRecord` (policy-seam T1) ·
   number-match challenge for destructive/critical · optional human `note` · E2EE + verifiable verdict + audit chain ·
   **structure-not-data boundary** (default / structure-visible tier only; `privacy_preference` reserved as null).
-- **Defer:** reuse/standing autonomy & conditions (→ policy layer), semantic `ActionRecord` fields (→ T3),
-  predicate rules, paranoid/enterprise and ai-summary privacy tiers.
+- **External responsibility:** standing autonomy, conditions, and predicate rules belong to the separate policy
+  project; allw does not evaluate, hold, generate or sign them.
+- **Defer:** semantic `ActionRecord` fields and paranoid/enterprise and ai-summary privacy tiers.
 
 > **Caller set (MVP).** The set of integrators calling this contract has grown beyond the original Claude Code /
 > Codex hooks to include the **OpenClaw** approval client and the **macts** HITL-provider plugin (see

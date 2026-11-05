@@ -131,8 +131,9 @@ implement in v1:
 
 - **Policy-editing as part of approval** — the ability for a human's answer to also adjust standing policy.
   Reserved, not built. And when it is built it can never become a field on a verdict: verdicts stay
-  **one-shot and scope-free** ([contract.md](./contract.md) §Verdict), and any standing rule is a separately
-  signed `PolicyRule` ([policy-seam.md](./policy-seam.md) §The approval → rule bridge).
+  **one-shot and scope-free** ([contract.md](./contract.md) §Verdict). The external policy layer owns any
+  standing change. allw only carries that layer's options to the human and returns the human's modification
+  signal; how that choice is authenticated remains open.
 - **Routing host-level vs. key-level approvals to different allw accounts** — the seam must exist from the
   start so it can be split later without a breaking change. Initially **both route to the same user's
   account**.
@@ -140,8 +141,8 @@ implement in v1:
 ### 3. Host ∧ key policy composition lives in macts
 
 A macts API key may **only tighten** host policy, never widen it: composition is **intersection**, matching the
-cross-gate monotonicity rule in [policy-seam.md](./policy-seam.md) §Composition & monotonicity. This
-composition is macts's job, not allw's — allw has no policy engine in v1 and simply receives whatever
+cross-gate monotonicity invariant in [contract.md](./contract.md). This
+composition is macts's job, not allw's — allw does not evaluate, hold, or generate rules and simply receives whatever
 escalations macts decides to raise. The observable consequence is ST-3's negative half: a host-forbidden
 operation is refused by macts and never becomes an approval request.
 
@@ -158,7 +159,7 @@ is a PR with a design problem.
 - **Fail-closed.** Timeout, no response, or an unverifiable artifact resolves to **deny** — in every caller,
   including across two nested timeout budgets (ST-2).
 - **One-shot and scope-free verdicts.** No reuse, no "don't ask again," no scope field. Standing autonomy is
-  the policy layer's job and arrives as a signed `PolicyRule`. ([contract.md](./contract.md) §Verdict.)
+  the separate external policy layer's job. ([contract.md](./contract.md) §Verdict.)
 - **WYSIWYS.** The verdict binds to `request_hash` over the exact plaintext the human was shown, computed
   device-side after decryption.
 - **Zero-knowledge relay.** The relay routes ciphertext and signed verdicts — never plaintext. At the default
@@ -173,10 +174,10 @@ is a PR with a design problem.
 ## Explicitly out of scope for the MVP
 
 - **The semantic / T3 capability-inference tier** — capability taxonomies, per-command schema DB, doc
-  extraction, capability-scoped rules. Deferred exactly as [policy-seam.md](./policy-seam.md) describes.
+  extraction, capability-scoped rules. Owned outside allw, as [policy-seam.md](./policy-seam.md) describes.
   Adding macts as a _caller_ does not pull this forward; see [positioning.md](./positioning.md) §Where it
   starts, where it goes.
-- **A policy engine inside allw.** v1 has none. Every escalation the MVP handles is decided by the _caller's_
+- **Rule evaluation, holding, generation or signing inside allw.** No replacement or placeholder is built. Every escalation the MVP handles is decided by the _caller's_
   policy (the hook's, OpenClaw's, macts's) before allw is invoked.
 - **The paranoid/enterprise and ai-summary privacy tiers.** `privacy_preference` stays reserved and null;
   only the default structure-visible tier is built.
