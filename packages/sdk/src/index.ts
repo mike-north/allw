@@ -605,7 +605,9 @@ function readVerifiedWasmResult(json: string): VerifiedWasmResult {
   if (typeof value.nonce_b64 !== "string" || value.nonce_b64.length === 0) {
     throw new Error("allw: verify_verdict result did not include a nonce_b64");
   }
-  if (value.note !== undefined && typeof value.note !== "string") {
+  // Inherited values cannot represent claims authenticated by the core.
+  const hasNote = Object.hasOwn(value, "note");
+  if (hasNote && typeof value.note !== "string") {
     throw new Error("allw: verify_verdict result included a malformed note");
   }
   return {
@@ -613,7 +615,7 @@ function readVerifiedWasmResult(json: string): VerifiedWasmResult {
     deviceId: value.device_id,
     decidedAt: value.decided_at,
     nonceB64: value.nonce_b64,
-    ...(value.note === undefined ? {} : { note: value.note }),
+    ...(hasNote ? { note: value.note as string } : {}),
   };
 }
 

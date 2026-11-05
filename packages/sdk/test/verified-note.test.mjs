@@ -45,6 +45,28 @@ test("SDK verification omits note for the note-less shared vector", async () => 
   assert.equal(Object.hasOwn(result, "note"), false);
 });
 
+test("SDK verification never treats an inherited note as signed", async (t) => {
+  // Only an own field in the core's JSON can represent a signed note.
+  const original = Object.getOwnPropertyDescriptor(Object.prototype, "note");
+  t.after(() => {
+    if (original) {
+      Object.defineProperty(Object.prototype, "note", original);
+    } else {
+      delete Object.prototype.note;
+    }
+  });
+  Object.defineProperty(Object.prototype, "note", {
+    value: "injected through the prototype",
+    configurable: true,
+    writable: true,
+  });
+  const result = await verifyVerdictWithAccountStates({
+    ...input,
+    verdict: JSON.parse(vector.verdict_json),
+  });
+  assert.equal(Object.hasOwn(result, "note"), false);
+});
+
 test("SDK rejects non-string notes from WASM before accepting the nonce", async (t) => {
   // A private copy substitutes only the FFI boundary, leaving the shipped vendor untouched.
   const root = mkdtempSync(join(tmpdir(), "allw-verified-note-"));
