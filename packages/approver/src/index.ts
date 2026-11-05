@@ -28,7 +28,6 @@ export type {
   DeviceInboundMessage,
   DisplayModel,
   DisplaySubstrate,
-  Risk,
   Surface,
   SyntacticSubstrate,
   UnsignedVerdict,

@@ -37,11 +37,8 @@ function context(overrides = {}) {
       display: "Claude Code on laptop",
       attestation: "verified",
     },
-    risk: {
-      level: "high",
-      reversible: false,
-      summary: "publishes local commits to the remote",
-    },
+    summary: "publishes local commits to the remote",
+    reversible: false,
     allowed_decisions: ["approved", "denied"],
     ...overrides,
   };
@@ -100,7 +97,7 @@ test("sync builds a pending inbox first and keeps resolved history below the fol
       resolved.id,
       {
         requestHash: "hash-resolved",
-        context: context({ risk: { level: "low", reversible: true, summary: "reads a file" } }),
+        context: context({ summary: "reads a file", reversible: true }),
         resolvedDecision: "approved",
       },
     ],
@@ -559,4 +556,17 @@ test("a runtime without a display escaper has its error text withheld, never sho
   const controller = new WebApproverController({ runtime: fake, nowMs: () => NOW });
   await controller.sync([tampered]);
   assert.equal(controller.detail("req-no-escaper")?.verificationError, WITHHELD_ERROR_TEXT);
+});
+
+// #406: refreshing a new-format inbox must not silently erase an existing local receipt.
+test("sync preserves terminal history when the active relay inbox omits it", async () => {
+  const request = envelope("history-survives-refresh");
+  const core = runtime(new Map([[request.id, { context: context(), requestHash: "bound-hash" }]]));
+  const controller = new WebApproverController({ runtime: core, nowMs: () => NOW });
+  await controller.sync([request]);
+  await controller.decide(request.id, "denied");
+  const before = controller.detail(request.id);
+  await controller.sync([]);
+  assert.deepEqual(controller.detail(request.id), before);
+  assert.equal(controller.auditHistory().length, 1);
 });

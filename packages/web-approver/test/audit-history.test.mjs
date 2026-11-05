@@ -63,11 +63,8 @@ function context(overrides = {}) {
       display: "Claude Code on laptop",
       attestation: "verified",
     },
-    risk: {
-      level: "high",
-      reversible: false,
-      summary: "pushes local commits to the remote",
-    },
+    summary: "pushes local commits to the remote",
+    reversible: false,
     allowed_decisions: ["approved", "denied"],
     ...overrides,
   };
@@ -166,7 +163,8 @@ test("auditHistory records have the correct outcome and summary", async () => {
       {
         requestHash: "hash-denied",
         context: context({
-          risk: { level: "critical", reversible: false, summary: "deletes everything" },
+          summary: "deletes everything",
+          reversible: false,
         }),
         resolvedDecision: "denied",
       },

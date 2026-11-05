@@ -56,7 +56,7 @@ test("action_from_powershell_command matches every case in the shared vector", a
         : wasm.action_from_powershell_command(c.command, c.cwd),
     );
     assert.equal(record.surface, "command", c.class);
-    assert.equal(record.risk, c.risk, c.class);
+
     assert.equal(record.syntactic.raw, c.command, c.class);
     assert.equal(record.syntactic.bin, c.bin, c.class);
     assert.deepEqual(record.syntactic.argv, c.argv, c.class);

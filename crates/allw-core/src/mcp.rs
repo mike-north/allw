@@ -10,9 +10,8 @@
 //! policy rule or registry scoped to `mcp_tool_call` must never silently match a tool call no MCP
 //! server ever served (`docs/policy-seam.md` §Structure vs. data in the ActionRecord).
 //!
-//! **Scope:** syntactic substrate only (T1). No capability inference, no semantic enrichment.
-//! The `capabilities` and `scope` fields of every produced `ActionRecord` are always `None`;
-//! they are reserved for the T3 semantic tier. See `docs/policy-seam.md` §The three tiers.
+//! **Scope:** faithfully preserve tool identity, params and caller prose. No capability inference,
+//! danger rating or policy metadata is produced.
 //!
 //! # `raw` display format
 //!
@@ -39,26 +38,7 @@
 //! The format is intended for display and fallback pattern matching only; the canonical,
 //! matchable params form lives in `syntactic.params` as a structured [`serde_json::Value`].
 //!
-//! # Risk heuristic (v1)
-//!
-//! A coarse, name-based risk tier is assigned from the tool name:
-//!
-//! | Tool name prefix                   | [`Risk`] assigned |
-//! |------------------------------------|-------------------|
-//! | starts with `delete`, `remove`, or `drop` | `High`     |
-//! | starts with `destroy`, `truncate`, or `purge` | `High` |
-//! | starts with `kill`, `terminate`, or `wipe` | `High`   |
-//! | all other tools                    | `Medium`          |
-//!
-//! Matching is **case-insensitive** and **prefix-only** (a tool named `"remotely_nice"` does
-//! **not** match `remove`). The heuristic is intentionally conservative: when in doubt, choose
-//! `Medium` over `Low`. `Low` and `Critical` are not assigned by this heuristic; callers may
-//! override the returned `ActionRecord` if they have richer signal.
-//!
-//! **TODO:** T3 will replace this with capability-derived risk once the semantic engine lands
-//! (`docs/policy-seam.md` §The three tiers, T3 column).
-
-use crate::contract::{ActionRecord, Risk, Surface, SyntacticSubstrate};
+use crate::contract::{ActionRecord, Surface, SyntacticSubstrate};
 
 /// Build an [`ActionRecord`] for an MCP tool call, populating only the syntactic substrate.
 ///
@@ -79,13 +59,11 @@ use crate::contract::{ActionRecord, Risk, Surface, SyntacticSubstrate};
 /// An [`ActionRecord`] with:
 ///
 /// - `surface = Surface::McpToolCall`
-/// - `record_schema_version = 1`
+/// - `record_schema_version = 2`
 /// - `syntactic.server`, `syntactic.tool`, `syntactic.params` populated from the arguments
 /// - `syntactic.raw` set to `"<server>.<tool>(<compact-json-params>)"` (see module-level docs)
 /// - All command-surface syntactic fields (`bin`, `argv`, `flags`, `positionals`, `cwd`,
 ///   `host`, `env_refs`) set to `None`
-/// - `risk` assigned by the v1 name-based heuristic (see module-level docs)
-/// - `capabilities = None` and `scope = None` (reserved for T3; see `docs/policy-seam.md`)
 ///
 /// # Example
 ///
@@ -132,15 +110,12 @@ pub fn action_from_mcp_tool_call(
 /// An [`ActionRecord`] with:
 ///
 /// - `surface = Surface::AgentToolCall`
-/// - `record_schema_version = 1`
+/// - `record_schema_version = 2`
 /// - `syntactic.server`, `syntactic.tool` populated from the arguments; `syntactic.params` set
 ///   only when `params` is `Some`
 /// - `syntactic.raw` set to `"<server>.<tool>(<compact-json-params>)"`, or `"<server>.<tool>()"`
 ///   when `params` is `None` (see module-level docs)
 /// - All command-surface and file-edit-surface syntactic fields set to `None`
-/// - `risk` assigned by the v1 name-based heuristic (see module-level docs) — identical to
-///   `mcp_tool_call`; T3 will replace this with capability-derived risk
-/// - `capabilities = None` and `scope = None` (reserved for T3; see `docs/policy-seam.md`)
 ///
 /// # Example
 ///
@@ -210,7 +185,7 @@ pub fn action_from_agent_tool_call_with_raw(
 ///
 /// Both surfaces reduce to the same `(server, tool, params)` function-identity shape
 /// (`docs/policy-seam.md` §Structure vs. data in the ActionRecord); only the `surface` tag
-/// differs. Kept private so the public builders above cannot drift apart on risk heuristic,
+/// differs. Kept private so the public builders above cannot drift apart on identity,
 /// `raw` formatting, or which fields are populated.
 ///
 /// `raw_override`, when `Some`, is bound verbatim as `syntactic.raw` instead of the synthesized
@@ -232,10 +207,9 @@ fn build_tool_call_action(
         }
         None => format!("{server}.{tool}()"),
     });
-    let risk = v1_risk_from_tool_name(tool);
 
     ActionRecord {
-        record_schema_version: 1,
+        record_schema_version: 2,
         surface,
         syntactic: SyntacticSubstrate {
             // command-surface fields — all None for mcp_tool_call / agent_tool_call
@@ -258,40 +232,8 @@ fn build_tool_call_action(
             // cross-surface display/fallback field
             raw: Some(raw),
         },
-        risk,
-        // T3 semantic fields — reserved; MUST be None in v1
-        capabilities: None,
-        scope: None,
     }
 }
-
-/// Assign a coarse [`Risk`] tier from the tool name (v1 heuristic).
-///
-/// Matching is case-insensitive prefix matching. See the module-level doc table for the full
-/// mapping. When no prefix matches, returns [`Risk::Medium`] (fail toward caution).
-fn v1_risk_from_tool_name(tool: &str) -> Risk {
-    /// Prefixes whose matching tools are classified as `High` risk.
-    const HIGH_PREFIXES: &[&str] = &[
-        "delete",
-        "remove",
-        "drop",
-        "destroy",
-        "truncate",
-        "purge",
-        "kill",
-        "terminate",
-        "wipe",
-    ];
-
-    let lower = tool.to_lowercase();
-    for prefix in HIGH_PREFIXES {
-        if lower.starts_with(prefix) {
-            return Risk::High;
-        }
-    }
-    Risk::Medium
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -322,7 +264,7 @@ mod tests {
     fn surface_is_mcp_tool_call_and_schema_version_is_1() {
         let r = representative_record();
         assert_eq!(r.surface, Surface::McpToolCall);
-        assert_eq!(r.record_schema_version, 1);
+        assert_eq!(r.record_schema_version, 2);
     }
 
     /// server and tool must be populated from the arguments.
@@ -409,20 +351,6 @@ mod tests {
 
     // ── reserved / None fields ────────────────────────────────────────────────
 
-    /// capabilities and scope MUST be None in v1 (policy-seam.md §forward-compat req #3).
-    #[test]
-    fn capabilities_and_scope_are_none() {
-        let r = representative_record();
-        assert!(
-            r.capabilities.is_none(),
-            "capabilities MUST be None in v1 (policy-seam.md §forward-compat req #3)"
-        );
-        assert!(
-            r.scope.is_none(),
-            "scope MUST be None in v1 (policy-seam.md §forward-compat req #3)"
-        );
-    }
-
     /// Command-surface fields must all be None for an mcp_tool_call record.
     #[test]
     fn command_surface_fields_are_none() {
@@ -468,76 +396,6 @@ mod tests {
         assert_eq!(
             r1, r2,
             "same inputs must produce identical ActionRecords (determinism)"
-        );
-    }
-
-    // ── risk heuristic ────────────────────────────────────────────────────────
-
-    /// Tools with destructive-prefix names must be assigned Risk::High.
-    /// Heuristic: case-insensitive prefix match against the HIGH_PREFIXES list
-    /// (delete, remove, drop, destroy, truncate, purge, kill, terminate, wipe).
-    #[test]
-    fn risk_high_for_destructive_tool_names() {
-        // Each entry: (tool_name, expected_risk, human_rationale)
-        let cases: &[(&str, &str)] = &[
-            ("delete_project", "delete* prefix → High"),
-            ("DELETE_ALL", "case-insensitive delete* → High"),
-            ("remove_item", "remove* prefix → High"),
-            ("drop_table", "drop* prefix → High"),
-            ("destroy_workspace", "destroy* prefix → High"),
-            ("truncate_log", "truncate* prefix → High"),
-            ("purge_cache", "purge* prefix → High"),
-            ("kill_process", "kill* prefix → High"),
-            ("terminate_session", "terminate* prefix → High"),
-            ("wipe_device", "wipe* prefix → High"),
-        ];
-
-        for (tool, rationale) in cases {
-            let r = action_from_mcp_tool_call("server", tool, json!({}));
-            assert_eq!(
-                r.risk,
-                Risk::High,
-                "tool '{}' should be High risk ({})",
-                tool,
-                rationale
-            );
-        }
-    }
-
-    /// Non-destructive tools must be assigned Risk::Medium (the default).
-    #[test]
-    fn risk_medium_for_benign_tool_names() {
-        let benign_tools = [
-            "list_projects",
-            "get_task",
-            "create_note",
-            "update_title",
-            "search",
-            "read_file",
-            "send_message",
-            // "remotely_nice" must NOT match "remove" — prefix-only matching
-            "remotely_nice",
-        ];
-
-        for tool in benign_tools {
-            let r = action_from_mcp_tool_call("server", tool, json!({}));
-            assert_eq!(
-                r.risk,
-                Risk::Medium,
-                "tool '{}' should be Medium risk (benign/non-destructive)",
-                tool
-            );
-        }
-    }
-
-    /// "remotely_nice" must NOT match the "remove" prefix — the heuristic is prefix-only.
-    #[test]
-    fn prefix_only_matching_does_not_match_mid_word() {
-        let r = action_from_mcp_tool_call("server", "remotely_nice", json!({}));
-        assert_eq!(
-            r.risk,
-            Risk::Medium,
-            "'remotely_nice' must NOT match the 'remove' prefix — prefix-only heuristic"
         );
     }
 
@@ -607,7 +465,7 @@ mod tests {
             Surface::McpToolCall,
             "agent_tool_call must never be tagged mcp_tool_call"
         );
-        assert_eq!(r.record_schema_version, 1);
+        assert_eq!(r.record_schema_version, 2);
     }
 
     /// server and tool must be populated from the arguments, exactly like `mcp_tool_call`.
@@ -684,25 +542,6 @@ mod tests {
         assert!(r.syntactic.diff_hash.is_none());
     }
 
-    /// capabilities and scope MUST be None in v1, same forward-compat requirement as every
-    /// other surface (policy-seam.md §forward-compat req #3).
-    #[test]
-    fn agent_tool_call_capabilities_and_scope_are_none() {
-        let r = action_from_agent_tool_call("openclaw", "deploy_service", None);
-        assert!(r.capabilities.is_none());
-        assert!(r.scope.is_none());
-    }
-
-    /// The risk heuristic is shared verbatim with `mcp_tool_call` (same tool-name prefixes).
-    #[test]
-    fn agent_tool_call_shares_risk_heuristic_with_mcp_tool_call() {
-        let destructive = action_from_agent_tool_call("openclaw", "delete_deployment", None);
-        assert_eq!(destructive.risk, Risk::High);
-
-        let benign = action_from_agent_tool_call("openclaw", "deploy_service", None);
-        assert_eq!(benign.risk, Risk::Medium);
-    }
-
     /// Same inputs (including the `None` params) must produce identical ActionRecords.
     #[test]
     fn agent_tool_call_deterministic_same_inputs_produce_identical_records() {
@@ -739,7 +578,6 @@ mod tests {
         assert_eq!(mcp.syntactic.tool, agent.syntactic.tool);
         assert_eq!(mcp.syntactic.params, agent.syntactic.params);
         assert_eq!(mcp.syntactic.raw, agent.syntactic.raw);
-        assert_eq!(mcp.risk, agent.risk);
     }
 
     // ── action_from_agent_tool_call_with_raw ─────────────────────────────────────
@@ -776,7 +614,7 @@ mod tests {
         assert_eq!(r.syntactic.params.as_ref(), Some(&params));
     }
 
-    /// Surface, schema version, server/tool identity, risk heuristic, and the None-in-v1 reserved
+    /// Surface, schema version and server/tool identity remain independent of caller prose;
     /// fields must all match [`action_from_agent_tool_call`] exactly — only `raw` differs.
     #[test]
     fn agent_tool_call_with_raw_matches_plain_builder_except_raw() {
@@ -789,9 +627,7 @@ mod tests {
         assert_eq!(plain.syntactic.server, with_raw.syntactic.server);
         assert_eq!(plain.syntactic.tool, with_raw.syntactic.tool);
         assert_eq!(plain.syntactic.params, with_raw.syntactic.params);
-        assert_eq!(plain.risk, with_raw.risk);
-        assert_eq!(plain.capabilities, with_raw.capabilities);
-        assert_eq!(plain.scope, with_raw.scope);
+
         assert_ne!(plain.syntactic.raw, with_raw.syntactic.raw);
     }
 

@@ -24,7 +24,6 @@ import type {
   ApprovalContext,
   ApprovalDecision,
   ApprovalEnvelope,
-  ApprovalRisk,
   NumberMatchChallenge,
   SubstrateView,
   PreparedApproval,
@@ -204,11 +203,10 @@ function validateEnvelope(envelope: ApprovalEnvelope): void {
 
 /** The decrypted wire context (Rust `allw_core::ApprovalContext` serde shape). */
 interface WireApprovalContext {
-  readonly action: { readonly surface: string; readonly syntactic: unknown; readonly risk: string };
+  readonly action: { readonly surface: string; readonly syntactic: unknown };
   readonly summary: string;
   readonly actor: { readonly id: string; readonly kind: string; readonly attestation?: string };
-  readonly risk: string;
-  readonly reversible: boolean;
+  readonly reversible?: boolean;
   readonly constraints: {
     readonly allowed_decisions: readonly string[];
     readonly challenge_required: boolean;
@@ -222,15 +220,6 @@ function asWireContext(value: unknown): WireApprovalContext {
   if (!isRecord(value.actor)) throw new Error("decrypted context is missing an 'actor' object");
   if (!isRecord(value.constraints)) throw new Error("decrypted context is missing 'constraints'");
   return value as unknown as WireApprovalContext;
-}
-
-const RISK_LEVELS: readonly ApprovalRisk["level"][] = ["low", "medium", "high", "critical"];
-
-/** Coerce an untrusted risk string to a known level, defaulting to the most severe (fail-closed). */
-function toRiskLevel(value: unknown): ApprovalRisk["level"] {
-  return RISK_LEVELS.includes(value as ApprovalRisk["level"])
-    ? (value as ApprovalRisk["level"])
-    : "critical";
 }
 
 /** Narrow the allowed-decision wire strings to the controller's `ApprovalDecision` union. */
@@ -323,7 +312,7 @@ function toKind(surface: string): ApprovalContext["kind"] {
  * Map the decrypted wire context + the core's escaped display model + verified attestation +
  * (optional) derived challenge onto the controller's {@link ApprovalContext} view model. Every
  * string in the result comes from `display` (escaped by the core, #246); `wire` supplies only the
- * non-text fields (surface, risk level, reversibility, allowed decisions) and the unescaped
+ * non-text fields (surface, optional reversibility, allowed decisions) and the unescaped
  * substrate that raw/argv divergence is decided on.
  *
  * The view carries the core's whole substrate, the context summary and the chain, so the web card
@@ -340,16 +329,12 @@ function toApprovalContext(
     display: display.actor_label,
     attestation,
   };
-  const risk: ApprovalRisk = {
-    level: toRiskLevel(wire.risk),
-    reversible: wire.reversible,
-    summary: display.summary,
-  };
   const context: ApprovalContext = {
     kind: toKind(wire.action.surface),
     substrate: toSubstrateView(display.syntactic),
     actor,
-    risk,
+    summary: display.summary,
+    ...(wire.reversible !== undefined ? { reversible: wire.reversible } : {}),
     allowed_decisions: toAllowedDecisions(wire.constraints.allowed_decisions),
     hasHiddenOrControlChars: display.has_hidden_or_control_chars,
   };

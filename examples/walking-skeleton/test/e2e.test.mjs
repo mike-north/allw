@@ -250,7 +250,7 @@ test("integrator independently re-verifies the verdict: request_id AND request_h
 
   const verdict = await client.requestApproval({
     action: {
-      recordSchemaVersion: 1,
+      recordSchemaVersion: 2,
       surface: "command",
       syntactic: { argv: ["git", "push", "--force", "origin", "main"] },
       risk: "high",
@@ -299,7 +299,7 @@ test("zero-knowledge: the relay stores only the opaque ciphertext envelope + sig
 
   await client.requestApproval({
     action: {
-      recordSchemaVersion: 1,
+      recordSchemaVersion: 2,
       surface: "command",
       syntactic: { argv: ["git", "push", "--force", "origin", "main"] },
       risk: "high",
@@ -383,7 +383,7 @@ test("root-vouched recipients: a key injected into the relay's device list canno
   });
   const verdict = await client.requestApproval({
     action: {
-      recordSchemaVersion: 1,
+      recordSchemaVersion: 2,
       surface: "command",
       syntactic: { argv: ["git", "push", "--force", "origin", "main"] },
       risk: "high",
@@ -464,7 +464,7 @@ test("interim vouching: after vouch, the SDK seals to the web device's kid and t
   const request = (summary) =>
     client.requestApproval({
       action: {
-        recordSchemaVersion: 1,
+        recordSchemaVersion: 2,
         surface: "command",
         syntactic: { argv: ["git", "push", "--force", "origin", "main"] },
         risk: "high",

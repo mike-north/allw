@@ -10,9 +10,6 @@
 /** The human's decision (`docs/contract.md` §Messages → Verdict). */
 export type Decision = "approved" | "denied" | "expired" | "aborted";
 
-/** Coarse risk classification shown to the human. */
-export type Risk = "low" | "medium" | "high" | "critical";
-
 /** The interception paradigm an action arrived through. */
 export type Surface = "command" | "mcp_tool_call" | "file_edit" | "agent_tool_call";
 
@@ -28,11 +25,6 @@ export interface ActionRecord {
   readonly record_schema_version: number;
   readonly surface: Surface;
   readonly syntactic: SyntacticSubstrate;
-  readonly risk: Risk;
-  /** Reserved for the T3 semantic tier — null/absent in v1. */
-  readonly capabilities?: unknown[] | null;
-  /** Reserved for the T3 semantic tier — null/absent in v1. */
-  readonly scope?: unknown;
 }
 
 /** The automation requesting approval (identity + optional attestation). */
@@ -58,8 +50,7 @@ export interface ApprovalContext {
   readonly action: ActionRecord;
   readonly summary: string;
   readonly actor: Actor;
-  readonly risk: Risk;
-  readonly reversible: boolean;
+  readonly reversible?: boolean;
   readonly constraints: Constraints;
   /** Upstream-gate IDs for audit correlation; omitted when absent. */
   readonly chain?: string[];
@@ -105,8 +96,7 @@ export interface DisplaySubstrate {
  */
 export interface DisplayModel {
   readonly surface: Surface;
-  readonly risk: Risk;
-  readonly reversible: boolean;
+  readonly reversible?: boolean;
   readonly summary: string;
   readonly actor_id: string;
   readonly actor_kind: string;

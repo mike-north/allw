@@ -55,14 +55,13 @@ const NOW_MS = 1700001500000;
  */
 const CONTEXT = {
   action: {
-    record_schema_version: 1,
+    record_schema_version: 2,
     surface: "command",
     syntactic: { bin: "git", raw: "git push --force origin main" },
-    risk: "high",
   },
   summary: "force push to main",
   actor: { id: "machine:laptop", kind: "claude-code" },
-  risk: "high",
+
   reversible: false,
   constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
 };
@@ -324,29 +323,19 @@ test("fail-closed: a ciphertext encrypted to a DIFFERENT device key cannot be de
   );
 });
 
-test("fail-closed (#296): a context with a non-null reserved field or a hidden risk downgrade is refused", async () => {
+test("removed fields are ignored by the core open path consistently", async () => {
   const wasm = await loadWasm();
-  // docs/contract.md §Device-side context checks: the core refuses these in decrypt_context, so the
-  // approver can't show (or sign) them, and its error is the core's text naming the field or tiers.
-  const cases = [
-    [
-      { ...CONTEXT, action: { ...CONTEXT.action, capabilities: [{ grant: "WRITE_EVERYTHING" }] } },
-      "action.capabilities",
-    ],
-    [{ ...CONTEXT, action: { ...CONTEXT.action, scope: { paths: ["/etc"] } } }, "action.scope"],
-    [{ ...CONTEXT, risk: "low" }, "context risk low is lower than action.risk high"],
-  ];
-  for (const [context, named] of cases) {
-    const { keyfile, jwe } = pairedApprover(wasm, JSON.stringify(context));
-    assert.throws(
-      () => prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS),
-      (err) => err instanceof Error && err.message.includes(named),
-      `the refusal must name ${named}`,
-    );
-  }
-  // A context that raises the shown risk above the record's still opens.
-  const { keyfile, jwe } = pairedApprover(wasm, JSON.stringify({ ...CONTEXT, risk: "critical" }));
-  assert.equal(prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS).context.risk, "critical");
+  const context = {
+    ...CONTEXT,
+    risk: "low",
+    action: { ...CONTEXT.action, risk: "critical", capabilities: [], scope: {} },
+  };
+  const { keyfile, jwe } = pairedApprover(wasm, JSON.stringify(context));
+  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
+  assert.equal(prepared.context.risk, undefined);
+  assert.equal(prepared.context.action.risk, undefined);
+  assert.equal(prepared.context.action.capabilities, undefined);
+  assert.equal(prepared.context.action.scope, undefined);
 });
 
 test("fail-closed: an envelope missing context_ciphertext is rejected before any crypto", async () => {
@@ -470,7 +459,6 @@ test("renderRequest shows the exact action, actor, risk, expiry, and request_has
   assert.match(rendered, /git push --force origin main/, "the exact action/argv is shown");
   assert.match(rendered, /force push to main/, "the summary is shown");
   assert.match(rendered, /machine:laptop \(claude-code\)/, "the actor id + kind are shown");
-  assert.match(rendered, /Risk:\s+high/, "the risk tier is shown");
   assert.match(rendered, /Reversible: no/, "reversibility is shown");
   assert.match(rendered, /2023-11-14T23:13:20\.000Z/, "the expiry is shown (ISO-8601 UTC)");
   assert.ok(
@@ -499,7 +487,7 @@ test("renderRequest surfaces cwd and env_refs (WYSIWYS completeness — review f
   // appear in the rendered output (the TOCTOU gap a `raw`-only summary would reopen).
   const ctx = {
     action: {
-      record_schema_version: 1,
+      record_schema_version: 2,
       surface: "command",
       syntactic: {
         bin: "rm",
@@ -508,11 +496,10 @@ test("renderRequest surfaces cwd and env_refs (WYSIWYS completeness — review f
         cwd: "/etc",
         env_refs: ["AWS_SECRET_ACCESS_KEY", "DEPLOY_TOKEN"],
       },
-      risk: "critical",
     },
     summary: "remove the build directory",
     actor: { id: "machine:ci", kind: "claude-code" },
-    risk: "critical",
+
     reversible: false,
     constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
   };
@@ -542,18 +529,17 @@ test("renderRequest surfaces MCP params (not hidden behind raw) — review fix #
 
   const ctx = {
     action: {
-      record_schema_version: 1,
+      record_schema_version: 2,
       surface: "mcp_tool_call",
       syntactic: {
         server: "filesystem",
         tool: "write_file",
         params: { path: "/etc/passwd", contents: "pwned" },
       },
-      risk: "critical",
     },
     summary: "write a file via MCP",
     actor: { id: "machine:agent", kind: "claude-code" },
-    risk: "critical",
+
     reversible: false,
     constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
   };
@@ -581,18 +567,17 @@ test("renderRequest surfaces MCP server/tool even when a benign raw masks them, 
   // so the human would see only "echo hello". The device must surface the hash-bound server/tool.
   const ctx = {
     action: {
-      record_schema_version: 1,
+      record_schema_version: 2,
       surface: "mcp_tool_call",
       syntactic: {
         server: "fs",
         tool: "delete_all_files",
         raw: "echo hello",
       },
-      risk: "critical",
     },
     summary: "say hello",
     actor: { id: "machine:agent", kind: "claude-code" },
-    risk: "critical",
+
     reversible: false,
     constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
   };
@@ -626,19 +611,18 @@ test("renderRequest labels an agent_tool_call's (server,tool) identity distinctl
 
   const ctx = {
     action: {
-      record_schema_version: 1,
+      record_schema_version: 2,
       surface: "agent_tool_call",
       syntactic: {
         server: "deploy-plugin",
         tool: "deploy_service",
         raw: "This plugin wants to deploy to production.",
       },
-      risk: "medium",
     },
     summary:
       "OpenClaw home-mini · agent agent-main · deploy-plugin/deploy_service: Deploy — deploy now",
     actor: { id: "openclaw:home-mini", kind: "openclaw" },
-    risk: "medium",
+
     reversible: true,
     constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
   };
@@ -681,7 +665,7 @@ test("renderRequest surfaces file-edit paths, operation, summary, and diff hash 
 
   const ctx = {
     action: {
-      record_schema_version: 1,
+      record_schema_version: 2,
       surface: "file_edit",
       syntactic: {
         operation: "patch",
@@ -690,11 +674,10 @@ test("renderRequest surfaces file-edit paths, operation, summary, and diff hash 
         diff_hash: "d".repeat(43),
         raw: patch,
       },
-      risk: "high",
     },
     summary: "edit app source",
     actor: { id: "machine:agent", kind: "codex" },
-    risk: "high",
+
     reversible: false,
     constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
   };
@@ -723,14 +706,13 @@ test("renderRequest disambiguates argv args containing whitespace (WYSIWYS — r
   // `rm -rf my dir` — indistinguishable from three args. The human must see the arg boundary.
   const ctx = {
     action: {
-      record_schema_version: 1,
+      record_schema_version: 2,
       surface: "command",
       syntactic: { argv: ["rm", "-rf", "my dir"] },
-      risk: "high",
     },
     summary: "remove a directory whose name has a space",
     actor: { id: "machine:ci", kind: "claude-code" },
-    risk: "high",
+
     reversible: false,
     constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
   };
@@ -755,14 +737,13 @@ test("renderRequest includes bin when the substrate carries it separately from a
   // the program name, not just the args (per docs/policy-seam.md, bin and argv are distinct).
   const ctx = {
     action: {
-      record_schema_version: 1,
+      record_schema_version: 2,
       surface: "command",
       syntactic: { bin: "git", argv: ["push", "--force", "origin", "main"] },
-      risk: "high",
     },
     summary: "force push",
     actor: { id: "machine:ci", kind: "claude-code" },
-    risk: "high",
+
     reversible: false,
     constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
   };
@@ -788,14 +769,13 @@ test("renderRequest does not double the bin when argv already leads with it (rev
 
   const ctx = {
     action: {
-      record_schema_version: 1,
+      record_schema_version: 2,
       surface: "command",
       syntactic: { bin: "git", argv: ["git", "status"] },
-      risk: "low",
     },
     summary: "git status",
     actor: { id: "machine:ci", kind: "claude-code" },
-    risk: "low",
+
     reversible: true,
     constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
   };
@@ -822,18 +802,17 @@ test("renderRequest surfaces a divergent argv even when raw masks it (WYSIWYS an
   // reconstructed argv so the divergence is visible.
   const ctx = {
     action: {
-      record_schema_version: 1,
+      record_schema_version: 2,
       surface: "command",
       syntactic: {
         bin: "git",
         argv: ["git", "push", "--force", "origin", "main"],
         raw: "git status",
       },
-      risk: "critical",
     },
     summary: "check repo status",
     actor: { id: "machine:agent", kind: "claude-code" },
-    risk: "critical",
+
     reversible: false,
     constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
   };
@@ -864,18 +843,17 @@ test("renderRequest does NOT add a redundant Argv line when raw matches the reco
   // produces exactly this). No divergence → no redundant `Argv:` line, just the headline.
   const ctx = {
     action: {
-      record_schema_version: 1,
+      record_schema_version: 2,
       surface: "command",
       syntactic: {
         bin: "git",
         argv: ["git", "push", "--force", "origin", "main"],
         raw: "git push --force origin main",
       },
-      risk: "high",
     },
     summary: "force push to main",
     actor: { id: "machine:ci", kind: "claude-code" },
-    risk: "high",
+
     reversible: false,
     constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
   };
@@ -903,7 +881,7 @@ test("renderRequest surfaces flags and positionals as labeled lines when present
   // path before #51. They must appear as their own labeled lines, quoted for boundary clarity.
   const ctx = {
     action: {
-      record_schema_version: 1,
+      record_schema_version: 2,
       surface: "command",
       syntactic: {
         bin: "git",
@@ -912,11 +890,10 @@ test("renderRequest surfaces flags and positionals as labeled lines when present
         positionals: ["origin", "main"],
         raw: "git push --force origin main",
       },
-      risk: "high",
     },
     summary: "force push to main",
     actor: { id: "machine:ci", kind: "claude-code" },
-    risk: "high",
+
     reversible: false,
     constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
   };
@@ -944,7 +921,7 @@ test("renderRequest quotes flags/positionals containing whitespace (boundary cla
   // disambiguation guarantee the argv line already provides).
   const ctx = {
     action: {
-      record_schema_version: 1,
+      record_schema_version: 2,
       surface: "command",
       syntactic: {
         bin: "grep",
@@ -952,11 +929,10 @@ test("renderRequest quotes flags/positionals containing whitespace (boundary cla
         flags: ["--include=md"],
         raw: "grep 'hello world' file.txt",
       },
-      risk: "low",
     },
     summary: "search files",
     actor: { id: "machine:ci", kind: "claude-code" },
-    risk: "low",
+
     reversible: true,
     constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
   };
@@ -987,14 +963,13 @@ test("quoteToken pins the display-quoting of representative tokens (table-driven
   const renderToken = (token) => {
     const ctx = {
       action: {
-        record_schema_version: 1,
+        record_schema_version: 2,
         surface: "command",
         syntactic: { argv: [token] },
-        risk: "low",
       },
       summary: "token quoting probe",
       actor: { id: "machine:ci", kind: "claude-code" },
-      risk: "low",
+
       reversible: true,
       constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
     };

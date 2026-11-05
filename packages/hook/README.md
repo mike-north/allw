@@ -7,6 +7,10 @@ zero-knowledge relay (via [`@allw/sdk`](../sdk)), and lets the call proceed **on
 human approval. Everything else — a human "no", a timeout, missing configuration, any error — blocks
 the call. This is the v1 beachhead: one inbox where a human approves or denies what their agents do.
 
+Risk labels/scoring and policy-only wire metadata are removed (#406 slice 1). Reversibility is an
+optional caller assertion; hooks/bridge omit it. Temporary command interpretation and derived fields
+remain only until slice 2.
+
 ## Runs entirely under Node + WASM (a hard constraint)
 
 The hook is a `node` entrypoint over the same audited Rust core the rest of `allw` uses, compiled to
@@ -201,7 +205,7 @@ effects:
   and gets no decision; any other `Monitor` input is denied. Monitors a plugin declares start
   without a `Monitor` call, so allw never sees them.
 - **`PowerShell`** — a PowerShell line (`tool_input.command`), shown to the human as
-  `PowerShell: <command>`; its risk is never below `medium`. A line that runs no program (blank or
+  `PowerShell: <command>`; no danger or reversibility rating is produced. A line that runs no program (blank or
   only a `#` comment, only separators or variables assigned a literal such as `$env:FOO=1`, or an
   empty-string program such as `& ''`) is denied without asking.
 - **`Edit` / `Write` / `MultiEdit`** — direct file edits (`tool_input.file_path` plus edit

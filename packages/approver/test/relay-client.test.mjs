@@ -531,14 +531,13 @@ test("runPair self-drives start+complete, mints a device_cert, and persists pair
       const requestId = "req-pair-roundtrip";
       const context = {
         action: {
-          record_schema_version: 1,
+          record_schema_version: 2,
           surface: "command",
           syntactic: { raw: "echo hi" },
-          risk: "low",
         },
         summary: "echo hi",
         actor: { id: "machine:x", kind: "claude-code" },
-        risk: "low",
+
         reversible: true,
         constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
       };

@@ -34,14 +34,13 @@ const NOW_MS = 1700001500000;
 
 const CONTEXT = {
   action: {
-    record_schema_version: 1,
+    record_schema_version: 2,
     surface: "command",
     syntactic: { bin: "rm", argv: ["rm", "-rf", "build"] },
-    risk: "medium",
   },
   summary: "delete the build directory",
   actor: { id: "machine:ci", kind: "claude-code" },
-  risk: "medium",
+
   reversible: true,
   constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
 };

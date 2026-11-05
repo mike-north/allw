@@ -52,14 +52,13 @@ const NOW_MS = 1700001500000;
 
 const CONTEXT = {
   action: {
-    record_schema_version: 1,
+    record_schema_version: 2,
     surface: "command",
     syntactic: { bin: "git", argv: ["git", "push", "--force", "origin", "main"], cwd: "/repo" },
-    risk: "high",
   },
   summary: "force push to main",
   actor: { id: ACTOR_ID, kind: ACTOR_KIND },
-  risk: "high",
+
   reversible: false,
   constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
 };

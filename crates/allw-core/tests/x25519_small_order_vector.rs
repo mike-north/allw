@@ -80,7 +80,7 @@ fn with_high_bit(mut bytes: [u8; 32]) -> [u8; 32] {
 fn context() -> ApprovalContext {
     serde_json::from_value(serde_json::json!({
         "action": {
-            "record_schema_version": 1,
+            "record_schema_version": 2,
             "surface": "command",
             "syntactic": { "argv": ["git", "status"], "raw": "git status" },
             "risk": "low"

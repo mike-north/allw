@@ -20,11 +20,11 @@
 //! # Record hash recipe
 //!
 //! ```text
-//! record_hash = SHA-256( b"allw/audit-record/v1" || 0x00 || JCS(record_without_record_hash) )
+//! record_hash = SHA-256( b"allw/audit-record/v2" || 0x00 || JCS(record_without_record_hash) )
 //! ```
 //!
 //! - **JCS** — RFC 8785 JSON Canonicalization Scheme via `serde_jcs`.
-//! - **Domain tag** `b"allw/audit-record/v1"` provides domain separation from every other
+//! - **Domain tag** `b"allw/audit-record/v2"` provides domain separation from every other
 //!   SHA-256 use in the system (e.g. `b"allw/request-hash/v1"` in `hash.rs`).  The `/v1`
 //!   suffix is the version knob — bump it if the hashed fields or recipe change.
 //! - **`record_hash` is excluded** (circular; including it would make the hash impossible to
@@ -55,14 +55,14 @@
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::contract::{ActionRecord, Actor, Approver, AuditRecord, Decision, PolicyBlock};
+use crate::contract::{ActionRecord, Actor, Approver, AuditRecord, Decision};
 
 /// The domain separation tag for audit record hashes.
 ///
 /// Distinct from `b"allw/request-hash/v1"` in `hash.rs` — cryptographic domain separation
 /// ensures these digests cannot collide with request hashes.  The `/v1` suffix is the
 /// canonicalization version knob; bump it if the hashed fields or recipe change.
-const AUDIT_DOMAIN_TAG: &[u8] = b"allw/audit-record/v1";
+const AUDIT_DOMAIN_TAG: &[u8] = b"allw/audit-record/v2";
 
 /// Null-byte separator between the domain tag and the JCS payload in the hash input.
 const SEPARATOR: u8 = 0x00;
@@ -151,11 +151,6 @@ pub struct AuditEntryInput {
     pub decided_at: i64,
     /// The full action record (for audit completeness).
     pub action: ActionRecord,
-    /// Reserved policy block.  **v1 callers MUST set `decision: PolicyDecision::Escalate`** —
-    /// the field is unconstrained at the type level so the T3 engine can later write
-    /// `allow`/`deny`, but writing a non-`escalate` decision in v1 violates the pinned contract
-    /// (`docs/policy-seam.md` §forward-compat req #4) and will mislead later policy analysis.
-    pub policy: PolicyBlock,
     /// Optional free-form note from the approver.
     pub note: Option<String>,
     /// The verdict's device-key signature — the EdDSA compact JWS string — carried into the
@@ -217,17 +212,6 @@ impl AuditChain {
     ///   `record_hash` of the current head.
     /// - `record_hash` = [`compute_record_hash`] of the completed record.
     pub fn append(&mut self, input: AuditEntryInput) -> &AuditRecord {
-        // v1 invariant (docs/policy-seam.md §forward-compat req #4): every v1 audit record is
-        // written on the `escalate` path. The field is type-unconstrained so T3 can later write
-        // allow/deny, so we guard the v1 convention here rather than in the type. debug_assert
-        // (not a hard error) keeps `append` infallible and the field forward-compatible while
-        // catching v1 misuse in tests/debug builds.
-        debug_assert_eq!(
-            input.policy.decision,
-            crate::contract::PolicyDecision::Escalate,
-            "v1 audit records must write policy.decision = Escalate (policy-seam.md forward-compat req #4)"
-        );
-
         let seq = self.records.len() as u64;
         let prev_hash = self.head_hash();
 
@@ -244,7 +228,6 @@ impl AuditChain {
             decision: input.decision,
             decided_at: input.decided_at,
             action: input.action,
-            policy: input.policy,
             note: input.note,
             sig: input.sig,
         };
@@ -320,7 +303,7 @@ impl AuditChain {
 /// # Recipe
 ///
 /// ```text
-/// record_hash = SHA-256( b"allw/audit-record/v1" || 0x00 || JCS(record_without_record_hash) )
+/// record_hash = SHA-256( b"allw/audit-record/v2" || 0x00 || JCS(record_without_record_hash) )
 /// ```
 ///
 /// # Exclusion of `record_hash`
@@ -334,7 +317,7 @@ impl AuditChain {
 ///
 /// # Domain separation
 ///
-/// `b"allw/audit-record/v1"` is distinct from `b"allw/request-hash/v1"` (in `hash.rs`),
+/// `b"allw/audit-record/v2"` is distinct from `b"allw/request-hash/v1"` (in `hash.rs`),
 /// ensuring audit record hashes cannot be confused with request hashes.
 ///
 /// # Determinism
@@ -375,10 +358,7 @@ pub fn compute_record_hash(record: &AuditRecord) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::{
-        ActionRecord, Actor, Approver, Decision, PolicyBlock, PolicyDecision, Risk, Surface,
-        SyntacticSubstrate,
-    };
+    use crate::contract::{ActionRecord, Actor, Approver, Decision, Surface, SyntacticSubstrate};
     use sha2::{Digest, Sha256};
 
     // ── Fixed test fixtures ───────────────────────────────────────────────────
@@ -404,7 +384,7 @@ mod tests {
 
     fn make_action() -> ActionRecord {
         ActionRecord {
-            record_schema_version: 1,
+            record_schema_version: 2,
             surface: Surface::Command,
             syntactic: SyntacticSubstrate {
                 bin: Some("git".to_string()),
@@ -427,19 +407,6 @@ mod tests {
                 diff_summary: None,
                 diff_hash: None,
             },
-            risk: Risk::High,
-            capabilities: None,
-            scope: None,
-        }
-    }
-
-    fn make_policy() -> PolicyBlock {
-        // docs/policy-seam.md §forward-compat req #4: v1 always writes escalate.
-        PolicyBlock {
-            decision: PolicyDecision::Escalate,
-            rule_id: None,
-            tier: "syntactic".to_string(),
-            schema_version: 1,
         }
     }
 
@@ -452,7 +419,7 @@ mod tests {
             decision: Decision::Approved,
             decided_at: TS_DECIDED,
             action: make_action(),
-            policy: make_policy(),
+
             note: None,
             // Representative EdDSA compact JWS (header.payload.signature). The audit chain
             // stores the verdict's signature verbatim; its shape is opaque to this module.
@@ -537,7 +504,7 @@ mod tests {
     //   1. Serialize record to serde_json::Value
     //   2. Remove "record_hash" key
     //   3. serde_jcs::to_vec (RFC 8785 JCS canonicalization)
-    //   4. SHA-256( b"allw/audit-record/v1" || 0x00 || jcs )
+    //   4. SHA-256( b"allw/audit-record/v2" || 0x00 || jcs )
     // and asserts equality with compute_record_hash.
 
     #[test]
@@ -552,14 +519,14 @@ mod tests {
         }
         let canonical = serde_jcs::to_vec(&value).unwrap();
         let mut hasher = Sha256::new();
-        hasher.update(b"allw/audit-record/v1"); // AUDIT_DOMAIN_TAG
+        hasher.update(b"allw/audit-record/v2"); // AUDIT_DOMAIN_TAG
         hasher.update([0x00u8]); // SEPARATOR
         hasher.update(&canonical);
         let expected: [u8; 32] = hasher.finalize().into();
 
         assert_eq!(
             rec.record_hash, expected,
-            "record_hash must equal SHA-256(b\"allw/audit-record/v1\" || 0x00 || JCS(record \\ {{record_hash}}))"
+            "record_hash must equal SHA-256(b\"allw/audit-record/v2\" || 0x00 || JCS(record \\ {{record_hash}}))"
         );
     }
 
@@ -648,14 +615,14 @@ mod tests {
         assert_eq!(err, AuditChainError::RecordHashMismatch { seq: 0 });
     }
 
-    /// Mutating action.risk WITHOUT recomputing record_hash → RecordHashMismatch.
+    /// Mutating the raw action WITHOUT recomputing record_hash → RecordHashMismatch.
     #[test]
     fn tamper_action_field_detected_as_record_hash_mismatch() {
         let mut chain = AuditChain::new();
         chain.append(make_entry("req_001"));
         chain.append(make_entry("req_002"));
 
-        chain.records[1].action.risk = Risk::Critical;
+        chain.records[1].action.syntactic.raw = Some("changed action".to_string());
 
         let err = chain.verify().unwrap_err();
         assert_eq!(err, AuditChainError::RecordHashMismatch { seq: 1 });
@@ -787,38 +754,10 @@ mod tests {
         );
     }
 
-    // ── 6. Reserved policy block ───────────────────────────────────────────────
     //
     // docs/policy-seam.md §forward-compat req #4: the `policy` block must be present even
     // though v1 only writes `escalate`.  Assert the block serializes with the `policy` key
     // present and round-trips correctly.
-
-    #[test]
-    fn policy_block_present_in_serialized_record() {
-        let mut chain = AuditChain::new();
-        let rec = chain.append(make_entry("req_001"));
-        let val: serde_json::Value = serde_json::to_value(rec).unwrap();
-
-        assert!(
-            val.get("policy").is_some(),
-            "AuditRecord must include a 'policy' key in JSON (policy-seam.md §forward-compat req #4)"
-        );
-    }
-
-    #[test]
-    fn policy_block_decision_is_escalate_after_round_trip() {
-        // docs/policy-seam.md §forward-compat req #4: v1 always writes escalate.
-        let mut chain = AuditChain::new();
-        let rec = chain.append(make_entry("req_001"));
-        let json = serde_json::to_string(rec).unwrap();
-        let back: AuditRecord = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(
-            back.policy.decision,
-            PolicyDecision::Escalate,
-            "policy.decision must round-trip as Escalate (policy-seam.md §forward-compat req #4)"
-        );
-    }
 
     // ── 7. Determinism ────────────────────────────────────────────────────────
 

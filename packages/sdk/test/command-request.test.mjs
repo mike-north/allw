@@ -53,7 +53,6 @@ function camel(coreJson) {
     recordSchemaVersion: core.record_schema_version,
     surface: core.surface,
     syntactic: core.syntactic,
-    risk: core.risk,
   };
 }
 
@@ -121,11 +120,11 @@ test("commandRequest fills the documented defaults around the core-built action"
   assert.equal(req.action.syntactic.cwd, process.cwd());
   assert.equal(req.summary, "Refund charge ch_123");
   // #231: top-level risk is taken from the core-built action, never stated twice.
-  assert.equal(req.risk, req.action.risk);
+
   // #231: actor defaults to this machine acting as a script.
   assert.deepEqual(req.actor, { id: `machine:${hostname()}`, kind: "script" });
   // #231: reversible defaults to false (conservative — "cannot be undone").
-  assert.equal(req.reversible, false);
+  assert.equal(req.reversible, undefined);
   // Absent optionals are omitted, so requestApproval's own defaults apply.
   for (const key of ["timeoutMs", "signal", "constraints", "chain"]) {
     assert.equal(key in req, false, `${key} is omitted when not given`);
@@ -172,7 +171,6 @@ test("commandRequest accepts a commandLine and builds it with action_from_comman
   const line = "rm -rf ./build";
   const req = await commandRequest({ commandLine: line, cwd: CWD, summary: "Clean build" });
   assert.deepEqual(req.action, camel(core.action_from_command(line, CWD)));
-  assert.equal(req.risk, req.action.risk);
 });
 
 // ── Fail-closed: the three cases #231 names ──────────────────────────────────────────────────
@@ -260,7 +258,7 @@ test("commandActionFromLine builds an assignment whose substitution holds '=' (#
   const version = await commandActionFromLine('VERSION="$(git log --format=%H -1)"');
   assert.equal(version.surface, "command");
   const dd = await commandActionFromLine('x="$(nice -n 1 dd if=/dev/zero of=/dev/sda)"');
-  assert.equal(dd.risk, "critical");
+
   for (const line of ["X=1", "A=1 B=2", "A[0]=1", "X+=y"]) {
     await rejectsWith(commandActionFromLine(line), "command_line_no_program", /runs no program/);
   }
@@ -342,10 +340,9 @@ test("invalid shell syntax still carries the core's error as its cause", async (
 // Defence in depth: the real core never returns these records, so the check is exercised directly.
 test("assertRecordHasProgram refuses a record with no argv or an empty program", () => {
   const record = (syntactic) => ({
-    recordSchemaVersion: 1,
+    recordSchemaVersion: 2,
     surface: "command",
     syntactic,
-    risk: "medium",
   });
   for (const [syntactic, reason] of [
     [{}, "command_line_empty"],
@@ -452,18 +449,16 @@ test("commandRequest rejects a non-boolean reversible", async () => {
 // ── Fail-closed: a core record the SDK cannot faithfully represent ───────────────────────────
 
 const GOOD_CORE = {
-  record_schema_version: 1,
+  record_schema_version: 2,
   surface: "command",
   syntactic: { bin: "ls", argv: ["ls"] },
-  risk: "low",
 };
 
 test("core record translation accepts a v1 command record", () => {
   assert.deepEqual(actionRecordFromCoreJson(JSON.stringify(GOOD_CORE)), {
-    recordSchemaVersion: 1,
+    recordSchemaVersion: 2,
     surface: "command",
     syntactic: { bin: "ls", argv: ["ls"] },
-    risk: "low",
   });
 });
 
@@ -490,7 +485,11 @@ for (const [name, json, pattern] of [
     JSON.stringify({ ...GOOD_CORE, surface: "mcp_tool_call" }),
     /not "command"/,
   ],
-  ["an unknown risk tier", JSON.stringify({ ...GOOD_CORE, risk: "none" }), /not a known tier/],
+  [
+    "an unexpected core output field",
+    JSON.stringify({ ...GOOD_CORE, removed: true }),
+    /unexpected keys/,
+  ],
   ["a non-object syntactic", JSON.stringify({ ...GOOD_CORE, syntactic: null }), /no syntactic/],
 ]) {
   test(`core record translation rejects ${name}`, () => {

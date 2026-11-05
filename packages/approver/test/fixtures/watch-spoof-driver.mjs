@@ -49,7 +49,7 @@ writeKeyfile(keyfilePath, keyfile);
 
 const spoofContext = {
   action: {
-    record_schema_version: 1,
+    record_schema_version: 2,
     surface: "command",
     // The spoof, then 100 more lines, so the block is far taller than a terminal.
     syntactic: {
@@ -58,11 +58,10 @@ const spoofContext = {
         ...Array.from({ length: 100 }, (_, i) => `echo line ${String(i)}`),
       ].join("\n"),
     },
-    risk: "critical",
   },
   summary: "check git status",
   actor: { id: "machine:ci", kind: "claude-code" },
-  risk: "critical",
+
   reversible: false,
   constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
 };

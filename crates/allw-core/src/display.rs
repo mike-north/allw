@@ -163,7 +163,7 @@ use std::fmt::Write as _;
 
 use serde::Serialize;
 
-use crate::contract::{ApprovalContext, Risk, Surface, SyntacticSubstrate};
+use crate::contract::{ApprovalContext, Surface, SyntacticSubstrate};
 
 mod unicode_tables;
 
@@ -528,10 +528,9 @@ pub struct DisplaySubstrate {
 pub struct DisplayModel {
     /// The action's surface (a closed enum — safe to show as-is).
     pub surface: Surface,
-    /// Coarse risk tier.
-    pub risk: Risk,
     /// Whether the action can be undone.
-    pub reversible: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reversible: Option<bool>,
     /// Escaped human-readable summary.
     pub summary: String,
     /// Escaped actor id.
@@ -654,7 +653,6 @@ pub fn display_model(context: &ApprovalContext) -> DisplayModel {
     let chain = esc.list(context.chain.as_ref());
     DisplayModel {
         surface: context.action.surface,
-        risk: context.risk,
         reversible: context.reversible,
         summary,
         actor_id,
@@ -685,12 +683,9 @@ mod tests {
     fn context_with(surface: Surface, syntactic: SyntacticSubstrate) -> ApprovalContext {
         ApprovalContext {
             action: ActionRecord {
-                record_schema_version: 1,
+                record_schema_version: 2,
                 surface,
                 syntactic,
-                risk: Risk::High,
-                capabilities: None,
-                scope: None,
             },
             summary: "delete a directory".to_string(),
             actor: Actor {
@@ -698,8 +693,8 @@ mod tests {
                 kind: "claude-code".to_string(),
                 attestation: None,
             },
-            risk: Risk::High,
-            reversible: false,
+
+            reversible: Some(false),
             constraints: Constraints {
                 allowed_decisions: vec![Decision::Approved, Decision::Denied],
                 challenge_required: false,
@@ -1451,7 +1446,7 @@ mod tests {
         );
         let json = serde_json::to_value(display_model(&ctx)).expect("model serializes");
         assert_eq!(json["surface"], "agent_tool_call");
-        assert_eq!(json["risk"], "high");
+        assert!(json.get("risk").is_none());
         assert_eq!(json["has_hidden_or_control_chars"], false);
         assert_eq!(
             json["syntactic"],

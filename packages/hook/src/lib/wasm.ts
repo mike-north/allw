@@ -42,8 +42,7 @@ export interface HookWasm {
   /**
    * Build an `ActionRecord` JSON for a **PowerShell** command line (the `command` surface, for
    * Claude Code's `PowerShell` tool). `raw` is the exact line and argv is always its whitespace
-   * split (PowerShell quoting is never read with POSIX rules); risk is at least Medium, or at least
-   * High for a compound, escaped or dynamic-execution line. Never throws for PowerShell syntax, so a
+   * split (PowerShell quoting is never read with POSIX rules). No danger tier is assigned. Never throws for PowerShell syntax, so a
    * valid PowerShell command is never denied for its quoting; **throws** only for a line that runs
    * no program (#376), with a `kind` as {@link HookWasm.action_from_command}.
    */

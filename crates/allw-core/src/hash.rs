@@ -15,7 +15,7 @@
 //! # Recipe
 //!
 //! ```text
-//! request_hash = SHA-256( b"allw/request-hash/v2" || 0x00 || JCS(request-hash input) )
+//! request_hash = SHA-256( b"allw/request-hash/v3" || 0x00 || JCS(request-hash input) )
 //! ```
 //!
 //! where `JCS(request-hash input)` is the RFC 8785 JSON Canonicalization Scheme encoding of the
@@ -34,7 +34,6 @@
 //! | `action` | The full [`ActionRecord`] — what the human approved |
 //! | `summary` | The human-readable description shown in the inbox |
 //! | `actor.id`, `actor.kind` | Actor identity as shown — NOT `attestation` (that is for cryptographic verification, not display) |
-//! | `risk` | The risk tier shown to the human |
 //! | `reversible` | Whether the action is reversible, as shown |
 //! | `constraints` | Allowed decisions + challenge policy the human acts under |
 //! | `chain` | Upstream-gate ids (omitted entirely when absent) |
@@ -51,7 +50,7 @@
 //!
 //! # Domain tag and versioning
 //!
-//! `DOMAIN_TAG = b"allw/request-hash/v2"` provides cryptographic domain separation so this
+//! `DOMAIN_TAG = b"allw/request-hash/v3"` provides cryptographic domain separation so this
 //! hash cannot be confused with any other SHA-256 digest in the system.  The `/v2` suffix is the
 //! version knob: the broadened input (every [`ApprovalContext`] field, not the four-field v1
 //! subset) is a breaking change from `request-hash/v1`, so the tag bumps with it.
@@ -61,19 +60,19 @@
 //! Uses `serde_jcs` 0.2.x — RFC 8785 conformant, actively maintained.  The on-the-wire key
 //! order is JCS-sorted (lexicographic by UTF-16 code unit), not the declaration order in the
 //! Rust structs.  The canonical object's top-level keys (ASCII, so UTF-16 sort = byte sort) are:
-//! `action` < `actor` < `chain` < `constraints` < `expires_at` < `reversible` < `risk` <
+//! `action` < `actor` < `chain` < `constraints` < `expires_at` < `reversible` <
 //! `summary`.
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::contract::{ActionRecord, ApprovalContext, Constraints, Risk};
+use crate::contract::{ActionRecord, ApprovalContext, Constraints};
 
 /// Domain separation tag — prefixed to the JCS bytes before hashing.
 ///
 /// The `/v2` suffix is the version knob; it was bumped from `/v1` when the hashed input
 /// broadened from the four-field subset to the full [`ApprovalContext`] (plus `expires_at`).
-const DOMAIN_TAG: &[u8] = b"allw/request-hash/v2";
+const DOMAIN_TAG: &[u8] = b"allw/request-hash/v3";
 
 /// Null-byte separator between domain tag and payload in the hash input.
 const SEPARATOR: u8 = 0x00;
@@ -85,7 +84,7 @@ const SEPARATOR: u8 = 0x00;
 /// Every [`ApprovalContext`] field plus the envelope's `expires_at`, as one flat object.
 /// JCS re-sorts keys, so declaration order is irrelevant; the canonical (sorted) top-level
 /// order is `action` < `actor` < `chain` < `constraints` < `expires_at` < `reversible` <
-/// `risk` < `summary`.
+/// `summary`.
 ///
 /// This type is private; the public API is [`compute_request_hash`] and
 /// [`canonical_request_bytes`].
@@ -97,8 +96,9 @@ struct CanonicalSubset<'a> {
     chain: Option<&'a [String]>,
     constraints: &'a Constraints,
     expires_at: i64,
-    reversible: bool,
-    risk: Risk,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reversible: Option<bool>,
+
     summary: &'a str,
 }
 
@@ -128,13 +128,13 @@ struct CanonicalActor<'a> {
 /// # Hashed fields
 ///
 /// `action` (full [`ActionRecord`]), `actor.id`, `actor.kind`, `chain`, `constraints`,
-/// `expires_at`, `reversible`, `risk`, `summary`. See the module doc for the full rationale and
+/// `expires_at`, `reversible`, `summary`. See the module doc for the full rationale and
 /// exclusion list.
 ///
 /// # Key order (JCS / RFC 8785)
 ///
 /// Top-level: `action` < `actor` < `chain` < `constraints` < `expires_at` < `reversible` <
-/// `risk` < `summary` (`chain` omitted entirely when `None`).
+/// `summary` (`chain` omitted entirely when `None`).
 /// Within `actor`: `id` < `kind`.
 /// Within `action` / `constraints`: JCS-sorted (depends on their field names).
 ///
@@ -155,7 +155,6 @@ pub fn canonical_request_bytes(ctx: &ApprovalContext, expires_at: i64) -> Vec<u8
         constraints: &ctx.constraints,
         expires_at,
         reversible: ctx.reversible,
-        risk: ctx.risk,
         summary: &ctx.summary,
     };
     // serde_jcs::to_vec implements RFC 8785 canonicalization; it sorts object keys
@@ -170,7 +169,7 @@ pub fn canonical_request_bytes(ctx: &ApprovalContext, expires_at: i64) -> Vec<u8
 /// # Recipe
 ///
 /// ```text
-/// request_hash = SHA-256( b"allw/request-hash/v2" || 0x00 || JCS(request-hash input) )
+/// request_hash = SHA-256( b"allw/request-hash/v3" || 0x00 || JCS(request-hash input) )
 /// ```
 ///
 /// where `JCS(request-hash input)` is the output of [`canonical_request_bytes`].
@@ -178,11 +177,11 @@ pub fn canonical_request_bytes(ctx: &ApprovalContext, expires_at: i64) -> Vec<u8
 /// # Hashed fields
 ///
 /// `action`, `actor.id`, `actor.kind`, `chain`, `constraints`, `expires_at`, `reversible`,
-/// `risk`, `summary`.  See module doc for the full rationale and the excluded-fields list.
+/// `summary`.  See module doc for the full rationale and the excluded-fields list.
 ///
 /// # Domain separation
 ///
-/// `b"allw/request-hash/v2"` ensures this digest cannot collide with any other SHA-256 use in
+/// `b"allw/request-hash/v3"` ensures this digest cannot collide with any other SHA-256 use in
 /// the system.  Bumping the version suffix is the canonicalization version knob.
 ///
 /// # Determinism
@@ -205,8 +204,7 @@ pub fn compute_request_hash(ctx: &ApprovalContext, expires_at: i64) -> [u8; 32] 
 mod tests {
     use super::*;
     use crate::contract::{
-        ActionRecord, Actor, ApprovalContext, Constraints, Decision, Risk, Surface,
-        SyntacticSubstrate,
+        ActionRecord, Actor, ApprovalContext, Constraints, Decision, Surface, SyntacticSubstrate,
     };
     use sha2::{Digest, Sha256};
 
@@ -222,7 +220,7 @@ mod tests {
     /// remains tractable.  capabilities/scope are None (omitted from JSON per wire spec).
     fn make_minimal_action() -> ActionRecord {
         ActionRecord {
-            record_schema_version: 1,
+            record_schema_version: 2,
             surface: Surface::Command,
             syntactic: SyntacticSubstrate {
                 bin: Some("git".to_string()),
@@ -241,9 +239,6 @@ mod tests {
                 diff_hash: None,
                 raw: Some("git push".to_string()),
             },
-            risk: Risk::High,
-            capabilities: None,
-            scope: None,
         }
     }
 
@@ -269,8 +264,8 @@ mod tests {
             action: make_minimal_action(),
             summary: "push to main".to_string(),
             actor: make_minimal_actor(),
-            risk: Risk::High,
-            reversible: false,
+
+            reversible: Some(false),
             constraints: make_minimal_constraints(),
             chain: None,
         }
@@ -283,27 +278,15 @@ mod tests {
     //   - Object keys sorted lexicographically by UTF-16 code unit (= byte order for ASCII)
     //   - Numbers in shortest form
     //
-    // Top-level keys (JCS order) — `chain` omitted (None in the fixture):
-    //   "action" < "actor" < "constraints" < "expires_at" < "reversible" < "risk" < "summary"
-    //   (a-c-t-i < a-c-t-o; "c" < "e" < "r"; "reversible" < "risk" since "re" < "ri";
-    //    "ri" < "su")
-    //
-    // action keys (JCS order):
-    //   "record_schema_version" < "risk" < "surface" < "syntactic"
-    //   (r-e < r-i; su-r < su-y)
-    // action.syntactic keys (JCS order, only bin+raw present): "bin" < "raw"
-    // actor keys (JCS order): "id" < "kind"
-    // constraints keys (JCS order): "allowed_decisions" < "challenge_required"
-    //
-    // Enum snake_case: Risk::High → "high"; Surface::Command → "command";
-    //   Decision::{Approved,Denied} → "approved","denied".
+    // JCS ASCII-key order: action < actor < constraints < expires_at < reversible < summary.
+    // Within action: record_schema_version < surface < syntactic; within syntactic: bin < raw.
+    // Within actor: id < kind. No absent chain or reversibility key is inserted.
     const EXPECTED_CANONICAL: &str = concat!(
-        r#"{"action":{"record_schema_version":1,"risk":"high","surface":"command","syntactic":{"bin":"git","raw":"git push"}},"#,
+        r#"{"action":{"record_schema_version":2,"surface":"command","syntactic":{"bin":"git","raw":"git push"}},"#,
         r#""actor":{"id":"machine:x","kind":"claude-code"},"#,
         r#""constraints":{"allowed_decisions":["approved","denied"],"challenge_required":false},"#,
         r#""expires_at":1700003600000,"#,
         r#""reversible":false,"#,
-        r#""risk":"high","#,
         r#""summary":"push to main"}"#
     );
 
@@ -327,7 +310,7 @@ mod tests {
     // ── Test 2: Hash = independent SHA-256 of the documented recipe ──────────
     //
     // Re-derives the documented recipe independently in the test body:
-    //   SHA-256( b"allw/request-hash/v2" || 0x00 || canonical_request_bytes(&ctx, expires_at) )
+    //   SHA-256( b"allw/request-hash/v3" || 0x00 || canonical_request_bytes(&ctx, expires_at) )
     // This is NOT circular: it independently applies the domain-tag + hash recipe and
     // asserts equality with compute_request_hash, verifying the implementation matches
     // the documented algorithm.
@@ -339,7 +322,7 @@ mod tests {
         // Re-derive the recipe directly in the test (not via compute_request_hash):
         let canonical = canonical_request_bytes(&ctx, TS_EXPIRES);
         let mut hasher = Sha256::new();
-        hasher.update(b"allw/request-hash/v2"); // DOMAIN_TAG
+        hasher.update(b"allw/request-hash/v3"); // DOMAIN_TAG
         hasher.update([0x00u8]); // SEPARATOR
         hasher.update(&canonical);
         let expected: [u8; 32] = hasher.finalize().into();
@@ -451,37 +434,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn mutating_action_risk_changes_hash() {
-        let base = make_minimal_context();
-        let base_hash = compute_request_hash(&base, TS_EXPIRES);
-
-        let mut mutated = base.clone();
-        mutated.action.risk = Risk::Critical;
-
-        assert_ne!(
-            compute_request_hash(&mutated, TS_EXPIRES),
-            base_hash,
-            "mutating action.risk must change the request_hash"
-        );
-    }
-
-    /// `risk` is now a top-level hashed field (v2), so mutating it must change the hash.
-    #[test]
-    fn mutating_top_level_risk_changes_hash() {
-        let base = make_minimal_context();
-        let base_hash = compute_request_hash(&base, TS_EXPIRES);
-
-        let mut mutated = base.clone();
-        mutated.risk = Risk::Low;
-
-        assert_ne!(
-            compute_request_hash(&mutated, TS_EXPIRES),
-            base_hash,
-            "mutating risk must change the request_hash (now a v2 hashed field)"
-        );
-    }
-
     /// `reversible` is now a hashed field (v2), so mutating it must change the hash.
     #[test]
     fn mutating_reversible_changes_hash() {
@@ -489,7 +441,7 @@ mod tests {
         let base_hash = compute_request_hash(&base, TS_EXPIRES);
 
         let mut mutated = base.clone();
-        mutated.reversible = !base.reversible;
+        mutated.reversible = Some(!base.reversible.unwrap());
 
         assert_ne!(
             compute_request_hash(&mutated, TS_EXPIRES),
@@ -593,21 +545,12 @@ mod tests {
     // value.  If this test fails, the canonicalization changed and DOMAIN_TAG must be bumped
     // to reflect the new version.
     //
-    // This value was derived AFTER tests 1 and 2 confirmed the canonicalization is
-    // spec-correct and the hash recipe matches the documented algorithm — so this frozen
-    // vector is anchored to a verified canonicalization, not an arbitrary snapshot.
-    //
-    // To regenerate: run `cargo test -p allw-core hash::tests::frozen_cross_platform_vector
-    //   -- --nocapture` and capture the printed hex, then verify tests 1 & 2 still pass.
-
-    /// Expected hex for the minimal fixture, computed once after tests 1+2 were green.
-    ///
-    /// Input:
-    /// - DOMAIN_TAG: b"allw/request-hash/v2"
-    /// - SEPARATOR: 0x00
-    /// - canonical: (see EXPECTED_CANONICAL in this module — the v2 flat object)
+    // Independently derived from the literal canonical bytes below with Python hashlib and the
+    // specified v3 domain, not captured from this implementation. ASCII keys have the same UTF-16
+    // and byte sort order. The canonicalization test separately asserts the complete byte string.
+    /// SHA-256("allw/request-hash/v3" || NUL || EXPECTED_CANONICAL).
     const FROZEN_HASH_HEX: &str =
-        "809fe4763353e8b10417f118581b510ebfe52b0725d35842f391f3d0c3d47be7";
+        "6952a2ab641bc1a13983b5b07826fcc9b48cb32c8b55e4969218fe14484ebc4c";
 
     #[test]
     fn frozen_cross_platform_vector() {

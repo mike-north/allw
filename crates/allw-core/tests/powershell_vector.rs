@@ -20,7 +20,6 @@ struct Case {
     class: String,
     command: String,
     cwd: Option<String>,
-    risk: String,
     bin: String,
     argv: Vec<String>,
 }
@@ -49,7 +48,7 @@ fn every_case_in_the_shared_vector_builds_the_expected_record() {
             .unwrap_or_else(|e| panic!("{}: must build: {e}", case.class));
         let json = serde_json::to_value(&record).expect("serialize ActionRecord");
         assert_eq!(json["surface"], "command", "{}", case.class);
-        assert_eq!(json["risk"], case.risk.as_str(), "{}", case.class);
+
         assert_eq!(
             json["syntactic"]["raw"],
             case.command.as_str(),

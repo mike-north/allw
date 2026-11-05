@@ -123,14 +123,13 @@ async function clientWithPollFailure(pollStatus, seen) {
 /** A request to submit; its content is irrelevant to the relay's refusal. */
 const REQUEST = {
   action: {
-    recordSchemaVersion: 1,
+    recordSchemaVersion: 2,
     surface: "command",
     syntactic: { bin: "git", raw: "git push" },
-    risk: "high",
   },
   summary: "Push to main",
   actor: { id: "machine:ci", kind: "claude-code" },
-  risk: "high",
+
   reversible: false,
   timeoutMs: 60_000,
 };

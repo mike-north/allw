@@ -77,21 +77,19 @@ export { RelayError } from "./relay.js";
  * rather than resolving to a `Decision`.
  */
 export type Decision = "approved" | "denied" | "expired" | "aborted";
-export type Risk = "low" | "medium" | "high" | "critical";
 
 /** The interception paradigm an action arrived through. */
 export type Surface = "command" | "mcp_tool_call" | "file_edit" | "agent_tool_call";
 
 /**
  * A reduced, matchable record of an approvable action. v1 carries the syntactic substrate;
- * semantic `capabilities`/`scope` are reserved for the policy layer. See `../../docs/policy-seam.md`.
+ * no danger rating or policy-only metadata is carried. See `../../docs/policy-seam.md`.
  */
 export interface ActionRecord {
   readonly recordSchemaVersion: number;
   readonly surface: Surface;
   /** Raw, structured syntactic form (tokenized command / MCP call). */
   readonly syntactic: unknown;
-  readonly risk: Risk;
 }
 
 /**
@@ -127,10 +125,9 @@ export interface ApprovalRequest {
   readonly summary: string;
   /** The automation requesting approval (identity shown to the human). */
   readonly actor: Actor;
-  /** Coarse risk classification shown to the human. */
-  readonly risk: Risk;
-  /** Whether the action can be undone if approved. */
-  readonly reversible: boolean;
+
+  /** Optional caller assertion of reversibility; absence makes no claim. */
+  readonly reversible?: boolean;
   /** Allowed decisions + challenge policy. Defaults to `{ approved, denied }`, no challenge. */
   readonly constraints?: Constraints;
   /** Upstream-gate IDs for audit-chain correlation (optional). */
@@ -334,9 +331,6 @@ export interface VerifiedVerdictResult {
   readonly note?: string;
 }
 
-/** @public Caller-policy decision vocabulary retained for contract/audit wire compatibility. */
-export type PolicyDecision = "allow" | "deny" | "escalate";
-
 export interface VerifyVerdictWithAccountStatesInput extends AccountStateOptions {
   /** Required account namespace; standalone helpers have no client account to fall back to. */
   readonly expectedAccountId: string;
@@ -457,12 +451,11 @@ interface WireApprovalContext {
     readonly record_schema_version: number;
     readonly surface: Surface;
     readonly syntactic: unknown;
-    readonly risk: Risk;
   };
   readonly summary: string;
   readonly actor: { readonly id: string; readonly kind: string; readonly attestation?: string };
-  readonly risk: Risk;
-  readonly reversible: boolean;
+
+  readonly reversible?: boolean;
   readonly constraints: {
     readonly allowed_decisions: readonly Decision[];
     readonly challenge_required: boolean;
@@ -485,7 +478,6 @@ function toWireContext(req: ApprovalRequest): WireApprovalContext {
       record_schema_version: req.action.recordSchemaVersion,
       surface: req.action.surface,
       syntactic: req.action.syntactic,
-      risk: req.action.risk,
     },
     summary: req.summary,
     actor: {
@@ -495,8 +487,8 @@ function toWireContext(req: ApprovalRequest): WireApprovalContext {
       // when absent so the canonicalization stays byte-identical (the core excludes it from the hash).
       ...(req.actor.attestation !== undefined ? { attestation: req.actor.attestation } : {}),
     },
-    risk: req.risk,
-    reversible: req.reversible,
+
+    ...(req.reversible !== undefined ? { reversible: req.reversible } : {}),
     constraints: {
       allowed_decisions: constraints.allowedDecisions,
       challenge_required: constraints.challengeRequired,

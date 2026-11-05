@@ -1565,7 +1565,7 @@ pub fn effective_allow(
 mod tests {
     use super::*;
     use crate::contract::{
-        ActionRecord, Actor, ApprovalContext, ApprovalRequest, Constraints, Risk, Surface,
+        ActionRecord, Actor, ApprovalContext, ApprovalRequest, Constraints, Surface,
         SyntacticSubstrate,
     };
     use crate::hash::compute_request_hash;
@@ -1618,7 +1618,7 @@ mod tests {
 
     fn make_action() -> ActionRecord {
         ActionRecord {
-            record_schema_version: 1,
+            record_schema_version: 2,
             surface: Surface::Command,
             syntactic: SyntacticSubstrate {
                 bin: Some("git".to_string()),
@@ -1637,9 +1637,6 @@ mod tests {
                 diff_hash: None,
                 raw: Some("git push --force".to_string()),
             },
-            risk: Risk::High,
-            capabilities: None,
-            scope: None,
         }
     }
 
@@ -1665,8 +1662,8 @@ mod tests {
                 kind: "claude-code".to_string(),
                 attestation: None,
             },
-            risk: Risk::High,
-            reversible: false,
+
+            reversible: Some(false),
             constraints: Constraints {
                 allowed_decisions: vec![Decision::Approved, Decision::Denied],
                 challenge_required,
