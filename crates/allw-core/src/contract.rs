@@ -1305,7 +1305,16 @@ mod tests {
         let verdict = make_verdict();
         let val: Value = serde_json::to_value(&verdict).unwrap();
 
-        for forbidden in &["scope", "reuse", "standing", "autonomy", "ttl", "max_uses"] {
+        for forbidden in &[
+            "scope",
+            "reuse",
+            "standing",
+            "autonomy",
+            "ttl",
+            "max_uses",
+            "rule_id",
+            "policy_rule",
+        ] {
             assert!(
                 val.get(forbidden).is_none(),
                 "Verdict must not contain a \"{forbidden}\" field (one-shot scope-free invariant, \
