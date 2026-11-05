@@ -168,55 +168,6 @@ export interface AllwWasm {
     raw: string,
     paramsJson?: string | null,
   ): string;
-  /** Sign an unsigned PolicyRule JSON with a device key and cert, returning signed JSON. */
-  sign_policy_rule(
-    unsignedRuleJson: string,
-    deviceId: string,
-    deviceSeedB64: string,
-    deviceCert: string,
-  ): string;
-  /**
-   * Emit a signed allow PolicyRule from an approved action plus syntactic scope choice.
-   * `scopeJson` is a PolicyRuleScope JSON value such as `{ "kind": "exact_call" }`.
-   */
-  policy_rule_from_approval(
-    id: string,
-    accountId: string,
-    actorJson: string,
-    actionJson: string,
-    scopeJson: string,
-    createdAt: number,
-    deviceId: string,
-    deviceSeedB64: string,
-    deviceCert: string,
-  ): string;
-  /** Verify signed PolicyRule JSON objects and evaluate them against one ActionRecord JSON. */
-  evaluate_policy(
-    actionJson: string,
-    actorJson: string | null | undefined,
-    signedRulesJson: string,
-    accountRootPubkeyB64: string,
-    nowMs: number,
-    expectedAccountId?: string | null,
-  ): string;
-  /** Verify one signed PolicyRule JSON object with account-state revocation enforcement. */
-  verify_policy_rule_with_account_states(
-    ruleJson: string,
-    accountRootPubkeyB64: string,
-    nowMs: number,
-    accountStatesJson: string,
-    expectedAccountId?: string | null,
-  ): string;
-  /** Verify signed PolicyRule JSON objects with account-state revocation and evaluate one action. */
-  evaluate_policy_with_account_states(
-    actionJson: string,
-    actorJson: string | null | undefined,
-    signedRulesJson: string,
-    accountRootPubkeyB64: string,
-    nowMs: number,
-    accountStatesJson: string,
-    expectedAccountId?: string | null,
-  ): string;
 }
 
 /** The init surface the generated `--target web` glue exposes alongside the FFI functions. */

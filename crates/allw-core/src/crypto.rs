@@ -5,7 +5,7 @@
 //! *without trusting the relay*, cryptographically bound to the exact request. It also
 //! enforces **fail-closed** (#6): every code path here returns `Err` — never a permissive
 //! default — on any failure, and the only success is an *authenticated, bound, fresh,
-//! approved* decision. The shared certificate verifier also binds verdicts and policy rules
+//! approved* decision. The shared certificate verifier also binds verdicts
 //! to the exact self-certifying account identity of their trusted root, independent of caller guards.
 //!
 //! # Signing substrate: hand-rolled EdDSA compact JWS
@@ -739,7 +739,7 @@ pub(crate) fn account_state_revokes_device(
 /// account-state document(s) among `account_states`.
 ///
 /// This is the shared revocation-resolution logic behind [`account_state_revokes_device`]
-/// (verdict/policy-rule verification) and the SDK's sender-side recipient filter (issue #204
+/// (verdict verification) and the SDK's sender-side recipient filter (issue #204
 /// fix 1): dropping a revoked device from the JWE recipient set *before* encrypting a new
 /// request, so a revoked device's plaintext confidentiality is cut off immediately rather than
 /// only at verdict-verification time.
@@ -1019,7 +1019,7 @@ impl std::error::Error for VerifyError {}
 
 /// A device key authenticated through an account-root-signed device certificate.
 ///
-/// This is the shared cert-chain result used by both verdict and policy-rule verification: callers
+/// This is the shared cert-chain result used by verdict verification: callers
 /// pass the account root, expected account id, and current time, then verify their artifact's JWS
 /// with the returned certified device key.
 pub(crate) struct CertifiedDevice {
