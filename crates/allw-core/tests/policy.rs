@@ -14,7 +14,10 @@ const DEVICE_SEED: [u8; 32] = [0x42; 32];
 const OTHER_DEVICE_SEED: [u8; 32] = [0x24; 32];
 const ROOT_SEED: [u8; 32] = [0x07; 32];
 const OTHER_ROOT_SEED: [u8; 32] = [0x08; 32];
-const ACCOUNT_ID: &str = "acct-policy";
+/// The fixture account is always the canonical identity of its signing root.
+fn account_id() -> String {
+    allw_core::account_id_for_root(&SigningKeyPair::from_seed(&ROOT_SEED).public_key())
+}
 const OTHER_ACCOUNT_ID: &str = "acct-other";
 const DEVICE_ID: &str = "device:phone";
 const OTHER_DEVICE_ID: &str = "device:watch";
@@ -44,7 +47,7 @@ fn other_root_key() -> SigningKeyPair {
 fn device_cert() -> String {
     issue_device_cert(
         &root_key(),
-        ACCOUNT_ID,
+        account_id().as_str(),
         DEVICE_ID,
         &device_key().public_key(),
         CREATED_AT,
@@ -55,7 +58,7 @@ fn device_cert() -> String {
 fn expired_device_cert() -> String {
     issue_device_cert(
         &root_key(),
-        ACCOUNT_ID,
+        account_id().as_str(),
         DEVICE_ID,
         &device_key().public_key(),
         CREATED_AT,
@@ -66,7 +69,7 @@ fn expired_device_cert() -> String {
 fn account_state(sequence: u64, revoked_device_ids: &[&str]) -> String {
     let state = AccountState {
         v: 1,
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         sequence,
         current_root: root_key().public_key().to_bytes(),
         previous_roots: Vec::new(),
@@ -118,7 +121,7 @@ fn precedence_is_deny_then_ask_then_allow_and_no_match_escalates() {
 
     let allow_git = signed(UnsignedPolicyRule {
         id: "allow-git".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::command_bin("git"),
         effect: PolicyEffect::Allow,
@@ -130,7 +133,7 @@ fn precedence_is_deny_then_ask_then_allow_and_no_match_escalates() {
     });
     let ask_force = signed(UnsignedPolicyRule {
         id: "ask-force".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::command_bin("git")
             .with_flag("--force")
@@ -144,7 +147,7 @@ fn precedence_is_deny_then_ask_then_allow_and_no_match_escalates() {
     });
     let deny_force = signed(UnsignedPolicyRule {
         id: "deny-force".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Id {
             id: "machine:macbook".to_string(),
         },
@@ -174,7 +177,7 @@ fn command_and_mcp_rules_do_not_match_file_edit_actions() {
     let action = file_edit_action("src/app.ts", "patch app");
     let command_deny = signed(UnsignedPolicyRule {
         id: "deny-command".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::command_bin("apply_patch"),
         effect: PolicyEffect::Deny,
@@ -186,7 +189,7 @@ fn command_and_mcp_rules_do_not_match_file_edit_actions() {
     });
     let mcp_deny = signed(UnsignedPolicyRule {
         id: "deny-mcp".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate {
             surface: Some(Surface::McpToolCall),
@@ -224,7 +227,7 @@ fn file_edit_deny_precedes_file_edit_allow() {
     };
     let allow = signed(UnsignedPolicyRule {
         id: "allow-file-edit".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: file_edit_predicate.clone(),
         effect: PolicyEffect::Allow,
@@ -236,7 +239,7 @@ fn file_edit_deny_precedes_file_edit_allow() {
     });
     let deny = signed(UnsignedPolicyRule {
         id: "deny-file-edit".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: file_edit_predicate,
         effect: PolicyEffect::Deny,
@@ -257,7 +260,7 @@ fn over_budget_file_edit_match_input_escalates_before_policy_match() {
     let action = file_edit_action(&"a".repeat(4097), "patch app");
     let allow = signed(UnsignedPolicyRule {
         id: "allow-file-edit".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate {
             surface: Some(Surface::FileEdit),
@@ -286,7 +289,7 @@ fn signed_policy_rule_rejects_tampering_and_wrong_device_key() {
     let other_key = SigningKeyPair::from_seed(&OTHER_DEVICE_SEED);
     let unsigned = UnsignedPolicyRule {
         id: "allow-ls".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::command_bin("ls"),
         effect: PolicyEffect::Allow,
@@ -318,7 +321,7 @@ fn signed_policy_rule_rejects_tampering_and_wrong_device_key() {
 fn signed_policy_rule_requires_account_root_cert_chain_and_matching_kid() {
     let unsigned = UnsignedPolicyRule {
         id: "allow-ls".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::command_bin("ls"),
         effect: PolicyEffect::Allow,
@@ -388,7 +391,7 @@ fn signed_policy_rule_requires_account_root_cert_chain_and_matching_kid() {
 fn signed_policy_rule_enforces_expected_account_id_when_supplied() {
     let unsigned = UnsignedPolicyRule {
         id: "allow-ls".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::command_bin("ls"),
         effect: PolicyEffect::Allow,
@@ -400,8 +403,13 @@ fn signed_policy_rule_enforces_expected_account_id_when_supplied() {
     };
     let signed_rule = sign_policy_rule(&unsigned, DEVICE_ID, &device_key(), Some(device_cert()));
 
-    verify_policy_rule_for_account(&signed_rule, &root_key().public_key(), NOW_OK, ACCOUNT_ID)
-        .expect("matching expected account id must preserve the happy path");
+    verify_policy_rule_for_account(
+        &signed_rule,
+        &root_key().public_key(),
+        NOW_OK,
+        account_id().as_str(),
+    )
+    .expect("matching expected account id must preserve the happy path");
 
     assert_eq!(
         verify_policy_rule_for_account(
@@ -419,7 +427,7 @@ fn signed_policy_rule_enforces_expected_account_id_when_supplied() {
 fn signed_policy_rule_rejects_revoked_device_from_account_state() {
     let unsigned = UnsignedPolicyRule {
         id: "allow-ls".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::command_bin("ls"),
         effect: PolicyEffect::Allow,
@@ -448,7 +456,7 @@ fn signed_policy_rule_rejects_revoked_device_from_account_state() {
 fn signed_policy_rule_rejects_stale_account_state_rollback() {
     let unsigned = UnsignedPolicyRule {
         id: "allow-ls".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::command_bin("ls"),
         effect: PolicyEffect::Allow,
@@ -478,7 +486,7 @@ fn signed_policy_rule_rejects_stale_account_state_rollback() {
 fn signed_policy_rule_rejects_cross_typ_jws_confusion() {
     let unsigned = UnsignedPolicyRule {
         id: "allow-ls".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::command_bin("ls"),
         effect: PolicyEffect::Allow,
@@ -497,7 +505,7 @@ fn signed_policy_rule_rejects_cross_typ_jws_confusion() {
             decision: Decision::Approved,
             decided_at: CREATED_AT,
             approver: Approver {
-                account_id: ACCOUNT_ID.to_string(),
+                account_id: account_id(),
                 device_id: DEVICE_ID.to_string(),
             },
             note: None,
@@ -523,7 +531,7 @@ fn signed_policy_rule_rejects_unenforced_expiry_and_bounds() {
     let key = device_key();
     let base = UnsignedPolicyRule {
         id: "allow-git".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::command_bin("git"),
         effect: PolicyEffect::Allow,
@@ -558,7 +566,7 @@ fn signed_policy_rule_rejects_empty_predicate() {
     let key = device_key();
     let empty_match = UnsignedPolicyRule {
         id: "empty-predicate".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate {
             surface: None,
@@ -586,7 +594,7 @@ fn signed_policy_rule_rejects_empty_predicate() {
 fn args_any_glob_matches_structured_tokens_not_raw_or_substrings() {
     let rule = signed(UnsignedPolicyRule {
         id: "allow-build-dir".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::command_bin("rm").with_args_any_glob("build"),
         effect: PolicyEffect::Allow,
@@ -644,7 +652,7 @@ fn args_any_glob_over_length_cap_fails_closed_to_escalate() {
     let oversized = format!("secret-{}", "a".repeat(4097));
     let rule = signed(UnsignedPolicyRule {
         id: "allow-secret-token".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::command_bin("tool").with_args_any_glob("*secret*"),
         effect: PolicyEffect::Allow,
@@ -669,7 +677,7 @@ fn oversized_action_token_cannot_bypass_deny_with_broad_allow() {
     let oversized = format!("secret-{}", "a".repeat(4097));
     let deny_secret = signed(UnsignedPolicyRule {
         id: "deny-secret".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::command_bin("tool").with_args_any_glob("*secret*"),
         effect: PolicyEffect::Deny,
@@ -681,7 +689,7 @@ fn oversized_action_token_cannot_bypass_deny_with_broad_allow() {
     });
     let allow_tool = signed(UnsignedPolicyRule {
         id: "allow-tool".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::command_bin("tool"),
         effect: PolicyEffect::Allow,
@@ -707,7 +715,7 @@ fn signed_policy_rule_rejects_over_length_glob_pattern() {
     let oversized = "a".repeat(4097);
     let unsigned = UnsignedPolicyRule {
         id: "allow-oversized-pattern".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::command_bin("tool").with_args_any_glob(&oversized),
         effect: PolicyEffect::Allow,
@@ -731,7 +739,7 @@ fn oversized_mcp_param_cannot_bypass_deny_with_broad_allow() {
     let oversized = format!("secret-{}", "a".repeat(4097));
     let deny_secret = signed(UnsignedPolicyRule {
         id: "deny-secret-param".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate {
             surface: Some(Surface::McpToolCall),
@@ -757,7 +765,7 @@ fn oversized_mcp_param_cannot_bypass_deny_with_broad_allow() {
     });
     let allow_tool = signed(UnsignedPolicyRule {
         id: "allow-create-issue".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::mcp_tool("github", "create_issue"),
         effect: PolicyEffect::Allow,
@@ -782,7 +790,7 @@ fn signed_policy_rule_rejects_over_length_mcp_glob_pattern() {
     let oversized = "a".repeat(4097);
     let unsigned = UnsignedPolicyRule {
         id: "allow-oversized-mcp-pattern".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate {
             surface: Some(Surface::McpToolCall),
@@ -821,7 +829,7 @@ fn from_approval_exact_call_round_trips_and_allows_only_the_same_command() {
     let action = git_force_action();
     let unsigned = UnsignedPolicyRule::from_approval(
         "approval-exact",
-        ACCOUNT_ID,
+        account_id().as_str(),
         &actor,
         &action,
         PolicyRuleScope::ExactCall,
@@ -876,7 +884,7 @@ fn from_approval_exact_call_uses_raw_command_when_argv_is_unavailable() {
     let verified = signed(
         UnsignedPolicyRule::from_approval(
             "approval-raw-exact",
-            ACCOUNT_ID,
+            account_id().as_str(),
             &actor,
             &action,
             PolicyRuleScope::ExactCall,
@@ -926,7 +934,7 @@ fn from_approval_exact_call_rejects_unrepresentable_command_shape() {
     assert!(
         UnsignedPolicyRule::from_approval(
             "approval-bin-only",
-            ACCOUNT_ID,
+            account_id().as_str(),
             &actor,
             &action,
             PolicyRuleScope::ExactCall,
@@ -955,7 +963,7 @@ fn from_approval_rejects_file_edit_policy_scopes_until_file_matchers_exist() {
         assert_eq!(
             UnsignedPolicyRule::from_approval(
                 "approval-file-edit",
-                ACCOUNT_ID,
+                account_id().as_str(),
                 &actor,
                 &action,
                 scope,
@@ -978,7 +986,7 @@ fn from_approval_mcp_param_rule_allows_matching_future_call_only() {
     let verified = signed(
         UnsignedPolicyRule::from_approval(
             "approval-param",
-            ACCOUNT_ID,
+            account_id().as_str(),
             &actor,
             &action,
             PolicyRuleScope::McpParamEquals {
@@ -1018,7 +1026,7 @@ fn syntactic_policy_ignores_reserved_semantic_fields() {
 
     let verified = signed(UnsignedPolicyRule {
         id: "allow-git".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::command_bin("git"),
         effect: PolicyEffect::Allow,
@@ -1070,7 +1078,7 @@ fn verdict_wire_shape_stays_one_shot_and_scope_free() {
 fn mcp_scoped_rule_does_not_match_agent_tool_call_action_with_identical_server_and_tool() {
     let mcp_deny = signed(UnsignedPolicyRule {
         id: "deny-mcp-scoped".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::mcp_tool("openclaw", "deploy_service"),
         effect: PolicyEffect::Deny,
@@ -1099,7 +1107,7 @@ fn mcp_scoped_rule_does_not_match_agent_tool_call_action_with_identical_server_a
 fn agent_tool_scoped_rule_does_not_match_mcp_tool_call_action_with_identical_server_and_tool() {
     let agent_deny = signed(UnsignedPolicyRule {
         id: "deny-agent-tool-scoped".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::agent_tool("openclaw", "deploy_service"),
         effect: PolicyEffect::Deny,
@@ -1126,7 +1134,7 @@ fn agent_tool_scoped_rule_does_not_match_mcp_tool_call_action_with_identical_ser
 fn agent_tool_scoped_rule_matches_agent_tool_call_action_by_server_and_tool() {
     let allow = signed(UnsignedPolicyRule {
         id: "allow-agent-tool".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::agent_tool("openclaw", "deploy_service"),
         effect: PolicyEffect::Allow,
@@ -1164,7 +1172,7 @@ fn agent_tool_call_deny_precedes_agent_tool_call_allow() {
     let action = action_from_agent_tool_call("openclaw", "deploy_service", None);
     let allow = signed(UnsignedPolicyRule {
         id: "allow-agent-tool".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::agent_tool("openclaw", "deploy_service"),
         effect: PolicyEffect::Allow,
@@ -1176,7 +1184,7 @@ fn agent_tool_call_deny_precedes_agent_tool_call_allow() {
     });
     let deny = signed(UnsignedPolicyRule {
         id: "deny-agent-tool".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::agent_tool("openclaw", "deploy_service"),
         effect: PolicyEffect::Deny,
@@ -1198,7 +1206,7 @@ fn agent_tool_call_deny_precedes_agent_tool_call_allow() {
 fn command_scoped_rule_does_not_match_agent_tool_call_action() {
     let deny_command = signed(UnsignedPolicyRule {
         id: "deny-deploy-command".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::command_bin("deploy_service"),
         effect: PolicyEffect::Deny,
@@ -1224,7 +1232,7 @@ fn oversized_agent_tool_call_param_cannot_bypass_deny_with_broad_allow() {
     let oversized = format!("secret-{}", "a".repeat(4097));
     let deny_secret = signed(UnsignedPolicyRule {
         id: "deny-secret-agent-param".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate {
             surface: Some(Surface::AgentToolCall),
@@ -1250,7 +1258,7 @@ fn oversized_agent_tool_call_param_cannot_bypass_deny_with_broad_allow() {
     });
     let allow_tool = signed(UnsignedPolicyRule {
         id: "allow-deploy-service".to_string(),
-        account_id: ACCOUNT_ID.to_string(),
+        account_id: account_id(),
         subject: allw_core::ActorMatcher::Any,
         predicate: PolicyPredicate::agent_tool("openclaw", "deploy_service"),
         effect: PolicyEffect::Allow,
@@ -1287,7 +1295,7 @@ fn from_approval_command_or_tool_any_args_scopes_to_agent_tool_call_surface() {
     let verified = signed(
         UnsignedPolicyRule::from_approval(
             "approval-agent-tool-any-args",
-            ACCOUNT_ID,
+            account_id().as_str(),
             &actor,
             &action,
             PolicyRuleScope::CommandOrToolAnyArgs,
@@ -1335,7 +1343,7 @@ fn from_approval_mcp_param_equals_scopes_to_agent_tool_call_surface() {
     let verified = signed(
         UnsignedPolicyRule::from_approval(
             "approval-agent-tool-param",
-            ACCOUNT_ID,
+            account_id().as_str(),
             &actor,
             &action,
             PolicyRuleScope::McpParamEquals {
@@ -1376,4 +1384,60 @@ fn from_approval_mcp_param_equals_scopes_to_agent_tool_call_surface() {
 fn agent_tool_call_action_with_no_rules_escalates() {
     let action = action_from_agent_tool_call("openclaw", "deploy_service", None);
     assert_eq!(evaluate(&action, &[]).decision, PolicyDecision::Escalate);
+}
+
+/// Root-signed policy certs cannot create aliases for the root's derived account.
+/// @see docs/enrollment.md §Self-Certifying Account Id; docs/contract.md §Verification checklist.
+#[test]
+fn self_certifying_policy_rejects_same_root_other_accounts() {
+    let root = root_key();
+    let canonical = allw_core::account_id_for_root(&root.public_key());
+    for account in [
+        allw_core::account_id_for_root(&other_root_key().public_key()),
+        "legacy-account".into(),
+        String::new(),
+        format!("{canonical}="),
+    ] {
+        let unsigned = UnsignedPolicyRule {
+            id: "allow-ls".into(),
+            account_id: account.clone(),
+            subject: allw_core::ActorMatcher::Any,
+            predicate: PolicyPredicate::command_bin("ls"),
+            effect: PolicyEffect::Allow,
+            bounds: None,
+            provenance: PolicyProvenance::Manual,
+            tier: PolicyTier::Syntactic,
+            created_at: CREATED_AT,
+            expires_at: None,
+        };
+        let cert = issue_device_cert(
+            &root,
+            &account,
+            DEVICE_ID,
+            &device_key().public_key(),
+            CREATED_AT,
+            None,
+        );
+        let rule = sign_policy_rule(&unsigned, DEVICE_ID, &device_key(), Some(cert));
+        let root_pub = root.public_key();
+        let results = [
+            verify_policy_rule(&rule, &root_pub, NOW_OK),
+            verify_policy_rule_for_account(&rule, &root_pub, NOW_OK, &account),
+            verify_policy_rule_with_account_states(&rule, &root_pub, NOW_OK, &[]),
+            allw_core::verify_policy_rule_with_account_states_for_account(
+                &rule,
+                &root_pub,
+                NOW_OK,
+                &[],
+                &account,
+            ),
+        ];
+        for result in results {
+            assert_eq!(
+                result,
+                Err(PolicyRuleError::AccountIdMismatch),
+                "account {account:?}"
+            );
+        }
+    }
 }

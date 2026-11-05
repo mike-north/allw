@@ -1,3 +1,5 @@
+// Native binding smoke for core JSON contracts and fail-closed exception propagation.
+// Account identity comes from the shared core-derived vector; this surface performs no derivation.
 import Foundation
 
 // Minimal base64url helpers (no padding, url-safe alphabet) so the smoke can
@@ -28,7 +30,7 @@ struct Smoke {
 
         // ── New (PM blocker 1a): sign → verify round-trip ────────────────────
         let deviceSeedBytes = [UInt8](repeating: 7, count: 32)
-        let accountSeedBytes = [UInt8](repeating: 11, count: 32)
+        let accountSeedBytes = [UInt8](repeating: 0x11, count: 32)
         let deviceSeed = base64urlEncode(deviceSeedBytes)
         let accountSeed = base64urlEncode(accountSeedBytes)
 
@@ -46,9 +48,22 @@ struct Smoke {
 
         let accountRootPubkey = try deriveSigningPubkeyB64(signingSeedB64: accountSeed)
 
+        // The fixed root is the shared vector's root. Read its core-derived account rather than
+        // duplicating the derivation or expanding the production native API for a test fixture.
+        let vectorData = try Data(contentsOf: URL(fileURLWithPath:
+            "crates/allw-core/tests/fixtures/wasm_vector.json"))
+        guard
+            let vector = try JSONSerialization.jsonObject(with: vectorData) as? [String: Any],
+            let accountId = vector["expected_account_id_for_root"] as? String,
+            let vectorRoot = vector["approver_root_pubkey_b64"] as? String,
+            vectorRoot == accountRootPubkey
+        else {
+            fatalError("native smoke root must match the shared core account vector")
+        }
+
         let deviceCert = try issueDeviceCertJson(
             accountRootSeedB64: accountSeed,
-            accountId: "acct-1",
+            accountId: accountId,
             deviceId: "dev-1",
             devicePubkeyB64: deviceSigningPubkey,
             issuedAt: 1_700_000_000_000,
@@ -58,12 +73,12 @@ struct Smoke {
         let requestHash = try computeRequestHashB64(contextJson: context, expiresAt: 4102444800000)
 
         let request = """
-        {"v":1,"id":"req-1","created_at":1700000000000,"expires_at":4102444800000,"approver":"acct-1","context_ciphertext":"opaque-jwe"}
+        {"v":1,"id":"req-1","created_at":1700000000000,"expires_at":4102444800000,"approver":"\(accountId)","context_ciphertext":"opaque-jwe"}
         """
         let nonce = base64urlEncode([UInt8](repeating: 9, count: 16))
         // device_cert is a JWS compact string — it must be embedded as a quoted JSON string value.
         let unsignedVerdict = """
-        {"v":1,"request_id":"req-1","request_hash":"\(requestHash)","decision":"approved","decided_at":1700000001000,"approver":{"account_id":"acct-1","device_id":"dev-1"},"device_cert":"\(deviceCert)"}
+        {"v":1,"request_id":"req-1","request_hash":"\(requestHash)","decision":"approved","decided_at":1700000001000,"approver":{"account_id":"\(accountId)","device_id":"dev-1"},"device_cert":"\(deviceCert)"}
         """
 
         let verdict = try signVerdictJson(
@@ -132,7 +147,7 @@ struct Smoke {
                 deviceId: "dev-1",
                 deviceEncryptionSeedB64: validDeviceSeed,
                 requestId: "req-1",
-                accountId: "acct-1",
+                accountId: accountId,
                 expiresAt: 4_102_444_800_000,
                 accountStates: [],
                 accountRootPubkeyB64: prepareAccountRoot
@@ -152,7 +167,7 @@ struct Smoke {
                 deviceId: "dev-1",
                 deviceEncryptionSeedB64: shortSeed,
                 requestId: "req-1",
-                accountId: "acct-1",
+                accountId: accountId,
                 expiresAt: 4_102_444_800_000,
                 accountStates: [],
                 accountRootPubkeyB64: prepareAccountRoot

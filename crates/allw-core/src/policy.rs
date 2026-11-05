@@ -4,7 +4,8 @@
 //! implements only the v1 syntactic tier from `docs/policy-seam.md`: command names, argv/glob
 //! checks, flags, MCP tool names, and MCP parameter equality/glob checks. It never reads or
 //! infers from the reserved semantic `capabilities` / `scope` fields; those belong to the
-//! deferred T3 engine.
+//! deferred T3 engine. Signed rules share the core certificate verifier with verdicts: a root
+//! authenticates only its exact derived account identity, never an arbitrary signed alias.
 
 use serde::{Deserialize, Serialize};
 
@@ -466,6 +467,8 @@ pub enum PolicyRuleError {
     MissingDeviceCert,
     CertSignatureInvalid,
     CertAccountMismatch,
+    /// The certified rule account is not the canonical id derived from the trusted root.
+    AccountIdMismatch,
     ExpectedAccountMismatch,
     CertDeviceMismatch,
     CertExpired,
@@ -495,6 +498,9 @@ impl std::fmt::Display for PolicyRuleError {
             }
             Self::CertAccountMismatch => {
                 write!(f, "policy-rule device cert account_id does not match rule")
+            }
+            Self::AccountIdMismatch => {
+                write!(f, "account id does not derive from the account root key")
             }
             Self::ExpectedAccountMismatch => {
                 write!(
@@ -581,6 +587,7 @@ pub fn sign_policy_rule(
 }
 
 /// Verify a signed policy rule against an account root, chaining through its device certificate.
+/// The certified account must derive from that root, even without expected-account or state inputs.
 pub fn verify_policy_rule(
     rule: &PolicyRule,
     account_root: &PublicKey,
@@ -662,6 +669,7 @@ fn verify_policy_rule_with_account_states_impl(
         |e| match e {
             DeviceCertError::SignatureInvalid => PolicyRuleError::CertSignatureInvalid,
             DeviceCertError::AccountMismatch => PolicyRuleError::CertAccountMismatch,
+            DeviceCertError::AccountIdMismatch => PolicyRuleError::AccountIdMismatch,
             DeviceCertError::CertExpired => PolicyRuleError::CertExpired,
         },
     )?;

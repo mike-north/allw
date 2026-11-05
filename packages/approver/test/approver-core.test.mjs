@@ -33,7 +33,11 @@ import { renderRequest } from "../dist/lib/render.js";
 
 // ── Deterministic fixtures (fixed timestamps; never Date.now() in test data) ─────────────────
 
-const ACCOUNT_ID = "acct-approver-test";
+/** All envelopes belong to the fixed root; device/encryption keys may still vary per case. */
+const fixtureWasm = await loadWasm();
+const ROOT_SEED = Buffer.alloc(32, 7).toString("base64url");
+const ROOT_PUB = fixtureWasm.ed25519_public_key(ROOT_SEED);
+const ACCOUNT_ID = fixtureWasm.account_id_for_root(ROOT_PUB);
 const DEVICE_ID = "dev-approver-test";
 const REQUEST_ID = "req-approver-test-1";
 /** 2023-11-14T22:13:20Z — cert issuance. */
@@ -93,7 +97,11 @@ function makeRequestJson() {
  * CONTEXT to the device's X25519 key (the integrator's encrypt step).
  */
 function pairedApprover(wasm, contextJson = CONTEXT_JSON) {
-  const fresh = generateKeyfile(wasm);
+  const fresh = {
+    ...generateKeyfile(wasm),
+    account_root_seed: ROOT_SEED,
+    account_root_pubkey: ROOT_PUB,
+  };
   const cert = wasm.issue_device_cert(
     fresh.account_root_seed,
     ACCOUNT_ID,

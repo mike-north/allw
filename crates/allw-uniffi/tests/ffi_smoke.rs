@@ -26,6 +26,11 @@ use serde_json::json;
 const DEVICE_SEED: [u8; 32] = [7; 32];
 const ACCOUNT_SEED: [u8; 32] = [11; 32];
 
+/// The native happy path belongs to the exact canonical identity of its fixed signing root.
+fn fixture_account_id() -> String {
+    allw_core::account_id_for_root(&SigningKeyPair::from_seed(&ACCOUNT_SEED).public_key())
+}
+
 /// Build a complete sign→verify fixture and return (verdict_json, request_json, context_json,
 /// account_root_pubkey_b64, now_ms).
 fn build_signed_verdict() -> (String, String, String, String, i64) {
@@ -46,7 +51,7 @@ fn build_signed_verdict_with_note(note: Option<&str>) -> (String, String, String
 
     let device_cert = issue_device_cert_json(
         account_seed,
-        "acct-1".to_string(),
+        fixture_account_id(),
         "dev-1".to_string(),
         device_signing_pubkey.to_string(),
         1_700_000_000_000,
@@ -73,7 +78,7 @@ fn build_signed_verdict_with_note(note: Option<&str>) -> (String, String, String
         "id": "req-1",
         "created_at": 1_700_000_000_000_i64,
         "expires_at": 4_102_444_800_000_i64,
-        "approver": "acct-1",
+        "approver": fixture_account_id(),
         "context_ciphertext": "opaque-jwe"
     });
     let nonce = URL_SAFE_NO_PAD.encode([9_u8; 16]);
@@ -83,7 +88,7 @@ fn build_signed_verdict_with_note(note: Option<&str>) -> (String, String, String
         "request_hash": request_hash,
         "decision": "approved",
         "decided_at": 1_700_000_001_000_i64,
-        "approver": { "account_id": "acct-1", "device_id": "dev-1" },
+        "approver": { "account_id": fixture_account_id(), "device_id": "dev-1" },
         "device_cert": device_cert
     });
     if let Some(note) = note {
@@ -98,6 +103,40 @@ fn build_signed_verdict_with_note(note: Option<&str>) -> (String, String, String
         account_root_pubkey,
         1_700_000_002_000,
     )
+}
+
+/// A genuine root-issued alias must fail through UniFFI without caller account/state guards.
+/// The alias and certificate are explicit here, independent of the happy-path fixture account.
+/// @see docs/enrollment.md §Self-Certifying Account Id; docs/contract.md §Verification checklist.
+#[test]
+fn uniffi_rejects_root_signed_account_alias() {
+    let (verdict_json, request_json, context_json, root, now_ms) = build_signed_verdict();
+    let mut verdict: serde_json::Value = serde_json::from_str(&verdict_json).unwrap();
+    let alias = "same-root-alias";
+    verdict["approver"]["account_id"] = json!(alias);
+    verdict["device_cert"] = json!(issue_device_cert_json(
+        URL_SAFE_NO_PAD.encode(ACCOUNT_SEED),
+        alias.to_string(),
+        "dev-1".to_string(),
+        derive_signing_pubkey_b64(URL_SAFE_NO_PAD.encode(DEVICE_SEED)).unwrap(),
+        1_700_000_000_000,
+        4_102_444_800_000,
+    )
+    .unwrap());
+    let error = verify_verdict_json(
+        verdict.to_string(),
+        request_json,
+        context_json,
+        root,
+        now_ms,
+    )
+    .expect_err("a root signature cannot create a second account identity");
+    match error {
+        allw_uniffi::AllwFfiError::Failure { details } => assert_eq!(
+            details,
+            "verify_verdict failed: account id does not derive from the account root key"
+        ),
+    }
 }
 
 #[test]
@@ -129,7 +168,7 @@ fn sign_and_verify_verdict_through_uniffi_json_surface() {
     let account_root_pubkey = derive_signing_pubkey_b64(account_seed.clone()).unwrap();
     let device_cert = issue_device_cert_json(
         account_seed.clone(),
-        "acct-1".to_string(),
+        fixture_account_id(),
         "dev-1".to_string(),
         device_signing_pubkey.to_string(),
         1_700_000_000_000,
@@ -154,7 +193,7 @@ fn sign_and_verify_verdict_through_uniffi_json_surface() {
         "id": "req-1",
         "created_at": 1_700_000_000_000_i64,
         "expires_at": 4_102_444_800_000_i64,
-        "approver": "acct-1",
+        "approver": fixture_account_id(),
         "context_ciphertext": "opaque-jwe"
     });
     let nonce = URL_SAFE_NO_PAD.encode([9_u8; 16]);
@@ -164,7 +203,7 @@ fn sign_and_verify_verdict_through_uniffi_json_surface() {
         "request_hash": request_hash,
         "decision": "approved",
         "decided_at": 1_700_000_001_000_i64,
-        "approver": { "account_id": "acct-1", "device_id": "dev-1" },
+        "approver": { "account_id": fixture_account_id(), "device_id": "dev-1" },
         "device_cert": device_cert
     });
 

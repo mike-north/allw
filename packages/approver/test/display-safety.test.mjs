@@ -48,7 +48,11 @@ import { writeKeyfile } from "../dist/lib/keyfile.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-const ACCOUNT_ID = "acct-display-test";
+/** Valid account identity keeps display-spoof cases on the legitimate approver path. */
+const fixtureWasm = await loadWasm();
+const ROOT_SEED = Buffer.alloc(32, 7).toString("base64url");
+const ROOT_PUB = fixtureWasm.ed25519_public_key(ROOT_SEED);
+const ACCOUNT_ID = fixtureWasm.account_id_for_root(ROOT_PUB);
 const DEVICE_ID = "dev-display-test";
 const REQUEST_ID = "req-display-1";
 const ISSUED_AT = 1700000000000;
@@ -80,7 +84,11 @@ function context(overrides = {}) {
 }
 
 function paired(wasm) {
-  const fresh = generateKeyfile(wasm);
+  const fresh = {
+    ...generateKeyfile(wasm),
+    account_root_seed: ROOT_SEED,
+    account_root_pubkey: ROOT_PUB,
+  };
   const cert = wasm.issue_device_cert(
     fresh.account_root_seed,
     ACCOUNT_ID,

@@ -187,10 +187,15 @@ verdict `sig` (+ optional integrator counter-sign). Periodically anchor the head
 
 ## Verification checklist (integrator MUST)
 
-1. Signature valid against the approver's device/account root key.
+1. Signature valid against the approver's device/account root key. Core verdict verification (including
+   plaintext-free provenance) and policy-rule verification MUST require the certified account id to equal
+   `account_id_for_root` of the trusted verifying root, using the existing core derivation
+   ([enrollment.md](./enrollment.md) §Self-Certifying Account Id). A valid root signature cannot create another
+   account identity: other-root-derived, free-form, empty and noncanonical ids fail closed with the distinct
+   `AccountIdMismatch` verification error. This applies even without an expected account or account state.
    Multi-account verifiers that already know the account namespace they intended to verify SHOULD also pass that
    `expected_account_id`; verification fails closed if the verdict's certified account does not match it, which
-   prevents accidentally accepting a verdict for another account certified by the same trusted root.
+   independently checks the caller's intended account, including when the wrong root was configured.
    The SDK client defaults `expectedAccountId` to its configured `accountId` when omitted or empty,
    for both `requestApproval` and the returned `Verdict.verify()`. This complements the independent
    binding of account state to the verdict's account, and still applies when re-verification explicitly

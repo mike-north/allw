@@ -34,8 +34,9 @@ glue.initSync({
 const json = (body, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
-const ACCOUNT_ID = "acct_poll_keepalive";
 const ACCOUNT_SEED = Buffer.alloc(32, 7).toString("base64url");
+/** Canonical identity keeps the valid approval on the nonce-store path. */
+const ACCOUNT_ID = glue.account_id_for_root(glue.ed25519_public_key(ACCOUNT_SEED));
 const accountStates = oneDeviceAccountStates(glue, {
   accountId: ACCOUNT_ID,
   accountSeed: ACCOUNT_SEED,

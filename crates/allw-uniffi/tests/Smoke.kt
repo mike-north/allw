@@ -1,3 +1,5 @@
+// Native binding smoke for core JSON contracts and fail-closed exception propagation.
+// Account identity comes from the shared core-derived vector; this surface performs no derivation.
 import uniffi.allw_uniffi.actionFromCommandJson
 import uniffi.allw_uniffi.computeRequestHashB64
 import uniffi.allw_uniffi.deriveDeviceKeysJson
@@ -8,6 +10,7 @@ import uniffi.allw_uniffi.signVerdictJson
 import uniffi.allw_uniffi.verifyVerdictJson
 import uniffi.allw_uniffi.AllwFfiException
 import java.util.Base64
+import java.io.File
 
 // Minimal base64url helper (no padding, url-safe alphabet).
 private fun base64urlEncode(bytes: ByteArray): String =
@@ -35,25 +38,32 @@ fun main() {
 
     // ── New (PM blocker 1a): sign → verify round-trip ────────────────────────
     val deviceSeed = base64urlEncode(ByteArray(32) { 7 })
-    val accountSeed = base64urlEncode(ByteArray(32) { 11 })
+    val accountSeed = base64urlEncode(ByteArray(32) { 0x11 })
 
     val deviceKeysJson = deriveDeviceKeysJson(deviceSeed, deviceSeed)
     val deviceSigningPubkey = jsonStringField(deviceKeysJson, "device_signing_pubkey_b64")
 
     val accountRootPubkey = deriveSigningPubkeyB64(accountSeed)
 
+    // Share the core's fixed-root account vector without porting account derivation into Kotlin.
+    val vector = File("crates/allw-core/tests/fixtures/wasm_vector.json").readText()
+    val accountId = jsonStringField(vector, "expected_account_id_for_root")
+    check(jsonStringField(vector, "approver_root_pubkey_b64") == accountRootPubkey) {
+        "native smoke root must match the shared core account vector"
+    }
+
     val deviceCert = issueDeviceCertJson(
-        accountSeed, "acct-1", "dev-1", deviceSigningPubkey,
+        accountSeed, accountId, "dev-1", deviceSigningPubkey,
         1_700_000_000_000L, 4_102_444_800_000L
     )
 
     val requestHash = computeRequestHashB64(context, 4102444800000)
     val request =
-        """{"v":1,"id":"req-1","created_at":1700000000000,"expires_at":4102444800000,"approver":"acct-1","context_ciphertext":"opaque-jwe"}"""
+        """{"v":1,"id":"req-1","created_at":1700000000000,"expires_at":4102444800000,"approver":"$accountId","context_ciphertext":"opaque-jwe"}"""
     val nonce = base64urlEncode(ByteArray(16) { 9 })
     // device_cert is a JWS compact string — it must be embedded as a quoted JSON string value.
     val unsignedVerdict =
-        """{"v":1,"request_id":"req-1","request_hash":"$requestHash","decision":"approved","decided_at":1700000001000,"approver":{"account_id":"acct-1","device_id":"dev-1"},"device_cert":"$deviceCert"}"""
+        """{"v":1,"request_id":"req-1","request_hash":"$requestHash","decision":"approved","decided_at":1700000001000,"approver":{"account_id":"$accountId","device_id":"dev-1"},"device_cert":"$deviceCert"}"""
 
     val verdict = signVerdictJson(unsignedVerdict, deviceSeed, nonce)
     val verified = verifyVerdictJson(verdict, request, context, accountRootPubkey, 1_700_000_002_000L)
@@ -84,7 +94,7 @@ fun main() {
     var caughtMalformedJwe = false
     try {
         prepareApprovalJson(
-            "NOT A JWE {{{", "dev-1", deviceSeed, "req-1", "acct-1",
+            "NOT A JWE {{{", "dev-1", deviceSeed, "req-1", accountId,
             4_102_444_800_000L, emptyList(), accountRootPubkey
         )
     } catch (_: AllwFfiException) {
@@ -96,7 +106,7 @@ fun main() {
     var caughtShortSeed = false
     try {
         prepareApprovalJson(
-            "{}", "dev-1", shortSeed, "req-1", "acct-1",
+            "{}", "dev-1", shortSeed, "req-1", accountId,
             4_102_444_800_000L, emptyList(), accountRootPubkey
         )
     } catch (_: AllwFfiException) {

@@ -63,7 +63,11 @@ async function loadWasm() {
 /** A fixed "now" so expires_at = NOW + timeout is deterministic and inside the verify window. */
 const NOW_MS = 1700001000000; // 2023-11-14T22:30:00Z
 const TIMEOUT_MS = 60_000;
-const ACCOUNT_ID = "acct_sdk_test_01";
+/** Canonical account identity of the deterministic root used by makeApprover. */
+const fixtureWasm = await loadWasm();
+const ACCOUNT_ID = fixtureWasm.account_id_for_root(
+  fixtureWasm.ed25519_public_key(Buffer.alloc(32, 7).toString("base64url")),
+);
 const RELAY_URL = "https://relay.allw.test";
 
 /** A representative ApprovalRequest in the SDK's ergonomic camelCase shape. */
