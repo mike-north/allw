@@ -13,11 +13,11 @@
  *  (a') happy poll round-trip (no WebSocket) → resolves `approved`;
  *  (b) timeout (no verdict) → resolves `expired`, never approved, `verify()` false;
  *  (b') relay `expired` terminal → resolves `expired`;
- *  (c) tampered / forged verdict → never approved (synthesized `denied`), `verify()` false;
+ *  (c) tampered / forged verdict → never approved (deadline `expired`), `verify()` false;
  *  (c-sig) verdict from an uncertified key → never approved;
  *  (c') authenticated human "denied" → resolves `denied` (the verified decision), `verify()` false;
- *  (f) a relay-forged outer decision whose fields echo the old message marker → synthesized
- *      `denied`, `verify()` false; genuine signed non-approvals still report the signed decision
+ *  (f) a relay-forged outer decision whose fields echo the old message marker → deadline
+ *      `expired`, `verify()` false; genuine signed non-approvals still report the signed decision
  *      (#311);
  *  (d) negative: no devices, relay submit error;
  *  (i) integrator-initiated cancellation (`ApprovalRequest.signal`, issue #195) → rejects with
@@ -192,7 +192,7 @@ function signVerdict(
   approver,
   req,
   capturedEnvelope,
-  { decision = "approved", note = undefined } = {},
+  { decision = "approved", note = undefined, nonceByte = 3 } = {},
 ) {
   const requestHash = wasm.compute_request_hash(
     JSON.stringify(wireContext(req)),
@@ -207,7 +207,7 @@ function signVerdict(
     approver: { account_id: ACCOUNT_ID, device_id: approver.deviceId },
     ...(note === undefined ? {} : { note }),
   };
-  const nonce = Buffer.alloc(16, 3).toString("base64url");
+  const nonce = Buffer.alloc(16, nonceByte).toString("base64url");
   const verdictJson = wasm.sign_verdict(
     JSON.stringify(unsigned),
     approver.deviceSeed,
@@ -299,6 +299,8 @@ function makeRelayDouble({ devices = [], behavior }) {
     }
     if (method === "POST" && path.endsWith("/retract")) {
       state.retractCalls += 1;
+      if (behavior.retractWait) await behavior.retractWait;
+      if (behavior.retractThrows) throw new TypeError("retract connection failed");
       if (init.headers?.Authorization !== `Bearer ${state.requestAuthToken}`) {
         return jsonResponse({ error: "authorization denied" }, 403);
       }
@@ -317,6 +319,9 @@ function makeRelayDouble({ devices = [], behavior }) {
       const outcome = behavior.poll(state.captured);
       if (outcome === null) return jsonResponse({ request_id: "x", status: "pending" });
       if (outcome === "expired") return jsonResponse({ request_id: "x", status: "expired" });
+      // Record delivery separately from GET attempts: a pending/silent relay is not evidence
+      // that a rejection branch actually received its intended untrusted artifact.
+      state.requests.push(`RESOLVED ${path}`);
       return jsonResponse({ request_id: "x", status: "resolved", verdict: outcome });
     }
     return jsonResponse({ error: "not found" }, 404);
@@ -378,6 +383,10 @@ function makeControllableWebSocketFactory() {
     return instance;
   };
   factory.emit = (frame) => instance?.emit(frame);
+  factory.disconnect = () => {
+    for (const listener of instance?.listeners.close ?? []) listener();
+  };
+  factory.isClosed = () => instance?.closed;
   return factory;
 }
 
@@ -559,22 +568,28 @@ test("(a-revoked) accountStates reject an otherwise valid verdict from a revoked
         env ? signVerdict(wasm, revokedDevice, req, env, { decision: "approved" }) : null,
     },
   });
+  const clock = finalityClock();
   const client = createClient({
     relayUrl: RELAY_URL,
     accountId: ACCOUNT_ID,
     approverRootKey: kept.accountRootPub,
     fetchImpl: relay.fetchImpl,
-    nowImpl: () => NOW_MS,
+    nowImpl: clock.now,
+    scheduleImpl: clock.schedule,
     webSocketFactory: undefined,
     pollIntervalMs: 5,
     accountStates: [revokedState],
   });
 
-  const verdict = await client.requestApproval(req);
+  const pending = client.requestApproval(req);
+  await clock.advance();
+  assertResolvedPoll(relay);
+  await clock.advance(TIMEOUT_MS);
+  const verdict = await pending;
   assert.equal(
     verdict.decision,
-    "denied",
-    "a revoked device's otherwise valid approval fails closed to denied",
+    "expired",
+    "a revoked device's otherwise valid approval fails closed at expiry",
   );
   assert.equal(
     await verdict.verify(kept.accountRootPub),
@@ -767,7 +782,7 @@ test("(b') relay reports terminal 'expired' → resolves expired", async () => {
   );
 });
 
-test("(c) tampered verdict (outer decision flipped) → never approved, synthesized denied", async () => {
+test("(c) tampered verdict (outer decision flipped) → never approved, expired at deadline", async () => {
   const wasm = await loadWasm();
   const approver = makeApprover(wasm);
   const req = sampleRequest();
@@ -784,9 +799,9 @@ test("(c) tampered verdict (outer decision flipped) → never approved, synthesi
     },
   });
 
-  const verdict = await pollClient(approver, relay).requestApproval(req);
+  const verdict = await expiryPollClient(approver, relay).requestApproval(req);
   assert.notEqual(verdict.decision, "approved", "a forged verdict must NEVER resolve approved");
-  assert.equal(verdict.decision, "denied", "an unverifiable verdict fails closed to denied");
+  assert.equal(verdict.decision, "expired", "an unverifiable verdict fails closed at expiry");
   assert.equal(
     await verdict.verify(approver.accountRootPub),
     false,
@@ -796,13 +811,13 @@ test("(c) tampered verdict (outer decision flipped) → never approved, synthesi
 
 /**
  * The note check runs before the decision gate (#251 S15): a signed non-approval whose note the
- * relay rewrote is unverifiable, so `verifyToDecision` returns null and the SDK synthesizes
- * `denied` — it is never reported as the verified decision. The verdict is signed `aborted` so a
- * verified decision (`aborted`) and the synthesized one (`denied`) are distinguishable.
+ * relay rewrote is unverifiable, so `verifyToDecision` returns null and the SDK waits for
+ * expiry — it is never reported as the verified decision. The verdict is signed `aborted` so a
+ * verified decision (`aborted`) and the deadline outcome (`expired`) are distinguishable.
  *
  * @see docs/contract.md §Wire encoding → verdict signature
  */
-test("(c-note) rewritten note on a signed non-approval → synthesized denied, never the verified decision", async () => {
+test("(c-note) rewritten note on a signed non-approval → expired at deadline, never the verified decision", async () => {
   const wasm = await loadWasm();
   const approver = makeApprover(wasm);
 
@@ -822,7 +837,7 @@ test("(c-note) rewritten note on a signed non-approval → synthesized denied, n
         },
       },
     });
-    return pollClient(approver, relay).requestApproval(req);
+    return expiryPollClient(approver, relay).requestApproval(req);
   };
 
   const control = await run(false);
@@ -831,8 +846,8 @@ test("(c-note) rewritten note on a signed non-approval → synthesized denied, n
   const tampered = await run(true);
   assert.equal(
     tampered.decision,
-    "denied",
-    "a rewritten note makes the verdict unverifiable → synthesized denied, not 'aborted'",
+    "expired",
+    "a rewritten note makes the verdict unverifiable → expired at deadline, not 'aborted'",
   );
   assert.equal(await tampered.verify(approver.accountRootPub), false);
 });
@@ -868,11 +883,11 @@ test("(c-sig) verdict signed by an uncertified key → never approved", async ()
     },
   });
 
-  const verdict = await pollClient(approver, relay).requestApproval(req);
+  const verdict = await expiryPollClient(approver, relay).requestApproval(req);
   assert.equal(
     verdict.decision,
-    "denied",
-    "a verdict from an uncertified key fails closed to denied",
+    "expired",
+    "a verdict from an uncertified key fails closed at expiry",
   );
   assert.equal(await verdict.verify(approver.accountRootPub), false);
 });
@@ -911,7 +926,7 @@ const NOT_APPROVED_MARKER = "verified human decision was not 'approved'";
 
 /**
  * Forged verdicts (#311): the device signs `signed`; the relay rewrites the outer `decision` to
- * `outer` and sets `field` to the marker. Each must resolve a synthesized `denied` with `verify()`
+ * `outer` and sets `field` to the marker. Each must wait until deadline `expired` with `verify()`
  * false: never `approved`, and never the forged `aborted`/`expired` reported as verified.
  *
  * `echoed` cases put the marker where serde quotes it back in the verify error, so classifying by
@@ -993,7 +1008,7 @@ const FORGED_NON_APPROVALS = [
 
 for (const forged of FORGED_NON_APPROVALS) {
   const kind = forged.echoed ? "marker echoed" : "control";
-  test(`(f) forged non-approval (${forged.name}; ${kind}) → synthesized denied, verify() false (#311)`, async () => {
+  test(`(f) forged non-approval (${forged.name}; ${kind}) → expired at deadline, verify() false (#311)`, async () => {
     const wasm = await loadWasm();
     const approver = makeApprover(wasm);
     const req = sampleRequest();
@@ -1011,8 +1026,8 @@ for (const forged of FORGED_NON_APPROVALS) {
       },
     });
 
-    const verdict = await pollClient(approver, relay).requestApproval(req);
-    assert.equal(verdict.decision, "denied", "an unverifiable verdict fails closed to denied");
+    const verdict = await expiryPollClient(approver, relay).requestApproval(req);
+    assert.equal(verdict.decision, "expired", "an unverifiable verdict fails closed at expiry");
     assert.equal(await verdict.verify(approver.accountRootPub), false, "verify() rejects it");
   });
 }
@@ -1038,7 +1053,7 @@ test("(f') genuine signed non-approvals report the signed decision (#311)", asyn
 /**
  * The structured non-approval is read from own properties only (#311 review). If something in the
  * integrator's process pollutes `Error.prototype` with `kind`/`decision`, an unverifiable verdict
- * must still be a synthesized `denied`, not the polluter's choice reported as verified.
+ * must still wait until expiry, not the polluter's choice reported as verified.
  */
 test("(f'') a polluted Error.prototype does not make a forged verdict a verified non-approval (#311)", async () => {
   const wasm = await loadWasm();
@@ -1060,8 +1075,8 @@ test("(f'') a polluted Error.prototype does not make a forged verdict a verified
   Error.prototype.kind = "not_approved";
   Error.prototype.decision = "aborted";
   try {
-    const verdict = await pollClient(approver, relay).requestApproval(req);
-    assert.equal(verdict.decision, "denied", "an inherited kind/decision is ignored");
+    const verdict = await expiryPollClient(approver, relay).requestApproval(req);
+    assert.equal(verdict.decision, "expired", "an inherited kind/decision is ignored");
     assert.equal(await verdict.verify(approver.accountRootPub), false);
   } finally {
     delete Error.prototype.kind;
@@ -1125,7 +1140,7 @@ test("submitted envelope carries EXACTLY the contract's key set (no plaintext le
   assert.equal(env.expires_at, NOW_MS + TIMEOUT_MS, "expires_at = now + timeoutMs");
 });
 
-test("(g) a verdict signed for a DIFFERENT envelope id resolves denied (no-swap binding)", async () => {
+test("(g) a verdict signed for a DIFFERENT envelope id waits to expiry (no-swap binding)", async () => {
   const wasm = await loadWasm();
   const approver = makeApprover(wasm);
   const req = sampleRequest();
@@ -1150,10 +1165,10 @@ test("(g) a verdict signed for a DIFFERENT envelope id resolves denied (no-swap 
     },
   });
 
-  const verdict = await pollClient(approver, relay).requestApproval(req);
+  const verdict = await expiryPollClient(approver, relay).requestApproval(req);
   assert.equal(
     verdict.decision,
-    "denied",
+    "expired",
     "a verdict bound to a different id must not be approved",
   );
   assert.equal(await verdict.verify(approver.accountRootPub), false);
@@ -1175,7 +1190,8 @@ test("(g') a replayed approved verdict nonce is rejected on the same client (#48
       },
     },
   });
-  const client = pollClient(approver, relay);
+  const clock = finalityClock();
+  const client = pollClient(approver, relay, { nowImpl: clock.now, scheduleImpl: clock.schedule });
 
   await withFixedRequestId("00000000-0000-4000-8000-000000000048", async () => {
     const first = await client.requestApproval(req);
@@ -1191,10 +1207,14 @@ test("(g') a replayed approved verdict nonce is rejected on the same client (#48
       "a second verify() call on the same object still does not self-trip replay protection",
     );
 
-    const second = await client.requestApproval(req);
+    const pending = client.requestApproval(req);
+    await clock.advance();
+    assertResolvedPoll(relay, 2);
+    await clock.advance(TIMEOUT_MS);
+    const second = await pending;
     assert.equal(
       second.decision,
-      "denied",
+      "expired",
       "the same signed verdict replayed to a later identical request fails closed",
     );
     assert.equal(
@@ -1426,7 +1446,7 @@ test("(i'') cancellation discovered via poll fallback rejects with RequestRetrac
   );
 });
 
-test("(i''') a failed retract call is best-effort: the original deadline still governs", async () => {
+test("(i''') a failed retract call promptly ends the local wait expired", async () => {
   const wasm = await loadWasm();
   const approver = makeApprover(wasm);
   const req = sampleRequest();
@@ -1435,10 +1455,10 @@ test("(i''') a failed retract call is best-effort: the original deadline still g
   const relay = makeRelayDouble({
     devices: [deviceRecord(approver)],
     // The relay refuses the retract (e.g. the request was already terminal server-side); no
-    // verdict is ever produced either, so only the fail-closed deadline can resolve the call.
+    // verdict is ever produced either, so cancellation must end the local wait without a deadline.
     behavior: { poll: () => null, retractStatus: 409 },
   });
-  const clock = makeTimeoutClock();
+  const clock = finalityClock();
 
   const client = createClient({
     relayUrl: RELAY_URL,
@@ -1453,14 +1473,16 @@ test("(i''') a failed retract call is best-effort: the original deadline still g
   });
 
   const pending = client.requestApproval({ ...req, signal: controller.signal });
-  await waitFor(() => relay.state.submitted);
+  await clock.advance();
   controller.abort();
+  await clock.advance();
 
   const verdict = await pending;
+  assert.equal(clock.now(), NOW_MS, "failed retraction does not wait for the deadline");
   assert.equal(
     verdict.decision,
     "expired",
-    "a best-effort retract failure never blocks or corrupts the fail-closed timeout",
+    "a retract failure ends the local wait without claiming server-side retraction",
   );
   assert.equal(relay.state.retractCalls, 1, "the retract attempt was still made");
   assert.equal(relay.state.retracted, false, "the relay-side status was never actually flipped");
@@ -1797,7 +1819,466 @@ test("(s-revoke) the loaded set also drives verdict revocation (no reload mid-re
   });
   const { source, calls } = recordingSource([revokedState]);
 
-  const verdict = await pollClient(kept, relay, { accountStates: source }).requestApproval(req);
-  assert.equal(verdict.decision, "denied", "a verdict from a device the loaded set revokes fails");
+  const verdict = await expiryPollClient(kept, relay, { accountStates: source }).requestApproval(
+    req,
+  );
+  assert.equal(verdict.decision, "expired", "a verdict from a device the loaded set revokes fails");
   assert.equal(calls.load, 1, "the same loaded set is used; load() is not called again");
 });
+
+/**
+ * A manual clock keeps transport/verification microtasks separate from elapsed request time.
+ * Advancing it fires only due timers; flushing one event-loop turn lets real WASM and promises
+ * settle without introducing wall-clock values into the request or verdict fixtures.
+ */
+function finalityClock() {
+  let current = NOW_MS;
+  const timers = [];
+  return {
+    now: () => current,
+    schedule: (fn, ms) => timers.push({ at: current + ms, fn }),
+    async advance(ms = 0) {
+      current += ms;
+      for (const timer of timers.splice(0)) {
+        if (timer.at <= current) timer.fn();
+        else timers.push(timer);
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+    },
+  };
+}
+
+/**
+ * Finality belongs to the integrator's full verification, for either delivery strategy. A relay
+ * may have older revocation state, or accept a genuine signature over the wrong plaintext hash.
+ * Neither provenance nor a forged outer decision may terminate the request.
+ * @see ../../../docs/contract.md §Transport, §Verification checklist
+ */
+for (const transport of ["WS", "poll"]) {
+  for (const rejected of ["hash", "revoked", "signature", "account"]) {
+    for (const decision of ["approved", "denied", "aborted"]) {
+      test(`(finality) ${transport}: ${rejected} then verified ${decision}`, async () => {
+        const wasm = await loadWasm();
+        const approver = makeApprover(wasm);
+        const revoked = makeSecondDevice(wasm, approver, { seedByte: 90, deviceId: "revoked" });
+        const states = [
+          signAccountState(wasm, approver, {
+            sequence: 2,
+            devices: [approver, revoked],
+            revokedDeviceIds: [revoked.deviceId],
+          }),
+        ];
+        const { source, calls } = recordingSource(states);
+        const req = sampleRequest();
+        const clock = finalityClock();
+        let candidate = null;
+        const relay = makeRelayDouble({ behavior: { poll: () => candidate } });
+        const ws = makeControllableWebSocketFactory();
+        const client = pollClient(approver, relay, {
+          accountStates: source,
+          nowImpl: clock.now,
+          scheduleImpl: clock.schedule,
+          ...(transport === "WS" ? { webSocketFactory: ws } : {}),
+        });
+        let settled = false;
+        const pending = client.requestApproval(req).finally(() => {
+          settled = true;
+        });
+        await clock.advance();
+        const env = relay.state.captured;
+        candidate = signVerdict(
+          wasm,
+          rejected === "revoked" ? revoked : approver,
+          rejected === "hash" ? { ...req, summary: "different plaintext" } : req,
+          env,
+        );
+        if (rejected === "signature") candidate.sig = "bad.jws.signature";
+        if (rejected === "account") candidate.approver.account_id = "foreign_account";
+        if (rejected === "hash" || rejected === "revoked") {
+          // The relay can accept this provenance using an older state; full SDK verification
+          // must still reject the wrong hash or the device revoked in the loaded snapshot.
+          assert.doesNotThrow(() =>
+            wasm.verify_verdict_provenance(
+              JSON.stringify(candidate),
+              env.id,
+              env.created_at,
+              env.expires_at,
+              ACCOUNT_ID,
+              approver.accountRootPub,
+              "[]",
+            ),
+          );
+        }
+        if (transport === "WS") ws.emit({ type: "verdict", verdict: candidate });
+        await clock.advance(5);
+        assert.equal(settled, false, "an unverifiable candidate never resolves early");
+        candidate = signVerdict(wasm, approver, req, env, { decision });
+        if (transport === "WS") ws.emit({ type: "verdict", verdict: candidate });
+        await clock.advance(5);
+        const result = await pending;
+        assert.equal(result.decision, decision);
+        assert.equal(await result.verify(approver.accountRootPub), decision === "approved");
+        assert.equal(calls.load, 1, "verification reuses the single account-state snapshot");
+      });
+    }
+  }
+
+  test(`(finality) ${transport}: relay resolved with wrong hash, no later verdict → deadline`, async () => {
+    const wasm = await loadWasm();
+    const approver = makeApprover(wasm);
+    const req = sampleRequest();
+    const clock = finalityClock();
+    let polls = 0;
+    const relay = makeRelayDouble({
+      behavior: {
+        poll: (env) => {
+          polls += 1;
+          return signVerdict(wasm, approver, { ...req, summary: "wrong hash" }, env);
+        },
+      },
+    });
+    const ws = makeControllableWebSocketFactory();
+    const client = pollClient(approver, relay, {
+      nowImpl: clock.now,
+      scheduleImpl: clock.schedule,
+      ...(transport === "WS" ? { webSocketFactory: ws } : {}),
+    });
+    let settled = false;
+    const pending = client.requestApproval(req).finally(() => {
+      settled = true;
+    });
+    await clock.advance();
+    if (transport === "WS")
+      ws.emit({
+        type: "verdict",
+        verdict: signVerdict(
+          wasm,
+          approver,
+          { ...req, summary: "wrong hash" },
+          relay.state.captured,
+        ),
+      });
+    await clock.advance();
+    assert.equal(settled, false);
+    const before = polls;
+    await clock.advance();
+    assert.equal(polls, before, "rejected poll results cannot spin without a scheduled sleep");
+    await clock.advance(TIMEOUT_MS - 1);
+    assert.equal(settled, false, "still pending immediately before expiry");
+    await clock.advance(1);
+    const result = await pending;
+    assert.equal(result.decision, "expired");
+    assert.equal(await result.verify(approver.accountRootPub), false);
+    const after = polls;
+    await clock.advance(1000);
+    assert.equal(polls, after, "no polling after expiry");
+  });
+}
+
+/** Exercise rejection fixtures through the deadline without waiting for real time to pass. */
+function expiryPollClient(approver, relay, extra = {}) {
+  const clock = finalityClock();
+  const client = pollClient(approver, relay, {
+    ...extra,
+    nowImpl: clock.now,
+    scheduleImpl: clock.schedule,
+  });
+  return {
+    async requestApproval(req) {
+      const pending = client.requestApproval(req);
+      await clock.advance();
+      assertResolvedPoll(relay);
+      await clock.advance(req.timeoutMs ?? TIMEOUT_MS);
+      return pending;
+    },
+  };
+}
+
+/** Cancellation and transport fallback retain their meaning after a rejected candidate. */
+for (const transport of ["WS", "poll"]) {
+  test(`(finality) ${transport}: cancellation after an invalid verdict still rejects`, async () => {
+    const wasm = await loadWasm();
+    const approver = makeApprover(wasm);
+    const clock = finalityClock();
+    const ws = makeControllableWebSocketFactory();
+    const controller = new AbortController();
+    const relay = makeRelayDouble({
+      behavior: {
+        poll: () => ({ sig: "junk" }),
+        onRetract: () => ws.emit({ type: "retracted" }),
+      },
+    });
+    const client = pollClient(approver, relay, {
+      nowImpl: clock.now,
+      scheduleImpl: clock.schedule,
+      ...(transport === "WS" ? { webSocketFactory: ws } : {}),
+    });
+    const pending = client.requestApproval({ ...sampleRequest(), signal: controller.signal });
+    // Attach the rejection observer before driving cancellation, avoiding unhandled rejections.
+    const rejected = assert.rejects(pending, RequestRetractedError);
+    await clock.advance();
+    if (transport === "WS") ws.emit({ type: "verdict", verdict: { sig: "junk" } });
+    await clock.advance(5);
+    controller.abort();
+    await clock.advance(5);
+    await rejected;
+    assert.equal(relay.state.retractCalls, 1);
+  });
+
+  test(`(finality) ${transport}: deadline bounds async nonce verification after junk`, async () => {
+    const wasm = await loadWasm();
+    const approver = makeApprover(wasm);
+    const req = sampleRequest();
+    const clock = finalityClock();
+    const ws = makeControllableWebSocketFactory();
+    let candidate = { sig: "junk" };
+    let release;
+    let nonceChecks = 0;
+    const relay = makeRelayDouble({ behavior: { poll: () => candidate } });
+    const client = pollClient(approver, relay, {
+      nowImpl: clock.now,
+      scheduleImpl: clock.schedule,
+      ...(transport === "WS" ? { webSocketFactory: ws } : {}),
+      nonceStore: {
+        checkAndInsert: () => {
+          nonceChecks += 1;
+          return new Promise((resolve) => {
+            release = resolve;
+          });
+        },
+      },
+    });
+    let result;
+    const pending = client.requestApproval(req).then((verdict) => {
+      result = verdict;
+    });
+    await clock.advance();
+    if (transport === "WS") ws.emit({ type: "verdict", verdict: candidate });
+    await clock.advance(5);
+    candidate = signVerdict(wasm, approver, req, relay.state.captured);
+    if (transport === "WS") ws.emit({ type: "verdict", verdict: candidate });
+    await clock.advance(5);
+    assert.equal(nonceChecks, 1, "the valid candidate reached async replay protection");
+    await clock.advance(TIMEOUT_MS - 10);
+    assert.equal(result?.decision, "expired", "verification cannot hang beyond expires_at");
+    if (transport === "WS") assert.equal(ws.isClosed(), true, "deadline closes the live socket");
+    release(true);
+    await clock.advance();
+    await pending;
+    assert.equal(result.decision, "expired", "late verification cannot replace expiry");
+  });
+}
+
+/** Frames already delivered must be verified before a following socket close triggers fallback. */
+for (const beforeClose of ["valid", "invalid"]) {
+  test(`(finality) WS: rejected frame then ${beforeClose} frame and immediate close`, async () => {
+    const wasm = await loadWasm();
+    const approver = makeApprover(wasm);
+    const req = sampleRequest();
+    const clock = finalityClock();
+    const ws = makeControllableWebSocketFactory();
+    let polls = 0;
+    const relay = makeRelayDouble({
+      behavior: {
+        poll: (env) => {
+          polls += 1;
+          return signVerdict(wasm, approver, req, env);
+        },
+      },
+    });
+    const client = pollClient(approver, relay, {
+      nowImpl: clock.now,
+      scheduleImpl: clock.schedule,
+      webSocketFactory: ws,
+    });
+    const pending = client.requestApproval(req);
+    await clock.advance();
+    ws.emit({ type: "verdict", verdict: { sig: "junk" } });
+    ws.emit({
+      type: "verdict",
+      verdict:
+        beforeClose === "valid"
+          ? signVerdict(wasm, approver, req, relay.state.captured)
+          : { sig: "junk" },
+    });
+    ws.disconnect();
+    await clock.advance();
+    const result = await pending;
+    assert.equal(result.decision, "approved");
+    assert.equal(await result.verify(approver.accountRootPub), true);
+    assert.equal(
+      polls,
+      beforeClose === "valid" ? 0 : 1,
+      "a delivered valid frame wins before close; rejected frames allow fallback",
+    );
+  });
+}
+
+/**
+ * A relay-resolved but SDK-rejected candidate cannot trap a caller who cancels. Only a confirmed
+ * retraction is reported as cancellation; refusal or network failure ends the local wait expired.
+ * @see ../../../docs/contract.md §Transport → Integrator retract
+ */
+for (const transport of ["WS", "poll"]) {
+  for (const failure of ["409", "throws"]) {
+    test(`(finality) ${transport}: abort after rejected candidate, retract ${failure} → prompt expiry`, async () => {
+      const wasm = await loadWasm();
+      const approver = makeApprover(wasm);
+      const req = sampleRequest();
+      const clock = finalityClock();
+      const ws = makeControllableWebSocketFactory();
+      const controller = new AbortController();
+      let served = 0;
+      let deliverVerified = false;
+      let finishRetract;
+      const retractWait = new Promise((resolve) => {
+        finishRetract = resolve;
+      });
+      const rejected = (env) =>
+        signVerdict(wasm, approver, { ...req, summary: "wrong plaintext hash" }, env);
+      const relay = makeRelayDouble({
+        behavior: {
+          poll: (env) => {
+            served += 1;
+            return deliverVerified ? signVerdict(wasm, approver, req, env) : rejected(env);
+          },
+          retractWait,
+          ...(failure === "409" ? { retractStatus: 409 } : { retractThrows: true }),
+        },
+      });
+      const client = pollClient(approver, relay, {
+        nowImpl: clock.now,
+        scheduleImpl: clock.schedule,
+        ...(transport === "WS" ? { webSocketFactory: ws } : {}),
+      });
+      let result;
+      const pending = client
+        .requestApproval({ ...req, signal: controller.signal })
+        .then((value) => {
+          result = value;
+        });
+      try {
+        await clock.advance();
+        if (transport === "WS") {
+          const candidate = rejected(relay.state.captured);
+          assert.doesNotThrow(() =>
+            wasm.verify_verdict_provenance(
+              JSON.stringify(candidate),
+              relay.state.captured.id,
+              NOW_MS,
+              NOW_MS + TIMEOUT_MS,
+              ACCOUNT_ID,
+              approver.accountRootPub,
+              "[]",
+            ),
+          );
+          ws.emit({ type: "verdict", verdict: candidate });
+        } else assert.ok(served > 0, "a resolved rejected candidate was served before abort");
+        await clock.advance();
+        assert.equal(result, undefined, "the unverifiable candidate leaves the wait pending");
+        controller.abort();
+        await clock.advance();
+        assert.equal(relay.state.retractCalls, 1);
+        assert.equal(result, undefined, "cancellation awaits the retract attempt settling");
+        deliverVerified = true;
+        if (transport === "WS")
+          ws.emit({
+            type: "verdict",
+            verdict: signVerdict(wasm, approver, req, relay.state.captured),
+          });
+        await clock.advance(5);
+        assert.equal(result, undefined, "a later approval cannot overtake an observed abort");
+        finishRetract();
+        await clock.advance();
+        assert.ok(clock.now() < NOW_MS + TIMEOUT_MS, "the request deadline has not elapsed");
+        assert.equal(result?.decision, "expired", "failed retraction promptly ends the local wait");
+        assert.equal(await result.verify(approver.accountRootPub), false);
+        if (transport === "WS") assert.equal(ws.isClosed(), true);
+      } finally {
+        finishRetract();
+        await clock.advance(TIMEOUT_MS);
+        await pending;
+      }
+    });
+  }
+}
+
+/**
+ * Deliver two genuine approvals while the first nonce insert is pending. The later device must
+ * not overtake it even when its nonce store operation could finish immediately. Independent
+ * re-verification under a state revoking only the second device identifies the winning artifact.
+ * @see ../../../docs/contract.md §Transport → integrator finality
+ */
+test("(finality) WS: first valid frame wins despite a slower first nonce check", async () => {
+  const wasm = await loadWasm();
+  const first = makeApprover(wasm);
+  const second = makeSecondDevice(wasm, first, { seedByte: 101, deviceId: "second_valid" });
+  const req = sampleRequest();
+  const clock = finalityClock();
+  const ws = makeControllableWebSocketFactory();
+  const relay = makeRelayDouble({ behavior: { poll: () => null } });
+  let release;
+  let checks = 0;
+  const firstNonce = Buffer.alloc(16, 31).toString("base64url");
+  const client = pollClient(first, relay, {
+    nowImpl: clock.now,
+    scheduleImpl: clock.schedule,
+    webSocketFactory: ws,
+    accountStates: [signAccountState(wasm, first, { sequence: 1, devices: [first, second] })],
+    nonceStore: {
+      checkAndInsert: (nonce) => {
+        checks += 1;
+        if (nonce === firstNonce)
+          return new Promise((resolve) => {
+            release = resolve;
+          });
+        return Promise.resolve(true);
+      },
+    },
+  });
+  let result;
+  const pending = client.requestApproval(req).then((value) => {
+    result = value;
+  });
+  await clock.advance();
+  ws.emit({
+    type: "verdict",
+    verdict: signVerdict(wasm, first, req, relay.state.captured, { nonceByte: 31 }),
+  });
+  ws.emit({
+    type: "verdict",
+    verdict: signVerdict(wasm, second, req, relay.state.captured, { nonceByte: 32 }),
+  });
+  await clock.advance();
+  try {
+    assert.equal(
+      checks,
+      1,
+      "the second frame cannot start nonce verification before the first completes",
+    );
+    assert.equal(result, undefined, "the second frame must not resolve the request first");
+  } finally {
+    release(true);
+    await clock.advance();
+    await pending;
+  }
+  assert.equal(result.decision, "approved");
+  const onlyFirstTrusted = signAccountState(wasm, first, {
+    sequence: 2,
+    devices: [first, second],
+    revokedDeviceIds: [second.deviceId],
+  });
+  assert.equal(
+    await result.verify(first.accountRootPub, { accountStates: [onlyFirstTrusted] }),
+    true,
+    "the result carries the first frame's artifact, not the faster second device's approval",
+  );
+});
+
+/** A rejection regression must receive its candidate; silence proves only timeout behavior. */
+function assertResolvedPoll(relay, minimum = 1) {
+  assert.ok(
+    relay.state.requests.filter((request) => request.startsWith("RESOLVED ")).length >= minimum,
+    "a resolved row containing the rejection candidate must be served before the deadline",
+  );
+}

@@ -197,8 +197,8 @@ verdict `sig` (+ optional integrator counter-sign). Periodically anchor the head
    _verified_ human "no". Report it with the decision from the **signed claims**, delivered structurally (the core's
    `NotApproved`; WASM throws an `Error` with `kind: "not_approved"` and `decision`). Never classify a failure by
    its error message, because untrusted verdict fields are echoed into parse errors
-   ([#311](https://github.com/mike-north/allw/issues/311)). Any other failure is unverifiable and reports a
-   synthesized `denied`.
+   ([#311](https://github.com/mike-north/allw/issues/311)). Any other failure is unverifiable: the SDK keeps waiting for a fully verified verdict until
+   `expires_at`, then reports `expired` if none arrives.
 4. Not expired; `decided_at` within window; nonce unseen (anti-replay).
 5. If the verdict is approved and destructive challenge is required: `challenge_response` equals the derived
    number-match challenge. Authenticated denials stay denials without a challenge response.
@@ -250,7 +250,8 @@ retracted}`. `retracted` (cancelled by the submitting integrator) is **distinct 
   timeout, §Invariants #7) — different cause, same "no verdict will ever arrive" shape.
 - **Cannot discard a real decision.** A retract is refused once the request already reached a terminal state:
   `resolved` (a device decided — the recorded verdict stands) or `expired`. Only a still-`pending` request can be
-  retracted; a race between a human deciding and an integrator cancelling always resolves in the human's favor.
+  retracted. The relay preserves a decision recorded before cancellation; the SDK may still end its
+  pending local wait fail-closed when cancellation cannot retract that row (§Transport).
 - **Scoped to the submitting integrator.** Authorized the same way as polling/wait — the `request_auth_token`
   `POST /requests` returned — so an integrator can retract only the request it submitted, never an arbitrary one.
 - **Devices clear it live.** A retract fans out the SAME `{ type: "retract", request_id }` message devices already
@@ -313,7 +314,13 @@ checks in the core, without plaintext, that it was signed for this request by th
 `decided_at` inside the request's `[created_at, expires_at]`, certified by the bound account root and not revoked. Any other verdict is refused with an `error` frame and changes nothing, so
 the request stays pending. The relay only forwards provenance-valid verdicts; it never decides what a verdict
 means. The integrator runs the full [verification checklist](#verification-checklist-integrator-must) and decides
-finality ([relay-api.md](./relay-api.md) §4). A device that was offline when a request arrived receives it
+finality: the SDK waits for the first fully verified verdict (approved, denied, expired, or aborted),
+ignoring unverifiable candidates over both WebSocket and polling until `expires_at`. Verification uses
+one account-state set loaded for the request, never a per-frame reload. Polling retains its cadence
+after rejection. If the relay has already resolved the request on a provenance-valid verdict that fails
+full verification, no replacement may arrive; the SDK still ends `expired` at its local deadline.
+Transport failures remain fail-closed and `retracted` remains cancellation rather than a human decision
+([relay-api.md](./relay-api.md) §4). A device that was offline when a request arrived receives it
 on its next `connect` (the queue), so delivery survives reconnect. If a device connection supplies `surface_id`,
 the relay fans out and flushes queued requests to at most one live socket per `surface_id`, preventing a single
 visible screen from showing both a native prompt and a mirrored prompt. Retractions still go to all live device
@@ -326,7 +333,8 @@ relay refuses at `now >= deadline` on its own receipt clock (`docs/relay-api.md`
 exactly `expires_at` it already treats the request as expired, 1 ms before the window `verify_verdict` checks
 (`decided_at` in `[created_at, expires_at]`, inclusive) closes. This is intentional, not a mismatch to fix on
 either side: the two checks are in series, so the stricter relay rule only ever tightens, and it matches the SDK's own wait, which
-fails closed at `now >= deadline`. A
+fails closed at `now >= deadline`. Pending async verification keeps the Node caller alive until
+this fail-closed result; terminal settlement releases its deadline backstop. A
 verdict for an expired request is refused (acked `expired`, not stored); the offline-queue flush skips expired
 requests (no dead request is re-pushed); and a read after the deadline **lazy-expires** the row — poll returns the
 terminal `expired` status and `…/wait` is pushed `{ type: "expired", request_id }`. In addition, the relay's
@@ -343,7 +351,12 @@ request_id }` to connected devices (the same message a resolve/expiry already se
 already-retracted request is refused (acked `retracted`, not stored) — retraction, like expiry, can never be
 overridden by a late decision. Retracting a `resolved` or already-`expired` request is refused (409): a retract can
 only affect a request still awaiting a decision, never discard one that already landed. Retracting an
-already-`retracted` request is idempotent (200).
+already-`retracted` request is idempotent (200). The SDK races the caller's abort signal with verdict
+delivery and its deadline. Once the retract attempt settles, confirmation rejects the pending call
+with `RequestRetractedError`; a 409 or any failure instead resolves it `expired`, even when the relay
+has already resolved on an SDK-unverifiable verdict. The SDK does not claim that a refused retract
+cancelled the server-side request. The original deadline still bounds a hung retract, and aborting
+after the local call has settled cannot change its result.
 
 ---
 

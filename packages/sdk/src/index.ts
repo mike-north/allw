@@ -68,9 +68,8 @@ export { RelayError } from "./relay.js";
 
 /**
  * A verdict decision. `requestApproval` *resolves* to `approved` (verified), `denied` (a verified
- * human "no" or a fail-closed synthesis), or `expired` (timeout / past deadline). `aborted` is part
- * of the wire vocabulary but originates **only from a signed device verdict** — the SDK never
- * synthesizes it.
+ * human "no"), or `expired` (verified human expiry or fail-closed timeout/cancellation).
+ * `aborted` originates **only from a signed device verdict** — the SDK never synthesizes it.
  *
  * Integrator-initiated cancellation (issue #195, {@link ApprovalRequest.signal}) is a **separate**
  * mechanism from this enum: a retracted request was never decided by any device, so it is not a
@@ -141,12 +140,12 @@ export interface ApprovalRequest {
   /**
    * Integrator-initiated cancellation (issue #195): when this signal aborts, `requestApproval`
    * tells the relay to retract the pending request — so connected approver devices clear the
-   * notification live — and the call **rejects** with {@link RequestRetractedError} instead of
-   * resolving to a `Verdict`. A retract is NOT a verdict; it never enters the audit chain as a
-   * decision. It is best-effort and cannot discard an already-recorded decision: if the request was
-   * already `resolved` (a device decided first) the retract is refused server-side and
-   * `requestApproval` still resolves normally to that verdict. Aborting before the request has even
-   * been submitted skips the network round-trip entirely and rejects immediately.
+   * notification live. Confirmed retraction **rejects** with {@link RequestRetractedError}:
+   * a retract is not a human verdict and never enters the audit chain as a decision. If retraction
+   * is refused (including a request already resolved on an unverifiable verdict) or fails, the
+   * still-pending local call resolves `expired` once that attempt settles. The original deadline
+   * still bounds a hung attempt. A call already settled on a verified decision is unaffected.
+   * Aborting before submission skips the network round-trip and rejects immediately.
    */
   readonly signal?: AbortSignal;
 }
@@ -208,7 +207,7 @@ export interface Verdict {
   /**
    * Re-run full verification against the approver's account-root Ed25519 public key (base64url).
    * Returns `true` only for an authenticated, bound, fresh, **approved** verdict; `false` for any
-   * non-approval, forgery, replay, or transport-synthesized denial. Re-verifying the same Verdict
+   * non-approval, forgery, replay, or transport-synthesized expiry. Re-verifying the same Verdict
    * object is idempotent: the nonce accepted by `requestApproval` does not self-trip this method.
    * Never throws.
    */
@@ -426,12 +425,11 @@ export interface ClientConfig {
    * Override the timer used for the poll sleep, the fail-closed deadline, and the per-fetch timeout.
    * Meant for tests, so the fail-closed timing can be driven by a fake clock instead of real time.
    *
-   * The defaults are two different `setTimeout` timers: the deadline backstop and per-fetch timeout
-   * are `unref`'d (they never hold a process open after the wait resolves), while the poll sleep is
-   * ref'd (it keeps the process alive between polls when no WebSocket is available). An override
-   * replaces **all** of them, so it must keep the event loop alive for the poll sleep. An override
-   * that `unref`s it lets node exit mid-wait with no verdict (#254); one that refs everything keeps
-   * the process alive until the deadline even after a verdict arrives.
+   * The native deadline is referenced while waiting (including async verification), then cleared
+   * on settlement so an early verdict does not keep the process alive. Poll sleeps are referenced
+   * and clamped to the deadline; per-fetch timeouts are unref'd. An override replaces all three
+   * and owns their keep-alive/cleanup behavior. Unref'ing every active timer lets Node exit with no
+   * verdict (#254); an override without cancellation may instead keep it alive after settlement.
    */
   readonly scheduleImpl?: (fn: () => void, ms: number) => void;
 }
@@ -775,7 +773,7 @@ function expectedAccountIdConstraint(expectedAccountId: string | undefined): str
  * - It throws the structured `kind: "not_approved"` error ⇒ a *verified* human "no" ⇒ the
  *   **signed** decision it carries (`denied`/`expired`/`aborted`), never the outer verdict's.
  * - It throws anything else (forgery, tamper, bad sig, replay, window, unparseable JSON) ⇒
- *   unverifiable ⇒ `null` (the caller fails closed to a synthesized `denied`).
+ *   unverifiable ⇒ `null` (the wait continues; without a verified verdict it ends `expired`).
  */
 async function verifyToDecision(
   wasm: AllwWasm,
@@ -964,34 +962,6 @@ function isPreDeadlineTransportFailure(err: unknown): boolean {
 }
 
 /**
- * Arm the integrator-initiated cancellation (issue #195): once the request has a
- * `request_auth_token` (i.e. `submit` succeeded), tell the relay to retract it the moment `signal`
- * aborts — immediately, if it is already aborted. Fire-and-forget and best-effort by design: the
- * awaiting `requestApproval` call learns of the retraction through the normal wait mechanism (the
- * relay pushes/reports the terminal `retracted` status back over the same WS/poll path a verdict
- * would arrive on — `wait.ts`), so a failed retract call here can only leave the original deadline
- * in force, never fabricate an approval or silently drop an already-recorded verdict.
- */
-function armRetractOnAbort(
-  relay: RelayClient,
-  requestId: string,
-  signal: AbortSignal | undefined,
-): void {
-  if (!signal) return;
-  const doRetract = (): void => {
-    relay.retract(requestId).catch(() => {
-      // Best-effort: a failed retract just means cancellation had no effect; the deadline still
-      // governs (fail-closed default), and a verdict recorded first is never discarded by this.
-    });
-  };
-  if (signal.aborted) {
-    doRetract();
-    return;
-  }
-  signal.addEventListener("abort", doRetract, { once: true });
-}
-
-/**
  * Construct a relay-bound client. The returned {@link Client.requestApproval} runs the full
  * E2EE round-trip and resolves to a verified {@link Verdict} — never a bare "allow".
  */
@@ -1070,8 +1040,6 @@ export function createClient(config: ClientConfig): Client {
         context_ciphertext: sealed.ciphertext,
       };
       await relay.submit(envelope);
-      // The request now has a `request_auth_token` to retract with — arm cancellation (issue #195).
-      armRetractOnAbort(relay, id, req.signal);
     } catch (err) {
       if (isPreDeadlineTransportFailure(err)) {
         // A hung/black-holed connection or a bare network error before the deadline ⇒ no verified
@@ -1093,15 +1061,35 @@ export function createClient(config: ClientConfig): Client {
       approver: config.accountId,
     });
 
-    // 5. Await the verdict (WS-preferred, poll fallback), fail-closed at `expires_at`.
+    // 5. The integrator owns finality: only full core verification ends the verdict wait. Reuse
+    // the encryption-time account-state snapshot, and retain the accepted nonce so verify() can
+    // recheck this same artifact without treating it as a replay.
+    const verification: { accepted: VerifiedDecision | null } = { accepted: null };
     let outcome;
     try {
       outcome = await awaitVerdict(id, {
         relay,
         now,
         deadline: expiresAt,
+        ...(req.signal ? { signal: req.signal } : {}),
         ...(webSocketFactory ? { webSocketFactory } : {}),
         pollIntervalMs,
+        acceptVerdict: async (value: unknown): Promise<boolean> => {
+          const verified = await verifyToDecision(
+            wasm,
+            value,
+            requestJson,
+            contextJson,
+            config.approverRootKey,
+            now(),
+            nonceStore,
+            accountStateSet.accountStates,
+            config.expectedAccountId,
+          );
+          if (verified === null) return false;
+          verification.accepted = verified;
+          return true;
+        },
         ...(config.scheduleImpl ? { schedule: config.scheduleImpl } : {}),
       });
     } catch {
@@ -1114,19 +1102,10 @@ export function createClient(config: ClientConfig): Client {
     let decision: Decision;
     let acceptedNonceB64: string | undefined;
     if (outcome.kind === "verdict") {
-      const verified = await verifyToDecision(
-        wasm,
-        outcome.value,
-        requestJson,
-        contextJson,
-        config.approverRootKey,
-        now(),
-        nonceStore,
-        accountStateSet.accountStates,
-        config.expectedAccountId,
-      );
-      // Unverifiable verdict ⇒ synthesized `denied` (never surface a forged decision as truth).
-      decision = verified?.decision ?? "denied";
+      // The wait returns a delivered verdict only after the callback accepted it. Preserve a
+      // fail-closed default if this internal contract is ever violated.
+      const verified = verification.accepted;
+      decision = verified?.decision ?? "expired";
       acceptedNonceB64 = verified?.nonceB64;
     } else if (outcome.kind === "expired") {
       decision = "expired";
