@@ -108,17 +108,15 @@
 //! - Before any budgeted work, an unbudgeted pre-pass records the tier of every visible program
 //!   word: each argv word, the command word of every segment, and, when that command word is a
 //!   wrapper, every later non-flag word (so `"$(sudo dd …)"` keeps `dd`'s tier). It descends into
-//!   substitutions, backticks, heredoc bodies, the `-c` / `--command` / `-Command` strings of a
-//!   shell, the arguments of `eval` (where the argv rules read them: at the command word, after
-//!   leading assignments, or after a wrapper there), and the whitespace words a wrapper runs
+//!   substitutions, backticks, heredoc and here-string bodies, the `-c` / `--command` /
+//!   `-Command` strings of a shell, the arguments of `eval` (where the argv rules read them: at
+//!   the command word, after leading assignments, or after a wrapper there), and the whitespace
+//!   words a wrapper runs
 //!   (`su -c 'dd …'`, `watch 'dd …'`, `env -S'dd …'`), down to [`MAX_SHELL_NESTING`] levels. A
 //!   segment that only names a program as an argument (`echo dd`) adds nothing beyond the
 //!   `shlex` words. It reads each word a bounded number of times for each level, so it is linear
-//!   for each level.
+//!   for each level, across at most seven readings per line (bash plus six alternates).
 //!
-//!   Known limits (#389): the pre-pass doesn't read here-strings (`bash <<< "dd …"`) or the
-//!   alternate readings (dash, no ANSI-C quotes, no arithmetic commands), so a `dd` only those
-//!   reach can still drop to `High` on exhaustion.
 //! - All analysis of one record shares one budget of [`MAX_RISK_WORK`] units (bytes scanned,
 //!   split or copied, plus argv positions classified). Exhausting it makes the record at least
 //!   `High`, and never lowers a tier already found: any program word the pre-pass sees keeps its
@@ -777,6 +775,8 @@ thread_local! {
     /// Bytes examined by the look-ahead scans below, so tests can measure the work actually done
     /// rather than only what was charged to the [`Budget`].
     static SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Linear memo-key copy/hash bytes, kept separate from historical look-ahead scan bounds.
+    static PRE_PASS_KEY_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Count `n` bytes examined by a look-ahead scan (tests only).
@@ -1823,41 +1823,92 @@ fn shell_line_risk(text: &str, source: Source, depth: usize, budget: &mut Budget
 
 /// Record, before any budgeted work, the program-table tier of every program word visible in the
 /// text: every word of `words` (the line's `shlex` split, or the argv), and the command word of
-/// every segment of `line` in the bash reading, descending into substitutions, backticks, heredoc
-/// bodies, `-c` strings and `eval` arguments down to [`MAX_SHELL_NESTING`] levels (see
-/// [`note_argv_reach`]). The pass isn't charged; each level scans its text once, so it is linear
-/// for each level. Its tiers are only read if the budget runs out, so a `dd` the line plainly
-/// runs, at the top level, in a `$(dd)`, a `sh -c 'dd'` or behind a wrapper, keeps its tier
-/// however much padding follows it. Counting a word that turns out not to run (`echo dd`) can
+/// every segment of `line` in every applicable reading, descending into substitutions, backticks,
+/// heredoc and here-string bodies, `-c` strings and `eval` arguments down to
+/// [`MAX_SHELL_NESTING`] levels (see [`note_argv_reach`]). The pass isn't charged; each reading
+/// scans its text a bounded number of times. At most seven readings per line and fixed nesting
+/// keep it linear per level. Its
+/// tiers are only read if the budget runs out, so a `dd` the line plainly runs, at the top level,
+/// in a `$(dd)`, a `sh -c 'dd'` or behind a wrapper, keeps its tier however much padding follows it. Counting a word that turns out not to run (`echo dd`) can
 /// only raise the tier.
 fn note_visible_programs(line: Option<&str>, words: &[String], budget: &mut Budget) {
+    let mut pass = PrePass {
+        budget,
+        visited: std::collections::HashSet::new(),
+    };
     for word in words {
-        budget.note(classify_program(word, &[], &[]));
+        pass.budget.note(classify_program(word, &[], &[]));
     }
     // Leading assignments (`X=1 sh -c '…'`) are skipped, as the argv rules skip them.
     let start = words.iter().take_while(|w| is_assignment_like(w)).count();
-    note_argv_reach(&words[start..], 0, budget);
+    note_argv_reach(&words[start..], 0, &mut pass);
     if let Some(line) = line {
-        note_line_programs(line, 0, budget);
+        note_line_programs(line, 0, &mut pass);
     }
 }
 
-/// The [`note_visible_programs`] pass over one line at nesting `depth`.
-fn note_line_programs(text: &str, depth: usize, budget: &mut Budget) {
+/// One record's lexical reachability walk. A script's program tiers depend on its text and
+/// remaining nesting depth, not on its parent reading or consumer. Memoizing that pair avoids
+/// rescanning identical bodies exposed by several readings, while retaining every distinct one.
+struct PrePass<'a> {
+    /// Tiers found here are retained only if ordinary analysis exhausts its shared budget.
+    budget: &'a mut Budget,
+    /// Owned text is necessary because decoded argv and here-string bodies are temporary.
+    visited: std::collections::HashSet<(usize, String)>,
+}
+
+/// Visit the authoritative reading and every applicable alternate before budgeted analysis.
+/// Alternatives must be reached at every nesting level: a nested `sh -c` can expose a program
+/// that bash quoting or arithmetic hides. The finite reading set and nesting limit bound fanout.
+fn note_line_programs(text: &str, depth: usize, pass: &mut PrePass<'_>) {
+    // Each repeated reach pays only linear hashing/copying, without multiplying its descendants.
+    #[cfg(test)]
+    PRE_PASS_KEY_BYTES.with(|c| c.set(c.get() + 2 * text.len()));
+    if !pass.visited.insert((depth, text.to_string())) {
+        return;
+    }
+    let primary = scan_shell_line(text, Reading::BASH);
+    note_reading_programs(&primary, depth, Reading::BASH, pass);
+    for reading in alternate_readings(text, &primary) {
+        let line = scan_shell_line(text, reading);
+        note_reading_programs(&line, depth, reading, pass);
+    }
+}
+
+/// Preserve visible program tiers from one reading, including every here-string body regardless
+/// of its consumer. Body descent uses the same nesting limit as budgeted script classification.
+fn note_reading_programs(
+    line: &ShellLine<'_>,
+    depth: usize,
+    reading: Reading,
+    pass: &mut PrePass<'_>,
+) {
     let mut unlimited = Budget::new(usize::MAX);
-    let line = scan_shell_line(text, Reading::BASH);
     for segment in &line.segments {
-        let unquoted: Vec<Word> = raw_words(segment, Reading::BASH)
+        let unquoted: Vec<Word> = raw_words(segment, reading)
             .iter()
-            .map(|w| unquote_word(w, Reading::BASH, &mut unlimited))
+            .map(|w| unquote_word(w, reading, &mut unlimited))
             .collect();
         if let (Some(c), _) = command_word(&unquoted) {
             if !unquoted[c].expansion {
                 let mut argv: Vec<String> = unquoted[c..].iter().map(|w| w.text.clone()).collect();
                 argv[0] = program_name(&argv[0]).to_string();
                 let (flags, positionals) = split_flags_and_positionals(&argv);
-                budget.note(classify_program(&argv[0], &flags, &positionals));
-                note_argv_reach(&argv, depth, budget);
+                pass.budget
+                    .note(classify_program(&argv[0], &flags, &positionals));
+                note_argv_reach(&argv, depth, pass);
+            }
+        }
+        if depth < MAX_SHELL_NESTING {
+            for (k, word) in unquoted.iter().enumerate() {
+                let script = match here_string(&word.text) {
+                    Some("") => unquoted.get(k + 1).map(|w| w.text.as_str()),
+                    Some(attached) => Some(attached),
+                    None => None,
+                };
+                if let Some(script) = script {
+                    note_line_programs(script, depth + 1, pass);
+                }
             }
         }
     }
@@ -1867,7 +1918,7 @@ fn note_line_programs(text: &str, depth: usize, budget: &mut Budget) {
     // Substitutions inside heredoc bodies are reached through the bodies themselves.
     let substitutions = line.substitutions.iter().map(|sub| sub.body);
     for nested in substitutions.chain(line.heredocs.iter().copied()) {
-        note_line_programs(nested, depth + 1, budget);
+        note_line_programs(nested, depth + 1, pass);
     }
 }
 
@@ -1887,7 +1938,7 @@ fn note_line_programs(text: &str, depth: usize, budget: &mut Budget) {
 ///
 /// So each word is read a bounded number of times for each level. A segment whose command word
 /// is none of these (`echo dd`) adds nothing.
-fn note_argv_reach(argv: &[String], depth: usize, budget: &mut Budget) {
+fn note_argv_reach(argv: &[String], depth: usize, pass: &mut PrePass<'_>) {
     let Some(first) = argv.first() else {
         return;
     };
@@ -1897,7 +1948,7 @@ fn note_argv_reach(argv: &[String], depth: usize, budget: &mut Budget) {
         for word in &argv[1..] {
             let flag = is_flag(word);
             if !flag {
-                budget.note(classify_program(word, &[], &[]));
+                pass.budget.note(classify_program(word, &[], &[]));
             }
             if nested && has_whitespace(word) {
                 if flag {
@@ -1905,10 +1956,10 @@ fn note_argv_reach(argv: &[String], depth: usize, budget: &mut Budget) {
                         .into_iter()
                         .take(PRE_PASS_FLAG_VALUES)
                     {
-                        note_line_programs(value, depth + 1, budget);
+                        note_line_programs(value, depth + 1, pass);
                     }
                 } else {
-                    note_line_programs(word, depth + 1, budget);
+                    note_line_programs(word, depth + 1, pass);
                 }
             }
         }
@@ -1928,7 +1979,7 @@ fn note_argv_reach(argv: &[String], depth: usize, budget: &mut Budget) {
         let base = basename(word);
         if base == "eval" {
             if j + 1 < argv.len() {
-                note_line_programs(&argv[j + 1..].join(" "), depth + 1, budget);
+                note_line_programs(&argv[j + 1..].join(" "), depth + 1, pass);
             }
             return;
         }
@@ -1946,7 +1997,7 @@ fn note_argv_reach(argv: &[String], depth: usize, budget: &mut Budget) {
                     Some(later.as_str())
                 };
                 if let Some(text) = text {
-                    note_line_programs(text, depth + 1, budget);
+                    note_line_programs(text, depth + 1, pass);
                 }
             }
             return;
