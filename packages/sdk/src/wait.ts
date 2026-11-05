@@ -6,8 +6,8 @@
  * `{ type: "expired", … }` for a past-deadline request, or `{ type: "retracted", … }` if the
  * integrator that submitted the request cancelled it (issue #195). If the socket cannot be used
  * (no global `WebSocket`, or it errors), fall back to polling `GET /:acct/requests/:id` until a
- * terminal status or the deadline. On the deadline elapsing with no terminal signal, resolve to
- * `timeout`.
+ * fully verified verdict, another terminal status, or the deadline. Without a fully verified
+ * verdict or other terminal signal at the deadline, resolve to `timeout`.
  *
  * Every path that is not a delivered verdict is a **deny** outcome (`expired`/`timeout`) — the SDK
  * never fabricates an approval. `retracted` is different in kind, not degree: it is not a verdict at
@@ -41,6 +41,11 @@ export interface WaitDeps {
   readonly webSocketFactory?: WebSocketFactory;
   /** Poll cadence in ms (fallback path). */
   readonly pollIntervalMs: number;
+  /**
+   * Integrator-owned full verification through the core. A rejected candidate is not terminal;
+   * transport delivery and relay provenance alone cannot decide a human outcome.
+   */
+  readonly acceptVerdict: (value: unknown) => Promise<boolean>;
   /**
    * Schedules `fn` after `ms`; injectable so tests can drive a fake clock. When absent, the wait
    * uses two defaults: an `unref`'d `setTimeout` for the deadline backstop (so it never holds a
@@ -132,31 +137,37 @@ export async function awaitVerdict(requestId: string, deps: WaitDeps): Promise<V
     }, remaining);
   });
 
-  if (deps.webSocketFactory) {
+  const lifetime = new AbortController();
+  try {
+    if (deps.webSocketFactory) {
+      try {
+        const wsOutcome = await Promise.race([
+          waitOverSocket(requestId, deps, deps.webSocketFactory, lifetime.signal),
+          deadlinePromise,
+        ]);
+        if (wsOutcome) return wsOutcome;
+        // The socket closed without a terminal frame before the deadline — fall through to polling
+        // as a robustness backstop.
+      } catch {
+        // Socket construction/connection failed — degrade to polling.
+      }
+    }
+
+    // `isSettled` stops the poll loop once the race is decided (e.g. the deadline won while a poll sleep
+    // was pending), so it neither lingers nor sends a poll after the caller already has its outcome.
+    let settled = false;
+    const isSettled = (): boolean => settled;
     try {
-      const wsOutcome = await Promise.race([
-        waitOverSocket(requestId, deps, deps.webSocketFactory),
+      return await Promise.race([
+        pollUntilTerminal(requestId, deps, pollSchedule, isSettled),
         deadlinePromise,
       ]);
-      if (wsOutcome) return wsOutcome;
-      // The socket closed without a terminal frame before the deadline — fall through to polling
-      // as a robustness backstop.
-    } catch {
-      // Socket construction/connection failed — degrade to polling.
+    } finally {
+      settled = true;
     }
-  }
-
-  // `isSettled` stops the poll loop once the race is decided (e.g. the deadline won while a poll sleep
-  // was pending), so it neither lingers nor sends a poll after the caller already has its outcome.
-  let settled = false;
-  const isSettled = (): boolean => settled;
-  try {
-    return await Promise.race([
-      pollUntilTerminal(requestId, deps, pollSchedule, isSettled),
-      deadlinePromise,
-    ]);
   } finally {
-    settled = true;
+    // Stop listening even when the deadline wins while verification is in flight.
+    lifetime.abort();
   }
 }
 
@@ -168,12 +179,16 @@ function waitOverSocket(
   requestId: string,
   deps: WaitDeps,
   factory: WebSocketFactory,
+  signal: AbortSignal,
 ): Promise<VerdictOutcome | null> {
   return new Promise<VerdictOutcome | null>((resolve, reject) => {
     let settled = false;
+    // Read through a function across awaits: deadline/close callbacks can settle the socket while
+    // async verification is pending, even though TypeScript cannot model those callback writes.
+    const isSettled = (): boolean => settled;
     let socket: MinimalWebSocket;
     const finish = (outcome: VerdictOutcome | null): void => {
-      if (settled) return;
+      if (isSettled()) return;
       settled = true;
       try {
         socket.close();
@@ -190,19 +205,48 @@ function waitOverSocket(
       return;
     }
 
+    signal.addEventListener(
+      "abort",
+      () => {
+        finish(null);
+      },
+      { once: true },
+    );
+    // Serialize verification: an async nonce store must not let later frames overtake the first
+    // fully verified decision. A failed candidate leaves the same socket and deadline in force.
+    let candidates = Promise.resolve();
     socket.addEventListener("message", (event: { data: unknown }) => {
-      const frame = parseFrame(event.data);
-      if (!frame) return;
-      const outcome = frameToOutcome(frame);
-      if (outcome) finish(outcome);
+      candidates = candidates
+        .then(async () => {
+          if (isSettled()) return;
+          if (deps.now() >= deps.deadline) {
+            finish({ kind: "timeout" });
+            return;
+          }
+          const frame = parseFrame(event.data);
+          if (!frame) return;
+          const outcome = frameToOutcome(frame);
+          if (!outcome) return;
+          if (outcome.kind === "verdict" && !(await deps.acceptVerdict(outcome.value))) return;
+          if (!isSettled()) finish(deps.now() >= deps.deadline ? { kind: "timeout" } : outcome);
+        })
+        .catch(() => {
+          finish(null);
+        });
     });
     socket.addEventListener("error", () => {
       // Treat a socket error as "no terminal frame" → poll fallback (not a hard reject, so a
       // transient WS issue still resolves via polling).
-      finish(null);
+      void candidates.then(() => {
+        finish(null);
+      });
     });
     socket.addEventListener("close", () => {
-      finish(null);
+      // A relay may close immediately after its terminal frame. Drain delivered candidates before
+      // falling back, so socket closure cannot discard a valid verdict or race its nonce insert.
+      void candidates.then(() => {
+        finish(null);
+      });
     });
   });
 }
@@ -221,8 +265,13 @@ async function pollUntilTerminal(
   isSettled: () => boolean,
 ): Promise<VerdictOutcome> {
   for (;;) {
+    if (isSettled() || deps.now() >= deps.deadline) return { kind: "timeout" };
     const outcome = await deps.relay.poll(requestId);
-    if (outcome) return outcome;
+    if (outcome && (outcome.kind !== "verdict" || (await deps.acceptVerdict(outcome.value)))) {
+      return deps.now() >= deps.deadline ? { kind: "timeout" } : outcome;
+    }
+    // Resolved relay rows can repeat an SDK-unverifiable verdict forever. Treat them like a
+    // pending response and sleep on the normal cadence rather than spinning or trusting status.
     const remaining = deps.deadline - deps.now();
     if (remaining <= 0 || isSettled()) return { kind: "timeout" };
     await new Promise<void>((resolve) => {

@@ -1093,7 +1093,10 @@ export function createClient(config: ClientConfig): Client {
       approver: config.accountId,
     });
 
-    // 5. Await the verdict (WS-preferred, poll fallback), fail-closed at `expires_at`.
+    // 5. The integrator owns finality: only full core verification ends the verdict wait. Reuse
+    // the encryption-time account-state snapshot, and retain the accepted nonce so verify() can
+    // recheck this same artifact without treating it as a replay.
+    const verification: { accepted: VerifiedDecision | null } = { accepted: null };
     let outcome;
     try {
       outcome = await awaitVerdict(id, {
@@ -1102,6 +1105,22 @@ export function createClient(config: ClientConfig): Client {
         deadline: expiresAt,
         ...(webSocketFactory ? { webSocketFactory } : {}),
         pollIntervalMs,
+        acceptVerdict: async (value: unknown): Promise<boolean> => {
+          const verified = await verifyToDecision(
+            wasm,
+            value,
+            requestJson,
+            contextJson,
+            config.approverRootKey,
+            now(),
+            nonceStore,
+            accountStateSet.accountStates,
+            config.expectedAccountId,
+          );
+          if (verified === null) return false;
+          verification.accepted = verified;
+          return true;
+        },
         ...(config.scheduleImpl ? { schedule: config.scheduleImpl } : {}),
       });
     } catch {
@@ -1114,19 +1133,10 @@ export function createClient(config: ClientConfig): Client {
     let decision: Decision;
     let acceptedNonceB64: string | undefined;
     if (outcome.kind === "verdict") {
-      const verified = await verifyToDecision(
-        wasm,
-        outcome.value,
-        requestJson,
-        contextJson,
-        config.approverRootKey,
-        now(),
-        nonceStore,
-        accountStateSet.accountStates,
-        config.expectedAccountId,
-      );
-      // Unverifiable verdict ⇒ synthesized `denied` (never surface a forged decision as truth).
-      decision = verified?.decision ?? "denied";
+      // The wait returns a delivered verdict only after the callback accepted it. Preserve a
+      // fail-closed default if this internal contract is ever violated.
+      const verified = verification.accepted;
+      decision = verified?.decision ?? "expired";
       acceptedNonceB64 = verified?.nonceB64;
     } else if (outcome.kind === "expired") {
       decision = "expired";

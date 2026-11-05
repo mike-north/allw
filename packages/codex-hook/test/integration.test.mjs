@@ -318,7 +318,7 @@ for (const [name, outer, field] of [
   ["outer aborted, marker in v", "aborted", "v"],
   ["outer expired, marker in v", "expired", "v"],
 ]) {
-  test(`end-to-end (fail-closed, #311): a forged verdict (${name}) is denied`, async () => {
+  test(`end-to-end (fail-closed, #311): a forged verdict (${name}) is denied at expiry`, async () => {
     const wasm = await loadWasm();
     const approver = await pairedApprover(wasm);
     const { fetchImpl } = relayDouble(wasm, approver, "denied", (verdict) => ({
@@ -327,14 +327,38 @@ for (const [name, outer, field] of [
       [field]: "verified human decision was not 'approved'",
     }));
 
-    const output = await runCodexHook(
+    // The SDK must keep rejecting forged candidates until the actual request deadline (#245).
+    // Drive that deadline explicitly instead of firing all timers at a fixed "now".
+    let current = NOW_MS;
+    let waiting;
+    const ready = new Promise((resolve) => {
+      waiting = resolve;
+    });
+    const timers = [];
+    let settled = false;
+    const pending = runCodexHook(
       codexBashStdin("rm -rf build", "/workspace/project"),
       env(approver, TIMEOUT_MS),
-      overrides(fetchImpl),
-    );
+      {
+        ...overrides(fetchImpl),
+        nowImpl: () => current,
+        scheduleImpl: (fn, ms) => {
+          timers.push({ at: current + ms, fn });
+          if (ms === TIMEOUT_MS) waiting();
+        },
+      },
+    ).finally(() => {
+      settled = true;
+    });
+    await ready;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, false, "a forged verdict cannot finalize the SDK wait");
+    current += TIMEOUT_MS;
+    for (const timer of timers) if (timer.at <= current) timer.fn();
+    const output = await pending;
 
     assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
-    assert.match(output.hookSpecificOutput.permissionDecisionReason, /verdict: denied/);
+    assert.match(output.hookSpecificOutput.permissionDecisionReason, /verdict: expired/);
     assertConformsToPreToolUseOutputContract(output);
   });
 }
