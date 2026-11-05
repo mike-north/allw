@@ -298,7 +298,7 @@ test("(#372) a command request through the SDK is byte-identical to one built fr
 
 test("(#372) blank, whitespace-only and ''-program commands deny without asking, with the Claude Code hook's reason", async () => {
   const wasm = await loadWasm();
-  for (const command of ["", "   ", "\t\n\t", "'' rm -rf x"]) {
+  for (const command of ["", "   ", "\t\n\t", "\r", "'' rm -rf x", "FOO=1", "&& ;"]) {
     const input = {
       hookEventName: "PreToolUse",
       toolName: "Bash",

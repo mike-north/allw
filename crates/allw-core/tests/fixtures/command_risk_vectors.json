@@ -128,12 +128,6 @@
       "why": "negative: flags after a wrapper are not wrapped programs"
     },
     {
-      "command": "FOO=bar",
-      "risk": "medium",
-      "bin": "FOO=bar",
-      "why": "negative: a bare assignment is Medium, as before"
-    },
-    {
       "command": "X=1 ls",
       "risk": "medium",
       "bin": "X=1",

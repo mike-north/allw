@@ -79,9 +79,10 @@ use allw_core::{
     verify_verdict_with_account_states as core_verify_verdict_with_account_states,
     verify_verdict_with_account_states_for_account as core_verify_verdict_with_account_states_for_account,
     AccountState, AccountStateChange, ActionRecord, Actor, ApprovalContext, ApprovalRequest,
-    Approver, CommandContext, ContextRecipient, Decision, DeviceEnrollment, DeviceKeyKind,
-    PolicyRule, PolicyRuleScope, PublicKey, SigningKeyPair, UnsignedPolicyRule, UnsignedVerdict,
-    Verdict, VerifyError, X25519KeyPair, X25519PublicKey, X25519_SMALL_ORDER_POINTS,
+    Approver, CommandContext, CommandError, ContextRecipient, Decision, DeviceEnrollment,
+    DeviceKeyKind, PolicyRule, PolicyRuleScope, PublicKey, SigningKeyPair, UnsignedPolicyRule,
+    UnsignedVerdict, Verdict, VerifyError, X25519KeyPair, X25519PublicKey,
+    X25519_SMALL_ORDER_POINTS,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::rngs::OsRng;
@@ -1642,6 +1643,20 @@ pub fn x25519_public_key(seed_b64: &str) -> Result<String, JsError> {
 
 // ── ActionRecord builders (the hook's syntactic substrate) ──────────────────────────────
 
+/// Maps a core command-builder refusal to the value `action_from_command` /
+/// `action_from_powershell_command` throw: a JS `Error` with the message
+/// `"{function} failed: {error}"` and an own property `kind`, the core's stable
+/// [`CommandError::code`](allw_core::CommandError::code) (`invalid_shell_syntax`, `no_command`,
+/// `no_program`, `empty_program`). Callers classify on `kind`, never on the message; every refusal
+/// is a deny (fail-closed). A thrown value without a `kind` is still a refusal.
+fn command_failure(function: &str, error: &CommandError) -> JsValue {
+    let thrown = js_sys::Error::new(&format!("{function} failed: {error}"));
+    // Setting an own property on a fresh `Error` cannot fail; if it ever did, the error would lack
+    // `kind` and the caller would still deny.
+    let _ = js_sys::Reflect::set(&thrown, &"kind".into(), &error.code().into());
+    thrown.into()
+}
+
 /// Builds an [`ActionRecord`](allw_core::ActionRecord) from a raw shell command line, returning it
 /// as JSON. This is the **command** surface (`docs/policy-seam.md` §The three tiers, T1): the core
 /// tokenizes the command (POSIX word-splitting), captures the syntactic substrate (bin / argv /
@@ -1654,15 +1669,17 @@ pub fn x25519_public_key(seed_b64: &str) -> Result<String, JsError> {
 ///
 /// # Errors
 ///
-/// Throws if the command string has unmatched quotes / invalid shell syntax
-/// ([`CommandError::InvalidShellSyntax`](allw_core::CommandError)) — fail-closed at the boundary, so
-/// the hook denies rather than guessing at a malformed command.
+/// Throws (see `command_failure`: an `Error` with a `kind`) if the command string has unmatched
+/// quotes / invalid shell syntax (`kind: "invalid_shell_syntax"`), or runs no program: blank
+/// (`no_command`), only assignments or operators (`no_program`), or an empty program word
+/// (`empty_program`), #376. Fail-closed at the boundary: the caller denies rather than guessing at
+/// a malformed command or asking a human to approve nothing.
 #[wasm_bindgen]
-pub fn action_from_command(command_line: &str, cwd: Option<String>) -> Result<String, JsError> {
+pub fn action_from_command(command_line: &str, cwd: Option<String>) -> Result<String, JsValue> {
     let ctx = CommandContext { cwd };
     let record = core_action_from_command(command_line, &ctx)
-        .map_err(|e| JsError::new(&format!("action_from_command failed: {e}")))?;
-    to_json(&record, "ActionRecord")
+        .map_err(|e| command_failure("action_from_command", &e))?;
+    Ok(to_json(&record, "ActionRecord")?)
 }
 
 /// Builds an [`ActionRecord`](allw_core::ActionRecord) from a raw **PowerShell** command line,
@@ -1671,18 +1688,23 @@ pub fn action_from_command(command_line: &str, cwd: Option<String>) -> Result<St
 /// `High` for a compound, escaped or dynamic-execution line. See
 /// [`allw_core::powershell`](allw_core::powershell) for the rules.
 ///
-/// Infallible by design: no PowerShell line is refused for its syntax, so a valid PowerShell
-/// command is never denied for its quoting.
+/// No PowerShell line is refused for its syntax, so a valid PowerShell command is never denied for
+/// its quoting.
+///
+/// # Errors
+///
+/// Throws (an `Error` with a `kind`, as [`action_from_command`]) only for a line that runs no
+/// program (#376): blank (`no_command`), only separators or literal assignments (`no_program`), or
+/// an empty-string program (`empty_program`).
 #[wasm_bindgen]
 pub fn action_from_powershell_command(
     command_line: &str,
     cwd: Option<String>,
-) -> Result<String, JsError> {
+) -> Result<String, JsValue> {
     let ctx = CommandContext { cwd };
-    to_json(
-        &core_action_from_powershell_command(command_line, &ctx),
-        "ActionRecord",
-    )
+    let record = core_action_from_powershell_command(command_line, &ctx)
+        .map_err(|e| command_failure("action_from_powershell_command", &e))?;
+    Ok(to_json(&record, "ActionRecord")?)
 }
 
 /// Builds an [`ActionRecord`](allw_core::ActionRecord) from a **pre-tokenized** argv, returning it
@@ -1700,18 +1722,21 @@ pub fn action_from_powershell_command(
 ///
 /// # Errors
 ///
-/// Throws if `argv_json` is not a JSON array of strings — fail-closed: the caller denies rather
-/// than submitting a record built from an unparseable plan.
+/// Throws if `argv_json` is not a JSON array of strings (a plain `Error`, no `kind`) — fail-closed:
+/// the caller denies rather than submitting a record built from an unparseable plan. Also throws,
+/// with a `kind` as [`action_from_command`], for an argv with no program (#376): empty
+/// (`no_command`), an empty program word (`empty_program`), or only assignments (`no_program`).
 #[wasm_bindgen]
 pub fn action_from_argv(
     argv_json: &str,
     raw: Option<String>,
     cwd: Option<String>,
-) -> Result<String, JsError> {
+) -> Result<String, JsValue> {
     let argv: Vec<String> = parse_json(argv_json, "command argv")?;
     let ctx = CommandContext { cwd };
-    let record = core_action_from_argv(&argv, raw.as_deref(), &ctx);
-    to_json(&record, "ActionRecord")
+    let record = core_action_from_argv(&argv, raw.as_deref(), &ctx)
+        .map_err(|e| command_failure("action_from_argv", &e))?;
+    Ok(to_json(&record, "ActionRecord")?)
 }
 
 /// Builds an [`ActionRecord`](allw_core::ActionRecord) for an MCP tool call, returning it as JSON.

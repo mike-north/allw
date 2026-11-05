@@ -73,6 +73,12 @@ unparseable command line (for example an unmatched quote), an empty program, a b
 `cwd`, a malformed `actor`, a non-positive or non-integer `timeoutMs`, or `raw` passed to
 `commandRequest`.
 
+A command that runs no program is refused too, because there is nothing to show the human. The core
+refuses it, so every allw surface agrees: a command line that is only variable assignments or shell
+operators (`FOO=1`, `&&`) rejects with `reason: "command_line_no_program"`, and an `argv` of only
+assignments (`["FOO=1"]`) with `reason: "argv_no_program"`. A blank or comment-only line is
+`command_line_empty`, and an empty program word is `argv_program_empty`.
+
 ## Who can read a request: account state
 
 `createClient` requires `accountStates`. A request is encrypted only to the devices that root-signed

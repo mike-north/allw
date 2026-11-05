@@ -523,10 +523,35 @@ export function commandBuildFailureReason(wasm: HookWasm, err: unknown): string 
 }
 
 /**
- * Why a core `command` record has no program to show the human, worded exactly as `@allw/sdk`'s
- * `commandActionFromLine` words its refusal, or `null` when it has one. A blank or whitespace-only
- * line has no `argv` at all; `'' rm …` has an empty first word. This reads the core's record; it does
- * not re-tokenize. A record that cannot be read is refused too (fail-closed).
+ * `@allw/sdk`'s `commandActionFromLine` wording for each core no-program refusal: the `kind` the
+ * WASM `action_from_command` throws (#376). {@link gatePosixCommand} denies with these, so a command
+ * is denied with the same reason here as through the hooks' `commandRequest` path.
+ */
+const NO_COMMAND = "commandLine contains no command";
+const NO_PROGRAM = "commandLine runs no program (only variable assignments or shell operators)";
+const EMPTY_PROGRAM = "commandLine's first word (the program) must be non-empty";
+
+/** The SDK wording for a core no-program refusal (`err.kind`), or `null` for any other error. */
+function coreNoProgramRefusal(err: unknown): string | null {
+  if (typeof err !== "object" || err === null || !Object.hasOwn(err, "kind")) return null;
+  switch ((err as { kind?: unknown }).kind) {
+    case "no_command":
+      return NO_COMMAND;
+    case "no_program":
+      return NO_PROGRAM;
+    case "empty_program":
+      return EMPTY_PROGRAM;
+    default:
+      return null;
+  }
+}
+
+/**
+ * Defence in depth: why a core `command` record has no program to show the human, worded exactly as
+ * `@allw/sdk`'s `commandActionFromLine` words its refusal, or `null` when it has one. The core
+ * already refuses such a line (#376); a blank or whitespace-only line would have no `argv` at all,
+ * and `'' rm …` an empty first word. This reads the core's record; it does not re-tokenize. A record
+ * that cannot be read is refused too (fail-closed).
  */
 function noProgramRefusal(actionRecord: string): string | null {
   let argv: unknown;
@@ -535,16 +560,16 @@ function noProgramRefusal(actionRecord: string): string | null {
   } catch {
     return "the core returned an unreadable command record";
   }
-  if (!Array.isArray(argv) || argv.length === 0) return "commandLine contains no command";
-  if (argv[0] === "") return "commandLine's first word (the program) must be non-empty";
+  if (!Array.isArray(argv) || argv.length === 0) return NO_COMMAND;
+  if (argv[0] === "") return EMPTY_PROGRAM;
   return null;
 }
 
 /**
  * Build a `command` record for a POSIX shell command (Bash, or Monitor's `command`) through the core.
- * A core error (invalid shell syntax), or a record with no program (a blank command, or an empty
- * first word), is a `build-error`, so the caller denies, exactly as the hooks' `commandRequest` path
- * does.
+ * A core error (invalid shell syntax, or a line that runs no program: blank, only assignments or
+ * operators, an empty program word), or a record with no program, is a `build-error`, so the caller
+ * denies, exactly as the hooks' `commandRequest` path does, with the same reason.
  */
 function gatePosixCommand(
   wasm: HookWasm,
@@ -564,7 +589,8 @@ function gatePosixCommand(
     }
     return { kind: "gated", actionRecord, summary };
   } catch (err) {
-    return { kind: "build-error", reason: commandBuildFailureReason(wasm, err) };
+    const refusal = coreNoProgramRefusal(err);
+    return { kind: "build-error", reason: commandBuildFailureReason(wasm, refusal ?? err) };
   }
 }
 

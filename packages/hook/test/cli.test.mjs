@@ -5,12 +5,13 @@
  * acceptance criterion that the hook "runs entirely under node (no binary to allowlist)" and that
  * the process boundary is fail-closed.
  *
- * These cases use the no-config / non-gated / malformed paths so the subprocess never needs a live
- * relay; the full crypto round-trip is covered deterministically in integration.test.mjs.
+ * These cases use no-config / non-gated / malformed paths and local relay doubles; they never need
+ * a live relay. The full crypto round-trip is covered deterministically in integration.test.mjs.
  *
  * @see https://code.claude.com/docs/en/hooks (the stdin/stdout/exit-code contract)
  * @see https://github.com/mike-north/allw/issues/247 (deny-only output)
  * @see ../../../docs/architecture.md (WASM-local: node entrypoint, never a native binary)
+ * @see ../../../docs/claude-code-integration.md (timeout-ordering invariant)
  */
 
 import { test } from "node:test";
@@ -27,6 +28,15 @@ import { loadWasm } from "../dist/lib/wasm.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const CLI = join(here, "..", "dist", "cli.js");
+
+/** The per-fetch timeout configured below, keeping failed-relay UATs short. */
+const FETCH_TIMEOUT_MS = 100;
+/** Allow Node/WASM startup and scheduler delays during concurrent workspace tests. */
+const STARTUP_SLACK_MS = 10_000;
+/** Bound the whole process, including the configured fetch, far below the host's 480 s timeout. */
+const CLI_BOUND_MS = FETCH_TIMEOUT_MS + STARTUP_SLACK_MS;
+/** Let a late normal exit report the elapsed-time assertion before the hang watchdog kills it. */
+const WATCHDOG_GRACE_MS = 1000;
 
 /** A gated tool call the subprocess tests can feed exactly as Claude Code would. */
 function bashStdin(command = "rm -rf build") {
@@ -47,8 +57,8 @@ const CHILD_HOME = mkdtempSync(join(tmpdir(), "allw-hook-cli-home-"));
  * The wall-clock guard is part of the UAT: if the process wedges instead of emitting an explicit
  * decision, the test fails quickly and kills the child so CI does not inherit the hang.
  */
-function runCli(stdin, env = {}, options = {}) {
-  const timeoutMs = options.timeoutMs ?? 5000;
+function runCli(stdin, env = {}) {
+  const timeoutMs = CLI_BOUND_MS + WATCHDOG_GRACE_MS;
   return new Promise((resolve, reject) => {
     const startedAt = performance.now();
     const child = spawn(process.execPath, [CLI], {
@@ -58,7 +68,11 @@ function runCli(stdin, env = {}, options = {}) {
     });
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
-      reject(new Error(`allw-hook subprocess did not exit within ${String(timeoutMs)}ms`));
+      reject(
+        new Error(
+          `allw-hook subprocess exceeded ${String(CLI_BOUND_MS)}ms decision bound; killed after ${String(timeoutMs)}ms (stdout: ${stdout}, stderr: ${stderr})`,
+        ),
+      );
     }, timeoutMs);
     let stdout = "";
     let stderr = "";
@@ -101,7 +115,7 @@ function hookEnv(relayUrl, extra = {}) {
     ALLW_APPROVER_ROOT_KEY: UAT_ROOT_KEY,
     ALLW_TIMEOUT_MS: "1000",
     // UATs need to prove bounded failure without burning the SDK's production 30s default.
-    ALLW_FETCH_TIMEOUT_MS: "100",
+    ALLW_FETCH_TIMEOUT_MS: String(FETCH_TIMEOUT_MS),
     ...extra,
   };
 }
@@ -125,7 +139,9 @@ async function refusedRelayUrl() {
 /** A relay double that accepts TCP connections and intentionally never writes an HTTP response. */
 async function hungRelay() {
   const sockets = new Set();
+  let connections = 0;
   const server = createServer((socket) => {
+    connections += 1;
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
     socket.on("error", () => {});
@@ -139,6 +155,8 @@ async function hungRelay() {
 
   return {
     url: `http://127.0.0.1:${String(address.port)}`,
+    // Count accepted connections even after the client closes: startup rejection must never dial.
+    connections: () => connections,
     async close() {
       for (const socket of sockets) socket.destroy();
       await new Promise((resolve, reject) => {
@@ -195,15 +213,15 @@ test("(#54) subprocess: ALLW_TIMEOUT_MS at the cap denies at startup before rela
     const { code, stdout, elapsedMs } = await runCli(
       bashStdin(),
       hookEnv(relay.url, { ALLW_TIMEOUT_MS: "420000" }),
-      { timeoutMs: 2000 },
     );
 
     assert.equal(code, 0);
     assert.equal(decisionOf(stdout), "deny");
     assert.match(reasonOf(stdout), /ALLW_TIMEOUT_MS=420000ms is too large/);
+    assert.equal(relay.connections(), 0, "oversized config must deny without relay I/O");
     assert.ok(
-      elapsedMs < 1000,
-      `oversized config must deny before waiting on relay I/O, elapsed=${String(elapsedMs)}ms`,
+      elapsedMs < CLI_BOUND_MS,
+      `startup deny exceeded ${String(CLI_BOUND_MS)}ms decision bound, elapsed=${String(elapsedMs)}ms`,
     );
   } finally {
     await relay.close();
@@ -211,36 +229,30 @@ test("(#54) subprocess: ALLW_TIMEOUT_MS at the cap denies at startup before rela
 });
 
 test("(#54) subprocess: connection-refused relay fails closed to deny within a bounded time", async () => {
-  const { code, stdout, elapsedMs } = await runCli(bashStdin(), hookEnv(await refusedRelayUrl()), {
-    timeoutMs: 2500,
-  });
+  const { code, stdout, elapsedMs } = await runCli(bashStdin(), hookEnv(await refusedRelayUrl()));
 
   assert.equal(code, 0);
   assert.equal(decisionOf(stdout), "deny");
   // The first relay call is the account-state fetch; it fails before anything is sealed (#243).
   assert.match(reasonOf(stdout), /loading account state failed: fetch failed/);
   assert.ok(
-    elapsedMs < 2000,
-    `connection refusal should not approach Claude Code's 480s hook timeout, elapsed=${String(
-      elapsedMs,
-    )}ms`,
+    elapsedMs < CLI_BOUND_MS,
+    `connection refusal exceeded ${String(CLI_BOUND_MS)}ms decision bound, elapsed=${String(elapsedMs)}ms`,
   );
 });
 
 test("(#54) subprocess: hung relay fetch fails closed to deny within a bounded time", async () => {
   const relay = await hungRelay();
   try {
-    const { code, stdout, elapsedMs } = await runCli(bashStdin(), hookEnv(relay.url), {
-      timeoutMs: 2500,
-    });
+    const { code, stdout, elapsedMs } = await runCli(bashStdin(), hookEnv(relay.url));
 
     assert.equal(code, 0);
     assert.equal(decisionOf(stdout), "deny");
     // The hung account-state fetch is bounded by the per-fetch timeout (#243 moved it first).
     assert.match(reasonOf(stdout), /loading account state failed: .*timed out after/);
     assert.ok(
-      elapsedMs < 2000,
-      `hung relay must be bounded by the SDK fetch timeout, elapsed=${String(elapsedMs)}ms`,
+      elapsedMs < CLI_BOUND_MS,
+      `hung relay exceeded ${String(CLI_BOUND_MS)}ms decision bound, elapsed=${String(elapsedMs)}ms`,
     );
   } finally {
     await relay.close();

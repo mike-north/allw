@@ -78,9 +78,10 @@ flow continues; denial, timeout, malformed input, or relay failure writes an exp
 never emits `permissionDecision: "allow"` — see
 [`docs/codex-integration.md`](../../docs/codex-integration.md) §Fail-Open Residual for why.
 
-A `Bash` command that is blank or whitespace-only, or whose program is an empty word
-(`'' rm -rf x`), is denied without asking, exactly as in the Claude Code hook: there is no program
-to show the human. A blank `cwd` counts as unknown: the request is still sent, bound to no directory.
+A `Bash` command that runs no program is denied without asking, exactly as in the Claude Code hook,
+because there is nothing to show the human: a blank, whitespace-only or comment-only command, one
+that is only variable assignments (`FOO=1`) or shell operators (`&&`, `;`), or one whose program is
+an empty word (`'' rm -rf x`). The core refuses these, so every allw surface does the same. A blank `cwd` counts as unknown: the request is still sent, bound to no directory.
 
 ## Development
 

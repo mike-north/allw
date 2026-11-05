@@ -124,12 +124,17 @@ export interface AllwWasm {
   check_account_id_for_root(accountId: string, accountRootPubkeyB64: string): void;
   /** Derive the Ed25519 public key for a 32-byte signing seed (base64url). */
   ed25519_public_key(seedB64: string): string;
-  /** Build an ActionRecord JSON for a shell command using the core T1 command parser. */
+  /**
+   * Build an ActionRecord JSON for a shell command using the core T1 command parser. **Throws** an
+   * `Error` whose `kind` is the core's code: `invalid_shell_syntax`, or, for a line that runs no
+   * program (#376), `no_command`, `no_program` or `empty_program`.
+   */
   action_from_command(commandLine: string, cwd?: string | null): string;
   /**
    * Build an ActionRecord JSON for a **PowerShell** command line (the `command` surface). `raw` is
    * the exact line and argv is always its whitespace split; risk is at least Medium, or at least High
-   * for a compound, escaped or dynamic-execution line. Never throws for PowerShell syntax.
+   * for a compound, escaped or dynamic-execution line. Never throws for PowerShell syntax; throws
+   * only for a line that runs no program (#376), with a `kind` as `action_from_command`.
    */
   action_from_powershell_command(commandLine: string, cwd?: string | null): string;
   /**
@@ -137,7 +142,9 @@ export interface AllwWasm {
    * For callers that hold the exact token vector that will execute and must bind it verbatim —
    * re-tokenizing their command text would risk binding different tokens than the ones that run
    * (`docs/openclaw-integration.md` §5.1). `raw` is the original command text (recorded verbatim
-   * and the only source of `env_refs`; never re-tokenized).
+   * and the only source of `env_refs`; never re-tokenized). **Throws** for malformed JSON (no
+   * `kind`), and for an argv with no program (#376) with a `kind` as `action_from_command`:
+   * `no_command` (empty), `empty_program`, or `no_program` (only assignments).
    */
   action_from_argv(argvJson: string, raw?: string | null, cwd?: string | null): string;
   /**

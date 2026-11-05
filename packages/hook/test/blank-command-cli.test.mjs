@@ -42,6 +42,18 @@ const NO_PROGRAM_CORPUS = [
     "'' rm -rf x",
     "commandLine's first word (the program) must be non-empty",
   ],
+  // #376: the core refuses these itself, so every surface inherits the refusal.
+  [
+    "a command that is only an env assignment",
+    "FOO=1",
+    "commandLine runs no program (only variable assignments or shell operators)",
+  ],
+  [
+    "a command that is only operators",
+    "&& ;",
+    "commandLine runs no program (only variable assignments or shell operators)",
+  ],
+  ["a carriage-return-only command", "\r", "commandLine contains no command"],
 ];
 
 /** Run the hook bin with `stdin` and a clean env; resolves `{ code, stdout, stderr }`. */

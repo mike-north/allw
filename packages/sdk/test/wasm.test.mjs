@@ -2200,14 +2200,22 @@ test("action_from_argv throws on a malformed argv JSON (fail-closed)", async () 
   );
 });
 
-test("action_from_argv with an empty argv still records raw (visible, not erased)", async () => {
+test("action_from_argv refuses an empty argv whatever raw says (#376)", async () => {
   const wasm = await loadWasm();
 
-  const record = JSON.parse(wasm.action_from_argv("[]", "  ", undefined));
+  assert.throws(
+    () => wasm.action_from_argv("[]", "rm -rf x", undefined),
+    (err) => err.kind === "no_command" && /^action_from_argv failed: /.test(err.message),
+  );
+});
 
-  assert.ok(!("bin" in record.syntactic));
-  assert.ok(!("argv" in record.syntactic));
-  assert.equal(record.syntactic.raw, "  ");
+test("action_from_argv's malformed-JSON error has no kind (#376)", async () => {
+  const wasm = await loadWasm();
+
+  assert.throws(
+    () => wasm.action_from_argv("not json", null, undefined),
+    (err) => err instanceof Error && !Object.hasOwn(err, "kind"),
+  );
 });
 
 // ── Self-certifying account id + pairing-start authorization (#242) ─────────────────
