@@ -52,9 +52,6 @@ concat-kdf = "0.1"
 # `CryptoRng + RngCore` trait bound for the injected RNG. `default-features = false` (no
 # `getrandom`/`std`) so this dependency never links an OS RNG — randomness is caller-injected.
 rand_core = { version = "0.6", default-features = false }
-# POSIX word-splitting tokenizer (small, well-tested; mirrors Python's shlex).
-# Used by `command::action_from_command` to tokenize shell command strings deterministically.
-shlex = "1"
 # Planned as modules are implemented:
 #   uniffi                  — Swift/Kotlin bindings
 #   wasm-bindgen            — WASM for node/browser surfaces

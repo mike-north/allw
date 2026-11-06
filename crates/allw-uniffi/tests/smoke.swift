@@ -28,6 +28,23 @@ struct Smoke {
             fatalError("expected 32-byte base64url request hash")
         }
 
+        // Opaque capture and unknown removed fields cross the generated Swift boundary unchanged.
+        // @see docs/action-record.md — Command capture; docs/contract.md — Unknown fields.
+        for raw in ["# comment", "FOO=1", "&&", "''", "'unmatched", "$env:X=1; & Remove-Item C:\\a"] {
+            let captured = try actionFromCommandJson(command: raw, cwd: "/caller")
+            guard let data = captured.data(using: .utf8),
+                  let record = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let facts = record["syntactic"] as? [String: Any],
+                  facts["raw"] as? String == raw, facts["argv"] == nil,
+                  facts["bin"] == nil, record["record_schema_version"] as? Int == 3
+            else { fatalError("opaque caller facts changed at the Swift boundary") }
+        }
+        let legacyContext = context.replacingOccurrences(of: "\"syntactic\":{",
+            with: "\"syntactic\":{\"bin\":{},\"flags\":false,\"positionals\":1,\"host\":[],\"env_refs\":0,")
+        if try computeRequestHashB64(contextJson: legacyContext, expiresAt: 4102444800000) != hash {
+            fatalError("removed fields must be ignored at the Swift boundary")
+        }
+
         // ── New (PM blocker 1a): sign → verify round-trip ────────────────────
         let deviceSeedBytes = [UInt8](repeating: 7, count: 32)
         let accountSeedBytes = [UInt8](repeating: 0x11, count: 32)

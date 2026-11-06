@@ -36,6 +36,21 @@ fun main() {
     val hash = computeRequestHashB64(context, 4102444800000)
     check(hash.length == 43) { "expected 32-byte base64url request hash" }
 
+    // Opaque capture and removed-field handling must survive generated Kotlin bindings too.
+    // @see docs/action-record.md — Command capture; docs/contract.md — Unknown fields.
+    for (raw in listOf("# comment", "FOO=1", "&&", "''", "'unmatched", "\$env:X=1; & Remove-Item C:\\a")) {
+        val captured = actionFromCommandJson(raw, "/caller")
+        check(captured.contains("\"record_schema_version\":3"))
+        check(!captured.contains("\"argv\":") && !captured.contains("\"bin\":"))
+        // Exact string content is also exercised in the Rust JSON-boundary tests.
+        check(captured.contains("\"raw\":"))
+    }
+    val legacyContext = context.replace("\"syntactic\":{",
+        "\"syntactic\":{\"bin\":{},\"flags\":false,\"positionals\":1,\"host\":[],\"env_refs\":0,")
+    check(computeRequestHashB64(legacyContext, 4102444800000) == hash) {
+        "removed fields must be ignored at the Kotlin boundary"
+    }
+
     // ── New (PM blocker 1a): sign → verify round-trip ────────────────────────
     val deviceSeed = base64urlEncode(ByteArray(32) { 7 })
     val accountSeed = base64urlEncode(ByteArray(32) { 0x11 })

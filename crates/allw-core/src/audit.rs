@@ -20,14 +20,14 @@
 //! # Record hash recipe
 //!
 //! ```text
-//! record_hash = SHA-256( b"allw/audit-record/v2" || 0x00 || JCS(record_without_record_hash) )
+//! record_hash = SHA-256( b"allw/audit-record/v3" || 0x00 || JCS(record_without_record_hash) )
 //! ```
 //!
 //! - **JCS** — RFC 8785 JSON Canonicalization Scheme via `serde_jcs`.
-//! - **Domain tag** `b"allw/audit-record/v2"` provides domain separation from every other
-//!   SHA-256 use in the system (e.g. `b"allw/request-hash/v3"` in `hash.rs`). The `/v2`
-//!   suffix versions the removal of policy-only audit metadata and the schema-2 action record;
-//!   prior v1 record hashes are not current-format verification evidence.
+//! - **Domain tag** `b"allw/audit-record/v3"` provides domain separation from every other
+//!   SHA-256 use in the system (e.g. `b"allw/request-hash/v4"` in `hash.rs`). The `/v3`
+//!   suffix versions the schema-3 caller-facts-only action record;
+//!   prior v1/v2 record hashes are not current-format verification evidence.
 //! - **`record_hash` is excluded** (circular; including it would make the hash impossible to
 //!   compute).  Every other field is included — critically `prev_hash`, which is how each
 //!   record commits to its predecessor.
@@ -60,10 +60,10 @@ use crate::contract::{ActionRecord, Actor, Approver, AuditRecord, Decision};
 
 /// The domain separation tag for audit record hashes.
 ///
-/// Distinct from `b"allw/request-hash/v3"` in `hash.rs` — cryptographic domain separation
-/// keeps audit and request hashes separate. The `/v2` suffix versions removal of policy-only
-/// audit metadata and the schema-2 action record; old v1 hashes are not converted.
-const AUDIT_DOMAIN_TAG: &[u8] = b"allw/audit-record/v2";
+/// Distinct from `b"allw/request-hash/v4"` in `hash.rs` — cryptographic domain separation
+/// keeps audit and request hashes separate. The `/v3` suffix versions the schema-3 caller-facts-only
+/// action record; old v1/v2 hashes are not converted.
+const AUDIT_DOMAIN_TAG: &[u8] = b"allw/audit-record/v3";
 
 /// Null-byte separator between the domain tag and the JCS payload in the hash input.
 const SEPARATOR: u8 = 0x00;
@@ -304,7 +304,7 @@ impl AuditChain {
 /// # Recipe
 ///
 /// ```text
-/// record_hash = SHA-256( b"allw/audit-record/v2" || 0x00 || JCS(record_without_record_hash) )
+/// record_hash = SHA-256( b"allw/audit-record/v3" || 0x00 || JCS(record_without_record_hash) )
 /// ```
 ///
 /// # Exclusion of `record_hash`
@@ -318,7 +318,7 @@ impl AuditChain {
 ///
 /// # Domain separation
 ///
-/// `b"allw/audit-record/v2"` is distinct from `b"allw/request-hash/v3"` (in `hash.rs`),
+/// `b"allw/audit-record/v3"` is distinct from `b"allw/request-hash/v4"` (in `hash.rs`),
 /// ensuring audit record hashes cannot be confused with request hashes.
 ///
 /// # Determinism
@@ -385,20 +385,15 @@ mod tests {
 
     fn make_action() -> ActionRecord {
         ActionRecord {
-            record_schema_version: 2,
+            record_schema_version: 3,
             surface: Surface::Command,
             syntactic: SyntacticSubstrate {
-                bin: Some("git".to_string()),
                 argv: Some(vec![
                     "git".to_string(),
                     "push".to_string(),
                     "--force".to_string(),
                 ]),
-                flags: Some(vec!["--force".to_string()]),
-                positionals: Some(vec!["origin".to_string(), "main".to_string()]),
                 cwd: Some("/repo".to_string()),
-                host: None,
-                env_refs: None,
                 server: None,
                 tool: None,
                 params: None,
@@ -505,7 +500,7 @@ mod tests {
     //   1. Serialize record to serde_json::Value
     //   2. Remove "record_hash" key
     //   3. serde_jcs::to_vec (RFC 8785 JCS canonicalization)
-    //   4. SHA-256( b"allw/audit-record/v2" || 0x00 || jcs )
+    //   4. SHA-256( b"allw/audit-record/v3" || 0x00 || jcs )
     // and asserts equality with compute_record_hash.
 
     #[test]
@@ -520,14 +515,14 @@ mod tests {
         }
         let canonical = serde_jcs::to_vec(&value).unwrap();
         let mut hasher = Sha256::new();
-        hasher.update(b"allw/audit-record/v2"); // AUDIT_DOMAIN_TAG
+        hasher.update(b"allw/audit-record/v3"); // AUDIT_DOMAIN_TAG
         hasher.update([0x00u8]); // SEPARATOR
         hasher.update(&canonical);
         let expected: [u8; 32] = hasher.finalize().into();
 
         assert_eq!(
             rec.record_hash, expected,
-            "record_hash must equal SHA-256(b\"allw/audit-record/v2\" || 0x00 || JCS(record \\ {{record_hash}}))"
+            "record_hash must equal SHA-256(b\"allw/audit-record/v3\" || 0x00 || JCS(record \\ {{record_hash}}))"
         );
     }
 

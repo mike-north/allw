@@ -15,7 +15,7 @@
 //! # Recipe
 //!
 //! ```text
-//! request_hash = SHA-256( b"allw/request-hash/v3" || 0x00 || JCS(request-hash input) )
+//! request_hash = SHA-256( b"allw/request-hash/v4" || 0x00 || JCS(request-hash input) )
 //! ```
 //!
 //! where `JCS(request-hash input)` is the RFC 8785 JSON Canonicalization Scheme encoding of the
@@ -50,11 +50,11 @@
 //!
 //! # Domain tag and versioning
 //!
-//! `DOMAIN_TAG = b"allw/request-hash/v3"` provides cryptographic domain separation so this
-//! hash cannot be confused with any other SHA-256 digest in the system. The `/v3` suffix is the
-//! canonical-contract version: removing risk/policy-only action slots, using ActionRecord schema 2,
-//! and making reversibility an optional caller assertion changes the v2 input contract. The clean
-//! domain break prevents prior v2 signed receipts from verifying as current-format receipts.
+//! `DOMAIN_TAG = b"allw/request-hash/v4"` provides cryptographic domain separation so this
+//! hash cannot be confused with any other SHA-256 digest in the system. The `/v4` suffix is the
+//! canonical-contract version: removing interpretation/derived fields, using ActionRecord schema 3,
+//! after v3 removed risk/policy fields and optionalized reversibility. The clean
+//! domain break prevents prior v2/v3 signed receipts from verifying as current-format receipts.
 //!
 //! # JCS crate
 //!
@@ -71,10 +71,9 @@ use crate::contract::{ActionRecord, ApprovalContext, Constraints};
 
 /// Domain separation tag — prefixed to the JCS bytes before hashing.
 ///
-/// The `/v3` suffix separates the current canonical contract from v2: risk/policy-only action
-/// slots are removed, the action record is schema 2, and reversibility is an optional assertion.
+/// The `/v4` suffix separates caller-facts-only schema 3 from earlier parsed substrate contracts.
 /// The input remains a flat context projection plus `expires_at`; old signed hashes are not converted.
-const DOMAIN_TAG: &[u8] = b"allw/request-hash/v3";
+const DOMAIN_TAG: &[u8] = b"allw/request-hash/v4";
 
 /// Null-byte separator between domain tag and payload in the hash input.
 const SEPARATOR: u8 = 0x00;
@@ -171,7 +170,7 @@ pub fn canonical_request_bytes(ctx: &ApprovalContext, expires_at: i64) -> Vec<u8
 /// # Recipe
 ///
 /// ```text
-/// request_hash = SHA-256( b"allw/request-hash/v3" || 0x00 || JCS(request-hash input) )
+/// request_hash = SHA-256( b"allw/request-hash/v4" || 0x00 || JCS(request-hash input) )
 /// ```
 ///
 /// where `JCS(request-hash input)` is the output of [`canonical_request_bytes`].
@@ -183,7 +182,7 @@ pub fn canonical_request_bytes(ctx: &ApprovalContext, expires_at: i64) -> Vec<u8
 ///
 /// # Domain separation
 ///
-/// `b"allw/request-hash/v3"` ensures this digest cannot collide with any other SHA-256 use in
+/// `b"allw/request-hash/v4"` ensures this digest cannot collide with any other SHA-256 use in
 /// the system.  Bumping the version suffix is the canonicalization version knob.
 ///
 /// # Determinism
@@ -218,20 +217,15 @@ mod tests {
 
     /// Minimal action used for the canonicalization anchor test.
     ///
-    /// Uses only `bin` and `raw` in the syntactic substrate so the hand-written JCS string
-    /// remains tractable.  capabilities/scope are None (omitted from JSON per wire spec).
+    /// Uses only caller `raw` in the syntactic substrate so the hand-written JCS string
+    /// remains tractable.  No inferred or reserved-policy fields exist.
     fn make_minimal_action() -> ActionRecord {
         ActionRecord {
-            record_schema_version: 2,
+            record_schema_version: 3,
             surface: Surface::Command,
             syntactic: SyntacticSubstrate {
-                bin: Some("git".to_string()),
                 argv: None,
-                flags: None,
-                positionals: None,
                 cwd: None,
-                host: None,
-                env_refs: None,
                 server: None,
                 tool: None,
                 params: None,
@@ -275,16 +269,16 @@ mod tests {
 
     // ── Test 1: Canonicalization is spec-correct (the anchor test) ────────────
     //
-    // This expected string is derived BY HAND from RFC 8785 rules for the v3 flat object:
+    // This expected string is derived BY HAND from RFC 8785 rules for the v4 flat object:
     //   - No whitespace
     //   - Object keys sorted lexicographically by UTF-16 code unit (= byte order for ASCII)
     //   - Numbers in shortest form
     //
     // JCS ASCII-key order: action < actor < constraints < expires_at < reversible < summary.
-    // Within action: record_schema_version < surface < syntactic; within syntactic: bin < raw.
+    // Within action: record_schema_version < surface < syntactic; within syntactic: raw only.
     // Within actor: id < kind. No absent chain or reversibility key is inserted.
     const EXPECTED_CANONICAL: &str = concat!(
-        r#"{"action":{"record_schema_version":2,"surface":"command","syntactic":{"bin":"git","raw":"git push"}},"#,
+        r#"{"action":{"record_schema_version":3,"surface":"command","syntactic":{"raw":"git push"}},"#,
         r#""actor":{"id":"machine:x","kind":"claude-code"},"#,
         r#""constraints":{"allowed_decisions":["approved","denied"],"challenge_required":false},"#,
         r#""expires_at":1700003600000,"#,
@@ -312,7 +306,7 @@ mod tests {
     // ── Test 2: Hash = independent SHA-256 of the documented recipe ──────────
     //
     // Re-derives the documented recipe independently in the test body:
-    //   SHA-256( b"allw/request-hash/v3" || 0x00 || canonical_request_bytes(&ctx, expires_at) )
+    //   SHA-256( b"allw/request-hash/v4" || 0x00 || canonical_request_bytes(&ctx, expires_at) )
     // This is NOT circular: it independently applies the domain-tag + hash recipe and
     // asserts equality with compute_request_hash, verifying the implementation matches
     // the documented algorithm.
@@ -324,7 +318,7 @@ mod tests {
         // Re-derive the recipe directly in the test (not via compute_request_hash):
         let canonical = canonical_request_bytes(&ctx, TS_EXPIRES);
         let mut hasher = Sha256::new();
-        hasher.update(b"allw/request-hash/v3"); // DOMAIN_TAG
+        hasher.update(b"allw/request-hash/v4"); // DOMAIN_TAG
         hasher.update([0x00u8]); // SEPARATOR
         hasher.update(&canonical);
         let expected: [u8; 32] = hasher.finalize().into();
@@ -360,7 +354,7 @@ mod tests {
 
     // ── Test 4: Sensitivity — each hashed field changes the hash ─────────────
     //
-    // The v3 request-hash input binds the context projection plus expires_at, so each of
+    // The v4 request-hash input binds the context projection plus expires_at, so each of
     // these mutations must perturb the hash (docs/contract.md §request_hash).
 
     #[test]
@@ -422,17 +416,17 @@ mod tests {
     }
 
     #[test]
-    fn mutating_action_bin_changes_hash() {
+    fn mutating_action_cwd_changes_hash() {
         let base = make_minimal_context();
         let base_hash = compute_request_hash(&base, TS_EXPIRES);
 
         let mut mutated = base.clone();
-        mutated.action.syntactic.bin = Some("rm".to_string());
+        mutated.action.syntactic.cwd = Some("rm".to_string());
 
         assert_ne!(
             compute_request_hash(&mutated, TS_EXPIRES),
             base_hash,
-            "mutating action.syntactic.bin must change the request_hash"
+            "mutating action.syntactic.cwd must change the request_hash"
         );
     }
 
@@ -548,11 +542,11 @@ mod tests {
     // to reflect the new version.
     //
     // Independently derived from the literal canonical bytes below with Python hashlib and the
-    // specified v3 domain, not captured from this implementation. ASCII keys have the same UTF-16
+    // specified v4 domain, not captured from this implementation. ASCII keys have the same UTF-16
     // and byte sort order. The canonicalization test separately asserts the complete byte string.
-    /// SHA-256("allw/request-hash/v3" || NUL || EXPECTED_CANONICAL).
+    /// SHA-256("allw/request-hash/v4" || NUL || EXPECTED_CANONICAL).
     const FROZEN_HASH_HEX: &str =
-        "6952a2ab641bc1a13983b5b07826fcc9b48cb32c8b55e4969218fe14484ebc4c";
+        "0cd833e3e1d0c51b908becb73ede798a0fd917d42a249df3a478225f57f21f7c";
 
     #[test]
     fn frozen_cross_platform_vector() {

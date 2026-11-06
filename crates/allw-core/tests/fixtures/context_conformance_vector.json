@@ -4,10 +4,9 @@
   "device_x25519_seed_b64": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc",
   "base_context": {
     "action": {
-      "record_schema_version": 2,
+      "record_schema_version": 3,
       "surface": "command",
       "syntactic": {
-        "bin": "git",
         "argv": ["git", "push"],
         "raw": "git push"
       }
@@ -208,6 +207,51 @@
       "set": {
         "risk": "low",
         "action.risk": "critical"
+      },
+      "expected": "accepted"
+    },
+    {
+      "class": "removed bin ignored even with formerly malformed shape",
+      "set": {
+        "action.syntactic.bin": {
+          "ignored": true
+        }
+      },
+      "expected": "accepted"
+    },
+    {
+      "class": "removed flags ignored even with formerly malformed shape",
+      "set": {
+        "action.syntactic.flags": {
+          "ignored": true
+        }
+      },
+      "expected": "accepted"
+    },
+    {
+      "class": "removed positionals ignored even with formerly malformed shape",
+      "set": {
+        "action.syntactic.positionals": {
+          "ignored": true
+        }
+      },
+      "expected": "accepted"
+    },
+    {
+      "class": "removed host ignored even with formerly malformed shape",
+      "set": {
+        "action.syntactic.host": {
+          "ignored": true
+        }
+      },
+      "expected": "accepted"
+    },
+    {
+      "class": "removed env_refs ignored even with formerly malformed shape",
+      "set": {
+        "action.syntactic.env_refs": {
+          "ignored": true
+        }
       },
       "expected": "accepted"
     }

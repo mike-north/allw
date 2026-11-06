@@ -349,16 +349,11 @@ fn make_attested_context() -> ApprovalContext {
     // attestation is excluded from request_hash (hash.rs), so adding it later does not perturb it.
     let mut context = ApprovalContext {
         action: ActionRecord {
-            record_schema_version: 2,
+            record_schema_version: 3,
             surface: Surface::Command,
             syntactic: SyntacticSubstrate {
-                bin: Some("git".to_string()),
                 argv: None,
-                flags: None,
-                positionals: None,
                 cwd: None,
-                host: None,
-                env_refs: None,
                 server: None,
                 tool: None,
                 params: None,
@@ -910,7 +905,7 @@ fn uniffi_signed_note_is_bound_to_the_verdict() {
 fn display_model_json_escapes_untrusted_context_text() {
     let context = json!({
         "action": {
-            "record_schema_version": 2,
+            "record_schema_version": 3,
             "surface": "command",
             "syntactic": { "raw": "rm -rf ~/x; : \u{1b}[2K\rgit status" },
             "risk": "high"
@@ -972,5 +967,58 @@ fn uniffi_sign_refuses_note_over_cap() {
     assert!(
         format!("{err:?}").contains("verdict note is 2049 bytes of UTF-8; the maximum is 2048"),
         "got {err:?}"
+    );
+}
+
+/// The native JSON boundary carries opaque bytes and follows the same ignore-unknown contract.
+/// @see docs/action-record.md — Command capture; docs/contract.md — Unknown fields.
+#[test]
+fn opaque_commands_and_removed_fields_match_core() {
+    for raw in [
+        "# comment",
+        "FOO=1",
+        "&&",
+        "''",
+        "'unmatched",
+        "$env:X=1; & Remove-Item C:\\a",
+        "echo $(id)\nnext",
+    ] {
+        let record: serde_json::Value =
+            serde_json::from_str(&action_from_command_json(raw.into(), "/caller".into()).unwrap())
+                .unwrap();
+        assert_eq!(
+            record,
+            json!({"record_schema_version": 3, "surface": "command", "syntactic": {"raw": raw, "cwd": "/caller"}})
+        );
+    }
+    for raw in ["", " \t\r\n", "\u{a0}\u{3000}"] {
+        assert!(action_from_command_json(raw.into(), String::new()).is_err());
+    }
+    let context = json!({
+        "action": {"record_schema_version": 3, "surface": "command", "syntactic": {"raw": "ssh $HOST"}},
+        "summary": "caller", "actor": {"id": "script", "kind": "script"},
+        "constraints": {"allowed_decisions": ["approved", "denied"], "challenge_required": false}
+    });
+    let before = compute_request_hash_b64(context.to_string(), 1_800_000_060_000).unwrap();
+    let mut legacy = context;
+    for (key, value) in [
+        ("bin", json!({})),
+        ("flags", json!(false)),
+        ("positionals", json!(1)),
+        ("host", json!([])),
+        ("env_refs", json!("x")),
+    ] {
+        legacy["action"]["syntactic"][key] = value;
+    }
+    assert_eq!(
+        before,
+        compute_request_hash_b64(legacy.to_string(), 1_800_000_060_000).unwrap()
+    );
+    let display: serde_json::Value =
+        serde_json::from_str(&allw_uniffi::display_model_json(legacy.to_string()).unwrap())
+            .unwrap();
+    assert_eq!(
+        display["syntactic"],
+        json!({"raw": "ssh $HOST", "raw_lines": ["ssh $HOST"]})
     );
 }

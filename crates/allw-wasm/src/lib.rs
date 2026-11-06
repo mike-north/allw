@@ -50,7 +50,6 @@ use allw_core::{
     action_from_argv as core_action_from_argv, action_from_command as core_action_from_command,
     action_from_file_edit as core_action_from_file_edit,
     action_from_mcp_tool_call as core_action_from_mcp_tool_call,
-    action_from_powershell_command as core_action_from_powershell_command,
     check_account_id_for_root as core_check_account_id_for_root,
     compute_request_hash as core_compute_request_hash, decrypt_context as core_decrypt_context,
     derive_number_match_challenge as core_derive_number_match_challenge,
@@ -170,7 +169,7 @@ fn ms_to_i64(ms: f64, what: &str) -> Result<i64, JsError> {
 /// Computes the WYSIWYS `request_hash` for an [`ApprovalContext`](allw_core::ApprovalContext)
 /// bound to `expires_at`, returning the 32-byte digest as a **base64url-unpadded** string.
 ///
-/// This reproduces the Rust `request-hash/v3` value; the cross-platform vector anchors parity.
+/// This reproduces the Rust `request-hash/v4` value; the cross-platform vector anchors parity.
 /// The v3 canonical contract removes risk/policy-only action slots, uses ActionRecord schema 2,
 /// and makes reversibility an optional caller assertion. Its domain separates prior v2 receipts
 /// from the current format; no compatibility conversion is performed.
@@ -1396,12 +1395,8 @@ pub fn x25519_public_key(seed_b64: &str) -> Result<String, JsError> {
 
 // ── ActionRecord builders (the hook's syntactic substrate) ──────────────────────────────
 
-/// Maps a core command-builder refusal to the value `action_from_command` /
-/// `action_from_powershell_command` throw: a JS `Error` with the message
-/// `"{function} failed: {error}"` and an own property `kind`, the core's stable
-/// [`CommandError::code`](allw_core::CommandError::code) (`invalid_shell_syntax`, `no_command`,
-/// `no_program`, `empty_program`). Callers classify on `kind`, never on the message; every refusal
-/// is a deny (fail-closed). A thrown value without a `kind` is still a refusal.
+/// Preserve the core's stable refusal kind on a fresh JS Error. The only content refusal is
+/// `no_command`; callers still deny every thrown value, including malformed known-input schemas.
 fn command_failure(function: &str, error: &CommandError) -> JsValue {
     let thrown = js_sys::Error::new(&format!("{function} failed: {error}"));
     // Setting an own property on a fresh `Error` cannot fail; if it ever did, the error would lack
@@ -1410,23 +1405,10 @@ fn command_failure(function: &str, error: &CommandError) -> JsValue {
     thrown.into()
 }
 
-/// Builds an [`ActionRecord`](allw_core::ActionRecord) from a raw shell command line, returning it
-/// as JSON. This is the **command** surface (`docs/policy-seam.md` §The three tiers, T1): the core
-/// tokenizes the command (POSIX word-splitting), captures the syntactic substrate (bin / argv /
-/// flags / positionals / cwd / host / env-refs). Raw caller input remains authoritative; no danger
-/// tier or policy-only slot is produced. The hook calls this to
-/// reduce a pending `Bash` tool call into the matchable record it submits for approval.
-///
-/// - `command_line` — the raw shell command (e.g. `"rm -rf build"`).
-/// - `cwd` — the working directory at invocation, or `None` if the caller didn't capture it.
-///
-/// # Errors
-///
-/// Throws (see `command_failure`: an `Error` with a `kind`) if the command string has unmatched
-/// quotes / invalid shell syntax (`kind: "invalid_shell_syntax"`), or runs no program: blank
-/// (`no_command`), only assignments or operators (`no_program`), or an empty program word
-/// (`empty_program`), #376. Fail-closed at the boundary: the caller denies rather than guessing at
-/// a malformed command or asking a human to approve nothing.
+/// Capture opaque nonblank text with optional caller cwd, returning core ActionRecord JSON.
+/// No shell language, program identity or argv is inferred. Blank/whitespace text throws an Error
+/// with `kind: "no_command"`; other failures remain fail-closed.
+/// @see docs/action-record.md — Command capture.
 #[wasm_bindgen]
 pub fn action_from_command(command_line: &str, cwd: Option<String>) -> Result<String, JsValue> {
     let ctx = CommandContext { cwd };
@@ -1435,49 +1417,10 @@ pub fn action_from_command(command_line: &str, cwd: Option<String>) -> Result<St
     Ok(to_json(&record, "ActionRecord")?)
 }
 
-/// Builds an [`ActionRecord`](allw_core::ActionRecord) from a raw **PowerShell** command line,
-/// returning it as JSON (the `command` surface, for a host's PowerShell tool). `raw` is the exact
-/// line; argv is its whitespace split. No danger rating is produced. See
-/// [`allw_core::powershell`](allw_core::powershell) for the rules.
-///
-/// No PowerShell line is refused for its syntax, so a valid PowerShell command is never denied for
-/// its quoting.
-///
-/// # Errors
-///
-/// Throws (an `Error` with a `kind`, as [`action_from_command`]) only for a line that runs no
-/// program (#376): blank (`no_command`), only separators or literal assignments (`no_program`), or
-/// an empty-string program (`empty_program`).
-#[wasm_bindgen]
-pub fn action_from_powershell_command(
-    command_line: &str,
-    cwd: Option<String>,
-) -> Result<String, JsValue> {
-    let ctx = CommandContext { cwd };
-    let record = core_action_from_powershell_command(command_line, &ctx)
-        .map_err(|e| command_failure("action_from_powershell_command", &e))?;
-    Ok(to_json(&record, "ActionRecord")?)
-}
-
-/// Builds an [`ActionRecord`](allw_core::ActionRecord) from a **pre-tokenized** argv, returning it
-/// as JSON. This is the **command** surface for callers that already hold a canonical execution
-/// plan and must bind it verbatim — an agent runtime that stores the exact `argv` it will later
-/// execute (`docs/openclaw-integration.md` §5.1). Re-tokenizing such a caller's command text with
-/// [`action_from_command`] risks binding a *different* token vector than the one that runs, which
-/// would break the WYSIWYS guarantee that the verdict is bound to the exact action.
-///
-/// - `argv_json` — JSON array of the canonical argument tokens.
-/// - `raw` — the original command text as the upstream gate renders it, or `undefined`/`null` when
-///   the caller has none. Recorded verbatim and used (only) to extract `env_refs` names; it is
-///   **never** re-tokenized.
-/// - `cwd` — the working directory the command is bound to, or `undefined`/`null` when unbound.
-///
-/// # Errors
-///
-/// Throws if `argv_json` is not a JSON array of strings (a plain `Error`, no `kind`) — fail-closed:
-/// the caller denies rather than submitting a record built from an unparseable plan. Also throws,
-/// with a `kind` as [`action_from_command`], for an argv with no program (#376): empty
-/// (`no_command`), an empty program word (`empty_program`), or only assignments (`no_program`).
+/// Capture caller argv verbatim, with optional original raw text and cwd, as core JSON.
+/// Quoting and interpretation are not performed. Malformed JSON/string-array types throw; a vector
+/// with no elements throws `kind: "no_command"`. Individual words remain opaque, including empty ones.
+/// @see docs/action-record.md — Command capture.
 #[wasm_bindgen]
 pub fn action_from_argv(
     argv_json: &str,
@@ -1492,7 +1435,7 @@ pub fn action_from_argv(
 }
 
 /// Builds an [`ActionRecord`](allw_core::ActionRecord) for an MCP tool call, returning it as JSON.
-/// This is the **mcp_tool_call** surface (`docs/policy-seam.md` §The three tiers, T1): the core
+/// This is the **mcp_tool_call** surface (`docs/action-record.md` §The action record, T1): the core
 /// preserves the `server`/`tool`/`params` verbatim (so instance-distinguishing values stay
 /// bound to the human decision); no danger rating is assigned. The hook calls this to reduce a
 /// pending `mcp__<server>__<tool>` call into the record it submits for approval.
@@ -1518,8 +1461,7 @@ pub fn action_from_mcp_tool_call(
 
 /// Builds an [`ActionRecord`](allw_core::ActionRecord) for an agent-runtime/plugin-owned tool
 /// call, returning it as JSON. This is the **agent_tool_call** surface
-/// (`docs/openclaw-integration.md` §5.2, `docs/policy-seam.md` §Structure vs. data in the
-/// ActionRecord): a tool call gated by the harness rather than served by an MCP server. It reuses
+/// (`docs/openclaw-integration.md` §5.2, `docs/action-record.md` §Tool calls and file edits): a tool call gated by the harness rather than served by an MCP server. It reuses
 /// the same `(server, tool, params)` function-identity substrate as `mcp_tool_call` — `server`
 /// holds the gating provider id (e.g. a plugin id), not an MCP server name — but is tagged with a
 /// **distinct surface** so an `mcp_tool_call`-scoped policy rule never matches it, even when the
@@ -1582,7 +1524,7 @@ pub fn action_from_agent_tool_call_with_raw(
 }
 
 /// Builds an [`ActionRecord`](allw_core::ActionRecord) for a file edit, returning it as JSON.
-/// This is the **file_edit** surface (`docs/policy-seam.md` §The three tiers, T1): the core
+/// This is the **file_edit** surface (`docs/action-record.md` §The action record, T1): the core
 /// preserves the operation kind, target paths, compact diff summary, and a hash of the full edit
 /// bytes. The hook calls this for Codex `apply_patch` and Claude Code `Edit`/`Write`/`MultiEdit`
 /// tool calls so file writes cannot bypass human approval by avoiding the command surface.

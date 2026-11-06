@@ -21,16 +21,11 @@ pub fn action_from_file_edit(
     let diff_hash = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize());
 
     ActionRecord {
-        record_schema_version: 2,
+        record_schema_version: 3,
         surface: Surface::FileEdit,
         syntactic: SyntacticSubstrate {
-            bin: None,
             argv: None,
-            flags: None,
-            positionals: None,
             cwd: None,
-            host: None,
-            env_refs: None,
             server: None,
             tool: None,
             params: None,
@@ -54,7 +49,7 @@ mod tests {
             action_from_file_edit("patch", &["src/app.ts".to_string()], "patch 1 file", diff);
 
         assert_eq!(record.surface, Surface::FileEdit);
-        assert_eq!(record.record_schema_version, 2);
+        assert_eq!(record.record_schema_version, 3);
         assert_eq!(record.syntactic.operation.as_deref(), Some("patch"));
         assert_eq!(
             record.syntactic.paths.as_deref(),

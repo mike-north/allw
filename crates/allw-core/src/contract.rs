@@ -84,8 +84,7 @@ pub enum Surface {
     /// `docs/openclaw-integration.md` §5.2). Reuses the `(server, tool)` function-identity pair
     /// from `mcp_tool_call` — `server` holds the gating provider id, `tool` the tool name — but
     /// is a **distinct surface** so a rule or registry scoped to `mcp_tool_call` never silently
-    /// sweeps in tool calls no MCP server ever served. See `docs/policy-seam.md` §Structure vs.
-    /// data in the ActionRecord.
+    /// sweeps in tool calls no MCP server ever served. See `docs/action-record.md` §Tool calls and file edits.
     AgentToolCall,
     // Future: DelegatedFetch.
 }
@@ -105,50 +104,23 @@ pub enum Decision {
 
 // ── SyntacticSubstrate ────────────────────────────────────────────────────────
 
-/// The tokenized, matchable syntactic form of an action.
+/// Caller-described facts bound into one human decision; no command meaning is inferred.
 ///
-/// All fields are optional; which ones are populated depends on the `surface`:
-///
-/// - `surface = command`: `bin`, `argv`, `flags`, `positionals`, `cwd`, `host`, `env_refs`
-/// - `surface = mcp_tool_call`: `server`, `tool`, `params`
-/// - `surface = agent_tool_call`: `server`, `tool`, `params` — same fields as `mcp_tool_call`
-///   (`server` holds the gating provider id, not an MCP server name); `params` is often absent.
-/// - `surface = file_edit`: `operation`, `paths`, `diff_summary`, `diff_hash`, `raw`
-/// - File edits set `raw` to the exact edit/patch text for WYSIWYS display.
-/// - Other surfaces may set `raw` for display/fallback.
-///
-/// The T1 syntactic substrate is the durable base that all three policy tiers match against.
-/// See `docs/policy-seam.md` §The action record.
+/// Fields coexist in one flat object and are optional by surface: command callers supply raw,
+/// cwd and/or argv; tool callers supply server/tool/params; file edits supply operation, paths,
+/// summary, digest and original edit text. Raw is original text on command/file-edit surfaces and
+/// caller description on tool surfaces. Unknown fields retain serde's ignore behavior.
+/// @see docs/action-record.md — The action record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SyntacticSubstrate {
     // ── command-surface fields ────────────────────────────────────────────────
-    /// The binary/executable name (e.g. `"git"`).
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub bin: Option<String>,
-
-    /// Full argument vector including the binary (e.g. `["git", "push", "--force"]`).
+    /// Caller-supplied argument vector, including its first word (e.g. `["git", "push", "--force"]`).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub argv: Option<Vec<String>>,
-
-    /// Parsed flag tokens (e.g. `["--force", "-f"]`).
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub flags: Option<Vec<String>>,
-
-    /// Positional arguments stripped of flags (e.g. `["origin", "main"]`).
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub positionals: Option<Vec<String>>,
 
     /// Working directory at time of invocation.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub cwd: Option<String>,
-
-    /// Hostname if the command targets a remote host (e.g. SSH targets).
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub host: Option<String>,
-
-    /// Names of environment variables referenced (values are NOT captured).
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub env_refs: Option<Vec<String>>,
 
     // ── mcp_tool_call / agent_tool_call-surface fields ───────────────────────
     /// Function-identity server/provider name — an MCP server for `mcp_tool_call`, or the
@@ -190,10 +162,10 @@ pub struct SyntacticSubstrate {
 
 // ── ActionRecord ──────────────────────────────────────────────────────────────
 
-/// A reduced, matchable record of an approvable action.
+/// Caller-described facts for an approvable action.
 ///
 /// Carries caller facts for display and hashing; no danger rating or policy metadata belongs here.
-/// Raw caller input remains authoritative over syntactic projections.
+/// Raw and supplied argv are independent caller facts; both remain hash-bound when present.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActionRecord {
     /// Schema version for this record shape. Bumped only on a breaking change.
@@ -202,7 +174,7 @@ pub struct ActionRecord {
     /// The interception paradigm this action arrived through.
     pub surface: Surface,
 
-    /// Descriptive syntactic projection carried with the caller's authoritative raw form.
+    /// Caller facts retained without interpreting command meaning or deriving metadata.
     pub syntactic: SyntacticSubstrate,
 }
 
@@ -548,17 +520,12 @@ mod tests {
 
     fn make_syntactic_command() -> SyntacticSubstrate {
         SyntacticSubstrate {
-            bin: Some("git".to_string()),
             argv: Some(vec![
                 "git".to_string(),
                 "push".to_string(),
                 "--force".to_string(),
             ]),
-            flags: Some(vec!["--force".to_string()]),
-            positionals: Some(vec!["origin".to_string(), "main".to_string()]),
             cwd: Some("/home/user/repo".to_string()),
-            host: None,
-            env_refs: None,
             server: None,
             tool: None,
             params: None,
@@ -572,7 +539,7 @@ mod tests {
 
     fn make_action_record() -> ActionRecord {
         ActionRecord {
-            record_schema_version: 2,
+            record_schema_version: 3,
             surface: Surface::Command,
             syntactic: make_syntactic_command(),
         }
@@ -684,19 +651,14 @@ mod tests {
         assert_eq!(orig, back);
     }
 
-    /// policy-seam.md §The action record: the substrate is a FLAT object whose command- and
+    /// action-record.md §The action record: the substrate is a FLAT object whose command- and
     /// mcp-surface fields coexist under their own snake_case keys. Pin the field names and the
     /// flat shape so a rename or accidental nesting is caught.
     #[test]
     fn syntactic_substrate_is_flat_with_snake_case_field_names() {
         let s = SyntacticSubstrate {
-            bin: Some("git".to_string()),
-            argv: None,
-            flags: None,
-            positionals: None,
+            argv: Some(vec!["git".into(), "status".into()]),
             cwd: None,
-            host: None,
-            env_refs: Some(vec!["AWS_PROFILE".to_string()]),
             server: Some("omnifocus".to_string()),
             tool: Some("delete_project".to_string()),
             params: Some(json!({ "list": "Agent Inbox" })),
@@ -709,7 +671,7 @@ mod tests {
         let val: Value = serde_json::to_value(&s).unwrap();
 
         // Flat: the command- and mcp-surface fields are siblings at the top level (no nesting).
-        assert!(val.get("bin").is_some(), "command field `bin` is top-level");
+        assert!(val.get("argv").is_some(), "caller argv is top-level");
         assert!(
             val.get("server").is_some() && val.get("tool").is_some(),
             "mcp fields `server`/`tool` coexist at the top level (flat substrate)"
@@ -721,13 +683,8 @@ mod tests {
                 && val.get("diff_hash").is_some(),
             "file-edit fields coexist at the top level (flat substrate)"
         );
-        // snake_case key name, not `envRefs`/`env-refs`.
-        assert_eq!(
-            val.get("env_refs"),
-            Some(&json!(["AWS_PROFILE"])),
-            "env_refs must serialize under the snake_case key `env_refs`"
-        );
-        // `params` is preserved as a structured JSON value (policy-seam.md: params as raw/structured).
+
+        // `params` is preserved as a structured JSON value (action-record.md: params as raw/structured).
         assert_eq!(val["params"]["list"], json!("Agent Inbox"));
     }
 
@@ -877,7 +834,7 @@ mod tests {
         assert_eq!(v, json!("command"));
     }
 
-    /// docs/openclaw-integration.md §5.2 + docs/policy-seam.md: the new surface's wire name is
+    /// docs/openclaw-integration.md §5.2 + docs/action-record.md: the new surface's wire name is
     /// `agent_tool_call`, distinct from `mcp_tool_call` — the whole point is that a rule scoped
     /// to one string never matches the other.
     #[test]
@@ -912,7 +869,7 @@ mod tests {
     #[test]
     fn action_record_with_unknown_surface_fails_closed_on_deserialize() {
         let bad_json = r#"{
-            "record_schema_version": 2,
+            "record_schema_version": 3,
             "surface": "totally_unknown_surface",
             "syntactic": {},
             "risk": "low"
