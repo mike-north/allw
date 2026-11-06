@@ -232,8 +232,7 @@ export function buildExecApprovalRequest(wasm: HookWasm, input: ExecMappingInput
       canonicalArgv !== undefined
         ? // §5.1: bind the canonical vector verbatim; `commandText` rides along as `raw` only.
           wasm.action_from_argv(JSON.stringify(canonicalArgv), commandText, cwd ?? null)
-        : // No canonical argv exists anywhere — the core tokenizes the command text itself. This is
-          // the documented last resort, not a shortcut past the rule above.
+        : // Text-only callers supply no argv: record the line without inferring a vector.
           wasm.action_from_command(commandText, cwd ?? null);
   } catch (err) {
     return {

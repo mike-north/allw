@@ -64,9 +64,9 @@ function baseContext(attestation) {
       : { id: ACTOR_ID, kind: ACTOR_KIND, attestation };
   return {
     action: {
-      record_schema_version: 2,
+      record_schema_version: 3,
       surface: "command",
-      syntactic: { bin: "git", raw: "git push --force origin main" },
+      syntactic: { raw: "git push --force origin main" },
     },
     summary: "force push to main",
     actor,

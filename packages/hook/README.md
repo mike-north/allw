@@ -195,19 +195,15 @@ pending, an uncaught exception, or a stray `process.exit`), or receives `SIGTERM
 Deliberately conservative, so the human is only interrupted for actions that actually run side
 effects:
 
-- **`Bash`** — a shell command (`tool_input.command`). A command that runs no program is denied
-  without asking, because there is nothing to show the human: a blank or comment-only command, one
-  that is only variable assignments (`FOO=1`) or shell operators (`&&`, `;`), or one whose program
-  is an empty word (`'' rm -rf build`). The core refuses these, so every allw surface does the same
-  (`docs/policy-seam.md` §Command lines that run no program).
+- **`Bash`** — a shell command (`tool_input.command`). Empty/whitespace-only text is denied
+  without asking. Nonblank text is recorded verbatim without inferring argv or command metadata
+  ([action-record.md](../../docs/action-record.md) §Command capture).
 - **`Monitor`** with a `command` — gated exactly like `Bash` (it runs the command in the background
   under your `Bash` permission rules). A `Monitor` WebSocket watch (`tool_input.ws`) runs no command
   and gets no decision; any other `Monitor` input is denied. Monitors a plugin declares start
   without a `Monitor` call, so allw never sees them.
-- **`PowerShell`** — a PowerShell line (`tool_input.command`), shown to the human as
-  `PowerShell: <command>`; no danger or reversibility rating is produced. A line that runs no program (blank or
-  only a `#` comment, only separators or variables assigned a literal such as `$env:FOO=1`, or an
-  empty-string program such as `& ''`) is denied without asking.
+- **`PowerShell`** — an opaque line through the same core builder, shown with a `PowerShell:`
+  summary. Only empty/whitespace-only text is refused; no argv or risk/reversibility is inferred.
 - **`Edit` / `Write` / `MultiEdit`** — direct file edits (`tool_input.file_path` plus edit
   payload).
 - **`NotebookEdit`** — a notebook cell edit (`tool_input.notebook_path` plus the cell change). An

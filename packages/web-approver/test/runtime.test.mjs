@@ -49,9 +49,9 @@ const NOW_MS = 1700001500000;
  */
 const CONTEXT = {
   action: {
-    record_schema_version: 2,
+    record_schema_version: 3,
     surface: "command",
-    syntactic: { bin: "git", argv: ["git", "push", "--force", "origin", "main"], cwd: "/repo" },
+    syntactic: { argv: ["git", "push", "--force", "origin", "main"], cwd: "/repo" },
   },
   summary: "force push to main",
   actor: { id: "machine:laptop", kind: "claude-code" },
@@ -192,7 +192,7 @@ test("agent_tool_call surface: maps to its own kind, distinct from mcp, with (se
   // rendered plaintext even though it is inside request_hash.
   const AGENT_TOOL_CALL_CONTEXT = {
     action: {
-      record_schema_version: 2,
+      record_schema_version: 3,
       surface: "agent_tool_call",
       syntactic: {
         server: "deploy-plugin",
@@ -236,35 +236,39 @@ test("agent_tool_call surface: maps to its own kind, distinct from mcp, with (se
 
 // ── PowerShell records (#298, review #316 B1) ───────────────────────────────────────────────────
 //
-// The core records a PowerShell line's argv as a whitespace split of `raw`, so the card's `argv:` line
-// can't present a benign reading of a destructive line. Records come from the real WASM builder.
+// The same opaque line builder records PowerShell raw without inferring argv.
+// Records come from the real WASM builder; display escaping remains core-owned.
 
 /** Prepare a PowerShell request built by the core, as the hook would send it. */
 async function preparePowerShell(line) {
   const wasm = await loadTestWasm();
   const { identity, encryptTo } = pairedIdentity(wasm);
-  const action = JSON.parse(wasm.action_from_powershell_command(line, String.raw`C:\Users\me`));
-  const context = { ...CONTEXT, action, risk: action.risk, summary: `PowerShell: ${line}` };
+  const action = JSON.parse(wasm.action_from_command(line, String.raw`C:\Users\me`));
+  const context = { ...CONTEXT, action, summary: `PowerShell: ${line}` };
   return runtimeAt(wasm, identity).prepare(makeEnvelope(encryptTo(JSON.stringify(context))));
 }
 
-test("PowerShell: a statement hidden from POSIX quoting is its own argv token on the card (#316 B1)", async () => {
+test("PowerShell: the full opaque statement reaches the card (#316 B1)", async () => {
   // PowerShell runs the Remove-Item: inside "…" its escape is the backtick and `\` is literal.
   const line = String.raw`echo "a\" ; Remove-Item -Recurse -Force C:\Users ; echo \"b"`;
   const prepared = await preparePowerShell(line);
   const lines = exactPlaintext(prepared.context).split("\n");
   const argvLine = lines.find((l) => l.startsWith("argv: "));
-  assert.match(argvLine ?? "", /^argv: echo .* ';' Remove-Item -Recurse -Force /);
+  assert.equal(argvLine, undefined, "line capture never infers argv");
   assert.ok(lines.includes(`raw: ${line}`));
   assert.equal(actionSummary(prepared.context), line);
-  assert.equal(prepared.context.divergentArgv, undefined, "argv is raw's whitespace split");
+  assert.equal(
+    prepared.context.divergentArgv,
+    undefined,
+    "raw-only capture has no invented second form",
+  );
 });
 
 test("PowerShell: a Windows path keeps its backslashes on the card (#316 B1)", async () => {
   const line = String.raw`Remove-Item C:\Users\me\proj\build -Recurse`;
   const prepared = await preparePowerShell(line);
   const text = exactPlaintext(prepared.context);
-  assert.ok(text.includes(String.raw`argv: Remove-Item 'C:\Users\me\proj\build' -Recurse`), text);
+  assert.ok(!text.includes("argv:"), "no vector is inferred from the line");
   assert.ok(text.includes(`raw: ${line}`));
   assert.ok(!text.includes("C:Usersmeprojbuild"));
   assert.equal(prepared.context.divergentArgv, undefined, "quoting a path is not a divergence");
@@ -304,7 +308,7 @@ test("tampered context: a mutated plaintext recomputes a different hash; the ver
   const tamperedContext = {
     ...CONTEXT,
     summary: "innocuous: list files",
-    action: { ...CONTEXT.action, syntactic: { bin: "ls", argv: ["ls", "-la"], cwd: "/repo" } },
+    action: { ...CONTEXT.action, syntactic: { argv: ["ls", "-la"], cwd: "/repo" } },
   };
   const prepared = await runtime.prepare(makeEnvelope(encryptTo(JSON.stringify(tamperedContext))));
 

@@ -49,7 +49,7 @@ writeKeyfile(keyfilePath, keyfile);
 
 const spoofContext = {
   action: {
-    record_schema_version: 2,
+    record_schema_version: 3,
     surface: "command",
     // The spoof, then 100 more lines, so the block is far taller than a terminal.
     syntactic: {

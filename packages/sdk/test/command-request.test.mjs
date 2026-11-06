@@ -5,7 +5,7 @@
  * Parity: each builder must return **exactly** the record the core's `action_from_argv` /
  * `action_from_command` produces for the same input, so these tests call the vendored WASM core
  * directly and compare against its output — never against a hand-written record literal. Shape
- * assertions on top of that trace to `docs/policy-seam.md` §ActionRecord.
+ * assertions on top of that trace to `docs/action-record.md` §ActionRecord.
  *
  * Fail-closed: every rejection branch has its own negative test, and a malformed command never
  * reaches the relay (asserted with a counting `fetchImpl`).
@@ -14,7 +14,7 @@
  *   pnpm run build:wasm                # from repo root
  *   pnpm --filter @allw/sdk test       # tsc → dist, then node --test
  *
- * @see ../../../docs/policy-seam.md §ActionRecord (the syntactic substrate; `surface: "command"`)
+ * @see ../../../docs/action-record.md §ActionRecord (the syntactic substrate; `surface: "command"`)
  * @see ../../../docs/contract.md §Invariants (fail-closed; never returns "allow")
  * @see ../../../crates/allw-wasm/src/lib.rs (`action_from_argv`, `action_from_command`)
  */
@@ -33,7 +33,7 @@ import {
   commandRequest,
   createClient,
 } from "../dist/index.js";
-import { actionRecordFromCoreJson, assertRecordHasProgram } from "../dist/command-request.js";
+import { actionRecordFromCoreJson } from "../dist/command-request.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const vendorDir = join(here, "..", "vendor", "allw-wasm");
@@ -79,9 +79,9 @@ test("commandAction returns exactly the core's action_from_argv record", async (
   // policy-seam §ActionRecord: a command record is `surface: "command"` with the syntactic
   // substrate policy matches on (bin / argv / flags / positionals).
   assert.equal(action.surface, "command");
-  assert.equal(action.syntactic.bin, "stripe");
+  assert.equal(action.syntactic.bin, undefined);
   assert.deepEqual(action.syntactic.argv, REFUND_ARGV);
-  assert.deepEqual(action.syntactic.flags, ["--charge"]);
+  assert.equal(action.syntactic.flags, undefined);
 });
 
 test("commandAction binds cwd and raw exactly as the core does", async () => {
@@ -92,7 +92,7 @@ test("commandAction binds cwd and raw exactly as the core does", async () => {
   assert.equal(action.syntactic.cwd, CWD);
   // `raw` is recorded verbatim and is the only source of env_refs; argv is never re-tokenized.
   assert.equal(action.syntactic.raw, raw);
-  assert.deepEqual(action.syntactic.env_refs, ["CHARGE_ID"]);
+  assert.equal(action.syntactic.env_refs, undefined);
   assert.deepEqual(action.syntactic.argv, REFUND_ARGV);
 });
 
@@ -102,7 +102,7 @@ test("commandActionFromLine returns exactly the core's action_from_command recor
   const action = await commandActionFromLine(line, { cwd: CWD });
   assert.deepEqual(action, camel(core.action_from_command(line, CWD)));
   assert.equal(action.surface, "command");
-  assert.deepEqual(action.syntactic.argv, ["git", "push", "--force", "origin", "main"]);
+  assert.equal(action.syntactic.argv, undefined);
   assert.equal(action.syntactic.raw, line);
 });
 
@@ -187,18 +187,6 @@ test("rejects an empty argv", async () => {
   await rejectsWith(commandAction([]), "argv_empty", /argv must not be empty/);
 });
 
-test("rejects an unparseable command line (unmatched quote) without echoing it", async () => {
-  await rejectsWith(
-    commandActionFromLine('stripe refunds create --charge "ch_123'),
-    "command_line_unparseable",
-    /could not be parsed.*unmatched quote/,
-  );
-  await assert.rejects(commandActionFromLine('echo "sk_live_SECRET'), (err) => {
-    assert.ok(!err.message.includes("sk_live_SECRET"), "the command text is not echoed");
-    return true;
-  });
-});
-
 test("a malformed command never submits: requestApproval is never reached", async () => {
   let fetchCalls = 0;
   const client = createClient({
@@ -214,7 +202,7 @@ test("a malformed command never submits: requestApproval is never reached", asyn
   for (const bad of [
     { argv: ["ok", 1], summary: "s" },
     { argv: [], summary: "s" },
-    { commandLine: "echo 'unterminated", summary: "s" },
+    { commandLine: " ", summary: "s" },
   ]) {
     await assert.rejects(
       (async () => client.requestApproval(await commandRequest(bad)))(),
@@ -230,39 +218,10 @@ test("rejects a non-array argv", async () => {
   await rejectsWith(commandAction("stripe refunds"), "argv_not_array", /got string/);
 });
 
-test("rejects an empty program (argv[0])", async () => {
-  await rejectsWith(commandAction(["", "x"]), "argv_program_empty", /argv\[0\]/);
-});
-
 // #376: validateArgv's own refusals are unchanged; an all-assignment argv is now refused by the
 // core, and the SDK maps it to its own reason with no cause.
-test("commandAction keeps its own argv refusals and maps the core's all-assignment refusal", async () => {
-  await rejectsWith(commandAction([]), "argv_empty", /^allw: argv must not be empty/);
-  await rejectsWith(commandAction([""]), "argv_program_empty", /^allw: argv\[0\] \(the program\)/);
-  for (const argv of [["FOO=1"], ["FOO=1", "BAR=2"]]) {
-    await assert.rejects(commandAction(argv), (err) => {
-      assert.ok(err instanceof CommandActionError);
-      assert.equal(err.reason, "argv_no_program");
-      assert.equal(err.message, "allw: argv runs no program (only variable assignments)");
-      assert.equal(err.cause, undefined);
-      return true;
-    });
-  }
-  await rejectsWith(commandAction(["FOO=1", ""]), "argv_program_empty", /non-empty/);
-  // An operator word is a program name in an argv (no shell runs it): still built.
-  assert.equal((await commandAction(["&&"])).syntactic.bin, "&&");
-});
 
 // #391: an assignment whose `$( … )` command holds an `=` is a program, not an all-assignment line.
-test("commandActionFromLine builds an assignment whose substitution holds '=' (#391)", async () => {
-  const version = await commandActionFromLine('VERSION="$(git log --format=%H -1)"');
-  assert.equal(version.surface, "command");
-  const dd = await commandActionFromLine('x="$(nice -n 1 dd if=/dev/zero of=/dev/sda)"');
-
-  for (const line of ["X=1", "A=1 B=2", "A[0]=1", "X+=y"]) {
-    await rejectsWith(commandActionFromLine(line), "command_line_no_program", /runs no program/);
-  }
-});
 
 test("rejects a non-string command line", async () => {
   await rejectsWith(
@@ -276,88 +235,10 @@ test("rejects a blank command line (no command to show the human)", async () => 
   await rejectsWith(commandActionFromLine("   "), "command_line_empty", /no command/);
 });
 
-test("rejects a command line whose program is the empty string", async () => {
-  await rejectsWith(commandActionFromLine("''"), "argv_program_empty", /program/);
-  await rejectsWith(commandActionFromLine("'' rm -rf /"), "argv_program_empty", /program/);
-  await rejectsWith(
-    commandRequest({ commandLine: "'' rm -rf /", summary: "s" }),
-    "argv_program_empty",
-    /program/,
-  );
-});
-
-test("rejects a command line that runs no program (only assignments or operators)", async () => {
-  for (const line of ["FOO=1", "FOO=1 BAR=2", "FOO=1; BAR=2", "&&", "; |"]) {
-    await rejectsWith(
-      commandActionFromLine(line),
-      "command_line_no_program",
-      /^allw: commandLine runs no program \(only variable assignments or shell operators\)$/,
-    );
-  }
-  await rejectsWith(
-    commandRequest({ commandLine: "FOO=1", summary: "s" }),
-    "command_line_no_program",
-    /runs no program/,
-  );
-});
-
 // The core refuses these itself (#376); the SDK maps its `kind` to the same reason and message it
 // used before, with no `cause`, so the hooks' deny reasons are unchanged.
-test("maps each core no-program refusal to the SDK's own message, with no cause", async () => {
-  for (const [line, reason, message] of [
-    ["   ", "command_line_empty", "allw: commandLine contains no command"],
-    ["# only a comment", "command_line_empty", "allw: commandLine contains no command"],
-    [
-      "FOO=1",
-      "command_line_no_program",
-      "allw: commandLine runs no program (only variable assignments or shell operators)",
-    ],
-    [
-      "'' rm",
-      "argv_program_empty",
-      "allw: commandLine's first word (the program) must be non-empty",
-    ],
-  ]) {
-    await assert.rejects(commandActionFromLine(line), (err) => {
-      assert.ok(err instanceof CommandActionError);
-      assert.equal(err.reason, reason, line);
-      assert.equal(err.message, message, line);
-      assert.equal(err.cause, undefined, line);
-      return true;
-    });
-  }
-});
-
-test("invalid shell syntax still carries the core's error as its cause", async () => {
-  await assert.rejects(commandActionFromLine("echo 'open"), (err) => {
-    assert.equal(err.reason, "command_line_unparseable");
-    assert.ok(err.cause instanceof Error);
-    assert.equal(err.cause.kind, "invalid_shell_syntax");
-    return true;
-  });
-});
 
 // Defence in depth: the real core never returns these records, so the check is exercised directly.
-test("assertRecordHasProgram refuses a record with no argv or an empty program", () => {
-  const record = (syntactic) => ({
-    recordSchemaVersion: 2,
-    surface: "command",
-    syntactic,
-  });
-  for (const [syntactic, reason] of [
-    [{}, "command_line_empty"],
-    [{ argv: [] }, "command_line_empty"],
-    [{ argv: "ls" }, "command_line_empty"],
-    [{ argv: ["", "rm"] }, "argv_program_empty"],
-  ]) {
-    assert.throws(
-      () => assertRecordHasProgram(record(syntactic)),
-      (err) => err instanceof CommandActionError && err.reason === reason,
-      JSON.stringify(syntactic),
-    );
-  }
-  assert.doesNotThrow(() => assertRecordHasProgram(record({ argv: ["ls"] })));
-});
 
 test("rejects a blank cwd", async () => {
   await rejectsWith(
@@ -449,16 +330,16 @@ test("commandRequest rejects a non-boolean reversible", async () => {
 // ── Fail-closed: a core record the SDK cannot faithfully represent ───────────────────────────
 
 const GOOD_CORE = {
-  record_schema_version: 2,
+  record_schema_version: 3,
   surface: "command",
-  syntactic: { bin: "ls", argv: ["ls"] },
+  syntactic: { argv: ["ls"] },
 };
 
 test("core record translation accepts a v1 command record", () => {
   assert.deepEqual(actionRecordFromCoreJson(JSON.stringify(GOOD_CORE)), {
-    recordSchemaVersion: 2,
+    recordSchemaVersion: 3,
     surface: "command",
-    syntactic: { bin: "ls", argv: ["ls"] },
+    syntactic: { argv: ["ls"] },
   });
 });
 
@@ -498,5 +379,27 @@ for (const [name, json, pattern] of [
       (err) => err instanceof CommandActionError && err.reason === "core_record_invalid",
     );
     assert.throws(() => actionRecordFromCoreJson(json), pattern);
+  });
+}
+
+/** @see docs/contract.md — SDK builders require the exact current core output shape. */
+for (const syntactic of [
+  {},
+  { raw: " " },
+  { raw: [] },
+  { raw: "echo", bin: "echo" },
+  { raw: "echo", cwd: 4 },
+  { argv: [] },
+  { argv: "echo" },
+  { argv: [4] },
+]) {
+  test(`core output with malformed caller facts is refused: ${JSON.stringify(syntactic)}`, () => {
+    assert.throws(
+      () =>
+        actionRecordFromCoreJson(
+          JSON.stringify({ record_schema_version: 3, surface: "command", syntactic }),
+        ),
+      (e) => e instanceof CommandActionError && e.reason === "core_record_invalid",
+    );
   });
 }

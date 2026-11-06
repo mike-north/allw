@@ -61,13 +61,8 @@ export interface ApprovalContext {
  * exactly when the hashed substrate field is; every string has already been escaped by the core.
  */
 export interface DisplaySubstrate {
-  readonly bin?: string;
   readonly argv?: readonly string[];
-  readonly flags?: readonly string[];
-  readonly positionals?: readonly string[];
   readonly cwd?: string;
-  readonly host?: string;
-  readonly env_refs?: readonly string[];
   readonly server?: string;
   readonly tool?: string;
   /** `params` as compact, escaped JSON (sorted keys). */

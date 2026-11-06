@@ -24,7 +24,7 @@
  * params, the wrong `tool_input` shape), this returns a `build-error` outcome carrying a reason —
  * the caller denies. A gated call is never silently allowed.
  *
- * @see ../../../../docs/policy-seam.md §The three tiers (the syntactic substrate, surfaces)
+ * @see ../../../../docs/action-record.md §The action record (the syntactic substrate, surfaces)
  * @see https://code.claude.com/docs/en/hooks (tool_name / tool_input; mcp__server__tool naming)
  */
 
@@ -39,7 +39,7 @@ const BASH_TOOL_NAME = "Bash";
 
 /**
  * Claude Code's PowerShell tool: a shell command in `tool_input.command`, like Bash, but in
- * PowerShell syntax, so the core's PowerShell builder records it (#298).
+ * PowerShell syntax, recorded opaquely by the same line builder as other command tools.
  */
 const POWERSHELL_TOOL_NAME = "PowerShell";
 
@@ -464,7 +464,7 @@ export function posixCommandCall(toolName: string, toolInput: unknown): PosixCom
     const request = readMonitorRequest(toolInput);
     if (request.kind === "ws") {
       // A WebSocket watch runs no command: it is a read-only network subscription, and allw does
-      // not gate raw egress (docs/policy-seam.md). Claude Code's own WebSocket prompt still applies.
+      // not gate raw egress (docs/action-record.md). Claude Code's own WebSocket prompt still applies.
       return { kind: "pass-through", reason: "allw: Monitor WebSocket watch runs no command" };
     }
     if (request.kind === "malformed") {
@@ -521,56 +521,43 @@ export function commandBuildFailureReason(wasm: HookWasm, err: unknown): string 
   )}`;
 }
 
-/**
- * `@allw/sdk`'s `commandActionFromLine` wording for each core no-program refusal: the `kind` the
- * WASM `action_from_command` throws (#376). {@link gatePosixCommand} denies with these, so a command
- * is denied with the same reason here as through the hooks' `commandRequest` path.
- */
+/** Blank command text leaves no presentation and fails closed with the SDK's wording. */
 const NO_COMMAND = "commandLine contains no command";
-const NO_PROGRAM = "commandLine runs no program (only variable assignments or shell operators)";
-const EMPTY_PROGRAM = "commandLine's first word (the program) must be non-empty";
-
-/** The SDK wording for a core no-program refusal (`err.kind`), or `null` for any other error. */
-function coreNoProgramRefusal(err: unknown): string | null {
-  if (typeof err !== "object" || err === null || !Object.hasOwn(err, "kind")) return null;
-  switch ((err as { kind?: unknown }).kind) {
-    case "no_command":
-      return NO_COMMAND;
-    case "no_program":
-      return NO_PROGRAM;
-    case "empty_program":
-      return EMPTY_PROGRAM;
-    default:
-      return null;
-  }
+/** Only a missing presentation is a command-content refusal; other text stays opaque. */
+function coreNoCommandRefusal(err: unknown): string | null {
+  return typeof err === "object" &&
+    err !== null &&
+    Object.hasOwn(err, "kind") &&
+    "kind" in err &&
+    err.kind === "no_command"
+    ? NO_COMMAND
+    : null;
 }
 
-/**
- * Defence in depth: why a core `command` record has no program to show the human, worded exactly as
- * `@allw/sdk`'s `commandActionFromLine` words its refusal, or `null` when it has one. The core
- * already refuses such a line (#376); a blank or whitespace-only line would have no `argv` at all,
- * and `'' rm …` an empty first word. This reads the core's record; it does not re-tokenize. A record
- * that cannot be read is refused too (fail-closed).
- */
-function noProgramRefusal(actionRecord: string): string | null {
-  let argv: unknown;
+/** Refuse an unreadable or malformed line-builder result without inferring an argv. */
+function commandRecordRefusal(actionRecord: string): string | null {
   try {
-    argv = (JSON.parse(actionRecord) as { syntactic?: { argv?: unknown } }).syntactic?.argv;
+    const record: unknown = JSON.parse(actionRecord);
+    if (typeof record !== "object" || record === null || !("syntactic" in record)) {
+      return "the core returned a malformed command record";
+    }
+    const facts = record.syntactic;
+    if (
+      typeof facts !== "object" ||
+      facts === null ||
+      !("raw" in facts) ||
+      typeof facts.raw !== "string" ||
+      facts.raw.trim() === ""
+    )
+      return NO_COMMAND;
+    return null;
   } catch {
     return "the core returned an unreadable command record";
   }
-  if (!Array.isArray(argv) || argv.length === 0) return NO_COMMAND;
-  if (argv[0] === "") return EMPTY_PROGRAM;
-  return null;
 }
 
-/**
- * Build a `command` record for a POSIX shell command (Bash, or Monitor's `command`) through the core.
- * A core error (invalid shell syntax, or a line that runs no program: blank, only assignments or
- * operators, an empty program word), or a record with no program, is a `build-error`, so the caller
- * denies, exactly as the hooks' `commandRequest` path does, with the same reason.
- */
-function gatePosixCommand(
+/** Build opaque command text through the core; every build/output failure denies. */
+function gateCommandLine(
   wasm: HookWasm,
   command: string,
   cwd: string | undefined,
@@ -582,13 +569,13 @@ function gatePosixCommand(
       cwd === undefined
         ? wasm.action_from_command(command)
         : wasm.action_from_command(command, cwd);
-    const refusal = noProgramRefusal(actionRecord);
+    const refusal = commandRecordRefusal(actionRecord);
     if (refusal !== null) {
       return { kind: "build-error", reason: commandBuildFailureReason(wasm, refusal) };
     }
     return { kind: "gated", actionRecord, summary };
   } catch (err) {
-    const refusal = coreNoProgramRefusal(err);
+    const refusal = coreNoCommandRefusal(err);
     return { kind: "build-error", reason: commandBuildFailureReason(wasm, refusal ?? err) };
   }
 }
@@ -609,7 +596,7 @@ export function gateToolCall(
   const posix = posixCommandCall(toolName, toolInput);
   if (posix !== null) {
     return posix.kind === "command"
-      ? gatePosixCommand(wasm, posix.command, cwd, posix.summary)
+      ? gateCommandLine(wasm, posix.command, cwd, posix.summary)
       : posix;
   }
 
@@ -621,21 +608,7 @@ export function gateToolCall(
         reason: "allw: PowerShell tool_input missing a string 'command' (fail-closed deny)",
       };
     }
-    try {
-      const actionRecord =
-        cwd === undefined
-          ? wasm.action_from_powershell_command(command)
-          : wasm.action_from_powershell_command(command, cwd);
-      return { kind: "gated", actionRecord, summary: oneLine(`PowerShell: ${command}`) };
-    } catch (err) {
-      return {
-        kind: "build-error",
-        reason: `allw: could not build an ActionRecord for the PowerShell command (fail-closed deny): ${agentSafeErrorText(
-          wasm,
-          err,
-        )}`,
-      };
-    }
+    return gateCommandLine(wasm, command, cwd, oneLine(`PowerShell: ${command}`));
   }
 
   if (isFileEditTool(toolName)) {

@@ -3,8 +3,7 @@
  * means "unknown".
  *
  * Both hooks build a command request through `@allw/sdk`'s `commandRequest`, which refuses a blank
- * or whitespace-only command, and a command whose program is an empty word (`''`): there is no
- * program to show the human. The Codex hook's mirror of this file drives the same corpus and expects
+ * or whitespace-only command. Nonblank text is opaque and reaches the human unchanged. The Codex hook's mirror of this file drives the same corpus and expects
  * the same reason (`../../codex-hook/test/blank-command-cli.test.mjs`).
  *
  * Each case drives the real `allw-hook` bin as a subprocess against a loopback relay double, so
@@ -39,26 +38,10 @@ const PREFIX = "allw: could not build an ActionRecord for the command (fail-clos
  * The shared corpus (the Codex hook's mirror uses the same one): each command and the SDK's
  * refusal, as `commandActionFromLine` words it.
  */
-const NO_PROGRAM_CORPUS = [
+const EMPTY_COMMAND_CORPUS = [
   ["a blank command", "", "commandLine contains no command"],
   ["a whitespace-only command", "   ", "commandLine contains no command"],
   ["a tabs-and-newlines command", "\t\n\t", "commandLine contains no command"],
-  [
-    "a command whose program is an empty word",
-    "'' rm -rf x",
-    "commandLine's first word (the program) must be non-empty",
-  ],
-  // #376: the core refuses these itself, so every surface inherits the refusal.
-  [
-    "a command that is only an env assignment",
-    "FOO=1",
-    "commandLine runs no program (only variable assignments or shell operators)",
-  ],
-  [
-    "a command that is only operators",
-    "&& ;",
-    "commandLine runs no program (only variable assignments or shell operators)",
-  ],
   ["a carriage-return-only command", "\r", "commandLine contains no command"],
 ];
 
@@ -111,7 +94,7 @@ async function runBash(t, command, cwd) {
   return { reason: output.permissionDecisionReason, relay };
 }
 
-for (const [label, command, refusal] of NO_PROGRAM_CORPUS) {
+for (const [label, command, refusal] of EMPTY_COMMAND_CORPUS) {
   test(`(#372) ${label} is denied without asking`, async (t) => {
     const { reason, relay } = await runBash(t, command, "/workspace/project");
     assert.equal(reason, `${PREFIX}${refusal}`);
@@ -125,3 +108,23 @@ test("(#371) a blank cwd is unknown: the human is asked, with a record bound to 
   assert.equal(relay.seen.submits, 1, "the call reached the relay and a human said no");
   assert.equal("cwd" in relay.seen.contexts[0].action.syntactic, false);
 });
+
+/** @see docs/action-record.md — nonblank shell-looking text always reaches a human. */
+for (const command of [
+  "# comment",
+  "FOO=1",
+  "&& ;",
+  "'' rm -rf x",
+  "'unmatched",
+  "echo $(id) # hi\nnext",
+]) {
+  test(`opaque command reaches the approver: ${JSON.stringify(command)}`, async (t) => {
+    const { reason, relay } = await runBash(t, command, "/workspace/project");
+    assert.match(reason, /not approved/);
+    assert.equal(relay.seen.submits, 1);
+    assert.deepEqual(relay.seen.contexts[0].action.syntactic, {
+      raw: command,
+      cwd: "/workspace/project",
+    });
+  });
+}

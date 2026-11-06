@@ -16,7 +16,7 @@ leaves never depend on the composition.
 Companion reading:
 
 - [contract.md](./contract.md) defines allw's one-shot, fail-closed approval primitive.
-- [policy-seam.md](./policy-seam.md) defines the action substrate and external-policy boundary.
+- [action-record.md](./action-record.md) defines the action substrate and external-policy boundary.
 - [hitl-seam-decisions.md](./hitl-seam-decisions.md) records the choices and rejected alternatives
   behind this contract.
 

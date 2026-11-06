@@ -1,6 +1,5 @@
 import {
   joinToolIdentity,
-  quoteToken,
   reconstructCommand,
   renderArgv,
   renderList,
@@ -142,13 +141,8 @@ export interface ApprovalActor {
  * and whenever the hidden-character warning shows, the escaped character is somewhere on screen.
  */
 export interface SubstrateView {
-  readonly bin?: string;
   readonly argv?: readonly string[];
-  readonly flags?: readonly string[];
-  readonly positionals?: readonly string[];
   readonly cwd?: string;
-  readonly host?: string;
-  readonly envRefs?: readonly string[];
   /** MCP server name, or the gating provider (plugin) id for an `agent_tool_call`. */
   readonly server?: string;
   readonly tool?: string;
@@ -187,8 +181,8 @@ export interface ApprovalContext {
   /** Every hash-bound action field, escaped by the core. */
   readonly substrate: SubstrateView;
   /**
-   * Set only when the hash-bound `bin`/`argv` describes a different command than `raw` (decided on
-   * the unescaped bytes): the escaped command line `bin`/`argv` reconstruct to. Renderers show it
+   * Set only when the hash-bound `argv` describes a different command than `raw` (decided on
+   * the unescaped bytes): the escaped command line `argv` reconstruct to. Renderers show it
    * as the headline with a warning, so a benign `raw` can never be the only half on screen.
    */
   readonly divergentArgv?: string;
@@ -260,11 +254,11 @@ export const RAW_ARGV_DIVERGENCE_WARNING =
   "⚠ raw and argv differ — the heading shows the hash-bound argv; the raw line below is what the agent wrote. Review both.";
 
 /**
- * Shown with a tool-surface request that also carries a hash-bound command form (`bin`/`argv`). The
- * heading is the tool identity, so the command is flagged; the plaintext shows it as `bin:`/`argv:` (#321).
+ * Shown with a tool-surface request that also carries a hash-bound command form (`argv`). The
+ * heading is the tool identity, so the command is flagged; the plaintext shows it as `argv:` (#321).
  */
 export const TOOL_COMMAND_FORM_WARNING =
-  "⚠ this tool call also carries a command (the bin/argv lines below) — it is hash-bound too. Review both.";
+  "⚠ this tool call also carries a command (the argv lines below) — it is hash-bound too. Review both.";
 
 /** Label for the context summary: the integrator's own description, not the action itself (#262). */
 export const CONTEXT_SUMMARY_LABEL = "Agent's description";
@@ -653,7 +647,7 @@ export const NO_ACTION_FIELDS_HEADLINE = "(no command, tool, or file-edit fields
  * 2. When raw and argv diverge: the hash-bound argv form, never the possibly benign `raw` (the card
  *    then shows a warning and both forms).
  * 3. A file edit: its diff summary, else `operation paths`.
- * 4. `raw`; else the command `bin`/`argv` reconstruct to.
+ * 4. `raw`; else the command `argv` reconstruct to.
  * 5. `server :: tool`, or the tool alone.
  * 6. `operation paths`; else the compact params; else {@link NO_ACTION_FIELDS_HEADLINE}.
  */
@@ -700,12 +694,7 @@ export function exactPlaintext(context: ApprovalContext): string {
   if (operationFirst) lines.push(`file_edit: ${s.operation ?? ""}`);
 
   if (s.cwd !== undefined) lines.push(`cwd: ${s.cwd}`);
-  if (s.host !== undefined) lines.push(`host: ${s.host}`);
-  if (s.bin !== undefined) lines.push(`bin: ${quoteToken(s.bin)}`);
   if (s.argv !== undefined) lines.push(`argv: ${renderArgv(s.argv)}`);
-  if (s.flags !== undefined) lines.push(`flags: ${renderArgv(s.flags)}`);
-  if (s.positionals !== undefined) lines.push(`positionals: ${renderArgv(s.positionals)}`);
-  if (s.envRefs !== undefined) lines.push(`env_refs: ${renderList(s.envRefs)}`);
   if (!toolCallFirst) {
     if (s.server !== undefined) lines.push(`server: ${s.server}`);
     if (s.tool !== undefined) lines.push(`tool: ${s.tool}`);

@@ -28,7 +28,7 @@ So today you're forced to choose between **babysitting** and **over-trusting**. 
 
 **A human-in-the-loop approval primitive for agents.** When an agent is about to do something sensitive, allw
 puts a clear, contextual **Approve / Deny** in front of the right human — on their phone or desktop — and returns
-a verifiable decision.
+a verifiable decision. The caller describes the action; allw does not interpret command meaning or rate danger.
 
 - **One inbox, every machine, every agent.** Pair a machine or agent once; all its approval requests land in a
   single place you can answer from anywhere. Stop watching terminals.

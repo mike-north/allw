@@ -52,9 +52,9 @@ const DEVICE_AUTH_TOKEN = "test-device-auth-token";
  */
 const CONTEXT = {
   action: {
-    record_schema_version: 2,
+    record_schema_version: 3,
     surface: "command",
-    syntactic: { bin: "git", argv: ["git", "push", "--force", "origin", "main"], cwd: "/repo" },
+    syntactic: { argv: ["git", "push", "--force", "origin", "main"], cwd: "/repo" },
   },
   summary: "force push to main",
   actor: { id: "machine:test-laptop", kind: "claude-code" },

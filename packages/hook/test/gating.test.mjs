@@ -3,7 +3,7 @@
  * `ActionRecord`-building outcomes (gated / pass-through / build-error). Uses the real WASM core.
  *
  * @see https://code.claude.com/docs/en/hooks (tool_name, mcp__server__tool naming)
- * @see ../../../docs/policy-seam.md §The three tiers (surfaces)
+ * @see ../../../docs/action-record.md §The action record (surfaces)
  */
 
 import { test } from "node:test";
@@ -116,9 +116,9 @@ test("gateToolCall(Bash) with a non-string command → build-error", async () =>
   assert.equal(out.kind, "build-error");
 });
 
-test("gateToolCall(Bash) with malformed shell (unmatched quote) → build-error (fail-closed)", async () => {
+test("gateToolCall(Bash) with a non-string command → build-error (fail-closed)", async () => {
   const wasm = await loadWasm();
-  const out = gateToolCall(wasm, "Bash", { command: 'echo "oops' }, "/repo");
+  const out = gateToolCall(wasm, "Bash", { command: 42 }, "/repo");
   assert.equal(out.kind, "build-error");
 });
 
@@ -239,12 +239,9 @@ test("gateToolCall(Monitor command) → gated exactly like Bash (#298)", async (
   assert.ok(monitor.summary.includes("tail -f build.log"));
 });
 
-test("gateToolCall(Monitor command) with malformed shell → build-error, like Bash (#298)", async () => {
+test("gateToolCall(Monitor command) with a non-string command → build-error, like Bash (#298)", async () => {
   const wasm = await loadWasm();
-  assert.equal(
-    gateToolCall(wasm, "Monitor", { command: 'echo "oops' }, "/repo").kind,
-    "build-error",
-  );
+  assert.equal(gateToolCall(wasm, "Monitor", { command: 42 }, "/repo").kind, "build-error");
 });
 
 test("gateToolCall(Monitor ws watch) → pass-through: it runs no command (#298)", async () => {
@@ -521,7 +518,7 @@ test("(#374) gateToolCall refuses a command with no program, with the hooks' exa
     approverRootKey: "x".repeat(43),
   };
   for (const toolName of ["Bash", "Monitor"]) {
-    for (const command of ["", "   ", "\t\n\t", "\r", "'' rm -rf x", "FOO=1", "FOO=1; &&", "|"]) {
+    for (const command of ["", "   ", "\t\n\t", "\r"]) {
       const gate = gateToolCall(wasm, toolName, { command }, "/repo");
       const label = `${toolName} ${JSON.stringify(command)}`;
       assert.equal(gate.kind, "build-error", label);
@@ -542,29 +539,6 @@ test("(#374) gateToolCall refuses a command with no program, with the hooks' exa
   }
   // A command with a program still gates.
   assert.equal(gateToolCall(wasm, "Bash", { command: "rm -rf x" }, "/repo").kind, "gated");
-});
-
-test("(#376) gateToolCall(PowerShell) refuses a line that runs no program, from the core", async () => {
-  const wasm = await loadWasm();
-  const prefix =
-    "allw: could not build an ActionRecord for the PowerShell command (fail-closed deny): " +
-    "action_from_powershell_command failed: ";
-  for (const [command, message] of [
-    ["", "command line contains no command"],
-    [" \t\r\n", "command line contains no command"],
-    ["$env:FOO=1", "command line runs no program (only variable assignments or shell operators)"],
-    ["; &&", "command line runs no program (only variable assignments or shell operators)"],
-    ["& ''", "command line's first program word is empty"],
-  ]) {
-    const gate = gateToolCall(wasm, "PowerShell", { command }, "C:\\w");
-    assert.equal(gate.kind, "build-error", JSON.stringify(command));
-    assert.equal(gate.reason, `${prefix}${message}`, JSON.stringify(command));
-  }
-  // A line that may run something still gates.
-  assert.equal(
-    gateToolCall(wasm, "PowerShell", { command: "$x = Get-Item a" }, "C:\\w").kind,
-    "gated",
-  );
 });
 
 test("(#374) commandBuildFailureReason recognises the SDK's error by name and reason, not instanceof", async () => {
@@ -597,4 +571,53 @@ test("(#374) commandBuildFailureReason recognises the SDK's error by name and re
     name: "CommandActionError",
   });
   assert.equal(commandBuildFailureReason(wasm, lookalike), `${prefix}allw: something else`);
+});
+
+/** @see docs/action-record.md — command capture is opaque for every shell tool. */
+test("Bash, Monitor and PowerShell carry opaque nonblank lines without inferred argv", async () => {
+  const wasm = await loadWasm();
+  for (const tool of ["Bash", "Monitor", "PowerShell"]) {
+    for (const raw of [
+      "# comment",
+      "FOO=1",
+      "&&",
+      "''",
+      "'unmatched",
+      "$env:X = 'a'; & Remove-Item C:\\a",
+      "echo $(id)\nnext",
+    ]) {
+      const outcome = gateToolCall(wasm, tool, { command: raw }, "/caller");
+      assert.equal(outcome.kind, "gated", `${tool}: ${raw}`);
+      assert.deepEqual(JSON.parse(outcome.actionRecord), {
+        record_schema_version: 3,
+        surface: "command",
+        syntactic: { raw, cwd: "/caller" },
+      });
+    }
+    for (const command of ["", " \t\r\n", "\u00a0\u3000"]) {
+      assert.equal(gateToolCall(wasm, tool, { command }, "/caller").kind, "build-error");
+    }
+  }
+});
+
+/** @see docs/contract.md — every unreadable/malformed core line result fails closed. */
+test("malformed core line outputs deny without inferring a vector", async () => {
+  const wasm = await loadWasm();
+  for (const output of [
+    "{",
+    "null",
+    "[]",
+    "{}",
+    '{"syntactic":null}',
+    '{"syntactic":{}}',
+    '{"syntactic":{"raw":[]}}',
+    '{"syntactic":{"raw":" "}}',
+  ]) {
+    const broken = { ...wasm, action_from_command: () => output };
+    assert.equal(
+      gateToolCall(broken, "PowerShell", { command: "echo hi" }, "/repo").kind,
+      "build-error",
+      output,
+    );
+  }
 });

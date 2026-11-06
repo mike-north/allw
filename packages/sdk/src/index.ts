@@ -83,12 +83,12 @@ export type Surface = "command" | "mcp_tool_call" | "file_edit" | "agent_tool_ca
 
 /**
  * A reduced, matchable record of an approvable action. v1 carries the syntactic substrate;
- * no danger rating or policy-only metadata is carried. See `../../docs/policy-seam.md`.
+ * no danger rating or policy-only metadata is carried. See `../../docs/action-record.md`.
  */
 export interface ActionRecord {
   readonly recordSchemaVersion: number;
   readonly surface: Surface;
-  /** Raw, structured syntactic form (tokenized command / MCP call). */
+  /** Caller-described raw/argv, tool identity/params or file-edit facts; no command interpretation. */
   readonly syntactic: unknown;
 }
 

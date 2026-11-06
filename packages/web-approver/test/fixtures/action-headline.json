@@ -1,5 +1,5 @@
 {
-  "description": "Shared by the CLI approver and the web approver: both must head a request with the same text. Each case gives a wire action surface and syntactic substrate. `headline` is the CLI's Action line; `heading` is what the human decides on (the CLI's Deciding on line and the web card heading); they differ only when a command's raw and argv diverge, where the heading is the hash-bound argv. Expected values are written by hand from the rule in docs/threat-model.md R3 (the headline paragraph) and the Decision on issue #321, never from either renderer's output. On a tool surface (mcp_tool_call, agent_tool_call) naming a tool or a server, the tool identity wins: `server :: tool`, the tool alone, or `server :: (tool missing)` when there is no tool. Each half of the identity is shown bare only when it is printable ASCII with no `::` and no character that quotes a command token; otherwise it is single-quoted, so two different server/tool splits never render alike. The caller's raw is then shown as `description` (the CLI's Description line, the web plaintext's `description:` row), and a hash-bound bin/argv sets `tool_command_form` (both approvers warn that the call also carries a command). Otherwise, whatever the surface: a file edit's diff_summary, else `operation paths`; then raw; then the command bin/argv reconstruct to; then `operation paths`; then the compact params JSON; then the no-fields wording. `description` and `tool_command_form` are absent when they don't apply. `distinct_from` names another case that must render differently from this one. Tokens and list items are quoted as in raw-argv-divergence.json.",
+  "description": "Shared by the CLI approver and the web approver: both must head a request with the same text. Each case gives a wire action surface and syntactic substrate. `headline` is the CLI's Action line; `heading` is what the human decides on (the CLI's Deciding on line and the web card heading); they differ only when a command's raw and argv diverge, where the heading is the hash-bound argv. Expected values are written by hand from the rule in docs/threat-model.md R3 (the headline paragraph) and the Decision on issue #321, never from either renderer's output. On a tool surface (mcp_tool_call, agent_tool_call) naming a tool or a server, the tool identity wins: `server :: tool`, the tool alone, or `server :: (tool missing)` when there is no tool. Each half of the identity is shown bare only when it is printable ASCII with no `::` and no character that quotes a command token; otherwise it is single-quoted, so two different server/tool splits never render alike. The caller's raw is then shown as `description` (the CLI's Description line, the web plaintext's `description:` row), and a hash-bound caller argv sets `tool_command_form` (both approvers warn that the call also carries a command). Otherwise, whatever the surface: a file edit's diff_summary, else `operation paths`; then raw; then the command caller argv reconstruct to; then `operation paths`; then the compact params JSON; then the no-fields wording. `description` and `tool_command_form` are absent when they don't apply. `distinct_from` names another case that must render differently from this one. Tokens and list items are quoted as in raw-argv-divergence.json.",
   "cases": [
     {
       "name": "a command's raw",
@@ -11,11 +11,10 @@
       "heading": "git status"
     },
     {
-      "name": "a command with bin/argv and no raw",
+      "name": "a command with caller argv and no raw",
       "surface": "command",
       "syntactic": {
-        "bin": "git",
-        "argv": ["push", "--force"]
+        "argv": ["git", "push", "--force"]
       },
       "headline": "git push --force",
       "heading": "git push --force"
@@ -134,13 +133,13 @@
       "surface": "mcp_tool_call",
       "syntactic": {
         "server": "fs",
-        "tool": "read\u2236\u2236file",
+        "tool": "read∶∶file",
         "params": {
           "p": 1
         }
       },
-      "headline": "fs :: 'read\u2236\u2236file'",
-      "heading": "fs :: 'read\u2236\u2236file'"
+      "headline": "fs :: 'read∶∶file'",
+      "heading": "fs :: 'read∶∶file'"
     },
     {
       "name": "a tool call with a server and no tool heads with the missing-tool marker; raw is still the description",
@@ -172,11 +171,10 @@
       "distinct_from": "a tool call with a server and no tool heads with the missing-tool marker; raw is still the description"
     },
     {
-      "name": "an agent tool call with bin/argv and no tool heads with the command",
+      "name": "an agent tool call with caller argv and no tool heads with argv",
       "surface": "agent_tool_call",
       "syntactic": {
-        "bin": "git",
-        "argv": ["push"]
+        "argv": ["git", "push"]
       },
       "headline": "git push",
       "heading": "git push"

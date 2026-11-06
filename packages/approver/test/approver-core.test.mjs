@@ -55,9 +55,9 @@ const NOW_MS = 1700001500000;
  */
 const CONTEXT = {
   action: {
-    record_schema_version: 2,
+    record_schema_version: 3,
     surface: "command",
-    syntactic: { bin: "git", raw: "git push --force origin main" },
+    syntactic: { raw: "git push --force origin main" },
   },
   summary: "force push to main",
   actor: { id: "machine:laptop", kind: "claude-code" },
@@ -410,7 +410,7 @@ test("tamper-mismatch: a mutated context yields a request_hash that fails the in
     summary: "innocuous: list files",
     action: {
       ...CONTEXT.action,
-      syntactic: { bin: "git", raw: "git push --force origin main", cwd: "/etc" },
+      syntactic: { raw: "git push --force origin main", cwd: "/etc" },
     },
   };
   const tamperedJson = JSON.stringify(tamperedContext);
@@ -487,10 +487,9 @@ test("renderRequest surfaces cwd and env_refs (WYSIWYS completeness — review f
   // appear in the rendered output (the TOCTOU gap a `raw`-only summary would reopen).
   const ctx = {
     action: {
-      record_schema_version: 2,
+      record_schema_version: 3,
       surface: "command",
       syntactic: {
-        bin: "rm",
         argv: ["rm", "-rf", "build"],
         raw: "rm -rf build",
         cwd: "/etc",
@@ -516,11 +515,7 @@ test("renderRequest surfaces cwd and env_refs (WYSIWYS completeness — review f
     /Cwd:\s+\/etc/,
     "the cwd is rendered (a /etc vs /tmp distinction matters)",
   );
-  assert.match(
-    rendered,
-    /Env refs:\s+AWS_SECRET_ACCESS_KEY, DEPLOY_TOKEN/,
-    "the referenced env var names are rendered",
-  );
+  assert.doesNotMatch(rendered, /Env refs:/, "legacy inferred fields are not shown");
 });
 
 test("renderRequest surfaces MCP params (not hidden behind raw) — review fix #1", async () => {
@@ -529,7 +524,7 @@ test("renderRequest surfaces MCP params (not hidden behind raw) — review fix #
 
   const ctx = {
     action: {
-      record_schema_version: 2,
+      record_schema_version: 3,
       surface: "mcp_tool_call",
       syntactic: {
         server: "filesystem",
@@ -567,7 +562,7 @@ test("renderRequest surfaces MCP server/tool even when a benign raw masks them, 
   // so the human would see only "echo hello". The device must surface the hash-bound server/tool.
   const ctx = {
     action: {
-      record_schema_version: 2,
+      record_schema_version: 3,
       surface: "mcp_tool_call",
       syntactic: {
         server: "fs",
@@ -611,7 +606,7 @@ test("renderRequest labels an agent_tool_call's (server,tool) identity distinctl
 
   const ctx = {
     action: {
-      record_schema_version: 2,
+      record_schema_version: 3,
       surface: "agent_tool_call",
       syntactic: {
         server: "deploy-plugin",
@@ -665,7 +660,7 @@ test("renderRequest surfaces file-edit paths, operation, summary, and diff hash 
 
   const ctx = {
     action: {
-      record_schema_version: 2,
+      record_schema_version: 3,
       surface: "file_edit",
       syntactic: {
         operation: "patch",
@@ -706,7 +701,7 @@ test("renderRequest disambiguates argv args containing whitespace (WYSIWYS — r
   // `rm -rf my dir` — indistinguishable from three args. The human must see the arg boundary.
   const ctx = {
     action: {
-      record_schema_version: 2,
+      record_schema_version: 3,
       surface: "command",
       syntactic: { argv: ["rm", "-rf", "my dir"] },
     },
@@ -729,49 +724,15 @@ test("renderRequest disambiguates argv args containing whitespace (WYSIWYS — r
   assert.doesNotMatch(rendered, /rm -rf my dir/, "the ambiguous bare-join form must NOT appear");
 });
 
-test("renderRequest includes bin when the substrate carries it separately from argv (review item #1)", async () => {
-  const wasm = await loadWasm();
-  const { keyfile } = pairedApprover(wasm);
-
-  // Substrate with `bin` separate from argv that does NOT lead with the binary: the human must see
-  // the program name, not just the args (per docs/policy-seam.md, bin and argv are distinct).
-  const ctx = {
-    action: {
-      record_schema_version: 2,
-      surface: "command",
-      syntactic: { bin: "git", argv: ["push", "--force", "origin", "main"] },
-    },
-    summary: "force push",
-    actor: { id: "machine:ci", kind: "claude-code" },
-
-    reversible: false,
-    constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
-  };
-  const ctxJson = JSON.stringify(ctx);
-  const jwe = wasm.encrypt_context(
-    ctxJson,
-    JSON.stringify([{ device_id: DEVICE_ID, public_key_b64: keyfile.device_encryption_pubkey }]),
-  );
-  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
-  const rendered = renderRequest(prepared);
-
-  // The fully-qualified command line leads with the binary name.
-  assert.match(
-    rendered,
-    /Action:\s+git push --force origin main/,
-    "the binary name is prepended when argv omits it",
-  );
-});
-
 test("renderRequest does not double the bin when argv already leads with it (review item #1)", async () => {
   const wasm = await loadWasm();
   const { keyfile } = pairedApprover(wasm);
 
   const ctx = {
     action: {
-      record_schema_version: 2,
+      record_schema_version: 3,
       surface: "command",
-      syntactic: { bin: "git", argv: ["git", "status"] },
+      syntactic: { argv: ["git", "status"] },
     },
     summary: "git status",
     actor: { id: "machine:ci", kind: "claude-code" },
@@ -802,10 +763,9 @@ test("renderRequest surfaces a divergent argv even when raw masks it (WYSIWYS an
   // reconstructed argv so the divergence is visible.
   const ctx = {
     action: {
-      record_schema_version: 2,
+      record_schema_version: 3,
       surface: "command",
       syntactic: {
-        bin: "git",
         argv: ["git", "push", "--force", "origin", "main"],
         raw: "git status",
       },
@@ -843,10 +803,9 @@ test("renderRequest does NOT add a redundant Argv line when raw matches the reco
   // produces exactly this). No divergence → no redundant `Argv:` line, just the headline.
   const ctx = {
     action: {
-      record_schema_version: 2,
+      record_schema_version: 3,
       surface: "command",
       syntactic: {
-        bin: "git",
         argv: ["git", "push", "--force", "origin", "main"],
         raw: "git push --force origin main",
       },
@@ -873,86 +832,6 @@ test("renderRequest does NOT add a redundant Argv line when raw matches the reco
   );
 });
 
-test("renderRequest surfaces flags and positionals as labeled lines when present (#51)", async () => {
-  const wasm = await loadWasm();
-  const { keyfile } = pairedApprover(wasm);
-
-  // `flags` and `positionals` are bound into request_hash (hash.rs) but were never rendered on any
-  // path before #51. They must appear as their own labeled lines, quoted for boundary clarity.
-  const ctx = {
-    action: {
-      record_schema_version: 2,
-      surface: "command",
-      syntactic: {
-        bin: "git",
-        argv: ["git", "push", "--force", "origin", "main"],
-        flags: ["--force"],
-        positionals: ["origin", "main"],
-        raw: "git push --force origin main",
-      },
-    },
-    summary: "force push to main",
-    actor: { id: "machine:ci", kind: "claude-code" },
-
-    reversible: false,
-    constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
-  };
-  const ctxJson = JSON.stringify(ctx);
-  const jwe = wasm.encrypt_context(
-    ctxJson,
-    JSON.stringify([{ device_id: DEVICE_ID, public_key_b64: keyfile.device_encryption_pubkey }]),
-  );
-  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
-  const rendered = renderRequest(prepared);
-
-  assert.match(rendered, /Flags:\s+--force/, "the parsed flags are surfaced on a labeled line");
-  assert.match(
-    rendered,
-    /Positionals:\s+origin main/,
-    "the parsed positionals are surfaced on a labeled line",
-  );
-});
-
-test("renderRequest quotes flags/positionals containing whitespace (boundary clarity — #51)", async () => {
-  const wasm = await loadWasm();
-  const { keyfile } = pairedApprover(wasm);
-
-  // A positional whose value contains a space must be quoted so its boundary is visible (same
-  // disambiguation guarantee the argv line already provides).
-  const ctx = {
-    action: {
-      record_schema_version: 2,
-      surface: "command",
-      syntactic: {
-        bin: "grep",
-        positionals: ["hello world", "file.txt"],
-        flags: ["--include=md"],
-        raw: "grep 'hello world' file.txt",
-      },
-    },
-    summary: "search files",
-    actor: { id: "machine:ci", kind: "claude-code" },
-
-    reversible: true,
-    constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
-  };
-  const ctxJson = JSON.stringify(ctx);
-  const jwe = wasm.encrypt_context(
-    ctxJson,
-    JSON.stringify([{ device_id: DEVICE_ID, public_key_b64: keyfile.device_encryption_pubkey }]),
-  );
-  const prepared = prepareRequest(wasm, keyfile, makeEnvelope(jwe), NOW_MS);
-  const rendered = renderRequest(prepared);
-
-  assert.match(
-    rendered,
-    /Positionals:\s+'hello world' file\.txt/,
-    "a space-containing positional is quoted to disambiguate its boundary",
-  );
-  // `=` is intentionally NOT in the quote set (no whitespace ambiguity) — the flag stays legible.
-  assert.match(rendered, /Flags:\s+--include=md/, "a flag with `=` renders without quoting");
-});
-
 test("quoteToken pins the display-quoting of representative tokens (table-driven — #51 nit)", async () => {
   const wasm = await loadWasm();
   const { keyfile } = pairedApprover(wasm);
@@ -963,7 +842,7 @@ test("quoteToken pins the display-quoting of representative tokens (table-driven
   const renderToken = (token) => {
     const ctx = {
       action: {
-        record_schema_version: 2,
+        record_schema_version: 3,
         surface: "command",
         syntactic: { argv: [token] },
       },

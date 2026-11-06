@@ -10,7 +10,7 @@ implementing** — the architecture only makes sense across several docs togethe
 
 - `docs/contract.md` — the approval-primitive contract (the keystone everything else consumes).
 - `docs/enrollment.md` — account/device enrollment, rotation, revocation, and recovery.
-- `docs/policy-seam.md` — the `ActionRecord` substrate and boundary with external policy.
+- `docs/action-record.md` — the `ActionRecord` substrate and boundary with external policy.
 - `docs/architecture.md` — tech-stack and system-design decisions (and their rationale).
 - `docs/threat-model.md` — adversaries, residual risks, and the security review checklist.
 - `docs/positioning.md` — the product thesis (why decisions are shaped the way they are).
@@ -100,8 +100,7 @@ is carrying policy-adjustment options from that layer to the human, and passing 
 signal back.
 
 That policy-modification feature is not built or reserved. allw does not interpret what an action does or
-rate its danger. Temporary command interpretation and parsed/derived fields remain only until #406 slice 2;
-they are scheduled for removal, not product scope. Risk labels/scoring and policy-only metadata are removed.
+rate its danger. Command interpretation, derived fields, risk labels/scoring and policy-only metadata are removed.
 
 **WASM-local is a hard constraint, not a preference** (`docs/architecture.md`). On-machine code (the hook, the
 SDK) runs as **WASM under `node`**, never a standalone native binary — so enterprise binary-allowlisting (Google
@@ -119,7 +118,7 @@ addon is itself a native binary). Native binaries belong only in signed, store-d
 ## Related repos (context; not in this tree)
 
 - **vaultkeeper** — holds the _credential perimeter_: agents _use_ secrets via delegated injection, never _read_
-  them. This is why `allw` deliberately does not gate raw network egress (`docs/policy-seam.md`).
+  them. This is why `allw` deliberately does not gate raw network egress (`docs/action-record.md`).
 - **macts / ofocus** — turn macOS apps into MCP surfaces; their policy choices stay in the caller, outside allw.
 
 ## Commits

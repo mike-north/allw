@@ -41,7 +41,7 @@ const RAW_HIDDEN =
 
 function context(syntactic, overrides = {}) {
   return {
-    action: { record_schema_version: 2, surface: "command", syntactic, risk: "high" },
+    action: { record_schema_version: 3, surface: "command", syntactic, risk: "high" },
     summary: "open the invoice",
     actor: { id: "machine:laptop", kind: "claude-code" },
 
@@ -87,7 +87,7 @@ test("MCP params with a bidi override are escaped in the DOM", async () => {
     {
       ...context({}),
       action: {
-        record_schema_version: 2,
+        record_schema_version: 3,
         surface: "mcp_tool_call",
         syntactic: { server: "fs", tool: "write", params: { path: `/tmp/${RLO}txt.exe` } },
       },
@@ -195,7 +195,7 @@ test("a tool call shows server :: tool, so a dotted server or tool name stays un
   const call = (server, tool) => ({
     ...context({}),
     action: {
-      record_schema_version: 2,
+      record_schema_version: 3,
       surface: "mcp_tool_call",
       syntactic: { server, tool },
     },

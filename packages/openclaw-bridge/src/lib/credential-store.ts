@@ -5,7 +5,7 @@
  * Both are secrets at rest. They are written to a `0600` file under the bridge's state directory —
  * the same custody backend `packages/approver/src/lib/keyfile.ts` uses for the v0 approver identity
  * — and are **never** placed in an environment variable (visible in a process list), a checked-in
- * config file, or a log line. `docs/policy-seam.md` §Network egress classes them as credential-vault
+ * config file, or a log line. The external credential perimeter owns custody of this
  * material; a real OS keystore backend is a follow-up that swaps this module out without touching
  * the gateway client.
  *

@@ -36,9 +36,9 @@ import { MAX_ESCAPED_DIAGNOSTIC_CHARS, escapeToPrintableAscii } from "./printabl
 export interface AllwWasm {
   /**
    * Computes the WYSIWYS `request_hash` (base64url-unpadded 32 bytes) for an `ApprovalContext`
-   * JSON bound to `expiresAt` (Unix ms). Reproduces the Rust `request-hash/v3` value exactly.
-   * The v3 canonical contract removes risk/policy-only action slots, uses ActionRecord schema 2,
-   * and binds reversibility only when the caller supplies an assertion. Prior v2 receipts cannot
+   * JSON bound to `expiresAt` (Unix ms). Reproduces the Rust `request-hash/v4` value exactly.
+   * The v4 canonical contract removes derived action fields, uses ActionRecord schema 3,
+   * and binds reversibility only when the caller supplies an assertion. Prior v2/v3 receipts cannot
    * verify as current-format receipts.
    */
   compute_request_hash(contextJson: string, expiresAt: number): string;
@@ -129,27 +129,9 @@ export interface AllwWasm {
   check_account_id_for_root(accountId: string, accountRootPubkeyB64: string): void;
   /** Derive the Ed25519 public key for a 32-byte signing seed (base64url). */
   ed25519_public_key(seedB64: string): string;
-  /**
-   * Build an ActionRecord JSON for a shell command using the core T1 command parser. **Throws** an
-   * `Error` whose `kind` is the core's code: `invalid_shell_syntax`, or, for a line that runs no
-   * program (#376), `no_command`, `no_program` or `empty_program`.
-   */
+  /** Record opaque nonblank command text and optional cwd. Blank text throws `no_command`. */
   action_from_command(commandLine: string, cwd?: string | null): string;
-  /**
-   * Build an ActionRecord JSON for a **PowerShell** command line (the `command` surface). `raw` is
-   * the exact line and argv is its whitespace split. No danger tier is assigned. Never throws for PowerShell syntax; throws
-   * only for a line that runs no program (#376), with a `kind` as `action_from_command`.
-   */
-  action_from_powershell_command(commandLine: string, cwd?: string | null): string;
-  /**
-   * Build an ActionRecord JSON from a **canonical, pre-tokenized** argv (JSON array of strings).
-   * For callers that hold the exact token vector that will execute and must bind it verbatim —
-   * re-tokenizing their command text would risk binding different tokens than the ones that run
-   * (`docs/openclaw-integration.md` §5.1). `raw` is the original command text (recorded verbatim
-   * and the only source of `env_refs`; never re-tokenized). **Throws** for malformed JSON (no
-   * `kind`), and for an argv with no program (#376) with a `kind` as `action_from_command`:
-   * `no_command` (empty), `empty_program`, or `no_program` (only assignments).
-   */
+  /** Record caller argv verbatim with optional raw/cwd. Empty or malformed arrays throw. */
   action_from_argv(argvJson: string, raw?: string | null, cwd?: string | null): string;
   /**
    * Build an ActionRecord JSON for an agent-runtime/plugin-owned tool call (`agent_tool_call`

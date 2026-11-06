@@ -1,6 +1,6 @@
 /**
  * How the web approver lays out command-form substrate fields as text: token quoting, list joining,
- * reconstructing a command line from `bin`/`argv`, and detecting when that reconstruction differs
+ * reconstructing a command line from caller `argv`, and detecting when that reconstruction differs
  * from the agent's `raw` string.
  *
  * These are **layout** rules, not escaping. Every string they print is already escaped by the core
@@ -35,58 +35,21 @@ export function renderArgv(tokens: readonly string[]): string {
 }
 
 /**
- * Join list items (paths, env refs, chain ids) with `, `, each quoted by {@link quoteToken}, so an
+ * Join list items (paths and chain ids) with `, `, each quoted by {@link quoteToken}, so an
  * item containing `, ` stays visibly one item.
  */
 export function renderList(items: readonly string[]): string {
   return items.map(quoteToken).join(", ");
 }
 
-/** The command-form fields a command line is reconstructed from. */
-export interface CommandParts {
-  readonly bin?: string | undefined;
+/** Caller-supplied execution vector; raw text never supplies missing words. */
+interface CommandParts {
   readonly argv?: readonly string[] | undefined;
-  readonly positionals?: readonly string[] | undefined;
 }
 
-/**
- * The command line `bin`/`argv` describe, or `undefined` when there is no command form. `bin` is
- * prepended unless `argv` already starts with it; with no `argv`, `bin` and any `positionals` are
- * used, so a program name is never dropped.
- *
- * Applied to the raw wire substrate it gives the value divergence is decided on; applied to the
- * core-escaped substrate it gives the line that is shown.
- */
+/** Quote supplied argv for display, preserving every word boundary; never infer a program. */
 export function reconstructCommand(parts: CommandParts): string | undefined {
-  const tokens = commandTokens(parts);
-  return tokens === undefined ? undefined : renderArgv(tokens);
-}
-
-/**
- * The command-form tokens {@link reconstructCommand} renders, or `undefined` when there is no
- * command form.
- */
-function commandTokens(parts: CommandParts): readonly string[] | undefined {
-  const { argv, bin } = parts;
-  if (argv !== undefined && argv.length > 0) {
-    return bin !== undefined && argv[0] !== bin ? [bin, ...argv] : argv;
-  }
-  if (bin !== undefined) {
-    const positionals = parts.positionals;
-    return positionals !== undefined ? [bin, ...positionals] : [bin];
-  }
-  return undefined;
-}
-
-/**
- * Whether `tokens` are exactly `raw` split at ASCII whitespace (space, tab, line feed: the only
- * characters `shlex` splits on). Such an argv carries raw's bytes in raw's order and can't say
- * anything raw doesn't, so it is not a divergence. Any other separator, including a Unicode space or
- * a carriage return, stays inside a token here, so an argv split on it still diverges.
- */
-function isWhitespaceSplitOf(tokens: readonly string[], raw: string): boolean {
-  const words = raw.split(/[ \t\n]+/).filter((word) => word !== "");
-  return words.length === tokens.length && words.every((word, i) => word === tokens[i]);
+  return parts.argv !== undefined && parts.argv.length > 0 ? renderArgv(parts.argv) : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -106,27 +69,16 @@ function readStringArray(record: Record<string, unknown>, key: string): string[]
 }
 
 /**
- * Whether the hash-bound `bin`/`argv` describes a different command than `raw`.
- *
- * Both halves are bound into `request_hash`, so an integrator could pair a benign `raw` with a
- * dangerous `argv`. This compares the **raw** (unescaped) substrate, because distinct inputs can
- * escape to the same text. Returns false when there is no `raw` or no command form, and when the
- * tokens are exactly `raw`'s ASCII-whitespace split (display quoting alone, such as a quoted
- * `C:\Users` path, is not a different command).
- *
- * @param syntactic the decrypted wire `syntactic` substrate (untrusted; any shape is tolerated)
+ * Compare raw caller text with the literal quoted argv form, on unescaped bytes. Every mismatch
+ * warns, including formatting-only differences: this never splits raw or claims semantic equivalence.
+ * No divergence exists without both caller-supplied forms. The core hashes the original bytes.
  */
 export function rawDivergesFromArgv(syntactic: unknown): boolean {
   if (!isRecord(syntactic)) return false;
   const raw = readString(syntactic, "raw");
   if (raw === undefined) return false;
-  const tokens = commandTokens({
-    bin: readString(syntactic, "bin"),
-    argv: readStringArray(syntactic, "argv"),
-    positionals: readStringArray(syntactic, "positionals"),
-  });
-  if (tokens === undefined || isWhitespaceSplitOf(tokens, raw)) return false;
-  return renderArgv(tokens) !== raw;
+  const argv = readStringArray(syntactic, "argv");
+  return argv !== undefined && argv.length > 0 && renderArgv(argv) !== raw;
 }
 
 /**

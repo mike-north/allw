@@ -3,7 +3,7 @@
 **What this is.** The committed source of truth for v1 scope: which integrations the MVP must serve, the
 journeys that prove it works, the capability milestones that sequence the work, and the decisions that are
 locked. It sits _above_ the design docs — this doc says **what we are shipping and in what order**;
-[contract.md](./contract.md), [policy-seam.md](./policy-seam.md), [architecture.md](./architecture.md), and
+[contract.md](./contract.md), [action-record.md](./action-record.md), [architecture.md](./architecture.md), and
 [enrollment.md](./enrollment.md) say **how**. If this doc and a design doc appear to disagree, the design doc
 owns the mechanism and this doc is the one that needs fixing.
 
@@ -14,11 +14,10 @@ milestone descriptions and this table in sync; they are two views of one decisio
 
 ---
 
-**#406 partial implementation:** allw does not interpret what an action does or rate its danger.
-Risk labels/scoring and policy-only wire metadata are removed. `reversible` is an optional caller assertion;
-hooks and the OpenClaw bridge omit it. Command/PowerShell tokenization, no-program refusals, web command
-interpretation, and parsed/derived fields remain temporarily and are scheduled for removal in slice 2.
-They are not product scope. Faithful raw/cwd/caller argv/MCP/file-edit display and escaping remain.
+**Caller facts only:** allw records and shows raw/cwd/caller argv, tool identity/parameters and
+file edits faithfully. It does not interpret command meaning, derive command metadata or rate danger.
+`reversible` is an optional caller assertion; hooks and the OpenClaw bridge omit it. CLI/web display
+escaping and warnings remain; native display wiring is deferred to #273 as an M7 blocker.
 
 ## (a) The three integration goals
 
@@ -180,7 +179,7 @@ is a PR with a design problem.
 ## Explicitly out of scope for the MVP
 
 - **The semantic / T3 capability-inference tier** — capability taxonomies, per-command schema DB, doc
-  extraction, capability-scoped rules. Owned outside allw, as [policy-seam.md](./policy-seam.md) describes.
+  extraction, capability-scoped rules. Owned outside allw, as [action-record.md](./action-record.md) describes.
   Adding macts as a _caller_ does not pull this forward; see [positioning.md](./positioning.md) §Where it
   starts, where it goes.
 - **Rule evaluation, holding, generation or signing inside allw.** No replacement or placeholder is built. Every escalation the MVP handles is decided by the _caller's_

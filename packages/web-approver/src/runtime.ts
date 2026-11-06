@@ -233,13 +233,8 @@ function toAllowedDecisions(values: readonly string[]): readonly ApprovalDecisio
  * whole substrate (#295).
  */
 interface CoreDisplaySubstrate {
-  readonly bin?: string;
   readonly argv?: readonly string[];
-  readonly flags?: readonly string[];
-  readonly positionals?: readonly string[];
   readonly cwd?: string;
-  readonly host?: string;
-  readonly env_refs?: readonly string[];
   readonly server?: string;
   readonly tool?: string;
   readonly params_json?: string;
@@ -275,13 +270,8 @@ type SubstrateDraft = { -readonly [K in keyof SubstrateView]: SubstrateView[K] }
  */
 function toSubstrateView(s: CoreDisplaySubstrate): SubstrateView {
   const view: SubstrateDraft = {};
-  if (s.bin !== undefined) view.bin = s.bin;
   if (s.argv !== undefined) view.argv = s.argv;
-  if (s.flags !== undefined) view.flags = s.flags;
-  if (s.positionals !== undefined) view.positionals = s.positionals;
   if (s.cwd !== undefined) view.cwd = s.cwd;
-  if (s.host !== undefined) view.host = s.host;
-  if (s.env_refs !== undefined) view.envRefs = s.env_refs;
   if (s.server !== undefined) view.server = s.server;
   if (s.tool !== undefined) view.tool = s.tool;
   if (s.params_json !== undefined) view.paramsJson = s.params_json;
