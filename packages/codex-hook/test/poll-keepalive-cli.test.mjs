@@ -93,7 +93,7 @@ test("codex hook bin waits across poll intervals and prints a deny (never empty 
     answerAfterMs: ANSWER_AFTER_MS,
   });
   t.after(relay.close);
-  // The hook appends deny lines to a log under its cwd; keep that out of the repo.
+  // Isolate the simulated Codex project from the repository.
   const { mkdtemp, rm } = await import("node:fs/promises");
   const { tmpdir } = await import("node:os");
   const cwd = await mkdtemp(join(tmpdir(), "allw-codex-poll-"));
