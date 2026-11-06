@@ -962,118 +962,125 @@ export function createClient(config: ClientConfig): Client {
     );
     await acceptSequence(config.accountStates, sealed.sequence);
 
-    // 4. Submit. This runs BEFORE the await-verdict deadline timer is armed, so a hung relay
-    // (TCP-accepted but never responding) would otherwise wedge the call forever. The per-request
-    // fetch timeout (RelayClient) bounds it; here we additionally ensure a *transport* failure fails
-    // closed to a `Verdict` (expired) instead of rejecting — the same fail-closed terminal a
-    // wait-stage timeout produces (issue #52, contract §Invariants #6). An HTTP-level error (a relay
-    // `RelayError` with a real status) still throws, surfacing misconfiguration loudly.
+    // This call owns its request credential through submission and the complete local wait,
+    // including verification and abort retraction. Relay-reported finality alone cannot release
+    // it: an unverifiable verdict must leave authentication available until local settlement.
     try {
-      // Build the relay-visible envelope (exactly the contract's key set) and submit it.
-      const envelope: ApprovalRequestEnvelope = {
+      // 4. Submit. This runs BEFORE the await-verdict deadline timer is armed, so a hung relay
+      // (TCP-accepted but never responding) would otherwise wedge the call forever. The per-request
+      // fetch timeout (RelayClient) bounds it; here we additionally ensure a *transport* failure fails
+      // closed to a `Verdict` (expired) instead of rejecting — the same fail-closed terminal a
+      // wait-stage timeout produces (issue #52, contract §Invariants #6). An HTTP-level error (a relay
+      // `RelayError` with a real status) still throws, surfacing misconfiguration loudly.
+      try {
+        // Build the relay-visible envelope (exactly the contract's key set) and submit it.
+        const envelope: ApprovalRequestEnvelope = {
+          v: PROTOCOL_VERSION,
+          id,
+          created_at: createdAt,
+          expires_at: expiresAt,
+          // The client is bound to one account; the envelope's routing `approver` IS that account.
+          // Using `config.accountId` (not a per-request field) removes the footgun where a request
+          // could be POSTed to one account DO while claiming a different approver in the request JSON.
+          approver: config.accountId,
+          context_ciphertext: sealed.ciphertext,
+        };
+        await relay.submit(envelope);
+      } catch (err) {
+        if (isPreDeadlineTransportFailure(err)) {
+          // A hung/black-holed connection or a bare network error before the deadline ⇒ no verified
+          // verdict is obtainable ⇒ fail closed to an `expired` Verdict (never approved). This is the
+          // load-bearing fix for #52: the call resolves deterministically instead of hanging forever.
+          return makeVerdict(id, "expired", { kind: "timeout" }, "", "", now, nonceStore);
+        }
+        // HTTP/protocol error ⇒ rethrow (the hook's try/catch maps it to a deny).
+        throw err;
+      }
+
+      // The `request_json` the core verifies against is the envelope WITHOUT the ciphertext — the
+      // verifier reads only routing/lifecycle (`v`, `id`, `created_at`, `expires_at`, `approver`).
+      const requestJson = JSON.stringify({
         v: PROTOCOL_VERSION,
         id,
         created_at: createdAt,
         expires_at: expiresAt,
-        // The client is bound to one account; the envelope's routing `approver` IS that account.
-        // Using `config.accountId` (not a per-request field) removes the footgun where a request
-        // could be POSTed to one account DO while claiming a different approver in the request JSON.
         approver: config.accountId,
-        context_ciphertext: sealed.ciphertext,
-      };
-      await relay.submit(envelope);
-    } catch (err) {
-      if (isPreDeadlineTransportFailure(err)) {
-        // A hung/black-holed connection or a bare network error before the deadline ⇒ no verified
-        // verdict is obtainable ⇒ fail closed to an `expired` Verdict (never approved). This is the
-        // load-bearing fix for #52: the call resolves deterministically instead of hanging forever.
-        return makeVerdict(id, "expired", { kind: "timeout" }, "", "", now, nonceStore);
-      }
-      // HTTP/protocol error ⇒ rethrow (the hook's try/catch maps it to a deny).
-      throw err;
-    }
-
-    // The `request_json` the core verifies against is the envelope WITHOUT the ciphertext — the
-    // verifier reads only routing/lifecycle (`v`, `id`, `created_at`, `expires_at`, `approver`).
-    const requestJson = JSON.stringify({
-      v: PROTOCOL_VERSION,
-      id,
-      created_at: createdAt,
-      expires_at: expiresAt,
-      approver: config.accountId,
-    });
-
-    // 5. The integrator owns finality: only full core verification ends the verdict wait. Reuse
-    // the encryption-time account-state snapshot, and retain the accepted nonce so verify() can
-    // recheck this same artifact without treating it as a replay.
-    const verification: { accepted: VerifiedDecision | null } = { accepted: null };
-    let outcome;
-    try {
-      outcome = await awaitVerdict(id, {
-        relay,
-        now,
-        deadline: expiresAt,
-        ...(req.signal ? { signal: req.signal } : {}),
-        ...(webSocketFactory ? { webSocketFactory } : {}),
-        pollIntervalMs,
-        acceptVerdict: async (value: unknown): Promise<boolean> => {
-          const verified = await verifyToDecision(
-            wasm,
-            value,
-            requestJson,
-            contextJson,
-            config.approverRootKey,
-            now(),
-            nonceStore,
-            accountStateSet.accountStates,
-            expectedAccountId,
-          );
-          if (verified === null) return false;
-          verification.accepted = verified;
-          return true;
-        },
-        ...(config.scheduleImpl ? { schedule: config.scheduleImpl } : {}),
       });
-    } catch {
-      // Any transport error while awaiting ⇒ fail closed (no verdict ⇒ not approved).
-      outcome = { kind: "timeout" } as const;
-    }
 
-    // 6. Reduce the outcome to a verified decision. Only a delivered, fully-verified verdict can
-    //    be "approved"; every other path is a deny (contract §Invariants #6).
-    let decision: Decision;
-    let acceptedNonceB64: string | undefined;
-    if (outcome.kind === "verdict") {
-      // The wait returns a delivered verdict only after the callback accepted it. Preserve a
-      // fail-closed default if this internal contract is ever violated.
-      const verified = verification.accepted;
-      decision = verified?.decision ?? "expired";
-      acceptedNonceB64 = verified?.nonceB64;
-    } else if (outcome.kind === "expired") {
-      decision = "expired";
-    } else if (outcome.kind === "retracted") {
-      // NOT a verdict (issue #195) — no device ever decided, so this must never surface as a
-      // `Decision`. Reject instead of resolving; contrast with `expired`/`timeout`, which are
-      // fail-closed *decisions* about an unanswered request.
-      throw new RequestRetractedError(id);
-    } else {
-      // timeout — fail closed.
-      decision = "expired";
-    }
+      // 5. The integrator owns finality: only full core verification ends the verdict wait. Reuse
+      // the encryption-time account-state snapshot, and retain the accepted nonce so verify() can
+      // recheck this same artifact without treating it as a replay.
+      const verification: { accepted: VerifiedDecision | null } = { accepted: null };
+      let outcome;
+      try {
+        outcome = await awaitVerdict(id, {
+          relay,
+          now,
+          deadline: expiresAt,
+          ...(req.signal ? { signal: req.signal } : {}),
+          ...(webSocketFactory ? { webSocketFactory } : {}),
+          pollIntervalMs,
+          acceptVerdict: async (value: unknown): Promise<boolean> => {
+            const verified = await verifyToDecision(
+              wasm,
+              value,
+              requestJson,
+              contextJson,
+              config.approverRootKey,
+              now(),
+              nonceStore,
+              accountStateSet.accountStates,
+              expectedAccountId,
+            );
+            if (verified === null) return false;
+            verification.accepted = verified;
+            return true;
+          },
+          ...(config.scheduleImpl ? { schedule: config.scheduleImpl } : {}),
+        });
+      } catch {
+        // Any transport error while awaiting ⇒ fail closed (no verdict ⇒ not approved).
+        outcome = { kind: "timeout" } as const;
+      }
 
-    // 7. Resolve to a Verdict whose decision reflects reality; `verify()` re-runs the full check.
-    return makeVerdict(
-      id,
-      decision,
-      outcome,
-      requestJson,
-      contextJson,
-      now,
-      nonceStore,
-      accountStateSet.accountStates,
-      expectedAccountId,
-      acceptedNonceB64,
-    );
+      // 6. Reduce the outcome to a verified decision. Only a delivered, fully-verified verdict can
+      //    be "approved"; every other path is a deny (contract §Invariants #6).
+      let decision: Decision;
+      let acceptedNonceB64: string | undefined;
+      if (outcome.kind === "verdict") {
+        // The wait returns a delivered verdict only after the callback accepted it. Preserve a
+        // fail-closed default if this internal contract is ever violated.
+        const verified = verification.accepted;
+        decision = verified?.decision ?? "expired";
+        acceptedNonceB64 = verified?.nonceB64;
+      } else if (outcome.kind === "expired") {
+        decision = "expired";
+      } else if (outcome.kind === "retracted") {
+        // NOT a verdict (issue #195) — no device ever decided, so this must never surface as a
+        // `Decision`. Reject instead of resolving; contrast with `expired`/`timeout`, which are
+        // fail-closed *decisions* about an unanswered request.
+        throw new RequestRetractedError(id);
+      } else {
+        // timeout — fail closed.
+        decision = "expired";
+      }
+
+      // 7. Resolve to a Verdict whose decision reflects reality; `verify()` re-runs the full check.
+      return makeVerdict(
+        id,
+        decision,
+        outcome,
+        requestJson,
+        contextJson,
+        now,
+        nonceStore,
+        accountStateSet.accountStates,
+        expectedAccountId,
+        acceptedNonceB64,
+      );
+    } finally {
+      relay.releaseRequest(id);
+    }
   }
 
   return { requestApproval };

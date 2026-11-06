@@ -416,6 +416,17 @@ highest-verified sequence floor. Rows from the pre-verification cache are droppe
 specified-but-unimplemented `action_structure` / `privacy_preference` (#216); `expires_at ≤ now` ⇒ 400). → **202**
 `{ request_id, status:"pending", delivered_to, push_wakeups, request_auth_token }`. 409 on dup `id`.
 
+**SDK credential lifetime.** A long-lived SDK client retains each request token only through
+that `requestApproval` call's local lifecycle: submission, authenticated polling / WebSocket wait,
+full verdict verification, and any abort retraction. It releases that request's cached credential
+when the call resolves or rejects, including HTTP, protocol, read and transport failures, confirmed
+retraction, failed retraction or deadline. A relay-reported `resolved` row with an unverifiable
+verdict is not local settlement: its credential remains available while the SDK continues waiting.
+Cleanup is per request and preserves other active requests. Returned `Verdict.verify()` is local,
+remains idempotent for the accepted artifact, and needs no request token. This client cache lifetime
+is independent of the relay's seven-day post-terminal retention (§1); it does not change nonce
+replay protection or its retention policy.
+
 **Unknown account.** `POST /{acct}/requests` on an account with no bound root (no root-signed
 `pairing/start` has ever succeeded, so no device can have paired since #264) ⇒ **404**
 `{ "error": "unknown account" }`, checked before the body is read. This includes accounts that

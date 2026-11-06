@@ -2491,6 +2491,10 @@ function credentialFixture(t, approver, transport) {
       if (mode === "submit-read") return readFailure("read");
       if (mode === "submit-network") throw new TypeError("submit failed");
       if (mode === "submit-hung") return new Promise(() => {});
+      if (mode === "submit-delayed")
+        await new Promise((resolve) => {
+          row.finishSubmit = resolve;
+        });
       return jsonResponse({ request_auth_token: row.token }, 202);
     }
     const id = path.split("/requests/")[1].split("/")[0];
@@ -2499,6 +2503,7 @@ function credentialFixture(t, approver, transport) {
     assert.equal(init.headers?.Authorization, `Bearer ${row.token}`, "request-specific auth");
     if (path.endsWith("/retract")) {
       row.retracts += 1;
+      if (row.retractGate) await row.retractGate;
       if (row.mode === "abort-409") return jsonResponse({}, 409);
       if (row.mode === "abort-network") throw new TypeError("retract failed");
       if (row.mode === "abort-hung") return new Promise(() => {});
@@ -2686,4 +2691,69 @@ for (const transport of ["poll", "WS"]) {
     assert.equal(active.row.retracts, 1, "surviving request still authenticates its retract");
     assert.equal(f.retained().size, 0);
   });
+}
+
+/** Abort must keep authentication available through submission and the in-flight retract race.
+ * @see ../../../docs/contract.md §Transport → Integrator retract
+ */
+for (const transport of ["poll", "WS"]) {
+  for (const failure of ["confirmed", "409", "network"]) {
+    test(`(credentials) ${transport}: delayed submit and retract ${failure} preserve local finality`, async (t) => {
+      const approver = makeApprover(fixtureWasm);
+      const f = credentialFixture(t, approver, transport);
+      const { row, controller, result } = await f.start("submit-delayed");
+      assert.equal(f.retained().size, 0, "no credential exists before submit replies");
+      let finishRetract;
+      row.retractGate = new Promise((resolve) => {
+        finishRetract = resolve;
+      });
+      row.mode = failure === "confirmed" ? "abort" : `abort-${failure}`;
+      controller.abort();
+      row.finishSubmit();
+      await f.clock.advance();
+      assert.equal(row.retracts, 1);
+      assert.deepEqual(
+        [...f.retained().keys()],
+        [row.env.id],
+        "in-flight retract owns its credential",
+      );
+      finishRetract();
+      await f.clock.advance();
+      const settled = await result;
+      if (failure === "confirmed") assert.ok(settled.error instanceof RequestRetractedError);
+      else assert.equal(settled.value.decision, "expired");
+      assert.equal(f.retained().size, 0);
+    });
+    test(`(credentials) ${transport}: rejected relay row then retract ${failure} releases on settlement`, async (t) => {
+      const approver = makeApprover(fixtureWasm);
+      const f = credentialFixture(t, approver, transport);
+      const { row, controller, result } = await f.start("invalid");
+      if (transport === "WS")
+        f.sockets.get(row.env.id).emit({ type: "verdict", verdict: { sig: "junk" } });
+      await f.clock.advance(5);
+      let settled = false;
+      void result.then(() => {
+        settled = true;
+      });
+      assert.equal(settled, false, "relay finality cannot end local verification");
+      let finishRetract;
+      row.retractGate = new Promise((resolve) => {
+        finishRetract = resolve;
+      });
+      row.mode = failure === "confirmed" ? "abort" : `abort-${failure}`;
+      controller.abort();
+      await f.clock.advance();
+      assert.equal(row.retracts, 1);
+      assert.deepEqual([...f.retained().keys()], [row.env.id]);
+      await f.deliver(row, "approved");
+      assert.equal(settled, false, "late approval cannot overtake the abort/retract race");
+      assert.deepEqual([...f.retained().keys()], [row.env.id]);
+      finishRetract();
+      await f.clock.advance();
+      const outcome = await result;
+      if (failure === "confirmed") assert.ok(outcome.error instanceof RequestRetractedError);
+      else assert.equal(outcome.value.decision, "expired");
+      assert.equal(f.retained().size, 0);
+    });
+  }
 }

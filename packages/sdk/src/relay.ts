@@ -221,6 +221,7 @@ export class RelayClient {
   private readonly fetchImpl: FetchImpl;
   private readonly fetchTimeoutMs: number;
   private readonly schedule: ScheduleImpl;
+  /** Credentials owned by active local requests; completed calls must not accumulate here. */
   private readonly requestAuthTokens = new Map<string, string>();
 
   constructor(
@@ -371,6 +372,16 @@ export class RelayClient {
       envelope.id,
       (body as { request_auth_token: string }).request_auth_token,
     );
+  }
+
+  /**
+   * Release only this request's credential after its owning local lifecycle settles. Polling a
+   * relay-reported verdict does not end that lifecycle until the SDK verifies it; cancellation
+   * also needs the credential through its retract attempt (or the bounded local deadline).
+   * Returned Verdict verification is local and does not use this transport credential.
+   */
+  releaseRequest(requestId: string): void {
+    this.requestAuthTokens.delete(requestId);
   }
 
   /**
