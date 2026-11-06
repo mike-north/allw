@@ -42,19 +42,25 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   §3). The router claims the whole `/.well-known` segment before account routing, so it never reaches an
   account; a leading `.` is outside the base64url alphabet account ids use, so it cannot collide with one.
   Every relay-level route, present or future, lives there.
-- **Auth.** `Authorization: Bearer <token>` (token = base64url, `^[A-Za-z0-9_-]+$`, ~43 chars). Every
-  HTTP route takes the token **only** from this header. The `?auth=<token>` query form is accepted
-  only on the two **WebSocket** upgrade routes (`…/devices/{device_id}/connect` and
-  `…/requests/{request_id}/wait`), because browsers can't set headers on a WebSocket; elsewhere a
-  query token alone cannot authenticate (#303): guarded routes return **401**; optional-auth
-  `GET /devices` returns only anonymous routing rows. A token in a URL ends up in access, proxy and CDN logs, browser
-  history and `Referer`, so it is kept out of URLs everywhere else. When an `Authorization` header is
-  present it is the only credential considered, even on a WebSocket route: a wrong one is **403**, and
-  a malformed one or another scheme is **401**, whatever the query says. An empty or whitespace-only
-  `Authorization` header is dropped by the Workers runtime before the relay sees it, so it counts as
-  absent: on a WebSocket upgrade route, the `?auth=` token then applies.
-  The relay stores only `SHA-256(token)`; the plaintext is returned **once** at issuance — cache it.
-  On guarded routes, missing token ⇒ **401**; wrong/expired/cross-scope token ⇒ **403**.
+- **Auth.** HTTP routes take credentials only as `Authorization: Bearer <token>` (token = base64url,
+  `^[A-Za-z0-9_-]+$`, approximately 43 random characters). Socket upgrade routes
+  (`…/devices/{device_id}/connect` and `…/requests/{request_id}/wait`) take credentials only from
+  `Sec-WebSocket-Protocol`. Offer exactly two distinct protocols, in either order:
+  `allw.v1` and `allw.auth.<token>`, with only HTTP SP/HTAB whitespace around list members.
+  The relay selects and echoes **only `allw.v1`** in its 101 response;
+  it never reflects the credential offer. Missing, malformed, duplicate or extra offers yield **401**;
+  a syntactically valid wrong, foreign or wrong-scope capability yields **403** (device enrollment
+  checks still precede device-token checks). A nonempty `Authorization` header on a socket route
+  yields **401**, even with valid offers: no header fallback or competing credential precedence.
+  Workers drops empty/whitespace-only headers before the handler, so those count as absent.
+  Plain HTTP cannot authenticate through subprotocol offers, even with an Upgrade header on an HTTP
+  route. A socket route without Upgrade is **426** before auth. Query credentials are ignored
+  everywhere; query-only socket credentials fail **401**. There is no deprecation flag or fallback.
+  Unauthenticated optional-auth `GET /devices` returns only anonymous routing rows.
+  The relay stores only `SHA-256(token)`; plaintext is returned **once** at issuance — cache it.
+  Tokens never belong in generated URLs, request bodies, selected protocols, application logs or connector
+  error messages. Header transport avoids URL capture, but infrastructure capable of capturing
+  request headers can still capture the credential offer; configure header redaction there too.
 - **No existence answers before auth (#357).** A request id and a pairing code are each guarded by
   their own token, whose hash lives in the identifier's row. An identifier with no row answers exactly
   as a wrong token does: **401** `{"error":"authorization required"}` without a bearer token, **403**
@@ -97,7 +103,7 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   method or header gets a **403** preflight with no CORS headers. Every response except a WebSocket
   upgrade (101, returned untouched) carries `Vary: Origin`, including a 500 when a handler fails. There is no credentials mode (`Access-Control-Allow-Credentials` is never sent):
   auth is the bearer header, never a cookie. CORS does not apply to WebSocket upgrades, and the relay
-  does not check `Origin` there, since the socket authenticates with `?auth=`. Non-browser clients
+  does not check `Origin` there, since the socket authenticates with its private subprotocol offer. Non-browser clients
   send no `Origin` and are unaffected.
 - **Errors** are plain bodies with the status code; `400` covers malformed JSON / bad fields /
   unexpected envelope keys (zero-knowledge guard).
@@ -141,7 +147,8 @@ GET A device_cert (once, right after pairing — you cannot approve without one)
 RECEIVE PENDING  (pick one; native app SHOULD use the WebSocket)
   A) GET  /{acct}/devices/{device_id}/inbox        (Bearer device_auth_token)
         → { envelopes: [ ApprovalEnvelope … ] }    (poll, 1–5s)
-  B) GET  /{acct}/devices/{device_id}/connect?surface_id=…&auth=<device_auth_token>  (WebSocket)
+  B) GET  /{acct}/devices/{device_id}/connect?surface_id=…  (WebSocket)
+        offers: allw.v1, allw.auth.<device_auth_token>; selected: allw.v1
         ← { type:"request", request_id, envelope }   (on connect: offline queue flush; then live)
         ← { type:"retract", request_id }             (resolved/expired elsewhere, or the integrator cancelled it — #195)
 
@@ -514,7 +521,10 @@ unknown id gets the same, never a "not found", §1, #357); then **409** as above
 
 ## 4. WebSocket protocol — `/{acct}/devices/{device_id}/connect`
 
-Upgrade with `?auth=<device_auth_token>` (or Bearer header). On connect the relay flushes the
+Upgrade with `new WebSocket(url, ["allw.v1", "allw.auth." + deviceAuthToken])` (or the equivalent
+protocol-list argument on a native connector). `url` carries only routing and optional `surface_id`,
+never a credential; the server selects `allw.v1`. The wait socket uses the same grammar with its
+request-scoped token. On connect the relay flushes the
 offline queue (still-pending, non-expired) as `request` messages. Hibernatable.
 
 **relay → device**

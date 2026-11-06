@@ -30,8 +30,12 @@ export interface MinimalWebSocket {
   close(): void;
 }
 
-/** Constructs a {@link MinimalWebSocket} for a `ws(s)://` URL. */
-export type WebSocketFactory = (url: string) => MinimalWebSocket;
+/**
+ * Constructs a socket from a token-free URL and private protocol offers; forward both arguments.
+ * Protocols contain a bearer capability and must never be logged.
+ * @public
+ */
+export type WebSocketFactory = (url: string, protocols: string[]) => MinimalWebSocket;
 
 /** Tunables for the wait loop, all injectable for deterministic tests. */
 export interface WaitDeps {
@@ -216,9 +220,10 @@ function waitOverSocket(
     };
 
     try {
-      socket = factory(deps.relay.waitUrl(requestId));
-    } catch (cause) {
-      reject(cause instanceof Error ? cause : new Error("WebSocket construction failed"));
+      socket = factory(deps.relay.waitUrl(requestId), deps.relay.waitProtocols(requestId));
+    } catch {
+      // Connector exceptions may quote the offered credential. Only a fixed error can escape.
+      reject(new Error("WebSocket construction failed"));
       return;
     }
 

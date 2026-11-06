@@ -52,7 +52,12 @@ async function call(
 ): Promise<Reply> {
   const headers: Record<string, string> = {};
   if (options.token !== undefined) headers.Authorization = `Bearer ${options.token}`;
-  if (options.websocket) headers.Upgrade = "websocket";
+  if (options.websocket) {
+    headers.Upgrade = "websocket";
+    delete headers.Authorization;
+    if (options.token !== undefined)
+      headers["Sec-WebSocket-Protocol"] = `allw.v1, allw.auth.${options.token}`;
+  }
   if (options.body !== undefined) headers["Content-Type"] = "application/json";
   const resp = await exports.default.fetch(relayUrl(accountId, subPath), {
     method,
@@ -133,7 +138,7 @@ describe("request ids: an unknown id answers like a wrong token (#357)", () => {
     const owner = await exports.default.fetch(
       relayUrl(acct, `/requests/${rid("req-oracle-wait")}/wait`),
       {
-        headers: { Upgrade: "websocket", Authorization: `Bearer ${token}` },
+        headers: { Upgrade: "websocket", "Sec-WebSocket-Protocol": `allw.v1, allw.auth.${token}` },
       },
     );
     expect(owner.status).toBe(101);
@@ -141,26 +146,14 @@ describe("request ids: an unknown id answers like a wrong token (#357)", () => {
     owner.webSocket?.close();
   });
 
-  // The WebSocket route also reads `?auth=` (#303), so an unknown id must read it the same way: a
-  // stranger's query token is a 403 for an unknown id exactly as for a known one, never a 401.
-  it("GET /requests/{id}/wait with a ?auth= query token", async () => {
+  it("query-only credentials are ignored for known and unknown wait ids", async () => {
     const acct = testAccount("acct-oracle-wait-query");
     const token = await submit(acct, rid("req-oracle-wait-query"));
-    await expectIndistinguishable(
-      (id, t) =>
-        call(acct, "GET", `/requests/${id}/wait${t === undefined ? "" : `?auth=${t}`}`, {
-          websocket: true,
-        }),
-      rid("req-oracle-wait-query"),
-      rid("req-oracle-wait-query-unknown"),
-    );
-    const owner = await exports.default.fetch(
-      relayUrl(acct, `/requests/${rid("req-oracle-wait-query")}/wait?auth=${token}`),
-      { headers: { Upgrade: "websocket" } },
-    );
-    expect(owner.status).toBe(101);
-    owner.webSocket?.accept();
-    owner.webSocket?.close();
+    for (const id of [rid("req-oracle-wait-query"), rid("req-oracle-wait-query-unknown")]) {
+      expect(
+        await call(acct, "GET", `/requests/${id}/wait?auth=${token}`, { websocket: true }),
+      ).toEqual(NO_TOKEN);
+    }
   });
 
   // An HTTP route ignores `?auth=` (#303) for known and unknown ids alike: both are a 401.

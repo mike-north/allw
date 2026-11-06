@@ -613,6 +613,11 @@ attestation, audit records, hook/SDK fail-closed behavior, or enrollment.
 
 ### Relay and Transport
 
+Socket capabilities travel in `Sec-WebSocket-Protocol`, not URLs. Header-capturing proxy/CDN
+infrastructure can still record offers; application code does not guarantee infrastructure redaction.
+Only `allw.v1` is selected. Factories receive private offers and must forward them without logging;
+raw connector exceptions/events must not reach logs or caller errors.
+
 - [ ] Relay-visible request fields are limited to the envelope contract; no plaintext action context or structure is added.
 - [ ] The plaintext envelope carries only routing/lifecycle metadata and ciphertext; no action
       structure or data appears (R7).
@@ -634,8 +639,10 @@ attestation, audit records, hook/SDK fail-closed behavior, or enrollment.
 - [ ] Network failures, hung reads, refused connections, and malformed relay responses deny or expire, never allow.
 - [ ] Any new endpoint states who may call it and what authentication/authorization is required.
 - [ ] Bearer tokens stay out of URLs: HTTP routes read them only from the `Authorization` header. The
-      `?auth=` query form is accepted only on the WebSocket upgrade routes, where browsers cannot set headers
-      (`docs/relay-api.md` §1, #303). A new route never opts into it unless it is a WebSocket upgrade.
+      `Sec-WebSocket-Protocol` carries socket credentials as exactly `allw.v1` plus
+      `allw.auth.<token>`; the relay echoes only `allw.v1`. Query authentication is refused, as is
+      Authorization on socket routes; ordinary HTTP accepts only Authorization
+      (`docs/relay-api.md` §1, #251). A new socket route must preserve this exact separation.
 - [ ] A token-guarded identifier (a request id, a pairing code) answers an unknown identifier exactly as a wrong
       token (401 / 403, same body); no route says "not found" before its credential check (`docs/relay-api.md` §1,
       #357).

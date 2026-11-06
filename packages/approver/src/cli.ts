@@ -17,7 +17,7 @@ import { parseArgs } from "node:util";
 import { runKeygen } from "./commands/keygen.js";
 import { runPair } from "./commands/pair.js";
 import { runVouch } from "./commands/vouch.js";
-import { createReadlinePrompter, runWatch, type WebSocketLike } from "./commands/watch.js";
+import type { WebSocketLike } from "./commands/watch.js";
 import { printSameMachineDemoWarning } from "./lib/demo-warning.js";
 import { defaultKeyfilePath } from "./lib/paths.js";
 import { createTerminalConfirmer } from "./lib/terminal-confirmer.js";
@@ -199,6 +199,9 @@ async function main(): Promise<void> {
     }
     case "watch":
     case "serve": {
+      // Watch's transport dependency is needed only after the CLI has loaded the display core.
+      // Keep module-load failures inside the safe fatal-error boundary used by every command.
+      const { createReadlinePrompter, runWatch } = await import("./commands/watch.js");
       await runWatch(
         wasm,
         {
@@ -207,7 +210,8 @@ async function main(): Promise<void> {
         },
         {
           // Node 24 ships a global WebSocket; it satisfies our structural WebSocketLike surface.
-          connect: (url: string): WebSocketLike => new WebSocket(url),
+          connect: (url: string, protocols: string[]): WebSocketLike =>
+            new WebSocket(url, protocols),
           prompter: createReadlinePrompter(),
         },
       );

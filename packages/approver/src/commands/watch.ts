@@ -15,6 +15,8 @@
 
 import { createInterface, type Interface } from "node:readline/promises";
 
+import { relayWebSocketProtocols } from "@allw/sdk/relay-websocket";
+
 import {
   prepareRequest,
   signDecision,
@@ -96,17 +98,6 @@ export function displaySafeLogger(log: WatchLogger, wasm: AllwWasm): WatchLogger
       log.warn(wasm.escape_for_display(line));
     },
   };
-}
-
-/** Remove relay bearer capabilities from URLs before printing them to terminals or captured logs. */
-function redactAuthQuery(url: string): string {
-  try {
-    const parsed = new URL(url);
-    parsed.searchParams.delete("auth");
-    return parsed.toString();
-  } catch {
-    return url.split("?")[0] ?? url;
-  }
 }
 
 /** Parse a raw WS message payload into our typed inbound union; returns null if unrecognized. */
@@ -381,13 +372,14 @@ export async function runWatch(
   wasm: AllwWasm,
   options: WatchOptions,
   deps: {
-    connect: (url: string) => WebSocketLike;
+    /** Forward both arguments; protocols are private capabilities and must not be logged. */
+    connect: (url: string, protocols: string[]) => WebSocketLike;
     prompter: Prompter;
     log?: WatchLogger;
     now?: () => number;
   },
 ): Promise<void> {
-  const log = displaySafeLogger(deps.log ?? defaultLogger, wasm);
+  const sink = displaySafeLogger(deps.log ?? defaultLogger, wasm);
   // readKeyfile returns a VALIDATED Keyfile (validateKeyfile): the required seeds/pubkeys are
   // well-formed base64url-32-byte keys and every optional pairing field is a string-or-absent. So a
   // present relay_url/account_id/device_id is guaranteed a string here — a corrupt non-string field
@@ -411,8 +403,20 @@ export async function runWatch(
     throw new Error("keyfile has no device_cert — re-pair to mint one before watching");
   }
 
-  // The presence socket carries the device bearer token in its query, and account-state fetches
-  // carry it as a header: refuse a plaintext or malformed relay URL before either is built (#267).
+  // Relay frames and thrown errors are untrusted and can reflect the private capability.
+  // Redact before display escaping, including encoded protocol/URL representations.
+  const redact = (line: string): string => line.split(deviceAuthToken).join("[redacted]");
+  const log: WatchLogger = {
+    info: (line) => {
+      sink.info(redact(line));
+    },
+    warn: (line) => {
+      sink.warn(redact(line));
+    },
+  };
+
+  // Presence offers carry the device capability: refuse plaintext or malformed relay URLs before
+  // building the socket or account-state request (#267).
   // The URL in use is checked and named by its source, `--relay` when it overrides the keyfile;
   // from here on only its canonical form is used, for the socket and for account-state fetches.
   const relayUrl = assertCliRelayUrl(
@@ -420,11 +424,17 @@ export async function runWatch(
     options.relayUrl !== undefined ? "--relay" : "keyfile relay_url",
   );
 
-  const url = deviceConnectWsUrl(relayUrl, accountId, deviceId, deviceAuthToken);
-  log.info(`Connecting to ${redactAuthQuery(url)} …`);
+  const url = deviceConnectWsUrl(relayUrl, accountId, deviceId);
+  log.info(`Connecting to ${url} …`);
   // TODO(#41 v0): no reconnect/backoff — on close the loop simply exits (re-run `watch` to
   // reconnect). A resilient reconnect-with-backoff loop is out of scope for the v0 skeleton.
-  const ws = deps.connect(url);
+  let ws: WebSocketLike;
+  try {
+    ws = deps.connect(url, relayWebSocketProtocols(deviceAuthToken));
+  } catch {
+    // Runtime/connector errors may quote private protocol offers; never attach their cause.
+    throw new Error("WebSocket connection failed");
+  }
 
   // Resolve the root-signed account-state documents that root-anchor an actor key (#16). A
   // relay-supplied `/actors` key is NOT a trust anchor (a malicious relay could forge it), so the
@@ -479,8 +489,8 @@ export async function runWatch(
         log.warn(`Relay error: ${msg.error}`);
       }
     });
-    ws.addEventListener("error", (ev) => {
-      log.warn(`WebSocket error: ${String((ev as { message?: unknown }).message ?? ev)}`);
+    ws.addEventListener("error", () => {
+      log.warn("WebSocket error.");
     });
     ws.addEventListener("close", () => {
       log.info("Connection closed.");

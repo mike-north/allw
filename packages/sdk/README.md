@@ -164,3 +164,15 @@ try {
 
 The SDK does not evaluate policy, hold rules, or generate or sign standing grants. The caller owns its
 external policy and combines it with the verified human decision.
+
+### WebSocket transport
+
+The SDK connects to token-free wait URLs and passes `['allw.v1', 'allw.auth.<request token>']`
+as the second argument to its WebSocket factory. Custom `webSocketFactory(url, protocols)` overrides
+must forward both arguments to `new WebSocket(url, protocols)`. `@allw/sdk/relay-websocket` exports
+`relayWebSocketProtocols(token)` for browser-safe device connectors. Never log protocol lists or raw
+connector errors. The relay selects only `allw.v1`. Query auth and socket Authorization are refused;
+HTTP still uses Authorization. Socket failures retain authenticated polling fallback, cryptographic
+verification, deadline/abort handling and credential cleanup. Rebuild all consumers for this clean
+break; coordinate relay and Pages deployment with updated clients. Infrastructure that captures
+request headers can still capture offered credentials ([relay API](../../docs/relay-api.md#1-conventions)).

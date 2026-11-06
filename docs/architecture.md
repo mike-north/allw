@@ -65,6 +65,18 @@ account state, pairing authorization and plaintext-free verdict provenance.
 Structure-visible metadata/privacy tiers are unimplemented proposals held in #216. Derived program names are removed, so that design needs reconsideration; no alternative metadata source is chosen.
 See [contract.md](./contract.md) §Messages for the actual envelope.
 
+### Relay socket credentials
+
+Every socket producer (SDK waiter, CLI watch and browser retract listener) passes a token-free URL
+and two protocol offers: `allw.v1` and `allw.auth.<base64url capability>`. The relay selects only
+`allw.v1`. The browser-safe SDK `relay-websocket` entry point builds these offers without loading
+Node or WASM; injected factories must forward both URL and protocols. HTTP uses Authorization only;
+query auth and socket Authorization are refused. This is a coordinated clean break: rebuild all
+SDK consumers and approver clients and deploy relay + Pages together; old clients cannot upgrade.
+The SDK retains authenticated HTTP polling fallback and local verification/settlement semantics.
+Header-capturing infrastructure remains capable of seeing offers; URLs and application diagnostics
+must stay token-free. Exact parsing and rejection order belong to [relay-api.md](./relay-api.md) §1.
+
 ## Local execution: WASM, not native binaries
 
 On-machine code (the Claude Code hook, the integrator SDK, anything running the core _locally_) ships as **WASM

@@ -349,11 +349,14 @@ function jsonResponse(data, status = 200) {
  */
 function makeWebSocketFactory(frameFor) {
   const urls = [];
-  const factory = (url) => {
+  const protocols = [];
+  const factory = (url, offered) => {
     urls.push(url);
+    protocols.push(offered);
     return new FakeWebSocket(url, frameFor);
   };
   factory.urls = urls;
+  factory.protocols = protocols;
   return factory;
 }
 
@@ -515,13 +518,14 @@ test("(a) happy WS round-trip → approved, verify() re-passes", async () => {
   });
 
   const verdict = await client.requestApproval(req);
-  assert.match(
+  assert.equal(
     wsFactory.urls[0],
-    new RegExp(
-      `/requests/${relay.state.captured.id}/wait\\?auth=token-${relay.state.captured.id}$`,
-    ),
-    "the wait WebSocket URL carries the request auth token returned by submit",
+    `${RELAY_URL.replace(/^http/, "ws")}/${ACCOUNT_ID}/requests/${relay.state.captured.id}/wait`,
   );
+  assert.deepEqual(wsFactory.protocols[0], [
+    "allw.v1",
+    `allw.auth.token-${relay.state.captured.id}`,
+  ]);
   assert.equal(
     verdict.decision,
     "approved",
@@ -2521,10 +2525,15 @@ function credentialFixture(t, approver, transport) {
       return jsonResponse({ status: "resolved", verdict: { sig: "junk" } });
     return jsonResponse({ status: "pending" });
   };
-  const ws = (url) => {
+  const ws = (url, protocols) => {
     const parsed = new URL(url);
     const id = parsed.pathname.split("/requests/")[1].split("/")[0];
-    assert.equal(parsed.searchParams.get("auth"), rows.get(id).token, "socket request auth");
+    assert.equal(parsed.search, "", "socket URL is credential-free");
+    assert.deepEqual(
+      protocols,
+      ["allw.v1", `allw.auth.${rows.get(id).token}`],
+      "socket request auth",
+    );
     const socket = new ControllableFakeWebSocket(url);
     sockets.set(id, socket);
     if (rows.get(id).mode.startsWith("poll-"))
@@ -2757,3 +2766,73 @@ for (const transport of ["poll", "WS"]) {
     });
   }
 }
+
+// The runtime constructor and user overrides have the same private second argument. A default
+// constructor must never silently drop it and turn a socket-capable runtime into polling only.
+test("default WebSocket constructor forwards offers and retains verified settlement", async () => {
+  const approver = makeApprover(fixtureWasm);
+  const req = sampleRequest();
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: { poll: () => null },
+  });
+  const original = globalThis.WebSocket;
+  const calls = [];
+  globalThis.WebSocket = class extends FakeWebSocket {
+    constructor(url, protocols) {
+      calls.push({ url, protocols });
+      super(url, () => ({
+        type: "verdict",
+        verdict: signVerdict(fixtureWasm, approver, req, relay.state.captured, {
+          decision: "approved",
+        }),
+      }));
+    }
+  };
+  try {
+    const client = createClient({
+      relayUrl: RELAY_URL,
+      accountId: ACCOUNT_ID,
+      approverRootKey: approver.accountRootPub,
+      accountStates: approver.accountStates,
+      fetchImpl: relay.fetchImpl,
+      nowImpl: () => NOW_MS,
+      timeoutMs: 1000,
+    });
+    const verdict = await client.requestApproval(req);
+    assert.equal(verdict.decision, "approved");
+    assert.equal(new URL(calls[0].url).search, "");
+    assert.deepEqual(calls[0].protocols, ["allw.v1", `allw.auth.token-${relay.state.captured.id}`]);
+  } finally {
+    globalThis.WebSocket = original;
+  }
+});
+
+test("a connector exception containing the request credential safely falls back to verified polling", async () => {
+  const approver = makeApprover(fixtureWasm);
+  const req = sampleRequest();
+  const relay = makeRelayDouble({
+    devices: [deviceRecord(approver)],
+    behavior: {
+      poll: () =>
+        signVerdict(fixtureWasm, approver, req, relay.state.captured, {
+          decision: "approved",
+        }),
+    },
+  });
+  const client = createClient({
+    relayUrl: RELAY_URL,
+    accountId: ACCOUNT_ID,
+    approverRootKey: approver.accountRootPub,
+    accountStates: approver.accountStates,
+    fetchImpl: relay.fetchImpl,
+    nowImpl: () => NOW_MS,
+    timeoutMs: 1000,
+    webSocketFactory: (_url, protocols) => {
+      throw new Error(`untrusted: ${protocols.join(",")}`);
+    },
+  });
+  const verdict = await client.requestApproval(req);
+  assert.equal(verdict.decision, "approved");
+  assert.equal(await verdict.verify(approver.accountRootPub), true);
+});

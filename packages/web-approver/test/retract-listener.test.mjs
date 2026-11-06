@@ -9,7 +9,7 @@
  * `docs/relay-api.md` and exercised end-to-end by the relay's own test suite.
  *
  * Coverage:
- *  - The connect URL carries `auth` and `surface_id` query params (`docs/relay-api.md` §3).
+ *  - The connect URL carries only `surface_id`; the private capability is a protocol offer (`docs/relay-api.md` §3).
  *  - A well-formed `{type:"retract", request_id}` message calls `onRetract`.
  *  - `request` / `ack` / `error` message types are ignored (out of this listener's scope).
  *  - Malformed JSON, non-object payloads, and a missing/empty `request_id` are ignored (never
@@ -67,14 +67,17 @@ function stubSocket() {
 function recordingConnector() {
   const sockets = [];
   const urls = [];
-  const connect = (url) => {
+  const protocols = [];
+  const connect = (url, offered) => {
     urls.push(url);
+    protocols.push(offered);
     const socket = stubSocket();
     sockets.push(socket);
     return socket;
   };
   connect.sockets = sockets;
   connect.urls = urls;
+  connect.protocols = protocols;
   return connect;
 }
 
@@ -103,7 +106,7 @@ function fakeScheduler() {
   };
 }
 
-test("connect URL carries auth and surface_id query params", () => {
+test("connect URL carries only surface_id and factory receives private protocol offers", () => {
   const connect = recordingConnector();
   const listener = createRetractListener({
     ...OPTIONS_BASE,
@@ -114,7 +117,8 @@ test("connect URL carries auth and surface_id query params", () => {
   const url = new URL(connect.urls[0]);
   assert.equal(url.protocol, "wss:");
   assert.equal(url.pathname, "/acct-1/devices/dev-1/connect");
-  assert.equal(url.searchParams.get("auth"), "token-abc");
+  assert.equal(url.searchParams.get("auth"), null);
+  assert.deepEqual(connect.protocols[0], ["allw.v1", "allw.auth.token-abc"]);
   assert.equal(url.searchParams.get("surface_id"), "surface-xyz");
 
   listener.stop();
@@ -283,4 +287,61 @@ test("stop() cancels an already-scheduled reconnect timer", () => {
   listener.stop();
 
   assert.equal(scheduler.pendingCount(), 0, "stop() cancels the pending reconnect timer");
+});
+
+test("default browser constructor forwards private offers and reconnects without credential URLs", () => {
+  const original = globalThis.WebSocket;
+  const sockets = [];
+  const calls = [];
+  const scheduler = fakeScheduler();
+  globalThis.WebSocket = class {
+    constructor(url, protocols) {
+      calls.push({ url, protocols });
+      const socket = stubSocket();
+      sockets.push(socket);
+      return socket;
+    }
+  };
+  let listener;
+  try {
+    listener = createRetractListener({
+      ...OPTIONS_BASE,
+      onRetract: () => {},
+      scheduleReconnect: scheduler.schedule,
+      cancelReconnect: scheduler.cancel,
+      randomImpl: () => 0,
+    });
+    sockets[0].emitClose();
+    scheduler.fireLatest();
+    assert.equal(calls.length, 2);
+    for (const call of calls) {
+      assert.equal(
+        call.url,
+        "wss://relay.test/acct-1/devices/dev-1/connect?surface_id=surface-xyz",
+      );
+      assert.deepEqual(call.protocols, ["allw.v1", "allw.auth.token-abc"]);
+    }
+  } finally {
+    listener?.stop();
+    globalThis.WebSocket = original;
+  }
+});
+
+test("a secret-bearing constructor exception is not exposed and reconnect remains stoppable", () => {
+  const scheduler = fakeScheduler();
+  const listener = createRetractListener({
+    ...OPTIONS_BASE,
+    onRetract: () => {},
+    connectImpl: () => {
+      throw new Error("token-abc private offer");
+    },
+    scheduleReconnect: scheduler.schedule,
+    cancelReconnect: scheduler.cancel,
+    randomImpl: () => 0,
+  });
+  assert.equal(scheduler.pendingCount(), 1);
+  scheduler.fireLatest();
+  assert.deepEqual(scheduler.delays(), [1000, 2000]);
+  listener.stop();
+  assert.equal(scheduler.pendingCount(), 1); // fired fake timer is retained only in test history
 });

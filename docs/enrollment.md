@@ -1107,7 +1107,8 @@ Endpoint authentication and authorization rules:
   `POST /enrollments/start`, which is scoped to that one enrollment;
 - actor enrollment requires an enrolled device token;
 - device revocation requires the target device token;
-- device presence requires the target device token, passed as a bearer header or `auth` query on WebSocket upgrade;
+- device presence requires the target device token, offered as `allw.auth.<token>` alongside `allw.v1` on WebSocket upgrade;
+  the relay selects only `allw.v1` (no query credentials or Authorization on sockets);
 - request polling and wait sockets require the `request_auth_token` returned by `POST /requests`;
 - legacy rows without a stored relay auth-token hash fail closed with `401`; devices must re-pair and pending
   requests must be re-submitted rather than becoming unauthenticated;

@@ -3,7 +3,7 @@
  *
  * Every relay request the CLI makes carries pairing material or the device bearer token: the
  * pairing-start authorization and pairing code, the `deviceAuthToken` on `account-states`, and the
- * same token in the presence WebSocket's query. Over plaintext HTTP to a remote host an on-path
+ * same token in the presence WebSocket's protocol offers. Over plaintext HTTP to a remote host an on-path
  * attacker reads all of it and can then do anything a malicious relay can. So a relay URL is
  * accepted only if it is `https:`, or `http:` on a local-development loopback host, and carries no
  * userinfo, query or fragment (`docs/threat-model.md` §Relay and Transport).

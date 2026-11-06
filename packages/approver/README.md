@@ -321,3 +321,13 @@ Covers the full round-trip against the **real WASM core**: encrypt → decrypt �
 `request_hash` → sign → `verify_verdict` accepts (id + hash, no-swap); the `denied` path; and
 fail-closed paths (malformed ciphertext, wrong-key ciphertext, missing cert). Relay pairing is
 exercised against an in-Node HTTP stub of the relay's pairing surface.
+
+### Presence socket authentication
+
+`watch` uses a token-free URL and offers `allw.v1` plus `allw.auth.<device token>` through the
+constructor's second argument. Injected `runWatch` connectors must forward `(url, protocols)`;
+`deviceConnectWsUrl(relayUrl, accountId, deviceId)` no longer accepts a credential. The relay selects
+only `allw.v1`. Query and socket Authorization authentication are refused. Rebuild the CLI and
+example connectors with the updated relay; the browser retract listener needs rebuilt Pages too.
+Protocol lists are private. Socket errors use fixed diagnostics, and logs redact reflected device
+capabilities. Infrastructure header capture remains a residual risk; see the relay API auth contract.

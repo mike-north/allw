@@ -633,12 +633,12 @@ test("pairingStart ABORTS against a hung relay (fail-closed AbortSignal.timeout 
 test("deviceConnectWsUrl upgrades http(s)→ws(s) and builds the presence path", async () => {
   await loadWasm();
   assert.equal(
-    deviceConnectWsUrl("https://relay.example.com", "acct-9", "dev-9", "device-token"),
-    "wss://relay.example.com/acct-9/devices/dev-9/connect?auth=device-token",
+    deviceConnectWsUrl("https://relay.example.com", "acct-9", "dev-9"),
+    "wss://relay.example.com/acct-9/devices/dev-9/connect",
   );
   assert.equal(
-    deviceConnectWsUrl("http://127.0.0.1:8787/", "acct-9", "dev 9", "token value"),
-    "ws://127.0.0.1:8787/acct-9/devices/dev%209/connect?auth=token%20value",
+    deviceConnectWsUrl("http://127.0.0.1:8787/", "acct-9", "dev 9"),
+    "ws://127.0.0.1:8787/acct-9/devices/dev%209/connect",
   );
 });
 

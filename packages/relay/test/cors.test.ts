@@ -344,13 +344,13 @@ describe("CORS on actual responses", () => {
       })
     ).json<{ device_id: string; device_auth_token: string }>();
 
-    const resp = await exports.default.fetch(
-      url(
-        acct,
-        `/devices/${complete.device_id}/connect?auth=${encodeURIComponent(complete.device_auth_token)}`,
-      ),
-      { headers: { Upgrade: "websocket", Origin: HOSTED_APPROVER } },
-    );
+    const resp = await exports.default.fetch(url(acct, `/devices/${complete.device_id}/connect`), {
+      headers: {
+        Upgrade: "websocket",
+        Origin: HOSTED_APPROVER,
+        "Sec-WebSocket-Protocol": `allw.v1, allw.auth.${complete.device_auth_token}`,
+      },
+    });
 
     expect(resp.status).toBe(101);
     expect(resp.webSocket).not.toBeNull();
