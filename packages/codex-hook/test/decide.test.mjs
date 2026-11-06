@@ -384,3 +384,27 @@ test("(#372) a blank cwd from Codex gives the same request as an absent one", as
     assert.equal(await requestFor(blank), unbound, JSON.stringify(blank));
   }
 });
+
+/** @see ../../../docs/codex-integration.md (Private denial diagnostics) */
+test("private denial metadata carries only the SDK verdict's available request id, never the Codex call id", async () => {
+  const { denyLogMetadata } = await import("../dist/lib/codex-io.js");
+  const wasm = await loadWasm();
+  const id = "a1234567-1234-4234-8234-123456789abc";
+  const output = await decide(
+    bashInput("echo secret", "/repo", "codex-call-is-not-request-id"),
+    {
+      wasm,
+      config: CONFIG,
+      commandRequest,
+      requestApproval: async () => ({
+        decision: "denied",
+        requestId: id,
+        note: "private human note",
+      }),
+    },
+    HOSTNAME,
+  );
+  assert.deepEqual(denyLogMetadata(output), { category: "no-approval", requestId: id });
+  assertConformsToPreToolUseOutputContract(output);
+  assert.doesNotMatch(JSON.stringify(output), /request_id|private human note/);
+});

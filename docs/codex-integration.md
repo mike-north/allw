@@ -106,6 +106,40 @@ This is the Codex-parallel install path for developers who already have a paired
    call. The hook submits a Codex-scoped approval request (`actor.id = "codex:<hostname>"`), and
    Codex proceeds only after a verified allw approval.
 
+## Private denial diagnostics
+
+Denial logging is off by default. To enable it, set exactly `ALLW_CODEX_DENY_LOG=1` in the
+hook process's environment (other values leave it off), for example before launching Codex:
+
+```sh
+export ALLW_CODEX_DENY_LOG=1
+```
+
+Opted-in denials append to `$XDG_STATE_HOME/allw/codex-deny.log` when `XDG_STATE_HOME` is
+nonempty and absolute; otherwise an unset/empty `XDG_STATE_HOME` uses
+`~/.allw/state/codex-deny.log`. A relative state path is refused. The hook no longer writes
+`.codex/allw-hook.log` under the project. Existing project logs are not migrated or deleted.
+
+Each line contains a UTC ISO timestamp, the deny category and, only when available from an SDK
+verdict, its UUID request id. No id is generated or fetched for logging; errors before a verdict
+omit it. For example:
+
+```text
+2026-11-06T12:00:00.000Z [allw] deny category=no-approval request_id=a1234567-1234-4234-8234-123456789abc
+2026-11-06T12:00:01.000Z [allw] deny category=config-error
+```
+
+The log never contains command/summary text, freeform reasons, plaintext actions, credentials,
+keys or human notes. It is a diagnostic stream, not a cryptographic audit record. Approvals and
+pass-throughs write nothing. Codex stdout and the fail-closed decision mapping are unchanged.
+
+New state directories use `0700`, and the log uses `0600`. As with the SDK's user-state store,
+the selected state root and log directory must be real directories owned by the effective user
+and not writable by group/others. Linked roots/directories are refused; the log is opened without
+following symlinks, must be a private user-owned regular file with one link, and is checked and
+appended through the same descriptor. A path or append failure silently skips optional logging
+and preserves the explicit deny.
+
 ## Human-Run UAT Setup
 
 The real-Codex UAT is intentionally operator-run. The automated/headless attempt triggered macOS
@@ -255,6 +289,7 @@ The hook reads the same allw config as the Claude Code hook — `~/.allw/config.
 | `ALLW_APPROVER_ROOT_KEY` | no       | Overrides `approver_root_key`: the approver account-root Ed25519 key.                                                                                                                                   |
 | `ALLW_TIMEOUT_MS`        | no       | Fail-closed approval deadline in ms, capped below hook time.                                                                                                                                            |
 | `ALLW_FETCH_TIMEOUT_MS`  | no       | Per-relay-fetch timeout in ms, only allowed to lower the cap.                                                                                                                                           |
+| `ALLW_CODEX_DENY_LOG`    | no       | Exactly `1` enables private metadata-only denial logging; see [Private denial diagnostics](#private-denial-diagnostics).                                                                                |
 
 With neither the file nor the overrides, or with an invalid file, every gated call is denied with a
 reason naming both ways to configure.

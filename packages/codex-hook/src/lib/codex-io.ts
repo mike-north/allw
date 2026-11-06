@@ -94,6 +94,23 @@ export interface CodexPreToolUseOutput {
  */
 export type CodexHookResult = CodexPreToolUseOutput | null;
 
+/** Private diagnostic metadata, never serialized into Codex's strict wire payload. */
+interface DenyLogMetadata {
+  readonly category: DenyReason;
+  readonly requestId?: string;
+}
+
+/** Object identity keeps logging metadata out of stdout and prevents parsing untrusted reasons. */
+const DENY_LOG_METADATA = new WeakMap<CodexPreToolUseOutput, DenyLogMetadata>();
+
+/**
+ * Read only metadata attached by denyOutput; arbitrary wire-shaped objects are not log sources.
+ * @internal
+ */
+export function denyLogMetadata(output: CodexPreToolUseOutput): DenyLogMetadata | undefined {
+  return DENY_LOG_METADATA.get(output);
+}
+
 /** Parse result: either a validated input or the fail-closed reason to deny with. */
 export type ParseResult =
   | { readonly ok: true; readonly input: CodexPreToolUseInput }
@@ -123,17 +140,23 @@ export function noBlockOutput(): CodexHookResult {
  * machine-readable reason for operators; it is preserved by prefixing `permissionDecisionReason`
  * with `allw[<category>]: ` rather than by adding an undocumented field. Any leading `allw: ` on
  * `reason` (several call sites already write their own) is stripped first so the prefix never
- * doubles up.
+ * doubles up. The optional request id is private diagnostic metadata, never a Codex wire field.
  */
-export function denyOutput(reason: string, category: DenyReason): CodexPreToolUseOutput {
+export function denyOutput(
+  reason: string,
+  category: DenyReason,
+  requestId?: string,
+): CodexPreToolUseOutput {
   const detail = reason.replace(/^allw:\s*/, "");
-  return {
+  const output: CodexPreToolUseOutput = {
     hookSpecificOutput: {
       hookEventName: HOOK_EVENT_NAME,
       permissionDecision: "deny",
       permissionDecisionReason: `allw[${category}]: ${detail}`,
     },
   };
+  DENY_LOG_METADATA.set(output, { category, ...(requestId !== undefined ? { requestId } : {}) });
+  return output;
 }
 
 /**

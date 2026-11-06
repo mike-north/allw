@@ -10,6 +10,8 @@
  * denied with the same reason in both; every other surface through `@allw/hook`'s `gateToolCall`.
  */
 
+import type { Verdict } from "@allw/sdk";
+
 import {
   agentSafeErrorText,
   agentSafeText,
@@ -29,10 +31,11 @@ import {
   type DenyReason,
 } from "./codex-io.js";
 
-/** The minimal verdict shape read from `@allw/sdk`. */
-export interface ApprovalVerdict {
-  readonly decision: "approved" | "denied" | "expired" | "aborted";
-}
+/**
+ * The SDK verdict fields consumed by the hook. A request id is diagnostic metadata when present;
+ * integrations without one still deny safely. Derive field names from the SDK, not its wire JSON.
+ */
+export type ApprovalVerdict = Pick<Verdict, "decision"> & Partial<Pick<Verdict, "requestId">>;
 
 /** The approval request shape submitted to the SDK. */
 export interface CodexApprovalRequest {
@@ -252,5 +255,6 @@ export async function decide(
   return denyOutput(
     `allw: ${agentSafeText(deps.wasm, summary)} — not approved (verdict: ${verdict.decision})`,
     verdictDenyReason,
+    verdict.requestId,
   );
 }

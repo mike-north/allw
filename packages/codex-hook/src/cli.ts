@@ -12,7 +12,7 @@
  */
 
 import { hostname as osHostname } from "node:os";
-import { appendFileSync, realpathSync } from "node:fs";
+import { realpathSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { MAX_ESCAPED_DIAGNOSTIC_CHARS, commandRequest, escapeToPrintableAscii } from "@allw/sdk";
@@ -34,6 +34,7 @@ import {
   type CodexHookResult,
   type CodexPreToolUseOutput,
 } from "./lib/codex-io.js";
+import { appendDenyLog } from "./lib/deny-log.js";
 import { getVersion } from "./version.js";
 
 /** Test-only SDK transport seams; production uses SDK defaults. */
@@ -54,23 +55,6 @@ async function readStdin(): Promise<string> {
  */
 export const BACKSTOP_DENY_REASON =
   "allw: Codex hook exited before reaching a decision (fail-closed deny)";
-
-/**
- * Append a single deny log line to `.codex/allw-hook.log` in the given directory.
- *
- * The file is created if it does not exist. Errors are swallowed: log appending must never
- * convert a deny into a process crash. The log is intentionally non-leaky — only the
- * `permissionDecisionReason` string (which already carries the machine-readable
- * `allw[<category>]: ` prefix from `denyOutput`) is written, not raw input.
- */
-function appendDenyLog(cwd: string, isoTimestamp: string, permissionDecisionReason: string): void {
-  try {
-    const logPath = `${cwd}/.codex/allw-hook.log`;
-    appendFileSync(logPath, `${isoTimestamp} [allw] deny reason=${permissionDecisionReason}\n`);
-  } catch {
-    // Intentionally swallowed — log failure must never affect the deny decision.
-  }
-}
 
 /**
  * Run the Codex hook against raw stdin and an env map. Pure with respect to stdout for tests.
@@ -158,16 +142,8 @@ async function main(): Promise<void> {
     );
   }
 
-  // Append a deny line to the project log so operators can audit without parsing stdout. `output`
-  // is non-null only for an explicit `deny`; approvals and pass-throughs write nothing and log
-  // nothing.
-  if (output !== null) {
-    appendDenyLog(
-      process.cwd(),
-      new Date().toISOString(),
-      output.hookSpecificOutput.permissionDecisionReason,
-    );
-  }
+  // Only opted-in, private metadata diagnostics; the decision is independent of disk writes.
+  appendDenyLog(process.env, output);
 
   decision.finalize(output);
   process.exit(0);
