@@ -253,7 +253,7 @@
       "action": {
         "record_schema_version": 3,
         "surface": "command",
-        "syntactic": {
+        "facts": {
           "argv": ["rm", "-rf", "~/x;", ":", "\u001b[2K\rgit", "status"],
           "cwd": "/home/dev/‮ppa",
           "raw": "rm -rf ~/x; : \u001b[2K\rgit status"
@@ -277,7 +277,7 @@
       "actor_id": "machine:ci⟨U+200B⟩",
       "actor_kind": "claude-code",
       "actor_label": "machine:ci⟨U+200B⟩ (claude-code)",
-      "syntactic": {
+      "facts": {
         "argv": ["rm", "-rf", "~/x;", ":", "\\x1b[2K\\rgit", "status"],
         "cwd": "/home/dev/⟨U+202E⟩ppa",
         "raw": "rm -rf ~/x; : \\x1b[2K\\rgit status",

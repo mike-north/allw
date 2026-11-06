@@ -359,7 +359,7 @@ pub fn compute_record_hash(record: &AuditRecord) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::{ActionRecord, Actor, Approver, Decision, Surface, SyntacticSubstrate};
+    use crate::contract::{ActionRecord, Actor, Approver, Decision, Facts, Surface};
     use sha2::{Digest, Sha256};
 
     // ── Fixed test fixtures ───────────────────────────────────────────────────
@@ -387,7 +387,7 @@ mod tests {
         ActionRecord {
             record_schema_version: 3,
             surface: Surface::Command,
-            syntactic: SyntacticSubstrate {
+            facts: Facts {
                 argv: Some(vec![
                     "git".to_string(),
                     "push".to_string(),
@@ -618,7 +618,7 @@ mod tests {
         chain.append(make_entry("req_001"));
         chain.append(make_entry("req_002"));
 
-        chain.records[1].action.syntactic.raw = Some("changed action".to_string());
+        chain.records[1].action.facts.raw = Some("changed action".to_string());
 
         let err = chain.verify().unwrap_err();
         assert_eq!(err, AuditChainError::RecordHashMismatch { seq: 1 });

@@ -45,8 +45,8 @@ fun main() {
         // Exact string content is also exercised in the Rust JSON-boundary tests.
         check(captured.contains("\"raw\":"))
     }
-    val legacyContext = context.replace("\"syntactic\":{",
-        "\"syntactic\":{\"bin\":{},\"flags\":false,\"positionals\":1,\"host\":[],\"env_refs\":0,")
+    val legacyContext = context.replace("\"facts\":{",
+        "\"facts\":{\"bin\":{},\"flags\":false,\"positionals\":1,\"host\":[],\"env_refs\":0,")
     check(computeRequestHashB64(legacyContext, 4102444800000) == hash) {
         "removed fields must be ignored at the Kotlin boundary"
     }

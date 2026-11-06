@@ -779,9 +779,7 @@ pub fn decrypt_context(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::{
-        ActionRecord, Actor, Constraints, Decision, Surface, SyntacticSubstrate,
-    };
+    use crate::contract::{ActionRecord, Actor, Constraints, Decision, Facts, Surface};
     use rand_chacha::rand_core::SeedableRng;
     use rand_chacha::ChaCha20Rng;
     use serde_json::Value;
@@ -815,7 +813,7 @@ mod tests {
             action: ActionRecord {
                 record_schema_version: 3,
                 surface: Surface::Command,
-                syntactic: SyntacticSubstrate {
+                facts: Facts {
                     argv: None,
                     cwd: None,
                     server: None,

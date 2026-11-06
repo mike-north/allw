@@ -15,7 +15,7 @@
 //!
 //! # `raw` display format
 //!
-//! The `syntactic.raw` field is set to:
+//! The `facts.raw` field is set to:
 //!
 //! ```text
 //! <server>.<tool>(<compact-json-params>)
@@ -36,11 +36,11 @@
 //! - `openclaw.deploy_service()`
 //!
 //! The format is intended for display and fallback pattern matching only; the canonical,
-//! matchable params form lives in `syntactic.params` as a structured [`serde_json::Value`].
+//! matchable params form lives in `facts.params` as a structured [`serde_json::Value`].
 //!
-use crate::contract::{ActionRecord, Surface, SyntacticSubstrate};
+use crate::contract::{ActionRecord, Facts, Surface};
 
-/// Build an [`ActionRecord`] for an MCP tool call, populating only the syntactic substrate.
+/// Build an [`ActionRecord`] for an MCP tool call, populating only the facts substrate.
 ///
 /// # Arguments
 ///
@@ -60,8 +60,8 @@ use crate::contract::{ActionRecord, Surface, SyntacticSubstrate};
 ///
 /// - `surface = Surface::McpToolCall`
 /// - `record_schema_version = 3`
-/// - `syntactic.server`, `syntactic.tool`, `syntactic.params` populated from the arguments
-/// - `syntactic.raw` set to `"<server>.<tool>(<compact-json-params>)"` (see module-level docs)
+/// - `facts.server`, `facts.tool`, `facts.params` populated from the arguments
+/// - `facts.raw` set to `"<server>.<tool>(<compact-json-params>)"` (see module-level docs)
 /// - Caller command fields (`argv`, `cwd`) left absent; no command metadata is inferred.
 ///
 /// # Example
@@ -78,8 +78,8 @@ use crate::contract::{ActionRecord, Surface, SyntacticSubstrate};
 /// );
 ///
 /// assert_eq!(record.surface, Surface::McpToolCall);
-/// assert_eq!(record.syntactic.server.as_deref(), Some("omnifocus"));
-/// assert_eq!(record.syntactic.tool.as_deref(), Some("delete_project"));
+/// assert_eq!(record.facts.server.as_deref(), Some("omnifocus"));
+/// assert_eq!(record.facts.tool.as_deref(), Some("delete_project"));
 /// ```
 pub fn action_from_mcp_tool_call(
     server: &str,
@@ -90,7 +90,7 @@ pub fn action_from_mcp_tool_call(
 }
 
 /// Build an [`ActionRecord`] for an agent-runtime/plugin-owned tool call gated by the harness
-/// rather than an MCP server (`docs/openclaw-integration.md` §5.2), populating only the syntactic
+/// rather than an MCP server (`docs/openclaw-integration.md` §5.2), populating only the facts
 /// substrate. Shares [`build_tool_call_action`] with [`action_from_mcp_tool_call`] — the two
 /// differ only in the `surface` tag stamped on the record.
 ///
@@ -110,11 +110,11 @@ pub fn action_from_mcp_tool_call(
 ///
 /// - `surface = Surface::AgentToolCall`
 /// - `record_schema_version = 3`
-/// - `syntactic.server`, `syntactic.tool` populated from the arguments; `syntactic.params` set
+/// - `facts.server`, `facts.tool` populated from the arguments; `facts.params` set
 ///   only when `params` is `Some`
-/// - `syntactic.raw` set to `"<server>.<tool>(<compact-json-params>)"`, or `"<server>.<tool>()"`
+/// - `facts.raw` set to `"<server>.<tool>(<compact-json-params>)"`, or `"<server>.<tool>()"`
 ///   when `params` is `None` (see module-level docs)
-/// - All command-surface and file-edit-surface syntactic fields set to `None`
+/// - All command-surface and file-edit-surface facts fields set to `None`
 ///
 /// # Example
 ///
@@ -125,9 +125,9 @@ pub fn action_from_mcp_tool_call(
 /// let record = action_from_agent_tool_call("openclaw", "deploy_service", None);
 ///
 /// assert_eq!(record.surface, Surface::AgentToolCall);
-/// assert_eq!(record.syntactic.server.as_deref(), Some("openclaw"));
-/// assert_eq!(record.syntactic.tool.as_deref(), Some("deploy_service"));
-/// assert!(record.syntactic.params.is_none());
+/// assert_eq!(record.facts.server.as_deref(), Some("openclaw"));
+/// assert_eq!(record.facts.tool.as_deref(), Some("deploy_service"));
+/// assert!(record.facts.params.is_none());
 /// ```
 pub fn action_from_agent_tool_call(
     server: &str,
@@ -142,9 +142,9 @@ pub fn action_from_agent_tool_call(
 ///
 /// Some callers already hold human-authored reviewer prose for the action — e.g. an OpenClaw
 /// plugin permission request's `description`/`detail` (`docs/openclaw-integration.md` §5.2:
-/// "`syntactic.raw` = `description`, plus `detail` when present"). For those callers the
+/// "`facts.raw` = `description`, plus `detail` when present"). For those callers the
 /// synthesized `<server>.<tool>()` display (what [`action_from_agent_tool_call`] produces when
-/// `params` is `None`) would silently discard that prose from the one syntactic field meant to
+/// `params` is `None`) would silently discard that prose from the caller-fact field meant to
 /// carry the reviewer-facing text. Use this builder instead; use
 /// [`action_from_agent_tool_call`] when no such prose exists and the synthesized display is the
 /// best available `raw`.
@@ -157,13 +157,13 @@ pub fn action_from_agent_tool_call(
 ///
 /// * `server` – the gating provider identity (e.g. an OpenClaw plugin id).
 /// * `tool`   – the tool name within that provider.
-/// * `raw`    – the reviewer-facing prose to bind verbatim as `syntactic.raw`.
+/// * `raw`    – the reviewer-facing prose to bind verbatim as `facts.raw`.
 /// * `params` – tool call parameters, if any structured form is available. `None` when the
 ///   caller has no structured parameters to offer.
 ///
 /// # Returns
 ///
-/// An [`ActionRecord`] identical to [`action_from_agent_tool_call`]'s, except `syntactic.raw` is
+/// An [`ActionRecord`] identical to [`action_from_agent_tool_call`]'s, except `facts.raw` is
 /// `raw` verbatim rather than the synthesized display.
 pub fn action_from_agent_tool_call_with_raw(
     server: &str,
@@ -180,14 +180,14 @@ pub fn action_from_agent_tool_call_with_raw(
     )
 }
 
-/// Shared syntactic-substrate reduction for the `mcp_tool_call` and `agent_tool_call` surfaces.
+/// Shared facts-substrate reduction for the `mcp_tool_call` and `agent_tool_call` surfaces.
 ///
 /// Both surfaces reduce to the same `(server, tool, params)` function-identity shape
 /// (`docs/action-record.md` §Tool calls and file edits); only the `surface` tag
 /// differs. Kept private so the public builders above cannot drift apart on identity,
 /// `raw` formatting, or which fields are populated.
 ///
-/// `raw_override`, when `Some`, is bound verbatim as `syntactic.raw` instead of the synthesized
+/// `raw_override`, when `Some`, is bound verbatim as `facts.raw` instead of the synthesized
 /// `"<server>.<tool>(...)"` display (see [`action_from_agent_tool_call_with_raw`]).
 fn build_tool_call_action(
     surface: Surface,
@@ -197,7 +197,7 @@ fn build_tool_call_action(
     raw_override: Option<String>,
 ) -> ActionRecord {
     // A serde_json::Value always serializes; surface any unexpected failure rather than
-    // silently emitting a `raw` that disagrees with `syntactic.params`.
+    // silently emitting a `raw` that disagrees with `facts.params`.
     let raw = raw_override.unwrap_or_else(|| match &params {
         Some(value) => {
             let compact_params = serde_json::to_string(value)
@@ -210,7 +210,7 @@ fn build_tool_call_action(
     ActionRecord {
         record_schema_version: 3,
         surface,
-        syntactic: SyntacticSubstrate {
+        facts: Facts {
             // command-surface fields — all None for mcp_tool_call / agent_tool_call
             argv: None,
             cwd: None,
@@ -265,8 +265,8 @@ mod tests {
     #[test]
     fn server_and_tool_are_set() {
         let r = representative_record();
-        assert_eq!(r.syntactic.server.as_deref(), Some("omnifocus"));
-        assert_eq!(r.syntactic.tool.as_deref(), Some("delete_project"));
+        assert_eq!(r.facts.server.as_deref(), Some("omnifocus"));
+        assert_eq!(r.facts.tool.as_deref(), Some("delete_project"));
     }
 
     /// params must equal the input serde_json::Value exactly (verbatim preservation).
@@ -275,7 +275,7 @@ mod tests {
         let input = json!({ "list": "Agent Inbox", "project_id": "abc" });
         let r = action_from_mcp_tool_call("omnifocus", "delete_project", input.clone());
         assert_eq!(
-            r.syntactic.params.as_ref(),
+            r.facts.params.as_ref(),
             Some(&input),
             "params must equal the input serde_json::Value exactly"
         );
@@ -301,7 +301,7 @@ mod tests {
             serde_json::from_str(&serialised).expect("JSON must deserialise back to ActionRecord");
 
         assert_eq!(
-            deserialised.syntactic.params.as_ref(),
+            deserialised.facts.params.as_ref(),
             Some(&original_params),
             "params must deep-equal the original after a full serde round-trip \
              (action-record.md §The approval → rule bridge: params.list == \"Agent Inbox\" \
@@ -326,7 +326,7 @@ mod tests {
             serde_json::to_string(&params).unwrap()
         );
         assert_eq!(
-            r.syntactic.raw.as_deref(),
+            r.facts.raw.as_deref(),
             Some(expected_raw.as_str()),
             "raw must be '<server>.<tool>(<compact-json-params>)' (compact, no whitespace)"
         );
@@ -336,7 +336,7 @@ mod tests {
     #[test]
     fn raw_uses_compact_json_not_pretty_printed() {
         let r = representative_record();
-        let raw = r.syntactic.raw.as_deref().expect("raw must be Some");
+        let raw = r.facts.raw.as_deref().expect("raw must be Some");
         assert!(
             !raw.contains('\n') && !raw.contains("  "),
             "raw must use compact (not pretty-printed) JSON; got: {raw}"
@@ -350,11 +350,11 @@ mod tests {
     fn command_surface_fields_are_none() {
         let r = representative_record();
         assert!(
-            r.syntactic.argv.is_none(),
+            r.facts.argv.is_none(),
             "argv must be None for mcp_tool_call surface"
         );
         assert!(
-            r.syntactic.cwd.is_none(),
+            r.facts.cwd.is_none(),
             "cwd must be None for mcp_tool_call surface"
         );
     }
@@ -380,12 +380,12 @@ mod tests {
     fn empty_params_object_preserved() {
         let r = action_from_mcp_tool_call("server", "list_items", json!({}));
         assert_eq!(
-            r.syntactic.params,
+            r.facts.params,
             Some(json!({})),
             "empty params object must be preserved verbatim"
         );
         // raw must contain the empty object, not omit params
-        let raw = r.syntactic.raw.as_deref().expect("raw must be Some");
+        let raw = r.facts.raw.as_deref().expect("raw must be Some");
         assert!(
             raw.ends_with("({})"),
             "raw for empty params must end with '({{}})'; got: {raw}"
@@ -401,7 +401,7 @@ mod tests {
         let array_params = json!(["file1.txt", "file2.txt"]);
         let r = action_from_mcp_tool_call("server", "list_files", array_params.clone());
         assert_eq!(
-            r.syntactic.params,
+            r.facts.params,
             Some(array_params),
             "array params must be preserved verbatim (params is typed as serde_json::Value, \
              not restricted to objects)"
@@ -419,7 +419,7 @@ mod tests {
             serde_json::from_str(&serialised).expect("must deserialise back");
 
         assert_eq!(
-            deserialised.syntactic.params,
+            deserialised.facts.params,
             Some(array_params),
             "array params must survive a serde round-trip"
         );
@@ -446,22 +446,22 @@ mod tests {
     #[test]
     fn agent_tool_call_server_and_tool_are_set() {
         let r = action_from_agent_tool_call("openclaw", "deploy_service", None);
-        assert_eq!(r.syntactic.server.as_deref(), Some("openclaw"));
-        assert_eq!(r.syntactic.tool.as_deref(), Some("deploy_service"));
+        assert_eq!(r.facts.server.as_deref(), Some("openclaw"));
+        assert_eq!(r.facts.tool.as_deref(), Some("deploy_service"));
     }
 
-    /// docs/openclaw-integration.md §5.2: `syntactic.params` is absent (not `null`) when the
+    /// docs/openclaw-integration.md §5.2: `facts.params` is absent (not `null`) when the
     /// caller has no structured parameters to offer.
     #[test]
     fn agent_tool_call_params_absent_when_none() {
         let r = action_from_agent_tool_call("openclaw", "deploy_service", None);
         assert!(
-            r.syntactic.params.is_none(),
+            r.facts.params.is_none(),
             "params must be None when the caller passes None"
         );
         let val: serde_json::Value = serde_json::to_value(&r).unwrap();
         assert!(
-            val["syntactic"].get("params").is_none(),
+            val["facts"].get("params").is_none(),
             "params: None must be omitted from JSON, not serialized as null"
         );
     }
@@ -472,17 +472,14 @@ mod tests {
     fn agent_tool_call_params_preserved_when_some() {
         let params = json!({ "target": "prod" });
         let r = action_from_agent_tool_call("openclaw", "deploy_service", Some(params.clone()));
-        assert_eq!(r.syntactic.params, Some(params));
+        assert_eq!(r.facts.params, Some(params));
     }
 
     /// raw must be `"<server>.<tool>()"` when params is None (see module-level doc format).
     #[test]
     fn agent_tool_call_raw_uses_empty_parens_when_params_absent() {
         let r = action_from_agent_tool_call("openclaw", "deploy_service", None);
-        assert_eq!(
-            r.syntactic.raw.as_deref(),
-            Some("openclaw.deploy_service()")
-        );
+        assert_eq!(r.facts.raw.as_deref(), Some("openclaw.deploy_service()"));
     }
 
     /// raw must be `"<server>.<tool>(<compact-json-params>)"` when params is Some, matching
@@ -495,7 +492,7 @@ mod tests {
             "openclaw.deploy_service({})",
             serde_json::to_string(&params).unwrap()
         );
-        assert_eq!(r.syntactic.raw.as_deref(), Some(expected_raw.as_str()));
+        assert_eq!(r.facts.raw.as_deref(), Some(expected_raw.as_str()));
     }
 
     /// Command-surface and file-edit-surface fields must all be None for an agent_tool_call
@@ -503,12 +500,12 @@ mod tests {
     #[test]
     fn agent_tool_call_command_and_file_edit_fields_are_none() {
         let r = action_from_agent_tool_call("openclaw", "deploy_service", None);
-        assert!(r.syntactic.argv.is_none());
-        assert!(r.syntactic.cwd.is_none());
-        assert!(r.syntactic.operation.is_none());
-        assert!(r.syntactic.paths.is_none());
-        assert!(r.syntactic.diff_summary.is_none());
-        assert!(r.syntactic.diff_hash.is_none());
+        assert!(r.facts.argv.is_none());
+        assert!(r.facts.cwd.is_none());
+        assert!(r.facts.operation.is_none());
+        assert!(r.facts.paths.is_none());
+        assert!(r.facts.diff_summary.is_none());
+        assert!(r.facts.diff_hash.is_none());
     }
 
     /// Same inputs (including the `None` params) must produce identical ActionRecords.
@@ -543,16 +540,16 @@ mod tests {
         assert_ne!(mcp.surface, agent.surface);
         assert_eq!(agent.surface, Surface::AgentToolCall);
         assert_eq!(mcp.surface, Surface::McpToolCall);
-        assert_eq!(mcp.syntactic.server, agent.syntactic.server);
-        assert_eq!(mcp.syntactic.tool, agent.syntactic.tool);
-        assert_eq!(mcp.syntactic.params, agent.syntactic.params);
-        assert_eq!(mcp.syntactic.raw, agent.syntactic.raw);
+        assert_eq!(mcp.facts.server, agent.facts.server);
+        assert_eq!(mcp.facts.tool, agent.facts.tool);
+        assert_eq!(mcp.facts.params, agent.facts.params);
+        assert_eq!(mcp.facts.raw, agent.facts.raw);
     }
 
     // ── action_from_agent_tool_call_with_raw ─────────────────────────────────────
 
     /// The whole point of the `_with_raw` builder: `raw` is bound verbatim, never the synthesized
-    /// `<server>.<tool>()` display (docs/openclaw-integration.md §5.2: `syntactic.raw` =
+    /// `<server>.<tool>()` display (docs/openclaw-integration.md §5.2: `facts.raw` =
     /// `description`, plus `detail` when present).
     #[test]
     fn agent_tool_call_with_raw_binds_raw_verbatim() {
@@ -563,7 +560,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            r.syntactic.raw.as_deref(),
+            r.facts.raw.as_deref(),
             Some("This plugin wants to deploy to production.")
         );
     }
@@ -579,8 +576,8 @@ mod tests {
             "custom reviewer prose",
             Some(params.clone()),
         );
-        assert_eq!(r.syntactic.raw.as_deref(), Some("custom reviewer prose"));
-        assert_eq!(r.syntactic.params.as_ref(), Some(&params));
+        assert_eq!(r.facts.raw.as_deref(), Some("custom reviewer prose"));
+        assert_eq!(r.facts.params.as_ref(), Some(&params));
     }
 
     /// Surface, schema version and server/tool identity remain independent of caller prose;
@@ -593,11 +590,11 @@ mod tests {
 
         assert_eq!(plain.surface, with_raw.surface);
         assert_eq!(plain.record_schema_version, with_raw.record_schema_version);
-        assert_eq!(plain.syntactic.server, with_raw.syntactic.server);
-        assert_eq!(plain.syntactic.tool, with_raw.syntactic.tool);
-        assert_eq!(plain.syntactic.params, with_raw.syntactic.params);
+        assert_eq!(plain.facts.server, with_raw.facts.server);
+        assert_eq!(plain.facts.tool, with_raw.facts.tool);
+        assert_eq!(plain.facts.params, with_raw.facts.params);
 
-        assert_ne!(plain.syntactic.raw, with_raw.syntactic.raw);
+        assert_ne!(plain.facts.raw, with_raw.facts.raw);
     }
 
     /// An empty `raw` string is bound as-is (empty string, not `None`) — the caller is
@@ -605,7 +602,7 @@ mod tests {
     #[test]
     fn agent_tool_call_with_raw_accepts_empty_string_verbatim() {
         let r = action_from_agent_tool_call_with_raw("openclaw", "deploy_service", "", None);
-        assert_eq!(r.syntactic.raw.as_deref(), Some(""));
+        assert_eq!(r.facts.raw.as_deref(), Some(""));
     }
 
     /// An `agent_tool_call_with_raw` record must survive a full serde round-trip.

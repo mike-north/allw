@@ -58,7 +58,7 @@ fn raw_context(surface: &str, raw: &str) -> ApprovalContext {
         "action": {
             "record_schema_version": 3,
             "surface": surface,
-            "syntactic": { "raw": raw },
+            "facts": { "raw": raw },
             "risk": "high"
         },
         "summary": "s",
@@ -129,7 +129,7 @@ fn every_raw_lines_case_matches_the_vector() {
     for case in &vector.raw_lines_cases {
         let model = display_model(&raw_context(&case.surface, &case.raw));
         assert_eq!(
-            model.syntactic.raw_lines.as_ref(),
+            model.facts.raw_lines.as_ref(),
             Some(&case.raw_lines),
             "class: {}",
             case.class

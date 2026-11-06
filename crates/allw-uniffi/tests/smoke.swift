@@ -34,13 +34,13 @@ struct Smoke {
             let captured = try actionFromCommandJson(command: raw, cwd: "/caller")
             guard let data = captured.data(using: .utf8),
                   let record = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let facts = record["syntactic"] as? [String: Any],
+                  let facts = record["facts"] as? [String: Any],
                   facts["raw"] as? String == raw, facts["argv"] == nil,
                   facts["bin"] == nil, record["record_schema_version"] as? Int == 3
             else { fatalError("opaque caller facts changed at the Swift boundary") }
         }
-        let legacyContext = context.replacingOccurrences(of: "\"syntactic\":{",
-            with: "\"syntactic\":{\"bin\":{},\"flags\":false,\"positionals\":1,\"host\":[],\"env_refs\":0,")
+        let legacyContext = context.replacingOccurrences(of: "\"facts\":{",
+            with: "\"facts\":{\"bin\":{},\"flags\":false,\"positionals\":1,\"host\":[],\"env_refs\":0,")
         if try computeRequestHashB64(contextJson: legacyContext, expiresAt: 4102444800000) != hash {
             fatalError("removed fields must be ignored at the Swift boundary")
         }

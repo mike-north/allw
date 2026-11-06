@@ -9,8 +9,8 @@
 use allw_core::{
     compute_request_hash, encrypt_context, sign_account_state, sign_actor_attestation,
     AccountState, AccountStateActor, AccountStateRevocation, AccountStateRevocationKind,
-    ActionRecord, Actor, ApprovalContext, Constraints, ContextRecipient, Decision, SigningKeyPair,
-    Surface, SyntacticSubstrate, X25519KeyPair,
+    ActionRecord, Actor, ApprovalContext, Constraints, ContextRecipient, Decision, Facts,
+    SigningKeyPair, Surface, X25519KeyPair,
 };
 use allw_uniffi::{
     action_from_agent_tool_call_json, action_from_agent_tool_call_with_raw_json,
@@ -351,7 +351,7 @@ fn make_attested_context() -> ApprovalContext {
         action: ActionRecord {
             record_schema_version: 3,
             surface: Surface::Command,
-            syntactic: SyntacticSubstrate {
+            facts: Facts {
                 argv: None,
                 cwd: None,
                 server: None,
@@ -709,10 +709,10 @@ fn action_from_agent_tool_call_json_builds_agent_tool_call_action() {
     let action: serde_json::Value = serde_json::from_str(&action_json).unwrap();
 
     assert_eq!(action["surface"], "agent_tool_call");
-    assert_eq!(action["syntactic"]["server"], "openclaw");
-    assert_eq!(action["syntactic"]["tool"], "deploy_service");
+    assert_eq!(action["facts"]["server"], "openclaw");
+    assert_eq!(action["facts"]["tool"], "deploy_service");
     assert!(
-        action["syntactic"].get("params").is_none(),
+        action["facts"].get("params").is_none(),
         "params must be absent (not null) when params_json is empty"
     );
 }
@@ -731,7 +731,7 @@ fn action_from_agent_tool_call_json_with_params_preserves_them_verbatim() {
     .unwrap();
     let action: serde_json::Value = serde_json::from_str(&action_json).unwrap();
 
-    assert_eq!(action["syntactic"]["params"], json!({ "target": "prod" }));
+    assert_eq!(action["facts"]["params"], json!({ "target": "prod" }));
 }
 
 /// A distinct-surface `agent_tool_call` record and an `mcp_tool_call` record built from the
@@ -815,14 +815,14 @@ fn action_from_agent_tool_call_with_raw_json_binds_raw_verbatim() {
     let action: serde_json::Value = serde_json::from_str(&action_json).unwrap();
 
     assert_eq!(action["surface"], "agent_tool_call");
-    assert_eq!(action["syntactic"]["server"], "openclaw");
-    assert_eq!(action["syntactic"]["tool"], "deploy_service");
+    assert_eq!(action["facts"]["server"], "openclaw");
+    assert_eq!(action["facts"]["tool"], "deploy_service");
     assert_eq!(
-        action["syntactic"]["raw"],
+        action["facts"]["raw"],
         "This plugin wants to deploy to production."
     );
     assert!(
-        action["syntactic"].get("params").is_none(),
+        action["facts"].get("params").is_none(),
         "params must be absent (not null) when params_json is empty"
     );
 }
@@ -907,7 +907,7 @@ fn display_model_json_escapes_untrusted_context_text() {
         "action": {
             "record_schema_version": 3,
             "surface": "command",
-            "syntactic": { "raw": "rm -rf ~/x; : \u{1b}[2K\rgit status" },
+            "facts": { "raw": "rm -rf ~/x; : \u{1b}[2K\rgit status" },
             "risk": "high"
         },
         "summary": "check \u{202E}status",
@@ -921,10 +921,7 @@ fn display_model_json_escapes_untrusted_context_text() {
         serde_json::from_str(&allw_uniffi::display_model_json(context.to_string()).unwrap())
             .unwrap();
 
-    assert_eq!(
-        model["syntactic"]["raw"],
-        "rm -rf ~/x; : \\x1b[2K\\rgit status"
-    );
+    assert_eq!(model["facts"]["raw"], "rm -rf ~/x; : \\x1b[2K\\rgit status");
     assert_eq!(model["summary"], "check ⟨U+202E⟩status");
     assert_eq!(model["has_hidden_or_control_chars"], true);
 }
@@ -988,14 +985,14 @@ fn opaque_commands_and_removed_fields_match_core() {
                 .unwrap();
         assert_eq!(
             record,
-            json!({"record_schema_version": 3, "surface": "command", "syntactic": {"raw": raw, "cwd": "/caller"}})
+            json!({"record_schema_version": 3, "surface": "command", "facts": {"raw": raw, "cwd": "/caller"}})
         );
     }
     for raw in ["", " \t\r\n", "\u{a0}\u{3000}"] {
         assert!(action_from_command_json(raw.into(), String::new()).is_err());
     }
     let context = json!({
-        "action": {"record_schema_version": 3, "surface": "command", "syntactic": {"raw": "ssh $HOST"}},
+        "action": {"record_schema_version": 3, "surface": "command", "facts": {"raw": "ssh $HOST"}},
         "summary": "caller", "actor": {"id": "script", "kind": "script"},
         "constraints": {"allowed_decisions": ["approved", "denied"], "challenge_required": false}
     });
@@ -1008,7 +1005,7 @@ fn opaque_commands_and_removed_fields_match_core() {
         ("host", json!([])),
         ("env_refs", json!("x")),
     ] {
-        legacy["action"]["syntactic"][key] = value;
+        legacy["action"]["facts"][key] = value;
     }
     assert_eq!(
         before,
@@ -1018,7 +1015,7 @@ fn opaque_commands_and_removed_fields_match_core() {
         serde_json::from_str(&allw_uniffi::display_model_json(legacy.to_string()).unwrap())
             .unwrap();
     assert_eq!(
-        display["syntactic"],
+        display["facts"],
         json!({"raw": "ssh $HOST", "raw_lines": ["ssh $HOST"]})
     );
 }

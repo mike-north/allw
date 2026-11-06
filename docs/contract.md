@@ -116,7 +116,8 @@ Core contract objects retain serde's existing **ignore unknown fields** behavior
 WASM and UniFFI. Removed `risk`, `capabilities`, `scope`, `policy`, and parsing-only substrate keys
 (`bin`, `flags`, `positionals`, `host`, `env_refs`) are unknown, are not retained
 or reserialized, and cannot influence the new canonical hash. This is not a compatibility mode:
-old signed hashes do not verify under the new hash domain. Malformed known fields and missing required
+old signed hashes do not verify under the current canonical contract. The removed `syntactic`
+member is ignored, never aliased; `facts` remains required. Malformed known fields and missing required
 fields still fail closed. SDK command-builder output validation requires the exact current core output shape.
 
 `reversible` is an optional boolean asserted by the caller. Absent or null means no assertion and is
@@ -405,7 +406,12 @@ where `JCS(...)` is the [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785) JSON 
 the single flat object above (object keys lexicographically sorted by JCS; `expires_at` canonicalizes as a sibling
 of `action`/`summary`/…). The `0x00` byte separates the domain tag from the payload.
 
-**Versioning:** schema 3 removes interpretation and derived substrate fields after schema 2 removed
+**Versioning:** the final pre-deploy `syntactic` → `facts` rename keeps schema 3 and the domains
+below because no schema-3 build has been deployed or published. It changes canonical bytes and
+digests; no alias or history migration is supplied. Within `action`, JCS orders `facts`,
+`record_schema_version`, then `surface`.
+
+Schema 3 removes interpretation and derived substrate fields after schema 2 removed
 risk/policy slots and optionalized reversibility. The domain is `b"allw/request-hash/v4"`;
 prior v2/v3 request hashes cannot verify as current-format receipts. Audit records use
 `allw/audit-record/v3` for this second record-shape break. Preserve old history as explicitly unverifiable

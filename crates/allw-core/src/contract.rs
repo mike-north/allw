@@ -102,7 +102,7 @@ pub enum Decision {
     Aborted,
 }
 
-// ── SyntacticSubstrate ────────────────────────────────────────────────────────
+// ── Facts ────────────────────────────────────────────────────────
 
 /// Caller-described facts bound into one human decision; no command meaning is inferred.
 ///
@@ -112,7 +112,7 @@ pub enum Decision {
 /// caller description on tool surfaces. Unknown fields retain serde's ignore behavior.
 /// @see docs/action-record.md — The action record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SyntacticSubstrate {
+pub struct Facts {
     // ── command-surface fields ────────────────────────────────────────────────
     /// Caller-supplied argument vector, including its first word (e.g. `["git", "push", "--force"]`).
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -168,14 +168,15 @@ pub struct SyntacticSubstrate {
 /// Raw and supplied argv are independent caller facts; both remain hash-bound when present.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActionRecord {
-    /// Schema version for this record shape. Bumped only on a breaking change.
+    /// Schema version for this record shape. Schema 3 carries opaque caller facts.
+    /// The final unpublished `facts` naming change retains 3; no old-key alias is supported.
     pub record_schema_version: u32,
 
     /// The interception paradigm this action arrived through.
     pub surface: Surface,
 
     /// Caller facts retained without interpreting command meaning or deriving metadata.
-    pub syntactic: SyntacticSubstrate,
+    pub facts: Facts,
 }
 
 // ── Actor ─────────────────────────────────────────────────────────────────────
@@ -518,8 +519,8 @@ mod tests {
         }
     }
 
-    fn make_syntactic_command() -> SyntacticSubstrate {
-        SyntacticSubstrate {
+    fn make_facts_command() -> Facts {
+        Facts {
             argv: Some(vec![
                 "git".to_string(),
                 "push".to_string(),
@@ -541,7 +542,7 @@ mod tests {
         ActionRecord {
             record_schema_version: 3,
             surface: Surface::Command,
-            syntactic: make_syntactic_command(),
+            facts: make_facts_command(),
         }
     }
 
@@ -644,10 +645,10 @@ mod tests {
     }
 
     #[test]
-    fn syntactic_substrate_round_trip() {
-        let orig = make_syntactic_command();
+    fn facts_substrate_round_trip() {
+        let orig = make_facts_command();
         let json = serde_json::to_string(&orig).unwrap();
-        let back: SyntacticSubstrate = serde_json::from_str(&json).unwrap();
+        let back: Facts = serde_json::from_str(&json).unwrap();
         assert_eq!(orig, back);
     }
 
@@ -655,8 +656,8 @@ mod tests {
     /// mcp-surface fields coexist under their own snake_case keys. Pin the field names and the
     /// flat shape so a rename or accidental nesting is caught.
     #[test]
-    fn syntactic_substrate_is_flat_with_snake_case_field_names() {
-        let s = SyntacticSubstrate {
+    fn facts_substrate_is_flat_with_snake_case_field_names() {
+        let s = Facts {
             argv: Some(vec!["git".into(), "status".into()]),
             cwd: None,
             server: Some("omnifocus".to_string()),
@@ -871,7 +872,7 @@ mod tests {
         let bad_json = r#"{
             "record_schema_version": 3,
             "surface": "totally_unknown_surface",
-            "syntactic": {},
+            "facts": {},
             "risk": "low"
         }"#;
         let result: Result<ActionRecord, _> = serde_json::from_str(bad_json);

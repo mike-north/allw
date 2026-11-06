@@ -210,7 +210,7 @@ pub fn action_from_agent_tool_call_json(
 /// with an **explicit** `raw` override instead of the synthesized `"<server>.<tool>(...)"`
 /// display. Use this when the caller already holds human-authored reviewer prose for the action
 /// (e.g. an OpenClaw plugin permission request's `description`/`detail` —
-/// `docs/openclaw-integration.md` §5.2: `syntactic.raw` = `description`, plus `detail` when
+/// `docs/openclaw-integration.md` §5.2: `facts.raw` = `description`, plus `detail` when
 /// present); use [`action_from_agent_tool_call_json`] when no such prose exists.
 ///
 /// `raw` is bound **verbatim** — it is never re-derived from `params_json`.

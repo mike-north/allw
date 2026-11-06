@@ -1,6 +1,6 @@
 //! # Display safety: visible escaping of untrusted approval text
 //!
-//! Every string an approver surface shows the human — the summary, the actor, every syntactic
+//! Every string an approver surface shows the human — the summary, the actor, every caller-facts
 //! substrate field — is **attacker-influenced plaintext**. WYSIWYS (`docs/contract.md`
 //! §Invariants #3) binds the verdict to the exact bytes the human saw, but that guarantee is only
 //! as strong as the rendering: a string carrying `ESC [2K` + `CR` can erase and repaint its own
@@ -163,7 +163,7 @@ use std::fmt::Write as _;
 
 use serde::Serialize;
 
-use crate::contract::{ApprovalContext, Surface, SyntacticSubstrate};
+use crate::contract::{ApprovalContext, Facts, Surface};
 
 mod unicode_tables;
 
@@ -442,12 +442,12 @@ fn content_lines(text: &str, crlf_is_structure: bool) -> (Vec<String>, bool) {
     (lines, flagged)
 }
 
-/// The escaped syntactic substrate of an action: each field of [`SyntacticSubstrate`], rendered
+/// The escaped facts substrate of an action: each field of [`Facts`], rendered
 /// for display.
 ///
 /// A field is present exactly when the source substrate field is present, so a surface can apply
 /// the same "show it whenever it is hash-bound" rules it applies today. This is deliberately a
-/// different type from [`SyntacticSubstrate`]: its strings are a rendering of hashed bytes and must
+/// different type from [`Facts`]: its strings are a rendering of hashed bytes and must
 /// never be fed back into hashing, matching, or a wire message.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -524,8 +524,8 @@ pub struct DisplayModel {
     pub actor_kind: String,
     /// The actor as one label, `"<id> (<kind>)"`, both parts escaped.
     pub actor_label: String,
-    /// The escaped syntactic substrate (`cwd` lives here as [`DisplaySubstrate::cwd`]).
-    pub syntactic: DisplaySubstrate,
+    /// The escaped facts substrate (`cwd` lives here as [`DisplaySubstrate::cwd`]).
+    pub facts: DisplaySubstrate,
     /// Escaped upstream-gate ids.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chain: Option<Vec<String>>,
@@ -573,7 +573,7 @@ impl Escaper {
         }
     }
 
-    fn substrate(&mut self, surface: Surface, s: &SyntacticSubstrate) -> DisplaySubstrate {
+    fn substrate(&mut self, surface: Surface, s: &Facts) -> DisplaySubstrate {
         let (params_json, params_json_lines) = match &s.params {
             Some(params) => {
                 self.scan_json(params);
@@ -629,7 +629,7 @@ pub fn display_model(context: &ApprovalContext) -> DisplayModel {
     let actor_id = esc.text(&context.actor.id);
     let actor_kind = esc.text(&context.actor.kind);
     let actor_label = format!("{actor_id} ({actor_kind})");
-    let syntactic = esc.substrate(context.action.surface, &context.action.syntactic);
+    let facts = esc.substrate(context.action.surface, &context.action.facts);
     let chain = esc.list(context.chain.as_ref());
     DisplayModel {
         surface: context.action.surface,
@@ -638,7 +638,7 @@ pub fn display_model(context: &ApprovalContext) -> DisplayModel {
         actor_id,
         actor_kind,
         actor_label,
-        syntactic,
+        facts,
         chain,
         has_hidden_or_control_chars: esc.found,
     }
@@ -660,12 +660,12 @@ mod tests {
 
     const EXPIRES_AT: i64 = 1_700_003_600_000;
 
-    fn context_with(surface: Surface, syntactic: SyntacticSubstrate) -> ApprovalContext {
+    fn context_with(surface: Surface, facts: Facts) -> ApprovalContext {
         ApprovalContext {
             action: ActionRecord {
                 record_schema_version: 3,
                 surface,
-                syntactic,
+                facts,
             },
             summary: "delete a directory".to_string(),
             actor: Actor {
@@ -683,8 +683,8 @@ mod tests {
         }
     }
 
-    fn empty_substrate() -> SyntacticSubstrate {
-        SyntacticSubstrate {
+    fn empty_substrate() -> Facts {
+        Facts {
             argv: None,
             cwd: None,
             server: None,
@@ -1077,7 +1077,7 @@ mod tests {
     fn display_model_escapes_every_context_string_and_sets_the_flag() {
         let mut ctx = context_with(
             Surface::Command,
-            SyntacticSubstrate {
+            Facts {
                 argv: Some(vec!["rm".into(), "-rf".into(), "~/x\u{1b}[2K".into()]),
                 cwd: Some("/repo\u{202E}".to_string()),
                 raw: Some(SPOOF.to_string()),
@@ -1096,7 +1096,7 @@ mod tests {
         assert_eq!(model.actor_kind, "kind\\x00");
         assert_eq!(model.actor_label, "machine:⟨U+202E⟩ci (kind\\x00)");
         assert_eq!(model.chain, Some(vec!["gate⟨U+009B⟩".to_string()]));
-        let s = &model.syntactic;
+        let s = &model.facts;
         assert_eq!(
             s.argv,
             Some(vec!["rm".into(), "-rf".into(), "~/x\\x1b[2K".into()])
@@ -1117,7 +1117,7 @@ mod tests {
     fn clean_context_does_not_set_the_flag() {
         let ctx = context_with(
             Surface::Command,
-            SyntacticSubstrate {
+            Facts {
                 argv: Some(vec!["git".into(), "status".into()]),
                 raw: Some("git status".into()),
                 ..empty_substrate()
@@ -1126,7 +1126,7 @@ mod tests {
         let model = display_model(&ctx);
         assert!(!model.has_hidden_or_control_chars);
         assert_eq!(model.actor_label, "machine:ci (claude-code)");
-        assert_eq!(model.syntactic.raw.as_deref(), Some("git status"));
+        assert_eq!(model.facts.raw.as_deref(), Some("git status"));
     }
 
     #[test]
@@ -1138,15 +1138,13 @@ mod tests {
             ("actor.id", |c| c.actor.id.push('\u{1b}')),
             ("actor.kind", |c| c.actor.kind.push('\u{200B}')),
             ("chain", |c| c.chain = Some(vec!["\r".into()])),
-            ("cwd", |c| c.action.syntactic.cwd = Some("\u{85}".into())),
-            ("tool", |c| {
-                c.action.syntactic.tool = Some("t\u{2066}".into())
-            }),
+            ("cwd", |c| c.action.facts.cwd = Some("\u{85}".into())),
+            ("tool", |c| c.action.facts.tool = Some("t\u{2066}".into())),
             ("server", |c| {
-                c.action.syntactic.server = Some("\u{FEFF}s".into())
+                c.action.facts.server = Some("\u{FEFF}s".into())
             }),
             ("diff_hash", |c| {
-                c.action.syntactic.diff_hash = Some("\u{0}".into())
+                c.action.facts.diff_hash = Some("\u{0}".into())
             }),
         ];
         for (name, mutate) in cases {
@@ -1161,7 +1159,7 @@ mod tests {
     fn params_are_rendered_as_escaped_json_and_scanned_for_the_flag() {
         let ctx = context_with(
             Surface::McpToolCall,
-            SyntacticSubstrate {
+            Facts {
                 server: Some("fs".into()),
                 tool: Some("write".into()),
                 params: Some(serde_json::json!({
@@ -1175,11 +1173,11 @@ mod tests {
         assert!(model.has_hidden_or_control_chars);
         // Sorted keys; JSON escapes ESC as \u001b; the bidi override gets display notation.
         assert_eq!(
-            model.syntactic.params_json.as_deref(),
+            model.facts.params_json.as_deref(),
             Some(r#"{"body":"x\u001by","path":"/tmp/a⟨U+202E⟩txt"}"#)
         );
         assert_eq!(
-            model.syntactic.params_json_lines,
+            model.facts.params_json_lines,
             Some(vec![
                 "{".to_string(),
                 r#"  "body": "x\u001by","#.to_string(),
@@ -1193,7 +1191,7 @@ mod tests {
     fn hidden_characters_in_a_params_key_set_the_flag() {
         let ctx = context_with(
             Surface::McpToolCall,
-            SyntacticSubstrate {
+            Facts {
                 params: Some(serde_json::json!({ "pa\u{200B}th": 1 })),
                 ..empty_substrate()
             },
@@ -1205,7 +1203,7 @@ mod tests {
     fn clean_params_do_not_set_the_flag() {
         let ctx = context_with(
             Surface::McpToolCall,
-            SyntacticSubstrate {
+            Facts {
                 params: Some(serde_json::json!({ "path": "/tmp/a", "n": [1, true, null] })),
                 ..empty_substrate()
             },
@@ -1217,7 +1215,7 @@ mod tests {
     fn file_edit_lines_split_on_line_feed_without_flagging_it() {
         let ctx = context_with(
             Surface::FileEdit,
-            SyntacticSubstrate {
+            Facts {
                 operation: Some("patch".into()),
                 paths: Some(vec!["src/a.rs".into()]),
                 raw: Some("-old\n+new".into()),
@@ -1227,17 +1225,17 @@ mod tests {
         let model = display_model(&ctx);
         assert!(!model.has_hidden_or_control_chars);
         assert_eq!(
-            model.syntactic.raw_lines,
+            model.facts.raw_lines,
             Some(vec!["-old".to_string(), "+new".to_string()])
         );
-        assert_eq!(model.syntactic.raw.as_deref(), Some("-old\\n+new"));
+        assert_eq!(model.facts.raw.as_deref(), Some("-old\\n+new"));
     }
 
     #[test]
     fn file_edit_cr_and_bidi_inside_a_line_set_the_flag() {
         let ctx = context_with(
             Surface::FileEdit,
-            SyntacticSubstrate {
+            Facts {
                 raw: Some("-old\r\n+ne\u{202E}w".into()),
                 ..empty_substrate()
             },
@@ -1245,7 +1243,7 @@ mod tests {
         let model = display_model(&ctx);
         assert!(model.has_hidden_or_control_chars);
         assert_eq!(
-            model.syntactic.raw_lines,
+            model.facts.raw_lines,
             Some(vec!["-old␍".to_string(), "+ne⟨U+202E⟩w".to_string()])
         );
     }
@@ -1253,7 +1251,7 @@ mod tests {
     fn raw_model(surface: Surface, raw: &str) -> DisplayModel {
         display_model(&context_with(
             surface,
-            SyntacticSubstrate {
+            Facts {
                 raw: Some(raw.into()),
                 ..empty_substrate()
             },
@@ -1268,7 +1266,7 @@ mod tests {
         );
         assert!(!model.has_hidden_or_control_chars);
         assert_eq!(
-            model.syntactic.raw_lines,
+            model.facts.raw_lines,
             Some(vec![
                 "func main() {␍".to_string(),
                 "→   fmt.Println(\"hi\")␍".to_string(),
@@ -1283,7 +1281,7 @@ mod tests {
         let model = raw_model(Surface::Command, raw);
         assert!(!model.has_hidden_or_control_chars);
         assert_eq!(
-            model.syntactic.raw_lines,
+            model.facts.raw_lines,
             Some(vec![
                 "git commit -m \"$(cat <<'EOF'".to_string(),
                 "fix: a thing".to_string(),
@@ -1295,7 +1293,7 @@ mod tests {
         );
         // The single-line form still shows every separator.
         assert_eq!(
-            model.syntactic.raw.as_deref(),
+            model.facts.raw.as_deref(),
             Some("git commit -m \"$(cat <<'EOF'\\nfix: a thing\\n\\n\\tdetail\\nEOF\\n)\"")
         );
     }
@@ -1306,7 +1304,7 @@ mod tests {
             let model = raw_model(surface, "echo ok\nrm -rf ~/x; : \u{1b}[2K\rgit status");
             assert!(model.has_hidden_or_control_chars, "{surface:?}");
             assert_eq!(
-                model.syntactic.raw_lines,
+                model.facts.raw_lines,
                 Some(vec![
                     "echo ok".to_string(),
                     "rm -rf ~/x; : \\x1b[2K\\rgit status".to_string(),
@@ -1327,7 +1325,7 @@ mod tests {
             let model = raw_model(surface, "cd ../scratch\r\nrm -rf -- *");
             assert!(model.has_hidden_or_control_chars, "{surface:?}");
             assert_eq!(
-                model.syntactic.raw_lines,
+                model.facts.raw_lines,
                 Some(vec![
                     "cd ../scratch\\r".to_string(),
                     "rm -rf -- *".to_string()
@@ -1342,7 +1340,7 @@ mod tests {
         let model = raw_model(Surface::Command, "printf 'a\tb'\n\techo indented");
         assert!(!model.has_hidden_or_control_chars);
         assert_eq!(
-            model.syntactic.raw_lines,
+            model.facts.raw_lines,
             Some(vec![
                 "printf 'a→   b'".to_string(),
                 "→   echo indented".to_string()
@@ -1354,7 +1352,7 @@ mod tests {
     fn a_trailing_cr_with_no_line_feed_after_it_warns() {
         let model = raw_model(Surface::Command, "ls\r");
         assert!(model.has_hidden_or_control_chars);
-        assert_eq!(model.syntactic.raw_lines, Some(vec!["ls\\r".to_string()]));
+        assert_eq!(model.facts.raw_lines, Some(vec!["ls\\r".to_string()]));
     }
 
     #[test]
@@ -1362,9 +1360,9 @@ mod tests {
         type Mutator = fn(&mut ApprovalContext);
         let cases: [(&str, Mutator); 3] = [
             ("argv", |c| {
-                c.action.syntactic.argv = Some(vec!["rm\t-rf".into()])
+                c.action.facts.argv = Some(vec!["rm\t-rf".into()])
             }),
-            ("cwd", |c| c.action.syntactic.cwd = Some("/tmp\t".into())),
+            ("cwd", |c| c.action.facts.cwd = Some("/tmp\t".into())),
             ("summary", |c| c.summary.push('\n')),
         ];
         for (name, mutate) in cases {
@@ -1378,7 +1376,7 @@ mod tests {
     fn display_model_never_changes_the_request_hash() {
         let ctx = context_with(
             Surface::Command,
-            SyntacticSubstrate {
+            Facts {
                 raw: Some(SPOOF.to_string()),
                 ..empty_substrate()
             },
@@ -1391,7 +1389,7 @@ mod tests {
         // The hash binds the real bytes, not their display form: substituting the escaped text
         // yields a different hash.
         let mut displayed = ctx.clone();
-        displayed.action.syntactic.raw = model.syntactic.raw.clone();
+        displayed.action.facts.raw = model.facts.raw.clone();
         assert_ne!(compute_request_hash(&displayed, EXPIRES_AT), before);
     }
 
@@ -1399,7 +1397,7 @@ mod tests {
     fn model_serializes_with_snake_case_enums_and_omits_absent_fields() {
         let ctx = context_with(
             Surface::AgentToolCall,
-            SyntacticSubstrate {
+            Facts {
                 server: Some("plugin".into()),
                 tool: Some("t".into()),
                 ..empty_substrate()
@@ -1410,7 +1408,7 @@ mod tests {
         assert!(json.get("risk").is_none());
         assert_eq!(json["has_hidden_or_control_chars"], false);
         assert_eq!(
-            json["syntactic"],
+            json["facts"],
             serde_json::json!({ "server": "plugin", "tool": "t" })
         );
         assert!(json.get("chain").is_none());

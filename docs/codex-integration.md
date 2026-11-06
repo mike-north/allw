@@ -259,7 +259,7 @@ The hook reads the same allw config as the Claude Code hook — `~/.allw/config.
 With neither the file nor the overrides, or with an invalid file, every gated call is denied with a
 reason naming both ways to configure.
 
-For gated calls, the hook builds the syntactic `ActionRecord`, requests approval through
+For gated calls, the hook builds the facts `ActionRecord`, requests approval through
 `@allw/sdk`, and maps the verdict to what it writes to stdout. Only `deny` is ever an explicit wire
 decision; "allw does not block" is empty stdout and exit 0, never a bare
 `permissionDecision: "allow"` — see [Fail-Open Residual](#fail-open-residual) item 3 for why:
