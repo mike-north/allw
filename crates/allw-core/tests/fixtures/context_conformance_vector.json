@@ -6,7 +6,7 @@
     "action": {
       "record_schema_version": 3,
       "surface": "command",
-      "syntactic": {
+      "facts": {
         "argv": ["git", "push"],
         "raw": "git push"
       }
@@ -213,7 +213,7 @@
     {
       "class": "removed bin ignored even with formerly malformed shape",
       "set": {
-        "action.syntactic.bin": {
+        "action.facts.bin": {
           "ignored": true
         }
       },
@@ -222,7 +222,7 @@
     {
       "class": "removed flags ignored even with formerly malformed shape",
       "set": {
-        "action.syntactic.flags": {
+        "action.facts.flags": {
           "ignored": true
         }
       },
@@ -231,7 +231,7 @@
     {
       "class": "removed positionals ignored even with formerly malformed shape",
       "set": {
-        "action.syntactic.positionals": {
+        "action.facts.positionals": {
           "ignored": true
         }
       },
@@ -240,7 +240,7 @@
     {
       "class": "removed host ignored even with formerly malformed shape",
       "set": {
-        "action.syntactic.host": {
+        "action.facts.host": {
           "ignored": true
         }
       },
@@ -249,7 +249,7 @@
     {
       "class": "removed env_refs ignored even with formerly malformed shape",
       "set": {
-        "action.syntactic.env_refs": {
+        "action.facts.env_refs": {
           "ignored": true
         }
       },

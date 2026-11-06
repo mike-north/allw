@@ -18,7 +18,7 @@
  * (`docs/contract.md` §Invariants). Nothing here decides access — the caller still composes
  * `allow = approved ∧ verified ∧ policy ∧ other gates` from the verdict `requestApproval` returns.
  *
- * @see ../../../docs/action-record.md §ActionRecord (the syntactic substrate; `surface: "command"`)
+ * @see ../../../docs/action-record.md §ActionRecord (the facts substrate; `surface: "command"`)
  * @see ../../../docs/contract.md §Invariants (never returns "allow"; fail-closed; WYSIWYS)
  * @see ../../../crates/allw-wasm/src/lib.rs (`action_from_argv`, `action_from_command`)
  */
@@ -73,13 +73,13 @@ export class CommandActionError extends Error {
 /** Options for {@link commandAction}. */
 export interface CommandActionOptions {
   /**
-   * The working directory the command will run in, bound into `syntactic.cwd` so the human sees
+   * The working directory the command will run in, bound into `facts.cwd` so the human sees
    * where it runs. Must be non-blank. Omitted ⇒ the record is not bound to a directory.
    */
   readonly cwd?: string;
   /**
    * The original command text, for an upstream gate that already renders the command as text
-   * (e.g. an agent runtime's own display string). The core records it verbatim in `syntactic.raw`
+   * (e.g. an agent runtime's own display string). The core records it verbatim in `facts.raw`
    * without deriving any metadata from it; the bound vector remains exactly `argv`.
    * Omitted ⇒ no `raw`.
    *
@@ -101,7 +101,7 @@ interface CommandRequestCommon {
   /** One-line, human-readable summary shown in the notification. Must be non-blank. */
   readonly summary: string;
   /**
-   * The working directory the command will run in, bound into `syntactic.cwd` so the human sees
+   * The working directory the command will run in, bound into `facts.cwd` so the human sees
    * where it runs. Must be non-blank when given.
    *
    * @defaultValue `process.cwd()`, which is where `execFile` / `spawn` run the command unless told
@@ -165,7 +165,7 @@ export type CommandRequestInput = CommandRequestCommon &
 /**
  * Build a `command` {@link ActionRecord} from a pre-tokenized `argv`, using the core's
  * `action_from_argv`. The result is exactly the core's record (top-level keys camelCased,
- * `syntactic` passed through unchanged).
+ * `facts` passed through unchanged).
  *
  * @throws {@link CommandActionError} (as a rejection) if `argv` is not a non-empty array of
  * strings, or an option has the wrong type.
@@ -197,7 +197,7 @@ export async function commandAction(
 /**
  * Build a `command` {@link ActionRecord} from a shell-style command line, using the core's
  * `action_from_command`. The result is exactly the core's record (top-level keys camelCased,
- * `syntactic` passed through).
+ * `facts` passed through).
  *
  * A nonblank line is opaque caller text, including quotes, comments, operators, substitutions
  * and newlines. The builder records it verbatim without manufacturing argv or a program identity.
@@ -437,7 +437,7 @@ function optionalString(value: unknown, name: string): string | undefined {
 }
 
 /** The exact top-level keys of the current core command record; no policy/risk slots exist. */
-const CORE_RECORD_KEYS = ["record_schema_version", "surface", "syntactic"] as const;
+const CORE_RECORD_KEYS = ["record_schema_version", "surface", "facts"] as const;
 
 /**
  * Translate the core's snake_case `ActionRecord` JSON into the SDK's camelCase
@@ -471,7 +471,7 @@ export function actionRecordFromCoreJson(json: string): ActionRecord {
   }
   const version = record.record_schema_version;
   const surface = record.surface;
-  const syntactic = record.syntactic;
+  const rawFacts = record.facts;
   if (version !== 3) {
     throw new CommandActionError("core_record_invalid", "the core record has no schema version");
   }
@@ -481,12 +481,12 @@ export function actionRecordFromCoreJson(json: string): ActionRecord {
       `the core record surface is ${JSON.stringify(surface)}, not "command"`,
     );
   }
-  if (typeof syntactic !== "object" || syntactic === null || Array.isArray(syntactic)) {
-    throw new CommandActionError("core_record_invalid", "the core record has no syntactic object");
+  if (typeof rawFacts !== "object" || rawFacts === null || Array.isArray(rawFacts)) {
+    throw new CommandActionError("core_record_invalid", "the core record has no facts object");
   }
   // A command builder emits only these caller facts. Reject drift rather than silently
   // forwarding a record whose meaning or shape the SDK cannot represent faithfully.
-  const facts = Object.fromEntries(Object.entries(syntactic));
+  const facts = Object.fromEntries(Object.entries(rawFacts));
   if (
     Object.keys(facts).some((key) => !["raw", "cwd", "argv"].includes(key)) ||
     (facts.raw !== undefined && typeof facts.raw !== "string") ||
@@ -502,7 +502,7 @@ export function actionRecordFromCoreJson(json: string): ActionRecord {
       "the core command record has malformed caller facts",
     );
   }
-  return { recordSchemaVersion: version, surface, syntactic };
+  return { recordSchemaVersion: version, surface, facts: rawFacts };
 }
 
 /** A short type description for error messages (never echoes the value itself). */

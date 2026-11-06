@@ -640,7 +640,7 @@ describe("loadVapidSigningKey — the keypair must actually match", () => {
     ["an off-curve public point", offCurveVapid],
   ])("rejects %s, and the transport then makes no request", async (_name, build) => {
     const vapid = await build();
-    // Syntactically fine: only the cryptographic check can catch these.
+    // Factsally fine: only the cryptographic check can catch these.
     expect(
       vapidConfigFromEnv({
         VAPID_PUBLIC_KEY: vapid.publicKey,

@@ -63,7 +63,7 @@ test("approved Bash verdict does not block and carries a distinct Codex actor", 
   assert.equal(approver.calls[0].actor.id, `codex:${HOSTNAME}`);
   assert.equal(approver.calls[0].actor.kind, "codex");
   assert.equal(approver.calls[0].action.surface, "command");
-  assert.equal(approver.calls[0].action.syntactic.cwd, "/repo");
+  assert.equal(approver.calls[0].action.facts.cwd, "/repo");
   assert.deepEqual(approver.calls[0].chain, ["codex:tool_use_id:call-1"]);
 });
 
@@ -175,9 +175,9 @@ test("MCP tools are gated through the shared ActionRecord builder", async () => 
   assert.equal(output, null, "an approved verdict must be silence, not permissionDecision:'allow'");
   assertConformsToPreToolUseOutputContract(output);
   assert.equal(approver.calls[0].action.surface, "mcp_tool_call");
-  assert.equal(approver.calls[0].action.syntactic.server, "filesystem");
-  assert.equal(approver.calls[0].action.syntactic.tool, "write_file");
-  assert.deepEqual(approver.calls[0].action.syntactic.params, {
+  assert.equal(approver.calls[0].action.facts.server, "filesystem");
+  assert.equal(approver.calls[0].action.facts.tool, "write_file");
+  assert.deepEqual(approver.calls[0].action.facts.params, {
     path: "/tmp/a",
     content: "hello",
   });
@@ -211,9 +211,9 @@ test("Codex apply_patch is gated through the file_edit ActionRecord builder", as
   assertConformsToPreToolUseOutputContract(output);
   assert.equal(approver.calls.length, 1, "apply_patch must request approval");
   assert.equal(approver.calls[0].action.surface, "file_edit");
-  assert.equal(approver.calls[0].action.syntactic.operation, "patch");
-  assert.deepEqual(approver.calls[0].action.syntactic.paths, ["src/app.ts"]);
-  assert.equal(typeof approver.calls[0].action.syntactic.diff_hash, "string");
+  assert.equal(approver.calls[0].action.facts.operation, "patch");
+  assert.deepEqual(approver.calls[0].action.facts.paths, ["src/app.ts"]);
+  assert.equal(typeof approver.calls[0].action.facts.diff_hash, "string");
   assert.deepEqual(approver.calls[0].chain, ["codex:tool_use_id:patch-call-1"]);
 });
 
@@ -234,7 +234,7 @@ test("non-gated Codex tools pass through without config-time approval", async ()
 
 /**
  * The record the core builds for a command line, in the SDK's camelCase shape: top-level keys
- * translated, `syntactic` passed through unchanged (docs/action-record.md §ActionRecord). It reads
+ * translated, `facts` passed through unchanged (docs/action-record.md §ActionRecord). It reads
  * the core directly, not through the SDK path under test.
  */
 function coreCommandAction(wasm, command, cwd) {
@@ -244,7 +244,7 @@ function coreCommandAction(wasm, command, cwd) {
   return {
     recordSchemaVersion: core.record_schema_version,
     surface: core.surface,
-    syntactic: core.syntactic,
+    facts: core.facts,
   };
 }
 

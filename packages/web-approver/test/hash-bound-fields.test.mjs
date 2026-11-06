@@ -33,10 +33,10 @@ import { loadTestWasm } from "./wasm-helper.mjs";
 const here = dirname(fileURLToPath(import.meta.url));
 const ESC = "\u001b";
 
-/** A wire `ApprovalContext` for `surface` with `syntactic`, plus top-level overrides. */
-function context(surface, syntactic, overrides = {}) {
+/** A wire `ApprovalContext` for `surface` with `facts`, plus top-level overrides. */
+function context(surface, facts, overrides = {}) {
   return {
-    action: { record_schema_version: 3, surface, syntactic, risk: "high" },
+    action: { record_schema_version: 3, surface, facts, risk: "high" },
     summary: "push the release branch",
     actor: { id: "machine:laptop", kind: "claude-code" },
 
@@ -63,8 +63,8 @@ test("raw/argv divergence matches the shared CLI/web fixture", () => {
     readFileSync(join(here, "fixtures", "raw-argv-divergence.json"), "utf8"),
   );
   for (const c of fixture.cases) {
-    assert.equal(rawDivergesFromArgv(c.syntactic), c.diverges, `${c.name}: diverges`);
-    assert.equal(reconstructCommand(c.syntactic) ?? null, c.reconstructed, `${c.name}: line`);
+    assert.equal(rawDivergesFromArgv(c.facts), c.diverges, `${c.name}: diverges`);
+    assert.equal(reconstructCommand(c.facts) ?? null, c.reconstructed, `${c.name}: line`);
   }
 });
 
@@ -183,8 +183,8 @@ test("a file edit without a diff summary is headed by its operation and paths", 
  * Collect every string the core's display substrate holds (arrays flattened). `params_json` is
  * skipped: `params_json_lines` holds the same params laid out for display, and that is checked.
  */
-function substrateStrings(syntactic) {
-  return Object.entries(syntactic)
+function substrateStrings(facts) {
+  return Object.entries(facts)
     .filter(([key]) => key !== "params_json")
     .flatMap(([key, value]) => (Array.isArray(value) ? value : [value]).map((v) => [key, v]));
 }
@@ -210,7 +210,7 @@ test("every string in the core display substrate reaches the card (mutation guar
   );
   const wasm = await loadTestWasm();
   const display = JSON.parse(wasm.display_model(JSON.stringify(all)));
-  const expected = substrateStrings(display.syntactic);
+  const expected = substrateStrings(display.facts);
   // Guard the guard: the core returned every field the wire carried.
   assert.deepEqual([...new Set(expected.map(([key]) => key))].sort(), [
     "argv",
@@ -309,7 +309,7 @@ test("the card heading follows the CLI's precedence: shared CLI/web headline fix
   assert.equal(fixture.cases.length, 20);
   const shown = new Map();
   for (const c of fixture.cases) {
-    const card = onlyCard(await mountWith([context(c.surface, c.syntactic)]));
+    const card = onlyCard(await mountWith([context(c.surface, c.facts)]));
     const heading = card.querySelector("h3")?.textContent;
     assert.equal(heading, c.heading, c.name);
     // On a tool surface the caller's raw is a labelled description, never the heading (#321).

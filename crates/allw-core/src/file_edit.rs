@@ -1,11 +1,11 @@
-//! Build [`ActionRecord`]s for file-edit tool calls — T1 syntactic substrate only.
+//! Build [`ActionRecord`]s for file-edit tool calls — T1 facts substrate only.
 //!
 //! The relay and approver must treat file edits as first-class actions, not as an MCP/command
 //! approximation. This surface captures the paths being changed, the edit operation kind, and a
-//! compact diff summary plus hash. The full edit bytes are also stored in `syntactic.raw` so the
+//! compact diff summary plus hash. The full edit bytes are also stored in `facts.raw` so the
 //! approver can show the exact content the human is signing over.
 
-use crate::contract::{ActionRecord, Surface, SyntacticSubstrate};
+use crate::contract::{ActionRecord, Facts, Surface};
 use base64::Engine;
 use sha2::{Digest, Sha256};
 
@@ -23,7 +23,7 @@ pub fn action_from_file_edit(
     ActionRecord {
         record_schema_version: 3,
         surface: Surface::FileEdit,
-        syntactic: SyntacticSubstrate {
+        facts: Facts {
             argv: None,
             cwd: None,
             server: None,
@@ -50,21 +50,15 @@ mod tests {
 
         assert_eq!(record.surface, Surface::FileEdit);
         assert_eq!(record.record_schema_version, 3);
-        assert_eq!(record.syntactic.operation.as_deref(), Some("patch"));
+        assert_eq!(record.facts.operation.as_deref(), Some("patch"));
         assert_eq!(
-            record.syntactic.paths.as_deref(),
+            record.facts.paths.as_deref(),
             Some(&["src/app.ts".to_string()][..])
         );
+        assert_eq!(record.facts.diff_summary.as_deref(), Some("patch 1 file"));
+        assert_eq!(record.facts.diff_hash.as_deref().map(str::len), Some(43));
         assert_eq!(
-            record.syntactic.diff_summary.as_deref(),
-            Some("patch 1 file")
-        );
-        assert_eq!(
-            record.syntactic.diff_hash.as_deref().map(str::len),
-            Some(43)
-        );
-        assert_eq!(
-            record.syntactic.raw.as_deref(),
+            record.facts.raw.as_deref(),
             Some(diff),
             "raw must carry the exact patch/edit text for WYSIWYS rendering"
         );

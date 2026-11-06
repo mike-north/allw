@@ -533,7 +533,7 @@ test("runPair self-drives start+complete, mints a device_cert, and persists pair
         action: {
           record_schema_version: 3,
           surface: "command",
-          syntactic: { raw: "echo hi" },
+          facts: { raw: "echo hi" },
         },
         summary: "echo hi",
         actor: { id: "machine:x", kind: "claude-code" },

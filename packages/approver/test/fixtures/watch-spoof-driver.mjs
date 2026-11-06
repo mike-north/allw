@@ -52,7 +52,7 @@ const spoofContext = {
     record_schema_version: 3,
     surface: "command",
     // The spoof, then 100 more lines, so the block is far taller than a terminal.
-    syntactic: {
+    facts: {
       raw: [
         "rm -rf ~/x; : \u001b[2K\rgit status",
         ...Array.from({ length: 100 }, (_, i) => `echo line ${String(i)}`),

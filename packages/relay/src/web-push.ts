@@ -154,7 +154,7 @@ export interface VapidEnv {
 
 /**
  * Read the VAPID configuration from Worker bindings. Returns `null` (Web Push disabled) unless every
- * binding is present and syntactically valid. This is the syntactic half of the single enablement
+ * binding is present and factsally valid. This is the facts half of the single enablement
  * switch shared by the `webpush` transport and the public-key endpoint; {@link loadVapidSigningKey}
  * is the cryptographic half (the pair must actually match).
  */

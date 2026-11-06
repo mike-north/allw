@@ -6,10 +6,10 @@
 //! decides what executes, whether it is dangerous, or whether it should be allowed.
 //!
 //! @see docs/action-record.md — Command capture; docs/contract.md — WYSIWYS.
-use crate::contract::{ActionRecord, Surface, SyntacticSubstrate};
+use crate::contract::{ActionRecord, Facts, Surface};
 
 /// Record shape for caller facts after removal of interpretation and derived fields.
-/// Older artifacts remain readable but use different request/audit hash domains.
+/// Older artifacts remain JSON evidence, but incompatible canonical bytes cannot verify.
 pub const RECORD_SCHEMA_VERSION: u32 = 3;
 
 /// Caller-supplied execution context; the builder never derives it from a command.
@@ -88,7 +88,7 @@ fn build_record(
     ActionRecord {
         record_schema_version: RECORD_SCHEMA_VERSION,
         surface: Surface::Command,
-        syntactic: SyntacticSubstrate {
+        facts: Facts {
             argv,
             cwd: ctx.cwd.clone(),
             raw,

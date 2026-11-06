@@ -1565,8 +1565,7 @@ pub fn effective_allow(
 mod tests {
     use super::*;
     use crate::contract::{
-        ActionRecord, Actor, ApprovalContext, ApprovalRequest, Constraints, Surface,
-        SyntacticSubstrate,
+        ActionRecord, Actor, ApprovalContext, ApprovalRequest, Constraints, Facts, Surface,
     };
     use crate::hash::compute_request_hash;
 
@@ -1620,7 +1619,7 @@ mod tests {
         ActionRecord {
             record_schema_version: 3,
             surface: Surface::Command,
-            syntactic: SyntacticSubstrate {
+            facts: Facts {
                 argv: None,
                 cwd: None,
                 server: None,

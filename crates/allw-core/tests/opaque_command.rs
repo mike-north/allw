@@ -26,7 +26,7 @@ fn lines_are_byte_faithful_and_never_infer_fields() {
             serde_json::to_value(record).unwrap(),
             json!({
                 "record_schema_version": 3, "surface": "command",
-                "syntactic": {"raw": line, "cwd": "/caller directory"}
+                "facts": {"raw": line, "cwd": "/caller directory"}
             }),
             "{line:?}"
         );
@@ -50,7 +50,7 @@ fn argv_is_supplied_not_interpreted() {
             serde_json::to_value(record).unwrap(),
             json!({
                 "record_schema_version": 3, "surface": "command",
-                "syntactic": {"raw": "opaque original", "argv": argv}
+                "facts": {"raw": "opaque original", "argv": argv}
             })
         );
     }
@@ -80,7 +80,7 @@ fn empty_inputs_fail_closed() {
 fn removed_fields_are_ignored_and_known_malformed_fields_are_refused() {
     let raw = json!({"raw": "ssh $HOST", "cwd": "/repo", "argv": ["ssh", "$HOST"],
         "bin": {"malformed": true}, "flags": false, "positionals": 4, "env_refs": "HOME", "host": [1]});
-    let substrate: allw_core::SyntacticSubstrate = serde_json::from_value(raw).unwrap();
+    let substrate: allw_core::Facts = serde_json::from_value(raw).unwrap();
     assert_eq!(
         serde_json::to_value(substrate).unwrap(),
         json!({"raw": "ssh $HOST", "cwd": "/repo", "argv": ["ssh", "$HOST"]})
@@ -91,7 +91,7 @@ fn removed_fields_are_ignored_and_known_malformed_fields_are_refused() {
         json!({"raw": []}),
         json!({"cwd": 1}),
     ] {
-        assert!(serde_json::from_value::<allw_core::SyntacticSubstrate>(malformed).is_err());
+        assert!(serde_json::from_value::<allw_core::Facts>(malformed).is_err());
     }
 }
 

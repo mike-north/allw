@@ -66,7 +66,7 @@ function baseContext(attestation) {
     action: {
       record_schema_version: 3,
       surface: "command",
-      syntactic: { raw: "git push --force origin main" },
+      facts: { raw: "git push --force origin main" },
     },
     summary: "force push to main",
     actor,

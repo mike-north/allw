@@ -1,13 +1,13 @@
 {
   "description": "Independent schema-3 contract anchors: canonical input authored from docs/contract.md and ASCII-key RFC 8785 ordering; expected digests calculated with Python hashlib before signed fixture regeneration. No core output is used. The audit signature is arbitrary hash-input text, not verification evidence.",
-  "request_canonical": "{\"action\":{\"record_schema_version\":3,\"surface\":\"command\",\"syntactic\":{\"raw\":\"git push\"}},\"actor\":{\"id\":\"machine:x\",\"kind\":\"claude-code\"},\"constraints\":{\"allowed_decisions\":[\"approved\",\"denied\"],\"challenge_required\":false},\"expires_at\":1700003600000,\"reversible\":false,\"summary\":\"push to main\"}",
-  "request_hash_b64": "DNgz4-HQxRuQi-y3Pt55ig_ZF9QqJJ3zpHgiX1fyH3w",
-  "audit_canonical": "{\"action\":{\"record_schema_version\":3,\"surface\":\"command\",\"syntactic\":{\"raw\":\"git push\"}},\"actor\":{\"id\":\"machine:x\",\"kind\":\"claude-code\"},\"approver\":{\"account_id\":\"vector-account\",\"device_id\":\"vector-device\"},\"decided_at\":1700000001000,\"decision\":\"approved\",\"prev_hash\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"request_hash\":\"DNgz4-HQxRuQi-y3Pt55ig_ZF9QqJJ3zpHgiX1fyH3w\",\"request_id\":\"opaque-vector\",\"seq\":0,\"sig\":\"fixture.header.signature\"}",
+  "request_canonical": "{\"action\":{\"facts\":{\"raw\":\"git push\"},\"record_schema_version\":3,\"surface\":\"command\"},\"actor\":{\"id\":\"machine:x\",\"kind\":\"claude-code\"},\"constraints\":{\"allowed_decisions\":[\"approved\",\"denied\"],\"challenge_required\":false},\"expires_at\":1700003600000,\"reversible\":false,\"summary\":\"push to main\"}",
+  "request_hash_b64": "1nYYX408B0ajV2NJhPPUXroHC9FZQyW0Jne8Oekw7Yg",
+  "audit_canonical": "{\"action\":{\"facts\":{\"raw\":\"git push\"},\"record_schema_version\":3,\"surface\":\"command\"},\"actor\":{\"id\":\"machine:x\",\"kind\":\"claude-code\"},\"approver\":{\"account_id\":\"vector-account\",\"device_id\":\"vector-device\"},\"decided_at\":1700000001000,\"decision\":\"approved\",\"prev_hash\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"request_hash\":\"1nYYX408B0ajV2NJhPPUXroHC9FZQyW0Jne8Oekw7Yg\",\"request_id\":\"opaque-vector\",\"seq\":0,\"sig\":\"fixture.header.signature\"}",
   "audit": {
     "seq": 0,
     "prev_hash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     "request_id": "opaque-vector",
-    "request_hash": "DNgz4-HQxRuQi-y3Pt55ig_ZF9QqJJ3zpHgiX1fyH3w",
+    "request_hash": "1nYYX408B0ajV2NJhPPUXroHC9FZQyW0Jne8Oekw7Yg",
     "actor": {
       "id": "machine:x",
       "kind": "claude-code"
@@ -21,12 +21,14 @@
     "action": {
       "record_schema_version": 3,
       "surface": "command",
-      "syntactic": {
+      "facts": {
         "raw": "git push"
       }
     },
     "sig": "fixture.header.signature",
-    "record_hash": "drvcin6J0YfKhWbQJPm-jyONuAbeTdp5MQseFio97I4"
+    "record_hash": "uE-kGjObOe5_Ky8Cv8hNmwU1pE8fwsH7DvAOs_Yhd0M"
   },
-  "audit_hash_b64": "drvcin6J0YfKhWbQJPm-jyONuAbeTdp5MQseFio97I4"
+  "audit_hash_b64": "uE-kGjObOe5_Ky8Cv8hNmwU1pE8fwsH7DvAOs_Yhd0M",
+  "agent_tool_call_request_canonical": "{\"action\":{\"facts\":{\"raw\":\"openclaw.deploy_service()\",\"server\":\"openclaw\",\"tool\":\"deploy_service\"},\"record_schema_version\":3,\"surface\":\"agent_tool_call\"},\"actor\":{\"id\":\"machine:x\",\"kind\":\"claude-code\"},\"constraints\":{\"allowed_decisions\":[\"approved\",\"denied\"],\"challenge_required\":false},\"expires_at\":1700003600000,\"reversible\":false,\"summary\":\"push to main\"}",
+  "agent_tool_call_request_hash_b64": "tjlMBBEWsnG5F8BxDcisd4jjpsU6NAm9lRpKldhLl4Y"
 }

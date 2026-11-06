@@ -13,7 +13,7 @@ The same record is embedded in the encrypted `ApprovalContext` and in the `Audit
 ActionRecord {
   record_schema_version: 3
   surface: "command" | "mcp_tool_call" | "agent_tool_call" | "file_edit"
-  syntactic: {
+  facts: {
     argv?, cwd?                         // caller-supplied command facts
     server?, tool?, params?              // tool identity and structured caller parameters
     operation?, paths?, diff_summary?, diff_hash? // file-edit substrate
@@ -22,7 +22,7 @@ ActionRecord {
 }
 ```
 
-The wire member remains named `syntactic`; it contains caller facts, with no parsed or derived
+The wire member `facts` contains caller facts, with no parsed or derived
 fields. Optional fields are omitted when absent. All action fields stay inside JWE ciphertext.
 The relay sees routing/lifecycle metadata and ciphertext only, never action data. Structure
 metadata/privacy tiers remain unimplemented proposals held in #216; no replacement metadata
@@ -78,10 +78,14 @@ The full retained record, summary, actor identity, optional reversibility assert
 chain and shown expiry are bound into the request hash ([contract.md](./contract.md)). Core serde
 objects ignore unknown fields, including removed `bin`, `flags`, `positionals`, `host` and
 `env_refs`; those fields are neither reserialized, displayed nor hashed. SDK command-builder output
-validation instead requires the exact current core output shape. No compatibility shim is provided.
+validation instead requires the exact current core output shape. No compatibility shim is provided. The removed `syntactic` member is an unknown field, not an alias;
+records missing the required `facts` member fail decoding.
 
 Schema 3 uses request hash domain `allw/request-hash/v4` and audit domain `allw/audit-record/v3`.
-Legacy bytes remain readable as artifacts, visibly unverifiable under this format. They must not be
+The final pre-deploy rename to `facts` retains schema 3 and both domains: no schema-3 build has
+been deployed or published. Its canonical JSON bytes and digests change, including JCS key order
+(`facts` before `record_schema_version` before `surface`). Pre-rename signed bytes cannot verify.
+Legacy bytes remain readable as JSON artifacts, visibly unverifiable under this format. They must not be
 silently discarded or migrated into apparently verified receipts. Existing web pairing keeps its `allw:pairing:v1` storage key and identity. In-session local
 receipts retain their original evidence across relay polling refreshes. A persistent receipt store
 across browser reloads is not implemented; this removal does not add one.

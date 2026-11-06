@@ -380,20 +380,20 @@ private enum WireSurface: String, Decodable {
 
 private struct WireActionRecord: Decodable {
     let surface: WireSurface
-    let syntactic: WireSyntacticSubstrate
+    let facts: WireFacts
 
     func toRenderAction(requestId: String) throws -> ApprovalAction {
         switch surface {
         case .command, .fileEdit:
             return .command(
                 CommandAction(
-                    cwd: syntactic.cwd,
-                    argv: syntactic.argv ?? [],
-                    raw: syntactic.raw
+                    cwd: facts.cwd,
+                    argv: facts.argv ?? [],
+                    raw: facts.raw
                 )
             )
         case .mcpToolCall:
-            guard let server = syntactic.server, let tool = syntactic.tool else {
+            guard let server = facts.server, let tool = facts.tool else {
                 throw ApprovalInboxError.unverified(
                     "core MCP action for request '\(requestId)' is missing server/tool"
                 )
@@ -402,14 +402,14 @@ private struct WireActionRecord: Decodable {
                 McpCallAction(
                     server: server,
                     tool: tool,
-                    paramsSummary: syntactic.raw ?? ""
+                    paramsSummary: facts.raw ?? ""
                 )
             )
         }
     }
 }
 
-private struct WireSyntacticSubstrate: Decodable {
+private struct WireFacts: Decodable {
     let argv: [String]?
     let cwd: String?
     let server: String?

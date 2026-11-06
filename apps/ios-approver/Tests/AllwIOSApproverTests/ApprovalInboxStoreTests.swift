@@ -700,7 +700,7 @@ private extension ApprovalInboxStoreTests {
     /// shape `prepare_approval_json`'s `context_json` produces.
     static func coreContextJson(summary: String, challengeRequired: Bool) -> String {
         """
-        {"action":{"record_schema_version":2,"surface":"command","syntactic":{"bin":"git","argv":["git","push","--force"],"cwd":"/repo","raw":"git push --force origin main"},"risk":"critical"},"summary":"\(summary)","actor":{"id":"machine:macbook-pro","kind":"claude-code"},"risk":"critical","reversible":false,"constraints":{"allowed_decisions":["approved","denied"],"challenge_required":\(challengeRequired ? "true" : "false")}}
+        {"action":{"record_schema_version":2,"surface":"command","facts":{"bin":"git","argv":["git","push","--force"],"cwd":"/repo","raw":"git push --force origin main"},"risk":"critical"},"summary":"\(summary)","actor":{"id":"machine:macbook-pro","kind":"claude-code"},"risk":"critical","reversible":false,"constraints":{"allowed_decisions":["approved","denied"],"challenge_required":\(challengeRequired ? "true" : "false")}}
         """
     }
 }

@@ -54,7 +54,7 @@ const CONTEXT = {
   action: {
     record_schema_version: 3,
     surface: "command",
-    syntactic: { argv: ["git", "push", "--force", "origin", "main"], cwd: "/repo" },
+    facts: { argv: ["git", "push", "--force", "origin", "main"], cwd: "/repo" },
   },
   summary: "force push to main",
   actor: { id: ACTOR_ID, kind: ACTOR_KIND },

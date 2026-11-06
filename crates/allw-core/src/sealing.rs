@@ -131,9 +131,7 @@ mod tests {
     //! @see https://www.rfc-editor.org/rfc/rfc7516 §7.2 (General JWE JSON Serialization)
     use super::*;
     use crate::account::account_id_for_root;
-    use crate::contract::{
-        ActionRecord, Actor, Constraints, Decision, Surface, SyntacticSubstrate,
-    };
+    use crate::contract::{ActionRecord, Actor, Constraints, Decision, Facts, Surface};
     use crate::crypto::{
         sign_account_state, AccountState, AccountStateDevice, AccountStateRevocation,
         AccountStateRevocationKind, SigningKeyPair,
@@ -198,7 +196,7 @@ mod tests {
             action: ActionRecord {
                 record_schema_version: 3,
                 surface: Surface::Command,
-                syntactic: SyntacticSubstrate {
+                facts: Facts {
                     argv: None,
                     cwd: None,
                     server: None,

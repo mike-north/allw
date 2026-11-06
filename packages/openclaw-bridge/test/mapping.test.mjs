@@ -67,7 +67,7 @@ test("exec approvals map to surface 'command' (§5.1)", () => {
   assert.equal(result.request.action.recordSchemaVersion, 3);
 });
 
-test("syntactic.argv is systemRunPlan.argv verbatim — never a re-tokenization (§5.1)", () => {
+test("facts.argv is systemRunPlan.argv verbatim — never a re-tokenization (§5.1)", () => {
   // `commandText` is a *rendering* for reviewers, not shell-safe quoting. Re-parsing it here would
   // split the script argument into four extra tokens and bind a vector that is NOT what the gateway
   // will execute — the exact failure the never-re-tokenize rule exists to prevent.
@@ -82,22 +82,22 @@ test("syntactic.argv is systemRunPlan.argv verbatim — never a re-tokenization 
   const result = build({ event, snapshot });
 
   assert.equal(result.kind, "request");
-  assert.deepEqual(result.request.action.syntactic.argv, ["bash", "-lc", "echo one two three"]);
-  assert.equal(result.request.action.syntactic.bin, undefined);
+  assert.deepEqual(result.request.action.facts.argv, ["bash", "-lc", "echo one two three"]);
+  assert.equal(result.request.action.facts.bin, undefined);
   assert.equal(
-    result.request.action.syntactic.raw,
+    result.request.action.facts.raw,
     "bash -lc echo one two three",
     "raw is the exact string OpenClaw shows its other reviewers (§5.1)",
   );
   assert.equal(
-    result.request.action.syntactic.argv.length,
+    result.request.action.facts.argv.length,
     3,
     "a re-parse of commandText would have produced 6 tokens — the rule exists for exactly this",
   );
 });
 
-test("syntactic.cwd comes from systemRunPlan.cwd, then request.cwd (§5.1)", () => {
-  assert.equal(build().request.action.syntactic.cwd, "/srv/app");
+test("facts.cwd comes from systemRunPlan.cwd, then request.cwd (§5.1)", () => {
+  assert.equal(build().request.action.facts.cwd, "/srv/app");
 
   const noPlanCwd = execEvent({
     request: { cwd: "/fallback" },
@@ -107,7 +107,7 @@ test("syntactic.cwd comes from systemRunPlan.cwd, then request.cwd (§5.1)", () 
     event: noPlanCwd,
     snapshot: execSnapshot({ presentation: { commandText: "ls" } }),
   });
-  assert.equal(result.request.action.syntactic.cwd, "/fallback");
+  assert.equal(result.request.action.facts.cwd, "/fallback");
 });
 
 test("request.commandArgv is used when there is no systemRunPlan (§5.1 fallback order)", () => {
@@ -120,7 +120,7 @@ test("request.commandArgv is used when there is no systemRunPlan (§5.1 fallback
     snapshot: execSnapshot({ presentation: { commandText: "kubectl delete ns prod" } }),
   });
   assert.equal(result.kind, "request");
-  assert.deepEqual(result.request.action.syntactic.argv, ["kubectl", "delete", "ns", "prod"]);
+  assert.deepEqual(result.request.action.facts.argv, ["kubectl", "delete", "ns", "prod"]);
 });
 
 test("with neither plan nor commandArgv the core records opaque command text (§5.1)", () => {
@@ -132,17 +132,17 @@ test("with neither plan nor commandArgv the core records opaque command text (§
     snapshot: execSnapshot({ presentation: { commandText: "rm -rf /tmp/scratch" } }),
   });
   assert.equal(result.kind, "request");
-  assert.equal(result.request.action.syntactic.argv, undefined);
-  assert.deepEqual(result.request.action.syntactic, { raw: "rm -rf /tmp/scratch" });
+  assert.equal(result.request.action.facts.argv, undefined);
+  assert.deepEqual(result.request.action.facts, { raw: "rm -rf /tmp/scratch" });
 });
 
-test("OpenClaw's execution locus never leaks into allw's syntactic.host (§5.1 name collision)", () => {
+test("OpenClaw's execution locus never leaks into allw's facts.host (§5.1 name collision)", () => {
   // `host: "node"` on an OpenClaw approval is the execution locus, not an ssh/scp destination.
   const result = build();
   assert.equal(
-    result.request.action.syntactic.host,
+    result.request.action.facts.host,
     undefined,
-    "syntactic.host is core-derived from the command, not OpenClaw's `host` field",
+    "facts.host is core-derived from the command, not OpenClaw's `host` field",
   );
   assert.match(result.request.summary, /node\/node-7/, "the locus belongs in the hashed summary");
 });
@@ -353,39 +353,36 @@ test("plugin approvals map to surface 'agent_tool_call' (§5.2)", () => {
   assert.equal(result.request.action.recordSchemaVersion, 3);
 });
 
-test("syntactic.server is pluginId, syntactic.tool is toolName (§5.2)", () => {
+test("facts.server is pluginId, facts.tool is toolName (§5.2)", () => {
   const result = buildPlugin();
-  assert.equal(result.request.action.syntactic.server, PLUGIN_ID);
-  assert.equal(result.request.action.syntactic.tool, TOOL_NAME);
+  assert.equal(result.request.action.facts.server, PLUGIN_ID);
+  assert.equal(result.request.action.facts.tool, TOOL_NAME);
 });
 
-test("syntactic.server falls back to 'openclaw' when pluginId is absent (§5.2)", () => {
+test("facts.server falls back to 'openclaw' when pluginId is absent (§5.2)", () => {
   const result = buildPlugin({ event: pluginEvent({ request: { pluginId: undefined } }) });
   assert.equal(result.kind, "request");
-  assert.equal(result.request.action.syntactic.server, "openclaw");
+  assert.equal(result.request.action.facts.server, "openclaw");
 });
 
-test("syntactic.tool falls back to a normalized slug of title when toolName is absent (§5.2)", () => {
+test("facts.tool falls back to a normalized slug of title when toolName is absent (§5.2)", () => {
   const result = buildPlugin({
     event: pluginEvent({ request: { toolName: undefined, title: "Deploy Service Now!" } }),
     snapshot: pluginSnapshot({ presentation: { title: "Deploy Service Now!" } }),
   });
   assert.equal(result.kind, "request");
-  assert.equal(result.request.action.syntactic.tool, "deploy-service-now");
+  assert.equal(result.request.action.facts.tool, "deploy-service-now");
 });
 
-test("syntactic.params is absent — OpenClaw exposes no structured parameters (§5.2)", () => {
+test("facts.params is absent — OpenClaw exposes no structured parameters (§5.2)", () => {
   const result = buildPlugin();
-  assert.ok(
-    !("params" in result.request.action.syntactic),
-    "params must be absent, not synthesized",
-  );
+  assert.ok(!("params" in result.request.action.facts), "params must be absent, not synthesized");
 });
 
-test("syntactic.raw is description, plus detail when present (§5.2)", () => {
+test("facts.raw is description, plus detail when present (§5.2)", () => {
   const withoutDetail = buildPlugin();
   assert.equal(
-    withoutDetail.request.action.syntactic.raw,
+    withoutDetail.request.action.facts.raw,
     "This plugin wants to deploy to production.",
   );
 
@@ -393,7 +390,7 @@ test("syntactic.raw is description, plus detail when present (§5.2)", () => {
     event: pluginEvent({ request: { detail: "It will restart 3 pods." } }),
   });
   assert.equal(
-    withDetail.request.action.syntactic.raw,
+    withDetail.request.action.facts.raw,
     "This plugin wants to deploy to production.\n\nIt will restart 3 pods.",
   );
 });

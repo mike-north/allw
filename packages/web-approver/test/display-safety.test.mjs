@@ -39,9 +39,9 @@ const ZWSP = "\u200b";
 const RAW_HIDDEN =
   /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/;
 
-function context(syntactic, overrides = {}) {
+function context(facts, overrides = {}) {
   return {
-    action: { record_schema_version: 3, surface: "command", syntactic, risk: "high" },
+    action: { record_schema_version: 3, surface: "command", facts, risk: "high" },
     summary: "open the invoice",
     actor: { id: "machine:laptop", kind: "claude-code" },
 
@@ -89,7 +89,7 @@ test("MCP params with a bidi override are escaped in the DOM", async () => {
       action: {
         record_schema_version: 3,
         surface: "mcp_tool_call",
-        syntactic: { server: "fs", tool: "write", params: { path: `/tmp/${RLO}txt.exe` } },
+        facts: { server: "fs", tool: "write", params: { path: `/tmp/${RLO}txt.exe` } },
       },
     },
   ]);
@@ -197,7 +197,7 @@ test("a tool call shows server :: tool, so a dotted server or tool name stays un
     action: {
       record_schema_version: 3,
       surface: "mcp_tool_call",
-      syntactic: { server, tool },
+      facts: { server, tool },
     },
   });
   const root = await mountWith([call("fs.delete", "x")]);

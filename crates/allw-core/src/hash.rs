@@ -205,7 +205,7 @@ pub fn compute_request_hash(ctx: &ApprovalContext, expires_at: i64) -> [u8; 32] 
 mod tests {
     use super::*;
     use crate::contract::{
-        ActionRecord, Actor, ApprovalContext, Constraints, Decision, Surface, SyntacticSubstrate,
+        ActionRecord, Actor, ApprovalContext, Constraints, Decision, Facts, Surface,
     };
     use sha2::{Digest, Sha256};
 
@@ -217,13 +217,13 @@ mod tests {
 
     /// Minimal action used for the canonicalization anchor test.
     ///
-    /// Uses only caller `raw` in the syntactic substrate so the hand-written JCS string
+    /// Uses only caller `raw` in the facts substrate so the hand-written JCS string
     /// remains tractable.  No inferred or reserved-policy fields exist.
     fn make_minimal_action() -> ActionRecord {
         ActionRecord {
             record_schema_version: 3,
             surface: Surface::Command,
-            syntactic: SyntacticSubstrate {
+            facts: Facts {
                 argv: None,
                 cwd: None,
                 server: None,
@@ -275,10 +275,10 @@ mod tests {
     //   - Numbers in shortest form
     //
     // JCS ASCII-key order: action < actor < constraints < expires_at < reversible < summary.
-    // Within action: record_schema_version < surface < syntactic; within syntactic: raw only.
+    // Within action: facts < record_schema_version < surface; within facts: raw only.
     // Within actor: id < kind. No absent chain or reversibility key is inserted.
     const EXPECTED_CANONICAL: &str = concat!(
-        r#"{"action":{"record_schema_version":3,"surface":"command","syntactic":{"raw":"git push"}},"#,
+        r#"{"action":{"facts":{"raw":"git push"},"record_schema_version":3,"surface":"command"},"#,
         r#""actor":{"id":"machine:x","kind":"claude-code"},"#,
         r#""constraints":{"allowed_decisions":["approved","denied"],"challenge_required":false},"#,
         r#""expires_at":1700003600000,"#,
@@ -421,12 +421,12 @@ mod tests {
         let base_hash = compute_request_hash(&base, TS_EXPIRES);
 
         let mut mutated = base.clone();
-        mutated.action.syntactic.cwd = Some("rm".to_string());
+        mutated.action.facts.cwd = Some("rm".to_string());
 
         assert_ne!(
             compute_request_hash(&mutated, TS_EXPIRES),
             base_hash,
-            "mutating action.syntactic.cwd must change the request_hash"
+            "mutating action.facts.cwd must change the request_hash"
         );
     }
 
@@ -546,7 +546,7 @@ mod tests {
     // and byte sort order. The canonicalization test separately asserts the complete byte string.
     /// SHA-256("allw/request-hash/v4" || NUL || EXPECTED_CANONICAL).
     const FROZEN_HASH_HEX: &str =
-        "0cd833e3e1d0c51b908becb73ede798a0fd917d42a249df3a478225f57f21f7c";
+        "d676185f8d3c0746a357634984f3d45eba070bd1594325b42677bc39e930ed88";
 
     #[test]
     fn frozen_cross_platform_vector() {

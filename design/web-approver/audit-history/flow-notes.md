@@ -8,7 +8,7 @@ as a trust receipt backed by the tamper-evident audit chain in `docs/contract.md
 
 The primary surface is a dense timeline of approved, denied, expired, and aborted decisions. It
 supports filtering by actor, surface, decision, and date without hiding verification status. Rows
-show actor identity, machine, syntactic surface, decision, and chain position so the history is
+show actor identity, machine, facts surface, decision, and chain position so the history is
 scannable before opening a detail view.
 
 Behavior notes:

@@ -329,9 +329,9 @@ which the gateway stores at request time and reuses verbatim when forwarding the
 | `ActionRecord` field | Source                                                          | Notes                                                                                          |
 | -------------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
 | `surface`            | constant `"command"`                                            |                                                                                                |
-| `syntactic.argv`     | `systemRunPlan.argv` → else `request.commandArgv` → else absent | Caller argv is retained verbatim; a text-only request never supplies inferred argv.            |
-| `syntactic.cwd`      | `systemRunPlan.cwd` → else `request.cwd` → else absent          | Absent is rendered explicitly as "working directory not bound" (§6.3), never silently omitted. |
-| `syntactic.raw`      | `systemRunPlan.commandText` → else `request.command`            | The exact string OpenClaw shows its other reviewers, recorded verbatim.                        |
+| `facts.argv`         | `systemRunPlan.argv` → else `request.commandArgv` → else absent | Caller argv is retained verbatim; a text-only request never supplies inferred argv.            |
+| `facts.cwd`          | `systemRunPlan.cwd` → else `request.cwd` → else absent          | Absent is rendered explicitly as "working directory not bound" (§6.3), never silently omitted. |
+| `facts.raw`          | `systemRunPlan.commandText` → else `request.command`            | The exact string OpenClaw shows its other reviewers, recorded verbatim.                        |
 
 OpenClaw's `host` is its execution locus (`gateway` | `node` | `sandbox`), not an allw substrate
 field. That locus and `nodeId` stay in the hash-bound summary (§6.2). No remote host is inferred.
@@ -357,10 +357,10 @@ challenge behavior is unchanged.
 | `ActionRecord` field | Source                                                             | Notes                                                                                                                                                         |
 | -------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `surface`            | constant `"agent_tool_call"`                                       | New surface; see the decision below.                                                                                                                          |
-| `syntactic.server`   | pinned `pluginId` → else event `pluginId` → else `"openclaw"`      | The gating provider identity — the function-identity slot, shared with `mcp_tool_call`.                                                                       |
-| `syntactic.tool`     | pinned `toolName` → else event `toolName` → else a slug of `title` | Fail closed if neither yields a non-empty token.                                                                                                              |
-| `syntactic.params`   | **absent**                                                         | OpenClaw exposes no structured parameters to a reviewer. Do not synthesize one.                                                                               |
-| `syntactic.raw`      | pinned `description`, plus pinned `detail` when present            | The prose the plugin author wrote for the approver; fallback matching. Approvers show it labelled as the description; the heading is `server :: tool` (#321). |
+| `facts.server`       | pinned `pluginId` → else event `pluginId` → else `"openclaw"`      | The gating provider identity — the function-identity slot, shared with `mcp_tool_call`.                                                                       |
+| `facts.tool`         | pinned `toolName` → else event `toolName` → else a slug of `title` | Fail closed if neither yields a non-empty token.                                                                                                              |
+| `facts.params`       | **absent**                                                         | OpenClaw exposes no structured parameters to a reviewer. Do not synthesize one.                                                                               |
+| `facts.raw`          | pinned `description`, plus pinned `detail` when present            | The prose the plugin author wrote for the approver; fallback matching. Approvers show it labelled as the description; the heading is `server :: tool` (#321). |
 
 **Decision: a distinct `agent_tool_call` surface.** Most plugin permission requests are not MCP
 calls (OpenClaw's own example gates a plugin-owned "deploy service" operation). The bridge cannot
@@ -369,7 +369,7 @@ never reaches an operator client. The distinct surface preserves the caller's in
 instead of labelling a plugin call as something an MCP server served.
 
 The surface reuses the existing encrypted `(server, tool)` fields: `server` holds the plugin id,
-`tool` the tool name. It adds no syntactic field and exposes no function identity to the relay.
+`tool` the tool name. It adds no facts field and exposes no function identity to the relay.
 The proposed `action_structure` metadata is unimplemented and held in #216; this mapping neither
 adds it nor supplies a replacement program-name source.
 
@@ -405,7 +405,7 @@ fail-closed condition.
 
 `ApprovalKind` also admits `system-agent`, whose presentation is `{ title, description,
 proposalHash, allowedDecisions: ["allow-once", "deny"] }` — an OpenClaw-internal proposal gate with
-no syntactic substrate to reduce. v1 does **not** map it.
+no facts substrate to reduce. v1 does **not** map it.
 
 The bridge must handle it, and every future unknown kind, explicitly:
 
@@ -469,7 +469,7 @@ Notes on the non-obvious choices:
 
 - **`summary` carries the execution context.** `summary` is a first-class, hashed, human-shown field
   ([contract.md](./contract.md) §request_hash), so the execution locus (`host`, `nodeId`), the
-  originating agent, and the gateway label are bound by the verdict without inventing a syntactic
+  originating agent, and the gateway label are bound by the verdict without inventing a facts
   field for each. Unknown components render as the literal `unknown` rather than being dropped — a
   missing field must be visible, not invisible.
 - **`chain` is the right home for the OpenClaw approval id.** The contract defines `chain` as
@@ -797,7 +797,7 @@ with each other but must precede slice 4.
 
 **Landed:** slice 1 (`action_from_argv` carrying the original command text, exported to WASM and
 UniFFI), slice 2 (the `agent_tool_call` surface in the core, plus an `action_from_agent_tool_call_with_raw`
-builder so a plugin's reviewer prose can bind verbatim as `syntactic.raw` instead of a synthesized
+builder so a plugin's reviewer prose can bind verbatim as `facts.raw` instead of a synthesized
 display, and the SDK `Surface` union widening), and slices 3–6 for **both** the exec and the plugin
 permission-request families, including the §11 UAT checklist's plugin rows.
 

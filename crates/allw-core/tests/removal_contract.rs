@@ -9,7 +9,7 @@ use serde_json::json;
 #[test]
 fn facts_only_context_and_optional_caller_assertion() {
     let wire = json!({
-        "action": {"record_schema_version": 3, "surface": "command", "syntactic": {"raw": "git push"}},
+        "action": {"record_schema_version": 3, "surface": "command", "facts": {"raw": "git push"}},
         "summary": "Publish commits", "actor": {"id": "script", "kind": "script"},
         "constraints": {"allowed_decisions": ["approved", "denied"], "challenge_required": false}
     });
@@ -42,7 +42,7 @@ fn facts_only_context_and_optional_caller_assertion() {
 #[test]
 fn every_shown_fact_changes_hash() {
     let base = json!({
-        "action": {"record_schema_version": 3, "surface": "command", "syntactic": {
+        "action": {"record_schema_version": 3, "surface": "command", "facts": {
             "raw": "git push", "argv": ["git", "push"], "cwd": "/repo",
             "server": "server", "tool": "tool", "params": {"x": 1}, "operation": "write",
             "paths": ["a"], "diff_summary": "edit", "diff_hash": "digest"
@@ -119,16 +119,16 @@ fn every_shown_fact_changes_hash() {
         ("constraints.challenge_required", json!(true)),
         ("constraints.allowed_decisions", json!(["denied"])),
         ("action.surface", json!("agent_tool_call")),
-        ("action.syntactic.raw", json!("other")),
-        ("action.syntactic.argv", json!(["other"])),
-        ("action.syntactic.cwd", json!("other")),
-        ("action.syntactic.server", json!("other")),
-        ("action.syntactic.tool", json!("other")),
-        ("action.syntactic.params", json!({"x": 2})),
-        ("action.syntactic.operation", json!("other")),
-        ("action.syntactic.paths", json!(["other"])),
-        ("action.syntactic.diff_summary", json!("other")),
-        ("action.syntactic.diff_hash", json!("other")),
+        ("action.facts.raw", json!("other")),
+        ("action.facts.argv", json!(["other"])),
+        ("action.facts.cwd", json!("other")),
+        ("action.facts.server", json!("other")),
+        ("action.facts.tool", json!("other")),
+        ("action.facts.params", json!({"x": 2})),
+        ("action.facts.operation", json!("other")),
+        ("action.facts.paths", json!(["other"])),
+        ("action.facts.diff_summary", json!("other")),
+        ("action.facts.diff_hash", json!("other")),
     ] {
         let mut changed = base.clone();
         let mut target = &mut changed;
@@ -153,53 +153,30 @@ fn every_shown_fact_changes_hash() {
     }
 }
 
-/// An old signed receipt remains evidence, but cannot verify against the new canonical contract.
+/// Historical signed JSON remains evidence; old required-member spelling is never an alias.
 #[test]
 fn old_verdict_is_preserved_but_unverifiable_under_new_hash() {
-    use allw_core::{verify_verdict, InMemoryNonceStore, PublicKey, VerifyError};
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     for legacy in [
         include_str!("fixtures/legacy_wire_v2.json"),
         include_str!("fixtures/legacy_wire_v3.json"),
+        include_str!("fixtures/legacy_syntactic_schema3.json"),
     ] {
         let old: serde_json::Value = serde_json::from_str(legacy).unwrap();
-        let verdict = serde_json::from_str(old["verdict_json"].as_str().unwrap()).unwrap();
-        let request = serde_json::from_str(old["request_json"].as_str().unwrap()).unwrap();
-        let context = serde_json::from_str(old["context_json"].as_str().unwrap()).unwrap();
-        let root: [u8; 32] = URL_SAFE_NO_PAD
-            .decode(old["approver_root_pubkey_b64"].as_str().unwrap())
-            .unwrap()
-            .try_into()
-            .unwrap();
-        let root = PublicKey::from_bytes(&root).unwrap();
-        assert!(matches!(
-            verify_verdict(
-                &verdict,
-                &request,
-                &context,
-                &root,
-                &mut InMemoryNonceStore::default(),
-                old["now_ms"].as_i64().unwrap()
-            ),
-            Err(VerifyError::RequestHashMismatch)
-        ));
-        assert!(old["context_json"].as_str().unwrap().contains("bin"));
+        let raw_context = old["context_json"].as_str().unwrap();
+        assert!(serde_json::from_str::<ApprovalContext>(raw_context).is_err());
+        assert!(!old["verdict_json"].as_str().unwrap().is_empty());
+        assert!(raw_context.contains("syntactic"));
     }
 }
 
-/// A legacy receipt stays readable evidence; its original hash cannot verify under audit v2.
-/// The fixture's old v1 hash was independently calculated over the specified ASCII-key JCS input.
+/// History is readable as original JSON, never silently migrated into current verified records.
 #[test]
 fn legacy_audit_is_readable_without_claiming_new_format_verification() {
-    use allw_core::{compute_record_hash, AuditRecord};
     let raw = include_str!("fixtures/legacy_audit_v1.json");
-    let old: AuditRecord = serde_json::from_str(raw).unwrap();
-    assert_eq!(old.action.syntactic.raw.as_deref(), Some("git push"));
-    assert!(!old.sig.is_empty());
-    assert_ne!(old.record_hash, compute_record_hash(&old));
-    // No migration/writer runs: the original artifact retains the old fields and signature.
+    assert!(serde_json::from_str::<allw_core::AuditRecord>(raw).is_err());
     let original: serde_json::Value = serde_json::from_str(raw).unwrap();
+    assert_eq!(original["action"]["syntactic"]["raw"], "git push");
     assert_eq!(original["action"]["risk"], "high");
     assert_eq!(original["policy"]["decision"], "escalate");
-    assert_eq!(original["sig"].as_str(), Some(old.sig.as_str()));
+    assert!(!original["sig"].as_str().unwrap().is_empty());
 }

@@ -82,7 +82,7 @@ fn context() -> ApprovalContext {
         "action": {
             "record_schema_version": 3,
             "surface": "command",
-            "syntactic": { "argv": ["git", "status"], "raw": "git status" },
+            "facts": { "argv": ["git", "status"], "raw": "git status" },
             "risk": "low"
         },
         "summary": "check git status",

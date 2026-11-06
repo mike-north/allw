@@ -29,7 +29,7 @@ export type {
   DisplayModel,
   DisplaySubstrate,
   Surface,
-  SyntacticSubstrate,
+  Facts,
   UnsignedVerdict,
   VerdictOutboundMessage,
 } from "./lib/types.js";

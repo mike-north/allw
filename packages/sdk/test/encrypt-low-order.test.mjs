@@ -68,7 +68,7 @@ const CONTEXT = {
   action: {
     record_schema_version: 3,
     surface: "command",
-    syntactic: { argv: ["git", "status"], raw: "git status" },
+    facts: { argv: ["git", "status"], raw: "git status" },
   },
   summary: "check git status",
   actor: { id: "machine:ci", kind: "claude-code" },

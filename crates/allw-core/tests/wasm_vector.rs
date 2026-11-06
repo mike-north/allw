@@ -58,9 +58,9 @@ use allw_core::{
     issue_device_cert, seal_context_for_account_state, select_recipients, sign_account_state,
     sign_pairing_start_authorization, sign_verdict, verify_verdict, AccountState,
     AccountStateDevice, AccountStateRevocation, AccountStateRevocationKind, ActionRecord, Actor,
-    ApprovalContext, ApprovalRequest, Approver, Constraints, Decision, InMemoryNonceStore,
-    JweError, PublicKey, Recipient, SigningKeyPair, Surface, SyntacticSubstrate, UnsignedVerdict,
-    Verdict, VerifyError, X25519KeyPair,
+    ApprovalContext, ApprovalRequest, Approver, Constraints, Decision, Facts, InMemoryNonceStore,
+    JweError, PublicKey, Recipient, SigningKeyPair, Surface, UnsignedVerdict, Verdict, VerifyError,
+    X25519KeyPair,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand_chacha::rand_core::SeedableRng;
@@ -340,7 +340,7 @@ fn make_minimal_context() -> ApprovalContext {
         action: ActionRecord {
             record_schema_version: 3,
             surface: Surface::Command,
-            syntactic: SyntacticSubstrate {
+            facts: Facts {
                 argv: None,
                 cwd: None,
                 server: None,
@@ -594,6 +594,11 @@ fn make_request() -> ApprovalRequest {
 fn build_vector() -> WasmVector {
     let context = make_minimal_context();
     let request_hash = compute_request_hash(&context, TS_EXPIRES);
+    // Pin the independently authored JCS/hash anchor before regenerating any signed fixture.
+    assert_eq!(
+        URL_SAFE_NO_PAD.encode(request_hash),
+        "1nYYX408B0ajV2NJhPPUXroHC9FZQyW0Jne8Oekw7Yg"
+    );
     let hex = request_hash
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -658,6 +663,11 @@ fn build_vector() -> WasmVector {
 
     let agent_tool_call_context = make_agent_tool_call_context();
     let agent_tool_call_request_hash = compute_request_hash(&agent_tool_call_context, TS_EXPIRES);
+    // Hand-authored agent-tool JCS anchor, independently hashed in Python before signing.
+    assert_eq!(
+        URL_SAFE_NO_PAD.encode(agent_tool_call_request_hash),
+        "tjlMBBEWsnG5F8BxDcisd4jjpsU6NAm9lRpKldhLl4Y"
+    );
 
     WasmVector {
         context_json: serde_json::to_string(&context).expect("context serializes"),
@@ -997,7 +1007,7 @@ fn committed_fixture_is_current() {
 fn fixture_hash_equals_frozen_vector() {
     // The same value asserted by hash::tests::frozen_cross_platform_vector.
     const FROZEN_HASH_HEX: &str =
-        "0cd833e3e1d0c51b908becb73ede798a0fd917d42a249df3a478225f57f21f7c";
+        "d676185f8d3c0746a357634984f3d45eba070bd1594325b42677bc39e930ed88";
 
     let context = make_minimal_context();
     let hash = compute_request_hash(&context, TS_EXPIRES);
@@ -1031,7 +1041,7 @@ fn agent_tool_call_fixture_hash_matches_independent_recompute() {
 }
 
 /// The `agent_tool_call` and `command` fixtures differ only in `action.surface` /
-/// `action.syntactic` — proving `surface` is actually hashed (not silently ignored) and that the
+/// `action.facts` — proving `surface` is actually hashed (not silently ignored) and that the
 /// two surfaces produce different `request_hash` values despite sharing the same summary, actor,
 /// risk, and constraints.
 #[test]
@@ -1041,7 +1051,7 @@ fn agent_tool_call_and_command_fixtures_hash_differently() {
 
     assert_ne!(
         command_hash, agent_tool_call_hash,
-        "changing action.surface (and its syntactic substrate) must change request_hash"
+        "changing action.surface (and its facts substrate) must change request_hash"
     );
 }
 

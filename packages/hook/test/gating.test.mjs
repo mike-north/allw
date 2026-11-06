@@ -99,7 +99,7 @@ test("gateToolCall(Bash) → gated with a command ActionRecord and a one-line su
   assert.equal(out.kind, "gated");
   const record = JSON.parse(out.actionRecord);
   assert.equal(record.surface, "command");
-  assert.equal(record.syntactic.cwd, "/repo");
+  assert.equal(record.facts.cwd, "/repo");
   assert.ok(out.summary.includes("git push --force"));
   assert.ok(!out.summary.includes("\n"), "summary is a single line");
 });
@@ -133,9 +133,9 @@ test("gateToolCall(MCP) → gated with an mcp_tool_call ActionRecord (params ver
   assert.equal(out.kind, "gated");
   const record = JSON.parse(out.actionRecord);
   assert.equal(record.surface, "mcp_tool_call");
-  assert.equal(record.syntactic.server, "omnifocus");
-  assert.equal(record.syntactic.tool, "delete_project");
-  assert.deepEqual(record.syntactic.params, { project_id: "abc", list: "Agent Inbox" });
+  assert.equal(record.facts.server, "omnifocus");
+  assert.equal(record.facts.tool, "delete_project");
+  assert.deepEqual(record.facts.params, { project_id: "abc", list: "Agent Inbox" });
 });
 
 test("gateToolCall(MCP) with no params defaults to an empty object", async () => {
@@ -143,7 +143,7 @@ test("gateToolCall(MCP) with no params defaults to an empty object", async () =>
   const out = gateToolCall(wasm, "mcp__srv__list", undefined, undefined);
   assert.equal(out.kind, "gated");
   const record = JSON.parse(out.actionRecord);
-  assert.deepEqual(record.syntactic.params, {});
+  assert.deepEqual(record.facts.params, {});
 });
 
 test("gateToolCall(apply_patch) → gated with a file_edit ActionRecord", async () => {
@@ -161,10 +161,10 @@ test("gateToolCall(apply_patch) → gated with a file_edit ActionRecord", async 
   assert.equal(out.kind, "gated");
   const record = JSON.parse(out.actionRecord);
   assert.equal(record.surface, "file_edit");
-  assert.equal(record.syntactic.operation, "patch");
-  assert.deepEqual(record.syntactic.paths, ["src/app.ts"]);
-  assert.match(record.syntactic.diff_summary, /src\/app\.ts/);
-  assert.equal(typeof record.syntactic.diff_hash, "string");
+  assert.equal(record.facts.operation, "patch");
+  assert.deepEqual(record.facts.paths, ["src/app.ts"]);
+  assert.match(record.facts.diff_summary, /src\/app\.ts/);
+  assert.equal(typeof record.facts.diff_hash, "string");
   assert.match(out.summary, /file edit/i);
 });
 
@@ -184,7 +184,7 @@ test("gateToolCall(apply_patch rename) captures both source and destination path
   assert.equal(out.kind, "gated");
   const record = JSON.parse(out.actionRecord);
   assert.equal(record.surface, "file_edit");
-  assert.deepEqual(record.syntactic.paths, ["src/old.ts", "src/new.ts"]);
+  assert.deepEqual(record.facts.paths, ["src/old.ts", "src/new.ts"]);
 });
 
 test("gateToolCall(Claude Edit/Write/MultiEdit) → gated file_edit records", async () => {
@@ -204,9 +204,9 @@ test("gateToolCall(Claude Edit/Write/MultiEdit) → gated file_edit records", as
     assert.equal(out.kind, "gated", `${toolName} must gate`);
     const record = JSON.parse(out.actionRecord);
     assert.equal(record.surface, "file_edit");
-    assert.equal(record.syntactic.operation, operation);
-    assert.equal(record.syntactic.paths.length, 1);
-    assert.equal(typeof record.syntactic.diff_hash, "string");
+    assert.equal(record.facts.operation, operation);
+    assert.equal(record.facts.paths.length, 1);
+    assert.equal(typeof record.facts.diff_hash, "string");
   }
 });
 
@@ -278,8 +278,8 @@ test("gateToolCall(PowerShell) → gated command record, labelled PowerShell (#2
   assert.equal(out.kind, "gated");
   const record = JSON.parse(out.actionRecord);
   assert.equal(record.surface, "command");
-  assert.equal(record.syntactic.raw, "Remove-Item -Recurse build");
-  assert.equal(record.syntactic.cwd, "C:\\w");
+  assert.equal(record.facts.raw, "Remove-Item -Recurse build");
+  assert.equal(record.facts.cwd, "C:\\w");
 
   assert.equal(out.summary, "PowerShell: Remove-Item -Recurse build");
 });
@@ -311,14 +311,14 @@ test("gateToolCall(NotebookEdit) → gated file_edit record bound to the cell ch
   assert.equal(out.kind, "gated");
   const record = JSON.parse(out.actionRecord);
   assert.equal(record.surface, "file_edit");
-  assert.equal(record.syntactic.operation, "notebook_edit");
-  assert.deepEqual(record.syntactic.paths, ["/repo/analysis.ipynb"]);
+  assert.equal(record.facts.operation, "notebook_edit");
+  assert.deepEqual(record.facts.paths, ["/repo/analysis.ipynb"]);
   assert.ok(out.summary.includes("/repo/analysis.ipynb"));
   assert.ok(out.summary.includes("abc123"));
 
   // The hash binds the change itself: a different new_source is a different record.
   const other = gateToolCall(wasm, "NotebookEdit", { ...input, new_source: "print(1)" }, "/repo");
-  assert.notEqual(JSON.parse(other.actionRecord).syntactic.diff_hash, record.syntactic.diff_hash);
+  assert.notEqual(JSON.parse(other.actionRecord).facts.diff_hash, record.facts.diff_hash);
 });
 
 test("gateToolCall(NotebookEdit) insert and delete modes gate; delete needs no new_source (#298)", async () => {
@@ -591,7 +591,7 @@ test("Bash, Monitor and PowerShell carry opaque nonblank lines without inferred 
       assert.deepEqual(JSON.parse(outcome.actionRecord), {
         record_schema_version: 3,
         surface: "command",
-        syntactic: { raw, cwd: "/caller" },
+        facts: { raw, cwd: "/caller" },
       });
     }
     for (const command of ["", " \t\r\n", "\u00a0\u3000"]) {
@@ -608,10 +608,10 @@ test("malformed core line outputs deny without inferring a vector", async () => 
     "null",
     "[]",
     "{}",
-    '{"syntactic":null}',
-    '{"syntactic":{}}',
-    '{"syntactic":{"raw":[]}}',
-    '{"syntactic":{"raw":" "}}',
+    '{"facts":null}',
+    '{"facts":{}}',
+    '{"facts":{"raw":[]}}',
+    '{"facts":{"raw":" "}}',
   ]) {
     const broken = { ...wasm, action_from_command: () => output };
     assert.equal(

@@ -124,7 +124,7 @@ async function main() {
     action: {
       recordSchemaVersion: 3,
       surface: "command",
-      syntactic: { argv: ["ls"] },
+      facts: { argv: ["ls"] },
     },
     summary: "poll keep-alive",
     actor: { id: "machine:test", kind: "script" },

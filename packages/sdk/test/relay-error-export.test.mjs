@@ -125,7 +125,7 @@ const REQUEST = {
   action: {
     recordSchemaVersion: 3,
     surface: "command",
-    syntactic: { raw: "git push" },
+    facts: { raw: "git push" },
   },
   summary: "Push to main",
   actor: { id: "machine:ci", kind: "claude-code" },

@@ -1393,7 +1393,7 @@ pub fn x25519_public_key(seed_b64: &str) -> Result<String, JsError> {
     Ok(URL_SAFE_NO_PAD.encode(pubkey.to_bytes()))
 }
 
-// ── ActionRecord builders (the hook's syntactic substrate) ──────────────────────────────
+// ── ActionRecord builders (the hook's facts substrate) ──────────────────────────────
 
 /// Preserve the core's stable refusal kind on a fresh JS Error. The only content refusal is
 /// `no_command`; callers still deny every thrown value, including malformed known-input schemas.
@@ -1494,14 +1494,14 @@ pub fn action_from_agent_tool_call(
 /// call, returning it as JSON, with an **explicit** `raw` override instead of the synthesized
 /// `"<server>.<tool>(...)"` display. Use this when the caller already holds human-authored
 /// reviewer prose for the action (e.g. an OpenClaw plugin permission request's
-/// `description`/`detail` — `docs/openclaw-integration.md` §5.2: `syntactic.raw` = `description`,
+/// `description`/`detail` — `docs/openclaw-integration.md` §5.2: `facts.raw` = `description`,
 /// plus `detail` when present); use [`action_from_agent_tool_call`] when no such prose exists.
 ///
 /// `raw` is bound **verbatim** — it is never re-derived from `params_json`.
 ///
 /// - `server` — the gating provider identity (e.g. `"openclaw"`).
 /// - `tool` — the tool name within that provider (e.g. `"deploy_service"`).
-/// - `raw` — the reviewer-facing prose to bind verbatim as `syntactic.raw`.
+/// - `raw` — the reviewer-facing prose to bind verbatim as `facts.raw`.
 /// - `params_json` — the tool-call parameters as a JSON value, or `undefined`/`null` when the
 ///   caller has no structured parameters to offer.
 ///
