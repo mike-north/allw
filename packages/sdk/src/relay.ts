@@ -8,6 +8,8 @@
  * @see ../../relay/src/index.ts (the endpoints this calls)
  */
 
+import { relayWebSocketProtocols } from "./relay-websocket.js";
+
 /** A `fetch`-compatible function (injectable for tests; defaults to the global `fetch`). */
 export type FetchImpl = typeof fetch;
 
@@ -419,11 +421,14 @@ export class RelayClient {
     return null;
   }
 
-  /** The WebSocket URL for the live verdict-wait socket (`GET /:acct/requests/:id/wait`). */
+  /** Token-free address of the live verdict socket; capabilities travel only in offered protocols. */
   waitUrl(requestId: string): string {
-    const path = `${toWsUrl(this.base)}/requests/${encodeURIComponent(requestId)}/wait`;
-    const token = this.requestAuthTokens.get(requestId);
-    return token === undefined ? path : `${path}?auth=${encodeURIComponent(token)}`;
+    return `${toWsUrl(this.base)}/requests/${encodeURIComponent(requestId)}/wait`;
+  }
+
+  /** Offers for this active request; settled requests have no capability and cannot open a socket. */
+  waitProtocols(requestId: string): string[] {
+    return relayWebSocketProtocols(this.requestAuthTokens.get(requestId) ?? "");
   }
 
   /**

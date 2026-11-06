@@ -339,14 +339,9 @@ export async function fetchDeviceRegistry(
  * Build the device presence WebSocket URL (`GET /:acct/devices/:deviceId/connect`). `http(s)` is
  * upgraded to `ws(s)` so the same relay base works for both HTTP pairing and the WS presence link.
  */
-export function deviceConnectWsUrl(
-  relayUrl: string,
-  accountId: string,
-  deviceId: string,
-  deviceAuthToken: string,
-): string {
+export function deviceConnectWsUrl(relayUrl: string, accountId: string, deviceId: string): string {
   const base = normalizeBase(relayUrl).replace(/^http/, "ws");
-  return `${base}/${encodeURIComponent(accountId)}/devices/${encodeURIComponent(deviceId)}/connect?auth=${encodeURIComponent(deviceAuthToken)}`;
+  return `${base}/${encodeURIComponent(accountId)}/devices/${encodeURIComponent(deviceId)}/connect`;
 }
 
 // The approver no longer resolves actor *keys* from the relay `/actors` registry: a relay-supplied

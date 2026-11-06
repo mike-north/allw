@@ -10,7 +10,11 @@
     },
     "./vendor/allw-wasm/allw_wasm_bg.wasm": "./vendor/allw-wasm/allw_wasm_bg.wasm",
     "./vendor/allw-wasm/allw_wasm.js": "./vendor/allw-wasm/allw_wasm.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./relay-websocket": {
+      "types": "./dist/relay-websocket.d.ts",
+      "import": "./dist/relay-websocket.js"
+    }
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

@@ -116,10 +116,16 @@ function recordingLogger() {
 function selfClosingSocket() {
   const listeners = { open: [], message: [], error: [], close: [] };
   const emit = (type) => {
-    for (const listener of listeners[type]) listener({});
+    for (const listener of listeners[type])
+      listener({
+        message: "device-secret-token",
+        data: JSON.stringify({ type: "error", error: "device-secret-token" }),
+      });
   };
   queueMicrotask(() => {
     emit("open");
+    emit("error");
+    emit("message");
     emit("close");
   });
   return {
@@ -161,7 +167,7 @@ function requestThenCloseSocket(envelope) {
   };
 }
 
-test("runWatch logs a redacted device presence URL while connecting with the auth token", async () => {
+test("runWatch uses private offers and keeps reflected event/frame credentials out of logs", async () => {
   const wasm = await loadWasm();
   const { keyfile } = pairedApprover(wasm);
   const dir = mkdtempSync(join(tmpdir(), "allw-watch-"));
@@ -172,12 +178,14 @@ test("runWatch logs a redacted device presence URL while connecting with the aut
 
     const log = recordingLogger();
     let connectedUrl = "";
+    let offered;
     await runWatch(
       wasm,
       { keyfilePath },
       {
-        connect(url) {
+        connect(url, protocols) {
           connectedUrl = url;
+          offered = protocols;
           return selfClosingSocket();
         },
         prompter: { decide: () => Promise.resolve(null) },
@@ -185,13 +193,16 @@ test("runWatch logs a redacted device presence URL while connecting with the aut
       },
     );
 
-    assert.match(connectedUrl, /\?auth=device-secret-token$/, "the socket uses the real token URL");
+    assert.equal(new URL(connectedUrl).search, "");
+    assert.deepEqual(offered, ["allw.v1", "allw.auth.device-secret-token"]);
     assert.ok(
       log._info.some((line) => line.startsWith("Connecting to ")),
       "the connection attempt is still logged",
     );
     assert.equal(
-      log._info.some((line) => line.includes("device-secret-token") || line.includes("?auth=")),
+      [...log._info, ...log._warn].some(
+        (line) => line.includes("device-secret-token") || line.includes("?auth="),
+      ),
       false,
       "logs must not expose the device bearer token or auth query string",
     );
@@ -729,4 +740,38 @@ test("origin fail-closed: a resolver error still renders the request as ⚠ UNVE
     log._warn.some((l) => /could not resolve account state/i.test(l)),
     "the resolver error is reported (origin downgraded, not aborted)",
   );
+});
+
+test("runWatch replaces secret-bearing connector exceptions with a fixed caller error", async () => {
+  const wasm = await loadWasm();
+  const { keyfile } = pairedApprover(wasm);
+  const dir = mkdtempSync(join(tmpdir(), "allw-watch-private-error-"));
+  const keyfilePath = join(dir, "keyfile.json");
+  const token = "private-constructor-capability";
+  writeKeyfile(keyfilePath, { ...keyfile, device_auth_token: token });
+  const log = recordingLogger();
+  try {
+    await assert.rejects(
+      runWatch(
+        wasm,
+        { keyfilePath },
+        {
+          connect: (_url, protocols) => {
+            throw new Error(`connector rejected ${protocols.join(",")}`);
+          },
+          prompter: fixedPrompter(null),
+          log,
+        },
+      ),
+      (error) => {
+        assert.equal(error.message, "WebSocket connection failed");
+        assert.equal(error.cause, undefined);
+        assert.equal(String(error).includes(token), false);
+        return true;
+      },
+    );
+    assert.equal(JSON.stringify([log._info, log._warn]).includes(token), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

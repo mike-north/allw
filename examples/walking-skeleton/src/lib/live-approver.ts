@@ -73,7 +73,7 @@ export async function runLiveApprover(options: LiveApproverOptions): Promise<voi
     { keyfilePath: options.keyfilePath },
     {
       // Node 24 ships a global WebSocket; it satisfies the structural WebSocketLike surface.
-      connect: (url: string): WebSocketLike => new WebSocket(url),
+      connect: (url: string, protocols: string[]): WebSocketLike => new WebSocket(url, protocols),
       prompter: autoPrompter(options.mode, log),
       log,
     },

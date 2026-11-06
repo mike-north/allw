@@ -363,7 +363,8 @@ export interface ClientConfig {
   readonly nowImpl?: NowImpl;
   /**
    * Override the WebSocket factory (tests / runtimes without a global `WebSocket`). When omitted,
-   * the SDK uses the global `WebSocket` if present and otherwise polls.
+   * the SDK uses the global `WebSocket` if present and otherwise polls. Forward both `(url, protocols)`
+   * to the constructor; protocols contain a private capability and must never be logged.
    */
   readonly webSocketFactory?: WebSocketFactory;
   /** Poll cadence in ms for the fallback path. Defaults to 1000. */
@@ -436,9 +437,10 @@ class InMemoryNonceStore implements NonceStore {
 
 /** The default WebSocket factory: the global `WebSocket` if the runtime provides one, else none. */
 function defaultWebSocketFactory(): WebSocketFactory | undefined {
-  const ctor = (globalThis as { WebSocket?: new (url: string) => unknown }).WebSocket;
+  const ctor = (globalThis as { WebSocket?: new (url: string, protocols: string[]) => unknown })
+    .WebSocket;
   if (!ctor) return undefined;
-  return (url: string) => new ctor(url) as never;
+  return (url: string, protocols: string[]) => new ctor(url, protocols) as never;
 }
 
 /**
@@ -1133,3 +1135,6 @@ function makeVerdict(
     },
   };
 }
+
+/** @public Credential offers shared by device connectors and request waiters. */
+export { relayWebSocketProtocols } from "./relay-websocket.js";

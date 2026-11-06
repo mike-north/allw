@@ -324,14 +324,17 @@ function stubLiveSocket() {
 function recordingConnector() {
   const sockets = [];
   const urls = [];
-  const connect = (url) => {
+  const protocols = [];
+  const connect = (url, offered) => {
     urls.push(url);
+    protocols.push(offered);
     const socket = stubLiveSocket();
     sockets.push(socket);
     return socket;
   };
   connect.sockets = sockets;
   connect.urls = urls;
+  connect.protocols = protocols;
   return connect;
 }
 
@@ -405,7 +408,11 @@ describe("mountWebApprover — live retraction listener (#150)", () => {
       await flushMicrotasks();
       const url = new URL(connect.urls[0]);
       assert.equal(url.searchParams.get("surface_id"), "surface-abc");
-      assert.equal(url.searchParams.get("auth"), RELAY_CONFIG.deviceAuthToken);
+      assert.equal(url.searchParams.get("auth"), null);
+      assert.deepEqual(connect.protocols[0], [
+        "allw.v1",
+        `allw.auth.${RELAY_CONFIG.deviceAuthToken}`,
+      ]);
 
       stop();
     } finally {

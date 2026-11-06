@@ -87,7 +87,8 @@ function writePairedKeyfile(relayUrl) {
 
 /**
  * Run `watch` with network access stubbed: `connect` records the URL and throws, so an accepted
- * URL ends at the socket and a rejected one never gets there.
+ * URL ends at the socket and a rejected one never gets there. The connector exception is withheld
+ * by watch; the recording, rather than its untrusted exception type, proves a socket attempt.
  */
 async function watchWith(keyfilePath, relayOverride) {
   const connected = [];
@@ -311,7 +312,7 @@ describe("watch --relay override (#267)", () => {
       const keyfilePath = writePairedKeyfile("https://relay.example.com");
       const { run, connected } = await watchWith(keyfilePath, input);
       if (runtime === "accept") {
-        await assert.rejects(run, ReachedNetwork);
+        await assert.rejects(run, { message: "WebSocket connection failed" });
         assert.equal(connected.length, 1, "an accepted URL reaches the presence socket");
         assertSocketFromCanonical(connected[0], canonical);
       } else {
@@ -325,7 +326,7 @@ describe("watch --relay override (#267)", () => {
   test("a valid --relay override is used even when the stored relay_url is plaintext", async () => {
     const keyfilePath = writePairedKeyfile("http://relay.example.com");
     const { run, connected } = await watchWith(keyfilePath, "https://relay.example.com");
-    await assert.rejects(run, ReachedNetwork);
+    await assert.rejects(run, { message: "WebSocket connection failed" });
     assert.match(connected[0], /^wss:\/\/relay\.example\.com\//);
   });
 });
@@ -346,7 +347,7 @@ describe("keyfile relay_url, used by watch (#267)", () => {
       const keyfilePath = writePairedKeyfile(input);
       const { run, connected } = await watchWith(keyfilePath, undefined);
       if (runtime === "accept") {
-        await assert.rejects(run, ReachedNetwork);
+        await assert.rejects(run, { message: "WebSocket connection failed" });
         assert.equal(connected.length, 1);
         assertSocketFromCanonical(connected[0], canonical);
       } else {

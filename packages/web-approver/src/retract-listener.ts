@@ -27,6 +27,8 @@
  * @see ./surface-id.ts (the persisted `surface_id` this listener connects with)
  */
 
+import { relayWebSocketProtocols } from "@allw/sdk/relay-websocket";
+
 /** The minimum reconnect delay in ms (`docs/relay-api.md` §7.3: "1→2→4→…→cap 30s"). */
 const MIN_RECONNECT_DELAY_MS = 1_000;
 /** The reconnect delay cap in ms. */
@@ -42,8 +44,8 @@ export interface LiveSocket {
   addEventListener(type: "error", listener: (ev: unknown) => void): void;
 }
 
-/** An injectable connector so tests never open a real network socket. */
-export type ConnectImpl = (url: string) => LiveSocket;
+/** Forward both URL and private protocol offers; offers contain a bearer and must not be logged. */
+export type ConnectImpl = (url: string, protocols: string[]) => LiveSocket;
 
 /** An injectable `setTimeout`-compatible scheduler for tests. */
 export type ReconnectScheduler = (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
@@ -81,11 +83,10 @@ export interface RetractListener {
   readonly stop: () => void;
 }
 
-/** Build the `/{accountId}/devices/{deviceId}/connect?auth=…&surface_id=…` WebSocket URL. */
+/** Build a token-free presence URL; the surface id controls screen deduplication only. */
 function connectUrl(options: RetractListenerOptions): string {
   const base = options.relayUrl.replace(/\/+$/, "").replace(/^http/, "ws");
   const params = new URLSearchParams({
-    auth: options.deviceAuthToken,
     surface_id: options.surfaceId,
   });
   return `${base}/${encodeURIComponent(options.accountId)}/devices/${encodeURIComponent(options.deviceId)}/connect?${params.toString()}`;
@@ -125,7 +126,8 @@ function decodeBinary(data: unknown): string | null {
  * @returns A {@link RetractListener} handle with `stop()` to tear the whole thing down.
  */
 export function createRetractListener(options: RetractListenerOptions): RetractListener {
-  const connectImpl: ConnectImpl = options.connectImpl ?? ((url) => new WebSocket(url));
+  const connectImpl: ConnectImpl =
+    options.connectImpl ?? ((url, protocols) => new WebSocket(url, protocols));
   const scheduleReconnect: ReconnectScheduler = options.scheduleReconnect ?? setTimeout;
   const cancelReconnect: ReconnectCanceller = options.cancelReconnect ?? clearTimeout;
   const randomImpl: () => number = options.randomImpl ?? Math.random;
@@ -152,7 +154,14 @@ export function createRetractListener(options: RetractListenerOptions): RetractL
 
   function connect(): void {
     if (stopped) return;
-    const ws = connectImpl(url);
+    let ws: LiveSocket;
+    try {
+      ws = connectImpl(url, relayWebSocketProtocols(options.deviceAuthToken));
+    } catch {
+      // Connector errors can contain credentials; reconnect without exposing their text/cause.
+      scheduleNextConnect();
+      return;
+    }
     socket = ws;
 
     ws.addEventListener("open", () => {
