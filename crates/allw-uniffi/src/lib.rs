@@ -145,14 +145,9 @@ fn decode_b64_vec(value: &str, what: &str) -> Result<Vec<u8>, AllwFfiError> {
         .map_err(|e| AllwFfiError::failure(format!("{what} is not valid base64url: {e}")))
 }
 
-/// Builds an [`ActionRecord`] from a **pre-tokenized** argv, returning it as JSON — the
-/// command-surface builder for callers holding a canonical execution plan they must bind verbatim
-/// (`docs/openclaw-integration.md` §5.1). `raw` carries the original command text (empty string
-/// when the caller has none) and is used only to record `syntactic.raw` and extract `env_refs`
-/// names; it is never re-tokenized. `cwd` is the bound working directory, empty when unbound.
-///
-/// Fails (fail-closed) for an argv with no program (#376): empty, an empty program word, or only
-/// variable assignments.
+/// Capture caller argv verbatim, with optional raw/cwd (empty binding strings mean absent).
+/// Only an empty vector is refused; word contents never acquire inferred shell meaning.
+/// @see docs/action-record.md — Command capture.
 #[uniffi::export]
 pub fn action_from_argv_json(
     argv: Vec<String>,
@@ -167,11 +162,9 @@ pub fn action_from_argv_json(
     to_json(&action, "ActionRecord")
 }
 
-/// Builds an [`ActionRecord`] from a raw shell command line, returning it as JSON.
-///
-/// Fails (fail-closed) for invalid shell syntax and for a line that runs no program (#376): blank,
-/// only variable assignments or shell operators, or an empty program word. The caller must deny,
-/// never ask a human to approve the line.
+/// Capture opaque nonblank command text and caller cwd (an empty cwd means unbound).
+/// No argv or program identity is inferred; blank/whitespace text fails closed.
+/// @see docs/action-record.md — Command capture.
 #[uniffi::export]
 pub fn action_from_command_json(command: String, cwd: String) -> Result<String, AllwFfiError> {
     let ctx = CommandContext {
@@ -184,7 +177,7 @@ pub fn action_from_command_json(command: String, cwd: String) -> Result<String, 
 
 /// Builds an [`ActionRecord`] for an agent-runtime/plugin-owned tool call, returning it as JSON.
 /// This is the **agent_tool_call** surface (`docs/openclaw-integration.md` §5.2,
-/// `docs/policy-seam.md` §Structure vs. data in the ActionRecord): a tool call gated by the
+/// `docs/action-record.md` §Tool calls and file edits): a tool call gated by the
 /// harness rather than served by an MCP server. Reuses the `(server, tool, params)`
 /// function-identity substrate from `mcp_tool_call` — `server` holds the gating provider id, not
 /// an MCP server name — but is tagged with a distinct `surface` so an `mcp_tool_call`-scoped
@@ -494,42 +487,26 @@ pub fn escape_for_display(text: String) -> String {
 mod tests {
     use super::*;
 
-    /// The native binding inherits the core's no-program refusal (#376): a blank line, a line of
-    /// only assignments or operators, and an empty program word all fail instead of building a
-    /// record.
+    /// Native callers refuse empty presentation without interpreting nonblank text.
     #[test]
-    fn action_from_command_json_refuses_a_line_that_runs_no_program() {
-        for (line, message) in [
-            ("", "contains no command"),
-            ("   ", "contains no command"),
-            ("FOO=1", "runs no program"),
-            ("&&", "runs no program"),
-            ("'' rm -rf x", "first program word is empty"),
-        ] {
+    fn action_from_command_json_refuses_blank_text() {
+        for (line, message) in [("", "contains no command"), ("   ", "contains no command")] {
             let err = action_from_command_json(line.to_string(), String::new())
-                .expect_err("a line that runs no program must be refused");
+                .expect_err("blank text must be refused");
             assert!(err.to_string().contains(message), "{line:?}: {err}");
         }
         assert!(action_from_command_json("ls".to_string(), String::new()).is_ok());
     }
 
-    /// The argv binding inherits the core's no-program refusal too (#376).
+    /// Native argv capture refuses a vector with no elements, irrespective of optional raw.
     #[test]
-    fn action_from_argv_json_refuses_an_argv_with_no_program() {
+    fn action_from_argv_json_refuses_empty_vector() {
         let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        for (argv, message) in [
-            (words(&[]), "contains no command"),
-            (words(&[""]), "first program word is empty"),
-            (
-                words(&["", "rm", "-rf", "x"]),
-                "first program word is empty",
-            ),
-            (words(&["FOO=1"]), "runs no program"),
-        ] {
-            let err = action_from_argv_json(argv.clone(), "rm -rf x".to_string(), String::new())
-                .expect_err("an argv with no program must be refused");
-            assert!(err.to_string().contains(message), "{argv:?}: {err}");
-        }
+        let argv = words(&[]);
+        let err = action_from_argv_json(argv, "rm -rf x".to_string(), String::new())
+            .expect_err("a vector with no elements must be refused");
+        assert!(err.to_string().contains("contains no command"));
+
         assert!(action_from_argv_json(words(&["ls"]), String::new(), String::new()).is_ok());
     }
 

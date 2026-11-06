@@ -431,13 +431,27 @@ app when tapped.
 
 ## #406 wire/hash rollout hold
 
-Risk/policy metadata removal changes caller plaintext and request hashes (`allw/request-hash/v3`).
-An old approver core rejects new contexts without risk; the new core cannot verify old signed request
-hashes. Use a quiet/drained rollout: stop callers and let pending requests resolve or expire, update
-Pages plus CLI/native approvers and callers together, reload browser tabs, then resume. The relay's
-current provenance-only WASM path accepts both formats and does not compute request hashes or render
-actions; a relay deployment is not required solely for this slice's format change. Its live source
-version still needs operator confirmation. No compatibility shim or automatic history migration exists.
+The final schema-3 caller-facts record uses `allw/request-hash/v4` and audit domain
+`allw/audit-record/v3`. It follows slice 1's schema-2 / request-v3 break. Consumed old/new caller,
+CLI and web approver probes show matching formats verify and mixed formats fail closed: successful
+decryption alone is not compatibility. No compatibility shim or automatic history migration exists.
+
+Use one coordinated **Mike-only** rollout after slice 2, with no per-slice deployments:
+
+1. Quiet every active caller and drain pending requests by decision or expiry.
+2. Confirm the deployed relay source/WASM version and its account/certificate/revocation/provenance
+   behavior, or update the relay from the approved final checkout first. The consumed slice-1 and
+   slice-2 provenance cores accept genuine verdicts from both formats without plaintext. This is
+   evidence for those builds only: the deployed relay version is unknown, so no unconditional
+   “relay needs no update” claim is made.
+3. Update Pages and **all active** callers and approvers (SDK installations, both hooks, bridge,
+   CLI, and any active native build) to the same final format while callers remain quiet.
+4. Reload paired browser tabs, restart long-running callers/approvers, verify matching-build
+   approve/deny/timeout behavior, then resume callers. Native display wiring remains #273's M7
+   blocker, not acceptance established by a binding build.
+
+No live version inventory or deployment is established by this repository change. Planning must
+read the final contract/threat/positioning/scope/deploy diff before merge; Mike owns deployment.
 
 Browser pairing remains under `allw:pairing:v1` with the same identity shape. The browser has no persisted
 audit-record store: its history is session-local. Inbox refresh preserves local terminal receipts.

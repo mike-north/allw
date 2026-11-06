@@ -60,7 +60,7 @@ function findChrome() {
 /** A wire `ApprovalContext` for `surface` with `syntactic`. */
 function context(surface, syntactic, summary) {
   return {
-    action: { record_schema_version: 2, surface, syntactic, risk: "high" },
+    action: { record_schema_version: 3, surface, syntactic, risk: "high" },
     summary,
     actor: { id: "machine:laptop", kind: "claude-code" },
 
@@ -70,7 +70,7 @@ function context(surface, syntactic, summary) {
 }
 
 /** Tail markers: each must end up laid out inside the viewport. */
-const MARKERS = ["DROP TABLE users", "TAIL-OF-LONG-PATH", "TAIL-OF-LONG-HOST", "TAIL-OF-SUMMARY"];
+const MARKERS = ["DROP TABLE users", "TAIL-OF-LONG-PATH", "TAIL-OF-LONG-CWD", "TAIL-OF-SUMMARY"];
 
 const CONTEXTS = [
   // The review's probe: a padded SQL tail in the params of a benign-looking tool call.
@@ -87,9 +87,8 @@ const CONTEXTS = [
   context(
     "command",
     {
-      bin: "cat",
       argv: ["cat", `/srv/${"a".repeat(300)}${ESC}TAIL-OF-LONG-PATH`],
-      host: `${"h".repeat(200)}TAIL-OF-LONG-HOST`,
+      cwd: `${"h".repeat(200)}TAIL-OF-LONG-CWD`,
     },
     `${"s".repeat(200)}TAIL-OF-SUMMARY`,
   ),
@@ -321,7 +320,6 @@ const AUDIT_CONTEXTS = [
   context(
     "command",
     {
-      bin: "deploy",
       argv: ["deploy", `${"x".repeat(300)}TAIL-OF-AUDIT-ARG`],
       cwd: `/srv/${"c".repeat(200)}TAIL-OF-AUDIT-CWD`,
     },

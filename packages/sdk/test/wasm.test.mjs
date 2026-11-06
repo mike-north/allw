@@ -1121,38 +1121,16 @@ test("verify_actor_attestation throws when a verdict/cert JWS is presented as an
 
 // ── ActionRecord builders (issue #13: the hook's syntactic substrate via the WASM core) ───────
 
-test("action_from_command builds a command ActionRecord (surface=command, tokenized + cwd)", async () => {
+test("action_from_command captures opaque raw and caller cwd only", async () => {
   const wasm = await loadWasm();
-
-  const json = wasm.action_from_command("git push --force origin main", "/home/dev/repo");
-  const record = JSON.parse(json);
-
-  // policy-seam.md §The three tiers (T1): the command surface captures the syntactic substrate.
-  assert.equal(record.surface, "command", "surface must be 'command'");
-  assert.equal(record.record_schema_version, 2, "v1 record schema version");
-  assert.equal(record.syntactic.bin, "git", "bin is argv[0]");
   assert.deepEqual(
-    record.syntactic.argv,
-    ["git", "push", "--force", "origin", "main"],
-    "argv is the full token vector",
+    JSON.parse(wasm.action_from_command("git push --force origin main", "/home/dev/repo")),
+    {
+      record_schema_version: 3,
+      surface: "command",
+      syntactic: { raw: "git push --force origin main", cwd: "/home/dev/repo" },
+    },
   );
-  assert.ok(
-    record.syntactic.flags.includes("--force"),
-    "flags include the force flag (starts with '-')",
-  );
-  assert.deepEqual(
-    record.syntactic.positionals,
-    ["push", "origin", "main"],
-    "positionals are the non-flag tokens after argv[0]",
-  );
-  assert.equal(record.syntactic.cwd, "/home/dev/repo", "cwd is threaded through from the hook");
-  assert.equal(record.syntactic.raw, "git push --force origin main", "raw is the original command");
-  // git push --force → High (command.rs risk heuristic).
-
-  // T1 forward-compat: semantic slots reserved (policy-seam.md §forward-compat req #3). A `None`
-  // serializes as an ABSENT key (skip_serializing_if), so the keys must not be present at all.
-  assert.ok(!("capabilities" in record), "capabilities reserved (absent) in v1");
-  assert.ok(!("scope" in record), "scope reserved (absent) in v1");
 });
 
 test("action_from_command omits cwd when not provided (cwd unknown)", async () => {
@@ -1167,15 +1145,13 @@ test("action_from_command omits cwd when not provided (cwd unknown)", async () =
   );
 });
 
-test("action_from_command throws on a malformed command (unmatched quote)", async () => {
+test("action_from_command carries unmatched quotes as caller text", async () => {
   const wasm = await loadWasm();
-
-  // Fail-closed at the boundary: an unmatched quote is invalid shell syntax → the hook denies.
-  assert.throws(
-    () => wasm.action_from_command('echo "hello world', "/tmp"),
-    /action_from_command failed/,
-    "an unmatched quote must surface as a thrown JS error (fail-closed)",
-  );
+  const raw = 'echo "hello world';
+  assert.deepEqual(JSON.parse(wasm.action_from_command(raw, "/tmp")).syntactic, {
+    raw,
+    cwd: "/tmp",
+  });
 });
 
 test("action_from_mcp_tool_call builds an mcp ActionRecord (surface=mcp_tool_call, params verbatim)", async () => {
@@ -1187,7 +1163,7 @@ test("action_from_mcp_tool_call builds an mcp ActionRecord (surface=mcp_tool_cal
   );
 
   assert.equal(record.surface, "mcp_tool_call", "surface must be 'mcp_tool_call'");
-  assert.equal(record.record_schema_version, 2, "v1 record schema version");
+  assert.equal(record.record_schema_version, 3, "v1 record schema version");
   assert.equal(record.syntactic.server, "omnifocus", "server is preserved");
   assert.equal(record.syntactic.tool, "delete_project", "tool is preserved");
   assert.deepEqual(
@@ -1227,7 +1203,7 @@ test("action_from_file_edit builds a file_edit ActionRecord with paths and diff 
   );
 
   assert.equal(record.surface, "file_edit", "surface must be 'file_edit'");
-  assert.equal(record.record_schema_version, 2, "v1 record schema version");
+  assert.equal(record.record_schema_version, 3, "v1 record schema version");
   assert.equal(record.syntactic.operation, "patch", "operation is preserved");
   assert.deepEqual(record.syntactic.paths, ["src/app.ts"], "target paths are preserved");
   assert.equal(record.syntactic.diff_summary, "patch src/app.ts", "summary is preserved");
@@ -1257,7 +1233,7 @@ test("action_from_agent_tool_call builds an agent_tool_call ActionRecord distinc
 
   assert.equal(record.surface, "agent_tool_call", "surface must be 'agent_tool_call'");
   assert.notEqual(record.surface, "mcp_tool_call", "must never be tagged mcp_tool_call");
-  assert.equal(record.record_schema_version, 2, "v1 record schema version");
+  assert.equal(record.record_schema_version, 3, "v1 record schema version");
   assert.equal(record.syntactic.server, "openclaw", "server is preserved");
   assert.equal(record.syntactic.tool, "deploy_service", "tool is preserved");
   assert.equal(
@@ -1385,9 +1361,9 @@ test("action_from_argv binds the caller's argv verbatim instead of re-parsing ra
   const record = JSON.parse(wasm.action_from_argv(JSON.stringify(argv), raw, "/srv/app"));
 
   assert.equal(record.surface, "command");
-  assert.equal(record.record_schema_version, 2);
+  assert.equal(record.record_schema_version, 3);
   assert.deepEqual(record.syntactic.argv, argv, "argv is the caller's canonical vector");
-  assert.equal(record.syntactic.bin, "bash");
+  assert.equal(record.syntactic.bin, undefined);
   assert.equal(record.syntactic.raw, raw, "raw is recorded verbatim");
   assert.equal(record.syntactic.cwd, "/srv/app");
   assert.notDeepEqual(
@@ -1397,7 +1373,7 @@ test("action_from_argv binds the caller's argv verbatim instead of re-parsing ra
   );
 });
 
-test("action_from_argv extracts env_refs (names only) from raw", async () => {
+test("action_from_argv never extracts env_refs from raw", async () => {
   const wasm = await loadWasm();
 
   const record = JSON.parse(
@@ -1413,7 +1389,7 @@ test("action_from_argv extracts env_refs (names only) from raw", async () => {
     ),
   );
 
-  assert.deepEqual(record.syntactic.env_refs, ["API_TOKEN", "TENANT"]);
+  assert.equal(record.syntactic.env_refs, undefined);
   assert.ok(!("cwd" in record.syntactic), "an omitted cwd stays absent, not null");
 });
 

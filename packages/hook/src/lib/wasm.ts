@@ -18,7 +18,7 @@
  *
  * @see ../../../approver/src/lib/wasm.ts (the loader pattern this mirrors)
  * @see ../../../../docs/architecture.md (WASM-local hard constraint)
- * @see ../../../../docs/policy-seam.md §The three tiers (the ActionRecord substrate)
+ * @see ../../../../docs/action-record.md §The action record (the ActionRecord substrate)
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -31,31 +31,9 @@ import { fileURLToPath, pathToFileURL } from "node:url";
  * a malformed input **throws** (fail-closed at the boundary). Mirrors `crates/allw-wasm/src/lib.rs`.
  */
 export interface HookWasm {
-  /**
-   * Build an `ActionRecord` JSON for a shell command (the `command` surface). `cwd` is the working
-   * directory at invocation, or omitted/`null` when unknown. **Throws** on invalid shell syntax
-   * (unmatched quotes) and for a line that runs no program (blank, only assignments or operators,
-   * an empty program word, #376): an `Error` whose `kind` is the core's code (`invalid_shell_syntax`,
-   * `no_command`, `no_program`, `empty_program`). The hook denies rather than guessing.
-   */
+  /** Record opaque nonblank command text and optional cwd. Blank text throws `no_command`. */
   action_from_command(commandLine: string, cwd?: string | null): string;
-  /**
-   * Build an `ActionRecord` JSON for a **PowerShell** command line (the `command` surface, for
-   * Claude Code's `PowerShell` tool). `raw` is the exact line and argv is always its whitespace
-   * split (PowerShell quoting is never read with POSIX rules). No danger tier is assigned. Never throws for PowerShell syntax, so a
-   * valid PowerShell command is never denied for its quoting; **throws** only for a line that runs
-   * no program (#376), with a `kind` as {@link HookWasm.action_from_command}.
-   */
-  action_from_powershell_command(commandLine: string, cwd?: string | null): string;
-  /**
-   * Build an `ActionRecord` JSON from a **canonical, pre-tokenized** argv (the `command` surface).
-   * `argvJson` is a JSON string array; `raw` is the original command text, recorded verbatim and
-   * used only to extract `env_refs` names — it is never re-tokenized. Use this instead of
-   * {@link HookWasm.action_from_command} whenever the upstream gate already owns the exact token
-   * vector that will execute (`docs/openclaw-integration.md` §5.1). **Throws** when `argvJson` is
-   * not a JSON array of strings, and for an argv with no program (empty, an empty program word, or
-   * only assignments; #376), with a `kind` as {@link HookWasm.action_from_command}.
-   */
+  /** Record caller argv verbatim with optional raw/cwd. Empty or malformed arrays throw. */
   action_from_argv(argvJson: string, raw?: string | null, cwd?: string | null): string;
   /**
    * Build an `ActionRecord` JSON for an MCP tool call (the `mcp_tool_call` surface). `paramsJson`

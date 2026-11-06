@@ -10,7 +10,7 @@
  *
  * # Completeness is a security property, not a nicety
  * Every field bound into `request_hash` that materially changes what the action *does* MUST be
- * shown. `cwd`, `host`, and `env_refs` change the meaning of an otherwise-identical command (e.g.
+ * shown. Caller `cwd` and `argv` change the meaning of an otherwise-identical command (e.g.
  * `rm -rf build` in `/tmp/scratch` vs `/etc`); MCP `params` are the entire payload. Hiding them
  * behind a `raw`-only summary reopens the context/action TOCTOU gap Invariant #3 closes, so the
  * renderer surfaces them explicitly rather than relying on `raw`.
@@ -92,7 +92,7 @@ function quoteToken(token: string): string {
 }
 
 /**
- * Join list items (paths, env refs, chain ids) with `, `, each quoted by {@link quoteToken} so an
+ * Join list items (paths and chain ids) with `, `, each quoted by {@link quoteToken} so an
  * item containing `, ` or whitespace stays visibly one item: `["a, /etc/passwd"]` renders as
  * `'a, /etc/passwd'`, never like the two items `a, /etc/passwd`.
  */
@@ -105,83 +105,28 @@ function renderArgv(argv: readonly string[]): string {
   return argv.map(quoteToken).join(" ");
 }
 
-/** The command-form fields a command line is reconstructed from. */
+/** Caller-supplied execution vector; raw text never supplies missing words. */
 interface CommandParts {
-  readonly bin?: string | undefined;
   readonly argv?: readonly string[] | undefined;
-  readonly positionals?: readonly string[] | undefined;
 }
 
-/**
- * Reconstruct the unambiguous command line from the `bin`/`argv` substrate, or `undefined` when
- * there is no command form (no `argv` and no `bin`). This is the single source of truth shared by
- * the headline ({@link renderActionHeadline}) and the divergence detail line
- * ({@link substrateDetailLines}) so they can never disagree about what argv reconstructs to.
- *
- * `bin` is prepended unless `argv` already leads with it (argv conventionally includes the binary),
- * so the human never sees args without the program they belong to.
- *
- * Applied to the raw substrate it yields the comparison value for divergence detection; applied to
- * the escaped display substrate it yields the printed line.
- *
- * The web approver applies the same rule (`packages/web-approver/src/command-line.ts`); both are
- * tested against one shared fixture (`packages/web-approver/test/fixtures/raw-argv-divergence.json`).
- */
+/** Quote supplied argv for display, preserving every word boundary; never infer a program. */
 export function reconstructCommand(parts: CommandParts): string | undefined {
-  const tokens = commandTokens(parts);
-  return tokens === undefined ? undefined : renderArgv(tokens);
+  return parts.argv !== undefined && parts.argv.length > 0 ? renderArgv(parts.argv) : undefined;
 }
 
 /**
- * The command-form tokens {@link reconstructCommand} renders: `argv` (with `bin` prepended unless it
- * already leads), or `bin` plus any positionals when there is no argv; `undefined` when there is no
- * command form.
- */
-function commandTokens(parts: CommandParts): readonly string[] | undefined {
-  const { argv, bin } = parts;
-  if (argv !== undefined && argv.length > 0) {
-    return bin !== undefined && argv[0] !== bin ? [bin, ...argv] : argv;
-  }
-  // No argv: still show `bin` (+ any positionals) rather than dropping the program name.
-  if (bin !== undefined) {
-    const positionals = parts.positionals;
-    return positionals !== undefined ? [bin, ...positionals] : [bin];
-  }
-  return undefined;
-}
-
-/**
- * Whether `tokens` are exactly `raw` split at ASCII whitespace (space, tab, line feed: the only
- * characters `shlex` splits on): the same non-whitespace bytes, in the same order, cut only there.
- * Such an argv can't say anything `raw` doesn't. Any other separator, including a Unicode space
- * (U+00A0, U+3000, …) or a carriage return, is treated as part of a token, so an argv split on it
- * differs from this split and the divergence warning still shows: an invisible separator is exactly
- * what that warning is for.
- */
-function isWhitespaceSplitOf(tokens: readonly string[], raw: string): boolean {
-  const words = raw.split(/[ \t\n]+/).filter((word) => word !== "");
-  return words.length === tokens.length && words.every((word, i) => word === tokens[i]);
-}
-
-/**
- * Whether the hash-bound `bin`/`argv` reconstructs to a different command than the `raw` headline.
- * Compared on the **raw** bytes (never on escaped text, where distinct inputs can render alike), so
- * the decision is exact. Returns false when there is no `raw` or no command form, and when the
- * tokens are exactly `raw`'s whitespace split (display quoting alone, such as a quoted `C:\Users`
- * path, is not a different command).
+ * Compare raw caller text with the literal quoted argv form, on unescaped bytes. Every mismatch
+ * warns, including formatting-only differences: this never splits raw or claims semantic equivalence.
+ * No divergence exists without both caller-supplied forms. The core hashes the original bytes.
  */
 export function rawDivergesFromArgv(action: ActionRecord): boolean {
   const syntactic = action.syntactic;
   if (!isRecord(syntactic)) return false;
   const raw = readString(syntactic, "raw");
   if (raw === undefined) return false;
-  const tokens = commandTokens({
-    bin: readString(syntactic, "bin"),
-    argv: readStringArray(syntactic, "argv"),
-    positionals: readStringArray(syntactic, "positionals"),
-  });
-  if (tokens === undefined || isWhitespaceSplitOf(tokens, raw)) return false;
-  return renderArgv(tokens) !== raw;
+  const argv = readStringArray(syntactic, "argv");
+  return argv !== undefined && argv.length > 0 && renderArgv(argv) !== raw;
 }
 
 /**
@@ -238,31 +183,26 @@ export function toolIdentity(display: DisplayModel): string | undefined {
 /**
  * Render the action into the literal command / tool call the agent attempted, as one display line,
  * from the core's escaped model. NOTE: this is the *headline* line only — meaning-changing fields
- * (`cwd`, `host`, `env_refs`, MCP `params`) are rendered as their own labeled lines by
+ * (`cwd`, supplied `argv`, MCP `params`) are rendered as their own labeled lines by
  * {@link substrateDetailLines}, so a `raw`-only headline never hides them.
  *
- * For the command surface the line is built to be **unambiguous**:
- * - tokens are quoted/escaped when they contain whitespace or shell metacharacters
- *   (so `my dir` is visibly one argument, not two), and
- * - the binary name (`bin`) is included when the substrate carries it separately from `argv` and
- *   `argv` does not already lead with it — the human must never see args without the program they
- *   belong to (per `docs/policy-seam.md`, `bin` and `argv` are distinct substrate fields).
+ * Supplied argv is quoted to preserve boundaries. Raw text never fills missing argv or identity.
  *
  * On a tool surface (`mcp_tool_call`, `agent_tool_call`) naming a `tool` or a `server`, the headline
  * is the tool identity ({@link toolIdentity}; `server :: (tool missing)` when there is no tool):
  * there `raw` is the caller's description of the call (OpenClaw's plugin text), not the action, so
  * it is shown on its own labelled `Description:` line instead.
  * Otherwise `raw` (the agent's original string form) is preferred when present; then we
- * reconstruct from `bin`/`argv`; then a `server :: tool` headline; then the compact params JSON so
+ * reconstruct from caller `argv`; then a `server :: tool` headline; then the compact params JSON so
  * nothing is ever silently dropped. The web approver uses the same rule, and both are checked
  * against one shared fixture (`packages/web-approver/test/fixtures/action-headline.json`).
  *
- * SECURITY (`docs/contract.md` §Invariant #3): the **full** `bin`/`argv` substrate is bound into
+ * SECURITY (`docs/contract.md` §Invariant #3): the **full** caller `argv` substrate is bound into
  * `request_hash` (`crates/allw-core/src/hash.rs`), but `raw` is just one substrate field. A buggy
  * or malicious integrator could send a benign `raw` ("git status") alongside a divergent, dangerous
  * `argv` (`git push --force …`) — both hashed, but the human would only see the benign string. The
  * device must not rely on integrator honesty for *which* field it shows, so when `raw` is present
- * AND the reconstructed `bin`/`argv` command diverges from it, {@link substrateDetailLines} also
+ * AND the reconstructed caller `argv` command diverges from it, {@link substrateDetailLines} also
  * surfaces the reconstructed form as a labeled `Argv:` line. Display-only — it never changes the
  * hash.
  */
@@ -279,7 +219,7 @@ export function renderActionHeadline(display: DisplayModel): string {
 
   if (s.raw !== undefined) return s.raw;
 
-  // No `raw`: reconstruct the command from `bin`/`argv` (+ `positionals` when there is no argv).
+  // No raw text: quote only the caller-supplied vector.
   const reconstructed = reconstructCommand(s);
   if (reconstructed !== undefined) return reconstructed;
 
@@ -298,11 +238,10 @@ export function renderActionHeadline(display: DisplayModel): string {
  * `request_hash` and so MUST be shown whenever present. Returns an empty array when none apply
  * (e.g. a bare `raw` command with no cwd/env). Every printed value comes from the escaped model.
  *
- * Includes the **anti-divergence** lines (`docs/contract.md` §Invariant #3): `argv`/`flags`/
- * `positionals` (command surface) and `server`/`tool` (MCP surface) are all bound into
+ * Includes the **anti-divergence** lines (`docs/contract.md` §Invariant #3): caller `argv` (command surface) and `server`/`tool` (MCP surface) are all bound into
  * `request_hash` but were not previously rendered on the `raw` path — so a benign `raw` (e.g.
  * `"echo hello"`) could mask a dangerous hashed `argv` OR a dangerous `server`/`tool`
- * (`fs :: delete_all_files`). The `Argv:` line appears whenever the reconstructed `bin`/`argv`
+ * (`fs :: delete_all_files`). The `Argv:` line appears whenever the reconstructed caller `argv`
  * command **diverges** from the `raw` headline; `Flags:`, `Positionals:`, and the `MCP:` line always
  * appear when present, regardless of which headline path ran. All are display-only — never the hash.
  */
@@ -310,7 +249,7 @@ function substrateDetailLines(action: ActionRecord, display: DisplayModel): stri
   const s = display.syntactic;
   const lines: string[] = [];
 
-  // Anti-divergence: when `raw` is shown as the headline but the hash-bound `bin`/`argv`
+  // Anti-divergence: when `raw` is shown as the headline but the hash-bound caller `argv`
   // reconstructs to a DIFFERENT command, surface that reconstructed form so a benign `raw` can
   // never hide a dangerous argv. (When there is no `raw`, the headline already IS the reconstructed
   // command, so the line would be redundant and is omitted.)
@@ -322,20 +261,7 @@ function substrateDetailLines(action: ActionRecord, display: DisplayModel): stri
     lines.push(`  Argv:       ${reconstructed}`);
   }
 
-  // `flags` / `positionals` are bound into the hash but were never rendered on any path before;
-  // surface them (quoted for boundary clarity) whenever present.
-  if (s.flags !== undefined && s.flags.length > 0) {
-    lines.push(`  Flags:      ${renderArgv(s.flags)}`);
-  }
-  if (s.positionals !== undefined && s.positionals.length > 0) {
-    lines.push(`  Positionals: ${renderArgv(s.positionals)}`);
-  }
-
   if (s.cwd !== undefined) lines.push(`  Cwd:        ${s.cwd}`);
-  if (s.host !== undefined) lines.push(`  Host:       ${s.host}`);
-  if (s.env_refs !== undefined && s.env_refs.length > 0) {
-    lines.push(`  Env refs:   ${renderList(s.env_refs)}`);
-  }
 
   // Server/tool are hash-bound but were rendered on NO line when a `raw` headline ran — so a
   // benign `raw` ("echo hello") could mask a dangerous `fs :: delete_all_files`. Surface them on an
@@ -406,7 +332,7 @@ function actionLines(display: DisplayModel): string[] {
 }
 
 /**
- * Printed directly above the prompt when the hash-bound `bin`/`argv` reconstructs to a different
+ * Printed directly above the prompt when the hash-bound caller `argv` reconstructs to a different
  * command than `raw`. The `Deciding on:` line then shows the argv form, so the decision point never
  * shows only the benign half of a divergent pair.
  */
@@ -415,7 +341,7 @@ export const RAW_ARGV_DIVERGENCE_WARNING =
 
 /**
  * Printed directly above the prompt when a tool-surface record, which heads with its tool identity,
- * also carries a hash-bound command form (`bin`/`argv`). The command itself is repeated as an
+ * also carries a hash-bound command form (caller `argv`). The command itself is repeated as an
  * `Argv:` row directly under `Deciding on:`, so it is on screen at the decision point however far
  * the block's own `Argv:` row has scrolled.
  */
@@ -509,7 +435,7 @@ export function renderRequest(
   lines.push(`  Summary:    ${display.summary}`);
   lines.push(...actionLines(display));
   lines.push(`  Surface:    ${display.surface}`);
-  // Meaning-changing substrate fields (cwd/host/env_refs/params) — bound into request_hash, so
+  // Meaning-changing substrate fields (cwd/argv/params) — bound into request_hash, so
   // shown explicitly. A human must never sign over a cwd/params they could not see.
   for (const detail of substrateDetailLines(context.action, display)) {
     lines.push(detail);

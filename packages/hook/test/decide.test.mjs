@@ -263,11 +263,11 @@ test("non-gated tool (Read) → no decision WITHOUT calling the approver (#247)"
   assert.equal(approver.calls.length, 0, "the human is never bothered for a non-gated tool");
 });
 
-test("gated Bash with a malformed command (unmatched quote) → deny, approver NOT called", async () => {
+test("gated Bash with a non-string command → deny, approver NOT called", async () => {
   const wasm = await loadWasm();
   const approver = recording("approved");
   const output = await decide(
-    bashInput('echo "unterminated'),
+    bashInput(42),
     { wasm, config: CONFIG, commandRequest, requestApproval: approver.fn },
     HOSTNAME,
   );
@@ -364,7 +364,7 @@ test("Claude file edit tools are gated; approved → no decision, with file_edit
   assert.equal(req.reversible, undefined);
 });
 
-test("the ApprovalRequest carries the command ActionRecord + actor + risk-derived reversible", async () => {
+test("the ApprovalRequest carries the command ActionRecord + actor + caller cwd; reversibility omitted", async () => {
   const wasm = await loadWasm();
   const approver = recording("approved");
   await decide(
@@ -375,16 +375,15 @@ test("the ApprovalRequest carries the command ActionRecord + actor + risk-derive
 
   const req = approver.calls[0];
   assert.equal(req.action.surface, "command");
-  assert.equal(req.action.syntactic.bin, "ls");
+  assert.equal(req.action.syntactic.raw, "ls -la");
   assert.equal(req.action.syntactic.cwd, "/workspace", "cwd is threaded into the record");
-  // `ls` is Low risk → reversible defaults to true.
 
   assert.equal(req.reversible, undefined, "the hook makes no reversibility assertion");
 });
 
 /**
  * The record the core builds for a command line, in the SDK's camelCase shape: top-level keys
- * translated, `syntactic` passed through unchanged (docs/policy-seam.md §ActionRecord). This is the
+ * translated, `syntactic` passed through unchanged (docs/action-record.md §ActionRecord). This is the
  * reference the hook's command requests are held to (#269), so it reads the core directly rather
  * than going through the SDK under test.
  */
@@ -497,7 +496,6 @@ test("(#269) a command the SDK refuses (blank, no program, blank cwd) → deny, 
   const cases = [
     ["Bash", "", "/repo"],
     ["Bash", "   ", "/repo"],
-    ["Bash", "'' rm -rf build", "/repo"],
     // Defense in depth: parseHookInput turns a blank cwd into an absent one before decide runs.
     ["Bash", "ls", ""],
     ["Monitor", "", "/repo"],
@@ -516,27 +514,6 @@ test("(#269) a command the SDK refuses (blank, no program, blank cwd) → deny, 
     assert.ok(reason.startsWith(COMMAND_DENY_PREFIX), reason);
     assert.ok(!reason.slice(COMMAND_DENY_PREFIX.length).startsWith("allw:"), reason);
   }
-});
-
-test("(#269) malformed shell → deny quoting the core's own error, as before", async () => {
-  const wasm = await loadWasm();
-  const command = 'echo "unterminated';
-  let coreError;
-  try {
-    wasm.action_from_command(command, "/repo");
-  } catch (err) {
-    coreError = err;
-  }
-  assert.ok(coreError instanceof Error, "the core refuses the unmatched quote");
-  const output = await decide(
-    shellInput("Bash", command, "/repo"),
-    { wasm, config: CONFIG, commandRequest, requestApproval: resolvesTo("approved") },
-    HOSTNAME,
-  );
-  assert.equal(
-    output.hookSpecificOutput.permissionDecisionReason,
-    `${COMMAND_DENY_PREFIX}${agentSafeErrorText(wasm, coreError)}`,
-  );
 });
 
 test("(#371) a blank cwd from Claude Code gives the same request as an absent one", async () => {

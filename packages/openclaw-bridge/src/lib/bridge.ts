@@ -128,7 +128,7 @@ function gatewayNowMs(
 
 /** Synthesize the exec event shape from a sanitized snapshot, for approvals that predate the
  * connection (backfill, §4.3). The snapshot deliberately withholds `systemRunPlan`, so this takes
- * §5.1's documented last-resort branch: the core tokenizes `presentation.commandText`, and the
+ * §5.1's text-only branch: the core records opaque `presentation.commandText` with no inferred argv, and the
  * absent `cwd` renders as an explicit "working directory not bound" line (§6.3). */
 function execEventFromSnapshot(snapshot: ApprovalSnapshot): ExecApprovalRequestedEvent | null {
   if (!isExecPresentation(snapshot.presentation)) return null;

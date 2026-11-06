@@ -10,7 +10,7 @@ governance layer that grows around it. See [`docs/`](./docs):
 - [architecture.md](./docs/architecture.md) — tech stack and system design.
 - [contract.md](./docs/contract.md) — the approval-primitive contract (the keystone).
 - [enrollment.md](./docs/enrollment.md) — account/device enrollment, rotation, revocation, and recovery.
-- [policy-seam.md](./docs/policy-seam.md) — the seam to the (later) policy layer.
+- [action-record.md](./docs/action-record.md) — the seam to the (later) policy layer.
 - [hitl-seam.md](./docs/hitl-seam.md) — the provider-neutral, layered policy + human-decision contract;
   [decision log](./docs/hitl-seam-decisions.md).
 - [decision-history.md](./docs/decision-history.md) — on-device, encrypted, ephemeral decision history and the reflection pass (post-v1).

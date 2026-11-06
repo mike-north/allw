@@ -26,7 +26,7 @@
  * - a malformed argv (missing argument) rejects before anything is submitted.
  *
  * @see ../../../docs/contract.md §Invariants (fail-closed; never returns "allow"; WYSIWYS)
- * @see ../../../docs/policy-seam.md §ActionRecord (`surface: "command"`)
+ * @see ../../../docs/action-record.md §ActionRecord (`surface: "command"`)
  * @see ./e2e.test.mjs (the harness pattern this reuses)
  */
 

@@ -147,7 +147,7 @@ test("malformed gated inputs deny before asking the approver with category=build
   const approver = recording("approved");
 
   const output = await decide(
-    bashInput('echo "unterminated'),
+    bashInput(" "),
     { wasm, config: CONFIG, commandRequest, requestApproval: approver.fn },
     HOSTNAME,
   );
@@ -234,7 +234,7 @@ test("non-gated Codex tools pass through without config-time approval", async ()
 
 /**
  * The record the core builds for a command line, in the SDK's camelCase shape: top-level keys
- * translated, `syntactic` passed through unchanged (docs/policy-seam.md §ActionRecord). It reads
+ * translated, `syntactic` passed through unchanged (docs/action-record.md §ActionRecord). It reads
  * the core directly, not through the SDK path under test.
  */
 function coreCommandAction(wasm, command, cwd) {
@@ -294,9 +294,9 @@ test("(#372) a command request through the SDK is byte-identical to one built fr
   }
 });
 
-test("(#372) blank, whitespace-only and ''-program commands deny without asking, with the Claude Code hook's reason", async () => {
+test("(#372) blank and whitespace-only commands deny without asking, with the Claude Code hook's reason", async () => {
   const wasm = await loadWasm();
-  for (const command of ["", "   ", "\t\n\t", "\r", "'' rm -rf x", "FOO=1", "&& ;"]) {
+  for (const command of ["", "   ", "\t\n\t", "\r"]) {
     const input = {
       hookEventName: "PreToolUse",
       toolName: "Bash",

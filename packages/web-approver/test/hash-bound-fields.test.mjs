@@ -36,7 +36,7 @@ const ESC = "\u001b";
 /** A wire `ApprovalContext` for `surface` with `syntactic`, plus top-level overrides. */
 function context(surface, syntactic, overrides = {}) {
   return {
-    action: { record_schema_version: 2, surface, syntactic, risk: "high" },
+    action: { record_schema_version: 3, surface, syntactic, risk: "high" },
     summary: "push the release branch",
     actor: { id: "machine:laptop", kind: "claude-code" },
 
@@ -73,13 +73,8 @@ test("command: every hash-bound field is on the card, with the context summary (
     context(
       "command",
       {
-        bin: "git",
         argv: ["git", "push", "--force", "origin", "main"],
-        flags: ["--force"],
-        positionals: ["origin", "main"],
         cwd: "/srv/app",
-        host: "prod-db",
-        env_refs: ["AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN"],
         raw: "git push --force origin main",
       },
       { chain: ["gate-a", "gate b"] },
@@ -91,12 +86,7 @@ test("command: every hash-bound field is on the card, with the context summary (
     plaintextOf(card),
     [
       "cwd: /srv/app",
-      "host: prod-db",
-      "bin: git",
       "argv: git push --force origin main",
-      "flags: --force",
-      "positionals: origin main",
-      "env_refs: AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN",
       "raw: git push --force origin main",
       "chain: gate-a, 'gate b'",
     ].join("\n"),
@@ -205,13 +195,8 @@ test("every string in the core display substrate reaches the card (mutation guar
   const all = context(
     "command",
     {
-      bin: "bin-value",
       argv: ["argv-0", "argv-1"],
-      flags: ["--flag-value"],
-      positionals: ["positional-value"],
       cwd: "/cwd-value",
-      host: "host-value",
-      env_refs: ["ENV_REF_VALUE"],
       server: "server-value",
       tool: "tool-value",
       params: { "params-key": "params-value" },
@@ -229,17 +214,12 @@ test("every string in the core display substrate reaches the card (mutation guar
   // Guard the guard: the core returned every field the wire carried.
   assert.deepEqual([...new Set(expected.map(([key]) => key))].sort(), [
     "argv",
-    "bin",
     "cwd",
     "diff_hash",
     "diff_summary",
-    "env_refs",
-    "flags",
-    "host",
     "operation",
     "params_json_lines",
     "paths",
-    "positionals",
     "raw",
     "raw_lines",
     "server",
@@ -263,13 +243,8 @@ const ESC_IN_ONE_FIELD = {
     context("command", { argv: ["ls"], raw: "ls" }, { actor: { id: `m${ESC}`, kind: "k" } }),
   "actor.kind": () =>
     context("command", { argv: ["ls"], raw: "ls" }, { actor: { id: "m", kind: `k${ESC}` } }),
-  bin: () => context("command", { bin: `ls${ESC}`, raw: "ls" }),
   argv: () => context("command", { argv: ["ls", `a${ESC}`], raw: "ls" }),
-  flags: () => context("command", { argv: ["ls"], flags: [`-l${ESC}`], raw: "ls" }),
-  positionals: () => context("command", { argv: ["ls"], positionals: [`p${ESC}`], raw: "ls" }),
   cwd: () => context("command", { argv: ["ls"], cwd: `/tmp${ESC}`, raw: "ls" }),
-  host: () => context("command", { argv: ["ls"], host: `db${ESC}`, raw: "ls" }),
-  env_refs: () => context("command", { argv: ["ls"], env_refs: [`TOKEN${ESC}`], raw: "ls" }),
   server: () => context("mcp_tool_call", { server: `fs${ESC}`, tool: "read" }),
   tool: () => context("mcp_tool_call", { server: "fs", tool: `read${ESC}` }),
   params: () => context("mcp_tool_call", { server: "fs", tool: "read", params: { p: `x${ESC}` } }),
@@ -360,7 +335,7 @@ test("the card heading follows the CLI's precedence: shared CLI/web headline fix
         null,
         `${c.name}: no divergence`,
       );
-      assert.match(plaintext, /^(bin|argv): /m, `${c.name}: the command form is in the plaintext`);
+      assert.match(plaintext, /^argv: /m, `${c.name}: the command form is in the plaintext`);
     }
   }
   // Two records that differ only in how a name splits into server and tool must not look alike.

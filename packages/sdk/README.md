@@ -60,7 +60,7 @@ if (verdict.decision !== "approved") process.exit(1); // fail-closed: only a ver
 
 | Field        | Value                                                                                                                                        |
 | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `action`     | Built by the core from `argv` (exact tokens) or `commandLine` (tokenized by the core).                                                       |
+| `action`     | Built by the core from `argv` (exact tokens) or `commandLine` (recorded verbatim, without inferred argv).                                    |
 | `actor`      | Default `{ id: "machine:<os.hostname()>", kind: "script" }`.                                                                                 |
 | `reversible` | Omitted by default. Supply a boolean only when asserting whether the action can be undone.                                                   |
 | `cwd`        | Default `process.cwd()`, where `execFile` / `spawn` run the command. If you run it elsewhere, pass that directory. `null` leaves it unbound. |
@@ -76,21 +76,21 @@ could bind different tokens than the ones that execute.
 
 For just the `ActionRecord`, use `commandAction(argv, { cwd?, raw? })` or
 `commandActionFromLine(line, { cwd? })`. Both return exactly the record the core builds, and neither
-binds a `cwd` unless you pass one. The SDK does no tokenizing or risk classification of its own.
+binds a `cwd` unless you pass one. Neither the SDK nor the core interprets command meaning or rates danger.
 `raw` is for an upstream gate that already holds the command's display text. It must be the exact text
 of `argv`, because some approvers show `raw` in place of `argv`. `commandRequest` does not take it.
 
 All three reject with a `CommandActionError` (with a machine-readable `reason`) when the input is
 malformed, so nothing is submitted. That covers an empty `argv`, a non-string element, a blank or
-unparseable command line (for example an unmatched quote), an empty program, a blank `summary` or
+whitespace-only command line, a blank `summary` or
 `cwd`, a malformed `actor`, a non-positive or non-integer `timeoutMs`, or `raw` passed to
 `commandRequest`.
 
-A command that runs no program is refused too, because there is nothing to show the human. The core
-refuses it, so every allw surface agrees: a command line that is only variable assignments or shell
-operators (`FOO=1`, `&&`) rejects with `reason: "command_line_no_program"`, and an `argv` of only
-assignments (`["FOO=1"]`) with `reason: "argv_no_program"`. A blank or comment-only line is
-`command_line_empty`, and an empty program word is `argv_program_empty`.
+A nonblank command line is opaque: comments, assignments, operators, substitutions, unmatched
+quotes and PowerShell syntax are carried verbatim. No argv, program identity or other command
+metadata is inferred. `commandAction` preserves every supplied word, including empty or
+assignment-looking words; only a vector with no elements is empty. Malformed known types still
+fail closed. See [action-record.md](../../docs/action-record.md) §Command capture.
 
 ## Who can read a request: account state
 

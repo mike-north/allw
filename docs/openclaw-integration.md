@@ -54,17 +54,16 @@ and broadcast events for every pending approval. This document specifies how all
 decision from the allw inbox.
 
 Companion reading: [contract.md](./contract.md) (the invariants this must honor),
-[policy-seam.md](./policy-seam.md) (the `ActionRecord`), [architecture.md](./architecture.md) (the
+[action-record.md](./action-record.md) (the `ActionRecord`), [architecture.md](./architecture.md) (the
 WASM-under-node constraint), and [codex-integration.md](./codex-integration.md) (the sibling
 integration whose actor-identity and timeout-ordering discipline this follows).
 
 ---
 
-**#406 partial implementation:** allw does not interpret what an action does or rate its danger.
-Risk labels/scoring and policy-only wire metadata are removed. `reversible` is an optional caller assertion;
-hooks and the OpenClaw bridge omit it. Command/PowerShell tokenization, no-program refusals, web command
-interpretation, and parsed/derived fields remain temporarily and are scheduled for removal in slice 2.
-They are not product scope. Faithful raw/cwd/caller argv/MCP/file-edit display and escaping remain.
+**Caller facts only:** allw records and shows raw/cwd/caller argv, tool identity/parameters and
+file edits faithfully. It does not interpret command meaning, derive command metadata or rate danger.
+`reversible` is an optional caller assertion; hooks and the OpenClaw bridge omit it. CLI/web display
+escaping and warnings remain; native display wiring is deferred to #273 as an M7 blocker.
 
 ## 1. Verified upstream contract
 
@@ -282,7 +281,7 @@ Rules that follow from OpenClaw's auth model:
 - The device private key and device token are **secrets at rest**: they live in the same custody
   backend the allw approver uses, never a config file the operator edits, never an environment
   variable in a process list, never a log line. They are exactly the class of value
-  [policy-seam.md](./policy-seam.md) §Network egress says belongs in a credential vault. Concretely,
+  the external credential perimeter says belongs in a credential vault. Concretely,
   that backend is today an owner-only (`0600`) file under the bridge's state directory, matching
   `packages/approver/src/lib/keyfile.ts`'s v0 custody; swapping it for a real OS keystore is a
   follow-up that replaces one module and touches no gateway or protocol code.
@@ -327,23 +326,15 @@ The canonical execution input is the event payload's `systemRunPlan`
 which the gateway stores at request time and reuses verbatim when forwarding the approved
 `system.run`. That plan is therefore what the human must be shown.
 
-| `ActionRecord` field    | Source                                                                              | Notes                                                                                                                       |
-| ----------------------- | ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `surface`               | constant `"command"`                                                                |                                                                                                                             |
-| `syntactic.argv`        | `systemRunPlan.argv` → else `request.commandArgv` → else tokenize `request.command` | **Never re-tokenize when a canonical `argv` exists.** Re-parsing risks binding a different token vector than what executes. |
-| `syntactic.bin`         | derived by the core from `argv[0]`                                                  | Core-derived; the bridge does not compute it.                                                                               |
-| `syntactic.flags`       | derived by the core                                                                 | Same.                                                                                                                       |
-| `syntactic.positionals` | derived by the core                                                                 | Same.                                                                                                                       |
-| `syntactic.cwd`         | `systemRunPlan.cwd` → else `request.cwd` → else absent                              | Absent is rendered explicitly as "working directory not bound" (§6.3), never silently omitted.                              |
-| `syntactic.raw`         | `systemRunPlan.commandText` → else `request.command`                                | The exact string OpenClaw shows its other reviewers; also what the core derives `env_refs` from.                            |
-| `syntactic.host`        | core-derived from the command (ssh/scp target)                                      | **Not** OpenClaw's `host` field — see the name-collision note below.                                                        |
-| `syntactic.env_refs`    | core-derived from `raw`                                                             | Names only; values are never captured.                                                                                      |
+| `ActionRecord` field | Source                                                          | Notes                                                                                          |
+| -------------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `surface`            | constant `"command"`                                            |                                                                                                |
+| `syntactic.argv`     | `systemRunPlan.argv` → else `request.commandArgv` → else absent | Caller argv is retained verbatim; a text-only request never supplies inferred argv.            |
+| `syntactic.cwd`      | `systemRunPlan.cwd` → else `request.cwd` → else absent          | Absent is rendered explicitly as "working directory not bound" (§6.3), never silently omitted. |
+| `syntactic.raw`      | `systemRunPlan.commandText` → else `request.command`            | The exact string OpenClaw shows its other reviewers, recorded verbatim.                        |
 
-**Name collision, called out so nobody wires it wrong:** OpenClaw's `host` on an exec approval is the
-_execution locus_ (`gateway` \| `node` \| `sandbox`). allw's `syntactic.host` is the _remote host a
-command targets_ (an ssh/scp destination). They are unrelated. OpenClaw's execution locus and
-`nodeId` are decision-relevant and are carried in the hashed `summary` (§6.2), not in
-`syntactic.host`.
+OpenClaw's `host` is its execution locus (`gateway` | `node` | `sandbox`), not an allw substrate
+field. That locus and `nodeId` stay in the hash-bound summary (§6.2). No remote host is inferred.
 
 ### 5.2 Family 2 — plugin permission requests → `surface: "agent_tool_call"`
 
@@ -722,7 +713,7 @@ The bridge is an **on-machine local surface** and inherits the hard constraint f
   companion binary. The bridge is `node dist/cli.js`, exactly like the Claude Code and Codex hooks.
 - **Thin shell only.** All hashing, JWE/JWS, verdict verification and `ActionRecord` construction
   stay in `crates/allw-core` behind the WASM boundary; policy evaluation belongs to the caller. The bridge maps OpenClaw
-  wire shapes to core inputs and back; it implements no crypto and no parsing the core already owns.
+  wire shapes to core inputs and back; it implements no crypto or command interpretation.
 - `@openclaw/gateway-client`'s Node entry owns its own WebSocket transport, which is pure JS and
   adds no native dependency — verify this at slice time, and reject any transitive native addon.
 - Native binaries remain confined to signed, store-distributed approver apps.
@@ -818,8 +809,8 @@ Rust core rather than being silently accepted. No metadata field or program-name
 
 | #   | Scope                                                                                                                                                                                                                                                                                                                              | Deliverable                                                                                                                                                         | Tests                                                                                                                                                                                                                                                    |
 | --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | **Core: argv-with-raw command records.** `allw-core` already has `action_from_argv`, but it is not exposed to WASM and cannot carry the original command text (it sets `raw: None`, which also suppresses `env_refs` extraction).                                                                                                  | A core builder taking `(argv, raw, ctx)`; a WASM export `action_from_argv`; UniFFI parity per the return-type suffix convention; SDK/hook `wasm.ts` type additions. | Rust unit tests for argv+raw (incl. empty argv, `env_refs` from `raw`); a cross-platform vector proving Rust and WASM produce byte-identical records.                                                                                                    |
-| 2   | **Core: the `agent_tool_call` surface.** Adds the `Surface` variant reserved in `policy-seam.md`, a builder over encrypted `(server, tool)` function identity and SDK `Surface` union widening. No relay `action_structure` acceptance.                                                                                            | Core enum + builder, WASM + UniFFI exports, SDK types; existing routing/ciphertext-only envelope validation is unchanged.                                           | Encrypted-substrate tests (server/tool/raw stay inside JWE); a negative test that an unknown surface string fails closed rather than defaulting.                                                                                                         |
+| 1   | **Core: argv-with-raw command records.** Caller argv and optional original command text are carried verbatim through WASM and UniFFI.                                                                                                                                                                                              | A core builder taking `(argv, raw, ctx)`; a WASM export `action_from_argv`; UniFFI parity per the return-type suffix convention; SDK/hook `wasm.ts` type additions. | Rust unit tests for argv+raw (incl. empty argv, verbatim raw, no derived fields); a cross-platform vector proving Rust and WASM produce byte-identical records.                                                                                          |
+| 2   | **Core: the `agent_tool_call` surface.** Adds the `Surface` variant reserved in `action-record.md`, a builder over encrypted `(server, tool)` function identity and SDK `Surface` union widening. No relay `action_structure` acceptance.                                                                                          | Core enum + builder, WASM + UniFFI exports, SDK types; existing routing/ciphertext-only envelope validation is unchanged.                                           | Encrypted-substrate tests (server/tool/raw stay inside JWE); a negative test that an unknown surface string fails closed rather than defaulting.                                                                                                         |
 | 3   | **Bridge skeleton: gateway client.** New `packages/openclaw-bridge`; Ed25519 device identity, `connect.challenge` proof, `PAIRING_REQUIRED` handling, device-token persistence in the OS keystore, protocol pin, capability advertisement, subscription + `*.approval.list` backfill + reconnect re-projection. No allw calls yet. | A connectable, scope-minimal operator client that logs pending approvals.                                                                                           | Integration tests against a fake gateway WebSocket speaking real `RequestFrame`/`ResponseFrame`/`EventFrame` shapes; negatives for challenge without `ts`, wrong protocol version, scope downgrade, reconnect double-delivery.                           |
 | 4   | **Mapping.** Event → `approval.get` reconcile → `ApprovalContext` construction for both families; deterministic summary templates; actor-id validation; caller-requested challenge and omitted reversibility; `chain` correlation.                                                                                                 | Pure, I/O-free mapping module (the `decide.ts` analogue).                                                                                                           | Field-by-field assertions derived from §5/§6 of this spec (never from captured output); negatives for `presentation-divergence`, empty `commandText`, missing tool identity, malformed gateway id.                                                       |
 | 5   | **Decision + resolution.** `requestApproval` wiring, full verdict verification, `approval.resolve` submission, `applied: false` reconcile, timeout budgeting, the complete §9 matrix.                                                                                                                                              | End-to-end fail-closed behavior.                                                                                                                                    | One direct negative test per §9 row, plus: `allow-always` is never submitted under any input; `no-expressible-allow`; `insufficient-budget`; gateway loss both not-restored and restored-while-pending; unsupported kind is neither approved nor denied. |

@@ -8,7 +8,7 @@
 //! ([`build_tool_call_action`]) and differ only in the `surface` tag they stamp. Keeping them
 //! distinct surfaces (rather than one builder always emitting `mcp_tool_call`) is deliberate: a
 //! policy rule or registry scoped to `mcp_tool_call` must never silently match a tool call no MCP
-//! server ever served (`docs/policy-seam.md` §Structure vs. data in the ActionRecord).
+//! server ever served (`docs/action-record.md` §Tool calls and file edits).
 //!
 //! **Scope:** faithfully preserve tool identity, params and caller prose. No capability inference,
 //! danger rating or policy metadata is produced.
@@ -50,7 +50,7 @@ use crate::contract::{ActionRecord, Surface, SyntacticSubstrate};
 ///   (object, array, null, primitive). All **keys and values are preserved** (no normalisation,
 ///   no dropping of any field), so instance-distinguishing values like `{"list": "Agent Inbox"}`
 ///   survive a serde round-trip and remain matchable by policy rules of the form
-///   `params.list == "Agent Inbox"` (see `docs/policy-seam.md` §The approval → rule bridge).
+///   `params.list == "Agent Inbox"` (see `docs/action-record.md` §The approval → rule bridge).
 ///   Object **key order is not guaranteed** (serde_json's default `Map` sorts keys) and must not
 ///   be relied upon — it is not semantically meaningful for `Value` equality or key lookup.
 ///
@@ -59,11 +59,10 @@ use crate::contract::{ActionRecord, Surface, SyntacticSubstrate};
 /// An [`ActionRecord`] with:
 ///
 /// - `surface = Surface::McpToolCall`
-/// - `record_schema_version = 2`
+/// - `record_schema_version = 3`
 /// - `syntactic.server`, `syntactic.tool`, `syntactic.params` populated from the arguments
 /// - `syntactic.raw` set to `"<server>.<tool>(<compact-json-params>)"` (see module-level docs)
-/// - All command-surface syntactic fields (`bin`, `argv`, `flags`, `positionals`, `cwd`,
-///   `host`, `env_refs`) set to `None`
+/// - Caller command fields (`argv`, `cwd`) left absent; no command metadata is inferred.
 ///
 /// # Example
 ///
@@ -110,7 +109,7 @@ pub fn action_from_mcp_tool_call(
 /// An [`ActionRecord`] with:
 ///
 /// - `surface = Surface::AgentToolCall`
-/// - `record_schema_version = 2`
+/// - `record_schema_version = 3`
 /// - `syntactic.server`, `syntactic.tool` populated from the arguments; `syntactic.params` set
 ///   only when `params` is `Some`
 /// - `syntactic.raw` set to `"<server>.<tool>(<compact-json-params>)"`, or `"<server>.<tool>()"`
@@ -184,7 +183,7 @@ pub fn action_from_agent_tool_call_with_raw(
 /// Shared syntactic-substrate reduction for the `mcp_tool_call` and `agent_tool_call` surfaces.
 ///
 /// Both surfaces reduce to the same `(server, tool, params)` function-identity shape
-/// (`docs/policy-seam.md` §Structure vs. data in the ActionRecord); only the `surface` tag
+/// (`docs/action-record.md` §Tool calls and file edits); only the `surface` tag
 /// differs. Kept private so the public builders above cannot drift apart on identity,
 /// `raw` formatting, or which fields are populated.
 ///
@@ -209,17 +208,12 @@ fn build_tool_call_action(
     });
 
     ActionRecord {
-        record_schema_version: 2,
+        record_schema_version: 3,
         surface,
         syntactic: SyntacticSubstrate {
             // command-surface fields — all None for mcp_tool_call / agent_tool_call
-            bin: None,
             argv: None,
-            flags: None,
-            positionals: None,
             cwd: None,
-            host: None,
-            env_refs: None,
             // shared function-identity fields
             server: Some(server.to_string()),
             tool: Some(tool.to_string()),
@@ -259,12 +253,12 @@ mod tests {
 
     // ── surface and identity fields ───────────────────────────────────────────
 
-    /// Surface must be McpToolCall and schema version must be 1.
+    /// Surface must be McpToolCall and schema version must be current.
     #[test]
-    fn surface_is_mcp_tool_call_and_schema_version_is_1() {
+    fn surface_is_mcp_tool_call_and_schema_version_is_current() {
         let r = representative_record();
         assert_eq!(r.surface, Surface::McpToolCall);
-        assert_eq!(r.record_schema_version, 2);
+        assert_eq!(r.record_schema_version, 3);
     }
 
     /// server and tool must be populated from the arguments.
@@ -289,7 +283,7 @@ mod tests {
 
     // ── params preserved verbatim through serde round-trip ────────────────────
 
-    /// policy-seam.md §The approval → rule bridge: instance-distinguishing params such as
+    /// action-record.md §The approval → rule bridge: instance-distinguishing params such as
     /// `{"list": "Agent Inbox"}` must survive a full serde JSON round-trip so that policy rules
     /// of the form `params.list == "Agent Inbox"` can match against them.
     ///
@@ -310,7 +304,7 @@ mod tests {
             deserialised.syntactic.params.as_ref(),
             Some(&original_params),
             "params must deep-equal the original after a full serde round-trip \
-             (policy-seam.md §The approval → rule bridge: params.list == \"Agent Inbox\" \
+             (action-record.md §The approval → rule bridge: params.list == \"Agent Inbox\" \
              must remain matchable)"
         );
     }
@@ -356,32 +350,12 @@ mod tests {
     fn command_surface_fields_are_none() {
         let r = representative_record();
         assert!(
-            r.syntactic.bin.is_none(),
-            "bin must be None for mcp_tool_call surface"
-        );
-        assert!(
             r.syntactic.argv.is_none(),
             "argv must be None for mcp_tool_call surface"
         );
         assert!(
-            r.syntactic.flags.is_none(),
-            "flags must be None for mcp_tool_call surface"
-        );
-        assert!(
-            r.syntactic.positionals.is_none(),
-            "positionals must be None for mcp_tool_call surface"
-        );
-        assert!(
             r.syntactic.cwd.is_none(),
             "cwd must be None for mcp_tool_call surface"
-        );
-        assert!(
-            r.syntactic.host.is_none(),
-            "host must be None for mcp_tool_call surface"
-        );
-        assert!(
-            r.syntactic.env_refs.is_none(),
-            "env_refs must be None for mcp_tool_call surface"
         );
     }
 
@@ -420,7 +394,7 @@ mod tests {
 
     /// Params that are a non-object JSON value (an array) must be preserved as-is.
     ///
-    /// policy-seam.md does not restrict params to objects — the field is typed as
+    /// action-record.md does not restrict params to objects — the field is typed as
     /// serde_json::Value and must accept any valid JSON.
     #[test]
     fn non_object_params_array_preserved() {
@@ -453,11 +427,11 @@ mod tests {
 
     // ── action_from_agent_tool_call ──────────────────────────────────────────────
 
-    /// Surface must be AgentToolCall (not McpToolCall) and schema version must be 1 — the
+    /// Surface must be AgentToolCall (not McpToolCall) and schema version must be current — the
     /// distinct-surface tag is the whole point of the `agent_tool_call` surface
     /// (docs/openclaw-integration.md §5.2).
     #[test]
-    fn agent_tool_call_surface_is_agent_tool_call_and_schema_version_is_1() {
+    fn agent_tool_call_surface_is_agent_tool_call_and_schema_version_is_current() {
         let r = action_from_agent_tool_call("openclaw", "deploy_service", None);
         assert_eq!(r.surface, Surface::AgentToolCall);
         assert_ne!(
@@ -465,7 +439,7 @@ mod tests {
             Surface::McpToolCall,
             "agent_tool_call must never be tagged mcp_tool_call"
         );
-        assert_eq!(r.record_schema_version, 2);
+        assert_eq!(r.record_schema_version, 3);
     }
 
     /// server and tool must be populated from the arguments, exactly like `mcp_tool_call`.
@@ -529,13 +503,8 @@ mod tests {
     #[test]
     fn agent_tool_call_command_and_file_edit_fields_are_none() {
         let r = action_from_agent_tool_call("openclaw", "deploy_service", None);
-        assert!(r.syntactic.bin.is_none());
         assert!(r.syntactic.argv.is_none());
-        assert!(r.syntactic.flags.is_none());
-        assert!(r.syntactic.positionals.is_none());
         assert!(r.syntactic.cwd.is_none());
-        assert!(r.syntactic.host.is_none());
-        assert!(r.syntactic.env_refs.is_none());
         assert!(r.syntactic.operation.is_none());
         assert!(r.syntactic.paths.is_none());
         assert!(r.syntactic.diff_summary.is_none());
@@ -564,7 +533,7 @@ mod tests {
     /// An `mcp_tool_call` record and an `agent_tool_call` record built from the identical
     /// `(server, tool)` pair must differ ONLY in `surface` — everything else about the shared
     /// function-identity substrate stays byte-identical, matching the "reuses the (server, tool)
-    /// pair" decision in docs/policy-seam.md and docs/openclaw-integration.md §5.2.
+    /// pair" decision in docs/action-record.md and docs/openclaw-integration.md §5.2.
     #[test]
     fn agent_tool_call_and_mcp_tool_call_share_identical_substrate_except_surface() {
         let params = json!({ "list": "Agent Inbox" });

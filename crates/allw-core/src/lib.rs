@@ -34,7 +34,6 @@ pub mod file_edit;
 pub mod hash;
 pub mod jwe;
 pub mod mcp;
-pub mod powershell;
 pub mod recipients;
 pub mod sealing;
 
@@ -85,7 +84,6 @@ pub use jwe::{
 pub use mcp::{
     action_from_agent_tool_call, action_from_agent_tool_call_with_raw, action_from_mcp_tool_call,
 };
-pub use powershell::action_from_powershell_command;
 pub use recipients::{
     select_recipients, Recipient, RecipientSelectionError, DEVICE_STATUS_ACTIVE,
     MAX_ACCOUNT_STATES, MAX_RECIPIENTS,

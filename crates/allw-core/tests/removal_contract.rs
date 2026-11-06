@@ -1,4 +1,4 @@
-//! Contract outcomes for #406 slice 1: the caller supplies facts, never a danger tier.
+//! Contract outcomes for #406: the caller supplies facts, never a danger tier.
 //! @see docs/contract.md §ApprovalContext and §request_hash.
 
 use allw_core::{compute_request_hash, ApprovalContext};
@@ -9,7 +9,7 @@ use serde_json::json;
 #[test]
 fn facts_only_context_and_optional_caller_assertion() {
     let wire = json!({
-        "action": {"record_schema_version": 2, "surface": "command", "syntactic": {"raw": "git push"}},
+        "action": {"record_schema_version": 3, "surface": "command", "syntactic": {"raw": "git push"}},
         "summary": "Publish commits", "actor": {"id": "script", "kind": "script"},
         "constraints": {"allowed_decisions": ["approved", "denied"], "challenge_required": false}
     });
@@ -42,9 +42,8 @@ fn facts_only_context_and_optional_caller_assertion() {
 #[test]
 fn every_shown_fact_changes_hash() {
     let base = json!({
-        "action": {"record_schema_version": 2, "surface": "command", "syntactic": {
-            "raw": "git push", "bin": "git", "argv": ["git", "push"], "flags": ["--force"],
-            "positionals": ["push"], "cwd": "/repo", "host": "host", "env_refs": ["HOME"],
+        "action": {"record_schema_version": 3, "surface": "command", "syntactic": {
+            "raw": "git push", "argv": ["git", "push"], "cwd": "/repo",
             "server": "server", "tool": "tool", "params": {"x": 1}, "operation": "write",
             "paths": ["a"], "diff_summary": "edit", "diff_hash": "digest"
         }}, "summary": "Publish", "actor": {"id": "script", "kind": "script"},
@@ -53,6 +52,63 @@ fn every_shown_fact_changes_hash() {
     });
     let ctx: ApprovalContext = serde_json::from_value(base.clone()).unwrap();
     let hash = compute_request_hash(&ctx, 1_800_000_060_000);
+    // Sign the fully populated context with a fixed fixture device. Each mutation below must
+    // fail real verdict verification, not merely produce a different standalone hash.
+    use allw_core::{
+        sign_verdict, verify_verdict, ApprovalRequest, InMemoryNonceStore, PublicKey,
+        SigningKeyPair, UnsignedVerdict, Verdict, VerifyError,
+    };
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/wasm_vector.json")).unwrap();
+    let template: Verdict =
+        serde_json::from_str(fixture["verdict_json"].as_str().unwrap()).unwrap();
+    let mut request: ApprovalRequest =
+        serde_json::from_str(fixture["request_json"].as_str().unwrap()).unwrap();
+    request.created_at = 1_800_000_000_000;
+    request.expires_at = 1_800_000_060_000;
+    let root: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(fixture["approver_root_pubkey_b64"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let root = PublicKey::from_bytes(&root).unwrap();
+    let verdict = sign_verdict(
+        &UnsignedVerdict {
+            v: 1,
+            request_id: request.id.clone(),
+            request_hash: hash,
+            decision: allw_core::Decision::Approved,
+            decided_at: 1_800_000_001_000,
+            approver: template.approver,
+            note: None,
+            challenge_response: None,
+        },
+        &SigningKeyPair::from_seed(&[0x22; 32]),
+        &[0x33; 16],
+        template.device_cert,
+    )
+    .unwrap();
+    let verify = |context: &ApprovalContext, request: &ApprovalRequest| {
+        verify_verdict(
+            &verdict,
+            request,
+            context,
+            &root,
+            &mut InMemoryNonceStore::default(),
+            1_800_000_002_000,
+        )
+    };
+    assert!(
+        verify(&ctx, &request).is_ok(),
+        "unmutated control must verify"
+    );
+    let mut later = request.clone();
+    later.expires_at += 1;
+    assert!(matches!(
+        verify(&ctx, &later),
+        Err(VerifyError::RequestHashMismatch)
+    ));
     for (path, value) in [
         ("summary", json!("different")),
         ("actor.id", json!("other")),
@@ -64,13 +120,8 @@ fn every_shown_fact_changes_hash() {
         ("constraints.allowed_decisions", json!(["denied"])),
         ("action.surface", json!("agent_tool_call")),
         ("action.syntactic.raw", json!("other")),
-        ("action.syntactic.bin", json!("other")),
         ("action.syntactic.argv", json!(["other"])),
-        ("action.syntactic.flags", json!(["other"])),
-        ("action.syntactic.positionals", json!(["other"])),
         ("action.syntactic.cwd", json!("other")),
-        ("action.syntactic.host", json!("other")),
-        ("action.syntactic.env_refs", json!(["other"])),
         ("action.syntactic.server", json!("other")),
         ("action.syntactic.tool", json!("other")),
         ("action.syntactic.params", json!({"x": 2})),
@@ -92,6 +143,13 @@ fn every_shown_fact_changes_hash() {
             compute_request_hash(&changed, 1_800_000_060_000),
             "{path}"
         );
+        assert!(
+            matches!(
+                verify(&changed, &request),
+                Err(VerifyError::RequestHashMismatch)
+            ),
+            "{path}"
+        );
     }
 }
 
@@ -100,29 +158,33 @@ fn every_shown_fact_changes_hash() {
 fn old_verdict_is_preserved_but_unverifiable_under_new_hash() {
     use allw_core::{verify_verdict, InMemoryNonceStore, PublicKey, VerifyError};
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-    let old: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/legacy_wire_v2.json")).unwrap();
-    let verdict = serde_json::from_str(old["verdict_json"].as_str().unwrap()).unwrap();
-    let request = serde_json::from_str(old["request_json"].as_str().unwrap()).unwrap();
-    let context = serde_json::from_str(old["context_json"].as_str().unwrap()).unwrap();
-    let root: [u8; 32] = URL_SAFE_NO_PAD
-        .decode(old["approver_root_pubkey_b64"].as_str().unwrap())
-        .unwrap()
-        .try_into()
-        .unwrap();
-    let root = PublicKey::from_bytes(&root).unwrap();
-    assert!(matches!(
-        verify_verdict(
-            &verdict,
-            &request,
-            &context,
-            &root,
-            &mut InMemoryNonceStore::default(),
-            old["now_ms"].as_i64().unwrap()
-        ),
-        Err(VerifyError::RequestHashMismatch)
-    ));
-    assert!(old["context_json"].as_str().unwrap().contains("risk"));
+    for legacy in [
+        include_str!("fixtures/legacy_wire_v2.json"),
+        include_str!("fixtures/legacy_wire_v3.json"),
+    ] {
+        let old: serde_json::Value = serde_json::from_str(legacy).unwrap();
+        let verdict = serde_json::from_str(old["verdict_json"].as_str().unwrap()).unwrap();
+        let request = serde_json::from_str(old["request_json"].as_str().unwrap()).unwrap();
+        let context = serde_json::from_str(old["context_json"].as_str().unwrap()).unwrap();
+        let root: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(old["approver_root_pubkey_b64"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let root = PublicKey::from_bytes(&root).unwrap();
+        assert!(matches!(
+            verify_verdict(
+                &verdict,
+                &request,
+                &context,
+                &root,
+                &mut InMemoryNonceStore::default(),
+                old["now_ms"].as_i64().unwrap()
+            ),
+            Err(VerifyError::RequestHashMismatch)
+        ));
+        assert!(old["context_json"].as_str().unwrap().contains("bin"));
+    }
 }
 
 /// A legacy receipt stays readable evidence; its original hash cannot verify under audit v2.

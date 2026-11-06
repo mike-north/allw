@@ -69,7 +69,7 @@ const SPOOF_ESCAPED = "rm -rf ~/x; : \\x1b[2K\\rgit status";
 function context(overrides = {}) {
   return {
     action: {
-      record_schema_version: 2,
+      record_schema_version: 3,
       surface: "command",
       syntactic: { raw: SPOOF },
     },
@@ -213,7 +213,7 @@ test("summary, argv, flags, chain and MCP params are escaped", async () => {
   assert.match(rendered, /Chain:\s+'gate\\x1b'/, "list items are quoted at their boundary");
   assert.match(rendered, /MCP:\s+fs :: 'write⟨U\+2066⟩'/);
   assert.ok(rendered.includes(`Params:     {"path":"/tmp/⟨U+202E⟩txt.exe"}`));
-  assert.ok(rendered.includes("Flags:      '--x\\r'"), "escaped token is quoted at its boundary");
+  assert.ok(rendered.includes("Argv:"), "caller argv remains visible and escaped");
 });
 
 test("the relay-supplied request id is escaped", async () => {
@@ -354,8 +354,8 @@ test("without a divergence, the decision line is the raw headline and no diverge
 
 // ── PowerShell records (#298, review #316 B1) ─────────────────────────────────────────────────────
 //
-// The core records a PowerShell line's argv as a plain whitespace split of `raw`, so no byte of the
-// line hides inside a token. Records here are built by the real WASM builder, never by hand.
+// The same opaque line builder records PowerShell text without manufacturing argv.
+// Records here are built by the real WASM builder, never by hand.
 
 /** The #316 B1 repro: PowerShell runs the `Remove-Item` (`\` is literal inside `"…"`). */
 const PS_HIDDEN_STATEMENT = String.raw`echo "a\" ; Remove-Item -Recurse -Force C:\Users ; echo \"b"`;
@@ -363,8 +363,7 @@ const PS_HIDDEN_STATEMENT = String.raw`echo "a\" ; Remove-Item -Recurse -Force C
 async function renderPowerShell(line) {
   const wasm = await loadWasm();
   const ctx = context({ summary: `PowerShell: ${line}` });
-  ctx.action = JSON.parse(wasm.action_from_powershell_command(line, String.raw`C:\Users\me`));
-  ctx.risk = ctx.action.risk;
+  ctx.action = JSON.parse(wasm.action_from_command(line, String.raw`C:\Users\me`));
   return render(ctx);
 }
 
@@ -378,7 +377,10 @@ test("a PowerShell line can't hide a statement from the decision line (#316 B1)"
     "the decision line is raw, verbatim",
   );
   assert.match(deciding, / ; Remove-Item -Recurse -Force /, "Remove-Item is its own word");
-  assert.ok(!rendered.includes(RAW_ARGV_DIVERGENCE_WARNING), "argv is raw's whitespace split");
+  assert.ok(
+    !rendered.includes(RAW_ARGV_DIVERGENCE_WARNING),
+    "raw-only capture has no invented second form",
+  );
 });
 
 test("a PowerShell Windows path renders verbatim with no divergence warning (#316 B1)", async () => {
@@ -389,7 +391,7 @@ test("a PowerShell Windows path renders verbatim with no divergence warning (#31
   assert.ok(!rendered.includes("C:Usersmeprojbuild"), "no backslash is stripped");
 });
 
-test("an argv that differs from raw's whitespace split still warns (#316 B1 negative)", async () => {
+test("caller argv whose quoted form differs from raw still warns (#316 B1 negative)", async () => {
   // Same words, but one token carries a space that raw splits on: a different command line.
   const ctx = context();
   ctx.action = {
@@ -400,8 +402,7 @@ test("an argv that differs from raw's whitespace split still warns (#316 B1 nega
   assert.equal(rendered.split("\n").at(-1), RAW_ARGV_DIVERGENCE_WARNING);
 });
 
-// Regression (#316 review round 2, R2-2): only shlex's ASCII whitespace counts. A Unicode space
-// separates argv tokens but reads as part of a word in raw, so it must still warn.
+// Caller argv and raw are compared literally: a Unicode separator difference must warn.
 test("an argv split on a Unicode space (U+00A0) inside a raw word still warns", async () => {
   const ctx = context();
   ctx.action = {
@@ -412,10 +413,10 @@ test("an argv split on a Unicode space (U+00A0) inside a raw word still warns", 
   assert.equal(rendered.split("\n").at(-1), RAW_ARGV_DIVERGENCE_WARNING);
 });
 
-test("a PowerShell line with an ideographic space (U+3000) still warns", async () => {
-  // The core's whitespace split cuts at U+3000; the approver's ASCII split does not.
+test("a PowerShell line retains an ideographic space without manufacturing argv", async () => {
+  // A line builder supplies only raw, so there is no invented second form to compare.
   const { rendered } = await renderPowerShell("Remove-Item\u3000build");
-  assert.equal(rendered.split("\n").at(-1), RAW_ARGV_DIVERGENCE_WARNING);
+  assert.equal(rendered.split("\n").at(-1), "  Deciding on: Remove-Item\u3000build");
 });
 
 test("a variation selector after ASCII cannot make a divergent argv look identical", async () => {
@@ -544,7 +545,7 @@ test("UAT: `watch` heads an OpenClaw tool call with its tool and flags its comma
       JSON.stringify(
         context({
           action: {
-            record_schema_version: 2,
+            record_schema_version: 3,
             surface: "agent_tool_call",
             syntactic: {
               server: "deploy-plugin",
@@ -773,7 +774,7 @@ test("list items (paths, env refs, chain) are quoted so one item cannot pose as 
   };
   const { rendered } = await render(ctx);
   assert.ok(rendered.includes("  Paths:      'a, /etc/passwd'"));
-  assert.ok(rendered.includes("  Env refs:   HOME, 'A B'"));
+  assert.ok(!rendered.includes("Env refs:"), "removed inferred fields are ignored");
   assert.ok(rendered.includes("  Chain:      'gate-a, gate-b'"));
 });
 
@@ -808,7 +809,7 @@ test("the Action and Deciding on lines match the shared CLI/web headline fixture
   for (const [i, c] of fixture.cases.entries()) {
     const ctx = context({
       action: {
-        record_schema_version: 2,
+        record_schema_version: 3,
         surface: c.surface,
         syntactic: c.syntactic,
       },
@@ -857,7 +858,7 @@ test("a tool call with a server and no tool always shows its server (#332 review
   ]) {
     const ctx = context({
       action: {
-        record_schema_version: 2,
+        record_schema_version: 3,
         surface,
         syntactic: { server: "fs", raw: "fs :: read_file", params: { path: "/etc/shadow" } },
       },

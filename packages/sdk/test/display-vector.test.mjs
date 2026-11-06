@@ -170,7 +170,7 @@ test("display_model raw_lines match every per-surface case in the shared vector"
   for (const c of cases) {
     const context = {
       action: {
-        record_schema_version: 2,
+        record_schema_version: 3,
         surface: c.surface,
         syntactic: { raw: c.raw },
       },

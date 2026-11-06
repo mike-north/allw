@@ -1,5 +1,5 @@
 {
-  "description": "Shared by the CLI approver and the web approver: both must decide raw/argv divergence the same way and reconstruct the same command line. Each case gives a wire syntactic substrate, whether raw and the hash-bound bin/argv describe different commands, and the command line bin/argv reconstruct to (null when there is no command form). Tokens that are exactly raw split at ASCII whitespace (space, tab, line feed) never diverge; any other difference is compared on the reconstructed line. Expected values are written by hand from the rules in packages/approver/src/lib/render.ts and packages/web-approver/src/command-line.ts: bin is prepended unless argv starts with it; with no argv, bin and positionals are used; a token is single-quoted when it is empty or contains whitespace, a quote, a backslash or one of $`&|;<>(){}[]*?#~!.",
+  "description": "Shared CLI/web argv layout: quote caller-supplied argv without parsing raw, and warn whenever that literal display form differs from raw. No program identity or argv is inferred.",
   "cases": [
     {
       "name": "raw matches argv",
@@ -11,19 +11,17 @@
       "reconstructed": "git status"
     },
     {
-      "name": "bin is prepended when argv omits it",
+      "name": "caller argv is complete; no program is inferred",
       "syntactic": {
-        "bin": "git",
         "argv": ["status"],
         "raw": "git status"
       },
-      "diverges": false,
-      "reconstructed": "git status"
+      "diverges": true,
+      "reconstructed": "status"
     },
     {
-      "name": "bin is not repeated when argv starts with it",
+      "name": "caller argv is shown once",
       "syntactic": {
-        "bin": "git",
         "argv": ["git", "push"],
         "raw": "git push"
       },
@@ -85,14 +83,12 @@
       "reconstructed": "ls a\u001b"
     },
     {
-      "name": "bin and positionals with no argv",
+      "name": "opaque raw alone has no command vector",
       "syntactic": {
-        "bin": "ls",
-        "positionals": ["-la", "/tmp"],
         "raw": "ls -la /tmp"
       },
       "diverges": false,
-      "reconstructed": "ls -la /tmp"
+      "reconstructed": null
     },
     {
       "name": "no raw: nothing to diverge from",
@@ -120,30 +116,30 @@
       "reconstructed": null
     },
     {
-      "name": "a PowerShell Windows path: argv is raw's whitespace split, so no divergence despite quoting",
+      "name": "a PowerShell Windows path differs from the literal quoted argv form",
       "syntactic": {
         "argv": ["Remove-Item", "C:\\Users\\me\\build", "-Recurse"],
         "raw": "Remove-Item C:\\Users\\me\\build -Recurse"
       },
-      "diverges": false,
+      "diverges": true,
       "reconstructed": "Remove-Item 'C:\\Users\\me\\build' -Recurse"
     },
     {
-      "name": "a glob token that display quoting wraps is still raw's own word",
+      "name": "a glob token that display quoting wraps is still raw's own word differs from the literal quoted argv form",
       "syntactic": {
         "argv": ["ls", "*.txt"],
         "raw": "ls *.txt"
       },
-      "diverges": false,
+      "diverges": true,
       "reconstructed": "ls '*.txt'"
     },
     {
-      "name": "runs of ASCII whitespace in raw are not a divergence",
+      "name": "runs of ASCII whitespace in raw are not a divergence differs from the literal quoted argv form",
       "syntactic": {
         "argv": ["git", "status"],
         "raw": "git \t status"
       },
-      "diverges": false,
+      "diverges": true,
       "reconstructed": "git status"
     },
     {

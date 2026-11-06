@@ -8,11 +8,10 @@ notifications, and key storage only.
 notifications, widgets, Siri / Shortcuts, hardware-backed keys, the Watch — is core value, not chrome, and a
 deliberate moat over web / Electron / push-only competitors.
 
-**#406 partial implementation:** allw does not interpret what an action does or rate its danger.
-Risk labels/scoring and policy-only wire metadata are removed. `reversible` is an optional caller assertion;
-hooks and the OpenClaw bridge omit it. Command/PowerShell tokenization, no-program refusals, web command
-interpretation, and parsed/derived fields remain temporarily and are scheduled for removal in slice 2.
-They are not product scope. Faithful raw/cwd/caller argv/MCP/file-edit display and escaping remain.
+**Caller facts only:** allw records and shows raw/cwd/caller argv, tool identity/parameters and
+file edits faithfully. It does not interpret command meaning, derive command metadata or rate danger.
+`reversible` is an optional caller assertion; hooks and the OpenClaw bridge omit it. CLI/web display
+escaping and warnings remain; native display wiring is deferred to #273 as an M7 blocker.
 
 ## Decisions at a glance
 
@@ -63,8 +62,7 @@ stay encrypted, including surface, program names, MCP server/tool names and sess
 The relay does not decrypt, compute request hashes, or render actions: its vendored WASM verifies
 account state, pairing authorization and plaintext-free verdict provenance.
 
-Structure-visible metadata/privacy tiers are unimplemented proposals held in #216. Slice 2 removes
-derived program names, so that design needs reconsideration; no alternative metadata source is chosen.
+Structure-visible metadata/privacy tiers are unimplemented proposals held in #216. Derived program names are removed, so that design needs reconsideration; no alternative metadata source is chosen.
 See [contract.md](./contract.md) §Messages for the actual envelope.
 
 ## Local execution: WASM, not native binaries

@@ -695,14 +695,12 @@ The inbox renders these as **"{harness} on {machine} / {stream}"** (e.g. _"Codex
 Each component carries a **different trust weight** (see Decision 5), and the renderer MUST reflect that — the
 label is not uniformly trusted just because it is one string on screen.
 
-**Relationship to `session_label`.** The contract already carries a `session_label` at the `ApprovalRequest`
-envelope level as a **structure** field (`docs/contract.md` §Messages; `docs/policy-seam.md` §Structure vs.
-data). The work-stream label is the **structured, trust-tiered refinement** of that field: `session_label`
-remains the relay-visible structure string (the `"{harness} on {machine} / {stream}"` rendering, or a compatible
-opaque token), while the components above and their per-component trust live inside the JWE `ApprovalContext` and
-the machine attestation (below), never widening what the relay sees. The structure-not-data boundary is
-unchanged: the relay may see the label string as structure; it never sees action data, and it is never the trust
-anchor for the label.
+**Relationship to `session_label`.** The implemented `ApprovalRequest` envelope carries no
+`session_label` or other action structure: it contains routing/lifecycle metadata and ciphertext only.
+The structure-visible label proposal remains unimplemented and held in #216 for an owner decision.
+The work-stream components and their trust weights above remain specification work; parser removal
+neither exposes a label nor supplies inferred metadata. The relay never sees action data and is never
+a trust anchor for a label ([contract.md](./contract.md) §Messages).
 
 ### Decision 5 — the two-part origin signal
 

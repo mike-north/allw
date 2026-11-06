@@ -196,16 +196,11 @@ mod tests {
     fn context() -> ApprovalContext {
         ApprovalContext {
             action: ActionRecord {
-                record_schema_version: 2,
+                record_schema_version: 3,
                 surface: Surface::Command,
                 syntactic: SyntacticSubstrate {
-                    bin: Some("git".to_string()),
                     argv: None,
-                    flags: None,
-                    positionals: None,
                     cwd: None,
-                    host: None,
-                    env_refs: None,
                     server: None,
                     tool: None,
                     params: None,

@@ -118,7 +118,7 @@
 //! is `../scratch` + CR) and runs the `rm` in the original directory. So outside a file edit that
 //! CR is escaped as `\r` and sets the flag, like any other CR.
 //!
-//! Everywhere else — single-line fields (argv tokens, `bin`, flags, `cwd`, ids, the summary) and
+//! Everywhere else — single-line fields (argv tokens, `cwd`, ids, the summary) and
 //! the single-line [`DisplaySubstrate::raw`] — TAB, LF and CR are escaped and set the flag, because
 //! they have no business there.
 //!
@@ -452,27 +452,12 @@ fn content_lines(text: &str, crlf_is_structure: bool) -> (Vec<String>, bool) {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DisplaySubstrate {
-    /// Escaped `bin`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bin: Option<String>,
     /// Escaped `argv`, one entry per token (token boundaries are preserved).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub argv: Option<Vec<String>>,
-    /// Escaped `flags`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub flags: Option<Vec<String>>,
-    /// Escaped `positionals`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub positionals: Option<Vec<String>>,
     /// Escaped working directory.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    /// Escaped remote host.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub host: Option<String>,
-    /// Escaped environment-variable names.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub env_refs: Option<Vec<String>>,
     /// Escaped server / gating-provider id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
@@ -618,13 +603,8 @@ impl Escaper {
         };
 
         DisplaySubstrate {
-            bin: self.opt(s.bin.as_ref()),
             argv: self.list(s.argv.as_ref()),
-            flags: self.list(s.flags.as_ref()),
-            positionals: self.list(s.positionals.as_ref()),
             cwd: self.opt(s.cwd.as_ref()),
-            host: self.opt(s.host.as_ref()),
-            env_refs: self.list(s.env_refs.as_ref()),
             server: self.opt(s.server.as_ref()),
             tool: self.opt(s.tool.as_ref()),
             params_json,
@@ -683,7 +663,7 @@ mod tests {
     fn context_with(surface: Surface, syntactic: SyntacticSubstrate) -> ApprovalContext {
         ApprovalContext {
             action: ActionRecord {
-                record_schema_version: 2,
+                record_schema_version: 3,
                 surface,
                 syntactic,
             },
@@ -705,13 +685,8 @@ mod tests {
 
     fn empty_substrate() -> SyntacticSubstrate {
         SyntacticSubstrate {
-            bin: None,
             argv: None,
-            flags: None,
-            positionals: None,
             cwd: None,
-            host: None,
-            env_refs: None,
             server: None,
             tool: None,
             params: None,
@@ -1103,13 +1078,8 @@ mod tests {
         let mut ctx = context_with(
             Surface::Command,
             SyntacticSubstrate {
-                bin: Some("rm".to_string()),
                 argv: Some(vec!["rm".into(), "-rf".into(), "~/x\u{1b}[2K".into()]),
-                flags: Some(vec!["-rf".into()]),
-                positionals: Some(vec!["~/x\u{1b}[2K".into()]),
                 cwd: Some("/repo\u{202E}".to_string()),
-                host: Some("h\u{200B}".to_string()),
-                env_refs: Some(vec!["HOME\u{7f}".into()]),
                 raw: Some(SPOOF.to_string()),
                 ..empty_substrate()
             },
@@ -1127,15 +1097,11 @@ mod tests {
         assert_eq!(model.actor_label, "machine:⟨U+202E⟩ci (kind\\x00)");
         assert_eq!(model.chain, Some(vec!["gate⟨U+009B⟩".to_string()]));
         let s = &model.syntactic;
-        assert_eq!(s.bin.as_deref(), Some("rm"));
         assert_eq!(
             s.argv,
             Some(vec!["rm".into(), "-rf".into(), "~/x\\x1b[2K".into()])
         );
-        assert_eq!(s.positionals, Some(vec!["~/x\\x1b[2K".into()]));
         assert_eq!(s.cwd.as_deref(), Some("/repo⟨U+202E⟩"));
-        assert_eq!(s.host.as_deref(), Some("h⟨U+200B⟩"));
-        assert_eq!(s.env_refs, Some(vec!["HOME\\x7f".into()]));
         assert_eq!(
             s.raw.as_deref(),
             Some("rm -rf ~/x; : \\x1b[2K\\rgit status")
@@ -1152,7 +1118,6 @@ mod tests {
         let ctx = context_with(
             Surface::Command,
             SyntacticSubstrate {
-                bin: Some("git".into()),
                 argv: Some(vec!["git".into(), "status".into()]),
                 raw: Some("git status".into()),
                 ..empty_substrate()
@@ -1395,13 +1360,9 @@ mod tests {
     #[test]
     fn tab_lf_and_cr_in_single_line_fields_still_warn() {
         type Mutator = fn(&mut ApprovalContext);
-        let cases: [(&str, Mutator); 5] = [
+        let cases: [(&str, Mutator); 3] = [
             ("argv", |c| {
                 c.action.syntactic.argv = Some(vec!["rm\t-rf".into()])
-            }),
-            ("bin", |c| c.action.syntactic.bin = Some("rm\n".into())),
-            ("flags", |c| {
-                c.action.syntactic.flags = Some(vec!["-f\r".into()])
             }),
             ("cwd", |c| c.action.syntactic.cwd = Some("/tmp\t".into())),
             ("summary", |c| c.summary.push('\n')),

@@ -66,7 +66,7 @@ function withHighBit(b64url) {
 
 const CONTEXT = {
   action: {
-    record_schema_version: 2,
+    record_schema_version: 3,
     surface: "command",
     syntactic: { argv: ["git", "status"], raw: "git status" },
   },

@@ -10,7 +10,7 @@
 //! - the `ApprovalContext` (byte-identical to the `hash::tests::make_minimal_context` fixture) and
 //!   its bound `expires_at`,
 //! - the expected `request_hash` (hex **and** base64url-unpadded) — the hex equals the core's
-//!   `request-hash/v3` frozen vector,
+//!   `request-hash/v4` frozen vector,
 //! - a known-good signed `Verdict`, its envelope `ApprovalRequest`, the human-shown
 //!   `ApprovalContext` (again, as the verifier consumes it), the approver **account-root** Ed25519
 //!   public key (base64url-unpadded), and a `now_ms` inside the decision window.
@@ -24,7 +24,7 @@
 //! ```
 //!
 //! Then re-run without the env var; the guard test must pass. Spec-first: the expected hash is the
-//! frozen `request-hash/v3` vector, not a captured snapshot — if a code change alters it, that is a
+//! frozen `request-hash/v4` vector, not a captured snapshot — if a code change alters it, that is a
 //! deliberate `DOMAIN_TAG` bump, mirrored here and in `hash.rs`.
 //!
 //! It also carries the self-certifying account-id vector (`account_id_for_root` of the approver
@@ -79,7 +79,7 @@ const DEVICE_ID: &str = "dev_wasm_vector_01";
 const REQUEST_ID: &str = "req_wasm_vector_01";
 
 // Bound expires_at — MUST equal the `expires_at` used by hash::tests so the request_hash matches
-// the frozen `request-hash/v3` vector. 2023-11-14T23:13:20Z.
+// the frozen `request-hash/v4` vector. 2023-11-14T23:13:20Z.
 const TS_EXPIRES: i64 = 1_700_003_600_000;
 // created_at < decided_at < expires_at; now_ms inside the window.
 const TS_CREATED: i64 = 1_700_000_000_000;
@@ -334,20 +334,15 @@ struct ForgedNotApprovedCase {
 // ── Builders (mirror hash::tests::make_minimal_context exactly) ───────────────────
 
 /// The minimal action — `bin` + `raw` only, matching the hash-vector fixture so the computed
-/// `request_hash` equals the frozen `request-hash/v3` value.
+/// `request_hash` equals the frozen `request-hash/v4` value.
 fn make_minimal_context() -> ApprovalContext {
     ApprovalContext {
         action: ActionRecord {
-            record_schema_version: 2,
+            record_schema_version: 3,
             surface: Surface::Command,
             syntactic: SyntacticSubstrate {
-                bin: Some("git".to_string()),
                 argv: None,
-                flags: None,
-                positionals: None,
                 cwd: None,
-                host: None,
-                env_refs: None,
                 server: None,
                 tool: None,
                 params: None,
@@ -965,7 +960,7 @@ fn fixture_path() -> PathBuf {
 // ── The guard test (and regenerator) ──────────────────────────────────────────────
 
 /// Asserts the committed fixture is current: it must byte-match a freshly built vector, and its
-/// expected hash must equal the frozen `request-hash/v3` vector. When `REGEN_WASM_VECTOR=1`, it
+/// expected hash must equal the frozen `request-hash/v4` vector. When `REGEN_WASM_VECTOR=1`, it
 /// (re)writes the fixture instead — the reproducible-build path.
 #[test]
 fn committed_fixture_is_current() {
@@ -995,21 +990,21 @@ fn committed_fixture_is_current() {
     );
 }
 
-/// Independent anchor: the fixture's expected hash equals the frozen `request-hash/v3` hex from
+/// Independent anchor: the fixture's expected hash equals the frozen `request-hash/v4` hex from
 /// `hash.rs`. If `hash.rs` bumps `DOMAIN_TAG`, this catches the drift (and the fixture must be
 /// regenerated). Spec-first — the value is the documented frozen vector, not a captured snapshot.
 #[test]
 fn fixture_hash_equals_frozen_vector() {
     // The same value asserted by hash::tests::frozen_cross_platform_vector.
     const FROZEN_HASH_HEX: &str =
-        "6952a2ab641bc1a13983b5b07826fcc9b48cb32c8b55e4969218fe14484ebc4c";
+        "0cd833e3e1d0c51b908becb73ede798a0fd917d42a249df3a478225f57f21f7c";
 
     let context = make_minimal_context();
     let hash = compute_request_hash(&context, TS_EXPIRES);
     let hex = hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
     assert_eq!(
         hex, FROZEN_HASH_HEX,
-        "fixture context must hash to the frozen request-hash/v3 vector"
+        "fixture context must hash to the frozen request-hash/v4 vector"
     );
 }
 

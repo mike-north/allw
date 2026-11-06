@@ -179,10 +179,11 @@ test("approve: a gated destructive command → human approves → hook makes no 
   const context = log[0].context;
   assert.ok(context, "the approver decrypted the human-shown context");
   const syntactic = context.action.syntactic;
-  assert.deepEqual(
-    syntactic.argv,
-    ["git", "push", "--force", "origin", "main"],
-    "the decrypted, human-shown argv is exactly the destructive command that was sent",
+  assert.equal(syntactic.argv, undefined, "line capture never infers an execution vector");
+  assert.equal(
+    syntactic.raw,
+    "git push --force origin main",
+    "the complete caller text reaches the approver",
   );
   assert.equal(syntactic.cwd, PROJECT_CWD, "the decrypted, human-shown cwd matches what was sent");
   assert.equal(syntactic.raw, DESTRUCTIVE_COMMAND, "the rendered raw command line matches exactly");
@@ -250,7 +251,7 @@ test("integrator independently re-verifies the verdict: request_id AND request_h
 
   const verdict = await client.requestApproval({
     action: {
-      recordSchemaVersion: 2,
+      recordSchemaVersion: 3,
       surface: "command",
       syntactic: { argv: ["git", "push", "--force", "origin", "main"] },
       risk: "high",
@@ -299,7 +300,7 @@ test("zero-knowledge: the relay stores only the opaque ciphertext envelope + sig
 
   await client.requestApproval({
     action: {
-      recordSchemaVersion: 2,
+      recordSchemaVersion: 3,
       surface: "command",
       syntactic: { argv: ["git", "push", "--force", "origin", "main"] },
       risk: "high",
@@ -383,7 +384,7 @@ test("root-vouched recipients: a key injected into the relay's device list canno
   });
   const verdict = await client.requestApproval({
     action: {
-      recordSchemaVersion: 2,
+      recordSchemaVersion: 3,
       surface: "command",
       syntactic: { argv: ["git", "push", "--force", "origin", "main"] },
       risk: "high",
@@ -464,7 +465,7 @@ test("interim vouching: after vouch, the SDK seals to the web device's kid and t
   const request = (summary) =>
     client.requestApproval({
       action: {
-        recordSchemaVersion: 2,
+        recordSchemaVersion: 3,
         surface: "command",
         syntactic: { argv: ["git", "push", "--force", "origin", "main"] },
         risk: "high",

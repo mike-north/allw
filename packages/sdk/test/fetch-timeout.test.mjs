@@ -59,9 +59,9 @@ const RELAY_URL = "https://relay.allw.test";
 function sampleRequest(overrides = {}) {
   return {
     action: {
-      recordSchemaVersion: 2,
+      recordSchemaVersion: 3,
       surface: "command",
-      syntactic: { bin: "git", raw: "git push --force" },
+      syntactic: { raw: "git push --force" },
     },
     summary: "Force-push to main",
     actor: { id: "machine:macbook-pro", kind: "claude-code" },

@@ -187,7 +187,7 @@ For each incoming request the approver:
    `expires_at` — identical bytes to the integrator's pre-send hash,
 3. **renders** the **complete** action substrate — the command/argv headline **plus** every other
    hash-bound field: a divergent reconstructed `argv` (when a benign `raw` would otherwise mask it),
-   `flags`, `positionals`, `cwd`, `host`, `env_refs`, or MCP `params` when present — followed by the
+   caller `argv`, `cwd`, or MCP `params` when present — followed by the
    summary, actor, optional caller reversibility, expiry, and `request_hash`,
 4. prompts **Approve / Deny / Skip**,
 5. **re-checks expiry** after the human decides and before signing (a prompt left open past the
@@ -201,7 +201,7 @@ A `{ type: "retract" }` (another device resolved it) clears the pending prompt.
 
 The full meaning-changing substrate is shown — never elided behind a `raw` summary. The reconstructed
 command (or MCP `server :: tool`) is the **`Action:` headline**; the remaining hash-bound fields —
-`flags`, `positionals`, `cwd`, `host`, `env_refs`, MCP `server`/`tool`, and MCP `params` — each get
+caller `argv`, `cwd`, MCP `server`/`tool`, and MCP `params` — each get
 their own labeled line when present, so the headline alone is never the whole story. (`argv` is
 normally the headline itself; it only also appears on a separate `Argv:` line when it **diverges**
 from a `raw` headline — see below.)
@@ -214,10 +214,7 @@ from a `raw` headline — see below.)
   Summary:    force push to main
   Action:     git push --force origin main
   Surface:    command
-  Flags:      --force
-  Positionals: origin main
   Cwd:        /home/me/project
-  Env refs:   GIT_SSH_COMMAND
   Actor:      machine:laptop (claude-code)
               ✓ VERIFIED origin — claude-code · machine:laptop
   Reversible: no
@@ -233,7 +230,7 @@ Approve / Deny / Skip? [a/d/s]
 a benign `raw` ("git status") alongside a divergent, dangerous `argv` (`git push --force …`) — both
 covered by `request_hash`, but a `raw`-only headline would show the human only the benign string
 while a downstream executor acts on `argv`. The device is the last line of defense against exactly
-that field mismatch, so when the reconstructed `bin`/`argv` command **diverges** from `raw`, the
+that field mismatch, so when the reconstructed caller `argv` command **diverges** from `raw`, the
 renderer surfaces the reconstructed form on a labeled `Argv:` line:
 
 ```
@@ -252,7 +249,9 @@ their own unconditional labeled line whenever present:
   MCP:        fs :: delete_all_files            ← hash-bound server/tool, surfaced even behind a benign raw
 ```
 
-This is **display-only** — it never changes the bytes bound into `request_hash`.
+This is **display-only** — it never changes the bytes bound into `request_hash`. Raw is compared
+with the literal quoted caller argv form without splitting raw. Formatting alone may warn; no
+semantic equivalence is inferred.
 
 #### Verified request origin (Invariant #4)
 
