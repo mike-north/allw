@@ -410,7 +410,7 @@ test("vouch refuses when the relay registered the id with a different encryption
       assert.equal(ask.asked.length, 0);
       assertNothingChanged(relay, keyfilePath);
     },
-    () => [registered(PHONE_DEVICE_ID, decoy)],
+    () => [{ device_id: PHONE_DEVICE_ID, pubkey: decoy.encryptionPubkey, created_at: 1 }],
   );
 });
 
@@ -544,4 +544,19 @@ test("vouch leading-dash public key: equals form reaches TTY refusal; space form
       assert.deepEqual(relay.requests, [], "neither refusal reaches the relay");
     }
   });
+});
+
+/** @see ../../../docs/enrollment.md §Interim vouching (pasted public keys) */
+test("vouch succeeds with a label-less anonymous registry (#251 item6)", async () => {
+  await withSetup(
+    async ({ wasm, keyfilePath, phone, relay, lines, log }) => {
+      assert.equal(await runVouch(wasm, vouchOptions(keyfilePath, phone), confirmer(true), log), 2);
+      assert.match(lines.join("\n"), /relay label: +\(none\)/);
+      assert.deepEqual(
+        relay.published().devices.map((d) => d.device_id),
+        [CLI_DEVICE_ID, PHONE_DEVICE_ID],
+      );
+    },
+    (phone) => [{ device_id: PHONE_DEVICE_ID, pubkey: phone.encryptionPubkey, created_at: 1 }],
+  );
 });

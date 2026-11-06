@@ -199,7 +199,7 @@ describe("AccountRelay — pairing", () => {
     // Verify the returned fields match what was enrolled
     expect(device?.device_id).toBe(device_id);
     expect(device?.pubkey).toBe(VALID_PUBKEY_1);
-    expect(device?.label).toBe("My Phone");
+    expect(device).not.toHaveProperty("label");
     expect(typeof device?.created_at).toBe("number");
 
     // ZERO-KNOWLEDGE INVARIANT: the device record must contain ONLY these fields.
@@ -680,7 +680,7 @@ describe("AccountRelay — per-account isolation", () => {
 });
 
 describe("AccountRelay — zero-knowledge invariant", () => {
-  it("GET /devices returns ONLY device_id, pubkey, label, created_at (no secret fields)", async () => {
+  it("anonymous GET /devices returns ONLY device_id, pubkey, created_at (no labels or secrets)", async () => {
     const acct = testAccount("acct-zk-devices");
 
     const startData = await startPairing(acct);
@@ -695,7 +695,7 @@ describe("AccountRelay — zero-knowledge invariant", () => {
     const keys = Object.keys(device ?? {}).sort();
 
     // Exact set of allowed fields — no private_key, secret, or extra fields.
-    expect(keys).toEqual(["created_at", "device_id", "label", "pubkey"]);
+    expect(keys).toEqual(["created_at", "device_id", "pubkey"]);
   });
 
   it("GET /actors returns ONLY actor_id, pubkey, label, created_at (no secret fields)", async () => {
