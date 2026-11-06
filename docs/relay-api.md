@@ -261,7 +261,12 @@ the code, so none of them says whether the code exists:
 5. 410 (code expired);
 6. 409 (account push-token budget full; the code is not consumed).
 
-Atomic — no half-enrollment.
+Atomic — no half-enrollment. After authentication and credential hashing, the relay rechecks the
+code's unused state, expiry and account push-token budget without yielding. Code consumption, the
+device public key and credential hash, and the entire push-token set commit in one storage
+transaction. Concurrent authenticated completions of the same usable code yield exactly one **201**;
+the others get **409** "pairing code already used" and enroll nothing. A failed enrollment insert
+rolls back every enrollment row and code consumption, leaving an otherwise usable code retryable.
 
 ### Relay-level (`/.well-known/allw/`, not per-account)
 
