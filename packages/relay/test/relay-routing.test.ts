@@ -371,23 +371,23 @@ interface WsClient {
  * Returns the 101 client wrapped in a queue-backed reader, or throws on a non-101 response.
  */
 async function connectWs(accountId: string, subPath: string): Promise<WsClient> {
-  let authedSubPath = subPath;
-  const deviceMatch = /^\/devices\/([^/?]+)\/connect(?:\?(.+))?$/.exec(subPath);
-  const waitMatch = /^\/requests\/([^/?]+)\/wait(?:\?(.+))?$/.exec(subPath);
-  if (deviceMatch && !new URLSearchParams(deviceMatch[2] ?? "").has("auth")) {
-    const token = deviceAuthTokens.get(
-      tokenKey(accountId, decodeURIComponent(deviceMatch[1] ?? "")),
-    );
-    if (token !== undefined) authedSubPath = appendAuthQuery(subPath, token);
-  } else if (waitMatch && !new URLSearchParams(waitMatch[2] ?? "").has("auth")) {
-    const token = requestAuthTokens.get(
-      tokenKey(accountId, decodeURIComponent(waitMatch[1] ?? "")),
-    );
-    if (token !== undefined) authedSubPath = appendAuthQuery(subPath, token);
-  }
-  const resp = await exports.default.fetch(relayUrl(accountId, authedSubPath), {
-    headers: { Upgrade: "websocket" },
+  const parsed = new URL(relayUrl(accountId, subPath));
+  const deviceMatch = /^\/devices\/([^/]+)\/connect$/.exec(
+    parsed.pathname.slice(accountId.length + 1),
+  );
+  const waitMatch = /^\/requests\/([^/]+)\/wait$/.exec(parsed.pathname.slice(accountId.length + 1));
+  const token = deviceMatch
+    ? deviceAuthTokens.get(tokenKey(accountId, decodeURIComponent(deviceMatch[1] ?? "")))
+    : waitMatch
+      ? requestAuthTokens.get(tokenKey(accountId, decodeURIComponent(waitMatch[1] ?? "")))
+      : undefined;
+  const resp = await exports.default.fetch(parsed.toString(), {
+    headers: {
+      Upgrade: "websocket",
+      ...(token === undefined ? {} : { "Sec-WebSocket-Protocol": `allw.v1, allw.auth.${token}` }),
+    },
   });
+  expect(resp.headers.get("Sec-WebSocket-Protocol")).toBe("allw.v1");
   if (resp.status !== 101 || !resp.webSocket) {
     throw new Error(`expected 101 WebSocket upgrade, got ${String(resp.status)}`);
   }
@@ -899,9 +899,14 @@ describe("AccountRelay — cross-device coordination", () => {
         const response = await relay["handleDeviceConnect"](
           "dev-stale-flush",
           new Request(
-            "https://relay.allw.test/acct/devices/dev-stale-flush/connect?surface_id=mac-screen&auth=stale-device-token",
-            // A real WebSocket client sends the upgrade header; the query token is accepted only then.
-            { headers: { Upgrade: "websocket" } },
+            "https://relay.allw.test/acct/devices/dev-stale-flush/connect?surface_id=mac-screen",
+            // A real client offers the application marker and a private credential protocol.
+            {
+              headers: {
+                Upgrade: "websocket",
+                "Sec-WebSocket-Protocol": "allw.v1, allw.auth.stale-device-token",
+              },
+            },
           ),
         );
         expect(response.status).toBe(101);
@@ -1420,18 +1425,22 @@ describe("AccountRelay — endpoint authentication", () => {
     expect(noAuth.status).toBe(401);
 
     const wrongAuth = await exports.default.fetch(
-      relayUrl(acct, appendAuthQuery(`/devices/${device.device_id}/connect`, "wrong-token")),
-      { headers: { Upgrade: "websocket" } },
+      relayUrl(acct, `/devices/${device.device_id}/connect`),
+      {
+        headers: {
+          Upgrade: "websocket",
+          "Sec-WebSocket-Protocol": `allw.v1, allw.auth.wrong-token`,
+        },
+      },
     );
     expect(wrongAuth.status).toBe(403);
 
-    const ok = await exports.default.fetch(
-      relayUrl(
-        acct,
-        appendAuthQuery(`/devices/${device.device_id}/connect`, device.device_auth_token),
-      ),
-      { headers: { Upgrade: "websocket" } },
-    );
+    const ok = await exports.default.fetch(relayUrl(acct, `/devices/${device.device_id}/connect`), {
+      headers: {
+        Upgrade: "websocket",
+        "Sec-WebSocket-Protocol": `allw.v1, allw.auth.${device.device_auth_token}`,
+      },
+    });
     expect(ok.status).toBe(101);
     ok.webSocket?.accept();
     ok.webSocket?.close();
@@ -1443,11 +1452,13 @@ describe("AccountRelay — endpoint authentication", () => {
     const deviceB = await pairDevice(acct, "__________________________________________8");
 
     const crossDevice = await exports.default.fetch(
-      relayUrl(
-        acct,
-        appendAuthQuery(`/devices/${deviceA.device_id}/connect`, deviceB.device_auth_token),
-      ),
-      { headers: { Upgrade: "websocket" } },
+      relayUrl(acct, `/devices/${deviceA.device_id}/connect`),
+      {
+        headers: {
+          Upgrade: "websocket",
+          "Sec-WebSocket-Protocol": `allw.v1, allw.auth.${deviceB.device_auth_token}`,
+        },
+      },
     );
     expect(crossDevice.status).toBe(403);
   });
@@ -1531,20 +1542,24 @@ describe("AccountRelay — endpoint authentication", () => {
     expect(noAuthWait.status).toBe(401);
 
     const wrongAuthWait = await exports.default.fetch(
-      relayUrl(
-        acct,
-        appendAuthQuery(`/requests/${rid("req-auth-token")}/wait`, "wrong-request-token"),
-      ),
-      { headers: { Upgrade: "websocket" } },
+      relayUrl(acct, `/requests/${rid("req-auth-token")}/wait`),
+      {
+        headers: {
+          Upgrade: "websocket",
+          "Sec-WebSocket-Protocol": `allw.v1, allw.auth.wrong-request-token`,
+        },
+      },
     );
     expect(wrongAuthWait.status).toBe(403);
 
     const okWait = await exports.default.fetch(
-      relayUrl(
-        acct,
-        appendAuthQuery(`/requests/${rid("req-auth-token")}/wait`, submit.data.request_auth_token),
-      ),
-      { headers: { Upgrade: "websocket" } },
+      relayUrl(acct, `/requests/${rid("req-auth-token")}/wait`),
+      {
+        headers: {
+          Upgrade: "websocket",
+          "Sec-WebSocket-Protocol": `allw.v1, allw.auth.${submit.data.request_auth_token}`,
+        },
+      },
     );
     expect(okWait.status).toBe(101);
     okWait.webSocket?.accept();
@@ -1685,9 +1700,9 @@ function rawFetch(
   });
 }
 
-describe("AccountRelay — ?auth= is accepted only on WebSocket upgrades (#303)", () => {
+describe("AccountRelay — query credentials never authenticate (#251)", () => {
   // A token in a URL lands in access, proxy and CDN logs, browser history and Referer. Browsers
-  // cannot set headers on a WebSocket, so only the two WebSocket routes accept the query form.
+  // use credential protocol offers for WebSockets instead of accepting any query form.
   for (const c of HTTP_QUERY_AUTH_CASES) {
     it(`rejects a query-only token on ${c.route} with 401, and accepts the same token as a header`, async () => {
       const acct = testAccount(`acct-query-auth-${c.route.replace(/[^a-z]+/gi, "-")}`);
@@ -1709,96 +1724,21 @@ describe("AccountRelay — ?auth= is accepted only on WebSocket upgrades (#303)"
     });
   }
 
-  it("still accepts ?auth= (or the header) on the device connect upgrade", async () => {
-    const acct = testAccount("acct-query-auth-ws-connect");
+  it("refuses query-only credentials on both upgrade routes", async () => {
+    const acct = testAccount("acct-query-auth-clean-break");
     const device = await pairDevice(acct);
-    const path = `/devices/${device.device_id}/connect`;
-
-    for (const init of [
-      { url: appendAuthQuery(path, device.device_auth_token), headers: {} },
-      { url: path, headers: bearer(device.device_auth_token) },
-    ]) {
-      const resp = await exports.default.fetch(relayUrl(acct, init.url), {
-        headers: { Upgrade: "websocket", ...init.headers },
-      });
-      expect(resp.status).toBe(101);
-      resp.webSocket?.accept();
-      resp.webSocket?.close();
-    }
-  });
-
-  // The router answers a non-upgrade request on a WebSocket route with 426 before the Durable
-  // Object sees it, so this drives the handler directly: bearerToken's own upgrade check is what
-  // keeps a valid query token from authenticating a plain HTTP request there.
-  it("refuses a valid ?auth= token on the connect handler when the request is not an upgrade", async () => {
-    const acct = testAccount("acct-query-auth-no-upgrade");
-    const device = await pairDevice(acct);
-    const url = relayUrl(
+    const submit = await post<SubmitResult>(
       acct,
-      appendAuthQuery(`/devices/${device.device_id}/connect`, device.device_auth_token),
+      "/requests",
+      makeEnvelope(rid("query-clean-break")),
     );
-    const status = await runInDurableObject(
-      env.ACCOUNT.get(env.ACCOUNT.idFromName(acct)),
-      async (relay: AccountRelay) =>
-        (await relay["handleDeviceConnect"](device.device_id, new Request(url))).status,
-    );
-    expect(status).toBe(401);
-  });
-
-  // workerd drops an empty Authorization header before the Durable Object, so it counts as absent
-  // and the WebSocket route's query token applies (docs/relay-api.md §1).
-  it("treats an empty or whitespace-only Authorization header as absent on a WebSocket upgrade", async () => {
-    const acct = testAccount("acct-query-auth-empty-header");
-    const device = await pairDevice(acct);
-    const url = relayUrl(
-      acct,
-      appendAuthQuery(`/devices/${device.device_id}/connect`, device.device_auth_token),
-    );
-    for (const authorization of ["", "   "]) {
-      const resp = await exports.default.fetch(url, {
-        headers: { Upgrade: "websocket", Authorization: authorization },
-      });
-      expect(resp.status, JSON.stringify(authorization)).toBe(101);
-      resp.webSocket?.accept();
-      resp.webSocket?.close();
-    }
-  });
-
-  it("still accepts ?auth= (or the header) on the request wait upgrade", async () => {
-    const acct = testAccount("acct-query-auth-ws-wait");
-    const submit = await post<SubmitResult>(acct, "/requests", makeEnvelope(rid("req-query-wait")));
-    const path = `/requests/${submit.data.request_id}/wait`;
-
-    for (const init of [
-      { url: appendAuthQuery(path, submit.data.request_auth_token), headers: {} },
-      { url: path, headers: bearer(submit.data.request_auth_token) },
-    ]) {
-      const resp = await exports.default.fetch(relayUrl(acct, init.url), {
-        headers: { Upgrade: "websocket", ...init.headers },
-      });
-      expect(resp.status).toBe(101);
-      resp.webSocket?.accept();
-      resp.webSocket?.close();
-    }
-  });
-
-  it("treats a header plus a query token as the header alone", async () => {
-    const acct = testAccount("acct-query-auth-header-wins");
-    const device = await pairDevice(acct);
-    const path = appendAuthQuery(`/devices/${device.device_id}/connect`, device.device_auth_token);
-
-    // A wrong bearer header is judged on its own: the valid query token does not rescue it.
-    const wrongHeader = await exports.default.fetch(relayUrl(acct, path), {
-      headers: { Upgrade: "websocket", ...bearer("wrong-device-token") },
-    });
-    expect(wrongHeader.status).toBe(403);
-
-    // Nor does it rescue a header that is malformed or of another scheme.
-    for (const authorization of ["Basic dXNlcjpwYXNz", "Bearer", "Bearer not a token"]) {
-      const resp = await exports.default.fetch(relayUrl(acct, path), {
-        headers: { Upgrade: "websocket", Authorization: authorization },
-      });
-      expect(resp.status).toBe(401);
+    for (const [path, token] of [
+      [`/devices/${device.device_id}/connect`, device.device_auth_token],
+      [`/requests/${submit.data.request_id}/wait`, submit.data.request_auth_token],
+    ] as const) {
+      const url = relayUrl(acct, appendAuthQuery(path, token));
+      const response = await exports.default.fetch(url, { headers: { Upgrade: "websocket" } });
+      expect(response.status).toBe(401);
     }
   });
 });

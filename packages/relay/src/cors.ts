@@ -25,7 +25,7 @@
  * CORS is a browser read-permission mechanism, not access control. Non-browser clients (the CLI,
  * SDK, hook, native apps) send no `Origin` and are unaffected, and a request from a disallowed
  * origin still reaches its handler and is authorized exactly as before. WebSocket upgrades are not
- * subject to CORS and pass through unchanged; they authenticate with the `?auth=` bearer.
+ * subject to CORS and pass through unchanged; they authenticate with private `Sec-WebSocket-Protocol` offers.
  *
  * @see https://fetch.spec.whatwg.org/#http-cors-protocol
  */

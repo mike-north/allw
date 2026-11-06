@@ -276,9 +276,11 @@ and the signed verdict — never plaintext, never a key it could sign with.
 `POST /pairing/start` returns `{ code, expires_at, pairing_auth_token }`; `POST /pairing/complete`
 must present that token as `Authorization: Bearer …` and returns `{ device_id, device_auth_token }`.
 Device-scoped endpoints such as `GET /devices/{id}/connect` and
-`POST /devices/{id}/revoke` require that device token (header or `auth` query for WebSocket
-upgrades). `POST /requests` returns `request_auth_token`; `GET /requests/{id}` and
-`GET /requests/{id}/wait` require it. `POST /account-states` takes no token — the relay verifies
+`POST /devices/{id}/revoke` require that device token (Authorization for HTTP; the `allw.auth.<token>` protocol
+offer alongside `allw.v1` for WebSocket upgrades). `POST /requests` returns `request_auth_token`; `GET /requests/{id}` and
+`GET /requests/{id}/wait` require it (Authorization for polling, protocol offer for the socket).
+Socket URLs contain no credentials; the selected protocol is only `allw.v1`, never the bearer.
+Query credentials cannot authenticate; see [relay-api.md](./relay-api.md) §1 for the exact grammar. `POST /account-states` takes no token — the relay verifies
 every document against the account's bound root (#242) — and `GET /account-states` is
 unauthenticated; the relay still cannot make a substituted actor key trusted, because consumers
 verify the root signature themselves. The relay stores only SHA-256 hashes of

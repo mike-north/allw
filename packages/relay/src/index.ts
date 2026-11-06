@@ -288,32 +288,31 @@ async function hashAuthToken(token: string): Promise<string> {
   return base64UrlEncode(new Uint8Array(digest));
 }
 
-/**
- * Where a route accepts its bearer token from.
- *
- * - `header`: only `Authorization: Bearer …`. This is every HTTP route.
- * - `header-or-websocket-query`: also `?auth=<token>`, but only on a WebSocket upgrade request and
- *   only when no `Authorization` header is present. Browsers cannot set headers on a WebSocket, so
- *   the two WebSocket routes (`…/connect`, `…/wait`) need the query form.
- *
- * A token in a URL leaks where a header does not: access, proxy and CDN logs, browser history,
- * `Referer`, error reports. So the query form exists only where it is needed (#303).
- */
-type BearerSource = "header" | "header-or-websocket-query";
+/** HTTP accepts only Authorization; socket routes accept only the negotiated protocol offer. */
+type BearerSource = "header" | "websocket-protocol";
 
 /**
- * The bearer token a request presents for a route accepting `source`, or `null` if none.
- * An `Authorization` header, when present, is the only credential considered. The query is never
- * a fallback for a header that is malformed or of another scheme.
+ * Socket grammar is exactly two distinct offers, in either order: `allw.v1` and
+ * `allw.auth.<base64url capability>`. Query credentials and Authorization on socket routes are
+ * refused, so malformed explicit credentials cannot fall back to another source. Never log offers.
+ * HTTP ignores protocol offers, even when an Upgrade header is sent to an HTTP route.
  */
 function bearerToken(request: Request, source: BearerSource): string | null {
   const auth = request.headers.get("Authorization");
-  if (auth !== null) {
-    return /^Bearer ([A-Za-z0-9_-]+)$/.exec(auth)?.[1] ?? null;
+  if (source === "header") {
+    return auth === null ? null : (/^Bearer ([A-Za-z0-9_-]+)$/.exec(auth)?.[1] ?? null);
   }
-  if (source !== "header-or-websocket-query" || !isWebSocketUpgrade(request)) return null;
-  const queryToken = new URL(request.url).searchParams.get("auth");
-  return queryToken && /^[A-Za-z0-9_-]+$/.test(queryToken) ? queryToken : null;
+  if (!isWebSocketUpgrade(request) || auth !== null) return null;
+  const offers = request.headers
+    .get("Sec-WebSocket-Protocol")
+    ?.split(",")
+    // HTTP list OWS is SP/HTAB only; Unicode whitespace is malformed protocol material.
+    .map((p) => p.replace(/^[ \t]+|[ \t]+$/g, ""));
+  if (offers?.length !== 2 || !offers.includes("allw.v1")) return null;
+  const credential = offers.find((p) => p !== "allw.v1");
+  return credential === undefined
+    ? null
+    : (/^allw\.auth\.([A-Za-z0-9_-]+)$/.exec(credential)?.[1] ?? null);
 }
 
 function authError(status: 401 | 403): Response {
@@ -1062,7 +1061,7 @@ export class AccountRelay extends DurableObject<Env> {
     request: Request,
     source: BearerSource = "header",
   ): Promise<Response> {
-    // The same `source` as the route's real check, so a WebSocket route's `?auth=` token is read
+    // The same `source` as the route's real check, so a WebSocket route's protocol capability is read
     // for an unknown identifier exactly as for a known one.
     return (await this.#authorizeStoredHash(request, null, source)) ?? authError(403);
   }
@@ -1771,7 +1770,7 @@ export class AccountRelay extends DurableObject<Env> {
     const authFailure = await this.#authorizeStoredHash(
       request,
       device.auth_token_hash,
-      "header-or-websocket-query",
+      "websocket-protocol",
     );
     if (authFailure) return authFailure;
     const surfaceId = parseSurfaceId(request);
@@ -1805,7 +1804,11 @@ export class AccountRelay extends DurableObject<Env> {
       }
     }
 
-    return new Response(null, { status: 101, webSocket: client });
+    return new Response(null, {
+      status: 101,
+      headers: { "Sec-WebSocket-Protocol": "allw.v1" },
+      webSocket: client,
+    });
   };
 
   /**
@@ -2421,11 +2424,7 @@ export class AccountRelay extends DurableObject<Env> {
    * will come for either of the latter two).
    */
   async #handleIntegratorWait(requestId: string, request: Request): Promise<Response> {
-    const authorized = await this.#authorizeRequestRead(
-      requestId,
-      request,
-      "header-or-websocket-query",
-    );
+    const authorized = await this.#authorizeRequestRead(requestId, request, "websocket-protocol");
     if (authorized instanceof Response) return authorized;
     const status = authorized.status;
 
@@ -2463,7 +2462,11 @@ export class AccountRelay extends DurableObject<Env> {
       }
     }
 
-    return new Response(null, { status: 101, webSocket: client });
+    return new Response(null, {
+      status: 101,
+      headers: { "Sec-WebSocket-Protocol": "allw.v1" },
+      webSocket: client,
+    });
   }
 
   /**
