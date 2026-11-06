@@ -83,6 +83,13 @@ caller text: comments, assignments, operators, substitutions and unmatched quote
 verbatim without inferred argv or program identity. A blank cwd counts as unknown; the request is
 still sent, bound to no directory. Malformed input and core build errors still deny.
 
+Denial logs are **off by default**. Set `ALLW_CODEX_DENY_LOG=1` in the hook environment to append
+metadata only (timestamp, deny category, available request UUID) to
+`$XDG_STATE_HOME/allw/codex-deny.log`, or `~/.allw/state/codex-deny.log` when XDG state is unset/empty.
+No project log is written. Optional logging failures preserve the deny; command text and human
+notes never enter the log. See [Private denial diagnostics](../../docs/codex-integration.md#private-denial-diagnostics)
+for path and permission requirements.
+
 ## Development
 
 ```sh

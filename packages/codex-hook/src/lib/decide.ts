@@ -31,6 +31,8 @@ import {
 
 /** The minimal verdict shape read from `@allw/sdk`. */
 export interface ApprovalVerdict {
+  /** SDK request identity when a verdict exists; never substitute a Codex tool-use id. */
+  readonly request_id?: string;
   readonly decision: "approved" | "denied" | "expired" | "aborted";
 }
 
@@ -252,5 +254,6 @@ export async function decide(
   return denyOutput(
     `allw: ${agentSafeText(deps.wasm, summary)} — not approved (verdict: ${verdict.decision})`,
     verdictDenyReason,
+    verdict.request_id,
   );
 }
