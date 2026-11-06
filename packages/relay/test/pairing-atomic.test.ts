@@ -38,7 +38,9 @@ interface Credential {
 
 /** A manually released promise makes interleavings depend on arrivals, never sleeps. */
 function latch(): { ready: Promise<void>; release: () => void } {
-  let release = (): void => {};
+  let release = (): void => {
+    throw new Error("latch not initialized");
+  };
   const ready = new Promise<void>((resolve) => {
     release = resolve;
   });
@@ -82,22 +84,26 @@ async function start(accountId: string): Promise<Pairing> {
 }
 
 /** Complete through the public Worker route; overrides exercise rejected, non-consuming inputs. */
-function complete(
+async function complete(
   accountId: string,
   pairing: Pairing,
   overrides: Record<string, unknown> = {},
   token: string | null = pairing.pairing_auth_token,
-): Promise<Response> {
-  return exports.default.fetch(`https://relay.allw.test/${accountId}/pairing/complete`, {
-    method: "POST",
-    headers: token === null ? {} : { Authorization: `Bearer ${token}` },
-    body: JSON.stringify({
-      code: pairing.code,
-      pubkey: DEVICE_X25519_PUBKEY,
-      push_tokens: PUSH_TOKENS,
-      ...overrides,
-    }),
-  });
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const response = await exports.default.fetch(
+    `https://relay.allw.test/${accountId}/pairing/complete`,
+    {
+      method: "POST",
+      headers: token === null ? {} : { Authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        code: pairing.code,
+        pubkey: DEVICE_X25519_PUBKEY,
+        push_tokens: PUSH_TOKENS,
+        ...overrides,
+      }),
+    },
+  );
+  return { status: response.status, body: await response.json<Record<string, unknown>>() };
 }
 
 /** Inspect persisted code/device/credential/token state, including orphan rows hidden by APIs. */
@@ -136,24 +142,29 @@ describe("pairing completion atomicity", () => {
     expect(responses.map((response) => response.status).sort()).toEqual([201, 409]);
     const winner = responses.find((response) => response.status === 201);
     const loser = responses.find((response) => response.status === 409);
-    expect(await loser?.json()).toEqual({ error: "pairing code already used" });
-    const credential = await winner?.json<Credential>();
-    expect(credential).toBeDefined();
+    expect(loser?.body).toEqual({ error: "pairing code already used" });
+    if (!winner) throw new Error("no successful pairing");
+    const deviceId = winner.body.device_id;
+    const authToken = winner.body.device_auth_token;
+    if (typeof deviceId !== "string" || typeof authToken !== "string") {
+      throw new Error("missing enrolled device credentials");
+    }
+    const credential: Credential = { device_id: deviceId, device_auth_token: authToken };
     const state = await stored(accountId, pairing.code);
     expect(state.pairing).toEqual([{ used: 1 }]);
     expect(state.devices).toHaveLength(1);
-    expect(state.devices[0]).toMatchObject({ device_id: credential?.device_id });
+    expect(state.devices[0]).toMatchObject({ device_id: credential.device_id });
     expect(state.devices[0]?.auth_token_hash).toMatch(/^[A-Za-z0-9_-]{43}$/);
-    expect(state.devices[0]?.auth_token_hash).not.toBe(credential?.device_auth_token);
+    expect(state.devices[0]?.auth_token_hash).not.toBe(credential.device_auth_token);
     expect(state.tokens).toEqual(
       PUSH_TOKENS.map((push) => ({
-        device_id: credential?.device_id,
+        device_id: credential.device_id,
         ...push,
       })),
     );
     const inbox = await exports.default.fetch(
-      `https://relay.allw.test/${accountId}/devices/${credential?.device_id}/inbox`,
-      { headers: { Authorization: `Bearer ${credential?.device_auth_token}` } },
+      `https://relay.allw.test/${accountId}/devices/${credential.device_id}/inbox`,
+      { headers: { Authorization: `Bearer ${credential.device_auth_token}` } },
     );
     expect(inbox.status).toBe(200);
     expect((await complete(accountId, pairing)).status).toBe(409);
@@ -173,12 +184,62 @@ describe("pairing completion atomicity", () => {
     }
     const response = await pending;
     expect(response.status).toBe(410);
-    expect(await response.json()).toEqual({ error: "pairing code expired" });
+    expect(response.body).toEqual({ error: "pairing code expired" });
     expect(await stored(accountId, pairing.code)).toEqual({
       pairing: [{ used: 0 }],
       devices: [],
       tokens: [],
     });
+  });
+
+  it("preserves the inclusive expiry boundary", async () => {
+    const accountId = testAccount("atomic-expiry-boundary");
+    const pairing = await start(accountId);
+    await pinRelayClock(accountId, NOW + PAIRING_TTL_MS);
+    expect((await complete(accountId, pairing)).status).toBe(201);
+  });
+
+  it("serializes account-budget checks for different codes and leaves the loser retryable", async () => {
+    const accountId = testAccount("atomic-concurrent-budget");
+    const pairings = [await start(accountId), await start(accountId)];
+    const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(accountId));
+    await runInDurableObject(stub, (relay: AccountRelay) => {
+      relay["sql"].exec(
+        "INSERT INTO device (device_id, pubkey, created_at) VALUES ('existing', ?, ?)",
+        DEVICE_X25519_PUBKEY,
+        NOW,
+      );
+      for (let n = 0; n < 31; n++) {
+        relay["sql"].exec(
+          "INSERT INTO device_push_token (device_id, transport, token, created_at) VALUES ('existing', 'fcm', ?, ?)",
+          `existing-${String(n)}`,
+          NOW,
+        );
+      }
+    });
+    const barrier = holdDeviceHashes(pairings, 2);
+    const pending = pairings.map((pairing) =>
+      complete(accountId, pairing, {
+        push_tokens: [PUSH_TOKENS[0]],
+      }),
+    );
+    try {
+      await barrier.arrived;
+    } finally {
+      barrier.release();
+    }
+    const responses = await Promise.all(pending);
+    expect(responses.map((response) => response.status).sort()).toEqual([201, 409]);
+    const loserIndex = responses.findIndex((response) => response.status === 409);
+    expect(responses[loserIndex]?.body).toEqual({ error: "account push-token limit reached" });
+    const loser = pairings[loserIndex];
+    if (!loser) throw new Error("no losing pairing");
+    const state = await stored(accountId, loser.code);
+    expect(state.pairing).toEqual([{ used: 0 }]);
+    expect(state.devices).toHaveLength(2);
+    expect(state.tokens).toHaveLength(32);
+    expect((await complete(accountId, loser, { push_tokens: [] })).status).toBe(201);
+    expect((await stored(accountId, loser.code)).devices).toHaveLength(3);
   });
 
   it.each(["device", "device_push_token"])(
@@ -225,7 +286,7 @@ describe("pairing completion atomicity", () => {
       body: {
         push_tokens: Array.from({ length: 5 }, (_, n) => ({
           transport: "fcm",
-          token: `push-${n}`,
+          token: `push-${String(n)}`,
         })),
       },
       status: 400,
@@ -252,7 +313,7 @@ describe("pairing completion atomicity", () => {
       for (let n = 0; n < 32; n++) {
         relay["sql"].exec(
           "INSERT INTO device_push_token (device_id, transport, token, created_at) VALUES ('existing', 'fcm', ?, ?)",
-          `existing-${n}`,
+          `existing-${String(n)}`,
           NOW,
         );
       }

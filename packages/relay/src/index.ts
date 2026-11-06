@@ -1288,43 +1288,52 @@ export class AccountRelay extends DurableObject<Env> {
     if (!pairing) return this.#unknownIdentifierAuthFailure(request);
     const authFailure = await this.#authorizeStoredHash(request, pairing.auth_token_hash);
     if (authFailure) return authFailure;
-    if (pairing.used !== 0) return json({ error: "pairing code already used" }, 409);
-    if (this.now() > pairing.expires_at) {
-      return json({ error: "pairing code expired" }, 410);
-    }
-
     const deviceId = crypto.randomUUID();
     const deviceAuthToken = generateAuthToken();
     const deviceAuthTokenHash = await hashAuthToken(deviceAuthToken);
+
+    // Crypto awaits do not hold the Durable Object input gate. The authenticated snapshot above
+    // may now be used or expired, so re-read it after the last await. Consumption and the complete
+    // enrollment share a synchronous transaction: no contender can pass a stale check, and any
+    // failed insert rolls back the code, credential hash and every push token together.
+    const current = this.sql
+      .exec<PairingRow>(
+        `SELECT code, label, created_at, expires_at, used, auth_token_hash FROM pairing WHERE code = ?`,
+        code,
+      )
+      .one();
+    if (current.used !== 0) return json({ error: "pairing code already used" }, 409);
     const now = this.now();
-    // Checked after the last await so the count and the inserts below are one atomic step.
+    if (now > current.expires_at) return json({ error: "pairing code expired" }, 410);
     const pushTokenBudget = this.#pushTokenBudgetFailure(pushTokens.length);
     if (pushTokenBudget) return pushTokenBudget;
 
-    // Mark the code as used and insert the device record atomically.
-    // SECURITY: only the public key (pubkey) is stored — no private key ever touches this table.
-    this.sql.exec(`UPDATE pairing SET used = 1 WHERE code = ?`, code);
-    this.sql.exec(
-      `INSERT INTO device (device_id, pubkey, label, created_at, auth_token_hash)
-       VALUES (?, ?, ?, ?, ?)`,
-      deviceId,
-      pubkey,
-      // Fall back to the label supplied at /pairing/start so that field stays meaningful when
-      // /pairing/complete omits its own.
-      label ?? pairing.label ?? null,
-      now,
-      deviceAuthTokenHash,
-    );
-    for (const pushToken of pushTokens) {
+    this.ctx.storage.transactionSync(() => {
+      // The unused check and conditional write cannot interleave with another request. A refused
+      // completion reaches neither this write nor any enrollment insert, keeping the code usable.
+      this.sql.exec(`UPDATE pairing SET used = 1 WHERE code = ? AND used = 0`, code);
+      // SECURITY: only the public encryption key and credential hash are stored, never secrets.
       this.sql.exec(
-        `INSERT INTO device_push_token (device_id, transport, token, created_at)
-         VALUES (?, ?, ?, ?)`,
+        `INSERT INTO device (device_id, pubkey, label, created_at, auth_token_hash)
+         VALUES (?, ?, ?, ?, ?)`,
         deviceId,
-        pushToken.transport,
-        pushToken.token,
+        pubkey,
+        // A start-time label remains meaningful when the completing device supplies none.
+        label ?? current.label ?? null,
         now,
+        deviceAuthTokenHash,
       );
-    }
+      for (const pushToken of pushTokens) {
+        this.sql.exec(
+          `INSERT INTO device_push_token (device_id, transport, token, created_at)
+           VALUES (?, ?, ?, ?)`,
+          deviceId,
+          pushToken.transport,
+          pushToken.token,
+          now,
+        );
+      }
+    });
 
     return json({ device_id: deviceId, device_auth_token: deviceAuthToken }, 201);
   }
