@@ -200,11 +200,11 @@ interface VerifiedAccountStateRow extends Record<string, string | number | null 
   sequence: number;
 }
 
-// Public shape returned to callers — only public key material + metadata.
+/** Routing registry row; labels are included only for authenticated same-account devices. */
 interface DeviceRecord {
   device_id: string;
   pubkey: string;
-  label: string | null;
+  label?: string | null;
   created_at: number;
 }
 
@@ -984,7 +984,7 @@ export class AccountRelay extends DurableObject<Env> {
 
       // GET /devices
       case "deviceList":
-        return this.#handleDeviceList();
+        return this.#handleDeviceList(request);
 
       // POST /devices/{device_id}/revoke
       case "deviceRevoke":
@@ -1067,6 +1067,10 @@ export class AccountRelay extends DurableObject<Env> {
     return (await this.#authorizeStoredHash(request, null, source)) ?? authError(403);
   }
 
+  /**
+   * Authenticate an enrolled device of this account using only its HTTP bearer token. Pairing and
+   * request capabilities confer no device authority; deleting a device also revokes its credential.
+   */
   async #authorizedDeviceId(request: Request): Promise<string | Response> {
     const token = bearerToken(request, "header");
     if (token === null) return authError(401);
@@ -1390,21 +1394,28 @@ export class AccountRelay extends DurableObject<Env> {
    * GET /devices
    * Response: { devices: DeviceRecord[] }
    *
-   * Lists all enrolled devices for this account.
-   * Returns only public key material + metadata (zero-knowledge invariant holds).
+   * Public routing rows remain available for vouch's absence/key-mismatch refusals, never as
+   * recipient or certificate authority. Human labels are private to enrolled devices in this
+   * account. A presented header must validate; failed authentication never becomes anonymous
+   * success. HTTP query credentials cannot authenticate this optional-auth route.
    */
-  #handleDeviceList(): Response {
+  async #handleDeviceList(request: Request): Promise<Response> {
+    const includeLabels = request.headers.has("Authorization");
+    if (includeLabels) {
+      const authorizedDevice = await this.#authorizedDeviceId(request);
+      if (authorizedDevice instanceof Response) return authorizedDevice;
+    }
     const rows = [
       ...this.sql.exec<DeviceRow>(
         `SELECT device_id, pubkey, label, created_at FROM device ORDER BY created_at ASC`,
       ),
     ];
 
-    // SECURITY: the DeviceRecord shape contains ONLY public key material + routing metadata.
+    // Omit the member entirely, including null/empty labels; public row count/order stay intact.
     const devices: DeviceRecord[] = rows.map((r) => ({
       device_id: r.device_id,
       pubkey: r.pubkey,
-      label: r.label,
+      ...(includeLabels ? { label: r.label } : {}),
       created_at: r.created_at,
     }));
 
