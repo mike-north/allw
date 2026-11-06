@@ -38,8 +38,8 @@ Out of scope:
 6. Every ambiguous, expired, missing, unverifiable, or transport-failed path must block the gated action.
 7. Auditors must be able to reconstruct the primitive request, human decision, verification evidence and
    audit linkage without trusting the relay. External policy decision/state evidence belongs to the caller.
-8. The relay must never observe plaintext action data or structure. The current envelope contains
-   routing/lifecycle metadata and ciphertext only; proposed structure metadata remains held in #216.
+8. The relay never sees action data. Today's envelope contains routing/lifecycle metadata and ciphertext
+   only, with no action structure; proposed structure metadata remains held in #216 for an owner decision.
 
 ## Assets
 
@@ -255,9 +255,8 @@ decision. A summary may help readability, but it is not a substitute for renderi
 escaped `raw_lines`, hidden/control warning, or all material fields. Baseline/current probes reproduce
 byte-identical raw output, so risk removal does not change this pre-existing exposure. Passing direct-swiftc
 iOS and Swift/Kotlin binding tests does not establish native escaped/material-field display acceptance or
-success of the separate SwiftPM route. The ENG LEAD recommends separate native plumbing work; planning
-has not accepted that disposition. The requirements below remain requirements for native, not a claim
-that it currently complies. No native expansion is authorized by this change.
+success of the separate SwiftPM route. Native display wiring is deferred and tracked on #273 as an M7
+blocker. The requirements below remain requirements for native, not a claim that it currently complies.
 
 Rendering must also be **display-safe**: every context string is attacker-influenced, and a control or bidi
 character can make the screen show something other than the bytes the hash binds. A command whose JSON carries

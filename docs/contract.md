@@ -18,10 +18,10 @@ and [enrollment.md](./enrollment.md) (account/device enrollment, rotation, revoc
    key(s) — exactly the devices root-signed account state lists as active (`docs/enrollment.md` §Model,
    recipient selection rule), never the relay's device list, so the relay cannot add a reader. The verdict is
    signed by a device key.
-2. **Relay data boundary** — the implemented request envelope exposes only routing/lifecycle metadata
-   (`v`, `id`, `created_at`, `expires_at`, `approver`) and opaque `context_ciphertext`. The relay never
-   sees program names, surface, MCP names, session labels, arguments or plaintext action data. Structure
-   metadata/privacy tiers are unimplemented proposals; #216 needs reconsideration after parser removal.
+2. **Relay data boundary** — the relay never sees action data. Today's implemented request envelope
+   exposes only routing/lifecycle metadata (`v`, `id`, `created_at`, `expires_at`, `approver`) and opaque
+   `context_ciphertext`; it carries no action structure. Structure metadata/privacy tiers remain
+   unimplemented proposals held in #216 for an owner decision after parser removal.
 3. **Verifiable verdict** — a signed artifact any party can verify _without trusting the relay_, cryptographically
    **bound to the exact request** (no replay, no swap).
 4. **WYSIWYS (what you see is what you sign)** — the verdict binds to a single `request_hash` over the _entire_
