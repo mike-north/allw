@@ -46,14 +46,15 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   HTTP route takes the token **only** from this header. The `?auth=<token>` query form is accepted
   only on the two **WebSocket** upgrade routes (`…/devices/{device_id}/connect` and
   `…/requests/{request_id}/wait`), because browsers can't set headers on a WebSocket; elsewhere a
-  query token alone is **401** (#303). A token in a URL ends up in access, proxy and CDN logs, browser
+  query token alone cannot authenticate (#303): guarded routes return **401**; optional-auth
+  `GET /devices` returns only anonymous routing rows. A token in a URL ends up in access, proxy and CDN logs, browser
   history and `Referer`, so it is kept out of URLs everywhere else. When an `Authorization` header is
   present it is the only credential considered, even on a WebSocket route: a wrong one is **403**, and
   a malformed one or another scheme is **401**, whatever the query says. An empty or whitespace-only
   `Authorization` header is dropped by the Workers runtime before the relay sees it, so it counts as
   absent: on a WebSocket upgrade route, the `?auth=` token then applies.
   The relay stores only `SHA-256(token)`; the plaintext is returned **once** at issuance — cache it.
-  Missing token ⇒ **401**; wrong/expired/cross-scope token ⇒ **403**.
+  On guarded routes, missing token ⇒ **401**; wrong/expired/cross-scope token ⇒ **403**.
 - **No existence answers before auth (#357).** A request id and a pairing code are each guarded by
   their own token, whose hash lives in the identifier's row. An identifier with no row answers exactly
   as a wrong token does: **401** `{"error":"authorization required"}` without a bearer token, **403**
@@ -83,7 +84,7 @@ WebSocket endpoints use `ws://` / `wss://` matching the base scheme.
   | ----------------------- | ----------------------------- | ------------------------------------------------------------------- | ------------------------- |
   | `pairing_auth_token`    | `POST /pairing/start`         | `POST /pairing/complete`                                            | 10 min (`PAIRING_TTL_MS`) |
   | `enrollment_auth_token` | `POST /enrollments/start`     | **specified, not implemented (#199)** — the enrollment courier (§3) | 10 min (specified)        |
-  | `device_auth_token`     | `POST /pairing/complete`      | all `devices/{id}/…`, `actors`                                      | until revoked             |
+  | `device_auth_token`     | `POST /pairing/complete`      | all `devices/{id}/…`, `actors`, labels on `GET /devices`            | until revoked             |
   | `request_auth_token`    | `POST /requests` (integrator) | `requests/{id}` polling/wait, `requests/{id}/retract`               | 7 days post-terminal      |
 
 - **CORS (browser clients).** A browser page may call the relay only from an allowlisted origin
@@ -373,9 +374,19 @@ no-op. Auth, in the revoke order: 401 (no bearer), 403 (not a device token, incl
 device's own), 404 (device not enrolled or revoked), 403 (another device's token). Revoking a device
 deletes its push tokens.
 
-**`GET /{acct}/devices`** — no auth. → **200**
-`{ devices: [{ device_id, pubkey, label|null, created_at }] }`. No secrets / no push tokens. Routing
-information only: it is not root-vouched, and integrators never choose encryption recipients from it (#243).
+**`GET /{acct}/devices`** — optional Bearer `device_auth_token`. Without an Authorization header,
+→ **200** `{ devices: [{ device_id, pubkey, created_at }] }`: the `label` member is omitted entirely,
+including stored null/empty labels. With a validated enrolled-device token from this account, the
+response is unchanged: `{ devices: [{ device_id, pubkey, label: string|null, created_at }] }`.
+A presented malformed header or another scheme returns **401**; an unrecognized, wrong-account,
+wrong-scope (pairing/request), or revoked token returns **403**, never anonymous success.
+A query credential is ignored and cannot expose labels, including as fallback for a refused header.
+Rows retain their ascending creation order, public ids/keys/timestamps and count; an unknown account
+still returns **200** `{ devices: [] }` anonymously. No secrets / no push tokens. Routing information
+only: it is not root-vouched, and integrators never choose encryption recipients from it (#243).
+`vouch` still reads this registry anonymously to refuse absent ids or mismatched encryption keys;
+agreement is never trust. This protects device labels, not all registry metadata: device identities
+and counts remain public, and `GET /actors` still exposes actor labels (§Actors).
 
 ### Actors (requester attestation) — Bearer `device_auth_token` for POST
 
