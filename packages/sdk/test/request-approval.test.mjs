@@ -35,6 +35,7 @@
  */
 
 import { test } from "node:test";
+import { RelayClient } from "../dist/relay.js";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -199,7 +200,7 @@ function signVerdict(
   approver,
   req,
   capturedEnvelope,
-  { decision = "approved", note = undefined, nonceByte = 3 } = {},
+  { decision = "approved", note = undefined, nonceByte = 3, decidedAt = NOW_MS } = {},
 ) {
   const requestHash = wasm.compute_request_hash(
     JSON.stringify(wireContext(req)),
@@ -210,7 +211,7 @@ function signVerdict(
     request_id: capturedEnvelope.id,
     request_hash: requestHash,
     decision,
-    decided_at: NOW_MS, // inside [created_at, expires_at]
+    decided_at: decidedAt, // inside [created_at, expires_at]
     approver: { account_id: approver.accountId ?? ACCOUNT_ID, device_id: approver.deviceId },
     ...(note === undefined ? {} : { note }),
   };
@@ -2451,3 +2452,238 @@ test("(S20 export) empty account state requires and enforces expectedAccountId",
     /account/i,
   );
 });
+
+/**
+ * Credential lifetime is local request lifetime, not relay-reported finality. Observe the real
+ * client's private map only in tests: outbound auth proves usability, while this narrow reference
+ * proves completed calls do not leave credentials reachable from a long-lived client. No debug API.
+ * @see ../../../docs/relay-api.md §3 Requests; §4 integrator finality
+ * @see ../../../docs/contract.md §Cancellation; §Verification checklist
+ */
+function credentialFixture(t, approver, transport) {
+  const clock = finalityClock();
+  const rows = new Map();
+  const sockets = new Map();
+  let mode = "pending";
+  let retained;
+  let nonce = 0;
+  const original = RelayClient.prototype.submit;
+  t.mock.method(RelayClient.prototype, "submit", async function (envelope) {
+    retained = this.requestAuthTokens;
+    return original.call(this, envelope);
+  });
+  const readFailure = (kind) => ({
+    ok: true,
+    status: 200,
+    json: async () => {
+      throw kind === "json" ? new SyntaxError("bad JSON") : new TypeError("read failed");
+    },
+  });
+  const fetchImpl = async (url, init) => {
+    const path = new URL(url).pathname;
+    if (init.method === "POST" && path.endsWith("/requests")) {
+      const env = JSON.parse(init.body);
+      const row = { env, mode, token: `credential-${env.id}`, polls: 0, retracts: 0 };
+      rows.set(env.id, row);
+      if (mode === "submit-http") return jsonResponse({}, 413);
+      if (mode === "submit-protocol") return jsonResponse({});
+      if (mode === "submit-json") return readFailure("json");
+      if (mode === "submit-read") return readFailure("read");
+      if (mode === "submit-network") throw new TypeError("submit failed");
+      if (mode === "submit-hung") return new Promise(() => {});
+      return jsonResponse({ request_auth_token: row.token }, 202);
+    }
+    const id = path.split("/requests/")[1].split("/")[0];
+    const row = rows.get(id);
+    assert.ok(row, "transport cannot use an unrelated request id");
+    assert.equal(init.headers?.Authorization, `Bearer ${row.token}`, "request-specific auth");
+    if (path.endsWith("/retract")) {
+      row.retracts += 1;
+      if (row.mode === "abort-409") return jsonResponse({}, 409);
+      if (row.mode === "abort-network") throw new TypeError("retract failed");
+      if (row.mode === "abort-hung") return new Promise(() => {});
+      return jsonResponse({ status: "retracted" });
+    }
+    row.polls += 1;
+    if (row.status) return jsonResponse({ status: row.status, verdict: row.verdict });
+    if (row.mode === "poll-http") return jsonResponse({}, 403);
+    if (row.mode === "poll-protocol") return jsonResponse({});
+    if (row.mode === "poll-json") return readFailure("json");
+    if (row.mode === "poll-read") return readFailure("read");
+    if (row.mode === "poll-network") throw new TypeError("poll failed");
+    if (row.mode === "poll-hung") return new Promise(() => {});
+    if (row.mode === "invalid")
+      return jsonResponse({ status: "resolved", verdict: { sig: "junk" } });
+    return jsonResponse({ status: "pending" });
+  };
+  const ws = (url) => {
+    const parsed = new URL(url);
+    const id = parsed.pathname.split("/requests/")[1].split("/")[0];
+    assert.equal(parsed.searchParams.get("auth"), rows.get(id).token, "socket request auth");
+    const socket = new ControllableFakeWebSocket(url);
+    sockets.set(id, socket);
+    if (rows.get(id).mode.startsWith("poll-"))
+      queueMicrotask(() => {
+        for (const listener of socket.listeners.close) listener();
+      });
+    return socket;
+  };
+  const client = pollClient(
+    approver,
+    { fetchImpl },
+    {
+      nowImpl: clock.now,
+      scheduleImpl: clock.schedule,
+      fetchTimeoutMs: 100,
+      ...(transport === "WS" ? { webSocketFactory: ws } : {}),
+    },
+  );
+  return {
+    clock,
+    rows,
+    sockets,
+    retained: () => retained,
+    async start(nextMode = "pending") {
+      mode = nextMode;
+      const controller = new AbortController();
+      // Attach both observers immediately, including for pre-wait submit rejections.
+      const result = client.requestApproval(sampleRequest({ signal: controller.signal })).then(
+        (value) => ({ value }),
+        (error) => ({ error }),
+      );
+      await clock.advance();
+      const row = [...rows.values()].at(-1);
+      return { row, controller, result };
+    },
+    async deliver(row, decision) {
+      const verdict = signVerdict(fixtureWasm, approver, sampleRequest(), row.env, {
+        decision,
+        nonceByte: ++nonce,
+        decidedAt: row.env.created_at,
+      });
+      if (transport === "WS") sockets.get(row.env.id).emit({ type: "verdict", verdict });
+      else {
+        row.status = "resolved";
+        row.verdict = verdict;
+        await clock.advance(5);
+      }
+      await clock.advance();
+    },
+  };
+}
+
+for (const transport of ["poll", "WS"]) {
+  test(`(credentials) ${transport}: sequential settlement releases every credential`, async (t) => {
+    const approver = makeApprover(fixtureWasm);
+    const f = credentialFixture(t, approver, transport);
+    // Reuse one client across successful, failed and cancelled calls; the bound must stay zero
+    // after each settlement, rather than merely shrinking at client disposal.
+    for (let repetition = 0; repetition < 3; repetition += 1) {
+      for (const mode of [
+        "approved",
+        "denied",
+        "aborted",
+        "expired",
+        "relay-expired",
+        "relay-retracted",
+        "deadline",
+        "invalid",
+        "abort",
+        "abort-409",
+        "abort-network",
+        "abort-hung",
+        "submit-http",
+        "submit-protocol",
+        "submit-json",
+        "submit-read",
+        "submit-network",
+        "submit-hung",
+        "poll-http",
+        "poll-protocol",
+        "poll-json",
+        "poll-read",
+        "poll-network",
+        "poll-hung",
+      ]) {
+        const { row, controller, result } = await f.start(mode);
+        const id = row.env.id;
+        if (!mode.startsWith("submit-")) {
+          // Errors can settle on the first poll; all other waits must still own their token.
+          if (!mode.startsWith("poll-")) assert.deepEqual([...f.retained().keys()], [id], mode);
+          if (["approved", "denied", "aborted", "expired"].includes(mode))
+            await f.deliver(row, mode);
+          else if (mode.startsWith("relay-")) {
+            const status = mode.slice(6);
+            if (transport === "WS") f.sockets.get(id).emit({ type: status });
+            else {
+              row.status = status;
+              await f.clock.advance(5);
+            }
+          } else if (mode.startsWith("abort")) {
+            controller.abort();
+            await f.clock.advance();
+            assert.equal(row.retracts, 1, "abort uses the credential before release");
+          } else if (mode === "invalid") {
+            if (transport === "WS")
+              f.sockets.get(id).emit({ type: "verdict", verdict: { sig: "junk" } });
+            await f.clock.advance(5);
+            assert.deepEqual([...f.retained().keys()], [id], "unverifiable rows are not terminal");
+          }
+        }
+        await f.clock.advance();
+        if (["deadline", "invalid", "abort-hung", "submit-hung", "poll-hung"].includes(mode)) {
+          await f.clock.advance(TIMEOUT_MS);
+        }
+        const settled = await result;
+        if (["submit-http", "submit-protocol", "submit-json"].includes(mode)) {
+          assert.equal(settled.error?.name, "RelayError", mode);
+        } else if (["abort", "relay-retracted"].includes(mode)) {
+          assert.ok(settled.error instanceof RequestRetractedError, mode);
+        } else {
+          assert.equal(settled.error, undefined, mode);
+          const expected = ["approved", "denied", "aborted"].includes(mode) ? mode : "expired";
+          assert.equal(settled.value.decision, expected, mode);
+          assert.equal(await settled.value.verify(approver.accountRootPub), mode === "approved");
+          assert.equal(await settled.value.verify(approver.accountRootPub), mode === "approved");
+        }
+        assert.equal(f.retained().size, 0, `${mode}: completed calls retain no credentials`);
+        if (transport === "WS" && f.sockets.has(id)) assert.equal(f.sockets.get(id).closed, true);
+      }
+    }
+  });
+
+  test(`(credentials) ${transport}: cleanup is isolated from another active request`, async (t) => {
+    const approver = makeApprover(fixtureWasm);
+    const f = credentialFixture(t, approver, transport);
+    const active = await f.start("invalid");
+    if (transport === "WS")
+      f.sockets.get(active.row.env.id).emit({ type: "verdict", verdict: { sig: "junk" } });
+    for (let i = 0; i < 12; i += 1) {
+      const other = await f.start();
+      assert.deepEqual(
+        new Set(f.retained().keys()),
+        new Set([active.row.env.id, other.row.env.id]),
+      );
+      await f.deliver(other.row, "approved");
+      const { value } = await other.result;
+      assert.equal(value.decision, "approved");
+      assert.equal(await value.verify(approver.accountRootPub), true);
+      assert.equal(
+        await value.verify(approver.accountRootPub),
+        true,
+        "same artifact is idempotent",
+      );
+      assert.deepEqual(
+        [...f.retained().keys()],
+        [active.row.env.id],
+        "cleanup cannot cross request ids",
+      );
+      await f.clock.advance(5);
+    }
+    active.controller.abort();
+    await f.clock.advance();
+    assert.ok((await active.result).error instanceof RequestRetractedError);
+    assert.equal(active.row.retracts, 1, "surviving request still authenticates its retract");
+    assert.equal(f.retained().size, 0);
+  });
+}
