@@ -88,10 +88,11 @@ test("opt-in CLI writes only to XDG state and omits hostile reason text and fabr
   assert.deepEqual(readdirSync(join(f.cwd, ".codex")), []);
 });
 
-// Imported dynamically so the process-boundary tests also provide pre-implementation red evidence.
+/** Keep process-boundary checks independent of the diagnostic helper module. */
 async function logger() {
   return import("../dist/lib/deny-log.js");
 }
+/** Build a deny whose freeform text must never enter private diagnostics. */
 async function output(reason = SECRET, id) {
   const { denyOutput } = await import("../dist/lib/codex-io.js");
   return denyOutput(reason, "no-approval", id);
