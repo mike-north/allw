@@ -2,7 +2,7 @@
  * WYSIWYS terminal rendering (`docs/contract.md` §Invariant #3 — what you see is what you sign).
  *
  * The human must be shown the **exact** action they are signing over, and the rendered fields are
- * precisely the ones bound into `request_hash` (the full `ActionRecord` syntactic substrate,
+ * precisely the ones bound into `request_hash` (the full `ActionRecord` facts substrate,
  * `summary`, `actor`, optional `reversible`, `expires_at`, plus the `request_hash` itself). When a
  * number-match challenge is required, the code derived from that `request_hash` is shown too; the
  * human must type it back before an approval can be signed.
@@ -121,11 +121,11 @@ export function reconstructCommand(parts: CommandParts): string | undefined {
  * No divergence exists without both caller-supplied forms. The core hashes the original bytes.
  */
 export function rawDivergesFromArgv(action: ActionRecord): boolean {
-  const syntactic = action.syntactic;
-  if (!isRecord(syntactic)) return false;
-  const raw = readString(syntactic, "raw");
+  const facts = action.facts;
+  if (!isRecord(facts)) return false;
+  const raw = readString(facts, "raw");
   if (raw === undefined) return false;
-  const argv = readStringArray(syntactic, "argv");
+  const argv = readStringArray(facts, "argv");
   return argv !== undefined && argv.length > 0 && renderArgv(argv) !== raw;
 }
 
@@ -177,7 +177,7 @@ export function toolIdentity(display: DisplayModel): string | undefined {
   const isToolSurface =
     display.surface === "mcp_tool_call" || display.surface === "agent_tool_call";
   if (!isToolSurface) return undefined;
-  return joinToolIdentity(display.syntactic.server, display.syntactic.tool);
+  return joinToolIdentity(display.facts.server, display.facts.tool);
 }
 
 /**
@@ -207,7 +207,7 @@ export function toolIdentity(display: DisplayModel): string | undefined {
  * hash.
  */
 export function renderActionHeadline(display: DisplayModel): string {
-  const s = display.syntactic;
+  const s = display.facts;
   const identity = toolIdentity(display);
   if (identity !== undefined) return identity;
   if (display.surface === "file_edit") {
@@ -246,7 +246,7 @@ export function renderActionHeadline(display: DisplayModel): string {
  * appear when present, regardless of which headline path ran. All are display-only — never the hash.
  */
 function substrateDetailLines(action: ActionRecord, display: DisplayModel): string[] {
-  const s = display.syntactic;
+  const s = display.facts;
   const lines: string[] = [];
 
   // Anti-divergence: when `raw` is shown as the headline but the hash-bound caller `argv`
@@ -312,11 +312,11 @@ function substrateDetailLines(action: ActionRecord, display: DisplayModel): stri
  * content is printed separately ({@link substrateDetailLines}), so its headline stays one line.
  */
 function actionLines(display: DisplayModel): string[] {
-  const lines = display.syntactic.raw_lines;
+  const lines = display.facts.raw_lines;
   const identity = toolIdentity(display);
   if (identity !== undefined) {
     // A tool call heads with its identity; its `raw` is the caller's description, labelled so.
-    if (display.syntactic.raw === undefined || !lines) return [`  Action:     ${identity}`];
+    if (display.facts.raw === undefined || !lines) return [`  Action:     ${identity}`];
     const [first = "", ...rest] = lines;
     return [
       `  Action:     ${identity}`,
@@ -324,7 +324,7 @@ function actionLines(display: DisplayModel): string[] {
       ...rest.map((line) => `             │ ${line}`),
     ];
   }
-  if (display.surface === "file_edit" || display.syntactic.raw === undefined || !lines) {
+  if (display.surface === "file_edit" || display.facts.raw === undefined || !lines) {
     return [`  Action:     ${renderActionHeadline(display)}`];
   }
   const [first = "", ...rest] = lines;
@@ -474,8 +474,8 @@ export function renderRequest(
   // own warning: the block's `Argv:` row can sit far above, behind agent-controlled params.
   const toolHeadline = toolIdentity(display) !== undefined;
   const diverges = !toolHeadline && rawDivergesFromArgv(context.action);
-  const decidingOn = diverges ? reconstructCommand(display.syntactic) : undefined;
-  const toolCommand = toolHeadline ? reconstructCommand(display.syntactic) : undefined;
+  const decidingOn = diverges ? reconstructCommand(display.facts) : undefined;
+  const toolCommand = toolHeadline ? reconstructCommand(display.facts) : undefined;
   lines.push(`  Deciding on: ${decidingOn ?? renderActionHeadline(display)}`);
   if (toolCommand !== undefined) {
     lines.push(`  Argv:       ${toolCommand}`);

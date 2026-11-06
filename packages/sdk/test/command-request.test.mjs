@@ -14,7 +14,7 @@
  *   pnpm run build:wasm                # from repo root
  *   pnpm --filter @allw/sdk test       # tsc → dist, then node --test
  *
- * @see ../../../docs/action-record.md §ActionRecord (the syntactic substrate; `surface: "command"`)
+ * @see ../../../docs/action-record.md §ActionRecord (the facts substrate; `surface: "command"`)
  * @see ../../../docs/contract.md §Invariants (fail-closed; never returns "allow")
  * @see ../../../crates/allw-wasm/src/lib.rs (`action_from_argv`, `action_from_command`)
  */
@@ -52,7 +52,7 @@ function camel(coreJson) {
   return {
     recordSchemaVersion: core.record_schema_version,
     surface: core.surface,
-    syntactic: core.syntactic,
+    facts: core.facts,
   };
 }
 
@@ -76,12 +76,12 @@ test("commandAction returns exactly the core's action_from_argv record", async (
   const action = await commandAction(REFUND_ARGV);
   assert.deepEqual(action, camel(core.action_from_argv(JSON.stringify(REFUND_ARGV), null, null)));
 
-  // policy-seam §ActionRecord: a command record is `surface: "command"` with the syntactic
+  // policy-seam §ActionRecord: a command record is `surface: "command"` with the facts
   // substrate policy matches on (bin / argv / flags / positionals).
   assert.equal(action.surface, "command");
-  assert.equal(action.syntactic.bin, undefined);
-  assert.deepEqual(action.syntactic.argv, REFUND_ARGV);
-  assert.equal(action.syntactic.flags, undefined);
+  assert.equal(action.facts.bin, undefined);
+  assert.deepEqual(action.facts.argv, REFUND_ARGV);
+  assert.equal(action.facts.flags, undefined);
 });
 
 test("commandAction binds cwd and raw exactly as the core does", async () => {
@@ -89,11 +89,11 @@ test("commandAction binds cwd and raw exactly as the core does", async () => {
   const raw = "stripe refunds create --charge $CHARGE_ID";
   const action = await commandAction(REFUND_ARGV, { cwd: CWD, raw });
   assert.deepEqual(action, camel(core.action_from_argv(JSON.stringify(REFUND_ARGV), raw, CWD)));
-  assert.equal(action.syntactic.cwd, CWD);
+  assert.equal(action.facts.cwd, CWD);
   // `raw` is recorded verbatim and is the only source of env_refs; argv is never re-tokenized.
-  assert.equal(action.syntactic.raw, raw);
-  assert.equal(action.syntactic.env_refs, undefined);
-  assert.deepEqual(action.syntactic.argv, REFUND_ARGV);
+  assert.equal(action.facts.raw, raw);
+  assert.equal(action.facts.env_refs, undefined);
+  assert.deepEqual(action.facts.argv, REFUND_ARGV);
 });
 
 test("commandActionFromLine returns exactly the core's action_from_command record", async () => {
@@ -102,8 +102,8 @@ test("commandActionFromLine returns exactly the core's action_from_command recor
   const action = await commandActionFromLine(line, { cwd: CWD });
   assert.deepEqual(action, camel(core.action_from_command(line, CWD)));
   assert.equal(action.surface, "command");
-  assert.equal(action.syntactic.argv, undefined);
-  assert.equal(action.syntactic.raw, line);
+  assert.equal(action.facts.argv, undefined);
+  assert.equal(action.facts.raw, line);
 });
 
 // ── commandRequest defaults ──────────────────────────────────────────────────────────────────
@@ -117,7 +117,7 @@ test("commandRequest fills the documented defaults around the core-built action"
     req.action,
     camel(core.action_from_argv(JSON.stringify(REFUND_ARGV), null, process.cwd())),
   );
-  assert.equal(req.action.syntactic.cwd, process.cwd());
+  assert.equal(req.action.facts.cwd, process.cwd());
   assert.equal(req.summary, "Refund charge ch_123");
   // #231: top-level risk is taken from the core-built action, never stated twice.
 
@@ -152,8 +152,8 @@ test("commandRequest honors overrides and passes optional fields through", async
   assert.equal(req.signal, signal);
   assert.deepEqual(req.constraints, constraints);
   assert.deepEqual(req.chain, ["gate-1"]);
-  assert.equal(req.action.syntactic.cwd, CWD);
-  assert.equal("raw" in req.action.syntactic, false, "commandRequest never sets raw on argv");
+  assert.equal(req.action.facts.cwd, CWD);
+  assert.equal("raw" in req.action.facts, false, "commandRequest never sets raw on argv");
 });
 
 test("commandRequest with cwd: null leaves the record unbound to any directory", async () => {
@@ -163,7 +163,7 @@ test("commandRequest with cwd: null leaves the record unbound to any directory",
     req.action,
     camel(core.action_from_argv(JSON.stringify(REFUND_ARGV), null, null)),
   );
-  assert.equal("cwd" in req.action.syntactic, false);
+  assert.equal("cwd" in req.action.facts, false);
 });
 
 test("commandRequest accepts a commandLine and builds it with action_from_command", async () => {
@@ -332,14 +332,14 @@ test("commandRequest rejects a non-boolean reversible", async () => {
 const GOOD_CORE = {
   record_schema_version: 3,
   surface: "command",
-  syntactic: { argv: ["ls"] },
+  facts: { argv: ["ls"] },
 };
 
 test("core record translation accepts a v1 command record", () => {
   assert.deepEqual(actionRecordFromCoreJson(JSON.stringify(GOOD_CORE)), {
     recordSchemaVersion: 3,
     surface: "command",
-    syntactic: { argv: ["ls"] },
+    facts: { argv: ["ls"] },
   });
 });
 
@@ -353,7 +353,7 @@ for (const [name, json, pattern] of [
   ],
   [
     "a missing key",
-    JSON.stringify({ surface: "command", syntactic: {}, risk: "low" }),
+    JSON.stringify({ surface: "command", facts: {}, risk: "low" }),
     /unexpected keys/,
   ],
   [
@@ -371,7 +371,7 @@ for (const [name, json, pattern] of [
     JSON.stringify({ ...GOOD_CORE, removed: true }),
     /unexpected keys/,
   ],
-  ["a non-object syntactic", JSON.stringify({ ...GOOD_CORE, syntactic: null }), /no syntactic/],
+  ["a non-object facts", JSON.stringify({ ...GOOD_CORE, facts: null }), /no facts/],
 ]) {
   test(`core record translation rejects ${name}`, () => {
     assert.throws(
@@ -383,7 +383,7 @@ for (const [name, json, pattern] of [
 }
 
 /** @see docs/contract.md — SDK builders require the exact current core output shape. */
-for (const syntactic of [
+for (const facts of [
   {},
   { raw: " " },
   { raw: [] },
@@ -393,11 +393,11 @@ for (const syntactic of [
   { argv: "echo" },
   { argv: [4] },
 ]) {
-  test(`core output with malformed caller facts is refused: ${JSON.stringify(syntactic)}`, () => {
+  test(`core output with malformed caller facts is refused: ${JSON.stringify(facts)}`, () => {
     assert.throws(
       () =>
         actionRecordFromCoreJson(
-          JSON.stringify({ record_schema_version: 3, surface: "command", syntactic }),
+          JSON.stringify({ record_schema_version: 3, surface: "command", facts }),
         ),
       (e) => e instanceof CommandActionError && e.reason === "core_record_invalid",
     );

@@ -159,7 +159,7 @@ test("approve: the script's command is shown exactly and the script proceeds", a
       h.wasm.action_from_argv(JSON.stringify(SCRIPT_ARGV), null, realpathSync(packageRoot)),
     ),
   );
-  assert.equal(context.action.syntactic.cwd, realpathSync(packageRoot));
+  assert.equal(context.action.facts.cwd, realpathSync(packageRoot));
   assert.equal(context.action.surface, "command", "no new surface: a script action is a command");
   assert.equal(context.summary, `Refund charge ${CHARGE_ID}`);
   // commandRequest defaults (#231): script actor on this machine, irreversible, core-derived risk.

@@ -36,7 +36,7 @@ const CONTEXT = {
   action: {
     record_schema_version: 3,
     surface: "command",
-    syntactic: { argv: ["rm", "-rf", "build"] },
+    facts: { argv: ["rm", "-rf", "build"] },
   },
   summary: "delete the build directory",
   actor: { id: "machine:ci", kind: "claude-code" },

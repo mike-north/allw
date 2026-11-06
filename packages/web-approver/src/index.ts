@@ -131,7 +131,7 @@ export interface ApprovalActor {
 }
 
 /**
- * The action's complete syntactic substrate as the core displays it (Rust
+ * The action's complete facts substrate as the core displays it (Rust
  * `allw_core::DisplaySubstrate`, from `display_model`, #246): every field the core binds into
  * `request_hash`, each already escaped (`\x1b`, `⟨U+202E⟩`, …). Renderers lay these out but never
  * escape anything themselves, and must never be handed raw decrypted strings.

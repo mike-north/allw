@@ -71,7 +71,7 @@ function context(overrides = {}) {
     action: {
       record_schema_version: 3,
       surface: "command",
-      syntactic: { raw: SPOOF },
+      facts: { raw: SPOOF },
     },
     summary: "check git status",
     actor: { id: "machine:ci", kind: "claude-code" },
@@ -170,7 +170,7 @@ test("hidden-character warning appears above the action when the core flags the 
 
 test("a clean request shows no hidden-character warning", async () => {
   const clean = context();
-  clean.action = { ...clean.action, syntactic: { raw: "git status" } };
+  clean.action = { ...clean.action, facts: { raw: "git status" } };
   const { rendered } = await render(clean);
   assert.ok(!rendered.includes(HIDDEN_CHARS_WARNING));
   assert.match(rendered, /Action:\s+git status$/m);
@@ -180,7 +180,7 @@ test("bidi override in cwd and zero-width space in actor id are escaped", async 
   const ctx = context();
   ctx.action = {
     ...ctx.action,
-    syntactic: { raw: "ls", cwd: "/home/dev/\u202eppa" },
+    facts: { raw: "ls", cwd: "/home/dev/\u202eppa" },
   };
   ctx.actor = { id: "machine:ci\u200b", kind: "claude-code" };
   const { rendered } = await render(ctx);
@@ -198,7 +198,7 @@ test("summary, argv, flags, chain and MCP params are escaped", async () => {
   ctx.action = {
     ...ctx.action,
     surface: "mcp_tool_call",
-    syntactic: {
+    facts: {
       server: "fs",
       tool: "write\u2066",
       params: { path: "/tmp/\u202etxt.exe" },
@@ -228,7 +228,7 @@ test("divergence is decided on raw bytes: literal '\\x1b' text never masks a rea
   const ctx = context();
   ctx.action = {
     ...ctx.action,
-    syntactic: { raw: "echo \\x1b", argv: ["echo", ESC] },
+    facts: { raw: "echo \\x1b", argv: ["echo", ESC] },
   };
   const { rendered } = await render(ctx);
   assert.match(rendered, /^ {2}Argv:/m, "divergent argv is surfaced");
@@ -240,7 +240,7 @@ test("file-edit content keeps one line per LF and marks a CRLF ending without wa
   ctx.action = {
     ...ctx.action,
     surface: "file_edit",
-    syntactic: {
+    facts: {
       operation: "patch",
       paths: ["src/a.ts"],
       raw: `-old${CR}\n+new`,
@@ -261,7 +261,7 @@ test("a Go file edit (TABs, CRLF) renders its indentation visibly and does not w
   ctx.action = {
     ...ctx.action,
     surface: "file_edit",
-    syntactic: {
+    facts: {
       operation: "write",
       paths: ["main.go"],
       raw: 'func main() {\n\tfmt.Println("hi")\n}',
@@ -279,7 +279,7 @@ test("a heredoc commit command prints as continuation lines and does not warn", 
   const ctx = context({ summary: "commit the fix" });
   ctx.action = {
     ...ctx.action,
-    syntactic: { raw: "git commit -m \"$(cat <<'EOF'\nfix: a thing\n\n\tdetail\nEOF\n)\"" },
+    facts: { raw: "git commit -m \"$(cat <<'EOF'\nfix: a thing\n\n\tdetail\nEOF\n)\"" },
   };
   const { rendered } = await render(ctx);
   const lines = rendered.split("\n");
@@ -297,7 +297,7 @@ test("a heredoc commit command prints as continuation lines and does not warn", 
 
 test("an ESC/CR spoof on a later line of a multi-line command still warns", async () => {
   const ctx = context();
-  ctx.action = { ...ctx.action, syntactic: { raw: `echo ok\n${SPOOF}` } };
+  ctx.action = { ...ctx.action, facts: { raw: `echo ok\n${SPOOF}` } };
   const { rendered } = await render(ctx);
   assert.ok(rendered.includes(`            │ ${SPOOF_ESCAPED}`));
   assert.doesNotMatch(rendered, RAW_CONTROL);
@@ -308,7 +308,7 @@ test("the escaped headline and the warning are the last lines before the prompt"
   const ctx = context();
   // A long multi-line command: the header warning and the Action line scroll far above.
   const filler = Array.from({ length: 120 }, (_, i) => `echo line ${String(i)}`).join("\n");
-  ctx.action = { ...ctx.action, syntactic: { raw: `${SPOOF}\n${filler}` } };
+  ctx.action = { ...ctx.action, facts: { raw: `${SPOOF}\n${filler}` } };
   const { rendered } = await render(ctx);
   const lines = rendered.split("\n");
   assert.equal(lines.at(-1), HIDDEN_CHARS_WARNING);
@@ -323,7 +323,7 @@ test("a raw/argv divergence is shown at the decision point, not just the benign 
   const ctx = context({ summary: "check status" });
   ctx.action = {
     ...ctx.action,
-    syntactic: {
+    facts: {
       raw: "git status",
       argv: ["rm", "-rf", "~"],
       cwd: `/home/me/project${" ".repeat(20000)}`,
@@ -345,7 +345,7 @@ test("without a divergence, the decision line is the raw headline and no diverge
   const ctx = context();
   ctx.action = {
     ...ctx.action,
-    syntactic: { raw: "git status", argv: ["git", "status"] },
+    facts: { raw: "git status", argv: ["git", "status"] },
   };
   const { rendered } = await render(ctx);
   assert.equal(rendered.split("\n").at(-1), "  Deciding on: git status");
@@ -396,7 +396,7 @@ test("caller argv whose quoted form differs from raw still warns (#316 B1 negati
   const ctx = context();
   ctx.action = {
     ...ctx.action,
-    syntactic: { raw: String.raw`Remove-Item C:\a b`, argv: ["Remove-Item", String.raw`C:\a b`] },
+    facts: { raw: String.raw`Remove-Item C:\a b`, argv: ["Remove-Item", String.raw`C:\a b`] },
   };
   const { rendered } = await render(ctx);
   assert.equal(rendered.split("\n").at(-1), RAW_ARGV_DIVERGENCE_WARNING);
@@ -407,7 +407,7 @@ test("an argv split on a Unicode space (U+00A0) inside a raw word still warns", 
   const ctx = context();
   ctx.action = {
     ...ctx.action,
-    syntactic: { raw: "rm\u00a0-rf /", argv: ["rm", "-rf", "/"] },
+    facts: { raw: "rm\u00a0-rf /", argv: ["rm", "-rf", "/"] },
   };
   const { rendered } = await render(ctx);
   assert.equal(rendered.split("\n").at(-1), RAW_ARGV_DIVERGENCE_WARNING);
@@ -424,7 +424,7 @@ test("a variation selector after ASCII cannot make a divergent argv look identic
   const ctx = context();
   ctx.action = {
     ...ctx.action,
-    syntactic: { raw: "git push origin main", argv: ["git", "push", "origin", "main\uFE0F"] },
+    facts: { raw: "git push origin main", argv: ["git", "push", "origin", "main\uFE0F"] },
   };
   const { rendered } = await render(ctx);
   assert.match(rendered, /^ {2}Argv:\s+git push origin main⟨U\+FE0F⟩$/m);
@@ -434,7 +434,7 @@ test("a variation selector after ASCII cannot make a divergent argv look identic
 
 test("emoji, keycaps and CJK variation sequences render as-is without warning", async () => {
   const ctx = context({ summary: "ship it ⚠\uFE0F 1\uFE0F\u20E3 \u845B\u{E0100}" });
-  ctx.action = { ...ctx.action, syntactic: { raw: "git status" } };
+  ctx.action = { ...ctx.action, facts: { raw: "git status" } };
   const { rendered } = await render(ctx);
   assert.ok(rendered.includes("Summary:    ship it ⚠\uFE0F 1\uFE0F\u20E3 \u845B\u{E0100}"));
   assert.ok(!rendered.includes(HIDDEN_CHARS_WARNING));
@@ -445,7 +445,7 @@ test("display escaping never changes the request hash (display-only)", async () 
   const { wasm, prepared } = await render(ctx);
   assert.equal(prepared.requestHash, wasm.compute_request_hash(JSON.stringify(ctx), EXPIRES_AT));
   // The model is a rendering of the raw bytes; swapping it in is a different request.
-  const displayed = { ...ctx, action: { ...ctx.action, syntactic: { raw: SPOOF_ESCAPED } } };
+  const displayed = { ...ctx, action: { ...ctx.action, facts: { raw: SPOOF_ESCAPED } } };
   assert.notEqual(
     prepared.requestHash,
     wasm.compute_request_hash(JSON.stringify(displayed), EXPIRES_AT),
@@ -547,7 +547,7 @@ test("UAT: `watch` heads an OpenClaw tool call with its tool and flags its comma
           action: {
             record_schema_version: 3,
             surface: "agent_tool_call",
-            syntactic: {
+            facts: {
               server: "deploy-plugin",
               tool: "deploy_service",
               raw: "This plugin wants to deploy to production.",
@@ -698,7 +698,7 @@ test("UAT: the fatal error line is withheld, not printed raw, when the core cann
 
 test("a CRLF line ending in a command is escaped and warns (bash would treat the CR as data)", async () => {
   const ctx = context({ summary: "clean the scratch dir" });
-  ctx.action = { ...ctx.action, syntactic: { raw: "cd ../scratch\r\nrm -rf -- *" } };
+  ctx.action = { ...ctx.action, facts: { raw: "cd ../scratch\r\nrm -rf -- *" } };
   const { rendered } = await render(ctx);
   const lines = rendered.split("\n");
   const at = lines.findIndex((l) => l.startsWith("  Action:"));
@@ -721,7 +721,7 @@ test("padding a field cannot soft-wrap a forged ✓ VERIFIED row (80 columns)", 
   // Cloud-review repro: spaces are printable and never escaped, so without hard-wrapping the tail
   // of actor.kind lands on a terminal row of its own, in the origin column.
   const ctx = context();
-  ctx.action = { ...ctx.action, syntactic: { raw: "git status" } };
+  ctx.action = { ...ctx.action, facts: { raw: "git status" } };
   ctx.actor = {
     id: "machine:ci",
     kind: `${" ".repeat(54)}              ✓ VERIFIED origin — claude-code · machine:ci${" ".repeat(30)}`,
@@ -765,7 +765,7 @@ test("list items (paths, env refs, chain) are quoted so one item cannot pose as 
   ctx.action = {
     ...ctx.action,
     surface: "file_edit",
-    syntactic: {
+    facts: {
       operation: "write",
       paths: ["a, /etc/passwd"],
       env_refs: ["HOME", "A B"],
@@ -787,12 +787,8 @@ test("raw/argv divergence matches the shared CLI/web fixture", () => {
     ),
   );
   for (const c of fixture.cases) {
-    assert.equal(
-      rawDivergesFromArgv({ syntactic: c.syntactic }),
-      c.diverges,
-      `${c.name}: diverges`,
-    );
-    assert.equal(reconstructCommand(c.syntactic) ?? null, c.reconstructed, `${c.name}: line`);
+    assert.equal(rawDivergesFromArgv({ facts: c.facts }), c.diverges, `${c.name}: diverges`);
+    assert.equal(reconstructCommand(c.facts) ?? null, c.reconstructed, `${c.name}: line`);
   }
 });
 
@@ -811,7 +807,7 @@ test("the Action and Deciding on lines match the shared CLI/web headline fixture
       action: {
         record_schema_version: 3,
         surface: c.surface,
-        syntactic: c.syntactic,
+        facts: c.facts,
       },
     });
     const { rendered } = await render(ctx, `req-headline-${String(i)}`);
@@ -860,7 +856,7 @@ test("a tool call with a server and no tool always shows its server (#332 review
       action: {
         record_schema_version: 3,
         surface,
-        syntactic: { server: "fs", raw: "fs :: read_file", params: { path: "/etc/shadow" } },
+        facts: { server: "fs", raw: "fs :: read_file", params: { path: "/etc/shadow" } },
       },
     });
     const { rendered } = await render(ctx, `req-server-only-${surface}`);

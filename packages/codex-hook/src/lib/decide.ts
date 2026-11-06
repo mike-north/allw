@@ -4,7 +4,7 @@
  * `deny` JSON.
  *
  * This deliberately mirrors the Claude Code hook's fail-closed matrix while using Codex-specific
- * actor identity. All syntactic `ActionRecord` construction stays delegated to the shared WASM
+ * actor identity. All facts `ActionRecord` construction stays delegated to the shared WASM
  * core: a POSIX shell command (`Bash`, `Monitor`'s `command`) through `@allw/sdk`'s
  * `commandRequest`, exactly as the Claude Code hook does (#372), so a blank command or program is
  * denied with the same reason in both; every other surface through `@allw/hook`'s `gateToolCall`.
@@ -60,7 +60,7 @@ export interface DecideDeps {
 interface CoreActionRecord {
   readonly record_schema_version: number;
   readonly surface: string;
-  readonly syntactic: unknown;
+  readonly facts: unknown;
 }
 
 /** Validate the parsed core `ActionRecord` fields this package maps into an SDK request. */
@@ -68,7 +68,7 @@ function isCoreActionRecord(value: unknown): value is CoreActionRecord {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
   return (
-    typeof v.record_schema_version === "number" && typeof v.surface === "string" && "syntactic" in v
+    typeof v.record_schema_version === "number" && typeof v.surface === "string" && "facts" in v
   );
 }
 
@@ -139,7 +139,7 @@ function buildApprovalRequest(
     action: {
       recordSchemaVersion: parsed.record_schema_version,
       surface: parsed.surface,
-      syntactic: parsed.syntactic,
+      facts: parsed.facts,
     },
     summary,
     actor: codexActor(hostname),

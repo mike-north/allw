@@ -54,7 +54,7 @@ const CONTEXT = {
   action: {
     record_schema_version: 3,
     surface: "command",
-    syntactic: { argv: ["git", "push", "--force", "origin", "main"], cwd: "/repo" },
+    facts: { argv: ["git", "push", "--force", "origin", "main"], cwd: "/repo" },
   },
   summary: "force push to main",
   actor: { id: "machine:test-laptop", kind: "claude-code" },
@@ -636,7 +636,7 @@ test("relay outage during prepare: origin downgrades to unverified without abort
   );
   assert.deepEqual(
     outagedPrepared.context.substrate.argv,
-    CONTEXT.action.syntactic.argv,
+    CONTEXT.action.facts.argv,
     "argv is still present for rendering after a resolver outage",
   );
 });

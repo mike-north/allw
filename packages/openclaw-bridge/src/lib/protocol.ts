@@ -70,7 +70,7 @@ export interface ExecApprovalRequest {
   readonly cwd?: string | undefined;
   readonly agentId?: string | undefined;
   readonly sessionKey?: string | undefined;
-  /** OpenClaw's *execution locus* (`gateway` | `node` | `sandbox`) — **not** allw's `syntactic.host`. */
+  /** OpenClaw's *execution locus* (`gateway` | `node` | `sandbox`) — **not** allw's `facts.host`. */
   readonly host?: string | undefined;
   readonly nodeId?: string | undefined;
   readonly warningText?: string | undefined;

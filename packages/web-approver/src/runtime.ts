@@ -203,7 +203,7 @@ function validateEnvelope(envelope: ApprovalEnvelope): void {
 
 /** The decrypted wire context (Rust `allw_core::ApprovalContext` serde shape). */
 interface WireApprovalContext {
-  readonly action: { readonly surface: string; readonly syntactic: unknown };
+  readonly action: { readonly surface: string; readonly facts: unknown };
   readonly summary: string;
   readonly actor: { readonly id: string; readonly kind: string; readonly attestation?: string };
   readonly reversible?: boolean;
@@ -256,7 +256,7 @@ interface CoreDisplayModel {
   readonly summary: string;
   readonly actor_id: string;
   readonly actor_label: string;
-  readonly syntactic: CoreDisplaySubstrate;
+  readonly facts: CoreDisplaySubstrate;
   readonly chain?: readonly string[];
   readonly has_hidden_or_control_chars: boolean;
 }
@@ -321,7 +321,7 @@ function toApprovalContext(
   };
   const context: ApprovalContext = {
     kind: toKind(wire.action.surface),
-    substrate: toSubstrateView(display.syntactic),
+    substrate: toSubstrateView(display.facts),
     actor,
     summary: display.summary,
     ...(wire.reversible !== undefined ? { reversible: wire.reversible } : {}),
@@ -332,8 +332,8 @@ function toApprovalContext(
   // call that heads with its identity has no raw/argv divergence: its `raw` is a description, and a
   // command form it carries is flagged separately (`toolCommandForm`).
   const divergentArgv =
-    toolIdentity(context) === undefined && rawDivergesFromArgv(wire.action.syntactic)
-      ? reconstructCommand(display.syntactic)
+    toolIdentity(context) === undefined && rawDivergesFromArgv(wire.action.facts)
+      ? reconstructCommand(display.facts)
       : undefined;
   // Spread optional keys only when present so `exactOptionalPropertyTypes` keeps them absent.
   return {

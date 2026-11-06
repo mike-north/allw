@@ -3,7 +3,7 @@
   "cases": [
     {
       "name": "raw matches argv",
-      "syntactic": {
+      "facts": {
         "argv": ["git", "status"],
         "raw": "git status"
       },
@@ -12,7 +12,7 @@
     },
     {
       "name": "caller argv is complete; no program is inferred",
-      "syntactic": {
+      "facts": {
         "argv": ["status"],
         "raw": "git status"
       },
@@ -21,7 +21,7 @@
     },
     {
       "name": "caller argv is shown once",
-      "syntactic": {
+      "facts": {
         "argv": ["git", "push"],
         "raw": "git push"
       },
@@ -30,7 +30,7 @@
     },
     {
       "name": "a benign raw paired with a dangerous argv",
-      "syntactic": {
+      "facts": {
         "argv": ["rm", "-rf", "~"],
         "raw": "git status"
       },
@@ -39,7 +39,7 @@
     },
     {
       "name": "single-quoted raw matches a token with a space",
-      "syntactic": {
+      "facts": {
         "argv": ["git", "commit", "-m", "a b"],
         "raw": "git commit -m 'a b'"
       },
@@ -48,7 +48,7 @@
     },
     {
       "name": "double-quoted raw counts as divergent (fails safe)",
-      "syntactic": {
+      "facts": {
         "argv": ["git", "commit", "-m", "a b"],
         "raw": "git commit -m \"a b\""
       },
@@ -57,7 +57,7 @@
     },
     {
       "name": "an embedded single quote is escaped POSIX-style",
-      "syntactic": {
+      "facts": {
         "argv": ["echo", "it's"],
         "raw": "echo 'it'\\''s'"
       },
@@ -66,7 +66,7 @@
     },
     {
       "name": "an empty token is shown as ''",
-      "syntactic": {
+      "facts": {
         "argv": ["printf", ""],
         "raw": "printf"
       },
@@ -75,7 +75,7 @@
     },
     {
       "name": "a hidden byte in argv that raw lacks",
-      "syntactic": {
+      "facts": {
         "argv": ["ls", "a\u001b"],
         "raw": "ls a"
       },
@@ -84,7 +84,7 @@
     },
     {
       "name": "opaque raw alone has no command vector",
-      "syntactic": {
+      "facts": {
         "raw": "ls -la /tmp"
       },
       "diverges": false,
@@ -92,7 +92,7 @@
     },
     {
       "name": "no raw: nothing to diverge from",
-      "syntactic": {
+      "facts": {
         "argv": ["rm", "-rf", "/"]
       },
       "diverges": false,
@@ -100,7 +100,7 @@
     },
     {
       "name": "no command form: raw only",
-      "syntactic": {
+      "facts": {
         "raw": "rm -rf /"
       },
       "diverges": false,
@@ -108,7 +108,7 @@
     },
     {
       "name": "an empty argv with no bin has no command form",
-      "syntactic": {
+      "facts": {
         "argv": [],
         "raw": "anything"
       },
@@ -117,7 +117,7 @@
     },
     {
       "name": "a PowerShell Windows path differs from the literal quoted argv form",
-      "syntactic": {
+      "facts": {
         "argv": ["Remove-Item", "C:\\Users\\me\\build", "-Recurse"],
         "raw": "Remove-Item C:\\Users\\me\\build -Recurse"
       },
@@ -126,7 +126,7 @@
     },
     {
       "name": "a glob token that display quoting wraps is still raw's own word differs from the literal quoted argv form",
-      "syntactic": {
+      "facts": {
         "argv": ["ls", "*.txt"],
         "raw": "ls *.txt"
       },
@@ -135,7 +135,7 @@
     },
     {
       "name": "runs of ASCII whitespace in raw are not a divergence differs from the literal quoted argv form",
-      "syntactic": {
+      "facts": {
         "argv": ["git", "status"],
         "raw": "git \t status"
       },
@@ -144,7 +144,7 @@
     },
     {
       "name": "an argv cut at U+00A0, which raw keeps inside a word, diverges",
-      "syntactic": {
+      "facts": {
         "argv": ["rm", "-rf", "/"],
         "raw": "rm -rf /"
       },
@@ -153,7 +153,7 @@
     },
     {
       "name": "an argv cut at U+3000 diverges",
-      "syntactic": {
+      "facts": {
         "argv": ["Remove-Item", "build"],
         "raw": "Remove-Item　build"
       },
@@ -162,7 +162,7 @@
     },
     {
       "name": "an argv cut at a carriage return diverges",
-      "syntactic": {
+      "facts": {
         "argv": ["git", "status"],
         "raw": "git\rstatus"
       },

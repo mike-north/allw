@@ -57,7 +57,7 @@ const CONTEXT = {
   action: {
     record_schema_version: 3,
     surface: "command",
-    syntactic: { raw: "git push --force origin main" },
+    facts: { raw: "git push --force origin main" },
   },
   summary: "force push to main",
   actor: { id: "machine:laptop", kind: "claude-code" },
@@ -410,7 +410,7 @@ test("tamper-mismatch: a mutated context yields a request_hash that fails the in
     summary: "innocuous: list files",
     action: {
       ...CONTEXT.action,
-      syntactic: { raw: "git push --force origin main", cwd: "/etc" },
+      facts: { raw: "git push --force origin main", cwd: "/etc" },
     },
   };
   const tamperedJson = JSON.stringify(tamperedContext);
@@ -489,7 +489,7 @@ test("renderRequest surfaces cwd and env_refs (WYSIWYS completeness — review f
     action: {
       record_schema_version: 3,
       surface: "command",
-      syntactic: {
+      facts: {
         argv: ["rm", "-rf", "build"],
         raw: "rm -rf build",
         cwd: "/etc",
@@ -526,7 +526,7 @@ test("renderRequest surfaces MCP params (not hidden behind raw) — review fix #
     action: {
       record_schema_version: 3,
       surface: "mcp_tool_call",
-      syntactic: {
+      facts: {
         server: "filesystem",
         tool: "write_file",
         params: { path: "/etc/passwd", contents: "pwned" },
@@ -564,7 +564,7 @@ test("renderRequest surfaces MCP server/tool even when a benign raw masks them, 
     action: {
       record_schema_version: 3,
       surface: "mcp_tool_call",
-      syntactic: {
+      facts: {
         server: "fs",
         tool: "delete_all_files",
         raw: "echo hello",
@@ -608,7 +608,7 @@ test("renderRequest labels an agent_tool_call's (server,tool) identity distinctl
     action: {
       record_schema_version: 3,
       surface: "agent_tool_call",
-      syntactic: {
+      facts: {
         server: "deploy-plugin",
         tool: "deploy_service",
         raw: "This plugin wants to deploy to production.",
@@ -662,7 +662,7 @@ test("renderRequest surfaces file-edit paths, operation, summary, and diff hash 
     action: {
       record_schema_version: 3,
       surface: "file_edit",
-      syntactic: {
+      facts: {
         operation: "patch",
         paths: ["src/app.ts"],
         diff_summary: "patch src/app.ts (+1 -1)",
@@ -703,7 +703,7 @@ test("renderRequest disambiguates argv args containing whitespace (WYSIWYS — r
     action: {
       record_schema_version: 3,
       surface: "command",
-      syntactic: { argv: ["rm", "-rf", "my dir"] },
+      facts: { argv: ["rm", "-rf", "my dir"] },
     },
     summary: "remove a directory whose name has a space",
     actor: { id: "machine:ci", kind: "claude-code" },
@@ -732,7 +732,7 @@ test("renderRequest does not double the bin when argv already leads with it (rev
     action: {
       record_schema_version: 3,
       surface: "command",
-      syntactic: { argv: ["git", "status"] },
+      facts: { argv: ["git", "status"] },
     },
     summary: "git status",
     actor: { id: "machine:ci", kind: "claude-code" },
@@ -765,7 +765,7 @@ test("renderRequest surfaces a divergent argv even when raw masks it (WYSIWYS an
     action: {
       record_schema_version: 3,
       surface: "command",
-      syntactic: {
+      facts: {
         argv: ["git", "push", "--force", "origin", "main"],
         raw: "git status",
       },
@@ -805,7 +805,7 @@ test("renderRequest does NOT add a redundant Argv line when raw matches the reco
     action: {
       record_schema_version: 3,
       surface: "command",
-      syntactic: {
+      facts: {
         argv: ["git", "push", "--force", "origin", "main"],
         raw: "git push --force origin main",
       },
@@ -844,7 +844,7 @@ test("quoteToken pins the display-quoting of representative tokens (table-driven
       action: {
         record_schema_version: 3,
         surface: "command",
-        syntactic: { argv: [token] },
+        facts: { argv: [token] },
       },
       summary: "token quoting probe",
       actor: { id: "machine:ci", kind: "claude-code" },

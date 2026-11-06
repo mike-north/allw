@@ -96,7 +96,7 @@ export interface DecideDeps {
 interface CoreActionRecord {
   readonly record_schema_version: number;
   readonly surface: string;
-  readonly syntactic: unknown;
+  readonly facts: unknown;
 }
 
 /** Validate the parsed core `ActionRecord` JSON has the fields the hook depends on. */
@@ -104,7 +104,7 @@ function isCoreActionRecord(value: unknown): value is CoreActionRecord {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
   return (
-    typeof v.record_schema_version === "number" && typeof v.surface === "string" && "syntactic" in v
+    typeof v.record_schema_version === "number" && typeof v.surface === "string" && "facts" in v
   );
 }
 
@@ -165,7 +165,7 @@ function buildApprovalRequest(
   const action = {
     recordSchemaVersion: parsed.record_schema_version,
     surface: parsed.surface,
-    syntactic: parsed.syntactic,
+    facts: parsed.facts,
   };
 
   return {

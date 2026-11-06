@@ -324,9 +324,9 @@ test("MCP tool call is gated; approved → no decision, with the request built f
   // The submitted request carries the mcp_tool_call ActionRecord built by the core.
   const req = approver.calls[0];
   assert.equal(req.action.surface, "mcp_tool_call");
-  assert.equal(req.action.syntactic.server, "omnifocus");
-  assert.equal(req.action.syntactic.tool, "delete_project");
-  assert.deepEqual(req.action.syntactic.params, { project_id: "abc", list: "Agent Inbox" });
+  assert.equal(req.action.facts.server, "omnifocus");
+  assert.equal(req.action.facts.tool, "delete_project");
+  assert.deepEqual(req.action.facts.params, { project_id: "abc", list: "Agent Inbox" });
   // delete* → High risk (core heuristic).
 
   // Actor identity is machine:<hostname>, kind claude-code.
@@ -356,10 +356,10 @@ test("Claude file edit tools are gated; approved → no decision, with file_edit
   assert.equal(approver.calls.length, 1, "file edits must request approval");
   const req = approver.calls[0];
   assert.equal(req.action.surface, "file_edit");
-  assert.equal(req.action.syntactic.operation, "edit");
-  assert.deepEqual(req.action.syntactic.paths, ["/workspace/src/app.ts"]);
-  assert.equal(typeof req.action.syntactic.diff_hash, "string");
-  assert.match(req.action.syntactic.diff_summary, /src\/app\.ts/);
+  assert.equal(req.action.facts.operation, "edit");
+  assert.deepEqual(req.action.facts.paths, ["/workspace/src/app.ts"]);
+  assert.equal(typeof req.action.facts.diff_hash, "string");
+  assert.match(req.action.facts.diff_summary, /src\/app\.ts/);
 
   assert.equal(req.reversible, undefined);
 });
@@ -375,15 +375,15 @@ test("the ApprovalRequest carries the command ActionRecord + actor + caller cwd;
 
   const req = approver.calls[0];
   assert.equal(req.action.surface, "command");
-  assert.equal(req.action.syntactic.raw, "ls -la");
-  assert.equal(req.action.syntactic.cwd, "/workspace", "cwd is threaded into the record");
+  assert.equal(req.action.facts.raw, "ls -la");
+  assert.equal(req.action.facts.cwd, "/workspace", "cwd is threaded into the record");
 
   assert.equal(req.reversible, undefined, "the hook makes no reversibility assertion");
 });
 
 /**
  * The record the core builds for a command line, in the SDK's camelCase shape: top-level keys
- * translated, `syntactic` passed through unchanged (docs/action-record.md §ActionRecord). This is the
+ * translated, `facts` passed through unchanged (docs/action-record.md §ActionRecord). This is the
  * reference the hook's command requests are held to (#269), so it reads the core directly rather
  * than going through the SDK under test.
  */
@@ -394,7 +394,7 @@ function coreCommandAction(wasm, command, cwd) {
   return {
     recordSchemaVersion: core.record_schema_version,
     surface: core.surface,
-    syntactic: core.syntactic,
+    facts: core.facts,
   };
 }
 

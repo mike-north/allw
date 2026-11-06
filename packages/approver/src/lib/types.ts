@@ -14,17 +14,17 @@ export type Decision = "approved" | "denied" | "expired" | "aborted";
 export type Surface = "command" | "mcp_tool_call" | "file_edit" | "agent_tool_call";
 
 /**
- * Tokenized syntactic substrate — opaque, untrusted structure the approver renders but never
+ * Tokenized facts substrate — opaque, untrusted structure the approver renders but never
  * interprets. Typed `unknown` because it arrives from decrypted plaintext: the renderer must
  * narrow it defensively rather than assume a shape.
  */
-export type SyntacticSubstrate = unknown;
+export type Facts = unknown;
 
-/** Reduced, matchable record of an approvable action (v1 carries the syntactic substrate only). */
+/** Reduced, matchable record of an approvable action (v1 carries the facts substrate only). */
 export interface ActionRecord {
   readonly record_schema_version: number;
   readonly surface: Surface;
-  readonly syntactic: SyntacticSubstrate;
+  readonly facts: Facts;
 }
 
 /** The automation requesting approval (identity + optional attestation). */
@@ -57,7 +57,7 @@ export interface ApprovalContext {
 }
 
 /**
- * The escaped syntactic substrate (Rust `allw_core::DisplaySubstrate`). Each field is present
+ * The escaped facts substrate (Rust `allw_core::DisplaySubstrate`). Each field is present
  * exactly when the hashed substrate field is; every string has already been escaped by the core.
  */
 export interface DisplaySubstrate {
@@ -97,7 +97,7 @@ export interface DisplayModel {
   readonly actor_kind: string;
   /** `"<id> (<kind>)"`, both parts escaped. */
   readonly actor_label: string;
-  readonly syntactic: DisplaySubstrate;
+  readonly facts: DisplaySubstrate;
   readonly chain?: readonly string[];
   readonly has_hidden_or_control_chars: boolean;
 }

@@ -710,8 +710,8 @@ test("a backfilled plugin approval is driven faithfully via a fresh approval.get
     { id: PLUGIN_APPROVAL_ID, kind: "plugin", decision: "allow-once" },
   ]);
   assert.equal(requests.length, 1);
-  assert.equal(requests[0].action.syntactic.server, PLUGIN_ID);
-  assert.equal(requests[0].action.syntactic.tool, TOOL_NAME);
+  assert.equal(requests[0].action.facts.server, PLUGIN_ID);
+  assert.equal(requests[0].action.facts.tool, TOOL_NAME);
 });
 
 test("a plugin.approval.list entry carrying the full record skips the redundant reconcile approval.get call (§4.3)", async () => {

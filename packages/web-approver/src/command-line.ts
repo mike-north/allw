@@ -73,11 +73,11 @@ function readStringArray(record: Record<string, unknown>, key: string): string[]
  * warns, including formatting-only differences: this never splits raw or claims semantic equivalence.
  * No divergence exists without both caller-supplied forms. The core hashes the original bytes.
  */
-export function rawDivergesFromArgv(syntactic: unknown): boolean {
-  if (!isRecord(syntactic)) return false;
-  const raw = readString(syntactic, "raw");
+export function rawDivergesFromArgv(facts: unknown): boolean {
+  if (!isRecord(facts)) return false;
+  const raw = readString(facts, "raw");
   if (raw === undefined) return false;
-  const argv = readStringArray(syntactic, "argv");
+  const argv = readStringArray(facts, "argv");
   return argv !== undefined && argv.length > 0 && renderArgv(argv) !== raw;
 }
 

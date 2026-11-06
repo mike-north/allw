@@ -76,7 +76,7 @@ function sampleRequest(overrides = {}) {
     action: {
       recordSchemaVersion: 3,
       surface: "command",
-      syntactic: { raw: "git push --force" },
+      facts: { raw: "git push --force" },
     },
     summary: "Force-push to main",
     actor: { id: "machine:macbook-pro", kind: "claude-code" },
@@ -100,7 +100,7 @@ function wireContext(req) {
     action: {
       record_schema_version: req.action.recordSchemaVersion,
       surface: req.action.surface,
-      syntactic: req.action.syntactic,
+      facts: req.action.facts,
     },
     summary: req.summary,
     actor: { id: req.actor.id, kind: req.actor.kind },

@@ -172,7 +172,7 @@ test("display_model raw_lines match every per-surface case in the shared vector"
       action: {
         record_schema_version: 3,
         surface: c.surface,
-        syntactic: { raw: c.raw },
+        facts: { raw: c.raw },
       },
       summary: "s",
       actor: { id: "machine:ci", kind: "claude-code" },
@@ -181,7 +181,7 @@ test("display_model raw_lines match every per-surface case in the shared vector"
       constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
     };
     const model = JSON.parse(wasm.display_model(JSON.stringify(context)));
-    assert.deepEqual(model.syntactic.raw_lines, c.raw_lines, c.class);
+    assert.deepEqual(model.facts.raw_lines, c.raw_lines, c.class);
     assert.equal(model.has_hidden_or_control_chars, c.has_hidden_or_control_chars, c.class);
   }
 });
@@ -195,7 +195,7 @@ test("display_model leaves the request hash bound to the raw bytes", async () =>
   assert.equal(wasm.compute_request_hash(contextJson, 1_700_003_600_000), before);
   // Substituting the escaped display form for the raw bytes is a different request.
   const displayed = structuredClone(dm.context);
-  displayed.action.syntactic.raw = dm.expected.syntactic.raw;
+  displayed.action.facts.raw = dm.expected.facts.raw;
   assert.notEqual(wasm.compute_request_hash(JSON.stringify(displayed), 1_700_003_600_000), before);
 });
 

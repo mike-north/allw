@@ -56,7 +56,7 @@ export interface BridgeApprovalRequest {
      * assumed (spec §5.1, §5.2).
      */
     readonly surface: "command" | "agent_tool_call";
-    readonly syntactic: unknown;
+    readonly facts: unknown;
   };
   readonly summary: string;
   readonly actor: { readonly id: string; readonly kind: "openclaw" };
@@ -112,21 +112,21 @@ const UNKNOWN = "unknown";
 interface CoreActionRecord {
   readonly record_schema_version: number;
   readonly surface: string;
-  readonly syntactic: unknown;
+  readonly facts: unknown;
 }
 
 function isCoreActionRecord(value: unknown): value is CoreActionRecord {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
   return (
-    typeof v.record_schema_version === "number" && typeof v.surface === "string" && "syntactic" in v
+    typeof v.record_schema_version === "number" && typeof v.surface === "string" && "facts" in v
   );
 }
 
 /**
  * The exec `summary` (spec §6.2). It is a first-class, hashed, human-shown field, so the execution
  * locus (`host`/`nodeId`), the originating agent, and the gateway label are bound by the verdict
- * without inventing a syntactic field for each. Components OpenClaw did not supply render as the
+ * without inventing a facts field for each. Components OpenClaw did not supply render as the
  * literal `unknown` rather than being dropped — a missing field must be *visible*.
  *
  * An unbound working directory appends an explicit `working directory not bound` component
@@ -259,11 +259,11 @@ export function buildExecApprovalRequest(wasm: HookWasm, input: ExecMappingInput
       detail: "core ActionRecord was not in the expected shape",
     };
   }
-  if (parsed.syntactic === null || typeof parsed.syntactic !== "object") {
+  if (parsed.facts === null || typeof parsed.facts !== "object") {
     return {
       kind: "deny",
       reason: "build-error",
-      detail: "core ActionRecord carried no syntactic substrate",
+      detail: "core ActionRecord carried no facts substrate",
     };
   }
   if (parsed.surface !== "command") {
@@ -300,7 +300,7 @@ export function buildExecApprovalRequest(wasm: HookWasm, input: ExecMappingInput
       action: {
         recordSchemaVersion: parsed.record_schema_version,
         surface: "command",
-        syntactic: parsed.syntactic,
+        facts: parsed.facts,
       },
       summary,
       actor: { id: actorIdForGateway(gatewayId), kind: "openclaw" },
@@ -363,7 +363,7 @@ function decisionsDiverge(
 }
 
 /**
- * Normalize a plugin's `title` into a slug usable as `syntactic.tool` when `toolName` is absent
+ * Normalize a plugin's `title` into a slug usable as `facts.tool` when `toolName` is absent
  * (spec §5.2: "else a normalized slug of `title`"). Returns `undefined` when `title` is absent or
  * reduces to an empty slug (e.g. a title with no alphanumeric characters), so the caller can fail
  * closed with `build-error` rather than binding an empty tool identity.
@@ -524,8 +524,8 @@ export function buildPluginApprovalRequest(
     };
   }
 
-  // §5.2: syntactic.raw = description, plus detail when present — the prose the plugin author
-  // wrote for the approver. syntactic.params stays absent: OpenClaw exposes no structured
+  // §5.2: facts.raw = description, plus detail when present — the prose the plugin author
+  // wrote for the approver. facts.params stays absent: OpenClaw exposes no structured
   // parameters to a reviewer, so none is synthesized.
   const description =
     descriptionField.value !== undefined && descriptionField.value.length > 0
@@ -564,11 +564,11 @@ export function buildPluginApprovalRequest(
       detail: "core ActionRecord was not in the expected shape",
     };
   }
-  if (parsed.syntactic === null || typeof parsed.syntactic !== "object") {
+  if (parsed.facts === null || typeof parsed.facts !== "object") {
     return {
       kind: "deny",
       reason: "build-error",
-      detail: "core ActionRecord carried no syntactic substrate",
+      detail: "core ActionRecord carried no facts substrate",
     };
   }
   if (parsed.surface !== "agent_tool_call") {
@@ -607,7 +607,7 @@ export function buildPluginApprovalRequest(
       action: {
         recordSchemaVersion: parsed.record_schema_version,
         surface: "agent_tool_call",
-        syntactic: parsed.syntactic,
+        facts: parsed.facts,
       },
       summary,
       actor: { id: actorIdForGateway(gatewayId), kind: "openclaw" },

@@ -24,7 +24,7 @@
  * params, the wrong `tool_input` shape), this returns a `build-error` outcome carrying a reason —
  * the caller denies. A gated call is never silently allowed.
  *
- * @see ../../../../docs/action-record.md §The action record (the syntactic substrate, surfaces)
+ * @see ../../../../docs/action-record.md §The action record (the facts substrate, surfaces)
  * @see https://code.claude.com/docs/en/hooks (tool_name / tool_input; mcp__server__tool naming)
  */
 
@@ -538,10 +538,10 @@ function coreNoCommandRefusal(err: unknown): string | null {
 function commandRecordRefusal(actionRecord: string): string | null {
   try {
     const record: unknown = JSON.parse(actionRecord);
-    if (typeof record !== "object" || record === null || !("syntactic" in record)) {
+    if (typeof record !== "object" || record === null || !("facts" in record)) {
       return "the core returned a malformed command record";
     }
-    const facts = record.syntactic;
+    const facts = record.facts;
     if (
       typeof facts !== "object" ||
       facts === null ||
@@ -584,7 +584,7 @@ function gateCommandLine(
  * Classify a tool call and, when gated, build its `ActionRecord` through the WASM core.
  *
  * All `ActionRecord` construction is delegated to the core — the hook never reimplements the
- * syntactic substrate. A thrown core error (invalid shell syntax, unparseable params) is caught and
+ * facts substrate. A thrown core error (invalid shell syntax, unparseable params) is caught and
  * returned as a `build-error` so the caller fails closed.
  */
 export function gateToolCall(

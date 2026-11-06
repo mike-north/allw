@@ -57,10 +57,10 @@ function findChrome() {
   return candidates.find((path) => path !== undefined && path !== "" && existsSync(path));
 }
 
-/** A wire `ApprovalContext` for `surface` with `syntactic`. */
-function context(surface, syntactic, summary) {
+/** A wire `ApprovalContext` for `surface` with `facts`. */
+function context(surface, facts, summary) {
   return {
-    action: { record_schema_version: 3, surface, syntactic, risk: "high" },
+    action: { record_schema_version: 3, surface, facts, risk: "high" },
     summary,
     actor: { id: "machine:laptop", kind: "claude-code" },
 

@@ -1119,7 +1119,7 @@ test("verify_actor_attestation throws when a verdict/cert JWS is presented as an
   );
 });
 
-// ── ActionRecord builders (issue #13: the hook's syntactic substrate via the WASM core) ───────
+// ── ActionRecord builders (issue #13: the hook's facts substrate via the WASM core) ───────
 
 test("action_from_command captures opaque raw and caller cwd only", async () => {
   const wasm = await loadWasm();
@@ -1128,7 +1128,7 @@ test("action_from_command captures opaque raw and caller cwd only", async () => 
     {
       record_schema_version: 3,
       surface: "command",
-      syntactic: { raw: "git push --force origin main", cwd: "/home/dev/repo" },
+      facts: { raw: "git push --force origin main", cwd: "/home/dev/repo" },
     },
   );
 });
@@ -1140,7 +1140,7 @@ test("action_from_command omits cwd when not provided (cwd unknown)", async () =
   const record = JSON.parse(wasm.action_from_command("ls -la"));
   assert.equal(record.surface, "command");
   assert.ok(
-    record.syntactic.cwd === undefined || record.syntactic.cwd === null,
+    record.facts.cwd === undefined || record.facts.cwd === null,
     "cwd is absent when the caller does not supply one",
   );
 });
@@ -1148,7 +1148,7 @@ test("action_from_command omits cwd when not provided (cwd unknown)", async () =
 test("action_from_command carries unmatched quotes as caller text", async () => {
   const wasm = await loadWasm();
   const raw = 'echo "hello world';
-  assert.deepEqual(JSON.parse(wasm.action_from_command(raw, "/tmp")).syntactic, {
+  assert.deepEqual(JSON.parse(wasm.action_from_command(raw, "/tmp")).facts, {
     raw,
     cwd: "/tmp",
   });
@@ -1164,10 +1164,10 @@ test("action_from_mcp_tool_call builds an mcp ActionRecord (surface=mcp_tool_cal
 
   assert.equal(record.surface, "mcp_tool_call", "surface must be 'mcp_tool_call'");
   assert.equal(record.record_schema_version, 3, "v1 record schema version");
-  assert.equal(record.syntactic.server, "omnifocus", "server is preserved");
-  assert.equal(record.syntactic.tool, "delete_project", "tool is preserved");
+  assert.equal(record.facts.server, "omnifocus", "server is preserved");
+  assert.equal(record.facts.tool, "delete_project", "tool is preserved");
   assert.deepEqual(
-    record.syntactic.params,
+    record.facts.params,
     params,
     "params are preserved verbatim (instance-distinguishing values stay matchable)",
   );
@@ -1204,12 +1204,12 @@ test("action_from_file_edit builds a file_edit ActionRecord with paths and diff 
 
   assert.equal(record.surface, "file_edit", "surface must be 'file_edit'");
   assert.equal(record.record_schema_version, 3, "v1 record schema version");
-  assert.equal(record.syntactic.operation, "patch", "operation is preserved");
-  assert.deepEqual(record.syntactic.paths, ["src/app.ts"], "target paths are preserved");
-  assert.equal(record.syntactic.diff_summary, "patch src/app.ts", "summary is preserved");
-  assert.equal(record.syntactic.raw, patch, "raw carries the exact patch text for display");
-  assert.equal(typeof record.syntactic.diff_hash, "string", "diff hash is present");
-  assert.equal(record.syntactic.diff_hash.length, 43, "SHA-256 base64url hash length");
+  assert.equal(record.facts.operation, "patch", "operation is preserved");
+  assert.deepEqual(record.facts.paths, ["src/app.ts"], "target paths are preserved");
+  assert.equal(record.facts.diff_summary, "patch src/app.ts", "summary is preserved");
+  assert.equal(record.facts.raw, patch, "raw carries the exact patch text for display");
+  assert.equal(typeof record.facts.diff_hash, "string", "diff hash is present");
+  assert.equal(record.facts.diff_hash.length, 43, "SHA-256 base64url hash length");
 });
 
 test("action_from_file_edit throws on empty paths (fail-closed)", async () => {
@@ -1234,14 +1234,14 @@ test("action_from_agent_tool_call builds an agent_tool_call ActionRecord distinc
   assert.equal(record.surface, "agent_tool_call", "surface must be 'agent_tool_call'");
   assert.notEqual(record.surface, "mcp_tool_call", "must never be tagged mcp_tool_call");
   assert.equal(record.record_schema_version, 3, "v1 record schema version");
-  assert.equal(record.syntactic.server, "openclaw", "server is preserved");
-  assert.equal(record.syntactic.tool, "deploy_service", "tool is preserved");
+  assert.equal(record.facts.server, "openclaw", "server is preserved");
+  assert.equal(record.facts.tool, "deploy_service", "tool is preserved");
   assert.equal(
-    record.syntactic.raw,
+    record.facts.raw,
     "openclaw.deploy_service()",
     "raw uses empty parens when params absent",
   );
-  assert.ok(!("params" in record.syntactic), "params must be absent (not null) when omitted");
+  assert.ok(!("params" in record.facts), "params must be absent (not null) when omitted");
   assert.ok(!("capabilities" in record), "capabilities reserved (absent) in v1");
   assert.ok(!("scope" in record), "scope reserved (absent) in v1");
 });
@@ -1254,9 +1254,9 @@ test("action_from_agent_tool_call preserves structured params when provided", as
     wasm.action_from_agent_tool_call("openclaw", "deploy_service", JSON.stringify(params)),
   );
 
-  assert.deepEqual(record.syntactic.params, params, "params are preserved verbatim");
+  assert.deepEqual(record.facts.params, params, "params are preserved verbatim");
   assert.equal(
-    record.syntactic.raw,
+    record.facts.raw,
     `openclaw.deploy_service(${JSON.stringify(params)})`,
     "raw matches the mcp_tool_call display format when params are present",
   );
@@ -1288,7 +1288,7 @@ test("agent_tool_call fixture vector: WASM compute_request_hash matches the Rust
 
 // ── action_from_agent_tool_call_with_raw (issue #213) ─────────────────────────────────────
 //
-// @see ../../../docs/openclaw-integration.md §5.2 (syntactic.raw = description, plus detail)
+// @see ../../../docs/openclaw-integration.md §5.2 (facts.raw = description, plus detail)
 
 test("action_from_agent_tool_call_with_raw binds raw verbatim instead of synthesizing it", async () => {
   const wasm = await loadWasm();
@@ -1303,14 +1303,14 @@ test("action_from_agent_tool_call_with_raw binds raw verbatim instead of synthes
   );
 
   assert.equal(record.surface, "agent_tool_call");
-  assert.equal(record.syntactic.server, "openclaw");
-  assert.equal(record.syntactic.tool, "deploy_service");
+  assert.equal(record.facts.server, "openclaw");
+  assert.equal(record.facts.tool, "deploy_service");
   assert.equal(
-    record.syntactic.raw,
+    record.facts.raw,
     "This plugin wants to deploy to production.",
     "raw is bound verbatim, never the synthesized <server>.<tool>() display",
   );
-  assert.ok(!("params" in record.syntactic), "params must be absent (not null) when omitted");
+  assert.ok(!("params" in record.facts), "params must be absent (not null) when omitted");
 });
 
 test("action_from_agent_tool_call_with_raw never re-derives raw from params", async () => {
@@ -1326,8 +1326,8 @@ test("action_from_agent_tool_call_with_raw never re-derives raw from params", as
     ),
   );
 
-  assert.equal(record.syntactic.raw, "custom reviewer prose");
-  assert.deepEqual(record.syntactic.params, params, "params are still preserved verbatim");
+  assert.equal(record.facts.raw, "custom reviewer prose");
+  assert.deepEqual(record.facts.params, params, "params are still preserved verbatim");
 });
 
 test("action_from_agent_tool_call_with_raw throws on malformed params JSON (fail-closed)", async () => {
@@ -1362,13 +1362,13 @@ test("action_from_argv binds the caller's argv verbatim instead of re-parsing ra
 
   assert.equal(record.surface, "command");
   assert.equal(record.record_schema_version, 3);
-  assert.deepEqual(record.syntactic.argv, argv, "argv is the caller's canonical vector");
-  assert.equal(record.syntactic.bin, undefined);
-  assert.equal(record.syntactic.raw, raw, "raw is recorded verbatim");
-  assert.equal(record.syntactic.cwd, "/srv/app");
+  assert.deepEqual(record.facts.argv, argv, "argv is the caller's canonical vector");
+  assert.equal(record.facts.bin, undefined);
+  assert.equal(record.facts.raw, raw, "raw is recorded verbatim");
+  assert.equal(record.facts.cwd, "/srv/app");
   assert.notDeepEqual(
-    record.syntactic.argv,
-    JSON.parse(wasm.action_from_command(raw, "/srv/app")).syntactic.argv,
+    record.facts.argv,
+    JSON.parse(wasm.action_from_command(raw, "/srv/app")).facts.argv,
     "the two builders must genuinely differ for this input, or the test proves nothing",
   );
 });
@@ -1389,8 +1389,8 @@ test("action_from_argv never extracts env_refs from raw", async () => {
     ),
   );
 
-  assert.equal(record.syntactic.env_refs, undefined);
-  assert.ok(!("cwd" in record.syntactic), "an omitted cwd stays absent, not null");
+  assert.equal(record.facts.env_refs, undefined);
+  assert.ok(!("cwd" in record.facts), "an omitted cwd stays absent, not null");
 });
 
 test("action_from_argv without raw records no raw and no env_refs", async () => {
@@ -1400,9 +1400,9 @@ test("action_from_argv without raw records no raw and no env_refs", async () => 
     wasm.action_from_argv(JSON.stringify(["echo", "$HOME"]), undefined, undefined),
   );
 
-  assert.ok(!("raw" in record.syntactic), "raw stays absent when the caller has no command text");
+  assert.ok(!("raw" in record.facts), "raw stays absent when the caller has no command text");
   assert.ok(
-    !("env_refs" in record.syntactic),
+    !("env_refs" in record.facts),
     "a token vector has already had its $VAR references expanded by whatever produced it",
   );
 });

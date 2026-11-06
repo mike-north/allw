@@ -82,14 +82,14 @@ export type Decision = "approved" | "denied" | "expired" | "aborted";
 export type Surface = "command" | "mcp_tool_call" | "file_edit" | "agent_tool_call";
 
 /**
- * A reduced, matchable record of an approvable action. v1 carries the syntactic substrate;
+ * A reduced, matchable record of an approvable action. v1 carries the facts substrate;
  * no danger rating or policy-only metadata is carried. See `../../docs/action-record.md`.
  */
 export interface ActionRecord {
   readonly recordSchemaVersion: number;
   readonly surface: Surface;
   /** Caller-described raw/argv, tool identity/params or file-edit facts; no command interpretation. */
-  readonly syntactic: unknown;
+  readonly facts: unknown;
 }
 
 /**
@@ -450,7 +450,7 @@ interface WireApprovalContext {
   readonly action: {
     readonly record_schema_version: number;
     readonly surface: Surface;
-    readonly syntactic: unknown;
+    readonly facts: unknown;
   };
   readonly summary: string;
   readonly actor: { readonly id: string; readonly kind: string; readonly attestation?: string };
@@ -477,7 +477,7 @@ function toWireContext(req: ApprovalRequest): WireApprovalContext {
     action: {
       record_schema_version: req.action.recordSchemaVersion,
       surface: req.action.surface,
-      syntactic: req.action.syntactic,
+      facts: req.action.facts,
     },
     summary: req.summary,
     actor: {

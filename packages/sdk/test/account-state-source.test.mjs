@@ -64,7 +64,7 @@ async function loadWasm() {
   return glue;
 }
 
-/** A syntactically valid self-certifying account id (43 base64url characters). */
+/** A factsally valid self-certifying account id (43 base64url characters). */
 const ACCOUNT_ID = "A".repeat(42) + "z";
 const RELAY_URL = "https://relay.allw.test";
 const NOW_MS = 1700001000000; // fixed (fixed-dates rule)
@@ -626,7 +626,7 @@ function sampleRequest() {
     action: {
       recordSchemaVersion: 3,
       surface: "command",
-      syntactic: { argv: ["ls"] },
+      facts: { argv: ["ls"] },
     },
     summary: "List files",
     actor: { id: "machine:test", kind: "claude-code" },

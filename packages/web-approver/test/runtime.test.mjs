@@ -51,7 +51,7 @@ const CONTEXT = {
   action: {
     record_schema_version: 3,
     surface: "command",
-    syntactic: { argv: ["git", "push", "--force", "origin", "main"], cwd: "/repo" },
+    facts: { argv: ["git", "push", "--force", "origin", "main"], cwd: "/repo" },
   },
   summary: "force push to main",
   actor: { id: "machine:laptop", kind: "claude-code" },
@@ -194,7 +194,7 @@ test("agent_tool_call surface: maps to its own kind, distinct from mcp, with (se
     action: {
       record_schema_version: 3,
       surface: "agent_tool_call",
-      syntactic: {
+      facts: {
         server: "deploy-plugin",
         tool: "deploy_service",
         raw: "This plugin wants to deploy to production.",
@@ -308,7 +308,7 @@ test("tampered context: a mutated plaintext recomputes a different hash; the ver
   const tamperedContext = {
     ...CONTEXT,
     summary: "innocuous: list files",
-    action: { ...CONTEXT.action, syntactic: { argv: ["ls", "-la"], cwd: "/repo" } },
+    action: { ...CONTEXT.action, facts: { argv: ["ls", "-la"], cwd: "/repo" } },
   };
   const prepared = await runtime.prepare(makeEnvelope(encryptTo(JSON.stringify(tamperedContext))));
 

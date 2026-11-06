@@ -106,7 +106,7 @@ test("(#371) a blank cwd is unknown: the human is asked, with a record bound to 
   const { reason, relay } = await runBash(t, "rm -rf build", "  ");
   assert.match(reason, / — not approved \(verdict: denied\)$/u);
   assert.equal(relay.seen.submits, 1, "the call reached the relay and a human said no");
-  assert.equal("cwd" in relay.seen.contexts[0].action.syntactic, false);
+  assert.equal("cwd" in relay.seen.contexts[0].action.facts, false);
 });
 
 /** @see docs/action-record.md — nonblank shell-looking text always reaches a human. */
@@ -122,7 +122,7 @@ for (const command of [
     const { reason, relay } = await runBash(t, command, "/workspace/project");
     assert.match(reason, /not approved/);
     assert.equal(relay.seen.submits, 1);
-    assert.deepEqual(relay.seen.contexts[0].action.syntactic, {
+    assert.deepEqual(relay.seen.contexts[0].action.facts, {
       raw: command,
       cwd: "/workspace/project",
     });

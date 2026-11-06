@@ -31,8 +31,8 @@ This package implements both approval families the gateway raises to `operator.a
 - **exec** approvals (§5.1, `surface: "command"`).
 - **plugin permission requests** (§5.2, `surface: "agent_tool_call"`). Function identity is the
   `(pluginId, toolName)` pair — `pluginId` falls back to `"openclaw"`, `toolName` falls back to a
-  normalized slug of `title`; a request with neither denies `build-error`. `syntactic.params` stays
-  absent (OpenClaw exposes no structured parameters to a reviewer) and `syntactic.raw` carries
+  normalized slug of `title`; a request with neither denies `build-error`. `facts.params` stays
+  absent (OpenClaw exposes no structured parameters to a reviewer) and `facts.raw` carries
   `description` (plus `detail` when present) verbatim.
 
   A plugin approval discovered by **backfill** (one that predates the connection) is left open

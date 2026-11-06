@@ -178,15 +178,15 @@ test("approve: a gated destructive command → human approves → hook makes no 
   // exactly `git push --force origin main` in `/workspace/project` (not merely that *a* hash matched).
   const context = log[0].context;
   assert.ok(context, "the approver decrypted the human-shown context");
-  const syntactic = context.action.syntactic;
-  assert.equal(syntactic.argv, undefined, "line capture never infers an execution vector");
+  const facts = context.action.facts;
+  assert.equal(facts.argv, undefined, "line capture never infers an execution vector");
   assert.equal(
-    syntactic.raw,
+    facts.raw,
     "git push --force origin main",
     "the complete caller text reaches the approver",
   );
-  assert.equal(syntactic.cwd, PROJECT_CWD, "the decrypted, human-shown cwd matches what was sent");
-  assert.equal(syntactic.raw, DESTRUCTIVE_COMMAND, "the rendered raw command line matches exactly");
+  assert.equal(facts.cwd, PROJECT_CWD, "the decrypted, human-shown cwd matches what was sent");
+  assert.equal(facts.raw, DESTRUCTIVE_COMMAND, "the rendered raw command line matches exactly");
 });
 
 // ── Acceptance item 3 (fail-closed): Deny → deny ─────────────────────────────────────────────────
@@ -253,7 +253,7 @@ test("integrator independently re-verifies the verdict: request_id AND request_h
     action: {
       recordSchemaVersion: 3,
       surface: "command",
-      syntactic: { argv: ["git", "push", "--force", "origin", "main"] },
+      facts: { argv: ["git", "push", "--force", "origin", "main"] },
       risk: "high",
     },
     summary: "force push to main",
@@ -302,7 +302,7 @@ test("zero-knowledge: the relay stores only the opaque ciphertext envelope + sig
     action: {
       recordSchemaVersion: 3,
       surface: "command",
-      syntactic: { argv: ["git", "push", "--force", "origin", "main"] },
+      facts: { argv: ["git", "push", "--force", "origin", "main"] },
       risk: "high",
     },
     summary: "force push to main",
@@ -386,7 +386,7 @@ test("root-vouched recipients: a key injected into the relay's device list canno
     action: {
       recordSchemaVersion: 3,
       surface: "command",
-      syntactic: { argv: ["git", "push", "--force", "origin", "main"] },
+      facts: { argv: ["git", "push", "--force", "origin", "main"] },
       risk: "high",
     },
     summary: "force push to main",
@@ -467,7 +467,7 @@ test("interim vouching: after vouch, the SDK seals to the web device's kid and t
       action: {
         recordSchemaVersion: 3,
         surface: "command",
-        syntactic: { argv: ["git", "push", "--force", "origin", "main"] },
+        facts: { argv: ["git", "push", "--force", "origin", "main"] },
         risk: "high",
       },
       summary,
