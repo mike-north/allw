@@ -562,3 +562,34 @@ test("relay double: max_sequence is the maximum served sequence, or zero for no 
     assert.equal((await response.json()).max_sequence, expected);
   }
 });
+
+/** @see ../../../docs/codex-integration.md (Private denial diagnostics) */
+test("private diagnostics retain the actual SDK request id after a signed denial", async (t) => {
+  const { appendDenyLog } = await import("../dist/lib/deny-log.js");
+  const wasm = await loadWasm();
+  const approver = await pairedApprover(wasm);
+  let wireRequestId;
+  const { fetchImpl } = relayDouble(wasm, approver, "denied", (verdict) => {
+    wireRequestId = verdict.request_id;
+    return verdict;
+  });
+  const state = mkdtempSync(join(tmpdir(), "allw-codex-private-sdk-"));
+  t.after(() => rmSync(state, { recursive: true, force: true }));
+  const output = await runCodexHook(
+    codexBashStdin("echo SECRET-token-key-material", "/workspace/project"),
+    env(approver, TIMEOUT_MS),
+    overrides(fetchImpl),
+  );
+  assertConformsToPreToolUseOutputContract(output);
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /SECRET-token-key-material/);
+  assert.match(wireRequestId, /^[0-9a-f-]{36}$/);
+  appendDenyLog(
+    { ALLW_CODEX_DENY_LOG: "1", XDG_STATE_HOME: state },
+    output,
+    () => "2026-11-06T12:00:00.000Z",
+  );
+  assert.equal(
+    readFileSync(join(state, "allw", "codex-deny.log"), "utf8"),
+    `2026-11-06T12:00:00.000Z [allw] deny category=no-approval request_id=${wireRequestId}\n`,
+  );
+});

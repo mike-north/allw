@@ -398,7 +398,7 @@ test("private denial metadata carries only the SDK verdict's available request i
       commandRequest,
       requestApproval: async () => ({
         decision: "denied",
-        request_id: id,
+        requestId: id,
         note: "private human note",
       }),
     },
