@@ -56,7 +56,7 @@ struct Vector {
 fn raw_context(surface: &str, raw: &str) -> ApprovalContext {
     serde_json::from_value(serde_json::json!({
         "action": {
-            "record_schema_version": 1,
+            "record_schema_version": 2,
             "surface": surface,
             "syntactic": { "raw": raw },
             "risk": "high"

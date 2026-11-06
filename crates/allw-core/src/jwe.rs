@@ -66,7 +66,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use x25519_dalek::{PublicKey as XPublicKey, SharedSecret, StaticSecret};
 
-use crate::contract::{ApprovalContext, ContextViolation};
+use crate::contract::ApprovalContext;
 
 // ── JOSE constant strings (RFC 7518) ────────────────────────────────────────────
 
@@ -322,10 +322,6 @@ pub enum JweError {
     DecryptionFailed,
     /// The decrypted plaintext was not a valid JSON [`ApprovalContext`].
     InvalidPlaintext,
-    /// The plaintext parsed, but breaks a v1 rule the device enforces before showing a request
-    /// ([`ApprovalContext::check_v1_conformance`]). Like [`Self::InvalidPlaintext`], this is a
-    /// context the device can't approve.
-    ContractViolation(ContextViolation),
 }
 
 impl std::fmt::Display for JweError {
@@ -342,9 +338,6 @@ impl std::fmt::Display for JweError {
             Self::KeyUnwrapFailed => "AES key-wrap unwrap of the encrypted_key failed",
             Self::DecryptionFailed => "AES-256-GCM authentication/decryption failed",
             Self::InvalidPlaintext => "decrypted plaintext is not a valid ApprovalContext",
-            Self::ContractViolation(violation) => {
-                return write!(f, "decrypted ApprovalContext is refused: {violation}");
-            }
         };
         write!(f, "{msg}")
     }
@@ -767,13 +760,6 @@ pub fn decrypt_context(
     let context: ApprovalContext =
         serde_json::from_slice(&plaintext).map_err(|_| JweError::InvalidPlaintext)?;
 
-    // ── Step 7: enforce the v1 device-side rules (fail closed) ──
-    // The hash binds the whole context, but approvers show only part of it. A context whose
-    // hidden part says something the shown part doesn't is refused here, so no surface can
-    // display (and so approve) it.
-    context
-        .check_v1_conformance()
-        .map_err(JweError::ContractViolation)?;
     Ok(context)
 }
 
@@ -794,7 +780,7 @@ pub fn decrypt_context(
 mod tests {
     use super::*;
     use crate::contract::{
-        ActionRecord, Actor, Constraints, Decision, Risk, Surface, SyntacticSubstrate,
+        ActionRecord, Actor, Constraints, Decision, Surface, SyntacticSubstrate,
     };
     use rand_chacha::rand_core::SeedableRng;
     use rand_chacha::ChaCha20Rng;
@@ -827,7 +813,7 @@ mod tests {
     fn make_context() -> ApprovalContext {
         ApprovalContext {
             action: ActionRecord {
-                record_schema_version: 1,
+                record_schema_version: 2,
                 surface: Surface::Command,
                 syntactic: SyntacticSubstrate {
                     bin: Some("git".to_string()),
@@ -846,9 +832,6 @@ mod tests {
                     diff_summary: None,
                     diff_hash: None,
                 },
-                risk: Risk::Critical,
-                capabilities: None,
-                scope: None,
             },
             summary: SUMMARY_MARKER.to_string(),
             actor: Actor {
@@ -856,8 +839,8 @@ mod tests {
                 kind: "claude-code".to_string(),
                 attestation: None,
             },
-            risk: Risk::Critical,
-            reversible: false,
+
+            reversible: Some(false),
             constraints: Constraints {
                 allowed_decisions: vec![Decision::Approved, Decision::Denied],
                 challenge_required: true,

@@ -17,6 +17,10 @@ All cryptography is delegated to the audited Rust core via WebAssembly — this 
 > device is tracked by **[#23](https://github.com/mike-north/allw/issues/23)**. The wire protocol
 > does **not** depend on key custody, so #23 swaps in later with **no protocol change**.
 
+Risk labels/scoring and policy-only wire metadata are removed (#406 slice 1). Reversibility is an
+optional caller assertion; hooks/bridge omit it. Temporary command interpretation and derived fields
+remain only until slice 2.
+
 ## Why WASM-under-node (a hard constraint, not a preference)
 
 On-machine `allw` code runs as **WASM under `node`**, never a standalone native binary — so
@@ -184,7 +188,7 @@ For each incoming request the approver:
 3. **renders** the **complete** action substrate — the command/argv headline **plus** every other
    hash-bound field: a divergent reconstructed `argv` (when a benign `raw` would otherwise mask it),
    `flags`, `positionals`, `cwd`, `host`, `env_refs`, or MCP `params` when present — followed by the
-   summary, actor, risk, reversibility, expiry, and `request_hash`,
+   summary, actor, optional caller reversibility, expiry, and `request_hash`,
 4. prompts **Approve / Deny / Skip**,
 5. **re-checks expiry** after the human decides and before signing (a prompt left open past the
    deadline emits nothing),
@@ -216,7 +220,6 @@ from a `raw` headline — see below.)
   Env refs:   GIT_SSH_COMMAND
   Actor:      machine:laptop (claude-code)
               ✓ VERIFIED origin — claude-code · machine:laptop
-  Risk:       high
   Reversible: no
   Expires:    2023-11-14T23:13:20.000Z
   request_hash (WYSIWYS): RfTZFQPM0Q8q6ve7iAhYWUYfNTPGof3GLDd104lyQto

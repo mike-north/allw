@@ -328,7 +328,7 @@ test("MCP tool call is gated; approved → no decision, with the request built f
   assert.equal(req.action.syntactic.tool, "delete_project");
   assert.deepEqual(req.action.syntactic.params, { project_id: "abc", list: "Agent Inbox" });
   // delete* → High risk (core heuristic).
-  assert.equal(req.action.risk, "high");
+
   // Actor identity is machine:<hostname>, kind claude-code.
   assert.equal(req.actor.id, `machine:${HOSTNAME}`);
   assert.equal(req.actor.kind, "claude-code");
@@ -360,8 +360,8 @@ test("Claude file edit tools are gated; approved → no decision, with file_edit
   assert.deepEqual(req.action.syntactic.paths, ["/workspace/src/app.ts"]);
   assert.equal(typeof req.action.syntactic.diff_hash, "string");
   assert.match(req.action.syntactic.diff_summary, /src\/app\.ts/);
-  assert.equal(req.action.risk, "high");
-  assert.equal(req.reversible, false);
+
+  assert.equal(req.reversible, undefined);
 });
 
 test("the ApprovalRequest carries the command ActionRecord + actor + risk-derived reversible", async () => {
@@ -378,8 +378,8 @@ test("the ApprovalRequest carries the command ActionRecord + actor + risk-derive
   assert.equal(req.action.syntactic.bin, "ls");
   assert.equal(req.action.syntactic.cwd, "/workspace", "cwd is threaded into the record");
   // `ls` is Low risk → reversible defaults to true.
-  assert.equal(req.action.risk, "low");
-  assert.equal(req.reversible, true, "low/medium risk → reversible hint true");
+
+  assert.equal(req.reversible, undefined, "the hook makes no reversibility assertion");
 });
 
 /**
@@ -396,7 +396,6 @@ function coreCommandAction(wasm, command, cwd) {
     recordSchemaVersion: core.record_schema_version,
     surface: core.surface,
     syntactic: core.syntactic,
-    risk: core.risk,
   };
 }
 
@@ -479,8 +478,7 @@ test("(#269) a command request built through the SDK is byte-identical to the co
         action,
         summary: c.summary,
         actor: { id: `machine:${HOSTNAME}`, kind: "claude-code" },
-        risk: action.risk,
-        reversible: action.risk === "low" || action.risk === "medium",
+
         ...(config.timeoutMs !== undefined ? { timeoutMs: config.timeoutMs } : {}),
       };
       assert.equal(

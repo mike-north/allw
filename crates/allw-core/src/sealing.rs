@@ -132,7 +132,7 @@ mod tests {
     use super::*;
     use crate::account::account_id_for_root;
     use crate::contract::{
-        ActionRecord, Actor, Constraints, Decision, Risk, Surface, SyntacticSubstrate,
+        ActionRecord, Actor, Constraints, Decision, Surface, SyntacticSubstrate,
     };
     use crate::crypto::{
         sign_account_state, AccountState, AccountStateDevice, AccountStateRevocation,
@@ -196,7 +196,7 @@ mod tests {
     fn context() -> ApprovalContext {
         ApprovalContext {
             action: ActionRecord {
-                record_schema_version: 1,
+                record_schema_version: 2,
                 surface: Surface::Command,
                 syntactic: SyntacticSubstrate {
                     bin: Some("git".to_string()),
@@ -215,9 +215,6 @@ mod tests {
                     diff_summary: None,
                     diff_hash: None,
                 },
-                risk: Risk::High,
-                capabilities: None,
-                scope: None,
             },
             summary: "force-push main".to_string(),
             actor: Actor {
@@ -225,8 +222,8 @@ mod tests {
                 kind: "claude-code".to_string(),
                 attestation: None,
             },
-            risk: Risk::High,
-            reversible: false,
+
+            reversible: Some(false),
             constraints: Constraints {
                 allowed_decisions: vec![Decision::Approved, Decision::Denied],
                 challenge_required: false,

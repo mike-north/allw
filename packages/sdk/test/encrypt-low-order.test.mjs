@@ -66,14 +66,13 @@ function withHighBit(b64url) {
 
 const CONTEXT = {
   action: {
-    record_schema_version: 1,
+    record_schema_version: 2,
     surface: "command",
     syntactic: { argv: ["git", "status"], raw: "git status" },
-    risk: "low",
   },
   summary: "check git status",
   actor: { id: "machine:ci", kind: "claude-code" },
-  risk: "low",
+
   reversible: true,
   constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
 };

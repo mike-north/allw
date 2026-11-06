@@ -39,8 +39,7 @@ export interface CodexApprovalRequest {
   readonly action: unknown;
   readonly summary: string;
   readonly actor: { readonly id: string; readonly kind: "codex" };
-  readonly risk: "low" | "medium" | "high" | "critical";
-  readonly reversible: boolean;
+
   /** Optional Codex call id carried for audit-chain correlation and dedupe. */
   readonly chain?: readonly string[];
   readonly timeoutMs?: number;
@@ -58,13 +57,10 @@ export interface DecideDeps {
   readonly requestApproval: RequestApprovalFn;
 }
 
-type Risk = "low" | "medium" | "high" | "critical";
-
 interface CoreActionRecord {
   readonly record_schema_version: number;
   readonly surface: string;
   readonly syntactic: unknown;
-  readonly risk: Risk;
 }
 
 /** Validate the parsed core `ActionRecord` fields this package maps into an SDK request. */
@@ -72,16 +68,8 @@ function isCoreActionRecord(value: unknown): value is CoreActionRecord {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
   return (
-    typeof v.record_schema_version === "number" &&
-    typeof v.surface === "string" &&
-    "syntactic" in v &&
-    (v.risk === "low" || v.risk === "medium" || v.risk === "high" || v.risk === "critical")
+    typeof v.record_schema_version === "number" && typeof v.surface === "string" && "syntactic" in v
   );
-}
-
-/** Low/medium actions default to reversible in the current coarse risk model. */
-function reversibleForRisk(risk: Risk): boolean {
-  return risk === "low" || risk === "medium";
 }
 
 /** The Codex machine actor: this host, acting as Codex. */
@@ -98,10 +86,10 @@ function codexChain(toolUseId: string | undefined): { chain?: readonly string[] 
 
 /**
  * Build the request for a POSIX shell command through `commandRequest`, which builds the record
- * with the core's `action_from_command` and takes `risk` from it. The Codex values are explicit
+ * with the core's `action_from_command` without inferring danger or reversibility. The Codex values are explicit
  * overrides: the actor, the call-id chain, the configured timeout, and `cwd` (`null` when Codex
- * sent none, so the record is unbound rather than bound to the hook's own directory). `reversible`
- * is derived from the core's risk once the record is built.
+ * sent none, so the record is unbound rather than bound to the hook's own directory). No reversibility
+ * assertion is made.
  *
  * @throws (as a rejection) whatever `commandRequest` throws; the caller denies.
  */
@@ -125,8 +113,7 @@ async function commandApprovalRequest(
     action: req.action,
     summary: req.summary,
     actor: codexActor(hostname),
-    risk: req.risk,
-    reversible: reversibleForRisk(req.risk),
+
     ...(req.chain !== undefined ? { chain: req.chain } : {}),
     ...(req.timeoutMs !== undefined ? { timeoutMs: req.timeoutMs } : {}),
   };
@@ -153,12 +140,10 @@ function buildApprovalRequest(
       recordSchemaVersion: parsed.record_schema_version,
       surface: parsed.surface,
       syntactic: parsed.syntactic,
-      risk: parsed.risk,
     },
     summary,
     actor: codexActor(hostname),
-    risk: parsed.risk,
-    reversible: reversibleForRisk(parsed.risk),
+
     ...codexChain(toolUseId),
     ...(config.timeoutMs !== undefined ? { timeoutMs: config.timeoutMs } : {}),
   };

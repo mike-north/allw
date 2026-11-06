@@ -164,7 +164,7 @@ test("approve: the script's command is shown exactly and the script proceeds", a
   assert.equal(context.summary, `Refund charge ${CHARGE_ID}`);
   // commandRequest defaults (#231): script actor on this machine, irreversible, core-derived risk.
   assert.deepEqual(context.actor, { id: `machine:${hostname()}`, kind: "script" });
-  assert.equal(context.reversible, false);
+  assert.equal(context.reversible, undefined);
   assert.equal(context.risk, context.action.risk);
 });
 

@@ -18,6 +18,10 @@ on an SDK-unverifiable verdict; it does not imply that the server-side request w
 The SDK never returns "allow". It returns a verified human decision. Your code decides whether to
 proceed, and it must fail closed: anything other than `decision === "approved"` means stop.
 
+Risk labels/scoring and policy-only wire metadata are removed (#406 slice 1). Reversibility is an
+optional caller assertion; hooks/bridge omit it. Temporary command interpretation and derived fields
+remain only until slice 2.
+
 ## Gate a command from a script
 
 A script about to run a command uses the `command` surface, the same one the agent hooks use.
@@ -57,9 +61,8 @@ if (verdict.decision !== "approved") process.exit(1); // fail-closed: only a ver
 | Field        | Value                                                                                                                                        |
 | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `action`     | Built by the core from `argv` (exact tokens) or `commandLine` (tokenized by the core).                                                       |
-| `risk`       | Taken from the core-built `action.risk`. You never state it twice.                                                                           |
 | `actor`      | Default `{ id: "machine:<os.hostname()>", kind: "script" }`.                                                                                 |
-| `reversible` | Default `false`. The human is told the action can't be undone unless you say otherwise.                                                      |
+| `reversible` | Omitted by default. Supply a boolean only when asserting whether the action can be undone.                                                   |
 | `cwd`        | Default `process.cwd()`, where `execFile` / `spawn` run the command. If you run it elsewhere, pass that directory. `null` leaves it unbound. |
 | others       | `timeoutMs`, `signal`, `constraints` and `chain` are passed through when given.                                                              |
 

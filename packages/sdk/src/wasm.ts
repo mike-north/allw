@@ -36,7 +36,10 @@ import { MAX_ESCAPED_DIAGNOSTIC_CHARS, escapeToPrintableAscii } from "./printabl
 export interface AllwWasm {
   /**
    * Computes the WYSIWYS `request_hash` (base64url-unpadded 32 bytes) for an `ApprovalContext`
-   * JSON bound to `expiresAt` (Unix ms). Reproduces the Rust `request-hash/v2` value exactly.
+   * JSON bound to `expiresAt` (Unix ms). Reproduces the Rust `request-hash/v3` value exactly.
+   * The v3 canonical contract removes risk/policy-only action slots, uses ActionRecord schema 2,
+   * and binds reversibility only when the caller supplies an assertion. Prior v2 receipts cannot
+   * verify as current-format receipts.
    */
   compute_request_hash(contextJson: string, expiresAt: number): string;
   /**
@@ -134,8 +137,7 @@ export interface AllwWasm {
   action_from_command(commandLine: string, cwd?: string | null): string;
   /**
    * Build an ActionRecord JSON for a **PowerShell** command line (the `command` surface). `raw` is
-   * the exact line and argv is always its whitespace split; risk is at least Medium, or at least High
-   * for a compound, escaped or dynamic-execution line. Never throws for PowerShell syntax; throws
+   * the exact line and argv is its whitespace split. No danger tier is assigned. Never throws for PowerShell syntax; throws
    * only for a line that runs no program (#376), with a `kind` as `action_from_command`.
    */
   action_from_powershell_command(commandLine: string, cwd?: string | null): string;

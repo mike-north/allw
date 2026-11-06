@@ -1129,7 +1129,7 @@ test("action_from_command builds a command ActionRecord (surface=command, tokeni
 
   // policy-seam.md §The three tiers (T1): the command surface captures the syntactic substrate.
   assert.equal(record.surface, "command", "surface must be 'command'");
-  assert.equal(record.record_schema_version, 1, "v1 record schema version");
+  assert.equal(record.record_schema_version, 2, "v1 record schema version");
   assert.equal(record.syntactic.bin, "git", "bin is argv[0]");
   assert.deepEqual(
     record.syntactic.argv,
@@ -1148,7 +1148,7 @@ test("action_from_command builds a command ActionRecord (surface=command, tokeni
   assert.equal(record.syntactic.cwd, "/home/dev/repo", "cwd is threaded through from the hook");
   assert.equal(record.syntactic.raw, "git push --force origin main", "raw is the original command");
   // git push --force → High (command.rs risk heuristic).
-  assert.equal(record.risk, "high", "git push --force is High risk");
+
   // T1 forward-compat: semantic slots reserved (policy-seam.md §forward-compat req #3). A `None`
   // serializes as an ABSENT key (skip_serializing_if), so the keys must not be present at all.
   assert.ok(!("capabilities" in record), "capabilities reserved (absent) in v1");
@@ -1187,7 +1187,7 @@ test("action_from_mcp_tool_call builds an mcp ActionRecord (surface=mcp_tool_cal
   );
 
   assert.equal(record.surface, "mcp_tool_call", "surface must be 'mcp_tool_call'");
-  assert.equal(record.record_schema_version, 1, "v1 record schema version");
+  assert.equal(record.record_schema_version, 2, "v1 record schema version");
   assert.equal(record.syntactic.server, "omnifocus", "server is preserved");
   assert.equal(record.syntactic.tool, "delete_project", "tool is preserved");
   assert.deepEqual(
@@ -1196,7 +1196,7 @@ test("action_from_mcp_tool_call builds an mcp ActionRecord (surface=mcp_tool_cal
     "params are preserved verbatim (instance-distinguishing values stay matchable)",
   );
   // delete* prefix → High (mcp.rs risk heuristic).
-  assert.equal(record.risk, "high", "delete_project → High risk");
+
   assert.ok(!("capabilities" in record), "capabilities reserved (absent) in v1");
   assert.ok(!("scope" in record), "scope reserved (absent) in v1");
 });
@@ -1227,14 +1227,13 @@ test("action_from_file_edit builds a file_edit ActionRecord with paths and diff 
   );
 
   assert.equal(record.surface, "file_edit", "surface must be 'file_edit'");
-  assert.equal(record.record_schema_version, 1, "v1 record schema version");
+  assert.equal(record.record_schema_version, 2, "v1 record schema version");
   assert.equal(record.syntactic.operation, "patch", "operation is preserved");
   assert.deepEqual(record.syntactic.paths, ["src/app.ts"], "target paths are preserved");
   assert.equal(record.syntactic.diff_summary, "patch src/app.ts", "summary is preserved");
   assert.equal(record.syntactic.raw, patch, "raw carries the exact patch text for display");
   assert.equal(typeof record.syntactic.diff_hash, "string", "diff hash is present");
   assert.equal(record.syntactic.diff_hash.length, 43, "SHA-256 base64url hash length");
-  assert.equal(record.risk, "high", "file edits are high risk in v1");
 });
 
 test("action_from_file_edit throws on empty paths (fail-closed)", async () => {
@@ -1258,7 +1257,7 @@ test("action_from_agent_tool_call builds an agent_tool_call ActionRecord distinc
 
   assert.equal(record.surface, "agent_tool_call", "surface must be 'agent_tool_call'");
   assert.notEqual(record.surface, "mcp_tool_call", "must never be tagged mcp_tool_call");
-  assert.equal(record.record_schema_version, 1, "v1 record schema version");
+  assert.equal(record.record_schema_version, 2, "v1 record schema version");
   assert.equal(record.syntactic.server, "openclaw", "server is preserved");
   assert.equal(record.syntactic.tool, "deploy_service", "tool is preserved");
   assert.equal(
@@ -1285,20 +1284,6 @@ test("action_from_agent_tool_call preserves structured params when provided", as
     `openclaw.deploy_service(${JSON.stringify(params)})`,
     "raw matches the mcp_tool_call display format when params are present",
   );
-});
-
-test("action_from_agent_tool_call shares the mcp_tool_call risk heuristic", async () => {
-  const wasm = await loadWasm();
-
-  const destructive = JSON.parse(
-    wasm.action_from_agent_tool_call("openclaw", "delete_deployment", undefined),
-  );
-  assert.equal(destructive.risk, "high", "delete* prefix → High, same heuristic as mcp_tool_call");
-
-  const benign = JSON.parse(
-    wasm.action_from_agent_tool_call("openclaw", "deploy_service", undefined),
-  );
-  assert.equal(benign.risk, "medium", "non-destructive tool names → Medium");
 });
 
 test("action_from_agent_tool_call throws on malformed params JSON (fail-closed)", async () => {
@@ -1400,7 +1385,7 @@ test("action_from_argv binds the caller's argv verbatim instead of re-parsing ra
   const record = JSON.parse(wasm.action_from_argv(JSON.stringify(argv), raw, "/srv/app"));
 
   assert.equal(record.surface, "command");
-  assert.equal(record.record_schema_version, 1);
+  assert.equal(record.record_schema_version, 2);
   assert.deepEqual(record.syntactic.argv, argv, "argv is the caller's canonical vector");
   assert.equal(record.syntactic.bin, "bash");
   assert.equal(record.syntactic.raw, raw, "raw is recorded verbatim");
@@ -1444,22 +1429,6 @@ test("action_from_argv without raw records no raw and no env_refs", async () => 
     !("env_refs" in record.syntactic),
     "a token vector has already had its $VAR references expanded by whatever produced it",
   );
-});
-
-test("action_from_argv shares the core risk heuristic with action_from_command", async () => {
-  const wasm = await loadWasm();
-
-  const fromArgv = JSON.parse(
-    wasm.action_from_argv(
-      JSON.stringify(["git", "push", "--force"]),
-      "git push --force",
-      undefined,
-    ),
-  );
-  const fromCommand = JSON.parse(wasm.action_from_command("git push --force", undefined));
-
-  assert.equal(fromArgv.risk, "high");
-  assert.deepEqual(fromArgv, fromCommand, "identical inputs must produce byte-identical records");
 });
 
 test("action_from_argv throws on a malformed argv JSON (fail-closed)", async () => {

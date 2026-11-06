@@ -69,14 +69,13 @@ const SPOOF_ESCAPED = "rm -rf ~/x; : \\x1b[2K\\rgit status";
 function context(overrides = {}) {
   return {
     action: {
-      record_schema_version: 1,
+      record_schema_version: 2,
       surface: "command",
       syntactic: { raw: SPOOF },
-      risk: "critical",
     },
     summary: "check git status",
     actor: { id: "machine:ci", kind: "claude-code" },
-    risk: "critical",
+
     reversible: false,
     constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
     ...overrides,
@@ -380,7 +379,6 @@ test("a PowerShell line can't hide a statement from the decision line (#316 B1)"
   );
   assert.match(deciding, / ; Remove-Item -Recurse -Force /, "Remove-Item is its own word");
   assert.ok(!rendered.includes(RAW_ARGV_DIVERGENCE_WARNING), "argv is raw's whitespace split");
-  assert.match(rendered, /^ {2}Risk:\s+high$/m, "a compound line fails upward");
 });
 
 test("a PowerShell Windows path renders verbatim with no divergence warning (#316 B1)", async () => {
@@ -546,7 +544,7 @@ test("UAT: `watch` heads an OpenClaw tool call with its tool and flags its comma
       JSON.stringify(
         context({
           action: {
-            record_schema_version: 1,
+            record_schema_version: 2,
             surface: "agent_tool_call",
             syntactic: {
               server: "deploy-plugin",
@@ -555,7 +553,6 @@ test("UAT: `watch` heads an OpenClaw tool call with its tool and flags its comma
               argv: ["rm", "-rf", "/srv"],
               params,
             },
-            risk: "critical",
           },
           actor: { id: "openclaw:home-mini", kind: "openclaw" },
         }),
@@ -811,10 +808,9 @@ test("the Action and Deciding on lines match the shared CLI/web headline fixture
   for (const [i, c] of fixture.cases.entries()) {
     const ctx = context({
       action: {
-        record_schema_version: 1,
+        record_schema_version: 2,
         surface: c.surface,
         syntactic: c.syntactic,
-        risk: "high",
       },
     });
     const { rendered } = await render(ctx, `req-headline-${String(i)}`);
@@ -861,10 +857,9 @@ test("a tool call with a server and no tool always shows its server (#332 review
   ]) {
     const ctx = context({
       action: {
-        record_schema_version: 1,
+        record_schema_version: 2,
         surface,
         syntactic: { server: "fs", raw: "fs :: read_file", params: { path: "/etc/shadow" } },
-        risk: "high",
       },
     });
     const { rendered } = await render(ctx, `req-server-only-${surface}`);

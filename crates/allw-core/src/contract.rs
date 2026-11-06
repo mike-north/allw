@@ -103,36 +103,6 @@ pub enum Decision {
     Aborted,
 }
 
-/// Coarse risk tier.
-///
-/// v1: coarse heuristic assigned by the integrator/SDK.
-/// Later (T3): capability-derived from the semantic `ActionRecord` fields.
-///
-/// Tiers are ordered by severity, `Low < Medium < High < Critical`. The ordering follows the
-/// declaration order, so keep the variants in ascending severity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Risk {
-    Low,
-    Medium,
-    High,
-    Critical,
-}
-
-impl Risk {
-    /// The tier's wire name (`"low"`, `"medium"`, `"high"`, `"critical"`), the same string serde
-    /// writes. Error messages use it so they name the tier exactly as the JSON does.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::Critical => "critical",
-        }
-    }
-}
-
 // ── SyntacticSubstrate ────────────────────────────────────────────────────────
 
 /// The tokenized, matchable syntactic form of an action.
@@ -222,9 +192,8 @@ pub struct SyntacticSubstrate {
 
 /// A reduced, matchable record of an approvable action.
 ///
-/// v1 populates the syntactic substrate; the semantic `capabilities`/`scope` fields are
-/// reserved for the policy layer's T3 semantic tier and are always `None` in v1.
-/// See `docs/policy-seam.md` §Forward-compat requirements.
+/// Carries caller facts for display and hashing; no danger rating or policy metadata belongs here.
+/// Raw caller input remains authoritative over syntactic projections.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActionRecord {
     /// Schema version for this record shape. Bumped only on a breaking change.
@@ -233,26 +202,8 @@ pub struct ActionRecord {
     /// The interception paradigm this action arrived through.
     pub surface: Surface,
 
-    /// Tokenized syntactic form. Populated in v1; the base all three policy tiers match against.
+    /// Descriptive syntactic projection carried with the caller's authoritative raw form.
     pub syntactic: SyntacticSubstrate,
-
-    /// Coarse risk tier. v1: heuristic. T3: capability-derived.
-    pub risk: Risk,
-
-    /// Reserved for the T3 semantic tier (docs/policy-seam.md §forward-compat req #3).
-    ///
-    /// MUST be `None` in v1. The field is typed `Option<Vec<serde_json::Value>>` so the T3
-    /// engine can layer on capability annotations without a wire-format break. Omitted from
-    /// JSON when `None`.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub capabilities: Option<Vec<serde_json::Value>>,
-
-    /// Reserved for the T3 semantic tier (docs/policy-seam.md §forward-compat req #3).
-    ///
-    /// MUST be `None` in v1. Typed as unstructured JSON to avoid foreclosing the T3 scope
-    /// shape. Omitted from JSON when `None`.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub scope: Option<serde_json::Value>,
 }
 
 // ── Actor ─────────────────────────────────────────────────────────────────────
@@ -312,7 +263,7 @@ mod option_wire_b64_vec {
 
 /// Request constraints on which decisions are valid and whether a challenge is required.
 ///
-/// `challenge_required` governs the number-match challenge for destructive/critical ops. When
+/// `challenge_required` records whether the caller requires a number-match challenge. When
 /// true, the approver signs the four-digit code derived from `request_hash`; verification
 /// fail-closes unless `challenge_response` matches that derived value.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -320,7 +271,7 @@ pub struct Constraints {
     /// Which [`Decision`] variants the approver is permitted to select.
     pub allowed_decisions: Vec<Decision>,
 
-    /// Whether a number-match challenge is required (destructive/critical operations).
+    /// Whether the caller requires a number-match challenge.
     pub challenge_required: bool,
 }
 
@@ -349,11 +300,9 @@ pub struct ApprovalContext {
     /// The automation requesting approval (identity + attestation).
     pub actor: Actor,
 
-    /// Coarse risk classification.
-    pub risk: Risk,
-
-    /// Whether the action can be undone if approved.
-    pub reversible: bool,
+    /// Optional caller assertion that the action can be undone; absence makes no claim.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reversible: Option<bool>,
 
     /// Allowed decisions and challenge policy.
     pub constraints: Constraints,
@@ -361,113 +310,6 @@ pub struct ApprovalContext {
     /// Upstream-gate IDs for audit-chain correlation. Omitted when absent.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub chain: Option<Vec<String>>,
-}
-
-// ── v1 device-side conformance ────────────────────────────────────────────────
-
-/// A semantic `ActionRecord` field reserved for the T3 tier, which v1 requires to be null
-/// (`docs/policy-seam.md` §forward-compat). The hash binds these fields, but no approver shows
-/// them, so a device refuses a context that sets one (see [`ContextViolation`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReservedField {
-    /// `action.capabilities`.
-    Capabilities,
-    /// `action.scope`.
-    Scope,
-}
-
-impl ReservedField {
-    /// The field's JSON path inside the `ApprovalContext`, e.g. `"action.capabilities"`.
-    #[must_use]
-    pub const fn path(self) -> &'static str {
-        match self {
-            Self::Capabilities => "action.capabilities",
-            Self::Scope => "action.scope",
-        }
-    }
-}
-
-/// Why a decrypted [`ApprovalContext`] breaks a v1 rule that the device enforces before it
-/// shows the request (`docs/contract.md` §Device-side context checks).
-///
-/// Each variant names content that the request hash binds but the human can't see or would
-/// misread. The device fails closed: it can't approve the request, so the caller is denied.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ContextViolation {
-    /// One or more reserved semantic fields are non-null. Any non-null JSON value counts,
-    /// including `[]`, `{}`, `""`, `0` and `false`. `fields` lists each one, in field order.
-    ReservedFieldsSet {
-        /// The non-null reserved fields (never empty).
-        fields: Vec<ReservedField>,
-    },
-    /// The context's `risk`, which approvers show, is lower than the record's `action.risk`,
-    /// which they don't. That would hide the record's tier behind a milder one. A context may
-    /// *raise* the risk above the record's; only a downgrade is refused.
-    RiskDowngrade {
-        /// The context's (shown) `risk`.
-        context: Risk,
-        /// The record's (unshown) `action.risk`.
-        action: Risk,
-    },
-}
-
-impl std::fmt::Display for ContextViolation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ReservedFieldsSet { fields } => {
-                let paths: Vec<&str> = fields.iter().map(|field| field.path()).collect();
-                let verb = if paths.len() == 1 { "is" } else { "are" };
-                write!(
-                    f,
-                    "{} {verb} reserved and must be null in v1",
-                    paths.join(" and ")
-                )
-            }
-            Self::RiskDowngrade { context, action } => write!(
-                f,
-                "context risk {} is lower than action.risk {}",
-                context.as_str(),
-                action.as_str()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ContextViolation {}
-
-impl ApprovalContext {
-    /// Checks the v1 rules a device enforces on a decrypted context before showing it. It checks
-    /// the reserved semantic fields first, then for a risk downgrade, and reports the first rule
-    /// broken.
-    ///
-    /// [`crate::decrypt_context`] runs this, so every device surface (WASM approvers, UniFFI
-    /// native apps) gets the check from the one audited place and only renders the error.
-    ///
-    /// # Errors
-    ///
-    /// [`ContextViolation`] naming the offending field(s) or both risk tiers.
-    pub fn check_v1_conformance(&self) -> Result<(), ContextViolation> {
-        let fields: Vec<ReservedField> = [
-            (
-                ReservedField::Capabilities,
-                self.action.capabilities.is_some(),
-            ),
-            (ReservedField::Scope, self.action.scope.is_some()),
-        ]
-        .into_iter()
-        .filter_map(|(field, set)| set.then_some(field))
-        .collect();
-        if !fields.is_empty() {
-            return Err(ContextViolation::ReservedFieldsSet { fields });
-        }
-        if self.risk < self.action.risk {
-            return Err(ContextViolation::RiskDowngrade {
-                context: self.risk,
-                action: self.action.risk,
-            });
-        }
-        Ok(())
-    }
 }
 
 // ── ApprovalRequest ───────────────────────────────────────────────────────────
@@ -592,42 +434,6 @@ impl Verdict {
     }
 }
 
-// ── PolicyDecision / PolicyBlock ──────────────────────────────────────────────
-
-/// Caller-policy outcome vocabulary preserved in the audit wire contract.
-///
-/// v1 always writes `Escalate` (the action was sent to the human gate). `Allow`/`Deny`
-/// remain wire values for external caller policy; allw does not evaluate rules.
-/// See `docs/policy-seam.md` §forward-compat req #4.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PolicyDecision {
-    Allow,
-    Deny,
-    Escalate,
-}
-
-/// Reserved policy block embedded in every [`AuditRecord`].
-///
-/// v1 always writes `decision: escalate`. The block preserves caller-policy provenance in
-/// audit history without making allw an evaluator or rule holder. See `docs/policy-seam.md`
-/// §Forward-compat requirements, item 4, and `AuditRecord`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PolicyBlock {
-    /// The caller-policy decision recorded with this human escalation.
-    pub decision: PolicyDecision,
-
-    /// Optional external rule identifier for correlation; allw never resolves or evaluates it.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub rule_id: Option<String>,
-
-    /// Caller-policy classification label (`"syntactic"` in v1), retained as wire metadata.
-    pub tier: String,
-
-    /// Version of the caller-policy metadata format recorded in this block.
-    pub schema_version: u32,
-}
-
 // ── AuditRecord ───────────────────────────────────────────────────────────────
 
 /// One entry in the append-only, hash-chained audit log.
@@ -671,9 +477,6 @@ pub struct AuditRecord {
 
     /// The action that was approved/denied (full record for audit completeness).
     pub action: ActionRecord,
-
-    /// Reserved policy block. v1 always writes `escalate`. See [`PolicyBlock`].
-    pub policy: PolicyBlock,
 
     /// Optional free-form note from the approver. Omitted when absent.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -769,12 +572,9 @@ mod tests {
 
     fn make_action_record() -> ActionRecord {
         ActionRecord {
-            record_schema_version: 1,
+            record_schema_version: 2,
             surface: Surface::Command,
             syntactic: make_syntactic_command(),
-            risk: Risk::High,
-            capabilities: None,
-            scope: None,
         }
     }
 
@@ -801,8 +601,8 @@ mod tests {
             action: make_action_record(),
             summary: "Force-push to main branch".to_string(),
             actor: make_actor(),
-            risk: Risk::High,
-            reversible: false,
+
+            reversible: Some(false),
             constraints: make_constraints(),
             chain: None,
         }
@@ -841,12 +641,6 @@ mod tests {
             decision: Decision::Approved,
             decided_at: TS_DECIDED,
             action: make_action_record(),
-            policy: PolicyBlock {
-                decision: PolicyDecision::Escalate,
-                rule_id: None,
-                tier: "syntactic".to_string(),
-                schema_version: 1,
-            },
             note: None,
             sig: SAMPLE_JWS.to_string(),
         }
@@ -878,15 +672,6 @@ mod tests {
         ] {
             let json = serde_json::to_string(&v).unwrap();
             let back: Decision = serde_json::from_str(&json).unwrap();
-            assert_eq!(v, back);
-        }
-    }
-
-    #[test]
-    fn risk_round_trip() {
-        for v in [Risk::Low, Risk::Medium, Risk::High, Risk::Critical] {
-            let json = serde_json::to_string(&v).unwrap();
-            let back: Risk = serde_json::from_str(&json).unwrap();
             assert_eq!(v, back);
         }
     }
@@ -1048,14 +833,7 @@ mod tests {
             val["actor"].get("attestation").is_none(),
             "actor.attestation: None must be omitted from JSON"
         );
-        assert!(
-            val["action"].get("capabilities").is_none(),
-            "ActionRecord.capabilities: None must be omitted from JSON (reserved T3 field)"
-        );
-        assert!(
-            val["action"].get("scope").is_none(),
-            "ActionRecord.scope: None must be omitted from JSON (reserved T3 field)"
-        );
+
         // chain: None is omitted too.
         assert!(
             val.get("chain").is_none(),
@@ -1068,19 +846,6 @@ mod tests {
         let orig = make_verdict();
         let json = serde_json::to_string(&orig).unwrap();
         let back: Verdict = serde_json::from_str(&json).unwrap();
-        assert_eq!(orig, back);
-    }
-
-    #[test]
-    fn policy_block_round_trip() {
-        let orig = PolicyBlock {
-            decision: PolicyDecision::Escalate,
-            rule_id: None,
-            tier: "syntactic".to_string(),
-            schema_version: 1,
-        };
-        let json = serde_json::to_string(&orig).unwrap();
-        let back: PolicyBlock = serde_json::from_str(&json).unwrap();
         assert_eq!(orig, back);
     }
 
@@ -1147,7 +912,7 @@ mod tests {
     #[test]
     fn action_record_with_unknown_surface_fails_closed_on_deserialize() {
         let bad_json = r#"{
-            "record_schema_version": 1,
+            "record_schema_version": 2,
             "surface": "totally_unknown_surface",
             "syntactic": {},
             "risk": "low"
@@ -1177,34 +942,6 @@ mod tests {
         assert_eq!(
             serde_json::to_value(Decision::Aborted).unwrap(),
             json!("aborted")
-        );
-    }
-
-    #[test]
-    fn risk_variants_serialize_to_snake_case() {
-        // contract.md §Wire encoding: Risk variants are snake_case
-        assert_eq!(serde_json::to_value(Risk::Low).unwrap(), json!("low"));
-        assert_eq!(serde_json::to_value(Risk::Medium).unwrap(), json!("medium"));
-        assert_eq!(serde_json::to_value(Risk::High).unwrap(), json!("high"));
-        assert_eq!(
-            serde_json::to_value(Risk::Critical).unwrap(),
-            json!("critical")
-        );
-    }
-
-    #[test]
-    fn policy_decision_variants_serialize_to_snake_case() {
-        assert_eq!(
-            serde_json::to_value(PolicyDecision::Allow).unwrap(),
-            json!("allow")
-        );
-        assert_eq!(
-            serde_json::to_value(PolicyDecision::Deny).unwrap(),
-            json!("deny")
-        );
-        assert_eq!(
-            serde_json::to_value(PolicyDecision::Escalate).unwrap(),
-            json!("escalate")
         );
     }
 
@@ -1259,42 +996,6 @@ mod tests {
     }
 
     // ── Structural JSON assertions: reserved semantic fields omitted ───────────
-
-    /// docs/policy-seam.md §forward-compat req #3 + issue #1 AC:
-    /// When capabilities and scope are None, they MUST be absent from JSON.
-    #[test]
-    fn action_record_omits_reserved_fields_when_none() {
-        let action = make_action_record(); // capabilities: None, scope: None
-        let val: Value = serde_json::to_value(&action).unwrap();
-
-        assert!(
-            val.get("capabilities").is_none(),
-            "capabilities MUST be absent from JSON when None (policy-seam.md §forward-compat req #3)"
-        );
-        assert!(
-            val.get("scope").is_none(),
-            "scope MUST be absent from JSON when None (policy-seam.md §forward-compat req #3)"
-        );
-    }
-
-    /// When capabilities is Some, the key MUST be present (proves T3 reserve round-trips).
-    #[test]
-    fn action_record_includes_capabilities_when_some() {
-        let mut action = make_action_record();
-        action.capabilities = Some(vec![json!({"name": "filesystem.write"})]);
-        action.scope = Some(json!({"path": "/home/user/repo"}));
-
-        let val: Value = serde_json::to_value(&action).unwrap();
-
-        assert!(
-            val.get("capabilities").is_some(),
-            "capabilities must be present in JSON when Some"
-        );
-        assert!(
-            val.get("scope").is_some(),
-            "scope must be present in JSON when Some"
-        );
-    }
 
     // ── Structural JSON assertions: verdict scope-free invariant ──────────────
 

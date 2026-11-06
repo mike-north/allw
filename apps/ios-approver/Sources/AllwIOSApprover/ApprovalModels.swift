@@ -24,13 +24,7 @@ public enum ActorAttestationState: String, Equatable, Sendable {
     case pending
 }
 
-/// Contract risk levels shown in the WYSIWYS detail.
-public enum ApprovalRiskLevel: String, Equatable, Sendable {
-    case low
-    case medium
-    case high
-    case critical
-}
+
 
 /// Errors the native inbox turns into fail-closed render states.
 public enum ApprovalInboxError: Error, Equatable, CustomStringConvertible, Sendable {
@@ -92,18 +86,6 @@ public struct ApprovalActor: Equatable, Sendable {
         self.id = id
         self.display = display
         self.attestation = attestation
-    }
-}
-
-public struct ApprovalRisk: Equatable, Sendable {
-    public let level: ApprovalRiskLevel
-    public let reversible: Bool
-    public let summary: String
-
-    public init(level: ApprovalRiskLevel, reversible: Bool, summary: String) {
-        self.level = level
-        self.reversible = reversible
-        self.summary = summary
     }
 }
 
@@ -171,20 +153,25 @@ public struct PreparedApproval: Equatable, Sendable {
 public struct ApprovalContext: Equatable, Sendable {
     public let action: ApprovalAction
     public let actor: ApprovalActor
-    public let risk: ApprovalRisk
+    /// Escaped caller description; never a danger rating.
+    public let summary: String
+    /// Optional caller assertion; absence makes no reversibility claim.
+    public let reversible: Bool?
     public let allowedDecisions: [ApprovalDecision]
     public let challenge: NumberMatchChallenge?
 
     public init(
         action: ApprovalAction,
         actor: ApprovalActor,
-        risk: ApprovalRisk,
+        summary: String,
+        reversible: Bool? = nil,
         allowedDecisions: [ApprovalDecision],
         challenge: NumberMatchChallenge?
     ) {
         self.action = action
         self.actor = actor
-        self.risk = risk
+        self.summary = summary
+        self.reversible = reversible
         self.allowedDecisions = allowedDecisions
         self.challenge = challenge
     }
@@ -225,7 +212,6 @@ public struct ApprovalListItem: Equatable, Sendable {
     public let id: String
     public let status: ApprovalStatus
     public let actor: String
-    public let riskLevel: ApprovalRiskLevel?
     public let summary: String
     public let expiresAt: Int64
     public let countdownMs: Int64
@@ -238,7 +224,6 @@ public struct ApprovalDetail: Equatable, Sendable {
     public let actor: String
     public let actorId: String?
     public let attestation: ActorAttestationState?
-    public let riskLevel: ApprovalRiskLevel?
     public let summary: String
     public let exactPlaintext: String
     public let requestHash: String?

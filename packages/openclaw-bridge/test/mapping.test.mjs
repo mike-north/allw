@@ -19,9 +19,7 @@ import {
   buildExecApprovalRequest,
   buildPluginApprovalRequest,
   execSummary,
-  floorRisk,
   pluginSummary,
-  reversibleForRisk,
   slugifyTitle,
 } from "../dist/index.js";
 import {
@@ -66,7 +64,7 @@ test("exec approvals map to surface 'command' (§5.1)", () => {
   const result = build();
   assert.equal(result.kind, "request");
   assert.equal(result.request.action.surface, "command");
-  assert.equal(result.request.action.recordSchemaVersion, 1);
+  assert.equal(result.request.action.recordSchemaVersion, 2);
 });
 
 test("syntactic.argv is systemRunPlan.argv verbatim — never a re-tokenization (§5.1)", () => {
@@ -225,62 +223,6 @@ test("allowed_decisions is always ['approved','denied'] regardless of OpenClaw's
 
 // ── §6.4 risk, challenge, reversibility ─────────────────────────────────────────
 
-test("risk comes from the core's classify_risk over the bound argv (§6.4)", () => {
-  // `git push --force` is High in the core's documented v1 heuristic.
-  assert.equal(build().request.risk, "high");
-  assert.equal(build().request.action.risk, "high");
-});
-
-test("a non-empty warningText floors the risk at high (§5.1, §6.4)", () => {
-  const event = execEvent({
-    request: { warningText: "this command was flagged by the gateway" },
-    systemRunPlan: { argv: ["ls"], commandText: "ls", cwd: "/srv" },
-  });
-  const result = build({ event, snapshot: execSnapshot({ presentation: { commandText: "ls" } }) });
-  assert.equal(result.request.risk, "high", "`ls` classifies Low; the warning floors it at high");
-});
-
-test("a blank warningText does not floor the risk", () => {
-  const event = execEvent({
-    request: { warningText: "   " },
-    systemRunPlan: { argv: ["ls"], commandText: "ls", cwd: "/srv" },
-  });
-  const result = build({ event, snapshot: execSnapshot({ presentation: { commandText: "ls" } }) });
-  assert.equal(result.request.risk, "low");
-});
-
-test("challenge_required is exactly risk === 'critical' (§6.4)", () => {
-  assert.equal(build().request.constraints.challengeRequired, false);
-
-  const event = execEvent({
-    systemRunPlan: {
-      argv: ["dd", "if=/dev/zero", "of=/dev/disk2"],
-      commandText: "dd if=/dev/zero of=/dev/disk2",
-      cwd: "/",
-    },
-  });
-  const critical = build({
-    event,
-    snapshot: execSnapshot({ presentation: { commandText: "dd if=/dev/zero of=/dev/disk2" } }),
-  });
-  assert.equal(critical.request.risk, "critical");
-  assert.equal(critical.request.constraints.challengeRequired, true);
-});
-
-test("reversible is risk ∈ {low, medium} (§6.4)", () => {
-  assert.equal(reversibleForRisk("low"), true);
-  assert.equal(reversibleForRisk("medium"), true);
-  assert.equal(reversibleForRisk("high"), false);
-  assert.equal(reversibleForRisk("critical"), false);
-  assert.equal(build().request.reversible, false, "git push --force is High ⇒ not reversible");
-});
-
-test("floorRisk never lowers a risk", () => {
-  assert.equal(floorRisk("critical", "high"), "critical");
-  assert.equal(floorRisk("low", "high"), "high");
-  assert.equal(floorRisk("high", "high"), "high");
-});
-
 test("the derived timeout is carried onto the request (§8)", () => {
   assert.equal(build({ timeoutMs: 31_337 }).request.timeoutMs, 31_337);
 });
@@ -422,7 +364,7 @@ test("plugin approvals map to surface 'agent_tool_call' (§5.2)", () => {
   const result = buildPlugin();
   assert.equal(result.kind, "request");
   assert.equal(result.request.action.surface, "agent_tool_call");
-  assert.equal(result.request.action.recordSchemaVersion, 1);
+  assert.equal(result.request.action.recordSchemaVersion, 2);
 });
 
 test("syntactic.server is pluginId, syntactic.tool is toolName (§5.2)", () => {
@@ -468,22 +410,6 @@ test("syntactic.raw is description, plus detail when present (§5.2)", () => {
     withDetail.request.action.syntactic.raw,
     "This plugin wants to deploy to production.\n\nIt will restart 3 pods.",
   );
-});
-
-test("risk comes from severity: info→low, warning→medium, critical→critical (§5.2, §6.4)", () => {
-  const info = buildPlugin({ event: pluginEvent({ request: { severity: "info" } }) });
-  assert.equal(info.request.risk, "low");
-
-  const warning = buildPlugin({ event: pluginEvent({ request: { severity: "warning" } }) });
-  assert.equal(warning.request.risk, "medium");
-
-  const critical = buildPlugin({ event: pluginEvent({ request: { severity: "critical" } }) });
-  assert.equal(critical.request.risk, "critical");
-});
-
-test("absent severity defaults to the upstream 'warning' default (medium risk) (§5.2)", () => {
-  const result = buildPlugin({ event: pluginEvent({ request: { severity: undefined } }) });
-  assert.equal(result.request.risk, "medium");
 });
 
 test("summary follows the §6.2 plugin template", () => {
@@ -536,16 +462,6 @@ test("allowed_decisions is always ['approved','denied'] for plugin approvals too
     });
     assert.deepEqual(result.request.constraints.allowedDecisions, ["approved", "denied"]);
   }
-});
-
-test("challenge_required/reversible follow the shared risk rule for plugin approvals (§6.4)", () => {
-  const critical = buildPlugin({ event: pluginEvent({ request: { severity: "critical" } }) });
-  assert.equal(critical.request.constraints.challengeRequired, true);
-  assert.equal(critical.request.reversible, false);
-
-  const info = buildPlugin({ event: pluginEvent({ request: { severity: "info" } }) });
-  assert.equal(info.request.constraints.challengeRequired, false);
-  assert.equal(info.request.reversible, true);
 });
 
 test("the derived timeout is carried onto the plugin request (§8)", () => {
@@ -643,7 +559,7 @@ test("the snapshot's severity is canonical when the event omits it (§5.2, §6.1
     snapshot: pluginSnapshot({ presentation: { severity: "critical" } }),
   });
   assert.equal(result.kind, "request");
-  assert.equal(result.request.risk, "critical");
+
   assert.equal(result.request.constraints.challengeRequired, true);
 });
 
@@ -726,4 +642,15 @@ test("pluginSummary renders the §6.2 template with the resolved server/tool ide
     }),
     "OpenClaw gw · agent a · openclaw/deploy_service: Deploy — deploy now",
   );
+});
+
+// #406: every upstream approval asks for number match; allw makes no risk/reversibility claim.
+test("exec and plugin requests omit danger and reversibility assertions", () => {
+  for (const result of [build(), buildPlugin()]) {
+    assert.equal(result.kind, "request");
+    assert.equal(result.request.constraints.challengeRequired, true);
+    assert.equal(Object.hasOwn(result.request, "risk"), false);
+    assert.equal(Object.hasOwn(result.request.action, "risk"), false);
+    assert.equal(Object.hasOwn(result.request, "reversible"), false);
+  }
 });

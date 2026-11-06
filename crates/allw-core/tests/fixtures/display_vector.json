@@ -153,120 +153,118 @@
     },
     {
       "class": "stacked combining marks: the third and later on one base are escaped (zalgo)",
-      "input": "o\u0336\u0336\u0301\u0301",
-      "escaped": "o\u0336\u0336⟨U+0301⟩⟨U+0301⟩",
+      "input": "ó̶̶́",
+      "escaped": "o̶̶⟨U+0301⟩⟨U+0301⟩",
       "has_hidden_or_control_chars": true
     },
     {
       "class": "one combining mark (decomposed é) is shown",
-      "input": "cafe\u0301",
-      "escaped": "cafe\u0301",
+      "input": "café",
+      "escaped": "café",
       "has_hidden_or_control_chars": false
     },
     {
       "class": "two combining marks (Vietnamese ệ decomposed) are shown",
-      "input": "e\u0323\u0302",
-      "escaped": "e\u0323\u0302",
+      "input": "ệ",
+      "escaped": "ệ",
       "has_hidden_or_control_chars": false
     },
     {
       "class": "a new base starts a new run of combining marks",
-      "input": "a\u0301\u0301b\u0301\u0301",
-      "escaped": "a\u0301\u0301b\u0301\u0301",
+      "input": "á́b́́",
+      "escaped": "á́b́́",
       "has_hidden_or_control_chars": false
     },
     {
       "class": "enclosing marks (Me) count toward the run",
-      "input": "x\u20dd\u20dd\u20dd",
-      "escaped": "x\u20dd\u20dd⟨U+20DD⟩",
+      "input": "x⃝⃝⃝",
+      "escaped": "x⃝⃝⟨U+20DD⟩",
       "has_hidden_or_control_chars": true
     },
     {
       "class": "combining marks with no base are counted from the start",
-      "input": "\u0301\u0301\u0301",
-      "escaped": "\u0301\u0301⟨U+0301⟩",
+      "input": "́́́",
+      "escaped": "́́⟨U+0301⟩",
       "has_hidden_or_control_chars": true
     },
     {
       "class": "an escaped grapheme joiner does not end a run of combining marks",
-      "input": "a\u0301\u034f\u0301",
-      "escaped": "a\u0301⟨U+034F⟩⟨U+0301⟩",
+      "input": "á͏́",
+      "escaped": "á⟨U+034F⟩⟨U+0301⟩",
       "has_hidden_or_control_chars": true
     },
     {
       "class": "variation selector after a combining mark",
-      "input": "a\u0301\ufe0f",
-      "escaped": "a\u0301⟨U+FE0F⟩",
+      "input": "á️",
+      "escaped": "á⟨U+FE0F⟩",
       "has_hidden_or_control_chars": true
     },
     {
       "class": "Mongolian variation selector after a Mongolian combining mark",
-      "input": "ᠠ\u18a9\u180b",
-      "escaped": "ᠠ\u18a9⟨U+180B⟩",
+      "input": "ᠠᢩ᠋",
+      "escaped": "ᠠᢩ⟨U+180B⟩",
       "has_hidden_or_control_chars": true
     },
     {
       "class": "emoji keycap (U+FE0F then the enclosing keycap) stays within the run limit",
-      "input": "1\ufe0f\u20e3",
-      "escaped": "1\ufe0f\u20e3",
+      "input": "1️⃣",
+      "escaped": "1️⃣",
       "has_hidden_or_control_chars": false
     },
     {
       "class": "a Unicode 17.0 combining mark (U+1ACF) is capped like any other",
-      "input": "o\u1acf\u1acf\u1acf",
-      "escaped": "o\u1acf\u1acf⟨U+1ACF⟩",
+      "input": "o᫏᫏᫏",
+      "escaped": "o᫏᫏⟨U+1ACF⟩",
       "has_hidden_or_control_chars": true
     },
     {
       "class": "an unassigned code point (U+0378, Cn in 17.0.0) counts toward a run of combining marks",
-      "input": "e\u0301\u0301\u0378",
-      "escaped": "e\u0301\u0301⟨U+0378⟩",
+      "input": "é́͸",
+      "escaped": "é́⟨U+0378⟩",
       "has_hidden_or_control_chars": true
     },
     {
       "class": "an unassigned code point outside a run of marks is shown",
-      "input": "o\u0378",
-      "escaped": "o\u0378",
+      "input": "o͸",
+      "escaped": "o͸",
       "has_hidden_or_control_chars": false
     },
     {
       "class": "an ideographic variation selector after a Unicode 17.0 ideograph (CJK Extension J) is shown",
-      "input": "𳑹\udb40\udd00",
-      "escaped": "𳑹\udb40\udd00",
+      "input": "𳑹󠄀",
+      "escaped": "𳑹󠄀",
       "has_hidden_or_control_chars": false
     },
     {
       "class": "accepted false positive: Burmese မြို့ ('city', U+1019 U+103C U+102D U+102F U+1037) has three marks after the spacing medial; the third warns",
-      "input": "မ\u103c\u102d\u102f\u1037",
-      "escaped": "မ\u103c\u102d\u102f⟨U+1037⟩",
+      "input": "မြို့",
+      "escaped": "မြို⟨U+1037⟩",
       "has_hidden_or_control_chars": true
     },
     {
       "class": "accepted false positive: Tibetan སྐྱེས ('born', U+0F66 U+0F90 U+0FB1 U+0F7A U+0F66), subjoined ka and ya then the vowel e; the vowel warns",
-      "input": "ས\u0f90\u0fb1\u0f7aས",
-      "escaped": "ས\u0f90\u0fb1⟨U+0F7A⟩ས",
+      "input": "སྐྱེས",
+      "escaped": "སྐྱ⟨U+0F7A⟩ས",
       "has_hidden_or_control_chars": true
     }
   ],
   "display_model_case": {
     "context": {
       "action": {
-        "record_schema_version": 1,
+        "record_schema_version": 2,
         "surface": "command",
         "syntactic": {
           "bin": "rm",
           "argv": ["rm", "-rf", "~/x;", ":", "\u001b[2K\rgit", "status"],
           "cwd": "/home/dev/‮ppa",
           "raw": "rm -rf ~/x; : \u001b[2K\rgit status"
-        },
-        "risk": "critical"
+        }
       },
       "summary": "check git status",
       "actor": {
         "id": "machine:ci​",
         "kind": "claude-code"
       },
-      "risk": "critical",
       "reversible": false,
       "constraints": {
         "allowed_decisions": ["approved", "denied"],
@@ -275,7 +273,6 @@
     },
     "expected": {
       "surface": "command",
-      "risk": "critical",
       "reversible": false,
       "summary": "check git status",
       "actor_id": "machine:ci⟨U+200B⟩",
@@ -323,8 +320,8 @@
     {
       "class": "stacked combining marks inside file content are escaped and flagged",
       "surface": "file_edit",
-      "raw": "a\u0301\u0301\u0301\u000ab",
-      "raw_lines": ["a\u0301\u0301⟨U+0301⟩", "b"],
+      "raw": "á́́\nb",
+      "raw_lines": ["á́⟨U+0301⟩", "b"],
       "has_hidden_or_control_chars": true
     }
   ]

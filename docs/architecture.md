@@ -8,6 +8,12 @@ notifications, and key storage only.
 notifications, widgets, Siri / Shortcuts, hardware-backed keys, the Watch — is core value, not chrome, and a
 deliberate moat over web / Electron / push-only competitors.
 
+**#406 partial implementation:** allw does not interpret what an action does or rate its danger.
+Risk labels/scoring and policy-only wire metadata are removed. `reversible` is an optional caller assertion;
+hooks and the OpenClaw bridge omit it. Command/PowerShell tokenization, no-program refusals, web command
+interpretation, and parsed/derived fields remain temporarily and are scheduled for removal in slice 2.
+They are not product scope. Faithful raw/cwd/caller argv/MCP/file-edit display and escaping remain.
+
 ## Decisions at a glance
 
 | Component                   | Choice                                                                                                   | Why                                                                                                                                                                                                                                                          |
@@ -49,32 +55,17 @@ generate rules, or decide whether an action runs. Callers compose that decision 
    DPAPI / libsecret (desktop — reuse vaultkeeper's backend abstraction). Signing keys never leave hardware.
 ```
 
-## Structure-not-data boundary
+## Relay data boundary
 
-The relay (and anything off-device) may observe action **structure** — surface kind, program / server+tool
-name, session label — but **never** action **data**: arguments, parameter values, environment variable names or
-values, or any content the agent is operating on. "Know the function, not the arguments." For MCP calls the
-function identity is the (server, tool) pair, parallel to a command's program name; both are structure. This
-tightens the existing E2EE / zero-knowledge property; it does not loosen it.
+The current relay-visible request envelope has exactly routing/lifecycle metadata (`v`, `id`,
+`created_at`, `expires_at`, `approver`) and opaque `context_ciphertext`. All action structure and data
+stay encrypted, including surface, program names, MCP server/tool names and session labels.
+The relay does not decrypt, compute request hashes, or render actions: its vendored WASM verifies
+account state, pairing authorization and plaintext-free verdict provenance.
 
-**Where the boundary is enforced:** on-device, in the WASM/native client, before any bytes reach the relay.
-The integrator constructs the `ApprovalRequest` envelope with at most an `action_structure` field (structure
-only) in the plaintext portion; all `ActionRecord` data travels exclusively inside the JWE
-`context_ciphertext`. The relay can never access data fields regardless of transport.
-
-**How the preference is carried:** a RESERVED `privacy_preference` wire field on `ApprovalRequest` (null =
-`"default"` in v1) controls how much structure the relay sees:
-
-- **default** (structure-visible) — relay receives `action_structure` (surface / program / server+tool /
-  session-label); v1 implementation.
-- **paranoid / enterprise** (structure-hidden) — relay receives routing metadata only; `action_structure`
-  omitted; reserved, not built.
-- **ai-summary** — future tier; reserved, not built.
-
-The enforcement point (WASM/native client) matters: it means structure-data stripping happens in the same
-audited Rust core that handles JOSE crypto and verdict verification — no separate enforcement layer, no
-opportunity for a surface to accidentally forward data. See [contract.md](./contract.md) §Messages and
-[threat-model.md](./threat-model.md) §R7 for the full invariant.
+Structure-visible metadata/privacy tiers are unimplemented proposals held in #216. Slice 2 removes
+derived program names, so that design needs reconsideration; no alternative metadata source is chosen.
+See [contract.md](./contract.md) §Messages for the actual envelope.
 
 ## Local execution: WASM, not native binaries
 
@@ -120,10 +111,10 @@ Going native buys:
 - **Ambient, glanceable pending state** — an iOS **Live Activity / Dynamic Island** showing "N approvals
   pending" + an **expiry countdown**; the Android analog is an **ongoing/foreground-service notification**; on
   macOS, a **menu-bar item**. No competitor (Clawvisor, ntfy, HumanLayer) does more than fire a push.
-- **Decide from the notification** — Approve/Deny (and number-match for destructive ops) inline from the lock
+- **Decide from the notification** — Approve/Deny (and caller-requested number-match) inline from the lock
   screen / **Apple Watch**, with rich in-notification context (the command, the diff, the record).
 - **Urgency control** — Time-Sensitive / Critical (iOS) and heads-up (Android) to pierce Focus/DND when an
-  approval is genuinely blocking, plus per-risk **notification channels** so the user tunes each tier's loudness.
+  approval is genuinely blocking, plus notification controls chosen by the user.
 - **Beyond notifications** — desktop/lock-screen **widgets** (WidgetKit), **Siri Shortcuts / App Intents**
   (voice, Action Button, interactive widgets, Spotlight, automations), **hardware-backed keys** (Secure Enclave /
   StrongBox) with **biometric-gated approval signing** (the verdict key never leaves hardware, released by
@@ -173,7 +164,7 @@ shared core rather than reimplementing crypto.
 | -------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------- |
 | iOS      | Swift / SwiftUI                          | Interactive notifications (Approve/Deny on lock screen) · **Live Activity + Dynamic Island** (pending + expiry) · **widgets** (WidgetKit) · **App Intents / Siri** (voice, Action Button, Spotlight) · Time-Sensitive/Critical · **Apple Watch** | Secure Enclave + Keychain  |
 | macOS    | Swift / SwiftUI (shares iOS)             | Notification Center actions · **menu-bar item** (persistent "N pending") · **desktop widgets** · App Intents · Focus filters (Live Activities are iOS-only; mirror to Mac via Continuity)                                                        | Secure Enclave + Keychain  |
-| Android  | Kotlin / Compose                         | Notification actions · heads-up · **ongoing/foreground-service** persistent pending · **home-screen widgets** · per-risk channels · **Wear OS**                                                                                                  | StrongBox / Keystore       |
+| Android  | Kotlin / Compose                         | Notification actions · heads-up · **ongoing/foreground-service** persistent pending · **home-screen widgets** · **Wear OS**                                                                                                                      | StrongBox / Keystore       |
 | Windows  | **Native** — WinUI 3 + C#/.NET           | **Updatable adaptive toasts** (WinRT) w/ buttons & inputs · Action Center persistence · **tray icon** ambient presence · Win11 widgets                                                                                                           | DPAPI / Credential Manager |
 | Linux    | **Native** — Rust + `gtk4-rs`/libadwaita | D-Bus notification **actions** · **StatusNotifierItem tray** persistence (platform-capped: no Live-Activity equivalent regardless of toolkit)                                                                                                    | libsecret                  |
 

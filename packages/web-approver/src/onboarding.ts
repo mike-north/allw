@@ -3,7 +3,7 @@
  *
  * Explains three concepts before a new user ever sees the pairing form: the human-in-the-loop
  * approval model, WYSIWYS ("what you see is what you sign"), and the number-match challenge used
- * for destructive/high-risk actions. This is a **purely explanatory** flow — it renders no
+ * when the caller requires it. This is a **purely explanatory** flow — it renders no
  * approve/deny controls and holds no `WebApproverController`/`WebApproverRuntime` reference, so
  * there is no path from this module into the approve-capable inbox. The only way forward is
  * {@link mountOnboardingGate}'s `onComplete` callback, which `src/app.ts` wires to the existing
@@ -73,7 +73,7 @@ const STEPS: readonly OnboardingStep[] = [
     kicker: "Human-in-the-loop approvals",
     headline: "Every sensitive action waits for you.",
     subcopy:
-      "allw pauses an agent's high-risk actions and asks you — a human — to approve or deny. It is not a password and not a standing rule that silently grants access; a verdict only ever tightens what the agent can do.",
+      "When a caller asks for approval, allw shows you the action so you can approve or deny. It is not a password and not a standing rule that silently grants access; a verdict only ever tightens what the agent can do.",
     bullets: [
       "Approvals never happen automatically — a human decides.",
       "No response, timeout, or unverifiable signature ⇒ the action is denied.",
@@ -92,12 +92,12 @@ const STEPS: readonly OnboardingStep[] = [
     ],
   },
   {
-    kicker: "Number-match for high-risk actions",
+    kicker: "Number-match when requested",
     headline: "A short code confirms it's really you.",
     subcopy:
-      "For destructive or irreversible actions, allw shows a short code you must re-enter to approve. Re-typing it proves a human deliberately confirmed this specific request.",
+      "When the caller requests number-match, allw shows a short code you must re-enter to approve. Re-typing it proves a human deliberately confirmed this specific request.",
     bullets: [
-      "Only shown for actions flagged as destructive or high-risk.",
+      "Shown when the caller requires number-match for this request.",
       "The code is derived from the exact request you're approving.",
       "Denials never need the code — only approvals do.",
     ],

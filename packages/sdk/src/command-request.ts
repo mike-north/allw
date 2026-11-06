@@ -27,7 +27,7 @@
 
 import { hostname } from "node:os";
 
-import type { ActionRecord, Actor, ApprovalRequest, Constraints, Risk } from "./index.js";
+import type { ActionRecord, Actor, ApprovalRequest, Constraints } from "./index.js";
 import { loadWasm } from "./wasm.js";
 
 /**
@@ -355,11 +355,7 @@ function coreRefusalKind(err: unknown): string {
  *   ({@link commandActionFromLine}).
  * - `cwd` — `process.cwd()`. Pass the directory you will run the command in if it differs, or
  *   `null` to leave the record unbound.
- * - `risk` — **taken from the core-built `action.risk`**, so the caller never states it twice and
- *   cannot contradict the core's classification. (Not overridable.)
- * - `actor` — `{ id: "machine:<os.hostname()>", kind: "script" }`.
- * - `reversible` — `false` (the human is told the action cannot be undone unless the caller says
- *   otherwise).
+ * - `reversible` — omitted unless the caller supplies a boolean assertion.
  * - `timeoutMs`, `signal`, `constraints`, `chain` — passed through when given; otherwise
  *   `requestApproval`'s own defaults apply.
  *
@@ -420,8 +416,8 @@ export async function commandRequest(input: CommandRequestInput): Promise<Approv
     action,
     summary: input.summary,
     actor,
-    risk: action.risk,
-    reversible: input.reversible ?? false,
+
+    ...(input.reversible !== undefined ? { reversible: input.reversible } : {}),
     // Optional fields are spread only when present so absent values omit the key
     // (exactOptionalPropertyTypes), matching a hand-built request byte for byte.
     ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
@@ -525,10 +521,8 @@ function optionalString(value: unknown, name: string): string | undefined {
   return value;
 }
 
-/** The exact top-level keys a v1 core `command` record carries (reserved T3 slots are omitted). */
-const CORE_RECORD_KEYS = ["record_schema_version", "surface", "syntactic", "risk"] as const;
-
-const RISKS: readonly Risk[] = ["low", "medium", "high", "critical"];
+/** The exact top-level keys of the current core command record; no policy/risk slots exist. */
+const CORE_RECORD_KEYS = ["record_schema_version", "surface", "syntactic"] as const;
 
 /**
  * Translate the core's snake_case `ActionRecord` JSON into the SDK's camelCase
@@ -562,7 +556,6 @@ export function actionRecordFromCoreJson(json: string): ActionRecord {
   }
   const version = record.record_schema_version;
   const surface = record.surface;
-  const risk = record.risk;
   const syntactic = record.syntactic;
   if (typeof version !== "number" || !Number.isInteger(version)) {
     throw new CommandActionError("core_record_invalid", "the core record has no schema version");
@@ -573,16 +566,10 @@ export function actionRecordFromCoreJson(json: string): ActionRecord {
       `the core record surface is ${JSON.stringify(surface)}, not "command"`,
     );
   }
-  if (!RISKS.includes(risk as Risk)) {
-    throw new CommandActionError(
-      "core_record_invalid",
-      `the core record risk ${JSON.stringify(risk)} is not a known tier`,
-    );
-  }
   if (typeof syntactic !== "object" || syntactic === null || Array.isArray(syntactic)) {
     throw new CommandActionError("core_record_invalid", "the core record has no syntactic object");
   }
-  return { recordSchemaVersion: version, surface, syntactic, risk: risk as Risk };
+  return { recordSchemaVersion: version, surface, syntactic };
 }
 
 /** A short type description for error messages (never echoes the value itself). */

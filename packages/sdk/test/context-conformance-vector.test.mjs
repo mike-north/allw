@@ -1,15 +1,6 @@
 /**
- * WASM half of the shared v1 device-side context-check vector (#296).
- *
- * `crates/allw-core/tests/fixtures/context_conformance_vector.json` is asserted by the Rust core
- * (`crates/allw-core/tests/context_conformance_vector.rs`) and, here, through the compiled `.wasm`.
- * Each case is sealed with `encrypt_context` and opened with `decrypt_context`, the call both
- * approvers make. That shows a context with non-null reserved fields, or a hidden risk downgrade,
- * can't be opened on a device. Expected values are hand-written from `docs/contract.md`
- * §Device-side context checks.
- *
- * @see ../../../docs/contract.md
- * @see ../../../crates/allw-core/tests/fixtures/context_conformance_vector.json
+ * Rust/WASM parity for removed fields following the existing ignore-unknown contract.
+ * @see ../../../docs/contract.md §Unknown fields and optional assertions
  */
 
 import { test } from "node:test";
@@ -72,32 +63,16 @@ test("decrypt_context accepts or refuses every case in the shared vector", async
   ]);
 
   for (const c of vector.cases) {
+    assert.equal(c.expected, "accepted", c.class);
     const context = patched(vector.base_context, c.set);
     const jwe = wasm.encrypt_context(JSON.stringify(context), recipients);
     const open = () =>
       JSON.parse(wasm.decrypt_context(jwe, vector.device_id, vector.device_x25519_seed_b64));
 
-    if (c.expected === "accepted") {
-      const opened = open();
-      assert.equal(opened.risk, context.risk, c.class);
-      assert.equal(opened.action.risk, context.action.risk, c.class);
-      assert.equal(opened.action.capabilities, undefined, c.class);
-      assert.equal(opened.action.scope, undefined, c.class);
-    } else {
-      assert.equal(c.expected, "refused", c.class);
-      assert.equal(typeof c.expected_error, "string", c.class);
-      assert.throws(
-        open,
-        (err) => {
-          assert.ok(err instanceof Error, c.class);
-          assert.ok(
-            err.message.includes(c.expected_error),
-            `${c.class}: ${JSON.stringify(err.message)} should name ${JSON.stringify(c.expected_error)}`,
-          );
-          return true;
-        },
-        c.class,
-      );
-    }
+    const opened = open();
+    assert.equal(opened.risk, undefined, c.class);
+    assert.equal(opened.action.risk, undefined, c.class);
+    assert.equal(opened.action.capabilities, undefined, c.class);
+    assert.equal(opened.action.scope, undefined, c.class);
   }
 });

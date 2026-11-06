@@ -624,14 +624,13 @@ function makeRelay(served) {
 function sampleRequest() {
   return {
     action: {
-      recordSchemaVersion: 1,
+      recordSchemaVersion: 2,
       surface: "command",
       syntactic: { bin: "ls", argv: ["ls"] },
-      risk: "low",
     },
     summary: "List files",
     actor: { id: "machine:test", kind: "claude-code" },
-    risk: "low",
+
     reversible: true,
     timeoutMs: 60_000,
   };

@@ -9,8 +9,8 @@
 use allw_core::{
     compute_request_hash, encrypt_context, sign_account_state, sign_actor_attestation,
     AccountState, AccountStateActor, AccountStateRevocation, AccountStateRevocationKind,
-    ActionRecord, Actor, ApprovalContext, Constraints, ContextRecipient, Decision, Risk,
-    SigningKeyPair, Surface, SyntacticSubstrate, X25519KeyPair,
+    ActionRecord, Actor, ApprovalContext, Constraints, ContextRecipient, Decision, SigningKeyPair,
+    Surface, SyntacticSubstrate, X25519KeyPair,
 };
 use allw_uniffi::{
     action_from_agent_tool_call_json, action_from_agent_tool_call_with_raw_json,
@@ -349,7 +349,7 @@ fn make_attested_context() -> ApprovalContext {
     // attestation is excluded from request_hash (hash.rs), so adding it later does not perturb it.
     let mut context = ApprovalContext {
         action: ActionRecord {
-            record_schema_version: 1,
+            record_schema_version: 2,
             surface: Surface::Command,
             syntactic: SyntacticSubstrate {
                 bin: Some("git".to_string()),
@@ -368,9 +368,6 @@ fn make_attested_context() -> ApprovalContext {
                 diff_summary: None,
                 diff_hash: None,
             },
-            risk: Risk::Critical,
-            capabilities: None,
-            scope: None,
         },
         summary: "force push to main".to_string(),
         actor: Actor {
@@ -378,8 +375,8 @@ fn make_attested_context() -> ApprovalContext {
             kind: PREP_ACTOR_KIND.to_string(),
             attestation: None,
         },
-        risk: Risk::Critical,
-        reversible: false,
+
+        reversible: Some(false),
         constraints: Constraints {
             allowed_decisions: vec![Decision::Approved, Decision::Denied],
             challenge_required: true,
@@ -913,7 +910,7 @@ fn uniffi_signed_note_is_bound_to_the_verdict() {
 fn display_model_json_escapes_untrusted_context_text() {
     let context = json!({
         "action": {
-            "record_schema_version": 1,
+            "record_schema_version": 2,
             "surface": "command",
             "syntactic": { "raw": "rm -rf ~/x; : \u{1b}[2K\rgit status" },
             "risk": "high"

@@ -68,16 +68,13 @@ export {
   buildExecApprovalRequest,
   buildPluginApprovalRequest,
   execSummary,
-  floorRisk,
   pluginSummary,
-  reversibleForRisk,
   slugifyTitle,
   type BridgeApprovalRequest,
   type DenyReason,
   type ExecMappingInput,
   type MappingOutcome,
   type PluginMappingInput,
-  type Risk,
 } from "./lib/mapping.js";
 
 export {

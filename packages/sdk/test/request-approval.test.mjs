@@ -74,14 +74,13 @@ const RELAY_URL = "https://relay.allw.test";
 function sampleRequest(overrides = {}) {
   return {
     action: {
-      recordSchemaVersion: 1,
+      recordSchemaVersion: 2,
       surface: "command",
       syntactic: { bin: "git", raw: "git push --force" },
-      risk: "high",
     },
     summary: "Force-push to main",
     actor: { id: "machine:macbook-pro", kind: "claude-code" },
-    risk: "high",
+
     reversible: false,
     timeoutMs: TIMEOUT_MS,
     ...overrides,
@@ -102,11 +101,10 @@ function wireContext(req) {
       record_schema_version: req.action.recordSchemaVersion,
       surface: req.action.surface,
       syntactic: req.action.syntactic,
-      risk: req.action.risk,
     },
     summary: req.summary,
     actor: { id: req.actor.id, kind: req.actor.kind },
-    risk: req.risk,
+
     reversible: req.reversible,
     constraints: {
       allowed_decisions: constraints.allowedDecisions,

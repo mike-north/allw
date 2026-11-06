@@ -49,14 +49,13 @@ const NOW_MS = 1700001500000;
  */
 const CONTEXT = {
   action: {
-    record_schema_version: 1,
+    record_schema_version: 2,
     surface: "command",
     syntactic: { bin: "git", argv: ["git", "push", "--force", "origin", "main"], cwd: "/repo" },
-    risk: "high",
   },
   summary: "force push to main",
   actor: { id: "machine:laptop", kind: "claude-code" },
-  risk: "high",
+
   reversible: false,
   constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
 };
@@ -158,7 +157,7 @@ test("valid envelope: prepare decrypts + recomputes the WYSIWYS hash; the signed
     ["git", "push", "--force", "origin", "main"],
     "the decrypted argv round-trips into the view model",
   );
-  assert.equal(prepared.context.risk.level, "high", "the risk tier round-trips");
+
   // No attestation + no account states ⇒ origin renders unverified (fail-closed display, #16).
   assert.equal(prepared.context.actor.attestation, "unverified");
 
@@ -193,19 +192,18 @@ test("agent_tool_call surface: maps to its own kind, distinct from mcp, with (se
   // rendered plaintext even though it is inside request_hash.
   const AGENT_TOOL_CALL_CONTEXT = {
     action: {
-      record_schema_version: 1,
+      record_schema_version: 2,
       surface: "agent_tool_call",
       syntactic: {
         server: "deploy-plugin",
         tool: "deploy_service",
         raw: "This plugin wants to deploy to production.",
       },
-      risk: "medium",
     },
     summary:
       "OpenClaw home-mini · agent agent-main · deploy-plugin/deploy_service: Deploy — deploy now",
     actor: { id: "openclaw:home-mini", kind: "openclaw" },
-    risk: "medium",
+
     reversible: true,
     constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
   };
@@ -351,32 +349,17 @@ test("undecryptable context: a JWE the device key cannot open fails closed in pr
   );
 });
 
-test("v1 context checks (#296): a non-null reserved field or a hidden risk downgrade fails closed in prepare", async () => {
+test("removed fields are ignored on the core prepare path", async () => {
   const wasm = await loadTestWasm();
   const { identity, encryptTo } = pairedIdentity(wasm);
   const runtime = runtimeAt(wasm, identity);
-  // docs/contract.md §Device-side context checks: the core's decrypt_context refuses these, so the
-  // card renders unverified (deny-only) with the core's error naming the field or both tiers.
-  const cases = [
-    [{ ...CONTEXT, action: { ...CONTEXT.action, capabilities: [] } }, "action.capabilities"],
-    [{ ...CONTEXT, action: { ...CONTEXT.action, scope: {} } }, "action.scope"],
-    [
-      { ...CONTEXT, risk: "low" },
-      `context risk low is lower than action.risk ${CONTEXT.action.risk}`,
-    ],
-  ];
-  for (const [context, named] of cases) {
-    await assert.rejects(
-      () => runtime.prepare(makeEnvelope(encryptTo(JSON.stringify(context)))),
-      (err) => err instanceof Error && err.message.includes(named),
-      `the refusal must name ${named}`,
-    );
-  }
-  // A context that raises the shown risk above the record's still opens.
-  const raised = await runtime.prepare(
-    makeEnvelope(encryptTo(JSON.stringify({ ...CONTEXT, risk: "critical" }))),
-  );
-  assert.equal(raised.context.risk.level, "critical");
+  const context = {
+    ...CONTEXT,
+    risk: "low",
+    action: { ...CONTEXT.action, risk: "critical", capabilities: [], scope: {} },
+  };
+  const result = await runtime.prepare(makeEnvelope(encryptTo(JSON.stringify(context))));
+  assert.equal(Object.hasOwn(result.context, "risk"), false);
 });
 
 test("missing ciphertext: a malformed envelope is rejected before any crypto", async () => {

@@ -245,7 +245,6 @@ function coreCommandAction(wasm, command, cwd) {
     recordSchemaVersion: core.record_schema_version,
     surface: core.surface,
     syntactic: core.syntactic,
-    risk: core.risk,
   };
 }
 
@@ -286,8 +285,7 @@ test("(#372) a command request through the SDK is byte-identical to one built fr
         action,
         summary: `Run command: ${command}`,
         actor: { id: `codex:${HOSTNAME}`, kind: "codex" },
-        risk: action.risk,
-        reversible: action.risk === "low" || action.risk === "medium",
+
         ...(toolUseId ? { chain: [`codex:tool_use_id:${toolUseId}`] } : {}),
         ...(config.timeoutMs !== undefined ? { timeoutMs: config.timeoutMs } : {}),
       };

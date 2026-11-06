@@ -5,7 +5,7 @@
 //! compact diff summary plus hash. The full edit bytes are also stored in `syntactic.raw` so the
 //! approver can show the exact content the human is signing over.
 
-use crate::contract::{ActionRecord, Risk, Surface, SyntacticSubstrate};
+use crate::contract::{ActionRecord, Surface, SyntacticSubstrate};
 use base64::Engine;
 use sha2::{Digest, Sha256};
 
@@ -21,7 +21,7 @@ pub fn action_from_file_edit(
     let diff_hash = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize());
 
     ActionRecord {
-        record_schema_version: 1,
+        record_schema_version: 2,
         surface: Surface::FileEdit,
         syntactic: SyntacticSubstrate {
             bin: None,
@@ -40,9 +40,6 @@ pub fn action_from_file_edit(
             diff_summary: Some(diff_summary.to_string()),
             diff_hash: Some(diff_hash),
         },
-        risk: Risk::High,
-        capabilities: None,
-        scope: None,
     }
 }
 
@@ -57,7 +54,7 @@ mod tests {
             action_from_file_edit("patch", &["src/app.ts".to_string()], "patch 1 file", diff);
 
         assert_eq!(record.surface, Surface::FileEdit);
-        assert_eq!(record.record_schema_version, 1);
+        assert_eq!(record.record_schema_version, 2);
         assert_eq!(record.syntactic.operation.as_deref(), Some("patch"));
         assert_eq!(
             record.syntactic.paths.as_deref(),
@@ -76,8 +73,5 @@ mod tests {
             Some(diff),
             "raw must carry the exact patch/edit text for WYSIWYS rendering"
         );
-        assert_eq!(record.risk, Risk::High);
-        assert!(record.capabilities.is_none());
-        assert!(record.scope.is_none());
     }
 }

@@ -313,11 +313,6 @@ public final class UniFfiApproverRuntime: ApproverCoreRuntime {
                 : wire.actor.id,
             attestation: attestationState
         )
-        let risk = ApprovalRisk(
-            level: wire.risk.toRenderLevel(),
-            reversible: wire.reversible,
-            summary: wire.summary
-        )
         let allowed = wire.constraints.allowedDecisions.compactMap { $0.toRenderDecision() }
         let challenge: NumberMatchChallenge?
         if wire.constraints.challengeRequired, let code = prepared.challengeCode {
@@ -328,7 +323,8 @@ public final class UniFfiApproverRuntime: ApproverCoreRuntime {
         return ApprovalContext(
             action: action,
             actor: actor,
-            risk: risk,
+            summary: wire.summary,
+            reversible: wire.reversible,
             allowedDecisions: allowed,
             challenge: challenge
         )
@@ -343,8 +339,7 @@ private struct WireApprovalContext: Decodable {
     let action: WireActionRecord
     let summary: String
     let actor: WireActor
-    let risk: WireRisk
-    let reversible: Bool
+    let reversible: Bool?
     let constraints: WireConstraints
 }
 
@@ -360,19 +355,6 @@ private struct WireConstraints: Decodable {
     enum CodingKeys: String, CodingKey {
         case allowedDecisions = "allowed_decisions"
         case challengeRequired = "challenge_required"
-    }
-}
-
-private enum WireRisk: String, Decodable {
-    case low, medium, high, critical
-
-    func toRenderLevel() -> ApprovalRiskLevel {
-        switch self {
-        case .low: return .low
-        case .medium: return .medium
-        case .high: return .high
-        case .critical: return .critical
-        }
     }
 }
 

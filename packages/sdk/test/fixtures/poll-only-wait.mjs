@@ -122,14 +122,13 @@ const client = createClient({
 async function main() {
   const verdict = await client.requestApproval({
     action: {
-      recordSchemaVersion: 1,
+      recordSchemaVersion: 2,
       surface: "command",
       syntactic: { bin: "ls", argv: ["ls"] },
-      risk: "low",
     },
     summary: "poll keep-alive",
     actor: { id: "machine:test", kind: "script" },
-    risk: "low",
+
     reversible: true,
     timeoutMs: mode === "early" ? 60_000 : 400,
   });

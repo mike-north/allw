@@ -7,6 +7,10 @@ the allw inbox, then resolves the approval.
 The governing spec is [`docs/openclaw-integration.md`](../../docs/openclaw-integration.md). Read it
 before changing behavior here — every rule below is a spec section, not a preference.
 
+Risk labels/scoring and policy-only wire metadata are removed (#406 slice 1). Reversibility is an
+optional caller assertion; hooks/bridge omit it. Temporary command interpretation and derived fields
+remain only until slice 2.
+
 ## What it is (and is not)
 
 - It is a **separate `node` process**, not an in-gateway OpenClaw plugin. A plugin would put allw's
@@ -33,7 +37,7 @@ This package implements both approval families the gateway raises to `operator.a
 
   A plugin approval discovered by **backfill** (one that predates the connection) is left open
   rather than driven: the pinned `ApprovalSnapshot` never carries `pluginId`/`toolName`/`severity`,
-  so building a record from it alone would fabricate the function identity and risk tier. A live
+  so building a record from it alone would fabricate the function identity . A live
   `plugin.approval.requested` event is unaffected.
 
 `system-agent` approvals (§5.3) are out of scope for v1 by design: they are logged and left for a

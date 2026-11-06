@@ -3,7 +3,7 @@
  *
  * The human must be shown the **exact** action they are signing over, and the rendered fields are
  * precisely the ones bound into `request_hash` (the full `ActionRecord` syntactic substrate,
- * `summary`, `actor`, `risk`, `reversible`, `expires_at`, plus the `request_hash` itself). When a
+ * `summary`, `actor`, optional `reversible`, `expires_at`, plus the `request_hash` itself). When a
  * number-match challenge is required, the code derived from that `request_hash` is shown too; the
  * human must type it back before an approval can be signed.
  * Rendering is pure (returns a string) so it is trivially testable and the CLI just prints it.
@@ -527,8 +527,9 @@ export function renderRequest(
     const reason = origin?.reason ?? "origin is unauthenticated plaintext";
     lines.push(`              ⚠ UNVERIFIED — ${reason} (#16)`);
   }
-  lines.push(`  Risk:       ${display.risk}`);
-  lines.push(`  Reversible: ${display.reversible ? "yes" : "no"}`);
+  if (display.reversible !== undefined) {
+    lines.push(`  Reversible: ${display.reversible ? "yes" : "no"}`);
+  }
   if (prepared.numberMatchChallenge !== undefined) {
     lines.push(`  Number match: ${prepared.numberMatchChallenge}`);
   }

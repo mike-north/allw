@@ -428,3 +428,19 @@ app when tapped.
 | Manifest, icons and root-scope `sw.js` bundled                                | Verified (`test/site-build.test.mjs`)                                |
 | Subscribe, push → notification, forget, in a real browser against a relay     | Verified locally in Chrome against `wrangler dev` (issue #237 PR)    |
 | A notification received on a real iPhone installed to the Home Screen         | **Not run** — human operator step (§6); requires a device and relay  |
+
+## #406 wire/hash rollout hold
+
+Risk/policy metadata removal changes caller plaintext and request hashes (`allw/request-hash/v3`).
+An old approver core rejects new contexts without risk; the new core cannot verify old signed request
+hashes. Use a quiet/drained rollout: stop callers and let pending requests resolve or expire, update
+Pages plus CLI/native approvers and callers together, reload browser tabs, then resume. The relay's
+current provenance-only WASM path accepts both formats and does not compute request hashes or render
+actions; a relay deployment is not required solely for this slice's format change. Its live source
+version still needs operator confirmation. No compatibility shim or automatic history migration exists.
+
+Browser pairing remains under `allw:pairing:v1` with the same identity shape. The browser has no persisted
+audit-record store: its history is session-local. Inbox refresh preserves local terminal receipts.
+Raw legacy artifacts must remain preserved by their owner and visibly unverifiable under the new
+hash domains; no format migration may turn them into apparently verified history. Native escaped
+display acceptance remains pending planning; see `apple-approver-app.md`.

@@ -16,6 +16,16 @@ and all its extensions are **thin surfaces**: they render and route, they never 
 
 ---
 
+## Current native display limitation (#406)
+
+The existing Swift package decodes `CorePreparedApproval.contextJson` directly and returns raw command
+text (or `argv.joined`) from `ApprovalInboxStore.renderExactPlaintext`. It does not wire the existing
+core `DisplayModel`, escaped `raw_lines`, or hidden/control-character warning. This pre-existing gap
+is unchanged by risk removal. Existing native tests pass, but iOS escaped-display acceptance is **not
+proven** and overall readiness remains pending planning's scope decision. Narrow wiring of the
+existing core display model is recommended only if explicitly authorized; no Swift escaping or
+new parser is proposed. The invariants below remain requirements, not a claim of current compliance.
+
 ## 1. Scope & platform matrix
 
 One SwiftUI codebase, native per platform (**Mac Catalyst is rejected** — true multiplatform
@@ -66,7 +76,7 @@ The package already provides (all `Sendable`, injectable seams, fail-closed, tes
   `canApprove(id, challengeResponse:)`, `decide(...)`. Core-verified expiry; number-match gating;
   sign-failure restores `.pending`.
 - `ApprovalModels` — `ApprovalEnvelope`, `ApprovalContext`, `ApprovalAction` (`CommandAction` /
-  `McpCallAction`), `ApprovalActor` + `ActorAttestationState`, `ApprovalRisk`, `NumberMatchChallenge`,
+  `McpCallAction`), `ApprovalActor` + `ActorAttestationState`, `NumberMatchChallenge`,
   `PreparedApproval` (carries the **core-computed `requestHash`** + `expiresAt`), `SignDecisionInput`,
   `SignedVerdict`, `ApprovalListItem` (with `countdownMs`).
 - `ApproverCoreRuntime` / `UniFfiApproverRuntime` + `UniFfiCoreBinding` / `UniFfiSignBinding` — the
@@ -104,7 +114,7 @@ app, not the package); consider renaming the product to `AllwAppleApprover` (opt
    **root-verified `device_cert`** is stored — "paired but uncertified" is not a usable state.
 4. **Inbox + detail (WYSIWYS) UI** per surface, driven by `ApprovalInboxStore` / `ApprovalListItem` /
    `ApprovalDetail`. Detail must render the **exact** bound plaintext (command argv/raw or MCP
-   server+tool+params-summary), actor + attestation badge, risk/reversibility, expiry countdown, and
+   server+tool+params-summary), actor + attestation badge, optional caller reversibility, expiry countdown, and
    the number-match challenge. Approve disabled structurally until `canApprove` is true.
 5. **Secure-Enclave signing path**: wire `LocalAuthenticationBiometricGate` + `KeychainSigningSeedProvider`
    (real Keychain, `biometryCurrentSet`, passcode-set, non-synchronizable) into `decide(...)`.
@@ -189,7 +199,7 @@ app, not the package); consider renaming the product to `AllwAppleApprover` (opt
 - **Lock-screen approve** works on iPhone and still satisfies biometric + Secure Enclave + WYSIWYS.
 - WYSIWYS detail renders the exact bound plaintext; tampered context (hash mismatch) ⇒ blocked;
   revoked/unknown actor ⇒ ⚠ UNVERIFIED, deny-only; expired ⇒ deny.
-- Number-match required for destructive/critical approvals.
+- Number-match required when requested by the caller.
 - Thin-shell verified (no crypto in app/extension targets); the package's Swift tests stay green;
   the UniFFI XCFramework builds in CI.
 

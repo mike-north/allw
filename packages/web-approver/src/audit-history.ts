@@ -137,7 +137,7 @@ function timelineRow(item: AuditHistoryItem, controller: WebApproverController):
   const summary = textElement("span", item.summary);
   summary.className = "audit-row__summary";
 
-  const meta = textElement("span", `${item.actor} · risk: ${item.riskLevel}`);
+  const meta = textElement("span", item.actor);
   meta.className = "audit-row__meta";
 
   main.append(summary, meta);

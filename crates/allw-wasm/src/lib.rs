@@ -170,8 +170,10 @@ fn ms_to_i64(ms: f64, what: &str) -> Result<i64, JsError> {
 /// Computes the WYSIWYS `request_hash` for an [`ApprovalContext`](allw_core::ApprovalContext)
 /// bound to `expires_at`, returning the 32-byte digest as a **base64url-unpadded** string.
 ///
-/// This must reproduce the exact value the Rust core produces (`request-hash/v2`); the
-/// cross-platform test vector anchors that parity.
+/// This reproduces the Rust `request-hash/v3` value; the cross-platform vector anchors parity.
+/// The v3 canonical contract removes risk/policy-only action slots, uses ActionRecord schema 2,
+/// and makes reversibility an optional caller assertion. Its domain separates prior v2 receipts
+/// from the current format; no compatibility conversion is performed.
 ///
 /// # Errors
 ///
@@ -1411,8 +1413,8 @@ fn command_failure(function: &str, error: &CommandError) -> JsValue {
 /// Builds an [`ActionRecord`](allw_core::ActionRecord) from a raw shell command line, returning it
 /// as JSON. This is the **command** surface (`docs/policy-seam.md` §The three tiers, T1): the core
 /// tokenizes the command (POSIX word-splitting), captures the syntactic substrate (bin / argv /
-/// flags / positionals / cwd / host / env-refs), and assigns a coarse v1 risk tier. The semantic
-/// `capabilities`/`scope` slots stay `null` (reserved for T3). The Claude Code hook calls this to
+/// flags / positionals / cwd / host / env-refs). Raw caller input remains authoritative; no danger
+/// tier or policy-only slot is produced. The hook calls this to
 /// reduce a pending `Bash` tool call into the matchable record it submits for approval.
 ///
 /// - `command_line` — the raw shell command (e.g. `"rm -rf build"`).
@@ -1435,8 +1437,7 @@ pub fn action_from_command(command_line: &str, cwd: Option<String>) -> Result<St
 
 /// Builds an [`ActionRecord`](allw_core::ActionRecord) from a raw **PowerShell** command line,
 /// returning it as JSON (the `command` surface, for a host's PowerShell tool). `raw` is the exact
-/// line; argv is always a plain whitespace split of it; risk is at least `Medium`, or at least
-/// `High` for a compound, escaped or dynamic-execution line. See
+/// line; argv is its whitespace split. No danger rating is produced. See
 /// [`allw_core::powershell`](allw_core::powershell) for the rules.
 ///
 /// No PowerShell line is refused for its syntax, so a valid PowerShell command is never denied for
@@ -1493,7 +1494,7 @@ pub fn action_from_argv(
 /// Builds an [`ActionRecord`](allw_core::ActionRecord) for an MCP tool call, returning it as JSON.
 /// This is the **mcp_tool_call** surface (`docs/policy-seam.md` §The three tiers, T1): the core
 /// preserves the `server`/`tool`/`params` verbatim (so instance-distinguishing values stay
-/// matchable) and assigns a coarse v1 risk tier from the tool name. The hook calls this to reduce a
+/// bound to the human decision); no danger rating is assigned. The hook calls this to reduce a
 /// pending `mcp__<server>__<tool>` call into the record it submits for approval.
 ///
 /// - `server` — the MCP server name (e.g. `"omnifocus"`).

@@ -64,14 +64,13 @@ function baseContext(attestation) {
       : { id: ACTOR_ID, kind: ACTOR_KIND, attestation };
   return {
     action: {
-      record_schema_version: 1,
+      record_schema_version: 2,
       surface: "command",
       syntactic: { bin: "git", raw: "git push --force origin main" },
-      risk: "high",
     },
     summary: "force push to main",
     actor,
-    risk: "high",
+
     reversible: false,
     constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
   };

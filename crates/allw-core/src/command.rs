@@ -1,10 +1,8 @@
 //! Build an [`ActionRecord`] from a shell command — T1 syntactic substrate only.
 //!
-//! This module implements the **syntactic tier (T1)** of the policy-seam
-//! (`docs/policy-seam.md §The three tiers`).  It captures **what the human typed** — the
-//! exact token stream — without any attempt to infer meaning.  The semantic tier (T3,
-//! capability inference) is explicitly deferred; [`ActionRecord::capabilities`] and
-//! [`ActionRecord::scope`] are always `None` from this module.
+//! Records raw command text alongside syntactic projections used by consumers. These projections
+//! are descriptive only: they establish no danger rating, reversibility assertion or authority.
+//! Raw caller input remains authoritative over the projections.
 //!
 //! # Public API
 //!
@@ -35,14 +33,6 @@
 //! returns an error.  [`action_from_argv`] does not tokenize; it fails only for an argv with no
 //! program (empty, an empty program word, or only assignments; #376), as both builders do.
 //!
-//! # Command lines with shell syntax (risk only)
-//!
-//! Tokenization only splits words, so `ls && rm -rf /` records `bin: "ls"` and the argv
-//! `["ls", "&&", "rm", "-rf", "/"]`. Those fields are unchanged. **Risk**, though, covers the
-//! commands a shell would run for the line: [`action_from_command`] also scans the raw line (see
-//! § Risk heuristic). [`action_from_argv`] records an argv that runs without a shell, so its words
-//! are never read as shell syntax.
-//!
 //! # Flag classification
 //!
 //! A token is classified as a **flag** if it begins with `-` (single-dash short options,
@@ -61,8 +51,7 @@
 //! Positionals are tokens in `argv[1..]` that are not flags.  For long flags with
 //! **separate** value tokens (`--key value`), the value token `value` is classified as a
 //! positional because syntactically it is indistinguishable from any other non-flag token
-//! at the T1 tier (no per-command schema is available in T1).  Only at T2 (curated-command
-//! schemas) or T3 (full semantic inference) would `value` be recognized as a parameter.
+//! here: the builder has no per-command schema and does not infer argument meaning.
 //!
 //! After a `--` end-of-options separator, all subsequent tokens are positionals regardless
 //! of whether they start with `-`.
@@ -89,38 +78,15 @@
 //! pattern `\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?` walks the raw command string before
 //! tokenization.  Names are deduplicated and returned in first-seen order.
 //!
-//! # Risk heuristic (v1)
-//!
-//! A coarse, documented heuristic assigns a [`Risk`] tier.  This is a v1 placeholder;
-//! `docs/policy-seam.md §The three tiers` states that T3 will derive risk from capabilities.
-//!
-//! The rules live in the private `command/risk.rs` module, whose module doc is the reference: the
-//! program table, how the program that actually runs is found (assignments, wrappers, shells with
-//! `-c`, `eval`), how a command line is scanned (operators, substitutions, heredocs), the bounds
-//! (all failing upward to `High`), and the known T1 limits. The table, in short:
-//!
-//! | Risk       | Matched commands / flags                                                      |
-//! |------------|-------------------------------------------------------------------------------|
-//! | `Critical` | `dd`, `mkfs`, `mkfs.*`, `fdisk`, `parted`, `shred`                           |
-//! | `High`     | `rm` recursive+force, `git push` with a force flag, `chmod -R`, `sudo`, `doas`, `run0`, `pkexec`, `su` |
-//! | `Low`      | `ls`, `cat`, `echo`, `pwd`, `whoami`, `date`, `env`, `printenv`, `which`     |
-//! | `Medium`   | everything else                                                               |
-//!
-//! Only `risk` follows what really runs. `bin` / `argv` / `flags` / `positionals` / `env_refs`
-//! stay `argv[0]`-based, so policy matching (which keys on `bin`) is unchanged; see
-//! `docs/policy-seam.md` §v1 command risk.
-
-use crate::contract::{ActionRecord, Risk, Surface, SyntacticSubstrate};
+use crate::contract::{ActionRecord, Surface, SyntacticSubstrate};
 use std::collections::HashSet;
-
-mod risk;
 
 // ── Record schema version ─────────────────────────────────────────────────────
 
 /// The `record_schema_version` stamped on every `ActionRecord` built by this module.
 ///
 /// This matches the value used in the existing contract tests (see `contract.rs`).
-pub const RECORD_SCHEMA_VERSION: u32 = 1;
+pub const RECORD_SCHEMA_VERSION: u32 = 2;
 
 // ── CommandContext ────────────────────────────────────────────────────────────
 
@@ -233,16 +199,7 @@ pub fn action_from_command(
     // Refuse a line that runs no program before building anything: a human must never be asked to
     // approve nothing (#376).
     check_runs_a_program(&argv)?;
-    // A command line can hold more than one command (`ls && rm -rf /`). `bin` / `argv` / `flags`
-    // / `positionals` still describe the word list, but risk covers every command a shell would
-    // run (`risk` module).
-    let risk = risk::command_line_risk(command_line, &argv);
-    Ok(build_record(
-        argv,
-        ctx,
-        Some(command_line.to_string()),
-        risk,
-    ))
+    Ok(build_record(argv, ctx, Some(command_line.to_string())))
 }
 
 /// Build an [`ActionRecord`] from a pre-tokenized argument vector, optionally carrying the
@@ -272,8 +229,7 @@ pub fn action_from_command(
 /// is built. Assignments are recognised as the line builder recognises them (a shell-identifier name,
 /// [`is_assignment_name`]), even though an argv runs without a shell, where `FOO=1` would be a
 /// program name: no real program is named like an assignment, so refusing it fails closed and keeps
-/// both builders consistent. (The risk rules use a wider, first-character test; see
-/// `risk::is_assignment_like`.) See `docs/policy-seam.md` §Command lines that run no program.
+/// both builders consistent. See `docs/policy-seam.md` §Command lines that run no program.
 ///
 /// # Examples
 ///
@@ -298,9 +254,7 @@ pub(crate) fn build_argv_record(
     raw: Option<&str>,
     ctx: &CommandContext,
 ) -> ActionRecord {
-    // The argv runs without a shell, so `raw` is display text and is not read for risk.
-    let risk = risk::argv_risk(argv);
-    build_record(argv.to_vec(), ctx, raw.map(str::to_string), risk)
+    build_record(argv.to_vec(), ctx, raw.map(str::to_string))
 }
 
 // ── No-program refusal ───────────────────────────────────────────────────────
@@ -332,9 +286,7 @@ fn is_pure_assignment(piece: &str) -> bool {
 /// `X+`, `A[i]+` are; `nice -n 1 dd if`, `FO-O`, `1X`, `A[0`, `A[a]b]`, `A[]]` and `` are not (bash
 /// runs each of those as a command).
 ///
-/// This is deliberately narrower than the risk rules' `is_assignment_like` (first character only):
-/// refusing must never catch a word bash runs as a command, while risk over-matching only raises the
-/// tier.
+/// The no-program refusal recognizes shell identifiers rather than arbitrary words containing `=`.
 fn is_assignment_name(name: &str) -> bool {
     let name = name.strip_suffix('+').unwrap_or(name);
     let (ident, subscript) = match name.find('[') {
@@ -404,14 +356,8 @@ fn check_argv_has_a_program(argv: &[String]) -> Result<(), CommandError> {
 
 // ── Core builder ─────────────────────────────────────────────────────────────
 
-/// Assemble the record for `argv`. `risk` is computed by the caller, because only the caller knows
-/// whether a shell runs the line (`risk::command_line_risk`) or not (`risk::argv_risk`).
-fn build_record(
-    argv: Vec<String>,
-    ctx: &CommandContext,
-    raw: Option<String>,
-    risk: Risk,
-) -> ActionRecord {
+/// Assemble the syntactic record without assigning danger or policy semantics.
+fn build_record(argv: Vec<String>, ctx: &CommandContext, raw: Option<String>) -> ActionRecord {
     let bin = argv.first().cloned().unwrap_or_default();
     let (flags, positionals) = split_flags_and_positionals(&argv);
     let env_refs = raw.as_deref().map(extract_env_refs).unwrap_or_default();
@@ -456,9 +402,6 @@ fn build_record(
             diff_hash: None,
             raw,
         },
-        risk,
-        capabilities: None,
-        scope: None,
     }
 }
 
@@ -650,10 +593,8 @@ mod tests {
     /// T1 rule: `bin` == argv[0] as-given.
     /// T1 rule: `-rf` is a single combined short-flag token (not split into `-r`, `-f`).
     ///   Classification rationale: shlex treats `-rf` as one token; at T1 we do not
-    ///   expand combined flags. The risk heuristic inspects character membership inside
-    ///   the combined token to detect `-rf` (see `combined_short_flags`).
+    ///   expand combined flags. The token is preserved as supplied.
     /// T1 rule: positionals are non-flag tokens after argv[0].
-    /// Risk: `rm` with recursive+force flags → `Risk::High` (module doc table).
     #[test]
     fn rm_rf_slash_x() {
         let r = action_from_command("rm -rf /x", &ctx_no_cwd()).unwrap();
@@ -681,16 +622,7 @@ mod tests {
             "positionals must be non-flag tokens after argv[0]"
         );
 
-        // risk: rm + recursive + force → High (module doc table: `rm -rf` → High)
-        assert_eq!(
-            r.risk,
-            Risk::High,
-            "rm -rf must be classified as Risk::High (recursive+force heuristic)"
-        );
-
         // reserved fields: T1 guarantee
-        assert!(r.capabilities.is_none(), "capabilities must be None in T1");
-        assert!(r.scope.is_none(), "scope must be None in T1");
     }
 
     /// `git push` — no flags, single positional, deterministic.
@@ -709,10 +641,6 @@ mod tests {
         assert_eq!(positionals(&r), vec!["push"]);
 
         // plain git push without --force → Medium
-        assert_eq!(r.risk, Risk::Medium);
-
-        assert!(r.capabilities.is_none());
-        assert!(r.scope.is_none());
     }
 
     /// `curl https://example.com -d @f`
@@ -751,8 +679,6 @@ mod tests {
         );
 
         // reserved fields
-        assert!(r.capabilities.is_none());
-        assert!(r.scope.is_none());
     }
 
     // ── Determinism ──────────────────────────────────────────────────────────
@@ -813,29 +739,6 @@ mod tests {
     }
 
     // ── Reserved fields (T1 guarantee) ───────────────────────────────────────
-
-    /// capabilities and scope MUST be None for all records produced by this module.
-    #[test]
-    fn reserved_fields_always_none() {
-        let commands = [
-            "rm -rf /",
-            "git push",
-            "curl https://example.com",
-            "sudo bash",
-            "ls -la",
-        ];
-        for cmd in &commands {
-            let r = action_from_command(cmd, &ctx_no_cwd()).unwrap();
-            assert!(
-                r.capabilities.is_none(),
-                "capabilities must be None for `{cmd}` (T1 guarantee)"
-            );
-            assert!(
-                r.scope.is_none(),
-                "scope must be None for `{cmd}` (T1 guarantee)"
-            );
-        }
-    }
 
     // ── Serde round-trip ─────────────────────────────────────────────────────
 
@@ -969,18 +872,6 @@ mod tests {
         }
     }
 
-    /// Regression for #391: the substitution's command keeps its risk once the line is built; the
-    /// inner `dd of=/dev/sda` is Critical.
-    #[test]
-    fn issue_391_substitution_with_dd_inside_an_assignment_is_critical() {
-        let r = action_from_command(
-            r#"x="$(nice -n 1 dd if=/dev/zero of=/dev/sda)""#,
-            &ctx_no_cwd(),
-        )
-        .unwrap();
-        assert_eq!(r.risk, Risk::Critical);
-    }
-
     /// Regression for #391: genuine all-assignment lines are still refused as `no_program`.
     #[test]
     fn issue_391_genuine_assignments_are_still_refused() {
@@ -1037,15 +928,6 @@ mod tests {
         let argv = vec!["FO-O=1".to_string(), String::new()];
         let r = action_from_argv(&argv, None, &ctx_no_cwd()).unwrap();
         assert_eq!(r.syntactic.bin.as_deref(), Some("FO-O=1"));
-        assert_eq!(r.risk, Risk::Medium);
-    }
-
-    /// A substitution hidden in an assignment keeps its risk: the line is not refused, and risk
-    /// still covers the command it runs.
-    #[test]
-    fn assignment_with_a_substitution_keeps_its_risk() {
-        let r = action_from_command("FOO=$(rm -rf ~)", &ctx_no_cwd()).unwrap();
-        assert_eq!(r.risk, Risk::High);
     }
 
     #[test]
@@ -1093,7 +975,6 @@ mod tests {
         assert_eq!(bin(&r), "git");
         assert_eq!(positionals(&r), vec!["push"]);
         assert!(flags(&r).contains(&"--force".to_string()));
-        assert_eq!(r.risk, Risk::High, "git push --force is High risk");
     }
 
     /// An argv with no program is refused (#376), whatever `raw` says: empty → NoCommand, an
@@ -1244,17 +1125,17 @@ mod tests {
 
     // ── record_schema_version ────────────────────────────────────────────────
 
-    /// All records built by this module use RECORD_SCHEMA_VERSION (== 1, matching contract tests).
+    /// All records built by this module use RECORD_SCHEMA_VERSION (== 2, matching contract tests).
     #[test]
-    fn record_schema_version_is_one() {
+    fn record_schema_version_is_two() {
         let r = action_from_command("ls", &ctx_no_cwd()).unwrap();
         assert_eq!(
             r.record_schema_version, RECORD_SCHEMA_VERSION,
             "record_schema_version must be RECORD_SCHEMA_VERSION"
         );
         assert_eq!(
-            RECORD_SCHEMA_VERSION, 1,
-            "RECORD_SCHEMA_VERSION must equal 1"
+            RECORD_SCHEMA_VERSION, 2,
+            "RECORD_SCHEMA_VERSION must equal 2"
         );
     }
 
@@ -1348,19 +1229,13 @@ mod tests {
             "/usr/bin/rm",
             "bin must be stored as-given (not basename-normalized)"
         );
-        // Risk heuristic uses basename internally: /usr/bin/rm → rm → High
-        assert_eq!(
-            r.risk,
-            Risk::High,
-            "risk heuristic must use basename of bin path"
-        );
     }
 
     /// #268 changes only `risk`: `bin` is still `argv[0]` and the syntactic fields keep their
     /// documented T1 meaning (module doc §Flag/§Positional classification), so policy matching
     /// cannot shift.
     #[test]
-    fn risk_268_syntactic_fields_unchanged() {
+    fn assignments_and_wrappers_keep_token_fields() {
         let r = action_from_command("FOO=1 git push --force origin main", &ctx_no_cwd()).unwrap();
         assert_eq!(bin(&r), "FOO=1");
         assert_eq!(
@@ -1388,7 +1263,7 @@ mod tests {
     /// #272 changes only `risk`: the record's words are still the shlex split of the line, so
     /// policy matching cannot shift.
     #[test]
-    fn risk_272_syntactic_fields_unchanged() {
+    fn compound_lines_keep_token_fields() {
         let r = action_from_command("ls && rm -rf /", &ctx_no_cwd()).unwrap();
         assert_eq!(bin(&r), "ls");
         assert_eq!(argv(&r), ["ls", "&&", "rm", "-rf", "/"]);

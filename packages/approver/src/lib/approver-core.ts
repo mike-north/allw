@@ -137,8 +137,7 @@ function parseEnvelope(value: unknown): ApprovalRequest {
  * @param nowMs current time in Unix ms — injected so expiry is deterministic/testable (no
  *   wall-clock read inside).
  * @throws on a malformed envelope, an **already-expired** request, a JWE the device key cannot
- *   decrypt, a malformed context, or one the core refuses (a non-null reserved field or a hidden
- *   risk downgrade, docs/contract.md §Device-side context checks).
+ *   decrypt, or a malformed context. Unknown contract fields are ignored in the shared core.
  */
 export function prepareRequest(
   wasm: AllwWasm,

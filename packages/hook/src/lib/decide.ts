@@ -11,7 +11,7 @@
  * # Building the request
  * A POSIX shell command (`Bash`, or `Monitor` with a `command`) is built through `@allw/sdk`'s
  * `commandRequest` (#269), the same core-built path a plain script uses, with the hook's own actor,
- * risk-derived `reversible` and timeout as explicit overrides. (`commandRequest` loads the SDK's copy
+ * timeout as an explicit override and no reversibility assertion. (`commandRequest` loads the SDK's copy
  * of the WASM core, the same vendored artifact the hook's `wasm` is.) Every other gated surface (MCP,
  * file edits, PowerShell) has no SDK builder yet, so its record comes from {@link gateToolCall} and
  * is translated here.
@@ -68,8 +68,7 @@ export interface HookApprovalRequest {
   readonly action: unknown;
   readonly summary: string;
   readonly actor: { readonly id: string; readonly kind: string };
-  readonly risk: "low" | "medium" | "high" | "critical";
-  readonly reversible: boolean;
+
   readonly timeoutMs?: number;
 }
 
@@ -93,15 +92,11 @@ export interface DecideDeps {
   readonly requestApproval: RequestApprovalFn;
 }
 
-/** A coarse risk classification (the core's `ActionRecord.risk`, lower-cased on the wire). */
-type Risk = "low" | "medium" | "high" | "critical";
-
 /** The subset of the core's snake_case `ActionRecord` JSON the hook reads back after building it. */
 interface CoreActionRecord {
   readonly record_schema_version: number;
   readonly surface: string;
   readonly syntactic: unknown;
-  readonly risk: Risk;
 }
 
 /** Validate the parsed core `ActionRecord` JSON has the fields the hook depends on. */
@@ -109,20 +104,8 @@ function isCoreActionRecord(value: unknown): value is CoreActionRecord {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
   return (
-    typeof v.record_schema_version === "number" &&
-    typeof v.surface === "string" &&
-    "syntactic" in v &&
-    (v.risk === "low" || v.risk === "medium" || v.risk === "high" || v.risk === "critical")
+    typeof v.record_schema_version === "number" && typeof v.surface === "string" && "syntactic" in v
   );
-}
-
-/**
- * Is a risk tier reversible by default? Coarse v1 heuristic: `high`/`critical` actions are treated
- * as irreversible (they typically destroy or push state), `low`/`medium` as reversible. This only
- * feeds the human-shown `reversible` hint; it never substitutes for the human's decision.
- */
-function reversibleForRisk(risk: Risk): boolean {
-  return risk === "low" || risk === "medium";
 }
 
 /** The machine actor the hook submits as: this host, acting as Claude Code. */
@@ -132,13 +115,11 @@ function hookActor(hostname: string): HookApprovalRequest["actor"] {
 
 /**
  * Build the `ApprovalRequest` for a POSIX shell command through `@allw/sdk`'s `commandRequest`,
- * which builds the record with the core's `action_from_command` and takes `risk` from it.
+ * which builds the record with the core's `action_from_command` without inferring danger or reversibility.
  *
  * The hook's own values are explicit overrides: its actor, the configured timeout, and `cwd`
  * (`null` when Claude Code sent none, so the record is unbound rather than bound to the hook's own
- * working directory). `reversible` is derived from the core's risk, which is known only once the
- * record is built, so it replaces `commandRequest`'s conservative `false` afterwards; the key order
- * is unchanged, so the request is the one the hook built by hand before #269.
+ * working directory). No reversibility assertion is made.
  *
  * @throws `CommandActionError` (as a rejection) when the SDK refuses the command: invalid
  * shell syntax, or a blank command or program. (It also refuses a blank `cwd`, which the stdin
@@ -159,7 +140,7 @@ async function commandApprovalRequest(
     actor: hookActor(hostname),
     ...(config.timeoutMs !== undefined ? { timeoutMs: config.timeoutMs } : {}),
   });
-  return { ...req, reversible: reversibleForRisk(req.risk) };
+  return req;
 }
 
 /**
@@ -185,15 +166,13 @@ function buildApprovalRequest(
     recordSchemaVersion: parsed.record_schema_version,
     surface: parsed.surface,
     syntactic: parsed.syntactic,
-    risk: parsed.risk,
   };
 
   return {
     action,
     summary,
     actor: hookActor(hostname),
-    risk: parsed.risk,
-    reversible: reversibleForRisk(parsed.risk),
+
     ...(config.timeoutMs !== undefined ? { timeoutMs: config.timeoutMs } : {}),
   };
 }

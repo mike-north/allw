@@ -299,7 +299,7 @@ private extension PreparedApproval {
             context: ApprovalContext(
                 action: .command(CommandAction(cwd: "/repo", argv: ["git", "status"], raw: nil)),
                 actor: ApprovalActor(id: "agent-1", display: "Codex", attestation: .verified),
-                risk: ApprovalRisk(level: .high, reversible: true, summary: "git status"),
+                summary: "git status", reversible: true,
                 allowedDecisions: [.approved, .denied],
                 challenge: nil
             )

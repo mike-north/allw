@@ -54,8 +54,7 @@ pub use audit::{
 pub use command::{action_from_argv, action_from_command, CommandContext, CommandError};
 pub use contract::{
     ActionRecord, Actor, ApprovalContext, ApprovalRequest, Approver, AuditRecord, Constraints,
-    ContextViolation, Decision, PolicyBlock, PolicyDecision, ReservedField, Risk, Surface,
-    SyntacticSubstrate, Verdict,
+    Decision, Surface, SyntacticSubstrate, Verdict,
 };
 pub use crypto::{
     derive_number_match_challenge, effective_allow, issue_device_cert, revoked_device_ids,

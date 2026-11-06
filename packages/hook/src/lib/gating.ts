@@ -16,9 +16,8 @@
  *   them (empty stdout), so Claude Code's own permission rules and mode decide. Widening the set of
  *   gated tools is a future, additive change.
  *
- * Gating is intentionally separate from risk: *whether* to ask the human is a matcher decision
- * here; *how risky* the action is, is the `ActionRecord.risk` the core assigns. A finer policy tier
- * (skip-on-low-risk, etc.) is the policy layer's job (`docs/policy-seam.md`), not the hook's.
+ * Tool-name gating decides whether to ask the human. The hook does not infer what the action
+ * means, rate danger, or assert reversibility; caller policy remains outside allw.
  *
  * # Fail-closed
  * If a call is gated but its `ActionRecord` cannot be built (a malformed command, unparseable MCP

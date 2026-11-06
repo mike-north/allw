@@ -381,7 +381,9 @@ function card(
   }
   article.append(metaLine("Actor", detail.actor));
   article.append(
-    metaLine("Risk", `${detail.riskLevel}${detail.reversible === false ? " · irreversible" : ""}`),
+    ...(detail.reversible !== undefined
+      ? [metaLine("Reversible", detail.reversible ? "yes" : "no")]
+      : []),
   );
   article.append(metaLine("Expires", `${String(Math.ceil(detail.countdownMs / 1000))}s`));
   article.append(metaLine("Request hash", detail.requestHash ?? "unverified"));

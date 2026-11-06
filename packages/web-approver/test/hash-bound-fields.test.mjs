@@ -36,10 +36,10 @@ const ESC = "\u001b";
 /** A wire `ApprovalContext` for `surface` with `syntactic`, plus top-level overrides. */
 function context(surface, syntactic, overrides = {}) {
   return {
-    action: { record_schema_version: 1, surface, syntactic, risk: "high" },
+    action: { record_schema_version: 2, surface, syntactic, risk: "high" },
     summary: "push the release branch",
     actor: { id: "machine:laptop", kind: "claude-code" },
-    risk: "high",
+
     reversible: false,
     constraints: { allowed_decisions: ["approved", "denied"], challenge_required: false },
     ...overrides,

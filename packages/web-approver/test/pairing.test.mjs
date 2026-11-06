@@ -99,7 +99,8 @@ function fakeRuntime() {
           kind: "command",
           substrate: { cwd: "/", argv: ["echo", "hi"], raw: "echo hi" },
           actor: { id: "test-actor", display: "Test Actor", attestation: "unverified" },
-          risk: { level: "low", reversible: true, summary: "test" },
+          summary: "test",
+          reversible: true,
           allowed_decisions: ["approved", "denied"],
         },
       };

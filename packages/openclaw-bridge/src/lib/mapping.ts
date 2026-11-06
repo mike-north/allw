@@ -28,11 +28,6 @@ import type {
   PluginApprovalRequestedEvent,
 } from "./protocol.js";
 
-/** Coarse risk tiers, in ascending order (the core's `Risk`). */
-export type Risk = "low" | "medium" | "high" | "critical";
-
-const RISK_ORDER: readonly Risk[] = ["low", "medium", "high", "critical"];
-
 /**
  * Machine-readable fail-closed reason codes (spec §9). They mirror the Codex hook's `denyReason`
  * categories so operators triage both surfaces the same way.
@@ -62,12 +57,10 @@ export interface BridgeApprovalRequest {
      */
     readonly surface: "command" | "agent_tool_call";
     readonly syntactic: unknown;
-    readonly risk: Risk;
   };
   readonly summary: string;
   readonly actor: { readonly id: string; readonly kind: "openclaw" };
-  readonly risk: Risk;
-  readonly reversible: boolean;
+
   readonly constraints: {
     readonly allowedDecisions: readonly ["approved", "denied"];
     readonly challengeRequired: boolean;
@@ -116,31 +109,17 @@ export interface PluginMappingInput {
 /** The literal rendered for a decision-relevant component OpenClaw did not supply (spec §6.2). */
 const UNKNOWN = "unknown";
 
-/** Low/medium actions are reversible — the same rule the Codex hook applies (spec §6.4). */
-export function reversibleForRisk(risk: Risk): boolean {
-  return risk === "low" || risk === "medium";
-}
-
-/** Raise `risk` to at least `floor` (used for the `warningText` floor of `high`, spec §5.1). */
-export function floorRisk(risk: Risk, floor: Risk): Risk {
-  return RISK_ORDER.indexOf(risk) >= RISK_ORDER.indexOf(floor) ? risk : floor;
-}
-
 interface CoreActionRecord {
   readonly record_schema_version: number;
   readonly surface: string;
   readonly syntactic: unknown;
-  readonly risk: Risk;
 }
 
 function isCoreActionRecord(value: unknown): value is CoreActionRecord {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
   return (
-    typeof v.record_schema_version === "number" &&
-    typeof v.surface === "string" &&
-    "syntactic" in v &&
-    (v.risk === "low" || v.risk === "medium" || v.risk === "high" || v.risk === "critical")
+    typeof v.record_schema_version === "number" && typeof v.surface === "string" && "syntactic" in v
   );
 }
 
@@ -298,12 +277,6 @@ export function buildExecApprovalRequest(wasm: HookWasm, input: ExecMappingInput
     };
   }
 
-  // §5.1/§6.4: `warningText` floors the risk at `high` — OpenClaw already decided this run warrants
-  // a warning, so allw must not present it as routine even when the argv looks benign.
-  const hasWarning =
-    event.request.warningText !== undefined && event.request.warningText.trim().length > 0;
-  const risk = hasWarning ? floorRisk(parsed.risk, "high") : parsed.risk;
-
   const summary = execSummary({
     gatewayId,
     host: event.request.host,
@@ -329,17 +302,15 @@ export function buildExecApprovalRequest(wasm: HookWasm, input: ExecMappingInput
         recordSchemaVersion: parsed.record_schema_version,
         surface: "command",
         syntactic: parsed.syntactic,
-        risk,
       },
       summary,
       actor: { id: actorIdForGateway(gatewayId), kind: "openclaw" },
-      risk,
-      reversible: reversibleForRisk(risk),
+
       // §6.2: the allw verdict vocabulary is fixed. OpenClaw's `allowedDecisions` constrains what
       // the *bridge* may submit downstream (§7.4), never what the human may choose upstream.
       constraints: {
         allowedDecisions: ["approved", "denied"],
-        challengeRequired: risk === "critical",
+        challengeRequired: true,
       },
       chain,
       timeoutMs: input.timeoutMs,
@@ -348,16 +319,6 @@ export function buildExecApprovalRequest(wasm: HookWasm, input: ExecMappingInput
 }
 
 // ── §5.2 plugin permission requests ─────────────────────────────────────────────
-
-/** `severity` → `risk` (spec §5.2, §6.4). Absent `severity` defaults upstream to `warning`. */
-const SEVERITY_RISK: Readonly<Record<string, Risk>> = {
-  info: "low",
-  warning: "medium",
-  critical: "critical",
-};
-
-/** The risk for the upstream default `severity: "warning"` when a plugin request omits it. */
-const DEFAULT_SEVERITY_RISK: Risk = "medium";
 
 /** The outcome of reconciling one field the pinned snapshot and the untyped event both carry. */
 interface ReconciledField {
@@ -485,7 +446,7 @@ export function buildPluginApprovalRequest(
 
   // §6.1 rule 3, extended to every field BOTH sources carry (not only `commandText`/prose): the
   // pinned `PluginApprovalPresentation` is the **canonical** source for function identity
-  // (`pluginId`, `toolName`), risk (`severity`), reviewer prose (`title`, `description`, `detail`),
+  // (`pluginId`, `toolName`), upstream severity (`severity`), reviewer prose (`title`, `description`, `detail`),
   // and actor context (`agentId`) — @openclaw/gateway-protocol's schema marks `title`,
   // `description`, `severity`, and `allowedDecisions` schema-**required** on this presentation, and
   // `detail`/`pluginId`/`toolName`/`agentId` schema-optional. The untyped event is only a
@@ -524,11 +485,8 @@ export function buildPluginApprovalRequest(
   if (agentId.divergence !== undefined) {
     return { kind: "deny", reason: "presentation-divergence", detail: agentId.divergence };
   }
-  // `allowedDecisions` is present on both sources' schemas; the sharpest divergence case (a
-  // severity of `medium` on the event vs. `critical` on the snapshot silently skipping the
-  // number-match challenge) is caught above, but a decision-set mismatch is checked too for the
-  // same reason — an unchecked disagreement here would leave the two sources' reviewer contracts
-  // silently inconsistent. Order-independent: the schema declares `allowedDecisions` a set.
+  // The decision set is upstream schema data, not a danger classification. Reconcile it before
+  // showing the request so the snapshot and event cannot describe different reviewer choices.
   if (decisionsDiverge(presentation.allowedDecisions, event.request.allowedDecisions)) {
     return {
       kind: "deny",
@@ -555,22 +513,16 @@ export function buildPluginApprovalRequest(
     };
   }
 
-  // §5.2/§6.4: an unrecognized severity is rejected rather than guessed at — silently defaulting
-  // an out-of-band value would misclassify risk for a condition OpenClaw's own schema never
-  // documented. Absent severity uses the upstream default (`warning` → medium).
-  let risk: Risk;
-  if (severityField.value === undefined) {
-    risk = DEFAULT_SEVERITY_RISK;
-  } else {
-    const mapped = SEVERITY_RISK[severityField.value];
-    if (mapped === undefined) {
-      return {
-        kind: "deny",
-        reason: "build-error",
-        detail: `plugin approval declared an unrecognized severity '${severityField.value}'`,
-      };
-    }
-    risk = mapped;
+  // This checks the upstream schema only; severity never becomes an allw danger rating.
+  if (
+    severityField.value !== undefined &&
+    !["info", "warning", "critical"].includes(severityField.value)
+  ) {
+    return {
+      kind: "deny",
+      reason: "build-error",
+      detail: `plugin approval declared an unrecognized severity '${severityField.value}'`,
+    };
   }
 
   // §5.2: syntactic.raw = description, plus detail when present — the prose the plugin author
@@ -657,17 +609,15 @@ export function buildPluginApprovalRequest(
         recordSchemaVersion: parsed.record_schema_version,
         surface: "agent_tool_call",
         syntactic: parsed.syntactic,
-        risk,
       },
       summary,
       actor: { id: actorIdForGateway(gatewayId), kind: "openclaw" },
-      risk,
-      reversible: reversibleForRisk(risk),
+
       // §6.2: the allw verdict vocabulary is fixed. OpenClaw's `allowedDecisions` constrains what
       // the *bridge* may submit downstream (§7.4), never what the human may choose upstream.
       constraints: {
         allowedDecisions: ["approved", "denied"],
-        challengeRequired: risk === "critical",
+        challengeRequired: true,
       },
       chain,
       timeoutMs: input.timeoutMs,

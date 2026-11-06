@@ -700,7 +700,7 @@ private extension ApprovalInboxStoreTests {
     /// shape `prepare_approval_json`'s `context_json` produces.
     static func coreContextJson(summary: String, challengeRequired: Bool) -> String {
         """
-        {"action":{"record_schema_version":1,"surface":"command","syntactic":{"bin":"git","argv":["git","push","--force"],"cwd":"/repo","raw":"git push --force origin main"},"risk":"critical"},"summary":"\(summary)","actor":{"id":"machine:macbook-pro","kind":"claude-code"},"risk":"critical","reversible":false,"constraints":{"allowed_decisions":["approved","denied"],"challenge_required":\(challengeRequired ? "true" : "false")}}
+        {"action":{"record_schema_version":2,"surface":"command","syntactic":{"bin":"git","argv":["git","push","--force"],"cwd":"/repo","raw":"git push --force origin main"},"risk":"critical"},"summary":"\(summary)","actor":{"id":"machine:macbook-pro","kind":"claude-code"},"risk":"critical","reversible":false,"constraints":{"allowed_decisions":["approved","denied"],"challenge_required":\(challengeRequired ? "true" : "false")}}
         """
     }
 }
@@ -941,7 +941,7 @@ private extension PreparedApproval {
             context: ApprovalContext(
                 action: .command(CommandAction(cwd: "/repo", argv: ["git", "push", "--force"], raw: nil)),
                 actor: ApprovalActor(id: "agent-1", display: "Codex", attestation: .verified),
-                risk: ApprovalRisk(level: .critical, reversible: false, summary: summary),
+                summary: summary, reversible: false,
                 allowedDecisions: allowedDecisions,
                 challenge: challenge
             )

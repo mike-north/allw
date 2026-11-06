@@ -141,7 +141,7 @@ export interface ExecApprovalPresentation {
  * `PluginApprovalPresentation` per the pinned schema: `kind`, `title`, `description`, `severity`,
  * and `allowedDecisions` are schema-**required**; `detail`, `pluginId`, `toolName`, `agentId` are
  * schema-optional (and nullable on the wire — `readNonEmptyString` folds `null` to `undefined`).
- * This is the **canonical** source for plugin function identity, risk, and reviewer prose
+ * This is the **canonical** source for plugin function identity, upstream severity, and reviewer prose
  * (`docs/openclaw-integration.md` §5.2, §6.1) — the untyped event is only a cross-check.
  */
 export interface PluginApprovalPresentation {

@@ -131,13 +131,6 @@ export interface ApprovalActor {
   readonly attestation: "verified" | "unverified" | "pending";
 }
 
-export interface ApprovalRisk {
-  readonly level: "low" | "medium" | "high" | "critical";
-  readonly reversible: boolean;
-  /** The context `summary`: the integrator's description of the action, escaped by the core. */
-  readonly summary: string;
-}
-
 /**
  * The action's complete syntactic substrate as the core displays it (Rust
  * `allw_core::DisplaySubstrate`, from `display_model`, #246): every field the core binds into
@@ -202,7 +195,10 @@ export interface ApprovalContext {
   /** Escaped ids of the upstream gates this request passed through. */
   readonly chain?: readonly string[];
   readonly actor: ApprovalActor;
-  readonly risk: ApprovalRisk;
+  /** Caller description, escaped by the core. */
+  readonly summary: string;
+  /** Present only when the caller asserts reversibility. */
+  readonly reversible?: boolean;
   readonly allowed_decisions: readonly ApprovalDecision[];
   readonly challenge?: NumberMatchChallenge;
   /**
@@ -285,7 +281,6 @@ export interface ApprovalListItem {
   readonly id: string;
   readonly status: ApprovalStatus;
   readonly actor: string;
-  readonly riskLevel: ApprovalRisk["level"] | "unknown";
   readonly summary: string;
   readonly expiresAt: number;
   readonly countdownMs: number;
@@ -367,9 +362,16 @@ export class WebApproverController {
    */
   async sync(envelopes: readonly ApprovalEnvelope[]): Promise<void> {
     const preparedRecords = await Promise.all(envelopes.map((envelope) => this.#prepare(envelope)));
+    // The relay returns its active inbox, not this device's decision history. Keep local
+    // receipts verbatim across refreshes; a routing refresh cannot erase or reopen a decision.
+    const terminal = Array.from(this.#records.values()).filter(
+      (record) => record.status === "approved" || record.status === "denied",
+    );
     this.#records.clear();
-
     for (const record of preparedRecords) {
+      this.#records.set(record.envelope.id, record);
+    }
+    for (const record of terminal) {
       this.#records.set(record.envelope.id, record);
     }
   }
@@ -548,7 +550,6 @@ export class WebApproverController {
       id: record.envelope.id,
       status: record.status,
       actor: context?.actor.display ?? "Unverified request",
-      riskLevel: context?.risk.level ?? "unknown",
       summary: context ? actionSummary(context) : "Unable to verify or decrypt this request",
       expiresAt: record.expiresAt,
       countdownMs: Math.max(0, record.expiresAt - this.#nowMs()),
@@ -580,11 +581,13 @@ export class WebApproverController {
 
     const detail: ApprovalDetail = {
       ...base,
-      contextSummary: prepared.context.risk.summary,
+      contextSummary: prepared.context.summary,
       requestHash: prepared.requestHash,
       actorId: prepared.context.actor.id,
       attestation: prepared.context.actor.attestation,
-      reversible: prepared.context.risk.reversible,
+      ...(prepared.context.reversible !== undefined
+        ? { reversible: prepared.context.reversible }
+        : {}),
     };
     if (prepared.context.challenge) {
       return { ...detail, challenge: prepared.context.challenge };
